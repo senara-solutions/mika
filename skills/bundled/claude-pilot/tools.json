@@ -11,7 +11,7 @@
         },
         "task_id": {
           "type": "string",
-          "description": "The UUID returned by create_work_item (36-char format like '15383984-a3e7-41bf-ac6f-630ba9a89d63'). Used for log filename and task correlation at /var/log/claude-pilot/{task_id}.log. Do NOT pass issue references (e.g., 'mika-284') — pass the work item UUID."
+          "description": "The UUID returned by create_task (36-char format like '15383984-a3e7-41bf-ac6f-630ba9a89d63'). Used for log filename and task correlation at /var/log/claude-pilot/{task_id}.log. Do NOT pass issue references (e.g., 'mika-284') — pass the task UUID."
         },
         "iteration_context": {
           "type": "string",

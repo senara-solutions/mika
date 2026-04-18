@@ -1,8 +1,8 @@
-//! Shared shallow-merge helper for work item metadata.
+//! Shared shallow-merge helper for task metadata.
 //!
-//! Both [`crate::tools::update_work_item_status`] (agent-facing) and
+//! Both [`crate::tools::update_task_status`] (agent-facing) and
 //! [`crate::task_engine::dispatcher::try_extract_callback_metadata`]
-//! (engine-facing) merge incoming metadata into a work item's existing
+//! (engine-facing) merge incoming metadata into a task's existing
 //! `metadata` JSON. They MUST share the same semantics so the agent can
 //! enrich engine-injected fields without losing them.
 //!

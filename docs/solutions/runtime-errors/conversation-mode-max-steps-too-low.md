@@ -10,7 +10,7 @@ issue: "#386"
 
 ## Problem
 
-mika-dev hit the 10-step conversation-mode limit before completing the autonomous dispatch sequence (fetch issue -> research code -> create work item -> launch claude-pilot). The agent got cut off during research at step 9 and never reached task creation.
+mika-dev hit the 10-step conversation-mode limit before completing the autonomous dispatch sequence (fetch issue -> research code -> create task -> launch claude-pilot). The agent got cut off during research at step 9 and never reached task creation.
 
 ## Root cause
 

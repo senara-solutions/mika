@@ -130,6 +130,6 @@ async fn resolve_chat_id(&self) -> Result<i64> {
 - [Plan: Delegate Send Message Tracing](../../plans/2026-03-15-002-fix-delegate-send-message-tracing-plan.md)
 - [Agent Team Management Tools Integration](agent-team-management-tools-integration.md)
 - [Team Task Child Wrong Agent ID](../database-issues/team-task-child-wrong-agent-id.md)
-- [Delegation Work Item Guard Enforcement](../architecture-patterns/delegation-work-item-guard-enforcement.md)
+- [Delegation Task Guard Enforcement](../architecture-patterns/delegation-work-item-guard-enforcement.md)
 - [Callback/Resume Agent Lifecycle](../architecture/callback-resume-agent-lifecycle.md)
 - GitHub Issue: [#149](https://github.com/senara-solutions/mika/issues/149)

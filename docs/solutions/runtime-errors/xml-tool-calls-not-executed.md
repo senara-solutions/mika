@@ -14,7 +14,7 @@ modules: [mika-common::llm::openai, mika-agent::agent]
 Tool calling broken across all OpenAI-compatible providers. LLMs output tool calls as XML text (`<function=tool_name>...</function></tool_call>`) instead of structured API `tool_calls`. The text is displayed verbatim — tools are never executed.
 
 **Symptoms:**
-- mika-dev outputs `<function=list_work_items>\n</function>\n</tool_call>` as visible text
+- mika-dev outputs `<function=list_tasks>\n</function>\n</tool_call>` as visible text
 - Opening `<tool_call>` tag missing from display while `</tool_call>` remains (model behavior, not a stripping issue)
 - Affects all non-Anthropic providers (all route through `OpenAiCompatibleProvider`)
 

@@ -23,7 +23,7 @@ Two independent systems competed for callback tasks in CLI mode:
 - **TUI `poll_callback_tasks()`** — polls every ~5s, session-scoped, claims atomically before processing, runs `run_agent()` with full conversation history.
 - **Engine `dispatch_undelivered_callbacks()`** — scans every 60s, queries ALL callbacks, runs `run_silent_agent()` in a new context-free `callback-{uuid}` session.
 
-When the engine won the race, the callback was processed in a silent turn that the user never saw. The generic "analyze and notify" trigger instruction caused the agent to skip mika-qa delegation and mark work items complete prematurely.
+When the engine won the race, the callback was processed in a silent turn that the user never saw. The generic "analyze and notify" trigger instruction caused the agent to skip mika-qa delegation and mark tasks complete prematurely.
 
 ## Root Cause
 
@@ -52,8 +52,8 @@ Construction sites:
 
 Extracted `build_callback_trigger_context()` from inline code in `run_silent_inner()`. Routes claude-pilot callbacks to self-dev workflow continuation instructions based on exact label match (`long_running:run_claude_pilot`):
 
-- **Success:** Delegate to mika-qa, manage work items based on verdict
-- **Failure:** Escalation — notify user, do not retry, leave work item status unchanged
+- **Success:** Delegate to mika-qa, manage tasks based on verdict
+- **Failure:** Escalation — notify user, do not retry, leave task status unchanged
 - **Other labels:** Generic "analyze and notify" (unchanged)
 
 ## Prevention

@@ -112,6 +112,6 @@ During code review (7 parallel agents), three additional bugs were caught and fi
 
 ## Lessons Learned
 
-- **Phase 2 comments are tech debt markers**: Treat "Phase 2" doc comments as bugs that need tracking. The comment existed since the initial implementation but was never tracked as a work item.
+- **Phase 2 comments are tech debt markers**: Treat "Phase 2" doc comments as bugs that need tracking. The comment existed since the initial implementation but was never tracked as a task.
 - **Review catches real bugs in new code**: The 7 review agents found 3 genuine bugs (flag theft, no cap, race condition) that would have shipped without review.
 - **`try_lock` for optional serialization**: Using `Option<Arc<Mutex>>` with `try_lock` lets the same code path work in both serialized (server) and unserialized (CLI) modes without branching the architecture.

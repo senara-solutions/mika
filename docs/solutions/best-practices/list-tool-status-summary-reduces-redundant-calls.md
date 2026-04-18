@@ -2,7 +2,7 @@
 title: List tool status-count summary reduces redundant agent calls
 date: 2026-04-15
 category: best-practices
-module: mika-agent/tools/list_work_items
+module: mika-agent/tools/list_tasks
 problem_type: best_practice
 component: tooling
 severity: medium
@@ -23,7 +23,7 @@ tags:
 
 ## Context
 
-Models (kimi-k2.5, qwen, and others) routinely followed an unfiltered `list_work_items({})` with 3+ redundant filtered calls (`status:"in_progress"`, `status:"blocked"`, `status:"completed"`) to reconstruct counts the first response already contained. The unfiltered response listed each item with its status, but didn't make the aggregate distribution obvious — so models fell into "ritual thoroughness": re-querying to verify counts already in hand.
+Models (kimi-k2.5, qwen, and others) routinely followed an unfiltered `list_tasks({})` with 3+ redundant filtered calls (`status:"in_progress"`, `status:"blocked"`, `status:"completed"`) to reconstruct counts the first response already contained. The unfiltered response listed each item with its status, but didn't make the aggregate distribution obvious — so models fell into "ritual thoroughness": re-querying to verify counts already in hand.
 
 This is a structural problem, not model-specific. The tool output didn't make the right next action obvious, forcing callers into defensive re-querying.
 
@@ -70,16 +70,16 @@ The broader principle: when the intent is "know the counts," the right action is
 
 Before (4 tool calls for a status question):
 ```
-list_work_items({})                          → 50 items (all fields)
-list_work_items({"status":"in_progress"})   → 0 items (redundant)
-list_work_items({"status":"blocked"})        → 2 items (redundant)
-list_work_items({"status":"completed"})      → 48 items (redundant)
+list_tasks({})                          → 50 items (all fields)
+list_tasks({"status":"in_progress"})   → 0 items (redundant)
+list_tasks({"status":"blocked"})        → 2 items (redundant)
+list_tasks({"status":"completed"})      → 48 items (redundant)
 ```
 
 After (1 tool call):
 ```
-list_work_items({})
-→ Work items (50):
+list_tasks({})
+→ Tasks (50):
   - [blocked] uuid-1 Fix auth flow (created:...)
   - [blocked] uuid-2 Update schema (created:...)
   - [completed] uuid-3 Add health endpoint (created:...)

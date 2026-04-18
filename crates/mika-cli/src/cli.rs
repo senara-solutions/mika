@@ -173,7 +173,7 @@ pub struct AskArgs {
     /// Without this flag, --task-id is correlation-only.
     #[arg(long, requires = "task_id", conflicts_with = "team")]
     pub task_complete: bool,
-    /// Link this message to a parent work item (metadata threading).
+    /// Link this message to a parent task (metadata threading).
     /// Used by claude-asked relay: mika ask --parent-task-id <uuid> "question"
     #[arg(long)]
     pub parent_task_id: Option<String>,

@@ -223,8 +223,8 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
         prompt.push_str("## Callback Result Turn\n");
         prompt.push_str(
             "A background task has completed and the results are provided in the user message below.\n\
-             IMPORTANT: You MUST NOT submit new long-running tasks or create work items during this turn.\n\
-             Process the results, take any required follow-up actions (e.g., updating work item status), \
+             IMPORTANT: You MUST NOT submit new long-running tasks or create tasks during this turn.\n\
+             Process the results, take any required follow-up actions (e.g., updating task status), \
              and then respond to the user with your analysis.\n\
              WARNING: Any <context type=\"tool_history\"> blocks in the conversation are summaries of PRIOR \
              turns — they do NOT mean you have already taken action in this turn. You MUST still call \
@@ -259,7 +259,7 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
          BAD: No tool calls → you say \"Comment posted: https://github.com/…#issuecomment-123\"\n  \
          GOOD: Build tool returns \"Compilation succeeded\" → you say \"The build passed.\"\n  \
          GOOD: run_gh posts a comment → you report the URL from the tool result.\n  \
-         If you need downstream status, call the appropriate tool (e.g., check_work_item, \
+         If you need downstream status, call the appropriate tool (e.g., check_task, \
          query_timeline) to verify it first.\n",
     );
     prompt.push_str(
@@ -433,16 +433,16 @@ Core memory tracks key people briefly — the people table is the full record.\n
         "- You can delegate tasks to specialized agents with delegate_task when other agents are configured.\n",
     );
     prompt.push_str(
-        "- Use create_work_item to track significant pieces of work (feature implementations, \
-         research projects, items waiting on external input). Check list_work_items before creating \
+        "- Use create_task to track significant pieces of work (feature implementations, \
+         research projects, items waiting on external input). Check list_tasks before creating \
          to avoid duplicates.\n\
-         - Work item status management follows two patterns:\n\
+         - Task status management follows two patterns:\n\
            - **Direct update:** When the user explicitly requests a status change (\"mark it done\", \
-         \"cancel the task\"), call update_work_item_status directly. The tool validates transitions — \
+         \"cancel the task\"), call update_task_status directly. The tool validates transitions — \
          terminal states (completed, cancelled) are final — status cannot be changed, but metadata \
          can still be written by including the metadata field.\n\
-           - **Inspect first:** When the user asks about a work item's state (\"check the task\", \
-         \"is the PR merged?\"), call check_work_item to read details and any linked GitHub PR/issue \
+           - **Inspect first:** When the user asks about a task's state (\"check the task\", \
+         \"is the PR merged?\"), call check_task to read details and any linked GitHub PR/issue \
          status. Present findings and wait for the user's decision before changing status.\n\
          - Status transitions: pending can go to any status; in_progress can go to blocked/completed/cancelled; \
          blocked can go to in_progress/completed/cancelled. Completed and cancelled are terminal \
@@ -450,8 +450,8 @@ Core memory tracks key people briefly — the people table is the full record.\n
     );
     prompt.push_str(
         "- **Delegation Rule:** Before delegating any implementation work (via delegate_task \
-         or long-running skills), you MUST first create a work item using create_work_item, then pass \
-         the work_item_id to the delegation tool. The tool will reject calls without a valid work_item_id.\n",
+         or long-running skills), you MUST first create a task using create_task, then pass \
+         the task_id to the delegation tool. The tool will reject calls without a valid task_id.\n",
     );
     prompt.push_str(
         "- Use search_tool_history to recall results of past tool calls across sessions (by tool name, \
@@ -537,7 +537,7 @@ pub struct SilentPromptContext<'a> {
     pub recent_audit_events: Option<&'a str>,
     /// Agent home directory. When set, file tool instructions include the absolute path.
     pub home_dir: Option<&'a std::path::Path>,
-    /// Task health summary: active work items + anomalous task states.
+    /// Task health summary: active tasks + anomalous task states.
     pub task_health: Option<&'a TaskHealthSummary>,
     /// Stored user preferences for autonomous action during heartbeat.
     pub stored_preferences: &'a [Preference],
@@ -635,17 +635,17 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     }
     prompt.push('\n');
 
-    // Task health: active work items + anomalies (labels sanitized to prevent prompt injection)
+    // Task health: active tasks + anomalies (labels sanitized to prevent prompt injection)
     if let Some(health) = ctx.task_health {
-        let has_items = !health.active_work_items.is_empty();
+        let has_items = !health.active_tasks.is_empty();
         let has_anomalies = !health.anomalies.is_empty();
         if has_items || has_anomalies {
             prompt.push_str("## Task Health\n");
             prompt.push_str("<task-health>\n");
 
             if has_items {
-                prompt.push_str("<active-work-items>\n");
-                for item in &health.active_work_items {
+                prompt.push_str("<pending-tasks>\n");
+                for item in &health.active_tasks {
                     let created_dt =
                         crate::timestamp::parse(&item.created_at).unwrap_or(ctx.current_utc);
                     let age_days = ctx.current_utc.signed_duration_since(created_dt).num_days();
@@ -659,7 +659,7 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
                     )
                     .unwrap();
                 }
-                prompt.push_str("</active-work-items>\n");
+                prompt.push_str("</pending-tasks>\n");
             }
 
             if has_anomalies {
@@ -684,7 +684,7 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
                 "Review the task health summary above. For each anomaly:\n\
                  1. If a stored preference covers this action pattern, take it autonomously and include \"(per your standing preference)\" in any notification.\n\
                  2. Otherwise, notify the user via send_message with the anomaly details and suggest an action.\n\
-                 3. For github_linked items, call check_work_item to inspect the linked PR/issue status before notifying.\n\
+                 3. For github_linked items, call check_task to inspect the linked PR/issue status before notifying.\n\
                  4. Include the task ID in all notifications so the user can reference it.\n\
                  5. Present findings as \"as of this check\" — task states may have changed since the query ran.\n\
                  6. After taking a corrective action that the user confirmed, ask: \"Should I always do this automatically in the future? I can remember this as a standing preference.\"\n\
@@ -1654,7 +1654,7 @@ notify = true
         use crate::db::{Task, TaskHealthAnomaly, TaskHealthSummary};
         let identity = test_identity();
         let health = TaskHealthSummary {
-            active_work_items: vec![Task {
+            active_tasks: vec![Task {
                 id: "abc-123".to_string(),
                 agent_id: "mika".to_string(),
                 team_run_id: None,
@@ -1716,7 +1716,7 @@ notify = true
         let prompt = build_silent_prompt(&ctx);
         assert!(prompt.contains("<task-health>"));
         assert!(prompt.contains("</task-health>"));
-        assert!(prompt.contains("<active-work-items>"));
+        assert!(prompt.contains("<pending-tasks>"));
         assert!(prompt.contains("Fix auth flow"));
         assert!(prompt.contains("<anomalies>"));
         assert!(prompt.contains("stuck_callback"));

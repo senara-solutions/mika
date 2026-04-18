@@ -8,16 +8,16 @@ Use this step INSTEAD of Step 3 when the user asks to iterate on an existing PR 
 
 **If iteration signals are present:**
 
-1. **Find the existing work item.** Call `list_work_items` and match by `reference_url` (the issue URL) or label. The item should be `in_progress` or `blocked`. If `blocked`, call `update_work_item_status` to transition it to `in_progress` before proceeding.
+1. **Find the existing task.** Call `list_tasks` and match by `reference_url` (the issue URL) or label. The item should be `in_progress` or `blocked`. If `blocked`, call `update_task_status` to transition it to `in_progress` before proceeding.
 
-2. **Discover the branch name.** Check the work item's metadata for `claude_pilot.branch` (set in Step 6). If not available, query: `gh pr list --search "is:open" --repo senara-solutions/<repo> --json headRefName,number` and match by issue number or PR number.
+2. **Discover the branch name.** Check the task's metadata for `claude_pilot.branch` (set in Step 6). If not available, query: `gh pr list --search "is:open" --repo senara-solutions/<repo> --json headRefName,number` and match by issue number or PR number.
 
 3. **Compose the prompt with iteration context.** Use `repo#number` in the `prompt` field (this triggers worktree reuse in the handler) and add `iteration_context` with the user's specific feedback:
 
 ```json
 {
   "prompt": "repo#number",
-  "task_id": "<existing work item ID>",
+  "task_id": "<existing task ID>",
   "iteration_context": "Iterate on PR #<N> (branch: <branch>). Push to existing branch — do NOT create a new PR.\n\nChanges requested:\n1. <user's specific feedback verbatim>\n2. <user's specific feedback verbatim>\n\nAddress ONLY these concerns. Do not re-implement the entire feature."
 }
 ```
@@ -38,7 +38,7 @@ Use this step when Vincent asks to "address review comments" or "handle PR feedb
 
 Call `address_pr_comments` (not `run_claude_pilot`):
 ```json
-{"pr_url": "<full PR URL>", "worktree_path": "<existing worktree path>", "task_id": "<work item UUID>"}
+{"pr_url": "<full PR URL>", "worktree_path": "<existing worktree path>", "task_id": "<task UUID>"}
 ```
 
 The handler fetches review comments from the GitHub API, constructs a focused prompt, and runs claude-pilot in free-text mode. After the callback, proceed to Step 6 (close-out). mika-qa triggers automatically on the PR update via webhook.

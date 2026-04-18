@@ -89,7 +89,7 @@ impl TaskEngine {
             .unwrap_or_default();
 
         for task in in_progress {
-            // Manual (work item) tasks represent human work — don't invalidate on restart
+            // Manual (task) tasks represent human work — don't invalidate on restart
             if task.trigger_type == trigger_type::MANUAL {
                 debug!(task_id = %task.id, "skipping manual task during startup recovery");
                 continue;

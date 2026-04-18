@@ -2,8 +2,8 @@
 //!
 //! Tests exercise the `should_defer_webhook`, `correlate_webhook`, and queue
 //! drain/replay logic with real `AsyncDatabase` instances to verify:
-//! - Webhooks targeting work items with active callbacks are deferred (R6)
-//! - Webhooks for unrelated work items are NOT deferred (R7)
+//! - Webhooks targeting tasks with active callbacks are deferred (R6)
+//! - Webhooks for unrelated tasks are NOT deferred (R7)
 //! - Expired webhooks are replayed after timeout (R8)
 
 use serde_json::json;
@@ -26,8 +26,8 @@ async fn test_db() -> AsyncDatabase {
     AsyncDatabase::new(db)
 }
 
-/// Create a work item with PR URL in metadata.
-async fn create_work_item(db: &AsyncDatabase, pr_url: &str, branch: &str) -> String {
+/// Create a task with PR URL in metadata.
+async fn create_task(db: &AsyncDatabase, pr_url: &str, branch: &str) -> String {
     let metadata = json!({
         "claude_pilot": {
             "pr_url": pr_url,
@@ -41,7 +41,7 @@ async fn create_work_item(db: &AsyncDatabase, pr_url: &str, branch: &str) -> Str
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
-            label: format!("Work item for {pr_url}"),
+            label: format!("Task for {pr_url}"),
             trigger_type: trigger_type::MANUAL.to_string(),
             cron_expr: None,
             event_source: None,
@@ -60,7 +60,7 @@ async fn create_work_item(db: &AsyncDatabase, pr_url: &str, branch: &str) -> Str
             r#type: None,
         })
         .await
-        .expect("create work item");
+        .expect("create task");
 
     db.update_manual_task_status(&task_id, "in_progress")
         .await
@@ -69,7 +69,7 @@ async fn create_work_item(db: &AsyncDatabase, pr_url: &str, branch: &str) -> Str
     task_id
 }
 
-/// Create a callback child task for a work item (simulating an in-flight `run_claude_pilot`).
+/// Create a callback child task for a task (simulating an in-flight `run_claude_pilot`).
 async fn create_callback_task(db: &AsyncDatabase, parent_id: &str) -> String {
     db.create_task(NewTask {
         agent_id: AGENT_ID.to_string(),
@@ -116,8 +116,8 @@ fn pr_review_text(repo: &str, number: u64) -> String {
 async fn webhook_deferred_when_callback_inflight() {
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/42";
-    let work_item_id = create_work_item(&db, pr_url, "feat/test").await;
-    let _callback_id = create_callback_task(&db, &work_item_id).await;
+    let task_id = create_task(&db, pr_url, "feat/test").await;
+    let _callback_id = create_callback_task(&db, &task_id).await;
 
     let text = pr_review_text("senara-solutions/mika", 42);
     let correlation = correlate_webhook(&text).expect("should correlate");
@@ -125,7 +125,7 @@ async fn webhook_deferred_when_callback_inflight() {
     let result = should_defer_webhook(&db, &correlation).await;
     assert!(result.is_some(), "webhook should be deferred");
     let (wi_id, _event_desc) = result.unwrap();
-    assert_eq!(wi_id, work_item_id);
+    assert_eq!(wi_id, task_id);
 }
 
 // -------------------------------------------------------------------------
@@ -137,8 +137,8 @@ async fn webhook_deferred_when_callback_inflight() {
 async fn webhook_not_deferred_after_callback_completed() {
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/42";
-    let work_item_id = create_work_item(&db, pr_url, "feat/test").await;
-    let callback_id = create_callback_task(&db, &work_item_id).await;
+    let task_id = create_task(&db, pr_url, "feat/test").await;
+    let callback_id = create_callback_task(&db, &task_id).await;
 
     // Mark callback as completed (simulating POST /tasks/{id}/complete)
     db.update_task_completed(&callback_id, Some("claude-pilot completed"))
@@ -156,41 +156,41 @@ async fn webhook_not_deferred_after_callback_completed() {
 }
 
 // -------------------------------------------------------------------------
-// R7: Webhook for unrelated work item → NOT deferred
+// R7: Webhook for unrelated task → NOT deferred
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn webhook_not_deferred_for_unrelated_work_item() {
+async fn webhook_not_deferred_for_unrelated_task() {
     let db = test_db().await;
 
-    // Work item for PR #42 with active callback
-    let work_item_id = create_work_item(
+    // Task for PR #42 with active callback
+    let task_id = create_task(
         &db,
         "https://github.com/senara-solutions/mika/pull/42",
         "feat/test",
     )
     .await;
-    let _callback_id = create_callback_task(&db, &work_item_id).await;
+    let _callback_id = create_callback_task(&db, &task_id).await;
 
-    // Webhook for PR #99 (different PR, no matching work item)
+    // Webhook for PR #99 (different PR, no matching task)
     let text = pr_review_text("senara-solutions/mika", 99);
     let correlation = correlate_webhook(&text).expect("should correlate");
 
     let result = should_defer_webhook(&db, &correlation).await;
     // The sole-inflight-callback fallback triggers here since there's exactly
-    // one work item with an active callback and the PR URL doesn't match.
+    // one task with an active callback and the PR URL doesn't match.
     // This is the intended behavior — the fallback exists for the pre-pr_url
     // state where the callback hasn't written metadata yet.
     assert!(
         result.is_some(),
-        "should defer via sole-inflight fallback (exactly one work item with active callback)"
+        "should defer via sole-inflight fallback (exactly one task with active callback)"
     );
 }
 
 #[tokio::test]
-async fn webhook_not_deferred_when_no_work_item_exists() {
+async fn webhook_not_deferred_when_no_task_exists() {
     let db = test_db().await;
-    // No work items at all
+    // No tasks at all
 
     let text = pr_review_text("senara-solutions/mika", 99);
     let correlation = correlate_webhook(&text).expect("should correlate");
@@ -198,15 +198,15 @@ async fn webhook_not_deferred_when_no_work_item_exists() {
     let result = should_defer_webhook(&db, &correlation).await;
     assert!(
         result.is_none(),
-        "webhook should NOT be deferred when no work items exist"
+        "webhook should NOT be deferred when no tasks exist"
     );
 }
 
 #[tokio::test]
-async fn webhook_not_deferred_when_work_item_has_no_callback() {
+async fn webhook_not_deferred_when_task_has_no_callback() {
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/42";
-    let _work_item_id = create_work_item(&db, pr_url, "feat/test").await;
+    let _task_id = create_task(&db, pr_url, "feat/test").await;
     // No callback task created
 
     let text = pr_review_text("senara-solutions/mika", 42);
@@ -215,7 +215,7 @@ async fn webhook_not_deferred_when_work_item_has_no_callback() {
     let result = should_defer_webhook(&db, &correlation).await;
     assert!(
         result.is_none(),
-        "webhook should NOT be deferred when work item has no active callback"
+        "webhook should NOT be deferred when task has no active callback"
     );
 }
 
@@ -241,7 +241,7 @@ async fn expired_webhooks_are_drained() {
                 images: None,
             },
             received_at: Instant::now() - Duration::from_secs(120),
-            work_item_id: "wi-1".to_string(),
+            task_id: "wi-1".to_string(),
             event_desc: "expired event".to_string(),
             deadline: Instant::now() - Duration::from_secs(1), // Past deadline
         },
@@ -256,7 +256,7 @@ async fn expired_webhooks_are_drained() {
                 images: None,
             },
             received_at: Instant::now(),
-            work_item_id: "wi-1".to_string(),
+            task_id: "wi-1".to_string(),
             event_desc: "active event".to_string(),
             deadline: Instant::now() + Duration::from_secs(60),
         },
@@ -270,16 +270,16 @@ async fn expired_webhooks_are_drained() {
 }
 
 // -------------------------------------------------------------------------
-// Queue drain by work item
+// Queue drain by task
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn drain_for_work_item_preserves_order() {
+async fn drain_for_task_preserves_order() {
     use std::time::{Duration, Instant};
 
     use mika_agent::server::types::MessageRequest;
 
-    fn make_deferred(req_id: &str, work_item_id: &str) -> DeferredWebhook {
+    fn make_deferred(req_id: &str, task_id: &str) -> DeferredWebhook {
         DeferredWebhook {
             request: MessageRequest {
                 text: format!("webhook {req_id}"),
@@ -290,7 +290,7 @@ async fn drain_for_work_item_preserves_order() {
                 images: None,
             },
             received_at: Instant::now(),
-            work_item_id: work_item_id.to_string(),
+            task_id: task_id.to_string(),
             event_desc: "test event".to_string(),
             deadline: Instant::now() + Duration::from_secs(60),
         }
@@ -303,7 +303,7 @@ async fn drain_for_work_item_preserves_order() {
         make_deferred("req-4", "wi-A"),
     ];
 
-    let drained = webhook_queue::drain_for_work_item(&mut queue, "wi-A");
+    let drained = webhook_queue::drain_for_task(&mut queue, "wi-A");
     assert_eq!(drained.len(), 3, "should drain all 3 webhooks for wi-A");
     assert_eq!(drained[0].request.request_id, "req-1");
     assert_eq!(drained[1].request.request_id, "req-3");
@@ -349,15 +349,15 @@ fn correlate_issue_returns_none() {
 #[tokio::test]
 async fn webhook_deferred_by_branch_match() {
     let db = test_db().await;
-    let work_item_id = create_work_item(
+    let task_id = create_task(
         &db,
         "https://github.com/senara-solutions/mika/pull/42",
         "feat/my-branch",
     )
     .await;
-    let _callback_id = create_callback_task(&db, &work_item_id).await;
+    let _callback_id = create_callback_task(&db, &task_id).await;
 
-    // check_suite event with branch that matches the work item
+    // check_suite event with branch that matches the task
     let text = "[GitHub] Check suite (failure) on senara-solutions/mika (branch: feat/my-branch)\nhttps://github.com/...";
     let correlation = correlate_webhook(text).expect("should correlate");
 
@@ -367,25 +367,25 @@ async fn webhook_deferred_by_branch_match() {
         "webhook should be deferred by branch match"
     );
     let (wi_id, _) = result.unwrap();
-    assert_eq!(wi_id, work_item_id);
+    assert_eq!(wi_id, task_id);
 }
 
 // -------------------------------------------------------------------------
-// Fallback: sole inflight callback work item
+// Fallback: sole inflight callback task
 // -------------------------------------------------------------------------
 
 #[tokio::test]
 async fn fallback_defers_when_sole_inflight_callback() {
     let db = test_db().await;
-    // Create work item WITHOUT pr_url in metadata (pre-callback state)
+    // Create task WITHOUT pr_url in metadata (pre-callback state)
     let metadata = json!({});
-    let work_item_id = db
+    let task_id = db
         .create_task(NewTask {
             agent_id: AGENT_ID.to_string(),
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
-            label: "Work item without pr_url".to_string(),
+            label: "Task without pr_url".to_string(),
             trigger_type: trigger_type::MANUAL.to_string(),
             cron_expr: None,
             event_source: None,
@@ -404,32 +404,32 @@ async fn fallback_defers_when_sole_inflight_callback() {
             r#type: None,
         })
         .await
-        .expect("create work item");
+        .expect("create task");
 
-    db.update_manual_task_status(&work_item_id, "in_progress")
+    db.update_manual_task_status(&task_id, "in_progress")
         .await
         .expect("update status");
 
-    let _callback_id = create_callback_task(&db, &work_item_id).await;
+    let _callback_id = create_callback_task(&db, &task_id).await;
 
-    // Webhook for a PR that doesn't match by URL (no work item found by pr_url)
+    // Webhook for a PR that doesn't match by URL (no task found by pr_url)
     let text = pr_review_text("senara-solutions/mika", 999);
     let correlation = correlate_webhook(&text).expect("should correlate");
 
     let result = should_defer_webhook(&db, &correlation).await;
     assert!(
         result.is_some(),
-        "should defer via fallback when exactly one work item has active callback"
+        "should defer via fallback when exactly one task has active callback"
     );
     let (wi_id, _) = result.unwrap();
-    assert_eq!(wi_id, work_item_id);
+    assert_eq!(wi_id, task_id);
 }
 
 #[tokio::test]
 async fn fallback_does_not_defer_when_multiple_inflight() {
     let db = test_db().await;
-    // Create two work items, both with active callbacks
-    let wi1 = create_work_item(
+    // Create two tasks, both with active callbacks
+    let wi1 = create_task(
         &db,
         "https://github.com/senara-solutions/mika/pull/10",
         "feat/a",
@@ -437,7 +437,7 @@ async fn fallback_does_not_defer_when_multiple_inflight() {
     .await;
     let _cb1 = create_callback_task(&db, &wi1).await;
 
-    let wi2 = create_work_item(
+    let wi2 = create_task(
         &db,
         "https://github.com/senara-solutions/mika/pull/20",
         "feat/b",
@@ -452,7 +452,7 @@ async fn fallback_does_not_defer_when_multiple_inflight() {
     let result = should_defer_webhook(&db, &correlation).await;
     assert!(
         result.is_none(),
-        "should NOT defer via fallback when multiple work items have active callbacks (ambiguous)"
+        "should NOT defer via fallback when multiple tasks have active callbacks (ambiguous)"
     );
 }
 
@@ -464,8 +464,8 @@ async fn fallback_does_not_defer_when_multiple_inflight() {
 async fn webhook_not_deferred_after_callback_failed() {
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/42";
-    let work_item_id = create_work_item(&db, pr_url, "feat/test").await;
-    let callback_id = create_callback_task(&db, &work_item_id).await;
+    let task_id = create_task(&db, pr_url, "feat/test").await;
+    let callback_id = create_callback_task(&db, &task_id).await;
 
     // Mark callback as failed
     db.update_task_failed(&callback_id, "process crashed")

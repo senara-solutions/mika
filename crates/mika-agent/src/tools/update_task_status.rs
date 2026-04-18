@@ -46,38 +46,38 @@ fn allowed_transitions(from: &str) -> &'static [&'static str] {
 /// Maximum metadata JSON size (10 KB).
 const MAX_METADATA_LEN: usize = 10_240;
 
-pub struct UpdateWorkItemStatusTool;
+pub struct UpdateTaskStatusTool;
 
 #[async_trait]
-impl Tool for UpdateWorkItemStatusTool {
+impl Tool for UpdateTaskStatusTool {
     fn name(&self) -> &str {
-        "update_work_item_status"
+        "update_task_status"
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "update_work_item_status".to_string(),
-            description: "Update the status of a work item (manual task). \
-                Only works on manual work items, not system tasks (reminders, callbacks, etc.). \
+            name: "update_task_status".to_string(),
+            description: "Update the status of a task (manual task). \
+                Only works on manual tasks, not system tasks (reminders, callbacks, etc.). \
                 Transitions are validated: pending can go to any status; in_progress can go to \
                 blocked/completed/cancelled; blocked can go to in_progress/completed/cancelled. \
                 Completed and cancelled are terminal — status cannot be changed, but metadata \
                 can still be attached by passing the metadata field (the status field is ignored \
                 in that case and the call succeeds). \
                 Every transition is logged as an audit event. \
-                Optionally attach or merge structured metadata (JSON object) on the work item."
+                Optionally attach or merge structured metadata (JSON object) on the task."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "The UUID of the work item to update"
+                        "description": "The UUID of the task to update"
                     },
                     "status": {
                         "type": "string",
                         "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"],
-                        "description": "The new status for the work item"
+                        "description": "The new status for the task"
                     },
                     "note": {
                         "type": "string",
@@ -85,7 +85,7 @@ impl Tool for UpdateWorkItemStatusTool {
                     },
                     "metadata": {
                         "type": "object",
-                        "description": "Optional structured metadata to merge into the work item. \
+                        "description": "Optional structured metadata to merge into the task. \
                             Shallow-merged at the top level AND one level deep for object-valued fields \
                             (e.g. fields under `claude_pilot.*` from a prior callback are preserved when \
                             you write a new key under `claude_pilot`). Max 10 KB."
@@ -145,12 +145,12 @@ impl Tool for UpdateWorkItemStatusTool {
             }
         }
 
-        // Look up the work item to get the current status for transition validation
+        // Look up the task to get the current status for transition validation
         let task = match ctx.db.get_task(task_id).await? {
             Some(t) if t.trigger_type == "manual" => t,
             Some(_) | None => {
                 return Ok(ToolOutput::error(format!(
-                    "Work item '{task_id}' not found. Only manual (work item) tasks can be updated with this tool."
+                    "Task '{task_id}' not found. Only manual tasks can be updated with this tool."
                 )));
             }
         };
@@ -158,7 +158,7 @@ impl Tool for UpdateWorkItemStatusTool {
         let old_status = task.status.clone();
 
         // Phantom retry guard (#579): reject retry-semantic metadata writes when the
-        // work item has an active callback child task (i.e., a dispatch is still running).
+        // task has an active callback child task (i.e., a dispatch is still running).
         // This prevents the LLM from fabricating pipeline failures and polluting retry
         // budget before any callback has returned. Only fires when metadata contains
         // retry-related keys — non-retry metadata writes are unaffected.
@@ -197,8 +197,7 @@ impl Tool for UpdateWorkItemStatusTool {
             if let Some(new_meta) = metadata_input {
                 merge_and_persist_metadata(task_id, new_meta, ctx).await?;
             }
-            let mut response =
-                format!("Work item {task_id} is already '{status}'. No status change.");
+            let mut response = format!("Task {task_id} is already '{status}'. No status change.");
             if metadata_input.is_some() {
                 response.push_str(" Metadata updated.");
             }
@@ -223,7 +222,7 @@ impl Tool for UpdateWorkItemStatusTool {
                 }
                 return Ok(ToolOutput::error(format!(
                     "Cannot transition from '{old_status}' to '{status}'. \
-                     '{old_status}' is a terminal state — completed and cancelled work items cannot be changed."
+                     '{old_status}' is a terminal state — completed and cancelled tasks cannot be changed."
                 )));
             }
 
@@ -246,7 +245,7 @@ impl Tool for UpdateWorkItemStatusTool {
         ctx.db
             .log_audit_event(
                 ctx.session_id,
-                "update_work_item_status",
+                "update_task_status",
                 &format!("task:{task_id}"),
                 Some(&old_status),
                 Some(status),
@@ -255,7 +254,7 @@ impl Tool for UpdateWorkItemStatusTool {
             )
             .await?;
 
-        let mut response = format!("Work item {task_id}: {old_status} → {status}");
+        let mut response = format!("Task {task_id}: {old_status} → {status}");
         if let Some(n) = note {
             response.push_str(&format!("\nNote: {n}"));
         }
@@ -279,7 +278,7 @@ fn has_retry_semantic_keys(meta: &Value) -> bool {
     }
 }
 
-/// Shallow-merge `new_meta` into the work item's existing metadata and persist.
+/// Shallow-merge `new_meta` into the task's existing metadata and persist.
 async fn merge_and_persist_metadata(
     task_id: &str,
     new_meta: &Value,
@@ -288,7 +287,7 @@ async fn merge_and_persist_metadata(
     let merged = if let Ok(Some(task)) = ctx.db.get_task_unscoped(task_id).await {
         if let Some(existing_str) = &task.metadata {
             if let Ok(mut existing) = serde_json::from_str::<Value>(existing_str) {
-                crate::work_item_metadata::merge_metadata(&mut existing, new_meta);
+                crate::task_metadata::merge_metadata(&mut existing, new_meta);
                 existing
             } else {
                 new_meta.clone()
@@ -301,9 +300,7 @@ async fn merge_and_persist_metadata(
     };
 
     let merged_str = serde_json::to_string(&merged)?;
-    ctx.db
-        .update_work_item_metadata(task_id, &merged_str)
-        .await?;
+    ctx.db.update_task_metadata(task_id, &merged_str).await?;
     Ok(())
 }
 
@@ -314,7 +311,7 @@ mod tests {
     use crate::task_engine::types::{action_type, trigger_type};
     use crate::test_utils::test_helpers::TestHarness;
 
-    async fn create_work_item(harness: &TestHarness, label: &str) -> String {
+    async fn create_task(harness: &TestHarness, label: &str) -> String {
         harness
             .db
             .create_task(NewTask {
@@ -347,9 +344,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_basic() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Test work item").await;
+        let id = create_task(&harness, "Test task").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -365,9 +362,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_with_note() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Noted item").await;
+        let id = create_task(&harness, "Noted item").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -388,9 +385,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_same_status() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Same status").await;
+        let id = create_task(&harness, "Same status").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -407,7 +404,7 @@ mod tests {
     async fn test_update_status_invalid_uuid() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -424,7 +421,7 @@ mod tests {
     async fn test_update_status_invalid_status() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -441,7 +438,7 @@ mod tests {
     async fn test_update_status_not_found() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -488,7 +485,7 @@ mod tests {
             .await
             .unwrap();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -505,7 +502,7 @@ mod tests {
     async fn test_update_status_empty_fields() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(serde_json::json!({"status": "completed"}), &ctx)
@@ -528,9 +525,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_with_metadata() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Meta item").await;
+        let id = create_task(&harness, "Meta item").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -551,9 +548,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_metadata_merge() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Merge meta").await;
+        let id = create_task(&harness, "Merge meta").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -588,9 +585,9 @@ mod tests {
         // Issue #489: engine writes claude_pilot.{cost_usd,duration_ms,session_id,turns},
         // agent enriches with claude_pilot.{pr_url,branch} — all six fields must survive.
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "489 repro").await;
+        let id = create_task(&harness, "489 repro").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         // Turn 1: engine-injected claude_pilot fields
         let r1 = tool
@@ -655,9 +652,9 @@ mod tests {
     #[tokio::test]
     async fn test_metadata_top_level_keys_preserved_across_updates() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "top-level merge").await;
+        let id = create_task(&harness, "top-level merge").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         tool.execute(
             serde_json::json!({
@@ -690,9 +687,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_status_rejects_non_object_metadata() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Bad meta").await;
+        let id = create_task(&harness, "Bad meta").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -727,10 +724,10 @@ mod tests {
     async fn test_valid_forward_transitions() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         // pending → in_progress
-        let id = create_work_item(&harness, "Forward 1").await;
+        let id = create_task(&harness, "Forward 1").await;
         let result = tool
             .execute(
                 serde_json::json!({"task_id": id, "status": "in_progress"}),
@@ -773,7 +770,7 @@ mod tests {
         );
 
         // pending → completed (skip in_progress)
-        let id2 = create_work_item(&harness, "Forward 2").await;
+        let id2 = create_task(&harness, "Forward 2").await;
         let result = tool
             .execute(
                 serde_json::json!({"task_id": id2, "status": "completed"}),
@@ -788,7 +785,7 @@ mod tests {
         );
 
         // pending → cancelled
-        let id3 = create_work_item(&harness, "Forward 3").await;
+        let id3 = create_task(&harness, "Forward 3").await;
         let result = tool
             .execute(
                 serde_json::json!({"task_id": id3, "status": "cancelled"}),
@@ -807,9 +804,9 @@ mod tests {
     async fn test_blocked_to_in_progress_allowed() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
-        let id = create_work_item(&harness, "Unblock item").await;
+        let id = create_task(&harness, "Unblock item").await;
 
         // pending → blocked
         tool.execute(
@@ -839,9 +836,9 @@ mod tests {
     async fn test_rejected_backward_transition() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
-        let id = create_work_item(&harness, "No regress").await;
+        let id = create_task(&harness, "No regress").await;
 
         // pending → in_progress
         tool.execute(
@@ -872,10 +869,10 @@ mod tests {
     async fn test_terminal_state_cannot_transition() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         // Test completed → anything
-        let id = create_work_item(&harness, "Completed item").await;
+        let id = create_task(&harness, "Completed item").await;
         tool.execute(
             serde_json::json!({"task_id": id, "status": "completed"}),
             &ctx,
@@ -901,7 +898,7 @@ mod tests {
         }
 
         // Test cancelled → anything
-        let id2 = create_work_item(&harness, "Cancelled item").await;
+        let id2 = create_task(&harness, "Cancelled item").await;
         tool.execute(
             serde_json::json!({"task_id": id2, "status": "cancelled"}),
             &ctx,
@@ -933,9 +930,9 @@ mod tests {
     async fn test_terminal_metadata_fallback_completed_with_metadata() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
-        let id = create_work_item(&harness, "Completed with late metadata").await;
+        let id = create_task(&harness, "Completed with late metadata").await;
         tool.execute(
             serde_json::json!({"task_id": id, "status": "completed"}),
             &ctx,
@@ -987,9 +984,9 @@ mod tests {
     async fn test_terminal_metadata_fallback_cancelled_with_metadata() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
-        let id = create_work_item(&harness, "Cancelled with late metadata").await;
+        let id = create_task(&harness, "Cancelled with late metadata").await;
         tool.execute(
             serde_json::json!({"task_id": id, "status": "cancelled"}),
             &ctx,
@@ -1030,9 +1027,9 @@ mod tests {
     async fn test_terminal_metadata_fallback_merges_with_existing() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
-        let id = create_work_item(&harness, "Merge test").await;
+        let id = create_task(&harness, "Merge test").await;
 
         // Set initial metadata and complete
         tool.execute(
@@ -1075,9 +1072,9 @@ mod tests {
     async fn test_terminal_no_metadata_still_rejected() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
-        let id = create_work_item(&harness, "No metadata terminal").await;
+        let id = create_task(&harness, "No metadata terminal").await;
         tool.execute(
             serde_json::json!({"task_id": id, "status": "completed"}),
             &ctx,
@@ -1105,9 +1102,9 @@ mod tests {
     async fn test_non_terminal_invalid_transition_with_metadata_still_rejected() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
-        let id = create_work_item(&harness, "Non-terminal reject").await;
+        let id = create_task(&harness, "Non-terminal reject").await;
         tool.execute(
             serde_json::json!({"task_id": id, "status": "in_progress"}),
             &ctx,
@@ -1141,7 +1138,7 @@ mod tests {
 
     // -- Phantom retry guard tests (#579) --
 
-    /// Helper: create a callback child task for a work item.
+    /// Helper: create a callback child task for a task.
     async fn create_callback_child(harness: &TestHarness, parent_id: &str, status: &str) -> String {
         let child_id = harness
             .db
@@ -1184,9 +1181,9 @@ mod tests {
     #[tokio::test]
     async fn test_retry_metadata_succeeds_without_active_callback() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "No callback item").await;
+        let id = create_task(&harness, "No callback item").await;
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -1206,7 +1203,7 @@ mod tests {
     #[tokio::test]
     async fn test_non_retry_metadata_allowed_during_active_callback() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Active dispatch item").await;
+        let id = create_task(&harness, "Active dispatch item").await;
 
         // Transition to in_progress so we can add a callback child
         harness
@@ -1217,7 +1214,7 @@ mod tests {
         create_callback_child(&harness, &id, "pending").await;
 
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         // Non-retry metadata should succeed even with active callback
         let result = tool
@@ -1241,7 +1238,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_metadata_rejected_with_pending_callback() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Pending callback item").await;
+        let id = create_task(&harness, "Pending callback item").await;
 
         harness
             .db
@@ -1251,7 +1248,7 @@ mod tests {
         create_callback_child(&harness, &id, "pending").await;
 
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -1277,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_metadata_rejected_with_in_progress_callback() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "In-progress callback item").await;
+        let id = create_task(&harness, "In-progress callback item").await;
 
         harness
             .db
@@ -1287,7 +1284,7 @@ mod tests {
         create_callback_child(&harness, &id, "in_progress").await;
 
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         let result = tool
             .execute(
@@ -1311,7 +1308,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_variant_key_rejected_with_active_callback() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Variant key item").await;
+        let id = create_task(&harness, "Variant key item").await;
 
         harness
             .db
@@ -1321,7 +1318,7 @@ mod tests {
         create_callback_child(&harness, &id, "pending").await;
 
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         // "retry_attempt" also matches the retry-semantic check
         let result = tool
@@ -1350,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn test_status_only_update_allowed_during_active_callback() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Status only item").await;
+        let id = create_task(&harness, "Status only item").await;
 
         harness
             .db
@@ -1360,7 +1357,7 @@ mod tests {
         create_callback_child(&harness, &id, "pending").await;
 
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         // Status-only update (no metadata) should succeed
         let result = tool
@@ -1384,7 +1381,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_metadata_allowed_after_callback_completed() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Completed callback item").await;
+        let id = create_task(&harness, "Completed callback item").await;
 
         harness
             .db
@@ -1394,7 +1391,7 @@ mod tests {
         create_callback_child(&harness, &id, "completed").await;
 
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         // Callback is completed, so retry metadata should be allowed
         let result = tool
@@ -1418,7 +1415,7 @@ mod tests {
     #[tokio::test]
     async fn test_retry_metadata_rejected_on_same_status_path() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Same status retry item").await;
+        let id = create_task(&harness, "Same status retry item").await;
 
         harness
             .db
@@ -1428,7 +1425,7 @@ mod tests {
         create_callback_child(&harness, &id, "pending").await;
 
         let ctx = harness.ctx();
-        let tool = UpdateWorkItemStatusTool;
+        let tool = UpdateTaskStatusTool;
 
         // Same-status path with retry metadata should still be caught
         let result = tool

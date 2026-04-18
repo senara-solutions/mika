@@ -1,5 +1,5 @@
 ---
-title: "Callback turn work item context injection"
+title: "Callback turn task context injection"
 category: architecture-patterns
 date: 2026-03-29
 tags: [silent-agent, callback, task-health, work-items, SilentTrigger, prompt-context]
@@ -7,11 +7,11 @@ related_issues: [314]
 modules: [agent, prompt, db]
 ---
 
-# Callback turn work item context injection
+# Callback turn task context injection
 
 ## Problem
 
-Callback turns (`SilentTrigger::Callback`) received no context about active work items. The task health injection guard in `run_silent_inner()` was gated to `SilentTrigger::Heartbeat` only:
+Callback turns (`SilentTrigger::Callback`) received no context about active tasks. The task health injection guard in `run_silent_inner()` was gated to `SilentTrigger::Heartbeat` only:
 
 ```rust
 let (task_health, stored_preferences) = if matches!(&params.trigger, SilentTrigger::Heartbeat) {
@@ -21,11 +21,11 @@ let (task_health, stored_preferences) = if matches!(&params.trigger, SilentTrigg
 };
 ```
 
-After a long-running background task (e.g., a 10-minute claude-pilot run), the callback agent had zero awareness of in-flight work items. It relied entirely on conversation memory to correlate the callback result to the originating work item — unreliable after async gaps, especially for models without prompt caching.
+After a long-running background task (e.g., a 10-minute claude-pilot run), the callback agent had zero awareness of in-flight tasks. It relied entirely on conversation memory to correlate the callback result to the originating task — unreliable after async gaps, especially for models without prompt caching.
 
 ## Root cause
 
-The original task health injection (introduced for heartbeat monitoring) used a conservative guard that excluded all non-heartbeat triggers. This was intentional at the time — the solution doc (`task-health-awareness-heartbeat-injection.md`) prevention rule #2 explicitly said "Gate heartbeat-specific data to heartbeat triggers only." However, as the callback workflow matured (workflow-aware triggers, self-dev continuation, work item tracking), the need for work item context in callback turns became clear.
+The original task health injection (introduced for heartbeat monitoring) used a conservative guard that excluded all non-heartbeat triggers. This was intentional at the time — the solution doc (`task-health-awareness-heartbeat-injection.md`) prevention rule #2 explicitly said "Gate heartbeat-specific data to heartbeat triggers only." However, as the callback workflow matured (workflow-aware triggers, self-dev continuation, task tracking), the need for task context in callback turns became clear.
 
 ## Solution
 
@@ -46,7 +46,7 @@ let (task_health, stored_preferences) = if matches!(
 ```
 
 This gives callback turns:
-1. `<active-work-items>` — list of pending/in_progress/blocked manual work items
+1. `<active-work-items>` — list of pending/in_progress/blocked manual tasks
 2. `<task-health>` anomalies — stuck callbacks, failed recurring, stale blocked items
 3. `<stored-preferences>` — `task_policy_*` preferences for autonomous action
 
@@ -57,14 +57,14 @@ This gives callback turns:
 
 ### Safety properties preserved
 
-- Callback agents only get `default_tools()` (read-only work item tools: `list_work_items`, `check_work_item`)
+- Callback agents only get `default_tools()` (read-only task tools: `list_tasks`, `check_task`)
 - `is_callback_turn: true` prevents spawning new long-running tasks
 - `get_task_health_summary()` is a lightweight SQLite query using partial index `idx_tasks_manual_active`
 - `.ok()` on the query means DB failures degrade gracefully to `(None, vec[])`
 
 ### TUI path asymmetry
 
-The TUI callback path (`run_agent()` in `chat.rs`) uses the conversation prompt builder which has no `task_health` field. This asymmetry is intentional — TUI users have full conversation history context and can interactively query work items.
+The TUI callback path (`run_agent()` in `chat.rs`) uses the conversation prompt builder which has no `task_health` field. This asymmetry is intentional — TUI users have full conversation history context and can interactively query tasks.
 
 ## Prevention
 

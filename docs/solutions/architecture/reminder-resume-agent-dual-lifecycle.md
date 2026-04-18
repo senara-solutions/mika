@@ -56,7 +56,7 @@ if is_callback {
 
 Key design decisions:
 1. **New `SilentTrigger::Reminder` variant** — gives proper prompt framing ("A reminder you set has fired") without untrusted-framing tags
-2. **Task health injection** — `Reminder` is included in the `matches!()` guard alongside `Heartbeat` and `Callback` for work item awareness
+2. **Task health injection** — `Reminder` is included in the `matches!()` guard alongside `Heartbeat` and `Callback` for task awareness
 3. **Schema v18 migration** — widened `idx_tasks_unique_reminder` to cover both `send_message` and `resume_agent` action types (excluding `callback` trigger type to avoid blocking callback task creation)
 
 ## Prevention

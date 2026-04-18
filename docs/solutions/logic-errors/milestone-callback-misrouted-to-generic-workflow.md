@@ -7,7 +7,7 @@ problem_type: logic_error
 component: tooling
 symptoms:
   - "Callback turn after claude-pilot child completion dispatches new work instead of resuming milestone loop"
-  - "Orphan work items created outside the milestone tree during milestone execution"
+  - "Orphan tasks created outside the milestone tree during milestone execution"
   - "Milestone loop never advances past child #1"
 root_cause: missing_workflow_step
 resolution_type: documentation_update
@@ -21,14 +21,14 @@ tags: [milestone, callback, routing, self-dev, prompt-engineering, parent-task-i
 
 During the first milestone dispatch (mika#6), claude-pilot completed child #1 (mika#582). The callback arrived as a `SilentTrigger::Callback` turn containing "mika#582" as an issue reference. mika-dev's LLM pattern-matched this to the Generic Workflow ("implement mika#582") instead of following the Callback Entry Point back to Step M4 (serial execution loop). The milestone loop never advanced to child #2.
 
-Separately, all 3 child work items were created without `parent_task_id` because the agent follows JSON examples literally, and Step M3 used bullet-list format without an explicit JSON code block.
+Separately, all 3 child tasks were created without `parent_task_id` because the agent follows JSON examples literally, and Step M3 used bullet-list format without an explicit JSON code block.
 
 ## Symptoms
 
-- Callback turn created an orphan work item for "mika#582" outside the milestone tree
+- Callback turn created an orphan task for "mika#582" outside the milestone tree
 - Agent dispatched `run_claude_pilot` 4 times for the same child issue
-- Milestone parent work item was never updated past child #1
-- `check_work_item` on children showed no `parent_task_id` set
+- Milestone parent task was never updated past child #1
+- `check_task` on children showed no `parent_task_id` set
 
 ## What Didn't Work
 
@@ -43,15 +43,15 @@ Two prompt changes to `skills/bundled/self-dev/system_prompt.md`:
 
 Added a mandatory check block before the success/failure/pipeline-failure handlers:
 
-1. Call `check_work_item(task_id)` on the callback's work item to get `parent_task_id`
-2. If `parent_task_id` exists, call `check_work_item(parent_task_id)` on the parent
+1. Call `check_task(task_id)` on the callback's task to get `parent_task_id`
+2. If `parent_task_id` exists, call `check_task(parent_task_id)` on the parent
 3. If parent's `type` is `'milestone'` or `'project'`, route to Step M4/P4 after completing the success/failure handling
 
 Key detail: the routing to M4/P4 only happens when the child reaches a **terminal state** (completed, blocked, failed after retries exhausted). Non-terminal paths (e.g., pipeline-failure retry) follow their existing "wait for callback" flow — the next callback re-enters the context check.
 
 Negative instructions prevent the LLM from misinterpreting the callback's issue reference as a new dispatch trigger.
 
-### 2. JSON code blocks for create_work_item in Step M3 and Step P3
+### 2. JSON code blocks for create_task in Step M3 and Step P3
 
 Replaced bullet-list format with explicit JSON examples showing all fields including `parent_task_id`:
 

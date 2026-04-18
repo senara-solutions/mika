@@ -372,7 +372,7 @@ impl TaskDispatcher {
         }
 
         // Best-effort: extract structured metadata from the callback result text
-        // and persist it to the parent work item BEFORE the silent agent runs.
+        // and persist it to the parent task BEFORE the silent agent runs.
         // This guarantees at minimum session_id, cost_usd, duration_ms, and turns
         // are captured even if the agent exhausts its step budget.
         if is_callback {
@@ -803,7 +803,7 @@ impl TaskDispatcher {
     }
 }
 
-/// Extract metadata from callback result text and persist to parent work item.
+/// Extract metadata from callback result text and persist to parent task.
 ///
 /// This is a best-effort, fire-and-forget operation. Failures are logged
 /// but do not block the callback dispatch. Runs BEFORE the silent agent
@@ -816,7 +816,7 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
         None => return,
     };
 
-    // 2. Verify parent is a manual work item
+    // 2. Verify parent is a manual task
     let parent = match db.get_task_unscoped(&parent_id).await {
         Ok(Some(t)) if t.trigger_type == "manual" => t,
         _ => return,
@@ -835,11 +835,11 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
 
     // 4. Two-level shallow merge with existing metadata (see issue #489).
     //    Shared helper guarantees identical semantics with the agent-facing
-    //    update_work_item_status tool.
+    //    update_task_status tool.
     let merged = match &parent.metadata {
         Some(existing) => {
             if let Ok(mut base) = serde_json::from_str::<serde_json::Value>(existing) {
-                crate::work_item_metadata::merge_metadata(&mut base, &extracted);
+                crate::task_metadata::merge_metadata(&mut base, &extracted);
                 base
             } else {
                 extracted
@@ -850,17 +850,17 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
 
     // 5. Persist
     match db
-        .update_work_item_metadata(&parent_id, &merged.to_string())
+        .update_task_metadata(&parent_id, &merged.to_string())
         .await
     {
         Ok(true) => info!(
             parent_task_id = %parent_id,
             callback_task_id = %task.id,
-            "engine: persisted callback metadata to work item"
+            "engine: persisted callback metadata to task"
         ),
         Ok(false) => warn!(
             parent_task_id = %parent_id,
-            "engine: parent work item not found for metadata write"
+            "engine: parent task not found for metadata write"
         ),
         Err(e) => warn!(
             parent_task_id = %parent_id,
@@ -1233,7 +1233,7 @@ mod tests {
     async fn test_try_extract_callback_metadata_writes_to_parent() {
         let db = test_db();
 
-        // Create a manual work item (parent)
+        // Create a manual task (parent)
         let parent = NewTask {
             agent_id: "mika".to_string(),
             team_run_id: None,
@@ -1318,7 +1318,7 @@ mod tests {
     async fn test_try_extract_callback_metadata_merges_with_existing() {
         let db = test_db();
 
-        // Create a manual work item with existing metadata
+        // Create a manual task with existing metadata
         let parent = NewTask {
             agent_id: "mika".to_string(),
             team_run_id: None,

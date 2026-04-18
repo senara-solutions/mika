@@ -1,26 +1,26 @@
 //! Integration tests: phantom retry guard (#579).
 //!
-//! Verifies that the agent loop's `update_work_item_status` tool rejects
-//! retry-semantic metadata writes when the work item has an active callback
+//! Verifies that the agent loop's `update_task_status` tool rejects
+//! retry-semantic metadata writes when the task has an active callback
 //! child task (i.e., a dispatch is still running).
 
 use mika_agent::db::NewTask;
-use mika_agent::tools::{default_tools, update_work_item_status::UpdateWorkItemStatusTool};
+use mika_agent::tools::{default_tools, update_task_status::UpdateTaskStatusTool};
 use mika_common::llm::mock::*;
 use serde_json::json;
 
 use super::assertions::*;
 use super::harness::EvalHarness;
 
-/// Build a tool registry that includes `update_work_item_status`.
-fn tools_with_update_work_item_status() -> mika_agent::tools::ToolRegistry {
+/// Build a tool registry that includes `update_task_status`.
+fn tools_with_update_task_status() -> mika_agent::tools::ToolRegistry {
     let mut tools = default_tools();
-    tools.register(Box::new(UpdateWorkItemStatusTool));
+    tools.register(Box::new(UpdateTaskStatusTool));
     tools
 }
 
-/// Helper: insert a manual work item and return its ID.
-async fn seed_work_item(harness: &EvalHarness, label: &str) -> String {
+/// Helper: insert a manual task and return its ID.
+async fn seed_task(harness: &EvalHarness, label: &str) -> String {
     harness
         .db
         .create_task(NewTask {
@@ -50,7 +50,7 @@ async fn seed_work_item(harness: &EvalHarness, label: &str) -> String {
         .unwrap()
 }
 
-/// Helper: create a callback child task for a work item.
+/// Helper: create a callback child task for a task.
 async fn create_callback_child(harness: &EvalHarness, parent_id: &str, status: &str) -> String {
     let child_id = harness
         .db
@@ -91,11 +91,11 @@ async fn create_callback_child(harness: &EvalHarness, parent_id: &str, status: &
 }
 
 /// Guard rejects retry metadata when active callback child exists.
-/// Simulates the phantom retry: LLM calls update_work_item_status with
+/// Simulates the phantom retry: LLM calls update_task_status with
 /// pipeline_retry_count while a dispatch is still running.
 #[tokio::test]
 async fn phantom_retry_rejected_during_active_dispatch() {
-    // We need to know the work item ID for the mock response, but the ID is
+    // We need to know the task ID for the mock response, but the ID is
     // generated at DB insert time. Use a placeholder UUID — the mock response
     // includes the task_id in the tool call, but we need the real ID from the DB.
     // Solution: build harness first, seed data, then use mock_provider's
@@ -106,31 +106,31 @@ async fn phantom_retry_rejected_during_active_dispatch() {
         .responses(vec![
             // Placeholder — will be consumed by the agent loop
             tool_call_response(
-                "update_work_item_status",
+                "update_task_status",
                 json!({"task_id": "placeholder", "status": "in_progress", "metadata": {"pipeline_retry_count": 1}}),
             ),
             text_response("The dispatch is still running. I'll wait for the callback."),
         ])
-        .tools(tools_with_update_work_item_status())
+        .tools(tools_with_update_task_status())
         .build()
         .await
         .unwrap();
 
-    // Seed the work item and active callback in THIS harness's DB
-    let work_item_id = seed_work_item(&harness, "Implement feature #334").await;
+    // Seed the task and active callback in THIS harness's DB
+    let task_id = seed_task(&harness, "Implement feature #334").await;
     harness
         .db
-        .update_manual_task_status(&work_item_id, "in_progress")
+        .update_manual_task_status(&task_id, "in_progress")
         .await
         .unwrap();
-    create_callback_child(&harness, &work_item_id, "pending").await;
+    create_callback_child(&harness, &task_id, "pending").await;
 
-    // Replace the mock responses with ones that use the real work item ID
+    // Replace the mock responses with ones that use the real task ID
     harness.mock_provider.clear_and_set(vec![
         tool_call_response(
-            "update_work_item_status",
+            "update_task_status",
             json!({
-                "task_id": &work_item_id,
+                "task_id": &task_id,
                 "status": "in_progress",
                 "metadata": {"pipeline_retry_count": 1}
             }),
@@ -145,10 +145,10 @@ async fn phantom_retry_rejected_during_active_dispatch() {
 
     assert_has_output(&trace);
     // Tool was called and returned the guard's error
-    assert_tools_include(&trace, &["update_work_item_status"]);
+    assert_tools_include(&trace, &["update_task_status"]);
     assert_tool_output_contains(
         &trace,
-        "update_work_item_status",
+        "update_task_status",
         0,
         "retry_metadata_rejected_active_dispatch",
     );
@@ -161,31 +161,31 @@ async fn retry_metadata_allowed_after_callback_completes() {
         .responses(vec![
             // Placeholder
             tool_call_response(
-                "update_work_item_status",
+                "update_task_status",
                 json!({"task_id": "placeholder", "status": "in_progress", "metadata": {"pipeline_retry_count": 1}}),
             ),
             text_response("Retry count updated. Launching retry."),
         ])
-        .tools(tools_with_update_work_item_status())
+        .tools(tools_with_update_task_status())
         .build()
         .await
         .unwrap();
 
     // Seed with completed callback child
-    let work_item_id = seed_work_item(&harness, "Implement feature #335").await;
+    let task_id = seed_task(&harness, "Implement feature #335").await;
     harness
         .db
-        .update_manual_task_status(&work_item_id, "in_progress")
+        .update_manual_task_status(&task_id, "in_progress")
         .await
         .unwrap();
-    create_callback_child(&harness, &work_item_id, "completed").await;
+    create_callback_child(&harness, &task_id, "completed").await;
 
     // Replace with real IDs
     harness.mock_provider.clear_and_set(vec![
         tool_call_response(
-            "update_work_item_status",
+            "update_task_status",
             json!({
-                "task_id": &work_item_id,
+                "task_id": &task_id,
                 "status": "in_progress",
                 "metadata": {"pipeline_retry_count": 1}
             }),
@@ -199,7 +199,7 @@ async fn retry_metadata_allowed_after_callback_completes() {
         .unwrap();
 
     assert_has_output(&trace);
-    assert_tools_include(&trace, &["update_work_item_status"]);
+    assert_tools_include(&trace, &["update_task_status"]);
     // The tool should NOT have returned the guard's error
     assert_output_contains(&trace, "Retry count updated");
 }

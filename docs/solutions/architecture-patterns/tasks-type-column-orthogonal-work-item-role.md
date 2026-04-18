@@ -15,9 +15,9 @@ tags:
   - raw-identifier
   - dedup-semantics
 related_components:
-  - crates/mika-agent/src/tools/create_work_item.rs
-  - crates/mika-agent/src/tools/list_work_items.rs
-  - crates/mika-agent/src/tools/check_work_item.rs
+  - crates/mika-agent/src/tools/create_task.rs
+  - crates/mika-agent/src/tools/list_tasks.rs
+  - crates/mika-agent/src/tools/check_task.rs
   - crates/mika-agent/src/server/dashboard.rs
 applies_when:
   - Adding a new categorical column to a widely-consumed SQLite table
@@ -44,7 +44,7 @@ When introducing a new categorical column to the `tasks` table — or any widely
 A `type` column on the existing `tasks` row is cheaper than a sibling `milestones` table:
 
 - Children reuse the existing `parent_task_id` FK — no new edges to maintain.
-- Every existing query (`list_work_items`, `check_work_item`, dedup helpers, dashboard DTOs) continues to work — additive change.
+- Every existing query (`list_tasks`, `check_task`, dedup helpers, dashboard DTOs) continues to work — additive change.
 - The agent loop's `validate_dispatch_readiness` stays type-agnostic. Dispatch readiness remains a function of `status` alone.
 - Non-manual tasks (callback, recurring, a2a) receive `type='issue'` automatically via the SQL `DEFAULT`, and it stays inert for them — zero cost.
 
@@ -178,14 +178,14 @@ Do **not** apply when:
 ### Tool response formatting: hide the default, show non-defaults
 
 ```rust
-// list_work_items: append type only when it differs from the default
+// list_tasks: append type only when it differs from the default
 let type_segment = if task.r#type != "issue" {
     format!(" type:{}", task.r#type)
 } else {
     String::new()
 };
 
-// check_work_item: always show type (single-item inspection benefits from explicitness)
+// check_task: always show type (single-item inspection benefits from explicitness)
 writeln!(output, "Type: {}", task.r#type)?;
 ```
 

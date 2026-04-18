@@ -167,21 +167,21 @@ async fn fetch_github_issue_status(
     Ok(format!("GitHub Issue Status:\n  State: {display_state}"))
 }
 
-pub struct CheckWorkItemTool;
+pub struct CheckTaskTool;
 
 #[async_trait]
-impl Tool for CheckWorkItemTool {
+impl Tool for CheckTaskTool {
     fn name(&self) -> &str {
-        "check_work_item"
+        "check_task"
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "check_work_item".to_string(),
-            description: "Read work item details and check the status of any linked GitHub PR or issue. \
-                Returns the work item's current status, metadata, timestamps, and — if the reference_url \
+            name: "check_task".to_string(),
+            description: "Read task details and check the status of any linked GitHub PR or issue. \
+                Returns the task's current status, metadata, timestamps, and — if the reference_url \
                 points to a GitHub PR or issue — fetches the current state from the GitHub API. \
-                Use this when the user asks about a work item's progress or wants to verify PR status \
+                Use this when the user asks about a task's progress or wants to verify PR status \
                 before deciding on a status change."
                 .to_string(),
             input_schema: serde_json::json!({
@@ -189,7 +189,7 @@ impl Tool for CheckWorkItemTool {
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "The UUID of the work item to check"
+                        "description": "The UUID of the task to check"
                     }
                 },
                 "required": ["task_id"]
@@ -207,19 +207,19 @@ impl Tool for CheckWorkItemTool {
             return Ok(e);
         }
 
-        // Look up the work item (manual tasks only, agent-scoped)
+        // Look up the task (manual tasks only, agent-scoped)
         let task = match ctx.db.get_manual_task(task_id).await? {
             Some(t) => t,
             None => {
                 return Ok(ToolOutput::error(format!(
-                    "Work item '{task_id}' not found. Only manual (work item) tasks can be checked with this tool."
+                    "Task '{task_id}' not found. Only manual tasks can be checked with this tool."
                 )));
             }
         };
 
         // Build the base output
         let mut output = String::new();
-        writeln!(output, "Work item: {}", task.id).unwrap();
+        writeln!(output, "Task: {}", task.id).unwrap();
         writeln!(output, "Label: {}", task.label).unwrap();
         writeln!(output, "Status: {}", task.status).unwrap();
         // Always emit Type for single-item inspection — disambiguates milestone
@@ -321,7 +321,7 @@ mod tests {
     use crate::task_engine::types::{action_type, trigger_type};
     use crate::test_utils::test_helpers::TestHarness;
 
-    async fn create_work_item(
+    async fn create_test_task(
         harness: &TestHarness,
         label: &str,
         reference_url: Option<&str>,
@@ -359,16 +359,16 @@ mod tests {
     #[tokio::test]
     async fn test_check_basic() {
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "Test work item", None, Some("user_request")).await;
+        let id = create_test_task(&harness, "Test task", None, Some("user_request")).await;
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"task_id": id}), &ctx)
             .await
             .unwrap();
         assert!(!result.is_error, "got error: {}", result.content);
-        assert!(result.content.contains("Test work item"));
+        assert!(result.content.contains("Test task"));
         assert!(result.content.contains("Status: pending"));
         assert!(result.content.contains("Source: user_request"));
     }
@@ -376,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_with_reference_url() {
         let harness = TestHarness::new();
-        let id = create_work_item(
+        let id = create_test_task(
             &harness,
             "PR task",
             Some("https://github.com/org/repo/pull/42"),
@@ -384,7 +384,7 @@ mod tests {
         )
         .await;
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"task_id": id}), &ctx)
@@ -407,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_non_github_url() {
         let harness = TestHarness::new();
-        let id = create_work_item(
+        let id = create_test_task(
             &harness,
             "External task",
             Some("https://jira.example.com/browse/PROJ-123"),
@@ -415,7 +415,7 @@ mod tests {
         )
         .await;
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"task_id": id}), &ctx)
@@ -429,7 +429,7 @@ mod tests {
     async fn test_check_not_found() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(
@@ -446,7 +446,7 @@ mod tests {
     async fn test_check_invalid_uuid() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"task_id": "not-a-uuid"}), &ctx)
@@ -460,7 +460,7 @@ mod tests {
     async fn test_check_empty_task_id() {
         let harness = TestHarness::new();
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(result.is_error);
@@ -470,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_with_children() {
         let harness = TestHarness::new();
-        let parent_id = create_work_item(&harness, "Parent item", None, Some("user_request")).await;
+        let parent_id = create_test_task(&harness, "Parent item", None, Some("user_request")).await;
 
         // Create two child tasks
         for label in &["Child 1", "Child 2"] {
@@ -504,7 +504,7 @@ mod tests {
         }
 
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"task_id": parent_id}), &ctx)
@@ -612,8 +612,8 @@ mod tests {
 
     // ===== `type` rendering tests (issue #595) =====
 
-    /// Helper: create a manual task with an explicit type override.
-    async fn create_typed_work_item(harness: &TestHarness, label: &str, task_type: &str) -> String {
+    /// Helper: create a manual test task with an explicit type override.
+    async fn create_typed_test_task(harness: &TestHarness, label: &str, task_type: &str) -> String {
         harness
             .db
             .create_task(NewTask {
@@ -647,9 +647,9 @@ mod tests {
     async fn test_check_shows_default_type() {
         // Single-item inspection always shows Type, even for the default.
         let harness = TestHarness::new();
-        let id = create_work_item(&harness, "default issue", None, Some("user_request")).await;
+        let id = create_test_task(&harness, "default issue", None, Some("user_request")).await;
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"task_id": id}), &ctx)
@@ -666,9 +666,9 @@ mod tests {
     #[tokio::test]
     async fn test_check_shows_milestone_type() {
         let harness = TestHarness::new();
-        let id = create_typed_work_item(&harness, "milestone parent", "milestone").await;
+        let id = create_typed_test_task(&harness, "milestone parent", "milestone").await;
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"task_id": id}), &ctx)
@@ -685,9 +685,9 @@ mod tests {
     #[tokio::test]
     async fn test_check_shows_project_type() {
         let harness = TestHarness::new();
-        let id = create_typed_work_item(&harness, "project parent", "project").await;
+        let id = create_typed_test_task(&harness, "project parent", "project").await;
         let ctx = harness.ctx();
-        let tool = CheckWorkItemTool;
+        let tool = CheckTaskTool;
 
         let result = tool
             .execute(serde_json::json!({"task_id": id}), &ctx)

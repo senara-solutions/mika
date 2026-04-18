@@ -1,10 +1,10 @@
 //! Integration tests for the structural PR review verdict handler (#524).
 //!
 //! These tests exercise `try_handle_pr_review_verdict` with a real AsyncDatabase
-//! to verify work item lookups, metadata updates, and audit event logging.
+//! to verify task lookups, metadata updates, and audit event logging.
 //! The `gh` subprocess calls (run_gh_checks, run_gh_merge) are NOT called because
 //! these tests use scenarios that short-circuit before reaching the merge path
-//! (no matching work item, wrong status, block verdict, etc.).
+//! (no matching task, wrong status, block verdict, etc.).
 
 use anyhow::Result;
 use serde_json::json;
@@ -27,8 +27,8 @@ async fn test_db() -> AsyncDatabase {
     AsyncDatabase::new(db)
 }
 
-/// Helper to create a work item with PR URL in metadata.
-async fn create_work_item_with_pr_url(db: &AsyncDatabase, pr_url: &str) -> String {
+/// Helper to create a task with PR URL in metadata.
+async fn create_task_with_pr_url(db: &AsyncDatabase, pr_url: &str) -> String {
     let metadata = json!({
         "claude_pilot": {
             "pr_url": pr_url,
@@ -42,7 +42,7 @@ async fn create_work_item_with_pr_url(db: &AsyncDatabase, pr_url: &str) -> Strin
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
-            label: format!("Test work item for {pr_url}"),
+            label: format!("Test task for {pr_url}"),
             trigger_type: trigger_type::MANUAL.to_string(),
             cron_expr: None,
             event_source: None,
@@ -202,11 +202,11 @@ async fn non_pr_review_event_passes_through() -> Result<()> {
 }
 
 // -------------------------------------------------------------------------
-// Test: pass verdict but no matching work item -> Passthrough
+// Test: pass verdict but no matching task -> Passthrough
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn verdict_pass_no_work_item_passes_through() -> Result<()> {
+async fn verdict_pass_no_task_passes_through() -> Result<()> {
     let db = test_db().await;
     let text = pr_review_text(
         "approved",
@@ -224,25 +224,25 @@ async fn verdict_pass_no_work_item_passes_through() -> Result<()> {
         VerdictAction::Passthrough { enrichment } => {
             assert!(
                 enrichment.is_none(),
-                "pass with no work item should pass through cleanly"
+                "pass with no task should pass through cleanly"
             );
         }
         VerdictAction::Handled { .. } => {
-            panic!("pass with no work item should not be handled");
+            panic!("pass with no task should not be handled");
         }
     }
     Ok(())
 }
 
 // -------------------------------------------------------------------------
-// Test: pass verdict with work item in completed status -> Passthrough (R5)
+// Test: pass verdict with task in completed status -> Passthrough (R5)
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn verdict_pass_completed_work_item_passes_through() -> Result<()> {
+async fn verdict_pass_completed_task_passes_through() -> Result<()> {
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/42";
-    let task_id = create_work_item_with_pr_url(&db, pr_url).await;
+    let task_id = create_task_with_pr_url(&db, pr_url).await;
 
     // Transition to completed (terminal)
     db.update_manual_task_status(&task_id, "completed")
@@ -265,22 +265,22 @@ async fn verdict_pass_completed_work_item_passes_through() -> Result<()> {
         VerdictAction::Passthrough { enrichment } => {
             assert!(
                 enrichment.is_none(),
-                "pass with completed work item should pass through cleanly"
+                "pass with completed task should pass through cleanly"
             );
         }
         VerdictAction::Handled { .. } => {
-            panic!("pass with completed work item should not be handled");
+            panic!("pass with completed task should not be handled");
         }
     }
     Ok(())
 }
 
 // -------------------------------------------------------------------------
-// Test: pass verdict with work item in pending status -> Passthrough (R5)
+// Test: pass verdict with task in pending status -> Passthrough (R5)
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn verdict_pass_pending_work_item_passes_through() -> Result<()> {
+async fn verdict_pass_pending_task_passes_through() -> Result<()> {
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/50";
 
@@ -296,7 +296,7 @@ async fn verdict_pass_pending_work_item_passes_through() -> Result<()> {
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
-            label: "Pending work item".to_string(),
+            label: "Pending task".to_string(),
             trigger_type: trigger_type::MANUAL.to_string(),
             cron_expr: None,
             event_source: None,
@@ -336,11 +336,11 @@ async fn verdict_pass_pending_work_item_passes_through() -> Result<()> {
         VerdictAction::Passthrough { enrichment } => {
             assert!(
                 enrichment.is_none(),
-                "pass with pending work item should pass through cleanly"
+                "pass with pending task should pass through cleanly"
             );
         }
         VerdictAction::Handled { .. } => {
-            panic!("pass with pending work item should not be handled");
+            panic!("pass with pending task should not be handled");
         }
     }
     Ok(())
@@ -354,7 +354,7 @@ async fn verdict_pass_pending_work_item_passes_through() -> Result<()> {
 async fn verdict_pass_no_github_token_passes_through() -> Result<()> {
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/42";
-    let _task_id = create_work_item_with_pr_url(&db, pr_url).await;
+    let _task_id = create_task_with_pr_url(&db, pr_url).await;
 
     let text = pr_review_text(
         "approved",

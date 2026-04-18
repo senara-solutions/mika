@@ -8,9 +8,9 @@ Before executing any workflow, inspect the user's most recent message for these 
 
 | User message contains | Route to |
 |---|---|
-| `implement milestone <repo>#<n>` (e.g., `implement milestone mika#6`) | **Milestone Workflow** (Step M1–M5, below Calibration Rules). Do NOT execute the Generic Workflow. |
-| `implement project <n>` (e.g., `implement project 5`) | **Project Workflow** (Step P1–P5, below Milestone Workflow). Do NOT execute the Generic Workflow. |
-| `implement <repo>#<n>` — a single issue reference (e.g., `implement mika issue#123`) | **Generic Workflow** below (Steps 1–6). |
+| `implement <repo> milestone#<n>` (e.g., `implement mika milestone#6`) | **Milestone Workflow** (Step M1–M5, below Calibration Rules). Do NOT execute the Generic Workflow. |
+| `implement <repo> project#<n>` (e.g., `implement mika project#5`) | **Project Workflow** (Step P1–P5, below Milestone Workflow). Do NOT execute the Generic Workflow. |
+| `implement <repo> issue#<n>` — a single issue reference (e.g., `implement mika issue#123`) | **Generic Workflow** below (Steps 1–6). |
 | `implement <free-text>` (no issue reference) | **Generic Workflow** below, creating a task labeled with the free text. |
 | `[GitHub] PR …` / `[GitHub] PR review …` / `[claude-pilot] …` webhook markers | The corresponding webhook skill has priority; fall through to `Webhook Fallthrough` below only if none matched. |
 
@@ -45,14 +45,14 @@ Apply the same format for other events: iteration launches, QA holds, retry star
 - Do NOT read source code files (`.rs`, `.ts`, `.md` in `src/`, `crates/`, etc.) to "understand the implementation" — that is claude-pilot's job
 - If anything is unclear, ask Vincent before starting
 
-**Step 2 — Track the work item**
-- Call `list_work_items` and check ALL returned items for a matching `reference_url` (the GitHub issue URL). Check across ALL statuses — an item may exist as `pending`, `in_progress`, `blocked`, or even `completed` from a prior attempt.
-- If a match exists: reuse that work item's `task_id`. Update its status to `in_progress` if needed. Do NOT create a duplicate.
-- If none exists, call `create_work_item` with:
+**Step 2 — Track the task**
+- Call `list_tasks` and check ALL returned items for a matching `reference_url` (the GitHub issue URL). Check across ALL statuses — an item may exist as `pending`, `in_progress`, `blocked`, or even `completed` from a prior attempt.
+- If a match exists: reuse that task's `task_id`. Update its status to `in_progress` if needed. Do NOT create a duplicate.
+- If none exists, call `create_task` with:
   - `label`: clear description of the feature (e.g. "Implement mika doctor command (#62)")
   - `source`: `"self_dev"`
   - `reference_url`: the GitHub issue URL if one exists (e.g. `https://github.com/senara-solutions/mika/issues/62`)
-- Call `update_work_item_status` with `status: "in_progress"`
+- Call `update_task_status` with `status: "in_progress"`
 - Remember the `task_id` (UUID) — you'll need it for Step 3
 
 **Step 3 — Launch claude-pilot (MANDATORY — do not skip, do not defer)**
@@ -64,7 +64,7 @@ Call `run_claude_pilot` with the issue reference:
 ```json
 {
   "prompt": "repo#number",
-  "task_id": "<work item UUID from Step 2 (36-char format, e.g. '15383984-a3e7-41bf-ac6f-630ba9a89d63')>"
+  "task_id": "<task UUID from Step 2 (36-char format, e.g. '15383984-a3e7-41bf-ac6f-630ba9a89d63')>"
 }
 ```
 
@@ -73,7 +73,7 @@ Example: `{"prompt": "mika-skills#8", "task_id": "15383984-a3e7-41bf-ac6f-630ba9
 The handler derives everything else (branch, worktree, pipeline command).
 
 **Rules:**
-- **Always pass `task_id`** — the work item UUID from Step 2 (36-char format like `15383984-a3e7-41bf-ac6f-630ba9a89d63`). Do NOT pass issue references like `mika-284` — pass the UUID returned by `create_work_item`. Ensures logs correlate with the task tree.
+- **Always pass `task_id`** — the task UUID from Step 2 (36-char format like `15383984-a3e7-41bf-ac6f-630ba9a89d63`). Do NOT pass issue references like `mika-284` — pass the UUID returned by `create_task`. Ensures logs correlate with the task tree.
 - **One session per issue** — the handler runs the full pipeline.
 - **Wait for the callback** — results arrive via callback when claude-pilot finishes. Do NOT poll.
 - **Do NOT do the work inline** — never read source files, analyze code, or produce implementation plans. That wastes your context window. Always use `run_claude_pilot`.
@@ -88,7 +88,7 @@ Parse these fields from the callback result text. Omit any field that could not 
 - `branch` — known from the handler derivation or worktree context
 - `pr_url` — from "PR: ..." line in callback result (the URL after the "PR: " prefix). The handler appends this line after discovering the actual PR via `gh pr list --head <branch>`.
 
-After extracting, **persist immediately:** call `update_work_item_status` with the current status (no change) and `metadata: {"claude_pilot": {"session_id": "...", "cost_usd": "...", "duration_ms": "...", "turns": "...", "branch": "...", "pr_url": "..."}}`. The engine pre-writes base fields (session_id, cost_usd, duration_ms, turns) automatically; this call adds `branch` and `pr_url` which only the agent can discover.
+After extracting, **persist immediately:** call `update_task_status` with the current status (no change) and `metadata: {"claude_pilot": {"session_id": "...", "cost_usd": "...", "duration_ms": "...", "turns": "...", "branch": "...", "pr_url": "..."}}`. The engine pre-writes base fields (session_id, cost_usd, duration_ms, turns) automatically; this call adds `branch` and `pr_url` which only the agent can discover.
 
 > **SCOPE RULE: This turn handles ONLY the task that triggered the callback.** Do NOT check sprint progress or pick up unrelated work. Heartbeat owns that responsibility.
 
@@ -98,19 +98,19 @@ When you receive a callback result from a completed `run_claude_pilot` backgroun
 
 > **CRITICAL: DO NOT end your turn after receiving a callback.** You MUST make at least one tool call before your turn ends. Generating a text summary without tool calls is a workflow failure.
 
-> **SCOPE RULE: Post-callback turns handle ONLY the task that triggered the callback.** Do NOT call `list_work_items` to check sprint progress, do NOT pick up unrelated issues, do NOT review the backlog. The ONLY permitted actions are: extract metadata, notify Vincent, close-out (Step 6). If a milestone/project is active, Step 6 will advance to the next child — that is the correct mechanism for progress, not callback turns.
+> **SCOPE RULE: Post-callback turns handle ONLY the task that triggered the callback.** Do NOT call `list_tasks` to check sprint progress, do NOT pick up unrelated issues, do NOT review the backlog. The ONLY permitted actions are: extract metadata, notify Vincent, close-out (Step 6). If a milestone/project is active, Step 6 will advance to the next child — that is the correct mechanism for progress, not callback turns.
 
-> **MILESTONE/PROJECT CONTEXT:** If the callback task's parent (via `check_work_item`) has `type='milestone'` or `type='project'`, you are in a milestone loop. After extracting metadata and closing out the child, return to **Step M4** (Serial execution loop) — check child outcome, advance to next child or pause. Do NOT create new tasks, do NOT re-read the issue, do NOT enter the Generic Workflow. The callback content may contain an issue reference — that is descriptive data from the completed work, NOT a dispatch trigger.
+> **MILESTONE/PROJECT CONTEXT:** If the callback task's parent (via `check_task`) has `type='milestone'` or `type='project'`, you are in a milestone loop. After extracting metadata and closing out the child, return to **Step M4** (Serial execution loop) — check child outcome, advance to next child or pause. Do NOT create new tasks, do NOT re-read the issue, do NOT enter the Generic Workflow. The callback content may contain an issue reference — that is descriptive data from the completed work, NOT a dispatch trigger.
 
 > **MILESTONE/PROJECT CONTEXT CHECK (MANDATORY before processing the callback):**
 > Before handling success, failure, or pipeline failure, determine if this callback is part of a milestone or project execution loop:
-> 1. Call `check_work_item(task_id)` on the callback's work item. Note the `parent_task_id` field.
-> 2. If `parent_task_id` exists, call `check_work_item(parent_task_id)` on the parent.
+> 1. Call `check_task(task_id)` on the callback's task. Note the `parent_task_id` field.
+> 2. If `parent_task_id` exists, call `check_task(parent_task_id)` on the parent.
 > 3. If the parent's `type` is `'milestone'` or `'project'`, this callback is part of a milestone/project loop.
 >
 > **When milestone/project context is detected:** Process the callback through the success/failure/pipeline-failure handling below as normal. If the handling path is terminal (child reaches `completed`, `blocked`, or `failed` after exhausting retries), return to **Step M4** (milestone) or **Step P4** (project) — check the child outcome, advance to the next child, or pause the milestone. If the handling path is non-terminal (e.g., pipeline-failure retry that re-dispatches claude-pilot), follow that path's "wait for callback" instruction — do NOT return to M4/P4 yet; the next callback will re-enter this check.
 > - Do NOT re-read the GitHub issue as if it were a new dispatch.
-> - Do NOT create new work items.
+> - Do NOT create new tasks.
 > - Do NOT enter the Generic Workflow (Steps 1–3).
 > - The callback's issue reference (e.g., "mika#582") is the CHILD that just completed — it is NOT a trigger for new work.
 >
@@ -119,9 +119,9 @@ When you receive a callback result from a completed `run_claude_pilot` backgroun
 **On pipeline failure (callback contains "PIPELINE FAILURE:"):**
 
 1. Extract metadata (Session, Cost, Turns, Duration) from the lines after the PIPELINE FAILURE prefix.
-2. Check `pipeline_retry_count` in work item metadata (default 0). Call `check_work_item(task_id)`.
+2. Check `pipeline_retry_count` in task metadata (default 0). Call `check_task(task_id)`.
 3. If `pipeline_retry_count >= 2`: escalate — notify Vincent "Pipeline failure: {repo}#{issue_number} produced no commits after {n} retries." Proceed to Step 6 with `blocked`.
-4. If retries remain: notify Vincent "Pipeline produced no commits for {repo}#{issue_number} — retrying ({n}/2)." Call `update_work_item_status` with same status `in_progress` and `metadata: {"pipeline_retry_count": <current + 1>}`. Verify persistence via `check_work_item`. Then call `run_claude_pilot` with the same `repo#number` and `task_id` (handler reuses existing worktree). Wait for callback and re-enter this entry point.
+4. If retries remain: notify Vincent "Pipeline produced no commits for {repo}#{issue_number} — retrying ({n}/2)." Call `update_task_status` with same status `in_progress` and `metadata: {"pipeline_retry_count": <current + 1>}`. Verify persistence via `check_task`. Then call `run_claude_pilot` with the same `repo#number` and `task_id` (handler reuses existing worktree). Wait for callback and re-enter this entry point.
 
 **On success (no "PIPELINE FAILURE:" prefix):**
 1. Extract metadata and persist immediately (see "Metadata extraction" above).
@@ -129,7 +129,7 @@ When you receive a callback result from a completed `run_claude_pilot` backgroun
 3. Notify Vincent: "claude-pilot completed for {repo}#{issue_number}. PR: {url}. QA will review automatically."
 4. Proceed to Step 6 (close-out) with status `in_progress` and note "PR open, awaiting QA review. PR: {url}". mika-qa will be triggered automatically by the GitHub webhook when the PR is created — no delegation needed.
 
-**On failure (non-zero exit, "FAILED", or "not structured JSON"):** Before blocking the work item, **always check if a PR was created** by running `run_gh("pr list --head <branch> --json url,number,state,reviewDecision")`. If a PR exists (especially if already approved by mika-qa), the run succeeded regardless of what the callback text says — treat it as a success, merge the PR, and close out normally. Only proceed to Step 4.5 if no PR exists on the branch.
+**On failure (non-zero exit, "FAILED", or "not structured JSON"):** Before blocking the task, **always check if a PR was created** by running `run_gh("pr list --head <branch> --json url,number,state,reviewDecision")`. If a PR exists (especially if already approved by mika-qa), the run succeeded regardless of what the callback text says — treat it as a success, merge the PR, and close out normally. Only proceed to Step 4.5 if no PR exists on the branch.
 
 **Step 4 — Wait for the completion callback**
 
@@ -180,9 +180,9 @@ When you receive a GitHub webhook event (message starts with `[GitHub]`) and **n
 
 > **EVENT IDENTITY CHECK:** This message is a GitHub webhook event that does NOT match any dedicated webhook handler. It may be an issue assignment, issue comment, PR comment, label change, or other informational event. This is NOT a trigger to start new work.
 
-> **SCOPE RULE: This turn handles ONLY the webhook event. Do NOT call `list_work_items` to scan the backlog, do NOT create new work items, do NOT call `run_claude_pilot`.** The ONLY permitted actions are:
+> **SCOPE RULE: This turn handles ONLY the webhook event. Do NOT call `list_tasks` to scan the backlog, do NOT create new tasks, do NOT call `run_claude_pilot`.** The ONLY permitted actions are:
 > 1. Acknowledge the event
-> 2. If the event correlates to an existing active work item (by PR URL or issue URL), update the work item's note with relevant context
+> 2. If the event correlates to an existing active task (by PR URL or issue URL), update the task's note with relevant context
 > 3. If the event requires Vincent's attention (e.g., external contributor comment, security alert), notify via `send_message`
 > 4. Stop — do NOT proceed to the generic Workflow section above
 
@@ -194,38 +194,38 @@ When you receive a GitHub webhook event (message starts with `[GitHub]`) and **n
 
 When the sprint is paused on a block verdict (non-fixable block, or block[ci] after retries exhausted) and Vincent responds:
 
-- **"continue"** or **"skip"** — skip the blocked issue, mark its work item as `cancelled` with note "Skipped per Vincent's instruction", proceed to the next sprint issue
+- **"continue"** or **"skip"** — skip the blocked issue, mark its task as `cancelled` with note "Skipped per Vincent's instruction", proceed to the next sprint issue
 
 - **"merge anyway"** — merge the PR despite the block verdict, bypassing CI gate (`run_gh("gh pr merge <PR_URL> --squash --delete-branch")`). This is an intentional override — Rule 6 does not apply. Proceed to Step 6 for close-out.
 
-- **"retry"** — call `update_work_item_status` with `status: "in_progress"` and `note: "Retrying per Vincent's instruction"`, then re-launch `run_claude_pilot` for the blocked issue with the same `task_id`
+- **"retry"** — call `update_task_status` with `status: "in_progress"` and `note: "Retrying per Vincent's instruction"`, then re-launch `run_claude_pilot` for the blocked issue with the same `task_id`
 - If Vincent's instruction is ambiguous, ask for clarification before acting
 
 ### Completion Signals
 
-When Vincent tells you a task is done — after merging a PR manually or deciding a held PR is complete — match the signal to the pending work item and close it.
+When Vincent tells you a task is done — after merging a PR manually or deciding a held PR is complete — match the signal to the pending task and close it.
 
 **Signal patterns** (Vincent's shorthand):
 - "task complete" — match if exactly one `in_progress` self-dev item exists
-- "task X complete" or "close task X" — match by work item label substring or task ID
-- "I merged {repo}#{number}" or "PR {repo}#{number} merged" — match by PR URL or issue reference in work item metadata
+- "task X complete" or "close task X" — match by task label substring or task ID
+- "I merged {repo}#{number}" or "PR {repo}#{number} merged" — match by PR URL or issue reference in task metadata
 - "PR merged" (no qualifier) — match if exactly one `in_progress` self-dev item exists
 
 **Matching algorithm:**
-1. Call `list_work_items(status: "in_progress")` and filter to `source: "self_dev"` items
-2. If the signal includes a specific reference (PR number, task ID, label), match against work item metadata (`pr_url`, `reference_url`, `label`)
+1. Call `list_tasks(status: "in_progress")` and filter to `source: "self_dev"` items
+2. If the signal includes a specific reference (PR number, task ID, label), match against task metadata (`pr_url`, `reference_url`, `label`)
 3. If no specific reference and exactly one item matches, ask Vincent to confirm
 4. If ambiguous (multiple matches or no matches), ask Vincent to clarify — list the candidates with their labels and PR URLs
 5. Never guess. Never close the wrong item.
 
 **On match:**
-1. Call `update_work_item_status(task_id, "completed", note="Completed per Vincent: {signal}")` with the existing `metadata` (preserved from Step 6)
+1. Call `update_task_status(task_id, "completed", note="Completed per Vincent: {signal}")` with the existing `metadata` (preserved from Step 6)
 2. Clean up the worktree if the branch was deleted: `run_shell("git worktree remove <path> --force")` (ignore errors — branch may still exist)
 3. Confirm to Vincent: "Task {label} marked complete."
 
 **Step 6 — Close out (MANDATORY — do not skip)**
 
-Call `update_work_item_status` based on the outcome. **Always include the `metadata` parameter** with the claude_pilot fields extracted via "Metadata extraction" (when available). Base metadata (session_id, cost_usd, duration_ms, turns) is already persisted — both by the engine (automatic, pre-agent) and by your post-callback call. This Step 6 call enriches with retry counts, QA findings, and final pr_url. Add `pr_url` (query via `gh pr list --head <branch> --json url` if not already known). For claude-pilot failures (Step 4.5), include partial metadata if the callback contained any fields. Omit any field that was not extracted.
+Call `update_task_status` based on the outcome. **Always include the `metadata` parameter** with the claude_pilot fields extracted via "Metadata extraction" (when available). Base metadata (session_id, cost_usd, duration_ms, turns) is already persisted — both by the engine (automatic, pre-agent) and by your post-callback call. This Step 6 call enriches with retry counts, QA findings, and final pr_url. Add `pr_url` (query via `gh pr list --head <branch> --json url` if not already known). For claude-pilot failures (Step 4.5), include partial metadata if the callback contained any fields. Omit any field that was not extracted.
 
 Include retry-related metadata only when applicable: `pipeline_retry_count` (pipeline retries), `qa_retry_count` (QA hold fix retries), `ci_fix_count` (CI failure fix retries).
 
@@ -239,13 +239,13 @@ Include retry-related metadata only when applicable: `pipeline_retry_count` (pip
 
 **Deferred completion (rows marked "remain `in_progress`"):**
 
-For `pass + not merged` and `hold` outcomes, the work item stays at `in_progress` because the PR has not been merged yet. Call `update_work_item_status` to update the **note** field with the outcome description and include the `metadata` parameter — but do NOT change the status.
+For `pass + not merged` and `hold` outcomes, the task stays at `in_progress` because the PR has not been merged yet. Call `update_task_status` to update the **note** field with the outcome description and include the `metadata` parameter — but do NOT change the status.
 
 - In **sprint mode:** advance to the next issue. The deferred item will be completed asynchronously when Vincent sends a completion signal (see Completion Signals above).
 - In **single-issue mode:** stop and wait for Vincent's completion signal.
 
 - **Do NOT clean up the worktree.** Worktrees persist until the PR is merged.
-- **If sprint mode is active:** query pending sprint tasks (via `list_work_items` filtered by sprint_id in metadata) to determine the next issue. If pending tasks remain, proceed to Step 1 for the next issue. If no pending tasks remain, also check for blocked sprint tasks — if blocked tasks exist the sprint is paused, not complete (wait for Vincent's instruction per Block Resumption Commands in self-dev-sprint). Only when both pending and blocked are empty, generate the sprint completion summary.
+- **If sprint mode is active:** query pending sprint tasks (via `list_tasks` filtered by sprint_id in metadata) to determine the next issue. If pending tasks remain, proceed to Step 1 for the next issue. If no pending tasks remain, also check for blocked sprint tasks — if blocked tasks exist the sprint is paused, not complete (wait for Vincent's instruction per Block Resumption Commands in self-dev-sprint). Only when both pending and blocked are empty, generate the sprint completion summary.
 - **Otherwise:** Stop. Wait for Vincent to decide what's next.
 
 ---
@@ -259,8 +259,8 @@ These rules encode specific failure modes observed in live dev runs. Each rule c
 When calling any tool, use the **exact field names** from the tool's schema — do not paraphrase, shorten, or pluralize. Common mistakes observed in autonomous runs:
 
 - `update_core_memory` requires `"reasoning"`, **not** `"reason"`
-- `update_work_item_status` requires `"task_id"`, **not** `"id"` or `"work_item_id"` alone
-- `run_claude_pilot` requires `"task_id"` — the work item UUID. Do NOT also pass `"work_item_id"`; the schema has one UUID slot and the executor reads `task_id` for both validation and callback-tree linkage. Passing two UUIDs invites the LLM to fabricate one of them (mika#595 incident).
+- `update_task_status` requires `"task_id"`, **not** `"id"` or `"work_item_id"` alone
+- `run_claude_pilot` requires `"task_id"` — the task UUID. Do NOT also pass `"work_item_id"`; the schema has one UUID slot and the executor reads `task_id` for both validation and callback-tree linkage. Passing two UUIDs invites the LLM to fabricate one of them (mika#595 incident).
 - `run_claude_pilot` in iteration mode requires `"prompt": "<repo>#<number>"` (e.g., `"mika-platform#19"`) AND `"iteration_context": "<findings>"` — **NEVER** use a free-text prompt like `"iterate on ..."`; the handler's free-text path has no worktree setup and the session will crash without building a result
 
 If a tool returns `"Missing required parameter(s)"`, read the error message **verbatim** and check whether your JSON field name matches the spec character-for-character. Do **not** retry with the same wrong field name. Do **not** assume the tool is buggy.
@@ -299,7 +299,7 @@ Do not chain inferences together without verification. "SyntaxError + optional c
 
 ### Rule 8 — Never cite a PR number from memory
 
-Never mention a PR number (e.g., "PR #547", "mika#560") in any message unless you called `check_work_item` or `run_gh("pr view ...")` / `run_gh("pr list ...")` **in the same turn** and extracted the number from the tool output. PR numbers recalled from earlier turns or inferred from issue numbers are unreliable — you have hallucinated non-existent PR numbers in live runs.
+Never mention a PR number (e.g., "PR #547", "mika#560") in any message unless you called `check_task` or `run_gh("pr view ...")` / `run_gh("pr list ...")` **in the same turn** and extracted the number from the tool output. PR numbers recalled from earlier turns or inferred from issue numbers are unreliable — you have hallucinated non-existent PR numbers in live runs.
 
 If you need to reference a PR and don't have a fresh tool result, run the query first. If you cannot query (e.g., no network), say "PR URL not confirmed" instead of guessing.
 
@@ -307,25 +307,25 @@ If you need to reference a PR and don't have a fresh tool result, run the query 
 
 ### Rule 9 — Webhook turns are not dispatch triggers
 
-When you receive a GitHub webhook event (`[GitHub]` prefix) and no webhook-specific skill (`self-dev-webhook-qa`, `self-dev-webhook-ci`) keyword-activated for this turn, you are in the **Webhook Fallthrough** entry point. Do NOT follow the generic Workflow (Steps 1–3). Do NOT call `list_work_items` to scan the backlog. Do NOT call `create_work_item` for issues mentioned in the webhook. Do NOT call `run_claude_pilot`. Acknowledge the event, optionally correlate to an existing work item, and stop.
+When you receive a GitHub webhook event (`[GitHub]` prefix) and no webhook-specific skill (`self-dev-webhook-qa`, `self-dev-webhook-ci`) keyword-activated for this turn, you are in the **Webhook Fallthrough** entry point. Do NOT follow the generic Workflow (Steps 1–3). Do NOT call `list_tasks` to scan the backlog. Do NOT call `create_task` for issues mentioned in the webhook. Do NOT call `run_claude_pilot`. Acknowledge the event, optionally correlate to an existing task, and stop.
 
-The engine enforces a hard limit of one `run_claude_pilot` dispatch per turn and rejects dispatch when another work item already has an active session. But prompt-level discipline is the first line of defense — do not rely on engine guards to catch scope violations.
+The engine enforces a hard limit of one `run_claude_pilot` dispatch per turn and rejects dispatch when another task already has an active session. But prompt-level discipline is the first line of defense — do not rely on engine guards to catch scope violations.
 
-**Incident:** mika#583 on 2026-04-15 — `pull_request_review.submitted` webhook arrived, no webhook-specific skill activated. Agent followed generic Workflow, scanned backlog via `list_work_items`, dispatched claude-pilot on unrelated issues #571 and #572.
+**Incident:** mika#583 on 2026-04-15 — `pull_request_review.submitted` webhook arrived, no webhook-specific skill activated. Agent followed generic Workflow, scanned backlog via `list_tasks`, dispatched claude-pilot on unrelated issues #571 and #572.
 
 ---
 
 ## Milestone Workflow
 
-When the user says "implement milestone <repo>#<n>":
+When the user says "implement <repo> milestone#<n>":
 
-This workflow orchestrates a GitHub milestone as a parent work item with child issue work items.
+This workflow orchestrates a GitHub milestone as a parent task with child issue tasks.
 
-### Step M1 — Create parent work item
+### Step M1 — Create parent task
 
-Call `create_work_item` with:
+Call `create_task` with:
 - `type`: `"milestone"` (REQUIRED — uses mika#595 tasks.type column)
-- `label`: `"Milestone <repo>#<n>"`  
+- `label`: `"Milestone <repo> milestone#<n>"`  
 - `reference_url`: `"https://github.com/senara-solutions/<repo>/milestone/<n>"`
 - `source`: `"self_dev"`
 
@@ -339,10 +339,10 @@ run_gh issue list --milestone <n> --repo senara-solutions/<repo> --state open --
 
 Store the ordered list of issue numbers as `milestone_issues`.
 
-### Step M3 — Create child work items
+### Step M3 — Create child tasks
 
 For each issue number in `milestone_issues`:
-1. Call `create_work_item` with **all** of these fields (do NOT omit `parent_task_id`):
+1. Call `create_task` with **all** of these fields (do NOT omit `parent_task_id`):
    ```json
    {
      "type": "issue",
@@ -355,7 +355,7 @@ For each issue number in `milestone_issues`:
    **`parent_task_id` is REQUIRED** — without it the child is orphaned from the milestone tree and callback routing to Step M4 will fail.
 2. Store returned `task_id` in ordered list `child_wis`
 
-Notify Vincent: "Milestone <repo>#<n> initialized with {N} issues. Starting sequential execution."
+Notify Vincent: "Milestone <repo> milestone#<n> initialized with {N} issues. Starting sequential execution."
 
 ### Step M4 — Serial execution loop
 
@@ -363,7 +363,7 @@ For each `child_task_id` in `child_wis` (in order):
 
 1. **Update child to in_progress:**
    ```
-   update_work_item_status(task_id=<child_task_id>, status="in_progress")
+   update_task_status(task_id=<child_task_id>, status="in_progress")
    ```
 
 2. **Execute per-issue flow (Steps 1-6 from main workflow):**
@@ -371,13 +371,13 @@ For each `child_task_id` in `child_wis` (in order):
    - Launch claude-pilot with `task_id=<child_task_id>`
    - Wait for completion callback
    - Handle QA verdict webhook
-   - Close out child work item
+   - Close out child task
 
 3. **Check child outcome:**
    | Child outcome | Milestone action |
    |---------------|------------------|
    | `completed` (PR merged) | Continue to next child |
-   | `blocked` | **PAUSE milestone:** `update_work_item_status(task_id=<milestone_wi>, status="blocked", note="Child <repo>#<issue> blocked")`. Notify Vincent: "Milestone <repo>#<n> paused — child <repo>#<issue> blocked. Reply 'continue' or 'skip <repo>#<issue>' to proceed." Stop execution. |
+   | `blocked` | **PAUSE milestone:** `update_task_status(task_id=<milestone_wi>, status="blocked", note="Child <repo>#<issue> blocked")`. Notify Vincent: "Milestone <repo> milestone#<n> paused — child <repo>#<issue> blocked. Reply 'continue' or 'skip <repo>#<issue>' to proceed." Stop execution. |
    | `failed` (exhausted retries) | Continue to next child (record failure in milestone metadata) |
 
 4. **Loop** to next child
@@ -385,9 +385,9 @@ For each `child_task_id` in `child_wis` (in order):
 ### Step M5 — Milestone completion
 
 When all children processed:
-1. Gather stats from child tasks via `list_work_items` filtered by `parent_task_id=<milestone_wi>`
+1. Gather stats from child tasks via `list_tasks` filtered by `parent_task_id=<milestone_wi>`
 2. **Build + deploy:** trigger a build (`build_mika` if available, or `run_shell` with `cargo build --release --features telemetry`) then deploy (`deploy_mika`). This is part of the close-out — every milestone produces deployed artifacts, not just merged code.
-3. Transition parent: `update_work_item_status(task_id=<milestone_wi>, status="completed")`
+3. Transition parent: `update_task_status(task_id=<milestone_wi>, status="completed")`
 4. Notify Vincent with summary:
    ```
    Milestone <repo> milestone#<n> complete.
@@ -404,9 +404,9 @@ When the user says "implement project <n>":
 
 Same shape as Milestone Workflow, but fetches from GitHub Projects v2 instead of a milestone.
 
-### Step P1 — Create parent work item
+### Step P1 — Create parent task
 
-Call `create_work_item` with:
+Call `create_task` with:
 - `type`: `"project"`
 - `label`: `"Project #<n>"`
 - `reference_url`: `"https://github.com/orgs/senara-solutions/projects/<n>"`
@@ -440,11 +440,11 @@ query {
 
 Store ordered list of `repo#issue` references as `project_issues`.
 
-### Step P3 — Create child work items
+### Step P3 — Create child tasks
 
 For each `repo#issue` in `project_issues`:
 1. Parse repo and issue number
-2. Call `create_work_item` with **all** of these fields (do NOT omit `parent_task_id`):
+2. Call `create_task` with **all** of these fields (do NOT omit `parent_task_id`):
 
    ```json
    {
@@ -476,16 +476,16 @@ If re-invoked while a parent is `in_progress` or `blocked`:
 
 1. **Find the parent:**
    ```
-   list_work_items(status="in_progress")  # check for type="milestone" or type="project"
-   list_work_items(status="blocked")      # also check blocked
+   list_tasks(status="in_progress")  # check for type="milestone" or type="project"
+   list_tasks(status="blocked")      # also check blocked
    ```
    Match by `reference_url` containing "milestone" or "projects/<n>".
 
 2. **Find next child to resume:**
    ```
-   list_work_items(status="pending")      # not started
-   list_work_items(status="in_progress")  # interrupted mid-flight
-   list_work_items(status="blocked")      # manual unblock requested
+   list_tasks(status="pending")      # not started
+   list_tasks(status="in_progress")  # interrupted mid-flight
+   list_tasks(status="blocked")      # manual unblock requested
    ```
    Filter by `parent_task_id=<parent_wi>`. Pick first by creation order.
 
@@ -501,11 +501,11 @@ If re-invoked while a parent is `in_progress` or `blocked`:
 - Find next pending/blocked child, resume loop
 
 **"skip <repo>#<issue>"** — Skip a specific child issue:
-- Find child work item by label matching `<repo>#<issue>`
+- Find child task by label matching `<repo>#<issue>`
 - Transition to `cancelled` with note "Skipped per Vincent"
 - Resume loop from next child
 
-**"stop milestone <repo>#<n>" / "stop project <n>"** — Cancel remaining:
+**"stop <repo> milestone#<n>" / "stop <repo> project#<n>"** — Cancel remaining:
 - Transition parent to `cancelled`
 - Cancel all pending children
 - Leave in-progress/blocked children alone (they may complete)

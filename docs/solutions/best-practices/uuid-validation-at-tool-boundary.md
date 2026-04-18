@@ -7,7 +7,7 @@ problem_type: best_practice
 component: tooling
 severity: medium
 applies_when:
-  - Adding a new tool that accepts a UUID-typed argument (task_id, work_item_id, parent_task_id, etc.)
+  - Adding a new tool that accepts a UUID-typed argument (task_id, task_id, parent_task_id, etc.)
   - LLM is fabricating or hallucinating UUIDs during recovery or multi-step workflows
   - Soft "not found" errors from DB lookups are not teaching the LLM what went wrong structurally
 tags:
@@ -22,7 +22,7 @@ tags:
 
 ## Context
 
-On 2026-04-11, mika-dev (qwen3-coder) called `run_claude_pilot` with a fabricated task_id — it pattern-matched the UUID shape from prior context and fabricated the suffix `a123456789ab`. The tool accepted it (only checking `len > 36`), hit the DB, and returned a soft "Work item not found" error. The LLM simply retried with the correct ID, wasting a tool step and DB query.
+On 2026-04-11, mika-dev (qwen3-coder) called `run_claude_pilot` with a fabricated task_id — it pattern-matched the UUID shape from prior context and fabricated the suffix `a123456789ab`. The tool accepted it (only checking `len > 36`), hit the DB, and returned a soft "Task not found" error. The LLM simply retried with the correct ID, wasting a tool step and DB query.
 
 Prompt-level instructions ("use the exact task_id") are unreliable for this failure class (per `feedback_prompt_enforcement_fragile.md`). The project philosophy is: "If the agent ignoring an instruction would cause real harm, enforce it in the harness."
 
@@ -58,9 +58,9 @@ if let Err(e) = super::validate_uuid("id", id) {
 
 Keep the empty-string check before `validate_uuid()` — it produces a more actionable "'id' is required" error than the generic UUID format error.
 
-For shared helpers like `validate_work_item()` that return `Option<String>`, extract the error content:
+For shared helpers like `validate_task()` that return `Option<String>`, extract the error content:
 ```rust
-if let Err(tool_output) = validate_uuid("work_item_id", work_item_id) {
+if let Err(tool_output) = validate_uuid("task_id", task_id) {
     return Some(tool_output.content);
 }
 ```
@@ -74,7 +74,7 @@ if let Err(tool_output) = validate_uuid("work_item_id", work_item_id) {
 
 ## When to Apply
 
-- Every tool in `crates/mika-agent/src/tools/` that accepts a `task_id`, `work_item_id`, `parent_task_id`, or similar UUID-typed field
+- Every tool in `crates/mika-agent/src/tools/` that accepts a `task_id`, `task_id`, `parent_task_id`, or similar UUID-typed field
 - NOT for `session_id` (uses prefixed formats like `delegate-{uuid}`, `system-{agent_id}`) or `trace_id` (32-char hex, not hyphenated UUID)
 - NOT for optional filter parameters where an invalid value simply returns empty results (e.g., `get_team_status` `run_id`)
 

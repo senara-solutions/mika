@@ -187,7 +187,7 @@ async fn test_deliver_retry_budget_exhausted_after_six_attempts() { ... }
 
 **When adding new classifications to the outcome enum, add tests on both sides.** Pure data-constructor tests (build the enum and check `is_retryable()`) prove the helper works. They do NOT prove that the single-attempt function produces the right variant. Add integration tests that drive real HTTP responses through the actual classification code.
 
-**Document the dedup LRU interaction.** The gateway's 10k-entry LRU cache has no TTL. Under extreme webhook volume during a 300s retry sleep, an entry can be evicted, allowing GitHub redelivery to bypass dedup. Agent-side idempotency (work item unique index) mitigates double-processing, but this is a known edge case — future work should add TTL (#590).
+**Document the dedup LRU interaction.** The gateway's 10k-entry LRU cache has no TTL. Under extreme webhook volume during a 300s retry sleep, an entry can be evicted, allowing GitHub redelivery to bypass dedup. Agent-side idempotency (task unique index) mitigates double-processing, but this is a known edge case — future work should add TTL (#590).
 
 ## References
 

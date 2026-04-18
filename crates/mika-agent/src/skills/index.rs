@@ -1330,24 +1330,24 @@ fn looks_like_typo(input: &str, known: &str) -> bool {
     prev[m] <= 2
 }
 
-/// Inject `work_item_id` as a required field into a tool's input schema.
+/// Inject `task_id` as a required field into a tool's input schema.
 ///
-/// Long-running exec handlers must track delegation via work items.
+/// Long-running exec handlers must track delegation via tasks.
 /// This adds the field to the JSON schema so the LLM knows to include it.
-fn inject_work_item_id_field(schema: &mut serde_json::Value) {
+fn inject_task_id_field(schema: &mut serde_json::Value) {
     if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
         props.insert(
-            "work_item_id".to_string(),
+            "task_id".to_string(),
             serde_json::json!({
                 "type": "string",
-                "description": "ID of the work item tracking this task. Create one first using create_work_item."
+                "description": "ID of the task tracking this work. Create one first using create_task."
             }),
         );
     }
     if let Some(required) = schema.get_mut("required").and_then(|r| r.as_array_mut()) {
-        required.push(serde_json::Value::String("work_item_id".to_string()));
+        required.push(serde_json::Value::String("task_id".to_string()));
     } else {
-        schema["required"] = serde_json::json!(["work_item_id"]);
+        schema["required"] = serde_json::json!(["task_id"]);
     }
 }
 
@@ -1691,12 +1691,12 @@ fn load_tools_json(skill_dir: &Path) -> Vec<ResolvedSkillTool> {
         .map(|def| {
             let mut schema = def.input_schema;
 
-            // Long-running exec handlers require a work_item_id for delegation tracking
+            // Long-running exec handlers require a task_id for delegation tracking
             if let ToolHandler::Exec {
                 long_running: true, ..
             } = &def.handler
             {
-                inject_work_item_id_field(&mut schema);
+                inject_task_id_field(&mut schema);
             }
 
             ResolvedSkillTool {
@@ -2498,7 +2498,7 @@ mod tests {
     }
 
     #[test]
-    fn test_long_running_tool_gets_work_item_id_injected() {
+    fn test_long_running_tool_gets_task_id_injected() {
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("builder");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -2533,16 +2533,16 @@ mod tests {
         assert_eq!(result.entries[0].skill_tools.len(), 1);
 
         let schema = &result.entries[0].skill_tools[0].definition.input_schema;
-        // work_item_id should be in properties
+        // task_id should be in properties
         assert!(
-            schema["properties"]["work_item_id"].is_object(),
-            "work_item_id property should be injected for long_running tools"
+            schema["properties"]["task_id"].is_object(),
+            "task_id property should be injected for long_running tools"
         );
-        // work_item_id should be required
+        // task_id should be required
         let required = schema["required"].as_array().unwrap();
         assert!(
-            required.contains(&serde_json::Value::String("work_item_id".to_string())),
-            "work_item_id should be in required fields"
+            required.contains(&serde_json::Value::String("task_id".to_string())),
+            "task_id should be in required fields"
         );
     }
 
@@ -2647,7 +2647,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_long_running_tool_no_work_item_id() {
+    fn test_non_long_running_tool_no_task_id() {
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("search");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -2682,10 +2682,10 @@ mod tests {
         assert_eq!(result.entries[0].skill_tools.len(), 1);
 
         let schema = &result.entries[0].skill_tools[0].definition.input_schema;
-        // work_item_id should NOT be injected for non-long-running tools
+        // task_id should NOT be injected for non-long-running tools
         assert!(
-            schema["properties"]["work_item_id"].is_null(),
-            "work_item_id should not be injected for non-long_running tools"
+            schema["properties"]["task_id"].is_null(),
+            "task_id should not be injected for non-long_running tools"
         );
     }
 

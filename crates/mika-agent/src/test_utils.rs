@@ -177,8 +177,8 @@ pub mod test_helpers {
         }
     }
 
-    /// Create a manual work item in the test DB and return its ID.
-    pub async fn create_test_work_item(db: &crate::async_db::AsyncDatabase) -> String {
+    /// Create a manual task in the test DB and return its ID.
+    pub async fn create_test_task(db: &crate::async_db::AsyncDatabase) -> String {
         use crate::db::NewTask;
         use crate::task_engine::types::{action_type, trigger_type};
 
@@ -187,7 +187,7 @@ pub mod test_helpers {
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
-            label: "test work item".to_string(),
+            label: "test task".to_string(),
             trigger_type: trigger_type::MANUAL.to_string(),
             cron_expr: None,
             event_source: None,

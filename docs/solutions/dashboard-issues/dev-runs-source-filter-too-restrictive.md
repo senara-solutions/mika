@@ -23,7 +23,7 @@ Two SQL query functions in `crates/mika-agent/src/db.rs` hardcoded `source = 'se
 - `get_dev_run()` — single dev run lookup
 - `list_dev_runs_paginated_with_count()` — paginated list (4 SQL strings)
 
-The `source` field indicates *how* the task was created (self-dev skill, GitHub issue, etc.), not *whether* it's a dev run. A dev run is any work item where mika-dev launches claude-pilot, regardless of originating source.
+The `source` field indicates *how* the task was created (self-dev skill, GitHub issue, etc.), not *whether* it's a dev run. A dev run is any task where mika-dev launches claude-pilot, regardless of originating source.
 
 ## Solution
 

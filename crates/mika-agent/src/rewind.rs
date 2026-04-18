@@ -474,11 +474,11 @@ async fn apply_reversal(db: &AsyncDatabase, evt: &AuditEvent) -> Result<bool> {
         }
 
         // Task creation: handled separately in execute_rewind
-        (_, _, "create_work_item" | "create_reminder") => Ok(true),
+        (_, _, "create_task" | "create_reminder") => Ok(true),
 
-        // update_work_item_status: restore previous status
-        (Some(before_status), Some(_), "update_work_item_status") => {
-            // target_key format is "task:{id}" or "work_item:{id}"
+        // update_task_status: restore previous status
+        (Some(before_status), Some(_), "update_task_status") => {
+            // target_key format is "task:{id}" (legacy: "work_item:{id}")
             if let Some(task_id) = parse_string_from_target_key(&evt.target_key) {
                 db.update_manual_task_status(&task_id, before_status)
                     .await?;
@@ -546,7 +546,7 @@ fn parse_id_from_target_key(target_key: &str, prefix: &str) -> Option<i64> {
     target_key.strip_prefix(prefix)?.parse().ok()
 }
 
-/// Parse a string ID from a target_key like "task:uuid" or "work_item:uuid"
+/// Parse a string ID from a target_key like "task:uuid" (legacy: "work_item:uuid")
 fn parse_string_from_target_key(target_key: &str) -> Option<String> {
     target_key
         .strip_prefix("task:")
@@ -618,12 +618,12 @@ fn describe_reversal(evt: &AuditEvent) -> (ReversalAction, String) {
             format!("Restore {} status to '{before}'", evt.target_key),
         ),
 
-        (Some(before), Some(_), "update_work_item_status") => (
+        (Some(before), Some(_), "update_task_status") => (
             ReversalAction::Restore,
             format!("Restore {} status to '{before}'", evt.target_key),
         ),
 
-        (_, _, "create_work_item" | "create_reminder") => (
+        (_, _, "create_task" | "create_reminder") => (
             ReversalAction::Delete,
             format!("Delete task from {}", evt.target_key),
         ),

@@ -1,21 +1,21 @@
 ---
-title: Work Item Metadata Two-Level Shallow Merge
+title: Task Metadata Two-Level Shallow Merge
 date: 2026-04-08
 tags: [work-items, metadata, callback, claude-pilot, shallow-merge]
 related_issue: 489
 related_pr: TBD
 ---
 
-# Work Item Metadata Two-Level Shallow Merge
+# Task Metadata Two-Level Shallow Merge
 
 ## Problem
 
-Work item `metadata` is enriched from two independent paths:
+Task `metadata` is enriched from two independent paths:
 
 1. **Engine path** — `task_engine::dispatcher::try_extract_callback_metadata`
    parses claude-pilot's stdout (cost, duration, session, turns) before the
    silent agent runs and persists it under `metadata.claude_pilot.*`.
-2. **Agent path** — the agent's later `update_work_item_status` call enriches
+2. **Agent path** — the agent's later `update_task_status` call enriches
    with PR URL, branch, etc. under the same `claude_pilot` key.
 
 Both paths previously implemented a **single-level shallow merge** by hand:
@@ -29,7 +29,7 @@ for (k, v) in new_obj {
 When the agent wrote `{"claude_pilot": {"pr_url": "..."}}`, the entire
 `claude_pilot` object overwrote the prior one — wiping out the
 engine-injected `cost_usd`, `duration_ms`, `session_id`, and `turns` fields.
-A real incident on work item `b5f073b7-eb8d-48fc-87e0-2c3deff42b0c`
+A real incident on task `b5f073b7-eb8d-48fc-87e0-2c3deff42b0c`
 permanently lost `$6.47` / `1230s` of telemetry, replacing it with `$0.15` /
 `118s` from the agent's merge turn.
 
@@ -40,7 +40,7 @@ implementation only honored that at the top level.
 ## Solution
 
 Introduce a **shared two-level shallow merge helper** in
-`crates/mika-agent/src/work_item_metadata.rs`:
+`crates/mika-agent/src/task_metadata.rs`:
 
 ```rust
 pub fn merge_metadata(base: &mut Value, incoming: &Value) {
@@ -68,7 +68,7 @@ Semantics:
 - One level only — recursion stops at depth 1.
 - All other top-level conflicts (scalar / array / type mismatch) replace.
 
-Both call sites — `tools/update_work_item_status.rs::merge_and_persist_metadata`
+Both call sites — `tools/update_task_status.rs::merge_and_persist_metadata`
 and `task_engine/dispatcher.rs::try_extract_callback_metadata` — now call
 the shared helper, guaranteeing identical semantics across the two
 enrichment paths.
@@ -89,11 +89,11 @@ replacing `claude_pilot`" — two levels expresses exactly that.
 
 ## Tests
 
-`work_item_metadata.rs` ships 10 unit tests covering inner-field merge,
+`task_metadata.rs` ships 10 unit tests covering inner-field merge,
 scalar/object conflicts, type mismatches, no-recursion-past-depth-1, array
 replacement, and no-op on non-object inputs.
 
-`update_work_item_status.rs::tests` adds two integration tests through the
+`update_task_status.rs::tests` adds two integration tests through the
 tool surface: the #489 reproduction (six-field claude_pilot survives) and
 the top-level multi-namespace case (`claude_pilot` and `github` coexist
 across two updates).

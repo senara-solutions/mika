@@ -13,7 +13,7 @@ module: agent, task_engine, cli
 
 Two issues with callback framing in the agent engine:
 
-1. **Missing parent_task_id:** After a long-running callback completes, the agent receives the callback task's own UUID but not the parent work item ID. The `parent_task_id` field exists on the `Task` struct at both dispatch points (server dispatcher and TUI poller) but was dropped when constructing `SilentTrigger::Callback` and `AgentRequest::CallbackResult`. This forced the agent to remember work item IDs across async gaps — unreliable after conversation compaction.
+1. **Missing parent_task_id:** After a long-running callback completes, the agent receives the callback task's own UUID but not the parent task ID. The `parent_task_id` field exists on the `Task` struct at both dispatch points (server dispatcher and TUI poller) but was dropped when constructing `SilentTrigger::Callback` and `AgentRequest::CallbackResult`. This forced the agent to remember task IDs across async gaps — unreliable after conversation compaction.
 
 2. **Competing instruction sets:** `build_callback_trigger_context()` had 3-branch routing: claude-pilot success (5-step workflow), claude-pilot failure (escalation), and generic. The engine's claude-pilot-specific instructions competed with the self-dev skill's 450-line prompt, creating two sources of truth. Weaker models followed neither fully.
 
@@ -55,7 +55,7 @@ pub fn build_callback_trigger_context(
 2. Added `parent_task_id: Option<String>` to `AgentRequest::CallbackResult` variant
 3. Server path: `dispatcher.rs` reads `task.parent_task_id.clone()` into the trigger
 4. TUI path: `app.rs` reads `task.parent_task_id` into the request, `chat.rs` passes it through
-5. `format_callback_framing()` emits `Parent work item: {id}` when parent is set
+5. `format_callback_framing()` emits `Parent task: {id}` when parent is set
 
 ### Files changed
 
@@ -74,7 +74,7 @@ pub fn build_callback_trigger_context(
 
 ## Cross-references
 
-- #314: Callback turn work item context injection (companion, already merged)
+- #314: Callback turn task context injection (companion, already merged)
 - `docs/solutions/logic-errors/tui-callback-skips-mika-qa-delegation.md`: Dual-path consistency pattern
 - `docs/solutions/architecture-patterns/trace-id-structural-linkage-delegate-silent-callback.md`: Option<String> propagation pattern
 - `docs/solutions/architecture-patterns/callback-task-loop-prevention.md`: Callback safety constraints

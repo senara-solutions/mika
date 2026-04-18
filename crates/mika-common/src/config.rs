@@ -335,7 +335,7 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         backend: ConfigBackend::Env,
         env_var: Some("MIKA_GITHUB_TOKEN"),
         secret: true,
-        description: "GitHub token for agent operations (context injection, work item enrichment, PR merge)",
+        description: "GitHub token for agent operations (context injection, task enrichment, PR merge)",
     },
     ConfigKeyInfo {
         key: "investigate_github_token",
@@ -629,7 +629,7 @@ pub struct Settings {
     #[serde(default)]
     pub server_log_file: Option<PathBuf>,
 
-    /// GitHub Personal Access Token for agent operations (context injection, work item enrichment, PR merge).
+    /// GitHub Personal Access Token for agent operations (context injection, task enrichment, PR merge).
     /// No fallback — `investigate_github_token` is used only by the investigation panel.
     #[serde(default)]
     pub github_token: Option<String>,

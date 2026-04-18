@@ -1,7 +1,7 @@
 //! Webhook deferral queue for sequencing GitHub webhooks against in-flight callbacks.
 //!
-//! When a work item has an in-flight `run_claude_pilot` callback, inbound webhooks
-//! targeting the same work item are deferred until the callback completes. This prevents
+//! When a task has an in-flight `run_claude_pilot` callback, inbound webhooks
+//! targeting the same task are deferred until the callback completes. This prevents
 //! race conditions where the webhook arrives before callback metadata (especially `pr_url`)
 //! is persisted.
 //!
@@ -30,15 +30,15 @@ pub struct DeferredWebhook {
     pub request: MessageRequest,
     /// When the webhook was received.
     pub received_at: Instant,
-    /// The work item ID this webhook correlates to.
-    pub work_item_id: String,
+    /// The task ID this webhook correlates to.
+    pub task_id: String,
     /// Human-readable description for audit events (e.g. "pull_request_review.submitted on repo#42").
     pub event_desc: String,
     /// Deadline after which the webhook is replayed regardless of callback state.
     pub deadline: Instant,
 }
 
-/// Result of attempting to correlate a webhook to a work item.
+/// Result of attempting to correlate a webhook to a task.
 #[derive(Debug, Clone)]
 pub struct WebhookCorrelation {
     pub pr_url: Option<String>,
@@ -55,7 +55,7 @@ static CHECK_SUITE_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Parse PR URL and/or branch from gateway-formatted webhook text.
 ///
-/// Returns `None` for event types that cannot be correlated to a work item
+/// Returns `None` for event types that cannot be correlated to a task
 /// (e.g. `issues.assigned`, `issue_comment.created`).
 pub fn correlate_webhook(text: &str) -> Option<WebhookCorrelation> {
     // Try pull_request_review format first (most common deferral case)
@@ -86,52 +86,52 @@ pub fn correlate_webhook(text: &str) -> Option<WebhookCorrelation> {
     None
 }
 
-/// Check whether a webhook should be deferred based on work item state.
+/// Check whether a webhook should be deferred based on task state.
 ///
-/// Returns `Some((work_item_id, event_desc))` if the webhook should be deferred,
+/// Returns `Some((task_id, event_desc))` if the webhook should be deferred,
 /// `None` if it should be processed immediately.
 pub async fn should_defer_webhook(
     db: &AsyncDatabase,
     correlation: &WebhookCorrelation,
 ) -> Option<(String, String)> {
-    // Strategy 1: Try to find work item by PR URL
+    // Strategy 1: Try to find task by PR URL
     if let Some(ref pr_url) = correlation.pr_url
-        && let Ok(Some(work_item)) = db.find_active_work_item_by_pr_url(pr_url).await
+        && let Ok(Some(task)) = db.find_active_task_by_pr_url(pr_url).await
     {
-        if has_active_callback_child(db, &work_item.id).await {
-            return Some((work_item.id.clone(), correlation.event_desc.clone()));
+        if has_active_callback_child(db, &task.id).await {
+            return Some((task.id.clone(), correlation.event_desc.clone()));
         }
-        // Work item found but no active callback — process immediately
+        // Task found but no active callback — process immediately
         return None;
     }
 
-    // Strategy 2: Try to find work item by branch
+    // Strategy 2: Try to find task by branch
     if let Some(ref branch) = correlation.branch
-        && let Ok(Some(work_item)) = db.find_active_work_item_by_branch(branch).await
+        && let Ok(Some(task)) = db.find_active_task_by_branch(branch).await
     {
-        if has_active_callback_child(db, &work_item.id).await {
-            return Some((work_item.id.clone(), correlation.event_desc.clone()));
+        if has_active_callback_child(db, &task.id).await {
+            return Some((task.id.clone(), correlation.event_desc.clone()));
         }
         return None;
     }
 
-    // Strategy 3: Fallback — check if exactly one active work item has an active callback.
+    // Strategy 3: Fallback — check if exactly one active task has an active callback.
     // This handles the pre-pr_url state where metadata hasn't been written yet.
-    find_sole_inflight_callback_work_item(db)
+    find_sole_inflight_callback_task(db)
         .await
-        .map(|work_item_id| (work_item_id, correlation.event_desc.clone()))
+        .map(|task_id| (task_id, correlation.event_desc.clone()))
 }
 
-/// Check if a work item has any active (pending or in_progress) callback child tasks.
-async fn has_active_callback_child(db: &AsyncDatabase, work_item_id: &str) -> bool {
-    match db.get_child_tasks(work_item_id).await {
+/// Check if a task has any active (pending or in_progress) callback child tasks.
+async fn has_active_callback_child(db: &AsyncDatabase, task_id: &str) -> bool {
+    match db.get_child_tasks(task_id).await {
         Ok(children) => children.iter().any(|c| {
             c.trigger_type == trigger_type::CALLBACK
                 && matches!(c.status.as_str(), "pending" | "in_progress")
         }),
         Err(e) => {
             warn!(
-                work_item_id = %work_item_id,
+                task_id = %task_id,
                 error = %e,
                 "failed to check callback children, allowing webhook through"
             );
@@ -140,22 +140,22 @@ async fn has_active_callback_child(db: &AsyncDatabase, work_item_id: &str) -> bo
     }
 }
 
-/// Find exactly one active work item with an active callback child for this agent.
+/// Find exactly one active task with an active callback child for this agent.
 ///
-/// Returns `Some(work_item_id)` if exactly one such work item exists (unambiguous deferral).
+/// Returns `Some(task_id)` if exactly one such task exists (unambiguous deferral).
 /// Returns `None` if zero or multiple exist (ambiguous — don't defer).
-async fn find_sole_inflight_callback_work_item(db: &AsyncDatabase) -> Option<String> {
-    // Get all active manual work items for this agent
-    let work_items = match db.list_active_work_items().await {
+async fn find_sole_inflight_callback_task(db: &AsyncDatabase) -> Option<String> {
+    // Get all active manual tasks for this agent
+    let tasks = match db.list_active_tasks().await {
         Ok(items) => items,
         Err(e) => {
-            warn!(error = %e, "failed to list active work items for fallback deferral check");
+            warn!(error = %e, "failed to list active tasks for fallback deferral check");
             return None;
         }
     };
 
     let mut inflight_ids: Vec<String> = Vec::new();
-    for item in &work_items {
+    for item in &tasks {
         if has_active_callback_child(db, &item.id).await {
             inflight_ids.push(item.id.clone());
         }
@@ -163,32 +163,29 @@ async fn find_sole_inflight_callback_work_item(db: &AsyncDatabase) -> Option<Str
 
     if inflight_ids.len() == 1 {
         debug!(
-            work_item_id = %inflight_ids[0],
-            "fallback deferral: exactly one work item with active callback found"
+            task_id = %inflight_ids[0],
+            "fallback deferral: exactly one task with active callback found"
         );
         Some(inflight_ids.remove(0))
     } else {
         if inflight_ids.len() > 1 {
             debug!(
                 count = inflight_ids.len(),
-                "fallback deferral: multiple work items with active callbacks — not deferring"
+                "fallback deferral: multiple tasks with active callbacks — not deferring"
             );
         }
         None
     }
 }
 
-/// Drain deferred webhooks for a specific work item from the queue.
+/// Drain deferred webhooks for a specific task from the queue.
 ///
 /// Returns the webhooks in arrival order (oldest first).
-pub fn drain_for_work_item(
-    queue: &mut Vec<DeferredWebhook>,
-    work_item_id: &str,
-) -> Vec<DeferredWebhook> {
+pub fn drain_for_task(queue: &mut Vec<DeferredWebhook>, task_id: &str) -> Vec<DeferredWebhook> {
     let mut drained = Vec::new();
     let mut i = 0;
     while i < queue.len() {
-        if queue[i].work_item_id == work_item_id {
+        if queue[i].task_id == task_id {
             drained.push(queue.remove(i));
         } else {
             i += 1;
@@ -227,11 +224,11 @@ mod tests {
         }
     }
 
-    fn make_deferred(work_item_id: &str, secs_until_deadline: u64) -> DeferredWebhook {
+    fn make_deferred(task_id: &str, secs_until_deadline: u64) -> DeferredWebhook {
         DeferredWebhook {
             request: make_request("test"),
             received_at: Instant::now(),
-            work_item_id: work_item_id.to_string(),
+            task_id: task_id.to_string(),
             event_desc: "test event".to_string(),
             deadline: Instant::now() + Duration::from_secs(secs_until_deadline),
         }
@@ -277,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_for_work_item() {
+    fn test_drain_for_task() {
         let mut queue = vec![
             make_deferred("wi-1", 60),
             make_deferred("wi-2", 60),
@@ -285,17 +282,17 @@ mod tests {
             make_deferred("wi-3", 60),
         ];
 
-        let drained = drain_for_work_item(&mut queue, "wi-1");
+        let drained = drain_for_task(&mut queue, "wi-1");
         assert_eq!(drained.len(), 2);
         assert_eq!(queue.len(), 2);
-        assert!(drained.iter().all(|d| d.work_item_id == "wi-1"));
+        assert!(drained.iter().all(|d| d.task_id == "wi-1"));
     }
 
     #[test]
-    fn test_drain_for_work_item_no_match() {
+    fn test_drain_for_task_no_match() {
         let mut queue = vec![make_deferred("wi-1", 60), make_deferred("wi-2", 60)];
 
-        let drained = drain_for_work_item(&mut queue, "wi-99");
+        let drained = drain_for_task(&mut queue, "wi-99");
         assert!(drained.is_empty());
         assert_eq!(queue.len(), 2);
     }
@@ -307,7 +304,7 @@ mod tests {
             DeferredWebhook {
                 request: make_request("expired"),
                 received_at: Instant::now() - Duration::from_secs(120),
-                work_item_id: "wi-1".to_string(),
+                task_id: "wi-1".to_string(),
                 event_desc: "expired event".to_string(),
                 deadline: Instant::now() - Duration::from_secs(1),
             },
@@ -317,8 +314,8 @@ mod tests {
 
         let expired = drain_expired(&mut queue);
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].work_item_id, "wi-1");
+        assert_eq!(expired[0].task_id, "wi-1");
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].work_item_id, "wi-2");
+        assert_eq!(queue[0].task_id, "wi-2");
     }
 }

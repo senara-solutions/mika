@@ -12,7 +12,7 @@ modules: [skills/matcher.rs, agent.rs, db.rs, commands/ask.rs, skills/index.rs]
 
 ## Problem
 
-When using `mika ask` for code implementation tasks, the agent announced it would implement but never called `run_claude_pilot` — only performed reconnaissance (reading files, creating work items). The session ended without commits or actual implementation.
+When using `mika ask` for code implementation tasks, the agent announced it would implement but never called `run_claude_pilot` — only performed reconnaissance (reading files, creating tasks). The session ended without commits or actual implementation.
 
 Three root causes combined:
 

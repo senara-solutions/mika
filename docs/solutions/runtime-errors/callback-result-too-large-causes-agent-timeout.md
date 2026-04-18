@@ -12,7 +12,7 @@ components: [agent-loop, format_callback_framing, silent-agent]
 
 ## Problem
 
-After a large claude-pilot run (226 turns, ~90KB callback result), the silent agent timed out during prompt assembly. `format_callback_framing()` injected the full 90KB result into the system prompt. The serialization/setup phase consumed the entire 5-minute `AGENT_TOTAL_TIMEOUT_SECS` (300s). The agent never reached the LLM API call — zero tool calls, work item left unprocessed.
+After a large claude-pilot run (226 turns, ~90KB callback result), the silent agent timed out during prompt assembly. `format_callback_framing()` injected the full 90KB result into the system prompt. The serialization/setup phase consumed the entire 5-minute `AGENT_TOTAL_TIMEOUT_SECS` (300s). The agent never reached the LLM API call — zero tool calls, task left unprocessed.
 
 **Symptom:** Task shows `delivered` but the agent produced the fallback message "I'm sorry, that took too long." with zero tool calls.
 

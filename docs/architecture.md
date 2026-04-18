@@ -159,7 +159,7 @@ Always present in the system prompt. The agent can edit these blocks via the
 | `self_model` | "I am {agent_id}. No interaction history yet." |
 | `current_priorities` | "No priorities set yet." |
 | `key_people` | "No people tracked yet." |
-| `workflows` | "Delegate-then-forget is not allowed. Any work sent to Claude Code must have a corresponding work item created first (via create_work_item). No exceptions." |
+| `workflows` | "Delegate-then-forget is not allowed. Any work sent to Claude Code must have a corresponding task created first (via create_task). No exceptions." |
 
 **Constraints:**
 - Per-block limit: `MAX_TOKENS_PER_BLOCK = 500` (~2000 characters at 4 chars/token)
@@ -205,8 +205,8 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `create_reminder` | Schedule a one-shot reminder (`fire_at`) or periodic reminder (`cron_expr` 6-field cron with seconds first, e.g. `0 0 9 * * 1`). Optional `timezone` parameter (IANA name, e.g. `Asia/Singapore`) — when provided, `fire_at` and `cron_expr` are interpreted as local time and converted to UTC automatically. Without `timezone`, `fire_at` must be ISO 8601 UTC. Timezone stored in task `metadata` for recurring reminders so rescheduling respects DST. Optional `action_type`: `send_message` (default, delivers text notification) or `resume_agent` (wakes the agent to act on the reminder). Minimum interval: 1 minute. Outputs full UUID. | Reminders |
 | `list_reminders` | List pending and future reminders (excludes system callback tasks). Shows local time when timezone metadata is available, UTC otherwise. Shows cron expression and timezone for periodic reminders. Shows `[auto]` badge for `resume_agent` reminders. Outputs full UUIDs for use with `cancel_reminder`. | Reminders |
 | `cancel_reminder` | Cancel a pending reminder by full UUID. Delegates to `CancelTaskTool` (alias for backwards compatibility). | Reminders |
-| `list_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
-| `create_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against constants. timeout_secs capped at 90 days. | Tasks |
+| `list_scheduled_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
+| `create_scheduled_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against constants. timeout_secs capped at 90 days. | Tasks |
 | `cancel_task` | Cancel a pending task by full UUID (36-char validation). | Tasks |
 | `complete_task` | Mark an agent's own callback task complete with a result string. Validates trigger_type=callback and ownership via agent_id. | Tasks |
 | `get_task` | Inspect a task by full UUID. Returns all fields including status, trigger_type, action_type, result, timeout_at. | Tasks |
@@ -226,8 +226,8 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `list_audit_events` | List recent memory mutation audit events (fact stores, updates, core memory edits). Useful for self-introspection. Non-orchestrator agents scoped to own events. | Introspection |
 | `search_tool_history` | Search past tool call history across sessions by tool name, keyword, time range, and success status. Returns truncated input/output (500 chars), 10KB output cap, 30-day retention. Non-orchestrator agents scoped to own tool calls. | Introspection |
 | `a2a_call` | Call a remote A2A agent via the A2A protocol's `message/send` method. Sends a message to an external agent endpoint and returns the response. Optional Bearer token auth. 120s timeout. | A2A |
-| `list_work_items` | List work items with optional status and source filters. Returns up to 50, ordered by creation date. Includes status-count summary and filter guidance note (unfiltered calls only). | Work Items |
-| `check_work_item` | Read work item details and check linked GitHub PR/issue status. Parses `reference_url` for GitHub URLs, calls GitHub REST API with `github_token`. Graceful degradation when no token. 15s timeout. | Work Items |
+| `list_tasks` | List tasks with optional status and source filters. Returns up to 50, ordered by creation date. Includes status-count summary and filter guidance note (unfiltered calls only). | Tasks |
+| `check_task` | Read task details and check linked GitHub PR/issue status. Parses `reference_url` for GitHub URLs, calls GitHub REST API with `github_token`. Graceful degradation when no token. 15s timeout. | Tasks |
 | `pr_merge_with_gate` | Merge a GitHub PR with a CI gate. Checks required CI checks via `gh pr checks --required`, classifies by decision matrix (blocked/auto_merge_enabled/merged/already_merged). Spawns `gh` subprocess with `scrub_mika_env_vars` + `GH_TOKEN` re-injection. Requires `github_token`. 60s timeout. See #490. | PR Merge |
 
 ### Management Tools
@@ -235,22 +235,22 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 12 tools for multi-agent and team workflows, registered via
 `management_tools_if_needed()`. `create_agent`, `list_agents`, and `create_team` are always
 registered (enabling agent and team bootstrapping from a single-agent setup). The
-remaining 9 tools (including work item write tools) are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
+remaining 9 tools (including task write tools) are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
 
 | Tool | Description | Timeout | Always registered |
 |------|-------------|---------|-------------------|
 | `create_agent` | Create a new agent with name, display name, soul (personality), and optional model override. | default (30s) | Yes |
 | `list_agents` | List all configured agents with their identities and role hints. | default (30s) | Yes |
 | `create_team` | Create a new team definition with specified agents and flow. All referenced agents must exist. | default (30s) | Yes |
-| `delegate_task` | Delegate a task to another agent and get their response. Requires `work_item_id` (must create a work item first). Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
+| `delegate_task` | Delegate a task to another agent and get their response. Requires `task_id` (must create a task first). Runs with `default_tools()` only (no management tools, no MCP) to prevent recursion. | 120s | No |
 | `list_teams` | List all configured teams with full configuration (roles, mandates, max_iterations). | default (30s) | No |
 | `run_team` | Run a team workflow with a specified goal. Team agents collaborate to decompose, execute, review, and deliver results. | 300s | No |
 | `get_team_status` | Get the status of a team's most recent run, or a specific run by ID. | default (30s) | No |
 | `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) | No |
 | `delete_team` | Delete a team definition and all its data (workspace, config). Irreversible. | default (30s) | No |
 | `update_team` | Update an existing team definition. Only provided fields are changed. | default (30s) | No |
-| `create_work_item` | Create a trackable work item with optional parent, source, and reference_url. Max depth 3, max 5 agent-created per session (user_request exempt). Cannot be used in callback turns. | default (30s) | No |
-| `update_work_item_status` | Update work item status with validated transitions. Permitted: pending→any, in_progress→blocked/completed/cancelled, blocked→in_progress/completed/cancelled. Terminal states (completed, cancelled) are final. Logs audit event. | default (30s) | No |
+| `create_task` | Create a trackable task with optional parent, source, and reference_url. Max depth 3, max 5 agent-created per session (user_request exempt). Cannot be used in callback turns. | default (30s) | No |
+| `update_task_status` | Update task status with validated transitions. Permitted: pending→any, in_progress→blocked/completed/cancelled, blocked→in_progress/completed/cancelled. Terminal states (completed, cancelled) are final. Logs audit event. | default (30s) | No |
 
 Management tools are NOT registered for team sub-agents or delegated agents,
 preventing infinite delegation chains.
@@ -518,7 +518,7 @@ Source: `crates/mika-agent/src/task_engine/`
 
 Agent-created callback tasks follow this end-to-end pattern:
 
-1. Agent calls `create_task` with `trigger_type="callback"` and `action_type="resume_agent"`. Receives full UUID.
+1. Agent calls `create_scheduled_task` with `trigger_type="callback"` and `action_type="resume_agent"`. Receives full UUID.
 2. Agent or background script does long-running work.
 3. External process completes the task via one of:
    - **CLI:** `mika ask --agent <name> --task-id <uuid> "<result>"` — marks task complete and exits (no silent agent run). TUI handles delivery.
@@ -528,7 +528,7 @@ Agent-created callback tasks follow this end-to-end pattern:
    - **Server path:** `TaskDispatcher::dispatch_resume_agent` fires via `SilentTrigger::Callback { label, result, failed }` → marks task `delivered` on success. The engine also periodically scans for undelivered callbacks (both completed and failed) via `dispatch_undelivered_callbacks()` every 60 ticks, ensuring failed callbacks from the background monitor are delivered even without an external trigger.
    - **CLI/TUI path:** TUI polls `get_undelivered_callback_tasks()` every ~5s when idle → atomically claims via `mark_task_delivered()` → injects result into conversation as `role='tool_result'` → runs agent with `is_callback_turn: true` (blocks long-running task creation). On agent failure, unclaims task for retry (resetting to the original status, preserving `failed` vs `completed`). Failed tasks with empty results get a fallback message (`FAILED_TASK_FALLBACK`).
 
-The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. The framing also includes a grounding instruction ("Report only what this result explicitly states") to prevent the agent from extrapolating downstream state (e.g., claiming PR readiness from a build success). When `failed=true`, the framing says "A background task has FAILED" to help the LLM distinguish success from failure. When a callback has a `parent_task_id`, the framing includes a "Parent work item: {id}" line so the agent can correlate the callback to the originating work item. `build_callback_trigger_context()` uses a single generic framing path for all callback types — workflow-specific behavior (e.g., claude-pilot → self-dev skill) is driven by active skill prompts, not the engine (#313). Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered` or `pending → failed → delivered`.
+The result is wrapped in `<callback_result trust="untrusted">` delimiters via `format_callback_framing()` before LLM injection to mitigate prompt injection. The framing also includes a grounding instruction ("Report only what this result explicitly states") to prevent the agent from extrapolating downstream state (e.g., claiming PR readiness from a build success). When `failed=true`, the framing says "A background task has FAILED" to help the LLM distinguish success from failure. When a callback has a `parent_task_id`, the framing includes a "Parent task: {id}" line so the agent can correlate the callback to the originating task. `build_callback_trigger_context()` uses a single generic framing path for all callback types — workflow-specific behavior (e.g., claude-pilot → self-dev skill) is driven by active skill prompts, not the engine (#313). Callback turns cannot spawn new long-running tasks (defense in depth: code guard via `LongRunningContext=None` + prompt guard via `callback_context` in `PromptContext`). Task lifecycle: `pending → completed → delivered` or `pending → failed → delivered`.
 
 ### SilentTrigger Variants
 
@@ -538,7 +538,7 @@ The result is wrapped in `<callback_result trust="untrusted">` delimiters via `f
 |---------|---------|---------------|
 | `Heartbeat` | Hourly heartbeat recurring task | Scheduled check-in, review commitments |
 | `Reflection` | Daily reflection recurring task | Memory reflection and consolidation |
-| `Callback { label, result, failed, parent_task_id }` | `resume_agent` dispatcher | Background task completed/failed, inject result with parent work item context |
+| `Callback { label, result, failed, parent_task_id }` | `resume_agent` dispatcher | Background task completed/failed, inject result with parent task context |
 | `SkillRun { skill_name }` | `run_skill` dispatcher | Run the named skill |
 
 ### Startup Maintenance
@@ -587,10 +587,10 @@ types and injects them into the system prompt as a `<task-health>` block:
 - **Stuck callbacks:** `completed` but not `delivered` for >10 minutes
 - **Failed recurring:** Recurring tasks in `failed` status (last 24h)
 - **Long-running:** Tasks `in_progress` for >1 hour
-- **Stale blocked:** Manual work items `blocked` with no activity for >24 hours
-- **GitHub-linked:** Active work items with GitHub PR/issue reference URLs
+- **Stale blocked:** Manual tasks `blocked` with no activity for >24 hours
+- **GitHub-linked:** Active tasks with GitHub PR/issue reference URLs
 
-Active manual work items (pending/in_progress/blocked) are included in the
+Active manual tasks (pending/in_progress/blocked) are included in the
 same block. Anomalies are capped at 10 (`health_thresholds::MAX_ANOMALIES`).
 Task policy preferences (`task_policy_*` prefix) are also injected as a
 `<stored-preferences>` block for autonomous action. Both are gated to
@@ -739,7 +739,7 @@ Tailwind CSS v4, TanStack React Query, React Router, Lucide icons.
 | `/sessions/:id` | Session Detail | Chat-style message thread with role-based styling, tool call summaries, and investigation side panel (SSE-powered agent analysis) |
 | `/traces` | Traces | Trace ID search |
 | `/traces/:id` | Trace Detail | All events for a trace |
-| `/tasks` | Tasks | Four-section view: Work Items, Team Run Tasks, Standalone Callbacks, Scheduled |
+| `/tasks` | Tasks | Four-section view: Tasks, Team Run Tasks, Standalone Callbacks, Scheduled |
 | `/team-runs` | Team Runs | Filterable team run list with status and team name filters |
 | `/team-runs/:id` | Team Run Detail | Run summary, iteration timeline, workspace entries, cross-links to sessions |
 
@@ -857,11 +857,11 @@ sends in a background task (does not block message processing).
 ### Agent Delegation
 
 When multiple agents are configured, the primary agent can delegate tasks to other
-agents via the `delegate_task` tool. **Work item guard:** `delegate_task` requires a
-`work_item_id` parameter — the agent must create a work item first using
-`create_work_item`, then pass its ID. Calls without a valid, active work item are
+agents via the `delegate_task` tool. **Task guard:** `delegate_task` requires a
+`task_id` parameter — the agent must create a task first using
+`create_task`, then pass its ID. Calls without a valid, active task are
 rejected at code level. Long-running skill executions enforce the same guard via
-schema injection (`inject_work_item_id_field`). The delegate runs with its own
+schema injection (`inject_task_id_field`). The delegate runs with its own
 personality, memory, and skills but receives only `default_tools()` (no management
 tools, no MCP) to prevent infinite delegation chains. The system prompt includes an
 "Agents & Teams" section listing available agents with their identities (emoji + name).
@@ -958,7 +958,7 @@ no exporter is created. Spans still flow to the normal log subscriber either way
 
 ## Appendix: Database Schema
 
-**Schema version:** 21 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index; v10: adds `trace_id TEXT` to `team_runs` for resume continuity, extends `unified_timeline` VIEW with `team_workspace` UNION ALL, adds `idx_team_ws_trace` partial index; v11: adds `execution_trace_id TEXT` to `tasks` with `idx_tasks_execution_trace` partial index, adds `parent_session_id TEXT` to `sessions` with `idx_sessions_parent` partial index, recreates `unified_timeline` VIEW with `COALESCE(execution_trace_id, created_trace_id)` for the task leg; v12: converts all timestamp columns from `INTEGER` (Unix epoch) to `TEXT` (ISO 8601 `%Y-%m-%dT%H:%M:%SZ`), full table rebuilds with `strftime()` data conversion, defaults changed from `unixepoch()` to `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`; v13: A2A protocol orthogonal persistence — adds `a2a` to tasks trigger_type CHECK, creates `a2a_task_map`, `a2a_artifacts`, `a2a_push_notification_configs` tables; v14: adds `metadata TEXT` to tasks; v15: creates `llm_calls` and `tool_calls` tables, recreates `unified_timeline` VIEW; v16: adds `step INTEGER` to `llm_calls`; v17: dedup active work items, creates `idx_tasks_manual_active_ref_url` unique index; v18: widens `idx_tasks_unique_reminder`; v19: adds `task_id TEXT` to sessions; v20: adds `llm_provider`/`llm_model` to `skill_overrides`; v21: adds `prompt_variant TEXT` to `llm_calls` — nullable JSON map of skill names to resolved variant descriptors)
+**Schema version:** 21 (v1→v3: clean-slate session+messages redesign; v4: adds `commitments` dedup indexes; v5: renames `memory_events` → `audit_events`, adds `trace_id` columns to messages/audit_events/team_workspace/tasks, creates `unified_timeline` VIEW for cross-subsystem correlation; v6: adds `mention_count` column to `people` table, incremented on each `update_person` call; v7: adds `skill_overrides` table to persist built-in skill `always_on` user preferences across `seed_bundled_skills()` re-sync cycles; v8: full table rebuild of `tasks` — adds `manual` trigger_type, `none` action_type, `blocked` status to CHECK constraints, adds `source TEXT` and `reference_url TEXT` columns, creates `idx_tasks_manual_active` partial index; v9: full table rebuild of `audit_events` — makes `after_value` nullable, adds `rewound_by_trace_id TEXT` column for rewind tracking, creates `idx_audit_rewound` partial index; v10: adds `trace_id TEXT` to `team_runs` for resume continuity, extends `unified_timeline` VIEW with `team_workspace` UNION ALL, adds `idx_team_ws_trace` partial index; v11: adds `execution_trace_id TEXT` to `tasks` with `idx_tasks_execution_trace` partial index, adds `parent_session_id TEXT` to `sessions` with `idx_sessions_parent` partial index, recreates `unified_timeline` VIEW with `COALESCE(execution_trace_id, created_trace_id)` for the task leg; v12: converts all timestamp columns from `INTEGER` (Unix epoch) to `TEXT` (ISO 8601 `%Y-%m-%dT%H:%M:%SZ`), full table rebuilds with `strftime()` data conversion, defaults changed from `unixepoch()` to `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`; v13: A2A protocol orthogonal persistence — adds `a2a` to tasks trigger_type CHECK, creates `a2a_task_map`, `a2a_artifacts`, `a2a_push_notification_configs` tables; v14: adds `metadata TEXT` to tasks; v15: creates `llm_calls` and `tool_calls` tables, recreates `unified_timeline` VIEW; v16: adds `step INTEGER` to `llm_calls`; v17: dedup active tasks, creates `idx_tasks_manual_active_ref_url` unique index; v18: widens `idx_tasks_unique_reminder`; v19: adds `task_id TEXT` to sessions; v20: adds `llm_provider`/`llm_model` to `skill_overrides`; v21: adds `prompt_variant TEXT` to `llm_calls` — nullable JSON map of skill names to resolved variant descriptors)
 
 ### Tables
 

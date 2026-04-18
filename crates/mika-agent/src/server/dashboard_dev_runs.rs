@@ -1,4 +1,4 @@
-//! Dashboard API handlers for Dev Runs — claude-pilot work items.
+//! Dashboard API handlers for Dev Runs — claude-pilot tasks.
 
 use axum::{
     Json,

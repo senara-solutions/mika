@@ -56,7 +56,7 @@ This rule is being added to the `self-dev` skill prompt as part of `mika-platfor
 
 1. **`verify-pipeline.sh`** should reject PRs containing only docs (under `docs/plans/` or `docs/solutions/`) with no source changes — and reject PRs containing only source changes with no corresponding plan/solution docs. Explicit opt-out via a commit trailer for the small number of legitimately doc-only or code-only changes. Tracked in `mika-platform#17` section C.
 2. **Branch protection** must require the `Pipeline Artifacts` status check on all four repos so a PR with the wrong file set cannot merge even if the agent calls `gh pr merge`. Tracked in `mika-platform#17` section A.
-3. **mika-dev's merge logic** must read the CI status rollup before calling merge. On any required-check `FAILURE`, block and transition the work item. On `PENDING`, use `gh pr merge --auto` so GitHub completes the merge when checks pass. Tracked in `mika-platform#17` section B.
+3. **mika-dev's merge logic** must read the CI status rollup before calling merge. On any required-check `FAILURE`, block and transition the task. On `PENDING`, use `gh pr merge --auto` so GitHub completes the merge when checks pass. Tracked in `mika-platform#17` section B.
 
 ## Prevention
 

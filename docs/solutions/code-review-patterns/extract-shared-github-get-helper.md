@@ -1,15 +1,15 @@
 ---
-title: "Extract shared github_get helper from check_work_item"
+title: "Extract shared github_get helper from check_task"
 category: code-review-patterns
 date: 2026-03-28
 tags: [refactoring, deduplication, github-api, reqwest]
 ---
 
-# Extract shared github_get helper from check_work_item
+# Extract shared github_get helper from check_task
 
 ## Problem
 
-`fetch_github_pr_status` and `fetch_github_issue_status` in `check_work_item.rs` shared ~15 lines of identical boilerplate: reqwest client construction with 10s timeout, Authorization/User-Agent/Accept headers, HTTP status code error mapping (401/403/404/429), and JSON response parsing.
+`fetch_github_pr_status` and `fetch_github_issue_status` in `check_task.rs` shared ~15 lines of identical boilerplate: reqwest client construction with 10s timeout, Authorization/User-Agent/Accept headers, HTTP status code error mapping (401/403/404/429), and JSON response parsing.
 
 ## Root Cause
 
@@ -23,4 +23,4 @@ The 404 error message was generalized from context-specific ("PR not found" / "i
 
 ## Prevention
 
-When adding new GitHub API endpoints to `check_work_item.rs`, reuse the `github_get` helper rather than duplicating HTTP boilerplate.
+When adding new GitHub API endpoints to `check_task.rs`, reuse the `github_get` helper rather than duplicating HTTP boilerplate.

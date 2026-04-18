@@ -70,7 +70,7 @@ Inspect your own runtime state — logs, conversations, tasks, audit trail, team
    SELECT trigger_type, status, COUNT(*) as count FROM tasks
    WHERE created_at >= '<start>' GROUP BY trigger_type, status;
    ```
-   Once workflow tasks land, also check: `trigger_type = 'manual'` progression, `blocked` transitions in audit_log, parent-child depth (must be ≤ 3), session cap violations (max 5 agent-created work items per session).
+   Once workflow tasks land, also check: `trigger_type = 'manual'` progression, `blocked` transitions in audit_log, parent-child depth (must be ≤ 3), session cap violations (max 5 agent-created tasks per session).
 
 8. **Analyze unified timeline**:
    ```sql

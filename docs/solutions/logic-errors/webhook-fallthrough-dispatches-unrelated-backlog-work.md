@@ -6,9 +6,9 @@ component: tooling
 severity: high
 symptoms:
   - "mika-dev dispatches claude-pilot on unrelated issues when receiving a GitHub webhook"
-  - "list_work_items and create_work_item called during webhook turns that should be informational"
+  - "list_tasks and create_task called during webhook turns that should be informational"
   - "Parallel claude-pilot sessions launched for different repos in the same turn"
-  - "Stale pending work items left behind from abandoned dispatch attempts"
+  - "Stale pending tasks left behind from abandoned dispatch attempts"
 root_cause: missing_workflow_step
 resolution_type: code_fix
 tags:
@@ -25,21 +25,21 @@ tags:
 
 ## Problem
 
-When mika-dev received a GitHub webhook (e.g., `pull_request_review.submitted`) that didn't keyword-match a specific webhook handler skill (`self-dev-webhook-qa`, `self-dev-webhook-ci`), the `self-dev` skill's always-on generic workflow took over. The generic workflow's Steps 1-3 instructed the agent to: understand the issue, track the work item via `list_work_items`, and immediately launch `run_claude_pilot`. This caused the agent to scan the backlog and dispatch claude-pilot on completely unrelated tickets.
+When mika-dev received a GitHub webhook (e.g., `pull_request_review.submitted`) that didn't keyword-match a specific webhook handler skill (`self-dev-webhook-qa`, `self-dev-webhook-ci`), the `self-dev` skill's always-on generic workflow took over. The generic workflow's Steps 1-3 instructed the agent to: understand the issue, track the task via `list_tasks`, and immediately launch `run_claude_pilot`. This caused the agent to scan the backlog and dispatch claude-pilot on completely unrelated tickets.
 
 ## Symptoms
 
 - `pull_request_review.submitted` webhook for PR #38 triggered backlog scanning
-- Agent called `list_work_items` and found unrelated issues #571, #572
-- Agent created work items and dispatched `run_claude_pilot` for both unrelated issues in the same turn
+- Agent called `list_tasks` and found unrelated issues #571, #572
+- Agent created tasks and dispatched `run_claude_pilot` for both unrelated issues in the same turn
 - Two parallel claude-pilot sessions launched against different repos simultaneously
-- Previous dispatch waves left orphaned `pending` work items that never transitioned
+- Previous dispatch waves left orphaned `pending` tasks that never transitioned
 
 ## What Didn't Work
 
 - **Prompt-only SCOPE RULE** on the Callback Entry Point prevented backlog scanning during callbacks, but webhook turns had no equivalent guardrail
 - **Skill decomposition** (`self-dev-webhook-qa`, `self-dev-webhook-ci`) handled specific event types but left a gap for unmatched events that fell through to the always-on `self-dev` prompt
-- **Per-work-item dispatch guard** (`validate_dispatch_readiness`) prevented double-dispatch on the same work item but allowed dispatches to different work items in the same turn
+- **Per-work-item dispatch guard** (`validate_dispatch_readiness`) prevented double-dispatch on the same task but allowed dispatches to different tasks in the same turn
 - The dangling reference at line 141 of `self-dev/system_prompt.md` pointed to a "Webhook Entry Point" section that had been decomposed into the separate `self-dev-webhook-qa` skill but was never updated
 
 ## Solution
@@ -48,11 +48,11 @@ Defense-in-depth fix with three layers: prompt-level scope control, engine-level
 
 ### 1. Prompt: Webhook Fallthrough Section
 
-Added a `### Webhook Fallthrough (no keyword-matched handler)` section to `mika-skills/self-dev/system_prompt.md` with a SCOPE RULE that explicitly prohibits `list_work_items` backlog scans, `create_work_item`, and `run_claude_pilot` on webhook turns where no specific handler skill activated. Also added Calibration Rule 9 encoding this incident.
+Added a `### Webhook Fallthrough (no keyword-matched handler)` section to `mika-skills/self-dev/system_prompt.md` with a SCOPE RULE that explicitly prohibits `list_tasks` backlog scans, `create_task`, and `run_claude_pilot` on webhook turns where no specific handler skill activated. Also added Calibration Rule 9 encoding this incident.
 
 ### 2. Engine: Global Active-Dispatch Guard
 
-Added a third check to `validate_dispatch_readiness()` in `executor.rs`: query `has_active_callback_tasks_excluding(work_item_id, agent_id)` to detect if ANY other work item already has an active callback child. Rejects with `global_dispatch_active` error, scoped to the requesting agent's `agent_id` to avoid cross-agent false positives in team/delegate scenarios.
+Added a third check to `validate_dispatch_readiness()` in `executor.rs`: query `has_active_callback_tasks_excluding(task_id, agent_id)` to detect if ANY other task already has an active callback child. Rejects with `global_dispatch_active` error, scoped to the requesting agent's `agent_id` to avoid cross-agent false positives in team/delegate scenarios.
 
 ### 3. Engine: Per-Turn Dispatch Counter
 
@@ -60,7 +60,7 @@ Added `dispatch_count: AtomicU32` to `LongRunningContext`, initialized to 0 per 
 
 ### 4. Health: Stale Pending Detection
 
-Added `stale_pending` anomaly type to `get_task_health_summary()`: flags manual work items in `pending` status for >24 hours with no callback child, surfacing items that were created but never dispatched.
+Added `stale_pending` anomaly type to `get_task_health_summary()`: flags manual tasks in `pending` status for >24 hours with no callback child, surfacing items that were created but never dispatched.
 
 ## Why This Works
 
@@ -68,7 +68,7 @@ The root cause was a structural gap in the self-dev skill prompt: no webhook-spe
 
 The prompt fix (Layer 1) addresses the immediate gap. But per institutional learnings from the #522 incident and the dispatch-readiness guard pattern, "tool boundaries are the only reliable enforcement — soft advisory strings from tools are ignored by LLMs under recovery load." The engine guards (Layers 2-3) provide structural backstops that cannot be bypassed by prompt non-adherence:
 
-- The global guard ensures at most one active dispatch across all work items per agent
+- The global guard ensures at most one active dispatch across all tasks per agent
 - The per-turn counter ensures at most one dispatch per conversation turn
 - Both return structured JSON errors that explain why dispatch was rejected, so the LLM can understand and comply
 

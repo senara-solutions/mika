@@ -77,14 +77,14 @@ pub fn is_unique_violation(err: &anyhow::Error) -> bool {
 
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
 
-/// Default value for the `tasks.type` column. New work items default to `"issue"`
+/// Default value for the `tasks.type` column. New tasks default to `"issue"`
 /// unless the caller explicitly requests `"milestone"` or `"project"`.
 pub const TASK_TYPE_ISSUE: &str = "issue";
 pub const TASK_TYPE_MILESTONE: &str = "milestone";
 pub const TASK_TYPE_PROJECT: &str = "project";
 
 /// All valid values for the `tasks.type` column. Enforced by SQLite CHECK and by
-/// the `create_work_item` tool boundary. Order is the documented enum order.
+/// the `create_task` tool boundary. Order is the documented enum order.
 pub const VALID_TASK_TYPES: &[&str] = &[TASK_TYPE_ISSUE, TASK_TYPE_MILESTONE, TASK_TYPE_PROJECT];
 
 pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
@@ -95,7 +95,7 @@ pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
     (
         "workflows",
         "Delegate-then-forget is not allowed. Any work sent to Claude Code must have a \
-         corresponding work item created first (via create_work_item). No exceptions.",
+         corresponding task created first (via create_task). No exceptions.",
     ),
 ];
 
@@ -160,7 +160,7 @@ pub struct Task {
     pub reference_url: Option<String>,
     pub source: Option<String>,
     pub metadata: Option<String>,
-    /// Work item kind: `"issue"`, `"milestone"`, or `"project"`. NOT NULL in the DB,
+    /// Task kind: `"issue"`, `"milestone"`, or `"project"`. NOT NULL in the DB,
     /// defaulted to `"issue"` for backward compatibility (added in schema v23). See
     /// [`VALID_TASK_TYPES`].
     pub r#type: String,
@@ -188,7 +188,7 @@ pub struct NewTask {
     pub reference_url: Option<String>,
     pub source: Option<String>,
     pub metadata: Option<String>,
-    /// Work item kind. `None` (or an empty string) means "use the SQL default"
+    /// Task kind. `None` (or an empty string) means "use the SQL default"
     /// (`"issue"`), preserving backward compatibility for existing callers. Values
     /// other than those in [`VALID_TASK_TYPES`] are rejected by the DB CHECK
     /// constraint; prefer validating at the tool boundary before INSERT.
@@ -276,8 +276,8 @@ pub struct TaskHealthAnomaly {
 /// Aggregated task health summary for heartbeat prompt injection.
 #[derive(Debug, Clone, Default)]
 pub struct TaskHealthSummary {
-    /// Active manual work items (pending/in_progress/blocked).
-    pub active_work_items: Vec<Task>,
+    /// Active manual tasks (pending/in_progress/blocked).
+    pub active_tasks: Vec<Task>,
     /// Anomalous task states across all trigger types, capped at [`health_thresholds::MAX_ANOMALIES`].
     pub anomalies: Vec<TaskHealthAnomaly>,
 }
@@ -1408,7 +1408,7 @@ impl Database {
 
     fn migrate_v7_to_v8(&self) -> Result<()> {
         info!(
-            "migrating database schema v7 → v8 (work items: manual trigger_type, blocked status, none action_type, reference_url, source)"
+            "migrating database schema v7 → v8 (tasks: manual trigger_type, blocked status, none action_type, reference_url, source)"
         );
 
         // SQLite cannot ALTER CHECK constraints, so we must rebuild the tasks table.
@@ -2410,13 +2410,13 @@ impl Database {
     }
 
     fn migrate_v16_to_v17(&self) -> Result<()> {
-        info!("migrating database schema v16 → v17 (add work item dedup index on reference_url)");
+        info!("migrating database schema v16 → v17 (add task dedup index on reference_url)");
 
         // Wrap in transaction for atomicity (matches pattern in migrate_v7_to_v8, etc.)
         self.conn.execute_batch(
             "BEGIN IMMEDIATE;
 
-             -- Step 1: Cancel duplicate active work items with the same (agent_id, reference_url).
+             -- Step 1: Cancel duplicate active tasks with the same (agent_id, reference_url).
              -- Keep the earliest-created item per group (by rowid for deterministic tiebreaking
              -- when created_at timestamps collide), cancel the rest with a metadata breadcrumb.
              UPDATE tasks SET status = 'cancelled',
@@ -2997,7 +2997,7 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Get a manual (work item) task by ID, scoped to the given agent.
+    /// Get a manual (task) task by ID, scoped to the given agent.
     pub fn get_manual_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks WHERE id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'",
@@ -3027,7 +3027,7 @@ impl Database {
         Ok(ids)
     }
 
-    /// Count child tasks for a given parent task (manual work items only).
+    /// Count child tasks for a given parent task (manual tasks only).
     pub fn count_child_tasks(
         &self,
         parent_task_id: &str,
@@ -3146,7 +3146,7 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Update the status of a manual (work item) task. Free transitions allowed.
+    /// Update the status of a manual (task) task. Free transitions allowed.
     /// Sets `completed_at` when transitioning to `completed`.
     /// Returns the old status for audit logging.
     pub fn update_manual_task_status(
@@ -3185,7 +3185,7 @@ impl Database {
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
     const TASK_COLUMN_COUNT: usize = 30;
 
-    /// List manual (work item) tasks for an agent with optional filters.
+    /// List manual (task) tasks for an agent with optional filters.
     /// Uses parameterized NULL checks to avoid dynamic SQL construction.
     pub fn list_manual_tasks(
         &self,
@@ -3229,11 +3229,11 @@ impl Database {
         Ok(rows)
     }
 
-    /// Count **active** agent-created work items in a session (for per-session cap enforcement).
+    /// Count **active** agent-created tasks in a session (for per-session cap enforcement).
     /// Only pending/in_progress/blocked items count — completed/cancelled/failed/delivered
-    /// items are terminal and should not block new work item creation (sprint mode).
+    /// items are terminal and should not block new task creation (sprint mode).
     /// Scoped to agent_id for defense-in-depth.
-    pub fn count_session_work_items(&self, agent_id: &str, session_id: &str) -> Result<i64> {
+    pub fn count_session_tasks(&self, agent_id: &str, session_id: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
              WHERE agent_id = ?1 AND created_by_session = ?2 AND trigger_type = 'manual'
@@ -3245,10 +3245,10 @@ impl Database {
         Ok(n)
     }
 
-    /// Find an active manual work item by agent_id and reference_url.
-    /// Used for dedup when `create_work_item` is called with a reference_url that
-    /// already has an active (non-terminal) work item.
-    pub fn find_active_work_item_by_ref_url(
+    /// Find an active manual task by agent_id and reference_url.
+    /// Used for dedup when `create_task` is called with a reference_url that
+    /// already has an active (non-terminal) task.
+    pub fn find_active_task_by_ref_url(
         &self,
         agent_id: &str,
         reference_url: &str,
@@ -3267,14 +3267,10 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Find an active manual work item by agent_id and PR URL stored in metadata.
+    /// Find an active manual task by agent_id and PR URL stored in metadata.
     /// Looks up `json_extract(metadata, '$.claude_pilot.pr_url')` for matching.
-    /// Used to locate the parent work item when a PR review verdict arrives.
-    pub fn find_active_work_item_by_pr_url(
-        &self,
-        agent_id: &str,
-        pr_url: &str,
-    ) -> Result<Option<Task>> {
+    /// Used to locate the parent task when a PR review verdict arrives.
+    pub fn find_active_task_by_pr_url(&self, agent_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1
@@ -3290,15 +3286,11 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Find an active manual work item by agent_id and branch stored in metadata.
+    /// Find an active manual task by agent_id and branch stored in metadata.
     /// Looks up `json_extract(metadata, '$.claude_pilot.branch')` for matching.
-    /// Used to locate the parent work item when a PR webhook arrives before
-    /// the PR URL has been recorded (in-flight work items only have a branch).
-    pub fn find_active_work_item_by_branch(
-        &self,
-        agent_id: &str,
-        branch: &str,
-    ) -> Result<Option<Task>> {
+    /// Used to locate the parent task when a PR webhook arrives before
+    /// the PR URL has been recorded (in-flight tasks only have a branch).
+    pub fn find_active_task_by_branch(&self, agent_id: &str, branch: &str) -> Result<Option<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1
@@ -3314,13 +3306,9 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Find an active manual work item by agent_id and label (case-insensitive).
-    /// Used as a fallback dedup path when `create_work_item` is called without a reference_url.
-    pub fn find_active_work_item_by_label(
-        &self,
-        agent_id: &str,
-        label: &str,
-    ) -> Result<Option<Task>> {
+    /// Find an active manual task by agent_id and label (case-insensitive).
+    /// Used as a fallback dedup path when `create_task` is called without a reference_url.
+    pub fn find_active_task_by_label(&self, agent_id: &str, label: &str) -> Result<Option<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
@@ -3349,7 +3337,7 @@ impl Database {
     }
 
     /// List pending/in_progress/blocked manual tasks for prompt injection (heartbeat awareness).
-    pub fn list_active_work_items(&self, agent_id: &str) -> Result<Vec<Task>> {
+    pub fn list_active_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks
              WHERE agent_id = ?1 AND trigger_type = 'manual'
@@ -3366,12 +3354,12 @@ impl Database {
 
     /// Build a task health summary for heartbeat prompt injection.
     ///
-    /// Returns active manual work items plus anomalous task states across all trigger types.
+    /// Returns active manual tasks plus anomalous task states across all trigger types.
     /// Anomalies are capped at [`crate::task_engine::types::health_thresholds::MAX_ANOMALIES`].
     pub fn get_task_health_summary(&self, agent_id: &str) -> Result<TaskHealthSummary> {
         use crate::task_engine::types::health_thresholds;
 
-        let active_work_items = self.list_active_work_items(agent_id)?;
+        let active_tasks = self.list_active_tasks(agent_id)?;
         let now = Utc::now();
         let mut anomalies: Vec<TaskHealthAnomaly> = Vec::new();
 
@@ -3480,7 +3468,7 @@ impl Database {
             }
         }
 
-        // 4. Stale blocked manual work items
+        // 4. Stale blocked manual tasks
         {
             let threshold = timestamp::format(
                 &(now - Duration::seconds(health_thresholds::STALE_BLOCKED_SECS)),
@@ -3507,7 +3495,7 @@ impl Database {
             }
         }
 
-        // 5. Stale pending manual work items with no callback child (#583)
+        // 5. Stale pending manual tasks with no callback child (#583)
         {
             let threshold = timestamp::format(
                 &(now - Duration::seconds(health_thresholds::STALE_PENDING_SECS)),
@@ -3539,7 +3527,7 @@ impl Database {
             }
         }
 
-        // 6. GitHub-linked manual work items (active, with reference_url containing github.com)
+        // 6. GitHub-linked manual tasks (active, with reference_url containing github.com)
         {
             let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len()) as i64;
             if remaining > 0 {
@@ -3563,7 +3551,7 @@ impl Database {
         anomalies.truncate(health_thresholds::MAX_ANOMALIES);
 
         Ok(TaskHealthSummary {
-            active_work_items,
+            active_tasks,
             anomalies,
         })
     }
@@ -3823,7 +3811,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Check if any active callback tasks exist for a work item OTHER than the excluded one.
+    /// Check if any active callback tasks exist for a task OTHER than the excluded one.
     ///
     /// Returns `Some((parent_task_id, callback_task_id))` if an active callback task exists
     /// whose parent differs from `excluded_parent_id`. Used by the global dispatch guard
@@ -7111,11 +7099,11 @@ impl Database {
         Ok((data, count))
     }
 
-    // ===== Dashboard: Dev Runs (work items with dev-run sources) =====
+    // ===== Dashboard: Dev Runs (tasks with dev-run sources) =====
 
-    /// Update the metadata JSON on a manual (work item) task.
+    /// Update the metadata JSON on a manual (task) task.
     /// Only works on `trigger_type='manual'` tasks. Returns false if not found.
-    pub fn update_work_item_metadata(&self, task_id: &str, metadata_json: &str) -> Result<bool> {
+    pub fn update_task_metadata(&self, task_id: &str, metadata_json: &str) -> Result<bool> {
         let rows = self.conn.execute(
             "UPDATE tasks SET metadata = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?2 AND trigger_type = 'manual'",
@@ -7124,7 +7112,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Get a single dev run (work item with a dev-run source) by ID — unscoped by agent_id.
+    /// Get a single dev run (task with a dev-run source) by ID — unscoped by agent_id.
     pub fn get_dev_run(&self, task_id: &str) -> Result<Option<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks WHERE id = ?1 AND trigger_type = 'manual' AND source IN ('self_dev', 'github_issue')",
@@ -7136,7 +7124,7 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// List dev runs (work items with dev-run sources) with pagination and count.
+    /// List dev runs (tasks with dev-run sources) with pagination and count.
     pub fn list_dev_runs_paginated_with_count(
         &self,
         status: Option<&str>,
@@ -9826,12 +9814,12 @@ mod tests {
     fn test_health_summary_empty_no_anomalies() {
         let db = db();
         let summary = db.get_task_health_summary("mika").unwrap();
-        assert!(summary.active_work_items.is_empty());
+        assert!(summary.active_tasks.is_empty());
         assert!(summary.anomalies.is_empty());
     }
 
     #[test]
-    fn test_health_summary_active_work_items() {
+    fn test_health_summary_active_tasks() {
         let db = db();
         let task = NewTask {
             reference_url: Some("https://github.com/org/repo/issues/1".to_string()),
@@ -9839,8 +9827,8 @@ mod tests {
         };
         db.create_task(&task).unwrap();
         let summary = db.get_task_health_summary("mika").unwrap();
-        assert_eq!(summary.active_work_items.len(), 1);
-        assert_eq!(summary.active_work_items[0].label, "Fix bug");
+        assert_eq!(summary.active_tasks.len(), 1);
+        assert_eq!(summary.active_tasks[0].label, "Fix bug");
         // Also detected as github_linked anomaly
         assert!(
             summary
@@ -10126,49 +10114,46 @@ mod tests {
         assert!(visible.iter().all(|m| !m.internal));
     }
 
-    // -- find_active_work_item_by_pr_url tests --
+    // -- find_active_task_by_pr_url tests --
 
     #[test]
-    fn test_find_active_work_item_by_pr_url_found() {
+    fn test_find_active_task_by_pr_url_found() {
         let db = db();
         let pr_url = "https://github.com/senara-solutions/mika/pull/42";
         let task = new_task("mika", "Implement feature", "manual", "none");
         let id = db.create_task(&task).unwrap();
         let meta =
             r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/42"}}"#;
-        db.update_work_item_metadata(&id, meta).unwrap();
+        db.update_task_metadata(&id, meta).unwrap();
 
-        let found = db.find_active_work_item_by_pr_url("mika", pr_url).unwrap();
+        let found = db.find_active_task_by_pr_url("mika", pr_url).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, id);
     }
 
     #[test]
-    fn test_find_active_work_item_by_pr_url_not_found() {
+    fn test_find_active_task_by_pr_url_not_found() {
         let db = db();
         let task = new_task("mika", "Implement feature", "manual", "none");
         let id = db.create_task(&task).unwrap();
         let meta =
             r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/42"}}"#;
-        db.update_work_item_metadata(&id, meta).unwrap();
+        db.update_task_metadata(&id, meta).unwrap();
 
         let found = db
-            .find_active_work_item_by_pr_url(
-                "mika",
-                "https://github.com/senara-solutions/mika/pull/99",
-            )
+            .find_active_task_by_pr_url("mika", "https://github.com/senara-solutions/mika/pull/99")
             .unwrap();
         assert!(found.is_none());
     }
 
     #[test]
-    fn test_find_active_work_item_by_pr_url_completed_not_returned() {
+    fn test_find_active_task_by_pr_url_completed_not_returned() {
         let db = db();
         let task = new_task("mika", "Done feature", "manual", "none");
         let id = db.create_task(&task).unwrap();
         let meta =
             r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/42"}}"#;
-        db.update_work_item_metadata(&id, meta).unwrap();
+        db.update_task_metadata(&id, meta).unwrap();
         db.conn
             .execute(
                 "UPDATE tasks SET status = 'completed' WHERE id = ?1",
@@ -10177,69 +10162,63 @@ mod tests {
             .unwrap();
 
         let found = db
-            .find_active_work_item_by_pr_url(
-                "mika",
-                "https://github.com/senara-solutions/mika/pull/42",
-            )
+            .find_active_task_by_pr_url("mika", "https://github.com/senara-solutions/mika/pull/42")
             .unwrap();
         assert!(found.is_none());
     }
 
     #[test]
-    fn test_find_active_work_item_by_pr_url_wrong_metadata_path() {
+    fn test_find_active_task_by_pr_url_wrong_metadata_path() {
         let db = db();
         let task = new_task("mika", "Wrong path", "manual", "none");
         let id = db.create_task(&task).unwrap();
         // pr_url in a different metadata path (not under claude_pilot)
         let meta = r#"{"other":{"pr_url":"https://github.com/senara-solutions/mika/pull/42"}}"#;
-        db.update_work_item_metadata(&id, meta).unwrap();
+        db.update_task_metadata(&id, meta).unwrap();
 
         let found = db
-            .find_active_work_item_by_pr_url(
-                "mika",
-                "https://github.com/senara-solutions/mika/pull/42",
-            )
+            .find_active_task_by_pr_url("mika", "https://github.com/senara-solutions/mika/pull/42")
             .unwrap();
         assert!(found.is_none());
     }
 
-    // -- find_active_work_item_by_branch tests --
+    // -- find_active_task_by_branch tests --
 
     #[test]
-    fn test_find_active_work_item_by_branch_found() {
+    fn test_find_active_task_by_branch_found() {
         let db = db();
         let branch = "feat/test";
         let task = new_task("mika", "Implement feature", "manual", "none");
         let id = db.create_task(&task).unwrap();
         let meta = r#"{"claude_pilot":{"branch":"feat/test"}}"#;
-        db.update_work_item_metadata(&id, meta).unwrap();
+        db.update_task_metadata(&id, meta).unwrap();
 
-        let found = db.find_active_work_item_by_branch("mika", branch).unwrap();
+        let found = db.find_active_task_by_branch("mika", branch).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, id);
     }
 
     #[test]
-    fn test_find_active_work_item_by_branch_not_found() {
+    fn test_find_active_task_by_branch_not_found() {
         let db = db();
         let task = new_task("mika", "Implement feature", "manual", "none");
         let id = db.create_task(&task).unwrap();
         let meta = r#"{"claude_pilot":{"branch":"feat/test"}}"#;
-        db.update_work_item_metadata(&id, meta).unwrap();
+        db.update_task_metadata(&id, meta).unwrap();
 
         let found = db
-            .find_active_work_item_by_branch("mika", "feat/other-branch")
+            .find_active_task_by_branch("mika", "feat/other-branch")
             .unwrap();
         assert!(found.is_none());
     }
 
     #[test]
-    fn test_find_active_work_item_by_branch_completed_not_returned() {
+    fn test_find_active_task_by_branch_completed_not_returned() {
         let db = db();
         let task = new_task("mika", "Done feature", "manual", "none");
         let id = db.create_task(&task).unwrap();
         let meta = r#"{"claude_pilot":{"branch":"feat/test"}}"#;
-        db.update_work_item_metadata(&id, meta).unwrap();
+        db.update_task_metadata(&id, meta).unwrap();
         db.conn
             .execute(
                 "UPDATE tasks SET status = 'completed' WHERE id = ?1",
@@ -10247,24 +10226,20 @@ mod tests {
             )
             .unwrap();
 
-        let found = db
-            .find_active_work_item_by_branch("mika", "feat/test")
-            .unwrap();
+        let found = db.find_active_task_by_branch("mika", "feat/test").unwrap();
         assert!(found.is_none());
     }
 
     #[test]
-    fn test_find_active_work_item_by_branch_wrong_path() {
+    fn test_find_active_task_by_branch_wrong_path() {
         let db = db();
         let task = new_task("mika", "Wrong path", "manual", "none");
         let id = db.create_task(&task).unwrap();
         // branch in a different metadata path (not under claude_pilot)
         let meta = r#"{"other":{"branch":"feat/test"}}"#;
-        db.update_work_item_metadata(&id, meta).unwrap();
+        db.update_task_metadata(&id, meta).unwrap();
 
-        let found = db
-            .find_active_work_item_by_branch("mika", "feat/test")
-            .unwrap();
+        let found = db.find_active_task_by_branch("mika", "feat/test").unwrap();
         assert!(found.is_none());
     }
 }

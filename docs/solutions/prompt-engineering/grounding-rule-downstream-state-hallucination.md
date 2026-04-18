@@ -47,7 +47,7 @@ prompt.push_str(
      extrapolate.\n  \
      BAD: Build tool returns \"Compilation succeeded\" → you say \"PR is ready for review.\"\n  \
      GOOD: Build tool returns \"Compilation succeeded\" → you say \"The build passed.\"\n  \
-     If you need downstream status, call the appropriate tool (e.g., check_work_item, \
+     If you need downstream status, call the appropriate tool (e.g., check_task, \
      query_timeline) to verify it first.\n",
 );
 ```

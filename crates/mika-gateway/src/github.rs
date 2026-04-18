@@ -740,7 +740,7 @@ async fn forward_to_resolved_route(
 /// function is called. Under extreme webhook volume (>10k deliveries during a
 /// single 300s retry sleep), the LRU may evict the entry. If GitHub redelivers
 /// the same event, the gateway would treat it as new. Agent-side idempotency
-/// (work item unique index) prevents duplicate processing. A TTL on the LRU
+/// (task unique index) prevents duplicate processing. A TTL on the LRU
 /// cache would close this gap but is deferred (see #590 for DLQ).
 async fn deliver_with_retry(
     state: &AppState,

@@ -43,7 +43,7 @@ impl Tool for PrMergeWithGateTool {
                 checks pass. If all required checks pass, the PR is merged immediately.\n\n\
                 IMPORTANT: 'auto_merge_enabled' means GitHub will merge when all checks pass — \
                 the PR is NOT yet merged. Do not claim the PR is merged until you confirm it.\n\n\
-                After a successful merge (action: 'merged'), update the work item status before \
+                After a successful merge (action: 'merged'), update the task status before \
                 reporting to the user."
                 .to_string(),
             input_schema: json!({
