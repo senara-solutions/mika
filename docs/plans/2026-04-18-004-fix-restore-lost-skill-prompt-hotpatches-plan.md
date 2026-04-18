@@ -1,7 +1,7 @@
 ---
 title: "Restore lost skill prompt hot-patches: run_gh schema discipline + M2/M3 pre-flight + P3 treatment"
 type: fix
-status: active
+status: completed
 date: 2026-04-18
 ---
 
