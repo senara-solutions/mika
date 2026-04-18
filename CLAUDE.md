@@ -66,7 +66,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~2430 tests)
+- `cargo test` — Run all tests (~2520 tests)
 - `cargo test -p mika-agent --test eval` — Run agent loop integration tests (eval harness)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
@@ -85,7 +85,7 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 
 - **One container per customer** — per-customer isolation with SQLite
 - **Three-layer memory model** — core memory (system prompt) + structured facts + hybrid search (FTS5 + vector). See `crates/mika-agent/CLAUDE.md`.
-- **Agent loop** — max 20 tool steps, 5-min timeout, 4 post-condition guards on EndTurn. See `crates/mika-agent/CLAUDE.md`.
+- **Agent loop** — max 20 tool steps, 5-min timeout, 5 post-condition guards on EndTurn. See `crates/mika-agent/CLAUDE.md`.
 - **Skills marketplace** — git-based distribution, per-provider/model prompt variants, dependency resolution. See `crates/mika-agent/CLAUDE.md`.
 - **Unified task engine** — SQLite-backed scheduler, callback/resume lifecycle, team suspend/resume. See `crates/mika-agent/CLAUDE.md`.
 - **HTTP server (mika-server)** — Axum, two auth layers, embedded dashboard. See `crates/mika-agent/CLAUDE.md`.
