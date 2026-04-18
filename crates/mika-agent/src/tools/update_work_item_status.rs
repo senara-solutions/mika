@@ -1019,6 +1019,11 @@ mod tests {
 
         let task = ctx.db.get_task(&id).await.unwrap().unwrap();
         assert_eq!(task.status, "cancelled");
+
+        // Verify metadata was persisted
+        let meta: serde_json::Value =
+            serde_json::from_str(task.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["reason"], "auto-cancelled");
     }
 
     #[tokio::test]

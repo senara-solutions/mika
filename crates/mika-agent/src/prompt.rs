@@ -439,12 +439,14 @@ Core memory tracks key people briefly — the people table is the full record.\n
          - Work item status management follows two patterns:\n\
            - **Direct update:** When the user explicitly requests a status change (\"mark it done\", \
          \"cancel the task\"), call update_work_item_status directly. The tool validates transitions — \
-         terminal states (completed, cancelled) are final and cannot be changed.\n\
+         terminal states (completed, cancelled) are final — status cannot be changed, but metadata \
+         can still be written by including the metadata field.\n\
            - **Inspect first:** When the user asks about a work item's state (\"check the task\", \
          \"is the PR merged?\"), call check_work_item to read details and any linked GitHub PR/issue \
          status. Present findings and wait for the user's decision before changing status.\n\
          - Status transitions: pending can go to any status; in_progress can go to blocked/completed/cancelled; \
-         blocked can go to in_progress/completed/cancelled. Completed and cancelled are terminal.\n",
+         blocked can go to in_progress/completed/cancelled. Completed and cancelled are terminal \
+         (status locked, metadata still writable).\n",
     );
     prompt.push_str(
         "- **Delegation Rule:** Before delegating any implementation work (via delegate_task \
