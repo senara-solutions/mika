@@ -109,9 +109,6 @@ impl Tool for UpdateWorkItemStatusTool {
         if task_id.is_empty() {
             return Ok(ToolOutput::error("'task_id' is required."));
         }
-        if let Err(e) = super::validate_uuid("task_id", task_id) {
-            return Ok(e);
-        }
         if status.is_empty() {
             return Ok(ToolOutput::error("'status' is required."));
         }
@@ -145,14 +142,17 @@ impl Tool for UpdateWorkItemStatusTool {
             }
         }
 
-        // Look up the work item to get the current status for transition validation
-        let task = match ctx.db.get_task(task_id).await? {
-            Some(t) if t.trigger_type == "manual" => t,
-            Some(_) | None => {
+        // Format + existence + agent-scope validation in one call
+        let task = match super::validate_task_exists(ctx.db, "task_id", task_id).await {
+            Ok(t) if t.trigger_type == "manual" => t,
+            Ok(t) => {
                 return Ok(ToolOutput::error(format!(
-                    "Work item '{task_id}' not found. Only manual (work item) tasks can be updated with this tool."
+                    "Task '{task_id}' exists but is not a manual work item (trigger_type='{}').\
+                     This tool only operates on work items created with create_work_item.",
+                    t.trigger_type
                 )));
             }
+            Err(e) => return Ok(e),
         };
 
         let old_status = task.status.clone();
@@ -454,7 +454,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("not found"));
+        assert!(result.content.contains("task_not_found"));
     }
 
     #[tokio::test]
@@ -498,7 +498,11 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("not found"));
+        assert!(
+            result.content.contains("not a manual work item"),
+            "expected non-manual rejection, got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

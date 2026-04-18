@@ -36,13 +36,9 @@ impl Tool for GetTaskTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("'id' is required."));
         }
-        if let Err(e) = super::validate_uuid("id", id) {
-            return Ok(e);
-        }
-
-        let task = match ctx.db.get_task(id).await? {
-            Some(t) => t,
-            None => return Ok(ToolOutput::error(format!("Task '{}' not found.", id))),
+        let task = match super::validate_task_exists(ctx.db, "id", id).await {
+            Ok(t) => t,
+            Err(e) => return Ok(e),
         };
 
         let next_fire = task
@@ -146,7 +142,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("not found"));
+        assert!(result.content.contains("task_not_found"));
     }
 
     #[tokio::test]

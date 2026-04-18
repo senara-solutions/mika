@@ -105,7 +105,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("not found"));
+        assert!(result.content.contains("task_not_found"));
     }
 
     #[tokio::test]
