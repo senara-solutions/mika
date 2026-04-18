@@ -334,6 +334,9 @@ async fn init_agent(
     )?;
     startup::seed_core_memory_if_empty(&db, agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
+    if agent_settings.dev_mode {
+        crate::well_known_agents::seed_well_known_skill_overrides(&db, agent_name);
+    }
     let async_db = AsyncDatabase::new_with_agent(db, agent_name);
 
     let skills_dir = agent_home.join("skills");
@@ -525,6 +528,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
     // Auto-migrate to multi-agent layout if needed
     home::migrate_to_multi_agent(global_home)?;
+
+    // Auto-provision well-known dev agents if dev_mode is enabled
+    if settings.dev_mode {
+        crate::well_known_agents::provision_well_known_agents(
+            global_home,
+            settings.disable_agent_provisioning,
+        );
+    }
 
     // Warn if embedded dashboard is enabled but no assets were compiled in
     if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
