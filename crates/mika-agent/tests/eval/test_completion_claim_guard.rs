@@ -153,7 +153,8 @@ async fn guard_skips_when_tool_not_registered() {
     // Seed a task anyway — guard should still not fire because tool isn't registered
     seed_task(&harness, "Some task").await;
 
-    let trace = harness.run("Status update?").await.unwrap();
+    // Note: user message avoids "status update" which triggers persistence eval guard (#648)
+    let trace = harness.run("How did things go?").await.unwrap();
 
     assert_has_output(&trace);
     assert_output_contains(&trace, "deployed");

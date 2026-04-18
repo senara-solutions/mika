@@ -16,12 +16,13 @@ Compaction includes tool names in summarization. Multi-modal tool results: `Tool
 
 ### Post-Conditions (EndTurn Chain)
 
-Four sequential post-conditions on assistant text responses:
+Five sequential post-conditions on assistant text responses:
 
 1. **Text-based tool call detection:** `detect_text_based_tool_call()` catches patterns that slip through `extract_xml_tool_calls()` in mika-common, re-prompts the LLM once.
 2. **Required-tools gate:** When keyword-matched skills declare `[constraints] required_tools`, the engine tracks tool calls across all steps; if required tools haven't been called, the response is rejected once. `filter_available_required_tools()` pre-filters against builtins + skill tools + MCP. Only `Keyword`-matched skills contribute constraints (#265).
 3. **Completion-claim guard (#483):** `detect_completion_claim()` detects completion-claim keywords (`merged`, `deployed`, `complete`/`completed`, `shipped`) in assistant text. If detected AND `update_task_status` is in the tool registry AND it was not called AND active tasks exist, the response is rejected once. Skips for delegates and team agents.
 4. **Fabricated action-claim guard (#308):** `detect_fabricated_action_claim()` detects when the agent claims to have performed an action with a GitHub resource URL but made zero tool calls in the turn. Single retry.
+5. **Persistence evaluation guard (#648):** `detect_informational_input()` checks user input for informational signals (FYI, diagnostic, correction, status update) and `detect_persistable_output()` checks assistant text for verdict-shaped patterns (root cause, confirmed, validated, lesson learned). If no persistence write tool (`store_fact`, `update_fact`, `update_core_memory`) was called and either detection matches, nudges the model once to consider calling `store_fact`. Conversation mode only. Nudge, not rejection — the model can decline. `PERSISTENCE_WRITE_TOOLS` constant defines the write-tool set.
 
 ### Deterministic Context Injection
 

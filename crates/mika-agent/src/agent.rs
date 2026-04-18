@@ -590,6 +590,30 @@ async fn run_loop(
     // Whether we already injected a fabricated-action correction. Only allow one retry.
     // Guards against fabricated action claims with URLs but zero tool calls (#308).
     let mut fabricated_action_retry_done = false;
+    // Whether we already nudged the agent to persist knowledge. Only allow one nudge.
+    // Guards against turns that produce institutional knowledge without calling
+    // store_fact/update_fact/update_core_memory (#648).
+    let mut persistence_eval_retry_done = false;
+    // Capture the user's input text for persistence evaluation guard (#648).
+    // Extracted once before the loop starts so it always reflects the real user
+    // message, not synthetic messages injected by guards during re-prompts.
+    let user_input_text: String = request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, LlmRole::User))
+        .map(|m| match &m.content {
+            LlmContent::Text(t) => t.clone(),
+            LlmContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    LlmContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        })
+        .unwrap_or_default();
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
@@ -886,6 +910,58 @@ async fn run_loop(
                             )),
                         });
                         continue;
+                    }
+
+                    // Persistence evaluation guard: if the agent is ending a turn
+                    // that appears to contain institutional knowledge but no
+                    // persistence tool was called, nudge the model to consider
+                    // calling store_fact. Only fires in conversation mode. See #648.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && mode.is_conversation()
+                        && !persistence_eval_retry_done
+                        && !PERSISTENCE_WRITE_TOOLS
+                            .iter()
+                            .any(|t| tools_called.contains(*t))
+                    {
+                        let input_match = detect_informational_input(&user_input_text);
+                        let output_match = detect_persistable_output(&text);
+
+                        if let Some(reason) = input_match.or(output_match) {
+                            persistence_eval_retry_done = true;
+                            let reason_description = if input_match.is_some() {
+                                format!(
+                                    "this turn contains informational input (matched: \"{reason}\")"
+                                )
+                            } else {
+                                format!(
+                                    "your response contains conclusions that may be worth \
+                                     persisting (matched: \"{reason}\")"
+                                )
+                            };
+                            info!(
+                                step,
+                                matched = reason,
+                                label = mode.label(),
+                                "Persistence evaluation: nudging agent to consider store_fact"
+                            );
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::Assistant,
+                                content: LlmContent::Blocks(
+                                    mika_common::llm::response_content_to_blocks(&response.content),
+                                ),
+                            });
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::User,
+                                content: LlmContent::Text(format!(
+                                    "[Before ending this turn, consider: {reason_description}. \
+                                     If any new information, conclusions, or corrections from \
+                                     this conversation should be remembered for future sessions, \
+                                     call store_fact now. If nothing warrants persistence, you \
+                                     may proceed with your response.]",
+                                )),
+                            });
+                            continue;
+                        }
                     }
 
                     if mode.saves_to_db() {
@@ -2930,6 +3006,87 @@ fn detect_fabricated_action_claim(text: &str) -> Option<(&str, &str)> {
     let url_match = GITHUB_RESOURCE_URL_RE.find(text)?;
     let verb_match = ACTION_CLAIM_RE.find(text)?;
     Some((verb_match.as_str(), url_match.as_str()))
+}
+
+/// Tools that persist institutional knowledge. Used by the persistence
+/// evaluation guard to decide whether the agent already wrote something
+/// worth remembering during this turn.
+const PERSISTENCE_WRITE_TOOLS: &[&str] = &["store_fact", "update_fact", "update_core_memory"];
+
+/// Regex matching informational input signals from the user — messages that
+/// are likely to contain knowledge worth persisting (FYI, diagnostics,
+/// corrections, status updates).
+static INFORMATIONAL_INPUT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+            r"(?i)(?:\b(?:FYI|for your information|heads up|just letting you know|diagnostic|maintenance check|self[- ]assessment|status update|incident report|not a dispatch)\b|(?:^|\s)(?:correction:|actually,|I should clarify))",
+        )
+        .expect("informational input regex must compile")
+});
+
+/// Detects whether user input contains informational signals that suggest
+/// the turn may produce knowledge worth persisting.
+///
+/// Returns the matched pattern for logging, or `None`. Uses a fast-path
+/// substring check before running the regex.
+fn detect_informational_input(text: &str) -> Option<&str> {
+    // Fast path: skip regex if no likely substrings present.
+    let lower = text.to_lowercase();
+    if !lower.contains("fyi")
+        && !lower.contains("heads up")
+        && !lower.contains("letting you know")
+        && !lower.contains("diagnostic")
+        && !lower.contains("maintenance")
+        && !lower.contains("assessment")
+        && !lower.contains("status update")
+        && !lower.contains("incident")
+        && !lower.contains("correction")
+        && !lower.contains("actually,")
+        && !lower.contains("clarify")
+        && !lower.contains("not a dispatch")
+        && !lower.contains("for your information")
+    {
+        return None;
+    }
+    INFORMATIONAL_INPUT_RE
+        .find(text)
+        .map(|m| m.as_str().trim_start())
+}
+
+/// Regex matching verdict-shaped output from the assistant — conclusions,
+/// diagnoses, confirmations, and other patterns that suggest institutional
+/// knowledge was produced but may not have been persisted.
+static PERSISTABLE_OUTPUT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+            r"(?i)\b(this validates|this confirms|root cause|conclusion:|verified that|diagnosed|determined that|the issue was|lesson learned|key takeaway|this means that|confirmed that|the fix works|validated that|the problem was)\b",
+        )
+        .expect("persistable output regex must compile")
+});
+
+/// Detects whether assistant output contains verdict-shaped patterns that
+/// suggest institutional knowledge was produced.
+///
+/// Returns the matched pattern for logging, or `None`. Uses a fast-path
+/// substring check before running the regex.
+fn detect_persistable_output(text: &str) -> Option<&str> {
+    // Fast path: skip regex if no likely substrings present.
+    let lower = text.to_lowercase();
+    if !lower.contains("validat")
+        && !lower.contains("confirm")
+        && !lower.contains("root cause")
+        && !lower.contains("conclusion")
+        && !lower.contains("verified")
+        && !lower.contains("diagnosed")
+        && !lower.contains("determined")
+        && !lower.contains("the issue was")
+        && !lower.contains("lesson")
+        && !lower.contains("takeaway")
+        && !lower.contains("this means")
+        && !lower.contains("the fix")
+        && !lower.contains("the problem was")
+    {
+        return None;
+    }
+    PERSISTABLE_OUTPUT_RE.find(text).map(|m| m.as_str())
 }
 
 fn detect_text_based_tool_call(text: &str) -> bool {
@@ -5004,5 +5161,100 @@ mod tests {
         let (verb, url) = result.unwrap();
         assert_eq!(verb, "posted");
         assert!(url.contains("#issuecomment-4146200192"));
+    }
+
+    // -- Persistence evaluation guard detection tests (#648) --
+
+    #[test]
+    fn test_detect_informational_input_fyi() {
+        let result = detect_informational_input("FYI the deploy succeeded");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "FYI");
+    }
+
+    #[test]
+    fn test_detect_informational_input_heads_up() {
+        let result = detect_informational_input("Heads up — the CI pipeline is red");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "Heads up");
+    }
+
+    #[test]
+    fn test_detect_informational_input_diagnostic() {
+        let result = detect_informational_input("Running a diagnostic on the memory system");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "diagnostic");
+    }
+
+    #[test]
+    fn test_detect_informational_input_correction() {
+        let result = detect_informational_input("actually, the timeout is 30s not 60s");
+        assert!(result.is_some());
+        // trim_start() ensures no leading whitespace from the (?:^|\s) anchor
+        assert_eq!(result.unwrap(), "actually,");
+    }
+
+    #[test]
+    fn test_detect_informational_input_no_match() {
+        assert!(detect_informational_input("Can you fix the bug in the parser?").is_none());
+    }
+
+    #[test]
+    fn test_detect_informational_input_empty() {
+        assert!(detect_informational_input("").is_none());
+    }
+
+    #[test]
+    fn test_detect_persistable_output_root_cause() {
+        let result =
+            detect_persistable_output("The root cause was a connection timeout in the retry loop");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "root cause");
+    }
+
+    #[test]
+    fn test_detect_persistable_output_confirms() {
+        let result =
+            detect_persistable_output("This confirms the diagnosis — the issue was in the parser");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "This confirms");
+    }
+
+    #[test]
+    fn test_detect_persistable_output_validated() {
+        let result = detect_persistable_output("I validated that the fix works correctly");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "validated that");
+    }
+
+    #[test]
+    fn test_detect_persistable_output_lesson_learned() {
+        let result = detect_persistable_output("Key lesson learned: always check the return code");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "lesson learned");
+    }
+
+    #[test]
+    fn test_detect_persistable_output_no_match() {
+        assert!(detect_persistable_output("Here's the code change you requested").is_none());
+    }
+
+    #[test]
+    fn test_detect_persistable_output_future_tense_no_match() {
+        // "I'll verify" is future-tense — should not trigger
+        assert!(detect_persistable_output("I'll verify the fix later").is_none());
+    }
+
+    #[test]
+    fn test_detect_persistable_output_empty() {
+        assert!(detect_persistable_output("").is_none());
+    }
+
+    #[test]
+    fn test_detect_informational_input_incident_report() {
+        let result =
+            detect_informational_input("incident report: prod database was down for 5 min");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "incident report");
     }
 }
