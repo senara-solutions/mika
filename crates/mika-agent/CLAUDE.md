@@ -55,7 +55,7 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 **`list_work_items` output enrichment:** Response includes a `Summary:` line with status-count breakdown (e.g., `"50 items total — 2 blocked, 48 completed"`) computed in-memory from the result set. Fully unfiltered calls also include a `Note:` with filter guidance discouraging redundant re-filtering. Filtered calls (by status or source) get a scoped summary but no guidance note. See #572.
 
-**Status transition state machine:** `pending` -> any; `in_progress` -> blocked/completed/cancelled; `blocked` -> in_progress/completed/cancelled. Terminal states cannot transition.
+**Status transition state machine:** `pending` -> any; `in_progress` -> blocked/completed/cancelled; `blocked` -> in_progress/completed/cancelled. Terminal states (`completed`, `cancelled`) cannot transition to a new status, but metadata can still be written (#617) — the tool applies metadata and returns success without changing status.
 
 **Phantom retry guard (#579):** `update_work_item_status` rejects retry-semantic metadata writes (any top-level key containing "retry", case-insensitive) when the work item has an active callback child task (`trigger_type="callback"` in `pending` or `in_progress` status). Returns structured JSON error `retry_metadata_rejected_active_dispatch`. Fail-open on `get_child_tasks` DB error — the dispatch readiness guard (#525) is the primary defense against re-dispatch. Non-retry metadata writes are unaffected.
 
