@@ -329,6 +329,25 @@ REASON: Security issues — hardcoded credentials and SQL injection vector
 
 **Backward compatibility:** mika-dev parses block sub-types like hold sub-types. Bare `block` (without sub-type) is treated as non-fixable — always use the appropriate sub-type.
 
+### Record to memory
+
+After posting the verdict, call `store_fact` to record the review outcome. This builds an audit trail that lets you track patterns across PRs and answer diagnostic questions about past reviews.
+
+**After every review:**
+```
+store_fact(category="event", description="PR review <repo>#<pr_number>: <verdict>. <one-line summary of key finding or reason>. Files: <count>.")
+```
+
+**When you find a recurring pattern** (same type of issue across 2+ PRs):
+```
+store_fact(category="preference", key="qa_pattern_<short_name>", value="<description of the pattern and which PRs exhibited it>")
+```
+
+Examples:
+- `store_fact(category="event", description="PR review mika#637: pass. Metadata-only writes on terminal tasks. Files: 3.")`
+- `store_fact(category="event", description="PR review mika#635: hold[review]. Missing test coverage for edge case. Files: 5.")`
+- `store_fact(category="preference", key="qa_pattern_missing_error_handling", value="PRs #620, #635 both had unhandled tool call errors in async paths.")`
+
 ### Constraints
 
 - Do NOT merge PRs. Merging is mika-dev's responsibility — you only produce verdicts.
