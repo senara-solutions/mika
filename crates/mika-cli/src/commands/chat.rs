@@ -6,6 +6,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use secrecy::ExposeSecret;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,7 +127,11 @@ async fn spawn_agent_worker(
         ctx.async_db.agent_id(),
     );
 
-    let brave_api_key = ctx.settings.brave_api_key.clone();
+    let brave_api_key = ctx
+        .settings
+        .brave_api_key
+        .as_ref()
+        .map(|s| s.expose_secret().to_string());
     let github_token = ctx.settings.agent_github_token().map(String::from);
 
     // Connect to MCP servers

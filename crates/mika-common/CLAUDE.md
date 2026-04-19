@@ -4,7 +4,7 @@ Shared library used by all Mika crates: config, LLM providers, Claude API client
 
 ## Modules
 
-- **Config:** config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum, `get_effective_value`/`lookup_config_key` helpers
+- **Config:** config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum, `get_effective_value`/`lookup_config_key` helpers. All API keys and tokens in `Settings` use `secrecy::SecretString` for compile-time exposure safety and zeroize-on-drop. Secrets exposed at accessor boundary via `.expose_secret()`. `get_effective_value()` returns `"[SET]"` for secret-flagged fields.
 - **Validation:** `validation.rs` — API key format, file permissions, binary-in-PATH, config value validation
 - **Dotenv:** `~/.mika/.env` load/read/write via dotenvy, `parse_dotenv` for reading without env mutation, `dotenv_to_toml` for config-rs injection
 - **Claude API client:** Typed request/response, retry, prompt caching injection

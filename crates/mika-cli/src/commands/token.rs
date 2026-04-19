@@ -1,4 +1,5 @@
 use anyhow::Result;
+use secrecy::ExposeSecret;
 use std::path::Path;
 
 use crate::cli::TokenCommand;
@@ -45,7 +46,7 @@ async fn github(global_home: &Path, agent_home: Option<&Path>) -> Result<()> {
     };
 
     // PAT first — the agent's machine user identity.
-    if let Some(pat) = settings.github_token.as_deref() {
+    if let Some(pat) = settings.github_token.as_ref().map(|s| s.expose_secret()) {
         print!("{pat}");
         return Ok(());
     }

@@ -22,6 +22,7 @@ use mika_common::llm::{
     LlmContent, LlmContentBlock, LlmMessage, LlmProvider, LlmRequest, LlmResponseContent, LlmRole,
     LlmStopReason, LlmToolResultContent, response_content_to_blocks,
 };
+use secrecy::ExposeSecret;
 
 use crate::async_db::AsyncDatabase;
 use crate::db::SessionMessage;
@@ -1067,7 +1068,11 @@ pub async fn handle_investigate(
             Arc::new(build_investigation_tools(InvestigationToolsConfig {
                 agents: state.agents.clone(),
                 http_client: state.http_client.clone(),
-                investigate_github_token: state.settings.investigate_github_token.clone(),
+                investigate_github_token: state
+                    .settings
+                    .investigate_github_token
+                    .as_ref()
+                    .map(|s| s.expose_secret().to_string()),
                 github_repo: state.settings.github_repo.clone(),
             }))
         })

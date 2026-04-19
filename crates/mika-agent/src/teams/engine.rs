@@ -11,6 +11,7 @@ use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::LlmProvider;
 use mika_common::team::TeamDefinition;
+use secrecy::ExposeSecret;
 
 use crate::agent::TeamAgentParams;
 use crate::async_db::AsyncDatabase;
@@ -191,7 +192,10 @@ impl TeamEngine {
             agents: Arc::new(res.agents),
             tool_registry: Arc::new(res.tool_registry),
             callback: callback.map(Arc::new),
-            brave_api_key: settings.brave_api_key.clone(),
+            brave_api_key: settings
+                .brave_api_key
+                .as_ref()
+                .map(|s| s.expose_secret().to_string()),
             github_token: settings.agent_github_token().map(String::from),
             github_app,
             team_db,
@@ -233,7 +237,10 @@ impl TeamEngine {
             agents: Arc::new(res.agents),
             tool_registry: Arc::new(res.tool_registry),
             callback: None, // No callback on resume — events go through task system
-            brave_api_key: settings.brave_api_key.clone(),
+            brave_api_key: settings
+                .brave_api_key
+                .as_ref()
+                .map(|s| s.expose_secret().to_string()),
             github_token: settings.agent_github_token().map(String::from),
             github_app,
             team_db,

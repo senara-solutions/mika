@@ -432,44 +432,71 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
 
         // Per-provider: Anthropic
         "anthropic_model" => settings.anthropic_model.clone(),
-        "anthropic_api_key" => settings.anthropic_api_key.clone(),
+        "anthropic_api_key" => settings
+            .anthropic_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
         "anthropic_base_url" => settings.anthropic_base_url.clone(),
         // Per-provider: OpenAI (api_key shares with openai_api_key)
         "openai_model" => settings.openai_model.clone(),
-        "openai_api_key" => settings.openai_api_key.clone(),
+        "openai_api_key" => settings
+            .openai_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
         "openai_base_url" => settings.openai_base_url.clone(),
         // Per-provider: OpenRouter
         "openrouter_model" => settings.openrouter_model.clone(),
-        "openrouter_api_key" => settings.openrouter_api_key.clone(),
+        "openrouter_api_key" => settings
+            .openrouter_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
         "openrouter_base_url" => settings.openrouter_base_url.clone(),
         // Per-provider: Groq
         "groq_model" => settings.groq_model.clone(),
-        "groq_api_key" => settings.groq_api_key.clone(),
+        "groq_api_key" => settings.groq_api_key.as_ref().map(|_| "[SET]".to_string()),
         "groq_base_url" => settings.groq_base_url.clone(),
         // Per-provider: Ollama
         "ollama_model" => settings.ollama_model.clone(),
-        "ollama_api_key" => settings.ollama_api_key.clone(),
+        "ollama_api_key" => settings
+            .ollama_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
         "ollama_base_url" => settings.ollama_base_url.clone(),
         // Per-provider: Mistral
         "mistral_model" => settings.mistral_model.clone(),
-        "mistral_api_key" => settings.mistral_api_key.clone(),
+        "mistral_api_key" => settings
+            .mistral_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
         "mistral_base_url" => settings.mistral_base_url.clone(),
         // Per-provider: Google
         "google_model" => settings.google_model.clone(),
-        "google_api_key" => settings.google_api_key.clone(),
+        "google_api_key" => settings
+            .google_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
         "google_base_url" => settings.google_base_url.clone(),
         // Per-provider: DeepSeek
         "deepseek_model" => settings.deepseek_model.clone(),
-        "deepseek_api_key" => settings.deepseek_api_key.clone(),
-        "minimax_api_key" => settings.minimax_api_key.clone(),
-        "kimi_api_key" => settings.kimi_api_key.clone(),
-        "qwen_api_key" => settings.qwen_api_key.clone(),
+        "deepseek_api_key" => settings
+            .deepseek_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
+        "minimax_api_key" => settings
+            .minimax_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
+        "kimi_api_key" => settings.kimi_api_key.as_ref().map(|_| "[SET]".to_string()),
+        "qwen_api_key" => settings.qwen_api_key.as_ref().map(|_| "[SET]".to_string()),
         "deepseek_base_url" => settings.deepseek_base_url.clone(),
 
         // Non-provider secrets/settings
-        "brave_api_key" => settings.brave_api_key.clone(),
-        "github_token" => settings.github_token.clone(),
-        "investigate_github_token" => settings.investigate_github_token.clone(),
+        "brave_api_key" => settings.brave_api_key.as_ref().map(|_| "[SET]".to_string()),
+        "github_token" => settings.github_token.as_ref().map(|_| "[SET]".to_string()),
+        "investigate_github_token" => settings
+            .investigate_github_token
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
         "github_repo" => settings.github_repo.clone(),
         "github_app_id" => settings.github_app_id.map(|v| v.to_string()),
         "github_app_private_key" => settings
@@ -481,7 +508,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "internal_token" => settings
             .internal_token
             .as_ref()
-            .map(|s| s.expose_secret().to_string()),
+            .map(|_| "[SET]".to_string()),
         "home_dir" => Some(settings.home_dir.display().to_string()),
         "db_path" => Some(settings.db_path.display().to_string()),
         // Observability
@@ -507,7 +534,7 @@ pub struct Settings {
     #[serde(default)]
     pub anthropic_model: Option<String>,
     #[serde(default)]
-    pub anthropic_api_key: Option<String>,
+    pub anthropic_api_key: Option<SecretString>,
     #[serde(default)]
     pub anthropic_base_url: Option<String>,
 
@@ -522,7 +549,7 @@ pub struct Settings {
     #[serde(default)]
     pub openrouter_model: Option<String>,
     #[serde(default)]
-    pub openrouter_api_key: Option<String>,
+    pub openrouter_api_key: Option<SecretString>,
     #[serde(default)]
     pub openrouter_base_url: Option<String>,
 
@@ -530,7 +557,7 @@ pub struct Settings {
     #[serde(default)]
     pub groq_model: Option<String>,
     #[serde(default)]
-    pub groq_api_key: Option<String>,
+    pub groq_api_key: Option<SecretString>,
     #[serde(default)]
     pub groq_base_url: Option<String>,
 
@@ -538,7 +565,7 @@ pub struct Settings {
     #[serde(default)]
     pub ollama_model: Option<String>,
     #[serde(default)]
-    pub ollama_api_key: Option<String>,
+    pub ollama_api_key: Option<SecretString>,
     #[serde(default)]
     pub ollama_base_url: Option<String>,
 
@@ -546,7 +573,7 @@ pub struct Settings {
     #[serde(default)]
     pub mistral_model: Option<String>,
     #[serde(default)]
-    pub mistral_api_key: Option<String>,
+    pub mistral_api_key: Option<SecretString>,
     #[serde(default)]
     pub mistral_base_url: Option<String>,
 
@@ -554,7 +581,7 @@ pub struct Settings {
     #[serde(default)]
     pub google_model: Option<String>,
     #[serde(default)]
-    pub google_api_key: Option<String>,
+    pub google_api_key: Option<SecretString>,
     #[serde(default)]
     pub google_base_url: Option<String>,
 
@@ -563,15 +590,15 @@ pub struct Settings {
     pub deepseek_model: Option<String>,
     pub minimax_model: Option<String>,
     pub minimax_base_url: Option<String>,
-    pub kimi_api_key: Option<String>,
+    pub kimi_api_key: Option<SecretString>,
     pub kimi_model: Option<String>,
     pub kimi_base_url: Option<String>,
-    pub qwen_api_key: Option<String>,
+    pub qwen_api_key: Option<SecretString>,
     pub qwen_model: Option<String>,
     pub qwen_base_url: Option<String>,
     #[serde(default)]
-    pub deepseek_api_key: Option<String>,
-    pub minimax_api_key: Option<String>,
+    pub deepseek_api_key: Option<SecretString>,
+    pub minimax_api_key: Option<SecretString>,
     #[serde(default)]
     pub deepseek_base_url: Option<String>,
 
@@ -611,7 +638,7 @@ pub struct Settings {
     /// OpenAI API key — used for embeddings AND as the OpenAI LLM provider's API key.
     /// Legacy field: MIKA_OPENAI_API_KEY env var.
     #[serde(default)]
-    pub openai_api_key: Option<String>,
+    pub openai_api_key: Option<SecretString>,
 
     /// Embedding model ID (default: text-embedding-3-small)
     #[serde(default = "default_embedding_model")]
@@ -623,7 +650,7 @@ pub struct Settings {
 
     /// Brave Search API key (optional; enables web_search builtin skill)
     #[serde(default)]
-    pub brave_api_key: Option<String>,
+    pub brave_api_key: Option<SecretString>,
 
     /// Optional log file path for mika-server (maps to MIKA_SERVER_LOG_FILE)
     #[serde(default)]
@@ -632,11 +659,11 @@ pub struct Settings {
     /// GitHub Personal Access Token for agent operations (context injection, task enrichment, PR merge).
     /// No fallback — `investigate_github_token` is used only by the investigation panel.
     #[serde(default)]
-    pub github_token: Option<String>,
+    pub github_token: Option<SecretString>,
 
     /// GitHub Personal Access Token for investigation panel issue creation (optional)
     #[serde(default)]
-    pub investigate_github_token: Option<String>,
+    pub investigate_github_token: Option<SecretString>,
 
     /// GitHub repository in owner/repo format for issue creation (optional)
     #[serde(default)]
@@ -757,7 +784,7 @@ impl Settings {
     /// Resolve the GitHub token for agent operations.
     /// Returns `MIKA_GITHUB_TOKEN` only — no fallback to `MIKA_INVESTIGATE_GITHUB_TOKEN`.
     pub fn agent_github_token(&self) -> Option<&str> {
-        self.github_token.as_deref()
+        self.github_token.as_ref().map(|s| s.expose_secret())
     }
 
     /// Resolve the GitHub token to use for agent action operations.
@@ -779,8 +806,8 @@ impl Settings {
         github_app: Option<&crate::github_app::GitHubApp>,
     ) -> Option<String> {
         // PAT first — the agent's machine user identity.
-        if let Some(pat) = self.github_token.as_deref() {
-            return Some(pat.to_string());
+        if let Some(pat) = self.github_token.as_ref() {
+            return Some(pat.expose_secret().to_string());
         }
         // Fall back to an App installation token (short-lived, org-scoped).
         if let Some(app) = github_app {
@@ -804,57 +831,57 @@ impl Settings {
         match provider {
             ProviderKind::Anthropic => (
                 self.anthropic_model.as_deref(),
-                self.anthropic_api_key.as_deref(),
+                self.anthropic_api_key.as_ref().map(|s| s.expose_secret()),
                 self.anthropic_base_url.as_deref(),
             ),
             ProviderKind::OpenAi => (
                 self.openai_model.as_deref(),
-                self.openai_api_key.as_deref(), // shared with embedding key
+                self.openai_api_key.as_ref().map(|s| s.expose_secret()),
                 self.openai_base_url.as_deref(),
             ),
             ProviderKind::OpenRouter => (
                 self.openrouter_model.as_deref(),
-                self.openrouter_api_key.as_deref(),
+                self.openrouter_api_key.as_ref().map(|s| s.expose_secret()),
                 self.openrouter_base_url.as_deref(),
             ),
             ProviderKind::Groq => (
                 self.groq_model.as_deref(),
-                self.groq_api_key.as_deref(),
+                self.groq_api_key.as_ref().map(|s| s.expose_secret()),
                 self.groq_base_url.as_deref(),
             ),
             ProviderKind::Ollama => (
                 self.ollama_model.as_deref(),
-                self.ollama_api_key.as_deref(),
+                self.ollama_api_key.as_ref().map(|s| s.expose_secret()),
                 self.ollama_base_url.as_deref(),
             ),
             ProviderKind::Mistral => (
                 self.mistral_model.as_deref(),
-                self.mistral_api_key.as_deref(),
+                self.mistral_api_key.as_ref().map(|s| s.expose_secret()),
                 self.mistral_base_url.as_deref(),
             ),
             ProviderKind::Google => (
                 self.google_model.as_deref(),
-                self.google_api_key.as_deref(),
+                self.google_api_key.as_ref().map(|s| s.expose_secret()),
                 self.google_base_url.as_deref(),
             ),
             ProviderKind::DeepSeek => (
                 self.deepseek_model.as_deref(),
-                self.deepseek_api_key.as_deref(),
+                self.deepseek_api_key.as_ref().map(|s| s.expose_secret()),
                 self.deepseek_base_url.as_deref(),
             ),
             ProviderKind::MiniMax => (
                 self.minimax_model.as_deref(),
-                self.minimax_api_key.as_deref(),
+                self.minimax_api_key.as_ref().map(|s| s.expose_secret()),
                 self.minimax_base_url.as_deref(),
             ),
             ProviderKind::Kimi => (
                 self.kimi_model.as_deref(),
-                self.kimi_api_key.as_deref(),
+                self.kimi_api_key.as_ref().map(|s| s.expose_secret()),
                 self.kimi_base_url.as_deref(),
             ),
             ProviderKind::Qwen => (
                 self.qwen_model.as_deref(),
-                self.qwen_api_key.as_deref(),
+                self.qwen_api_key.as_ref().map(|s| s.expose_secret()),
                 self.qwen_base_url.as_deref(),
             ),
         }
@@ -946,10 +973,11 @@ impl Settings {
     pub fn make_embedding_client(&self) -> Option<crate::embedding::EmbeddingClient> {
         self.openai_api_key
             .as_ref()
+            .map(|s| s.expose_secret())
             .filter(|k| !k.trim().is_empty())
             .and_then(|key| {
                 crate::embedding::EmbeddingClient::new(
-                    key.clone(),
+                    key.to_string(),
                     self.embedding_model.clone(),
                     self.embedding_dimensions,
                 )
@@ -1099,6 +1127,14 @@ impl std::fmt::Debug for Settings {
             .field(
                 "minimax_api_key",
                 &self.minimax_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "kimi_api_key",
+                &self.kimi_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "qwen_api_key",
+                &self.qwen_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("deepseek_base_url", &self.deepseek_base_url)
             // Non-provider
@@ -1402,7 +1438,7 @@ mod tests {
         let mut settings = Settings::load(tmp.path()).unwrap();
         // Simulate per-agent `.env` setting MIKA_GITHUB_TOKEN to the machine
         // user PAT (e.g., `github_pat_...`).
-        settings.github_token = Some("github_pat_test_value".to_string());
+        settings.github_token = Some("github_pat_test_value".to_string().into());
 
         // With no GitHub App available, `resolve_github_token` must still
         // return the PAT — the PAT is the agent's machine user identity and
@@ -1424,5 +1460,109 @@ mod tests {
 
         let resolved = settings.resolve_github_token(None).await;
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_api_keys_deserialize_as_secret_string() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"anthropic_api_key = "sk-ant-test-key-123""#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+        let key = settings
+            .anthropic_api_key
+            .as_ref()
+            .expect("key should be set");
+        assert_eq!(key.expose_secret(), "sk-ant-test-key-123");
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_effective_value_returns_set_for_secrets() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            concat!(
+                "anthropic_api_key = \"sk-ant-secret\"\n",
+                "openai_api_key = \"sk-openai-secret\"\n",
+                "brave_api_key = \"BSA-secret\"\n",
+            ),
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        // All secret fields should return "[SET]", not the raw value
+        assert_eq!(
+            get_effective_value("anthropic_api_key", &settings),
+            Some("[SET]".to_string())
+        );
+        assert_eq!(
+            get_effective_value("openai_api_key", &settings),
+            Some("[SET]".to_string())
+        );
+        assert_eq!(
+            get_effective_value("brave_api_key", &settings),
+            Some("[SET]".to_string())
+        );
+
+        // Unset secret fields should return None
+        assert_eq!(get_effective_value("groq_api_key", &settings), None);
+        assert_eq!(get_effective_value("github_token", &settings), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_debug_does_not_leak_secrets() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            concat!(
+                "anthropic_api_key = \"sk-ant-LEAKED\"\n",
+                "brave_api_key = \"BSA-LEAKED\"\n",
+                "github_token = \"ghp_LEAKED\"\n",
+            ),
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+        let debug_output = format!("{:?}", settings);
+
+        assert!(!debug_output.contains("sk-ant-LEAKED"));
+        assert!(!debug_output.contains("BSA-LEAKED"));
+        assert!(!debug_output.contains("ghp_LEAKED"));
+        assert!(debug_output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_provider_fields_exposes_secret_correctly() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            concat!(
+                "anthropic_api_key = \"sk-ant-provider-test\"\n",
+                "anthropic_model = \"claude-sonnet-4-20250514\"\n",
+            ),
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+        let (model, api_key, _base_url) = settings.provider_fields(ProviderKind::Anthropic);
+
+        assert_eq!(model, Some("claude-sonnet-4-20250514"));
+        assert_eq!(api_key, Some("sk-ant-provider-test"));
     }
 }

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: complete
 priority: p2
 issue_id: 646
 tags: [code-review, security]
@@ -58,11 +58,11 @@ Option A — small change, high consistency benefit.
 
 ## Acceptance Criteria
 
-- [ ] `investigate_github_token` field uses `Option<SecretString>`
-- [ ] `get_effective_value` calls `.expose_secret()` for the field
-- [ ] `investigate.rs` calls `.expose_secret()` when extracting the token
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` clean
+- [x] `investigate_github_token` field uses `Option<SecretString>`
+- [x] `get_effective_value` calls `.expose_secret()` for the field
+- [x] `investigate.rs` calls `.expose_secret()` when extracting the token
+- [x] `cargo test` passes
+- [x] `cargo clippy` clean
 
 ## Work Log
 

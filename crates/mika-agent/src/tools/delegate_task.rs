@@ -4,6 +4,7 @@ use mika_common::agent;
 use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
 use mika_common::home;
+use secrecy::ExposeSecret;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -278,7 +279,11 @@ impl Tool for DelegateTaskTool {
             team_context: "You are being consulted by another agent. Provide a thorough, complete answer.",
             session_id: &session_id,
             embedding_client: embedding_client.as_ref(),
-            brave_api_key: self.settings.brave_api_key.as_deref(),
+            brave_api_key: self
+                .settings
+                .brave_api_key
+                .as_ref()
+                .map(|s| s.expose_secret()),
             github_token: self.settings.agent_github_token(),
             github_app: self.github_app.as_deref(),
             skills_dirty: &skills_dirty,

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use secrecy::ExposeSecret;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -273,7 +274,11 @@ pub async fn run(
         embedding_client: embedding_client.as_ref(),
         thinking: None,
         user_images: &[],
-        brave_api_key: ctx.settings.brave_api_key.as_deref(),
+        brave_api_key: ctx
+            .settings
+            .brave_api_key
+            .as_ref()
+            .map(|s| s.expose_secret()),
         github_token: ctx.settings.agent_github_token(),
         github_app: ctx.github_app.as_deref(),
         skills_dirty: &skills_dirty,
