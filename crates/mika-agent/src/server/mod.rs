@@ -23,6 +23,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use secrecy::ExposeSecret;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -609,7 +610,10 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &internal_token,
                 &http_client,
                 embedding_client.clone(),
-                settings.brave_api_key.clone(),
+                settings
+                    .brave_api_key
+                    .as_ref()
+                    .map(|s| s.expose_secret().to_string()),
                 settings.disable_bundled_skills,
             )
             .await?;
@@ -627,7 +631,10 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 &internal_token,
                 &http_client,
                 embedding_client.clone(),
-                settings.brave_api_key.clone(),
+                settings
+                    .brave_api_key
+                    .as_ref()
+                    .map(|s| s.expose_secret().to_string()),
                 settings.disable_bundled_skills,
             )
             .await
@@ -684,7 +691,10 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         gateway_url,
         startup_time: std::time::Instant::now(),
         http_client,
-        brave_api_key: settings.brave_api_key.clone(),
+        brave_api_key: settings
+            .brave_api_key
+            .as_ref()
+            .map(|s| s.expose_secret().to_string()),
         github_token: settings.agent_github_token().map(String::from),
         github_app: global_github_app,
         global_home_dir: global_home.to_path_buf(),
