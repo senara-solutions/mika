@@ -66,6 +66,8 @@ pub struct GitHubWebhookEvent {
     pub comment: Option<GitHubComment>,
     /// Review data (present in pull_request_review events).
     pub review: Option<GitHubReview>,
+    /// Requested reviewer (present in pull_request.review_requested events).
+    pub requested_reviewer: Option<GitHubUser>,
     /// Repository data.
     pub repository: Option<GitHubRepository>,
 }
@@ -148,7 +150,7 @@ pub fn route_event(
     match (event_type, action) {
         ("issues", Some("assigned")) => Some("mika-dev"),
         ("issue_comment", Some("created")) => Some("mika-dev"),
-        ("pull_request", Some("opened" | "synchronize")) => Some("mika-qa"),
+        ("pull_request", Some("opened" | "synchronize" | "review_requested")) => Some("mika-qa"),
         ("pull_request", Some("closed")) => Some("mika-dev"),
         ("pull_request_review", Some("submitted")) => Some("mika-dev"),
         ("check_suite", Some("completed")) => match check_conclusion {
@@ -239,6 +241,11 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
             if action == "closed" {
                 let merged = pr.and_then(|p| p.merged).unwrap_or(false);
                 text.push_str(&format!("\nMerged: {merged}"));
+            }
+            if action == "review_requested"
+                && let Some(reviewer) = &event.requested_reviewer
+            {
+                text.push_str(&format!("\nRequested reviewer: @{}", reviewer.login));
             }
             if !body.is_empty() {
                 text.push_str(&format!("\n\n{body}"));
@@ -1042,6 +1049,14 @@ mod tests {
     }
 
     #[test]
+    fn test_route_event_pr_review_requested() {
+        assert_eq!(
+            route_event("pull_request", Some("review_requested"), None),
+            Some("mika-qa")
+        );
+    }
+
+    #[test]
     fn test_route_event_pr_review_submitted() {
         assert_eq!(
             route_event("pull_request_review", Some("submitted"), None),
@@ -1108,6 +1123,7 @@ mod tests {
             pull_request: None,
             comment: None,
             review: None,
+            requested_reviewer: None,
             repository: Some(GitHubRepository {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
@@ -1140,6 +1156,7 @@ mod tests {
             }),
             comment: None,
             review: None,
+            requested_reviewer: None,
             repository: Some(GitHubRepository {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
@@ -1165,6 +1182,7 @@ mod tests {
             pull_request: None,
             comment: None,
             review: None,
+            requested_reviewer: None,
             repository: Some(GitHubRepository {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
@@ -1174,6 +1192,72 @@ mod tests {
         assert!(text.contains("[GitHub] Check suite failure"));
         assert!(text.contains("org/repo"));
         assert!(text.contains("main"));
+    }
+
+    #[test]
+    fn test_format_event_text_pr_review_requested_with_reviewer() {
+        let event = GitHubWebhookEvent {
+            action: Some("review_requested".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: None,
+            pull_request: Some(GitHubPullRequest {
+                number: Some(15),
+                title: Some("Add feature".to_string()),
+                html_url: Some("https://github.com/org/repo/pull/15".to_string()),
+                body: None,
+                head: Some(GitHubRef {
+                    ref_name: Some("feat/new".to_string()),
+                }),
+                merged: None,
+            }),
+            comment: None,
+            review: None,
+            requested_reviewer: Some(GitHubUser {
+                login: "mika-platform-qa".to_string(),
+                user_type: Some("User".to_string()),
+            }),
+            repository: Some(GitHubRepository {
+                full_name: Some("org/repo".to_string()),
+                html_url: None,
+            }),
+        };
+        let text = format_event_text("pull_request", &event);
+        assert!(text.contains("[GitHub] PR review_requested"));
+        assert!(text.contains("org/repo#15"));
+        assert!(text.contains("Requested reviewer: @mika-platform-qa"));
+    }
+
+    #[test]
+    fn test_format_event_text_pr_review_requested_without_reviewer() {
+        let event = GitHubWebhookEvent {
+            action: Some("review_requested".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: None,
+            pull_request: Some(GitHubPullRequest {
+                number: Some(15),
+                title: Some("Add feature".to_string()),
+                html_url: Some("https://github.com/org/repo/pull/15".to_string()),
+                body: None,
+                head: Some(GitHubRef {
+                    ref_name: Some("feat/new".to_string()),
+                }),
+                merged: None,
+            }),
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            repository: Some(GitHubRepository {
+                full_name: Some("org/repo".to_string()),
+                html_url: None,
+            }),
+        };
+        let text = format_event_text("pull_request", &event);
+        assert!(text.contains("[GitHub] PR review_requested"));
+        assert!(!text.contains("Requested reviewer"));
     }
 
     // -- Delivery cache tests --

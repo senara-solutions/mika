@@ -170,7 +170,7 @@ If the completion callback indicates failure, diagnose before escalating:
 
 **Step 5 — (removed: QA is now webhook-driven)**
 
-QA review is triggered automatically when a PR is created or updated. The `pull_request.opened` and `pull_request.synchronize` GitHub webhooks route directly to mika-qa. Verdicts arrive back via `pull_request_review.submitted` webhook — handled by the `self-dev-webhook-qa` skill (keyword-triggered, activates automatically on PR review events).
+QA review is triggered automatically when a PR is created, updated, or a reviewer is requested. The `pull_request.opened`, `pull_request.synchronize`, and `pull_request.review_requested` GitHub webhooks route directly to mika-qa. Verdicts arrive back via `pull_request_review.submitted` webhook — handled by the `self-dev-webhook-qa` skill (keyword-triggered, activates automatically on PR review events).
 
 After claude-pilot creates a PR, proceed directly to Step 6 with `in_progress`.
 
