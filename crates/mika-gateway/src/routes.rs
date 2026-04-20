@@ -824,6 +824,11 @@ pub(crate) async fn handle_send(
     // Validate chat_id is a usable Telegram identifier (positive for private chats,
     // negative for groups/channels — but never zero, which is an invalid sentinel).
     if payload.chat_id == 0 {
+        tracing::warn!(
+            agent_name = ?payload.agent_name,
+            request_id = ?payload.request_id,
+            "chat_id=0 POST received at /send — agent should use NoChannel path"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "chat_id must be non-zero"})),

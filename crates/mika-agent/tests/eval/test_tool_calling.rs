@@ -359,3 +359,40 @@ async fn test_send_message_gateway_success_records_success() {
     );
     assert_tool_output_contains(&trace, "send_message", 0, "Message sent.");
 }
+
+#[tokio::test]
+async fn test_send_message_no_channel_returns_success_with_redirect() {
+    // LLM calls send_message, sender returns NoChannel (chat_id=0) ->
+    // tool_call should record success=true with actionable redirect text (#650).
+    let sender = Arc::new(EvalMockSender {
+        outcome: SendOutcome::NoChannel,
+    });
+
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            tool_call_response("send_message", json!({"text": "Build complete"})),
+            text_response("I see there's no reply channel. I'll use run_gh instead."),
+        ])
+        .message_sender(sender)
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("Notify about the build").await.unwrap();
+
+    assert_tools_include(&trace, &["send_message"]);
+
+    let send_calls = trace.calls_for_tool("send_message");
+    assert_eq!(
+        send_calls.len(),
+        1,
+        "expected exactly one send_message call"
+    );
+    // NoChannel is a success (not error) to prevent LLM retry loops
+    assert!(
+        send_calls[0].success,
+        "expected success=true for NoChannel outcome, got success=false"
+    );
+    assert_tool_output_contains(&trace, "send_message", 0, "No reply channel");
+    assert_tool_output_contains(&trace, "send_message", 0, "run_gh");
+}

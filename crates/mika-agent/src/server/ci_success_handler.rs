@@ -312,6 +312,11 @@ pub async fn try_handle_ci_success(
                     Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                         warn!(reason = %reason, "CI success merge notification delivery failed");
                     }
+                    Ok(crate::messaging::SendOutcome::NoChannel) => {
+                        warn!(
+                            "CI success merge notification skipped — no reply channel (chat_id=0)"
+                        );
+                    }
                     Err(e) => {
                         warn!(error = %e, "Failed to send CI success merge notification");
                     }

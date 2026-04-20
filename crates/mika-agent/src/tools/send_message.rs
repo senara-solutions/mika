@@ -75,6 +75,20 @@ impl Tool for SendMessageTool {
                             "Message delivery failed: {reason}"
                         )))
                     }
+                    // Intentionally returns success, not error. chat_id == 0 is a
+                    // permanent session condition (GitHub webhook / non-Telegram
+                    // channel), not a transient failure. Using ToolOutput::error
+                    // would cause Claude to retry in a loop. The message tells the
+                    // LLM to use channel-appropriate tools instead.
+                    Ok(SendOutcome::NoChannel) => {
+                        warn!("send_message: no reply channel (chat_id=0)");
+                        Ok(ToolOutput::success(
+                            "No reply channel for this session (chat_id is zero). \
+                             The user cannot receive messages via send_message. \
+                             Use channel-appropriate tools (e.g., run_gh for GitHub) \
+                             to deliver your response.",
+                        ))
+                    }
                     Err(e) => {
                         warn!(error = %e, "send_message: sender error");
                         Ok(ToolOutput::error(format!("Message delivery error: {e}")))
@@ -339,6 +353,57 @@ mod tests {
         assert!(
             result.content.contains("chat_id not configured"),
             "expected error details: {}",
+            result.content
+        );
+    }
+
+    /// NoChannel outcome returns success (not error) with actionable text (#650).
+    #[tokio::test]
+    async fn test_send_message_no_channel() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::with_outcome(SendOutcome::NoChannel));
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let ctx = crate::tools::ToolContext {
+            db: &harness.db,
+            session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
+            home_dir: std::path::Path::new("/tmp"),
+            global_home_dir: None,
+            core_memory_edit_count: &harness.counter,
+            is_onboarding: false,
+            message_sender: Some(mock.clone()),
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            skills_dirty: &skills_dirty,
+            is_reflection: false,
+            is_task_context: false,
+            is_callback_turn: false,
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
+            max_tasks_per_session: 25,
+            pr_review_posted: &pr_review_posted,
+        };
+        let tool = SendMessageTool;
+
+        let result = tool
+            .execute(serde_json::json!({"text": "Hello!"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "NoChannel should return success (not error) to avoid LLM retry loops"
+        );
+        assert!(
+            result.content.contains("No reply channel"),
+            "expected 'No reply channel' in output: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("run_gh"),
+            "expected tool redirect hint in output: {}",
             result.content
         );
     }

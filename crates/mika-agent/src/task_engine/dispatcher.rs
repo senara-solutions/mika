@@ -149,6 +149,9 @@ impl TaskDispatcher {
                 crate::messaging::SendOutcome::Failed { reason } => {
                     warn!(task_id = %task.id, reason = %reason, "send_message task: delivery failed");
                 }
+                crate::messaging::SendOutcome::NoChannel => {
+                    warn!(task_id = %task.id, "send_message task: no reply channel (chat_id=0)");
+                }
             }
         } else {
             debug!(task_id = %task.id, "send_message: no sender configured, dropping message");
