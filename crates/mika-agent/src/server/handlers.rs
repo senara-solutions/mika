@@ -847,6 +847,9 @@ async fn run_agent_for_message(
                     Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                         warn!(reason = %reason, "response delivery failed, saved to failed_sends");
                     }
+                    Ok(crate::messaging::SendOutcome::NoChannel) => {
+                        warn!("response delivery skipped — no reply channel (chat_id=0)");
+                    }
                     Err(e) => {
                         error!(error = %e, "failed to send response");
                     }
@@ -857,6 +860,9 @@ async fn run_agent_for_message(
                     Ok(crate::messaging::SendOutcome::Delivered) => {}
                     Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                         warn!(reason = %reason, "fallback response delivery failed, saved to failed_sends");
+                    }
+                    Ok(crate::messaging::SendOutcome::NoChannel) => {
+                        warn!("fallback response delivery skipped — no reply channel (chat_id=0)");
                     }
                     Err(e) => {
                         error!(error = %e, "failed to send fallback response");
@@ -910,6 +916,15 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
             Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                 warn!(id = send.id, reason = %reason, "failed send flush: delivery failed again");
                 let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+            }
+            Ok(crate::messaging::SendOutcome::NoChannel) => {
+                // Permanent condition — delete the entry instead of retrying.
+                // These entries were created before the NoChannel check existed.
+                let _ = agent_state.db.delete_failed_send(send.id).await;
+                warn!(
+                    id = send.id,
+                    "failed send flush: no reply channel (chat_id=0), deleting entry"
+                );
             }
             Err(e) => {
                 warn!(id = send.id, error = %e, "failed send flush: sender error");

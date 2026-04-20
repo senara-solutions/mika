@@ -308,6 +308,9 @@ async fn handle_pass_verdict(
                             Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                                 warn!(reason = %reason, "Merge notification delivery failed");
                             }
+                            Ok(crate::messaging::SendOutcome::NoChannel) => {
+                                warn!("Merge notification skipped — no reply channel (chat_id=0)");
+                            }
                             Err(e) => {
                                 warn!(error = %e, "Failed to send merge notification");
                             }

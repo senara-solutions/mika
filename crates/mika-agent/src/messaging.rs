@@ -17,6 +17,12 @@ pub enum SendOutcome {
         /// Human-readable reason including HTTP status or network error classification.
         reason: String,
     },
+    /// No reply channel available for this session. `chat_id == 0` is the
+    /// documented sentinel for GitHub webhook and other non-Telegram channels
+    /// where the agent should use channel-appropriate tools (e.g., `run_gh`)
+    /// instead of `send_message`. This is a permanent session condition, not a
+    /// transient error — callers should not retry or save to `failed_sends`.
+    NoChannel,
 }
 
 /// Trait for sending outbound messages to the user.
@@ -134,6 +140,17 @@ impl GatewayMessageSender {
 impl MessageSender for GatewayMessageSender {
     async fn send(&self, text: &str) -> Result<SendOutcome> {
         let chat_id = self.resolve_chat_id().await?;
+
+        // chat_id == 0 is the documented sentinel for "no reply channel" (GitHub
+        // webhooks, non-Telegram sessions). Short-circuit before the HTTP POST —
+        // no retry, no failed_sends entry, since this is a permanent condition.
+        if chat_id == 0 {
+            warn!(
+                agent_name = ?self.agent_name,
+                "send() called with chat_id=0 — no reply channel available"
+            );
+            return Ok(SendOutcome::NoChannel);
+        }
 
         tracing::debug!(
             agent_name = ?self.agent_name,
@@ -278,9 +295,10 @@ mod tests {
         );
     }
 
-    /// Verifies that a poisoned chat_id ("0") in the DB is parsed as 0,
-    /// which the gateway would reject. Defense-in-depth: resolve_chat_id
-    /// returns the raw value — validation happens at the gateway /send boundary.
+    /// Verifies that a poisoned chat_id ("0") in the DB is parsed as 0.
+    /// `resolve_chat_id()` returns the raw value — the `send()` method
+    /// catches `chat_id == 0` and returns `SendOutcome::NoChannel` before
+    /// the HTTP POST (#650).
     #[tokio::test]
     async fn test_resolve_chat_id_poisoned_zero_in_db() {
         let harness = TestHarness::new();
@@ -303,7 +321,86 @@ mod tests {
         let chat_id = sender.resolve_chat_id().await.unwrap();
         assert_eq!(
             chat_id, 0,
-            "poisoned value returns 0 — gateway rejects at /send"
+            "poisoned value returns 0 — send() catches this as NoChannel"
+        );
+    }
+
+    /// chat_id == 0 via explicit override returns NoChannel without HTTP POST (#650).
+    #[tokio::test]
+    async fn test_send_chat_id_zero_explicit_returns_no_channel() {
+        let harness = TestHarness::with_agent("test-agent");
+        let sender = GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("test-agent".to_string()),
+            Some(0), // explicit chat_id override of 0
+        );
+
+        let outcome = sender.send("hello").await.unwrap();
+        assert_eq!(
+            outcome,
+            SendOutcome::NoChannel,
+            "chat_id=0 should return NoChannel, not attempt HTTP POST"
+        );
+    }
+
+    /// chat_id == 0 from DB (poisoned value) returns NoChannel via send() (#650).
+    #[tokio::test]
+    async fn test_send_chat_id_zero_from_db_returns_no_channel() {
+        let harness = TestHarness::new();
+        harness
+            .db
+            .set_customer_config("chat_id", "0")
+            .await
+            .unwrap();
+
+        let sender = GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("mika".to_string()),
+            None, // no explicit override — falls back to DB
+        );
+
+        let outcome = sender.send("hello").await.unwrap();
+        assert_eq!(
+            outcome,
+            SendOutcome::NoChannel,
+            "poisoned chat_id=0 from DB should return NoChannel"
+        );
+    }
+
+    /// resolve_chat_id() returning Err (no chat_id configured) still propagates
+    /// as Err, not NoChannel.
+    #[tokio::test]
+    async fn test_send_no_chat_id_configured_returns_err() {
+        let harness = TestHarness::with_agent("no-chat-agent");
+        let sender = GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("no-chat-agent".to_string()),
+            None, // no explicit override, no DB entry
+        );
+
+        let result = sender.send("hello").await;
+        assert!(
+            result.is_err(),
+            "missing chat_id should return Err, not NoChannel"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("chat_id not configured"),
+            "error should mention chat_id not configured"
         );
     }
 }
