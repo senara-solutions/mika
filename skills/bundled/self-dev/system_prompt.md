@@ -229,6 +229,15 @@ Call `update_task_status` based on the outcome. **Always include the `metadata` 
 
 Include retry-related metadata only when applicable: `pipeline_retry_count` (pipeline retries), `qa_retry_count` (QA hold fix retries), `ci_fix_count` (CI failure fix retries).
 
+**On `task_not_found` from `update_task_status` — MANDATORY recovery (do NOT end the turn):**
+If `update_task_status` returns `{"error": "task_not_found", ...}`, the task ID is wrong (likely hallucinated suffix — first 8 chars correct, rest fabricated). Recover immediately:
+1. Call `list_tasks(status="in_progress")` — scan ALL returned items for a `reference_url` matching the current issue (e.g., `https://github.com/senara-solutions/mika/issues/677`). Also check `list_tasks(status="pending")` if no match found.
+2. **GATE:** If exactly one task matches the current issue's `reference_url`, use its `task_id` and retry `update_task_status` with the corrected ID and the same status + metadata you originally intended.
+3. If zero matches: escalate — notify Vincent "task_not_found recovery failed for {repo}#{issue}: no matching task in list_tasks output. Manual cleanup required." Do NOT silently end the turn.
+4. If multiple matches: escalate — notify Vincent with the candidate list and ask which to update.
+
+**Incident (mika#693, trace `7a9cb990`, 2026-04-20):** Agent called `update_task_status` with hallucinated UUID suffix. Tool returned `task_not_found`. Agent called `list_tasks` in a subsequent step — correct ID was visible — but ended the turn without retrying. Child task was left `in_progress` after PR merge, blocking milestone advancement.
+
 **Status rules:**
 - PR merged (GitHub auto-merge or "merge anyway") → `completed`
 - PR open, awaiting QA or review → remain `in_progress`
