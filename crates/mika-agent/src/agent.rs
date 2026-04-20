@@ -573,6 +573,21 @@ async fn run_loop(
     let effective_required_tools =
         filter_available_required_tools(required_tools, tools, skill_tool_map, mcp_manager);
 
+    // All registered tool names (builtins + skills + MCP) for prose-style tool call
+    // detection (#569). Built once before the loop — the tool set is stable across
+    // iterations.
+    let available_tool_names: HashSet<String> = tools
+        .definitions()
+        .iter()
+        .map(|d| d.name.clone())
+        .chain(skill_tool_map.keys().cloned())
+        .chain(
+            mcp_manager
+                .into_iter()
+                .flat_map(|m| m.tool_definitions().iter().map(|d| d.name.clone())),
+        )
+        .collect();
+
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
     let mut last_usage = None;
@@ -770,42 +785,34 @@ async fn run_loop(
                     // on code examples or explanatory prose. See #569.
                     if matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !prose_tool_call_retry_done
-                    {
-                        let available_tool_names: HashSet<String> = tools
-                            .definitions()
-                            .iter()
-                            .map(|d| d.name.clone())
-                            .chain(skill_tool_map.keys().cloned())
-                            .collect();
-                        if let Some(tool_name) =
+                        && let Some(tool_name) =
                             detect_prose_style_tool_call(&text, &available_tool_names)
-                        {
-                            prose_tool_call_retry_done = true;
-                            warn!(
-                                step,
-                                tool = %tool_name,
-                                label = mode.label(),
-                                "LLM output prose-style tool call instead of using structured API — re-prompting"
-                            );
-                            request.messages.push(LlmMessage {
-                                role: LlmRole::Assistant,
-                                content: LlmContent::Blocks(
-                                    mika_common::llm::response_content_to_blocks(&response.content),
-                                ),
-                            });
-                            request.messages.push(LlmMessage {
-                                role: LlmRole::User,
-                                content: LlmContent::Text(format!(
-                                    "[Your response contained a prose-style tool call for \
-                                     '{tool_name}' (e.g., {tool_name}({{...}})) instead of \
-                                     using the structured tool calling API. Do NOT output \
-                                     tool calls as text. Use the tool calling mechanism \
-                                     provided to you. Call {tool_name} now using the proper \
-                                     API.]",
-                                )),
-                            });
-                            continue;
-                        }
+                    {
+                        prose_tool_call_retry_done = true;
+                        warn!(
+                            step,
+                            tool = %tool_name,
+                            label = mode.label(),
+                            "LLM output prose-style tool call instead of using structured API — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[Your response contained a prose-style tool call for \
+                                 '{tool_name}' (e.g., {tool_name}({{...}})) instead of \
+                                 using the structured tool calling API. Do NOT output \
+                                 tool calls as text. Use the tool calling mechanism \
+                                 provided to you. Call {tool_name} now using the proper \
+                                 API.]",
+                            )),
+                        });
+                        continue;
                     }
 
                     // Required-tools enforcement: if matched skills declared required_tools
