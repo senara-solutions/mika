@@ -1224,6 +1224,7 @@ mod tests {
         // PgPool::connect_lazy creates a pool that only connects when first used.
         // Our GitHub webhook handler never touches Postgres, so this is safe.
         let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
             .connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("lazy pool");
 
@@ -1332,6 +1333,7 @@ mod tests {
         let telegram =
             TelegramClient::new(http_client.clone(), SecretString::from("fake-bot-token"));
         let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
             .connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("lazy pool");
         let delivery_cache = new_delivery_cache();
@@ -1679,6 +1681,7 @@ mod tests {
         let telegram =
             TelegramClient::new(http_client.clone(), SecretString::from("fake-bot-token"));
         let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
             .connect_lazy("postgres://fake:fake@localhost/fake")
             .expect("lazy pool");
 
