@@ -820,6 +820,22 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         Err(err) => return err,
     };
 
+    // Per-turn PR review idempotency guard (#695): if the command is `pr review ...`
+    // and we already posted a review in this turn, reject with a structured error.
+    // This makes the prompt-level idempotency rule enforceable at the tool layer.
+    if is_pr_review_command(&gh_args.args)
+        && ctx
+            .pr_review_posted
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return ToolOutput::error(
+            "{\"error\": \"duplicate_pr_review\", \"message\": \"A PR review was already \
+             posted in this turn. Duplicate reviews create duplicate webhooks. End your \
+             turn — the review is already submitted.\"}"
+                .to_string(),
+        );
+    }
+
     let mut cmd = tokio::process::Command::new("gh");
     cmd.args(&gh_args.args);
 
@@ -837,7 +853,22 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         cmd.env("GH_TOKEN", token);
     }
 
-    spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await
+    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+
+    // On success, record that a PR review was posted in this turn.
+    if !output.is_error && is_pr_review_command(&gh_args.args) {
+        ctx.pr_review_posted
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    output
+}
+
+/// Check if a `gh` command array is a `pr review` invocation.
+/// Matches: `["pr", "review", ...]` — the two positional args that identify
+/// a GitHub PR review command (--approve, --comment, or --request-changes).
+fn is_pr_review_command(args: &[String]) -> bool {
+    args.len() >= 2 && args[0] == "pr" && args[1] == "review"
 }
 
 /// Allowed top-level `gws` service subcommands.
@@ -2909,5 +2940,41 @@ mod tests {
             eligible.iter().any(|s| s["name"] == "my-custom-skill"),
             "my-custom-skill should be eligible"
         );
+    }
+
+    #[test]
+    fn test_is_pr_review_command() {
+        // Positive cases
+        assert!(is_pr_review_command(&[
+            "pr".to_string(),
+            "review".to_string(),
+            "455".to_string(),
+            "--approve".to_string(),
+        ]));
+        assert!(is_pr_review_command(&[
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--comment".to_string(),
+            "--body".to_string(),
+            "VERDICT: hold".to_string(),
+        ]));
+
+        // Negative cases
+        assert!(!is_pr_review_command(&[
+            "pr".to_string(),
+            "list".to_string(),
+        ]));
+        assert!(!is_pr_review_command(&[
+            "pr".to_string(),
+            "view".to_string(),
+            "455".to_string(),
+        ]));
+        assert!(!is_pr_review_command(&["pr".to_string()]));
+        assert!(!is_pr_review_command(&[]));
+        assert!(!is_pr_review_command(&[
+            "issue".to_string(),
+            "review".to_string(),
+        ]));
     }
 }

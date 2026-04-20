@@ -746,6 +746,7 @@ async fn run_investigation(
     // Create a minimal ToolContext for investigation tools.
     // session_id and trace_id carry the investigation context for the
     // create_github_issue tool to embed in issue bodies.
+    let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
     let tool_ctx = crate::tools::ToolContext {
         db: &db,
         session_id: &investigation_session_id,
@@ -766,6 +767,7 @@ async fn run_investigation(
         model_name: llm.model_name(),
         active_skill_paths: &[],
         max_tasks_per_session: 25,
+        pr_review_posted: &pr_review_posted,
     };
 
     let mut text_sent = false;

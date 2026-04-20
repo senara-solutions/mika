@@ -242,7 +242,7 @@ If missing: note it as a finding but do NOT block or hold for this alone. The co
 3. If Step 3e ran, you have emitted a `BUILD VERIFICATION:` section (Step 3e.5).
 4. **You have called `run_gh("pr review <NUMBER> --<approve|comment> --body '<verdict_body>'")` and it returned success.** This is the only action that fires the `pull_request_review.submitted` webhook that mika-dev listens for. Without it, your review is invisible to the rest of the system — no matter how well-composed the verdict text is.
 
-> **Idempotency:** If your conversation history already contains a successful `run_gh("pr review ...")` call for this same PR URL in this turn, do NOT post again — duplicate posting creates duplicate webhooks. But if no such call exists yet, you MUST post before ending the turn, even if you believe the verdict is "obvious" or "the text is already in my response". Silent skip is a protocol violation.
+> **Idempotency (enforced):** The engine rejects duplicate `pr review` calls within a single turn. If you attempt a second review, `run_gh` will return a `duplicate_pr_review` error — this is expected and means your first review was already posted. End your turn normally. Additionally, the engine accepts EndTurn immediately after a successful PR review (skipping later post-condition guards), so forced continuation will not occur. But if no review call exists yet, you MUST post before ending the turn — silent skip is a protocol violation.
 
 Post your verdict as a GitHub pull request review using `run_gh`. The review type depends on the verdict:
 

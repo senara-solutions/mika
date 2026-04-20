@@ -33,6 +33,7 @@ pub mod test_helpers {
     ) -> ToolContext<'a> {
         static HOME_DIR: &str = "/tmp/mika-test";
         static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+        static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
         ToolContext {
             db,
             session_id: "test-session",
@@ -53,6 +54,7 @@ pub mod test_helpers {
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
             max_tasks_per_session: 25,
+            pr_review_posted: &PR_REVIEW_POSTED,
         }
     }
 
@@ -105,6 +107,7 @@ pub mod test_helpers {
         /// Create a ToolContext in reflection mode.
         pub fn ctx_with_reflection(&self) -> ToolContext<'_> {
             static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+            static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
@@ -125,12 +128,14 @@ pub mod test_helpers {
                 model_name: "claude-sonnet-4-6",
                 active_skill_paths: &[],
                 max_tasks_per_session: 25,
+                pr_review_posted: &PR_REVIEW_POSTED,
             }
         }
 
         /// Create a ToolContext with a custom home directory.
         pub fn ctx_with_home<'a>(&'a self, home: &'a std::path::Path) -> ToolContext<'a> {
             static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+            static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
@@ -151,6 +156,7 @@ pub mod test_helpers {
                 model_name: "claude-sonnet-4-6",
                 active_skill_paths: &[],
                 max_tasks_per_session: 25,
+                pr_review_posted: &PR_REVIEW_POSTED,
             }
         }
         /// Create a ToolContext with custom home and global home directories.
@@ -161,6 +167,7 @@ pub mod test_helpers {
             global: &'a std::path::Path,
         ) -> ToolContext<'a> {
             static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
+            static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
@@ -181,6 +188,7 @@ pub mod test_helpers {
                 model_name: "claude-sonnet-4-6",
                 active_skill_paths: &[],
                 max_tasks_per_session: 25,
+                pr_review_posted: &PR_REVIEW_POSTED,
             }
         }
     }
