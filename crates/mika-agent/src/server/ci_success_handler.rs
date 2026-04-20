@@ -376,13 +376,17 @@ pub async fn try_handle_ci_success(
 // ---------------------------------------------------------------------------
 
 /// Minimal PR info needed for the handler.
-struct PrInfo {
-    number: u64,
-    head_sha: String,
+pub(crate) struct PrInfo {
+    pub(crate) number: u64,
+    pub(crate) head_sha: String,
 }
 
 /// Find an open PR whose head branch matches.
-async fn find_open_pr(repo: &str, branch: &str, token: &str) -> Result<Option<PrInfo>, String> {
+pub(crate) async fn find_open_pr(
+    repo: &str,
+    branch: &str,
+    token: &str,
+) -> Result<Option<PrInfo>, String> {
     let args = vec![
         "pr",
         "list",

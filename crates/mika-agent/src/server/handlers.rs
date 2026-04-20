@@ -16,6 +16,7 @@ use crate::compaction;
 use crate::messaging::{GatewayMessageSender, MessageSender};
 use crate::task_engine::types::{task_status, trigger_type};
 
+use super::ci_failure_handler;
 use super::ci_success_handler;
 use super::json_extractor::JsonBody;
 use super::state::{AgentState, AppState};
@@ -798,6 +799,30 @@ async fn run_agent_for_message(
         )
         .await;
         match ci_action {
+            VerdictAction::Handled { pre_digest } => {
+                req.text = pre_digest;
+            }
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+        }
+
+        // Structural CI failure handler: intercept check_suite.completed(failure|timed_out)
+        // webhooks, gather failure context, and prepare dispatch pre-digest (#594).
+        // Order-independent — self-selects on failure/timed_out conclusions.
+        let ci_failure_action = ci_failure_handler::try_handle_ci_failure(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            Some(&sender_arc),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match ci_failure_action {
             VerdictAction::Handled { pre_digest } => {
                 req.text = pre_digest;
             }

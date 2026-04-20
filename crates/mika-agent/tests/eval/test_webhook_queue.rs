@@ -329,7 +329,7 @@ fn correlate_pr_review_extracts_url() {
 
 #[test]
 fn correlate_check_suite_extracts_branch() {
-    let text = "[GitHub] Check suite (failure) on senara-solutions/mika (branch: feat/my-branch)\nhttps://github.com/...";
+    let text = "[GitHub] Check suite failure on senara-solutions/mika (branch: feat/my-branch)\nhttps://github.com/...";
     let c = correlate_webhook(text).expect("should correlate");
     assert!(c.pr_url.is_none());
     assert_eq!(c.branch, Some("feat/my-branch".to_string()));
@@ -358,7 +358,7 @@ async fn webhook_deferred_by_branch_match() {
     let _callback_id = create_callback_task(&db, &task_id).await;
 
     // check_suite event with branch that matches the task
-    let text = "[GitHub] Check suite (failure) on senara-solutions/mika (branch: feat/my-branch)\nhttps://github.com/...";
+    let text = "[GitHub] Check suite failure on senara-solutions/mika (branch: feat/my-branch)\nhttps://github.com/...";
     let correlation = correlate_webhook(text).expect("should correlate");
 
     let result = should_defer_webhook(&db, &correlation).await;
