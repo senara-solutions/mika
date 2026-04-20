@@ -51,6 +51,7 @@ pub mod test_helpers {
             is_callback_turn: false,
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
         }
     }
 
@@ -121,6 +122,7 @@ pub mod test_helpers {
                 is_callback_turn: false,
                 provider_name: "anthropic",
                 model_name: "claude-sonnet-4-6",
+                active_skill_paths: &[],
             }
         }
 
@@ -145,6 +147,7 @@ pub mod test_helpers {
                 is_callback_turn: false,
                 provider_name: "anthropic",
                 model_name: "claude-sonnet-4-6",
+                active_skill_paths: &[],
             }
         }
         /// Create a ToolContext with custom home and global home directories.
@@ -173,6 +176,7 @@ pub mod test_helpers {
                 is_callback_turn: false,
                 provider_name: "anthropic",
                 model_name: "claude-sonnet-4-6",
+                active_skill_paths: &[],
             }
         }
     }

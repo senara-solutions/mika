@@ -4,6 +4,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
+use crate::db::core_memory_section_names;
 
 pub struct SearchMemoryTool;
 
@@ -19,7 +20,7 @@ impl Tool for SearchMemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search_memory".to_string(),
-            description: "Search your stored facts across all categories (people, commitments, preferences, events, reminders, core memory). Uses semantic search when available, with full-text and keyword fallback.".to_string(),
+            description: "Search your stored facts across all categories (people, commitments, preferences, events, reminders). Uses semantic search when available, with full-text and keyword fallback. Note: core_memory is auto-injected into your system prompt — search there first before using this tool for core_memory content.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -51,6 +52,23 @@ impl Tool for SearchMemoryTool {
         }
 
         let category = input["category"].as_str().unwrap_or("all");
+
+        // Redirect: core_memory is auto-injected into the system prompt every turn.
+        // Querying the DB for it is always redundant.
+        if category == "core_memory" {
+            tracing::info!(
+                tool = "search_memory",
+                redirect_reason = "core_memory_in_prompt",
+                query = query,
+                "context redundancy redirect: core_memory already in system prompt"
+            );
+            return Ok(ToolOutput::error(
+                "core_memory is auto-injected into your system prompt on every turn — \
+                 the content is already in the 'Core Memory' block above. \
+                 Search there directly instead of querying the database. \
+                 If you need to modify core_memory, use the update_core_memory tool.",
+            ));
+        }
 
         let mut results = Vec::new();
 
@@ -84,16 +102,37 @@ impl Tool for SearchMemoryTool {
             }
         }
 
+        // Soft hint: if the query matches a core_memory section name, remind
+        // the agent that this data is already in the system prompt.
+        let core_memory_hint = if category == "all" {
+            let query_lower = query.to_lowercase();
+            core_memory_section_names()
+                .iter()
+                .find(|section| section.to_lowercase() == query_lower)
+                .map(|section| {
+                    format!(
+                        "Hint: '{section}' is a core_memory section already in your system prompt. \
+                         Check the 'Core Memory' block above first."
+                    )
+                })
+        } else {
+            None
+        };
+
         if results.is_empty() {
-            Ok(ToolOutput::success(format!(
-                "No results found for \"{query}\" in {category}."
-            )))
+            let mut msg = format!("No results found for \"{query}\" in {category}.");
+            if let Some(hint) = core_memory_hint {
+                msg = format!("{hint}\n\n{msg}");
+            }
+            Ok(ToolOutput::success(msg))
         } else {
             let count = results.len();
             let body = results.join("\n");
-            Ok(ToolOutput::success(format!(
-                "Found {count} result(s) for \"{query}\":\n{body}"
-            )))
+            let mut msg = format!("Found {count} result(s) for \"{query}\":\n{body}");
+            if let Some(hint) = core_memory_hint {
+                msg = format!("{hint}\n\n{msg}");
+            }
+            Ok(ToolOutput::success(msg))
         }
     }
 }
@@ -240,6 +279,172 @@ mod tests {
     use crate::test_utils::test_helpers::TestHarness;
     use crate::tools::index_fact;
 
+    // --- Context redundancy redirect tests ---
+
+    #[tokio::test]
+    async fn test_search_core_memory_category_redirected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "self_model", "category": "core_memory"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("auto-injected"),
+            "expected redirect message, got: {}",
+            result.content
+        );
+        assert!(result.content.contains("update_core_memory"));
+    }
+
+    #[tokio::test]
+    async fn test_search_person_category_not_redirected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "Alice", "category": "person"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_search_all_category_not_redirected() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "Alice", "category": "all"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_query_validation_before_redirect() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "", "category": "core_memory"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        // Should be the validation error, not the redirect
+        assert!(
+            result.content.contains("required"),
+            "expected validation error, got: {}",
+            result.content
+        );
+    }
+
+    // --- Core memory heading hint tests ---
+
+    #[tokio::test]
+    async fn test_search_all_with_section_name_query_has_hint() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "self_model", "category": "all"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("Hint:"),
+            "expected hint, got: {}",
+            result.content
+        );
+        assert!(result.content.contains("core_memory section"));
+    }
+
+    #[tokio::test]
+    async fn test_search_all_with_non_section_query_no_hint() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "Alice", "category": "all"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.content.contains("Hint:"));
+    }
+
+    #[tokio::test]
+    async fn test_search_all_section_name_case_insensitive() {
+        let harness = TestHarness::new();
+        harness.db.seed_core_memory(None).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "Self_Model", "category": "all"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("Hint:"),
+            "expected hint for case-insensitive match, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_all_section_name_no_results_still_has_hint() {
+        let harness = TestHarness::new();
+        // Don't seed core memory — query will find no results
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "user_summary", "category": "all"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("Hint:"),
+            "expected hint even with no results, got: {}",
+            result.content
+        );
+        assert!(result.content.contains("No results found"));
+    }
+
+    // --- Existing tests ---
+
     #[tokio::test]
     async fn test_search_finds_person() {
         let harness = TestHarness::new();
@@ -320,6 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_core_memory() {
+        // category="core_memory" is now redirected — core memory is always in the prompt.
         let harness = TestHarness::new();
         harness.db.seed_core_memory(None).await.unwrap();
         let ctx = harness.ctx();
@@ -332,8 +538,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.content.contains("[core_memory]"));
-        assert!(result.content.contains("user_summary"));
+        assert!(result.is_error);
+        assert!(result.content.contains("auto-injected"));
     }
 
     #[tokio::test]
