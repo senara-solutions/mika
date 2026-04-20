@@ -21,10 +21,11 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 
 HMAC-SHA256 signature validation via `X-Hub-Signature-256`. Event routing:
 - `issues.assigned` and `issue_comment.created` and `pull_request_review.submitted` and `pull_request.closed` and `check_suite.completed(failure/timed_out/success)` -> mika-dev
-- `pull_request.opened/synchronize` -> mika-qa
+- `pull_request.opened/synchronize/review_requested` -> mika-qa
 - Delivery UUID dedup via 10k-entry LRU cache
 - 256KB body limit
 - Multi-tenant routing via `github_repos` table lookup with `agent_base_url` fallback for single-tenant mode
+- Machine user assignee filtering: `MIKA_GITHUB_APP_LOGIN` in per-agent `.env` (e.g., `~/.mika/agents/mika-dev/.env`) should match the machine user login (e.g., `mika-platform-dev`). Filtering logic lives in the self-dev skill prompt, not in gateway code.
 
 ### Inbound delivery retry (#589)
 

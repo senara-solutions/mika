@@ -64,7 +64,7 @@ pub(crate) async fn handle_github_webhook(
 **Event routing (static map):**
 - `issues.opened/assigned` → mika-dev
 - `issue_comment.created` → mika-dev
-- `pull_request.opened/synchronize` → mika-qa
+- `pull_request.opened/synchronize/review_requested` → mika-qa
 - `pull_request_review.submitted` → mika-dev
 - `check_suite.completed(failure/timed_out)` → mika-dev
 
