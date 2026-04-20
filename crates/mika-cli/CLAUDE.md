@@ -4,7 +4,7 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 ## Subcommands
 
-`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`.
+`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`.
 
 ### Key Commands
 
@@ -44,7 +44,15 @@ Scoped flags: `--agent <name>` (override active agent, most subcommands), `--tea
 
 ## Other `--format text|json` Commands
 
-`agents validate`, `teams list`, `teams status`, `teams validate`, `skills list`, `skills validate`, `status`, `config list`, `memory search`, `provider`, `model`.
+`agents validate`, `teams list`, `teams status`, `teams validate`, `skills list`, `skills validate`, `status`, `config list`, `memory search`, `provider`, `model`, `webhook list-dead`, `webhook replay`, `webhook replay-all`.
+
+## Webhook CLI
+
+`mika webhook list-dead` — list DLQ entries (pending + dead). Optional `--status` filter, `--limit` cap.
+`mika webhook replay <delivery_id>` — replay a single dead entry.
+`mika webhook replay-all` — replay all dead entries.
+
+Requires `MIKA_GATEWAY_URL` (default: `http://localhost:3001`) and `MIKA_INTERNAL_TOKEN` for gateway auth.
 
 ## Skills CLI
 

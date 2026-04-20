@@ -286,9 +286,9 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
 // -- Agent mapping --
 
 /// Result of resolving a GitHub repo to a customer container.
-struct ResolvedRoute {
-    container_url: String,
-    agent_mapping: serde_json::Value,
+pub(crate) struct ResolvedRoute {
+    pub(crate) container_url: String,
+    pub(crate) agent_mapping: serde_json::Value,
 }
 
 /// Validate that an agent name is well-formed: lowercase alphanumeric + hyphens,
@@ -554,11 +554,12 @@ pub(crate) async fn handle_github_webhook(
 
     // 12. Async dispatch with retry — return 200 to GitHub immediately.
     // Retry budget: initial attempt + up to 5 retries with backoff [2s, 5s, 15s, 60s, 300s].
-    // DLQ for events that exhaust retries is tracked in #590.
+    // Events that exhaust retries are persisted in the DLQ (#590).
     let forwarding_state = state.clone();
     let target = target_agent.to_string();
     let repo_name = event.repository.as_ref().and_then(|r| r.full_name.clone());
     let semaphore = state.webhook_semaphore.clone();
+    let event_type_owned = event_type.to_string();
     tokio::spawn(async move {
         deliver_with_retry(
             &forwarding_state,
@@ -566,6 +567,7 @@ pub(crate) async fn handle_github_webhook(
             &text,
             &request_id,
             repo_name.as_deref(),
+            &event_type_owned,
             permit,
             &semaphore,
         )
@@ -578,7 +580,7 @@ pub(crate) async fn handle_github_webhook(
 /// Resolve the container URL and agent mapping for a GitHub webhook event by
 /// looking up the repository's full_name in the `github_repos` table. Falls back
 /// to `agent_base_url` for backward compatibility with single-tenant deployments.
-async fn resolve_github_container_url(
+pub(crate) async fn resolve_github_container_url(
     state: &AppState,
     repo_full_name: Option<&str>,
 ) -> Option<ResolvedRoute> {
@@ -647,7 +649,7 @@ async fn resolve_github_container_url(
 ///
 /// Used by [`deliver_with_retry`] so the route (Postgres lookup + agent mapping)
 /// is resolved exactly once, regardless of how many retries occur.
-async fn forward_to_resolved_route(
+pub(crate) async fn forward_to_resolved_route(
     state: &AppState,
     route: &ResolvedRoute,
     default_agent: &str,
@@ -742,12 +744,14 @@ async fn forward_to_resolved_route(
 /// the same event, the gateway would treat it as new. Agent-side idempotency
 /// (task unique index) prevents duplicate processing. A TTL on the LRU
 /// cache would close this gap but is deferred (see #590 for DLQ).
+#[allow(clippy::too_many_arguments)]
 async fn deliver_with_retry(
     state: &AppState,
     target_agent: &str,
     text: &str,
     request_id: &str,
     repo_full_name: Option<&str>,
+    event_type: &str,
     initial_permit: tokio::sync::OwnedSemaphorePermit,
     semaphore: &Arc<tokio::sync::Semaphore>,
 ) {
@@ -757,6 +761,7 @@ async fn deliver_with_retry(
         text,
         request_id,
         repo_full_name,
+        event_type,
         initial_permit,
         semaphore,
         &RETRY_DELAYS,
@@ -774,6 +779,7 @@ async fn deliver_with_retry_inner(
     text: &str,
     request_id: &str,
     repo_full_name: Option<&str>,
+    event_type: &str,
     initial_permit: tokio::sync::OwnedSemaphorePermit,
     semaphore: &Arc<tokio::sync::Semaphore>,
     retry_delays: &[Duration],
@@ -818,8 +824,22 @@ async fn deliver_with_retry_inner(
                         request_id,
                         attempts_made,
                         last_reason = %last_reason,
-                        "GitHub event delivery abandoned — gateway semaphore at capacity during retry, event dropped"
+                        "GitHub event delivery abandoned — gateway semaphore at capacity during retry, persisting to DLQ"
                     );
+                    crate::dlq::insert_delivery(
+                        &state.pool,
+                        crate::dlq::NewDelivery {
+                            delivery_id: request_id,
+                            event_type,
+                            target_agent,
+                            repo_full_name,
+                            payload: text,
+                            request_id,
+                            attempts: attempts_made as i32,
+                            last_error: &last_reason,
+                        },
+                    )
+                    .await;
                     return;
                 }
             }
@@ -882,14 +902,28 @@ async fn deliver_with_retry_inner(
         }
     }
 
-    // All retries exhausted — every attempt returned Retryable.
+    // All retries exhausted — every attempt returned Retryable. Persist to DLQ.
     error!(
         target_agent,
         request_id,
         total_attempts = attempts_made,
         last_reason = %last_reason,
-        "GitHub event delivery failed — retry budget exhausted, event dropped (DLQ: #590)"
+        "GitHub event delivery failed — retry budget exhausted, persisting to DLQ"
     );
+    crate::dlq::insert_delivery(
+        &state.pool,
+        crate::dlq::NewDelivery {
+            delivery_id: request_id,
+            event_type,
+            target_agent,
+            repo_full_name,
+            payload: text,
+            request_id,
+            attempts: attempts_made as i32,
+            last_error: &last_reason,
+        },
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -1677,6 +1711,7 @@ mod tests {
             "test event",
             "delivery-1",
             Some("org/repo"),
+            "issues",
             permit,
             &semaphore,
         )
@@ -1708,6 +1743,7 @@ mod tests {
             "test event",
             "delivery-429",
             Some("org/repo"),
+            "issues",
             permit,
             &semaphore,
         )
@@ -1736,6 +1772,7 @@ mod tests {
             "test event",
             "delivery-503",
             Some("org/repo"),
+            "issues",
             permit,
             &semaphore,
         )
@@ -1762,6 +1799,7 @@ mod tests {
             "test event",
             "delivery-400",
             Some("org/repo"),
+            "issues",
             permit,
             &semaphore,
         )
@@ -1789,6 +1827,7 @@ mod tests {
             "test event",
             "delivery-404",
             Some("org/repo"),
+            "issues",
             permit,
             &semaphore,
         )
@@ -1839,6 +1878,7 @@ mod tests {
                 "test event",
                 "delivery-exhausted",
                 Some("org/repo"),
+                "issues",
                 permit,
                 &semaphore,
             ),
@@ -1919,6 +1959,7 @@ mod tests {
                 "test event",
                 "delivery-sem",
                 None,
+                "issues",
                 permit,
                 &sem_clone,
                 &TEST_DELAYS_OBSERVE_ONLY,
@@ -1964,6 +2005,7 @@ mod tests {
                 "test event",
                 "delivery-blocked",
                 None,
+                "issues",
                 permit,
                 &sem_clone,
                 &TEST_DELAYS_OBSERVE_AND_ABANDON,
@@ -2021,6 +2063,7 @@ mod tests {
             "test event",
             "delivery-202",
             Some("org/repo"),
+            "issues",
             permit,
             &semaphore,
         )

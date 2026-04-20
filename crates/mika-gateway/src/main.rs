@@ -1,5 +1,6 @@
 mod a2a_auth;
 mod a2a_routes;
+pub(crate) mod dlq;
 pub mod github;
 pub mod openapi;
 mod routes;
@@ -107,6 +108,9 @@ async fn main() -> Result<()> {
         github_webhook_secret: settings.github_webhook_secret.clone(),
         github_delivery_cache: github::new_delivery_cache(),
     };
+
+    // Spawn DLQ background worker (retries pending deliveries every 30s)
+    tokio::spawn(dlq::run_dlq_worker(state.clone()));
 
     let app = build_router(state);
 
