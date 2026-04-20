@@ -181,6 +181,16 @@ impl SkillRegistry {
         }
     }
 
+    /// Create a registry from pre-built entries (for integration tests).
+    pub fn from_test_entries(entries: Vec<SkillEntry>) -> Self {
+        Self {
+            skills: entries,
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+        }
+    }
+
     /// Create a registry with pre-populated skipped skills (for testing/display).
     pub fn with_skipped(skipped: Vec<SkippedSkill>) -> Self {
         Self {
