@@ -776,34 +776,56 @@ async fn run_loop(
                             .filter(|t| !tools_called.contains(t.as_str()))
                             .collect();
                         if !missing.is_empty() {
-                            required_tools_retry_done = true;
-                            let missing_names: Vec<&str> =
-                                missing.iter().map(|s| s.as_str()).collect();
-                            warn!(
-                                step,
-                                ?missing_names,
-                                label = mode.label(),
-                                "agent responded without calling required tools — re-prompting"
-                            );
-                            // Push the assistant's response so the model sees what it tried
-                            request.messages.push(LlmMessage {
-                                role: LlmRole::Assistant,
-                                content: LlmContent::Blocks(
-                                    mika_common::llm::response_content_to_blocks(&response.content),
-                                ),
-                            });
-                            // Inject a correction telling the model which tools it must call
-                            request.messages.push(LlmMessage {
-                                role: LlmRole::User,
-                                content: LlmContent::Text(format!(
-                                    "[Your response was rejected because you did not call the required \
-                                     tool(s): {}. You MUST call these tools with real data before \
-                                     producing your response. Do not fabricate or assume results — \
-                                     call the tools now.]",
-                                    missing_names.join(", ")
-                                )),
-                            });
-                            continue;
+                            // Check if a required tool failed with a terminal error.
+                            // If so, the workflow is broken and retrying won't help —
+                            // allow EndTurn so the agent can report the failure. See #516.
+                            if has_terminal_required_tool_failure(
+                                &effective_required_tools,
+                                &all_tool_summaries,
+                            ) {
+                                let missing_names: Vec<&str> =
+                                    missing.iter().map(|s| s.as_str()).collect();
+                                warn!(
+                                    step,
+                                    ?missing_names,
+                                    label = mode.label(),
+                                    "required tools missing but a required tool failed terminally \
+                                     — allowing EndTurn without retry"
+                                );
+                                required_tools_retry_done = true;
+                                // Fall through — let the response proceed to the next guard.
+                            } else {
+                                required_tools_retry_done = true;
+                                let missing_names: Vec<&str> =
+                                    missing.iter().map(|s| s.as_str()).collect();
+                                warn!(
+                                    step,
+                                    ?missing_names,
+                                    label = mode.label(),
+                                    "agent responded without calling required tools — re-prompting"
+                                );
+                                // Push the assistant's response so the model sees what it tried
+                                request.messages.push(LlmMessage {
+                                    role: LlmRole::Assistant,
+                                    content: LlmContent::Blocks(
+                                        mika_common::llm::response_content_to_blocks(
+                                            &response.content,
+                                        ),
+                                    ),
+                                });
+                                // Inject a correction telling the model which tools it must call
+                                request.messages.push(LlmMessage {
+                                    role: LlmRole::User,
+                                    content: LlmContent::Text(format!(
+                                        "[Your response was rejected because you did not call the \
+                                         required tool(s): {}. You MUST call these tools with real \
+                                         data before producing your response. Do not fabricate or \
+                                         assume results — call the tools now.]",
+                                        missing_names.join(", ")
+                                    )),
+                                });
+                                continue;
+                            }
                         }
                     }
 
@@ -2899,6 +2921,85 @@ fn filter_available_required_tools(
         })
         .cloned()
         .collect()
+}
+
+/// Known retryable error patterns in tool output. If any of these match (case-insensitive),
+/// the error is considered transient and the tool should be retried.
+const RETRYABLE_ERROR_PATTERNS: &[&str] = &[
+    "http 429",
+    "rate limit",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "timed out",
+    "timeout",
+    "connection refused",
+    "connection reset",
+];
+
+/// Known terminal error patterns in tool output. If any of these match (case-insensitive)
+/// AND no retryable pattern matches, the error is considered unrecoverable.
+///
+/// Patterns are intentionally specific to avoid false positives on non-error text.
+/// Bare words like "not found" or "forbidden" are excluded — they match too broadly
+/// (e.g., search results saying "no items found"). Use HTTP-prefixed patterns for
+/// HTTP errors and full phrases for API-specific errors.
+const TERMINAL_ERROR_PATTERNS: &[&str] = &[
+    // GitHub self-action errors
+    "can not approve your own",
+    "can't review your own",
+    "you can't review your own",
+    // HTTP client errors (non-retryable)
+    "http 404",
+    "http 403",
+    "http 401",
+    // Permission errors (specific phrases, not bare words)
+    "insufficient permissions",
+    "resource not accessible",
+    "permission denied",
+];
+
+/// Check whether a tool's output text matches a known terminal (unrecoverable) error.
+///
+/// Returns `true` only when:
+/// 1. The output matches at least one terminal error pattern, AND
+/// 2. The output does NOT match any retryable error pattern.
+///
+/// Unknown errors (matching neither list) return `false` (conservative default — retry).
+fn is_terminal_tool_error(output: &str) -> bool {
+    let lower = output.to_lowercase();
+
+    // Retryable patterns take priority — if any match, this is NOT terminal.
+    if RETRYABLE_ERROR_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+
+    // Check for terminal patterns.
+    TERMINAL_ERROR_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Check whether any required tool was called and failed with a terminal error.
+///
+/// Scans `all_tool_summaries` for entries matching a tool name in `required` where
+/// `success == false` and the output matches a known terminal error pattern.
+/// When found, the required_tools gate should allow EndTurn without retry — the agent
+/// attempted the tool and hit an unrecoverable wall. See #516.
+///
+/// Known limitations:
+/// - Scans all steps in the session. A tool that failed terminally in an earlier step
+///   but succeeded in a later step will still match (name-only dedup, no step filtering).
+///   Bounded by the once-only `required_tools_retry_done` flag.
+/// - Pattern matching uses the 300-char `output_summary`, not the full output. Terminal
+///   error text beyond 300 chars will not be detected. The failure mode is conservative
+///   (retry instead of bypass).
+fn has_terminal_required_tool_failure(
+    required: &HashSet<String>,
+    summaries: &[ToolCallSummary],
+) -> bool {
+    summaries.iter().any(|s| {
+        required.contains(&s.name) && !s.success && is_terminal_tool_error(&s.output_summary)
+    })
 }
 
 /// Inject matched skill prompt snippets into the system prompt and resolve
@@ -5286,5 +5387,236 @@ mod tests {
             detect_informational_input("incident report: prod database was down for 5 min");
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "incident report");
+    }
+
+    // -- is_terminal_tool_error tests --
+
+    #[test]
+    fn test_terminal_error_github_self_approval() {
+        assert!(is_terminal_tool_error(
+            "Exit code: 1\nGraphQL: Can not approve your own pull request"
+        ));
+    }
+
+    #[test]
+    fn test_terminal_error_github_self_review() {
+        assert!(is_terminal_tool_error(
+            "Exit code: 1\nYou can't review your own pull request"
+        ));
+    }
+
+    #[test]
+    fn test_terminal_error_http_404() {
+        assert!(is_terminal_tool_error("HTTP 404: Not Found"));
+    }
+
+    #[test]
+    fn test_terminal_error_http_403() {
+        assert!(is_terminal_tool_error("HTTP 403: Forbidden"));
+    }
+
+    #[test]
+    fn test_terminal_error_http_401() {
+        assert!(is_terminal_tool_error("HTTP 401: Unauthorized"));
+    }
+
+    #[test]
+    fn test_terminal_error_insufficient_permissions() {
+        assert!(is_terminal_tool_error(
+            "Exit code: 1\ninsufficient permissions for this resource"
+        ));
+    }
+
+    #[test]
+    fn test_terminal_error_resource_not_accessible() {
+        assert!(is_terminal_tool_error(
+            "Resource not accessible by integration"
+        ));
+    }
+
+    #[test]
+    fn test_terminal_error_permission_denied() {
+        assert!(is_terminal_tool_error("permission denied"));
+    }
+
+    #[test]
+    fn test_terminal_error_case_insensitive() {
+        assert!(is_terminal_tool_error(
+            "Exit code: 1\nGraphQL: CAN NOT APPROVE YOUR OWN pull request"
+        ));
+    }
+
+    #[test]
+    fn test_retryable_error_http_429() {
+        assert!(!is_terminal_tool_error("HTTP 429: rate limit exceeded"));
+    }
+
+    #[test]
+    fn test_retryable_error_rate_limit() {
+        assert!(!is_terminal_tool_error(
+            "API rate limit exceeded. Please retry after 60 seconds."
+        ));
+    }
+
+    #[test]
+    fn test_retryable_error_http_500() {
+        assert!(!is_terminal_tool_error("HTTP 500: Internal Server Error"));
+    }
+
+    #[test]
+    fn test_retryable_error_http_502() {
+        assert!(!is_terminal_tool_error("HTTP 502: Bad Gateway"));
+    }
+
+    #[test]
+    fn test_retryable_error_http_503() {
+        assert!(!is_terminal_tool_error("HTTP 503: Service Unavailable"));
+    }
+
+    #[test]
+    fn test_retryable_error_http_504() {
+        assert!(!is_terminal_tool_error("HTTP 504: Gateway Timeout"));
+    }
+
+    #[test]
+    fn test_retryable_error_timeout() {
+        assert!(!is_terminal_tool_error("request timed out after 30s"));
+    }
+
+    #[test]
+    fn test_retryable_error_connection_refused() {
+        assert!(!is_terminal_tool_error("connection refused"));
+    }
+
+    #[test]
+    fn test_retryable_overrides_terminal() {
+        // A 429 with "permission denied" text should still be retryable
+        assert!(!is_terminal_tool_error(
+            "HTTP 429: permission denied rate limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn test_not_found_bare_is_not_terminal() {
+        // Bare "not found" should NOT be terminal — too broad, matches search results
+        assert!(!is_terminal_tool_error("No matching records found"));
+        assert!(!is_terminal_tool_error("file not found: /tmp/data"));
+    }
+
+    #[test]
+    fn test_forbidden_bare_is_not_terminal() {
+        // Bare "forbidden" should NOT be terminal — too broad
+        assert!(!is_terminal_tool_error(
+            "some resources are forbidden by default"
+        ));
+    }
+
+    #[test]
+    fn test_unauthorized_bare_is_not_terminal() {
+        // Bare "unauthorized" should NOT be terminal — too broad
+        assert!(!is_terminal_tool_error(
+            "unauthorized access attempt logged"
+        ));
+    }
+
+    #[test]
+    fn test_unknown_error_not_terminal() {
+        assert!(!is_terminal_tool_error("some random error message"));
+    }
+
+    #[test]
+    fn test_empty_output_not_terminal() {
+        assert!(!is_terminal_tool_error(""));
+    }
+
+    #[test]
+    fn test_successful_output_not_terminal() {
+        assert!(!is_terminal_tool_error("PR approved successfully"));
+    }
+
+    // -- has_terminal_required_tool_failure tests --
+
+    fn make_summary(name: &str, output: &str, success: bool) -> ToolCallSummary {
+        ToolCallSummary {
+            step: 0,
+            name: name.to_string(),
+            input_summary: String::new(),
+            output_summary: output.to_string(),
+            success,
+            non_zero_exit: !success,
+        }
+    }
+
+    #[test]
+    fn test_terminal_required_tool_failure_detected() {
+        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
+        let summaries = vec![make_summary(
+            "run_gh",
+            "Exit code: 1\nGraphQL: Can not approve your own pull request",
+            false,
+        )];
+        assert!(has_terminal_required_tool_failure(&required, &summaries));
+    }
+
+    #[test]
+    fn test_terminal_failure_non_required_tool_ignored() {
+        let required: HashSet<String> = ["qa_pr_view"].iter().map(|s| s.to_string()).collect();
+        let summaries = vec![make_summary(
+            "run_gh",
+            "Exit code: 1\nGraphQL: Can not approve your own pull request",
+            false,
+        )];
+        assert!(!has_terminal_required_tool_failure(&required, &summaries));
+    }
+
+    #[test]
+    fn test_terminal_failure_successful_tool_ignored() {
+        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
+        let summaries = vec![make_summary("run_gh", "PR approved successfully", true)];
+        assert!(!has_terminal_required_tool_failure(&required, &summaries));
+    }
+
+    #[test]
+    fn test_terminal_failure_retryable_error_not_terminal() {
+        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
+        let summaries = vec![make_summary(
+            "run_gh",
+            "HTTP 429: rate limit exceeded",
+            false,
+        )];
+        assert!(!has_terminal_required_tool_failure(&required, &summaries));
+    }
+
+    #[test]
+    fn test_terminal_failure_unknown_error_not_terminal() {
+        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
+        let summaries = vec![make_summary("run_gh", "some random error", false)];
+        assert!(!has_terminal_required_tool_failure(&required, &summaries));
+    }
+
+    #[test]
+    fn test_terminal_failure_empty_summaries() {
+        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
+        assert!(!has_terminal_required_tool_failure(&required, &[]));
+    }
+
+    #[test]
+    fn test_terminal_failure_empty_output_not_terminal() {
+        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
+        let summaries = vec![make_summary("run_gh", "", false)];
+        assert!(!has_terminal_required_tool_failure(&required, &summaries));
+    }
+
+    #[test]
+    fn test_terminal_failure_multiple_summaries_one_terminal() {
+        let required: HashSet<String> = ["run_gh", "qa_pr_view"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let summaries = vec![
+            make_summary("qa_pr_view", "PR #42: Fix bug", true),
+            make_summary("run_gh", "Exit code: 1\nHTTP 404: Not Found", false),
+        ];
+        assert!(has_terminal_required_tool_failure(&required, &summaries));
     }
 }

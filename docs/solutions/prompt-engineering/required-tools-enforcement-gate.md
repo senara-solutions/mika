@@ -57,8 +57,22 @@ You MUST call these tools with real data before producing your response. Do not 
 or assume results — call the tools now.]
 ```
 
+## Terminal Failure Bypass (#516)
+
+When a required tool was called and failed with a terminal (unrecoverable) error, the gate allows EndTurn without retry. This prevents wasting LLM calls re-running a workflow that will hit the same wall.
+
+Detection uses two pattern lists checked against `output_summary` (300 chars, case-insensitive):
+1. `RETRYABLE_ERROR_PATTERNS` — checked first, takes priority (HTTP 429/5xx, rate limits, timeouts, connection errors)
+2. `TERMINAL_ERROR_PATTERNS` — GitHub self-approval, HTTP 4xx, permission errors
+
+`has_terminal_required_tool_failure()` scans `all_tool_summaries` for any required tool with `success == false` and a terminal output pattern. If found, the gate logs a warning and falls through to the next guard instead of re-prompting.
+
+Unknown errors (matching neither list) default to retryable — the conservative path preserves existing retry behavior.
+
 ## Limitations
 
 - **Best-effort**: If the model ignores the correction, the second response is accepted regardless. The feature is a guardrail, not a hard constraint.
 - **Step budget**: The retry consumes a loop step. A skill requiring tools at step 9 of 10 might not have room.
 - **No input validation**: The enforcement checks that the tool was *called*, not that the inputs or outputs are valid.
+- **Terminal detection scope**: Pattern matching operates on the 300-char `output_summary`, not the full tool output. Long preambles before the error text may cause missed detection (conservative fallback: retry).
+- **Cross-step name collisions**: A tool that failed terminally in an earlier step but succeeded later will still match. Bounded by the once-only `required_tools_retry_done` flag.

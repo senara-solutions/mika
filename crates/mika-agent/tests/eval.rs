@@ -15,6 +15,7 @@ mod eval {
     mod test_multi_step;
     mod test_persistence_eval_guard;
     mod test_phantom_retry_guard;
+    mod test_required_tools_gate;
     mod test_tool_calling;
     mod test_verdict_handler;
     mod test_webhook_queue;
