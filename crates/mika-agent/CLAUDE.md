@@ -65,7 +65,7 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 **Phantom retry guard (#579):** `update_task_status` rejects retry-semantic metadata writes (any top-level key containing "retry", case-insensitive) when the task has an active callback child task (`trigger_type="callback"` in `pending` or `in_progress` status). Returns structured JSON error `retry_metadata_rejected_active_dispatch`. Fail-open on `get_child_tasks` DB error — the dispatch readiness guard (#525) is the primary defense against re-dispatch. Non-retry metadata writes are unaffected.
 
-**Idempotent creation:** Deduplicates on `reference_url` (DB partial unique index `idx_tasks_manual_active_ref_url`) and on label (case-insensitive pre-check). Five loop-prevention guards. Max 5 agent-created items per session (user_request exempt).
+**Idempotent creation:** Deduplicates on `reference_url` (DB partial unique index `idx_tasks_manual_active_ref_url`) and on label (case-insensitive pre-check). Five loop-prevention guards. Max 25 agent-created items per session (configurable via `max_agent_tasks_per_session`, user_request exempt).
 
 **Note on renamed scheduled task tools:** The former scheduled-task tools `create_task` and `list_tasks` have been renamed to `create_scheduled_task` (in `create_scheduled_task.rs`) and `list_scheduled_tasks` (in `list_scheduled_tasks.rs`) to avoid name collisions with the task tracking tools above.
 

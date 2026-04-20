@@ -1571,6 +1571,9 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         provider_name: provider,
         model_name: model,
         active_skill_paths: &active_skill_paths,
+        max_tasks_per_session: params
+            .settings
+            .map_or(25, |s| s.max_agent_tasks_per_session),
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -2379,6 +2382,9 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         provider_name: provider,
         model_name: model,
         active_skill_paths: &[], // Silent mode: no context-redundancy checks needed
+        max_tasks_per_session: params
+            .settings
+            .map_or(25, |s| s.max_agent_tasks_per_session),
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
@@ -2699,6 +2705,9 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         provider_name: provider,
         model_name: model,
         active_skill_paths: &[], // Team mode: no context-redundancy checks needed
+        max_tasks_per_session: params
+            .settings
+            .map_or(25, |s| s.max_agent_tasks_per_session),
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =

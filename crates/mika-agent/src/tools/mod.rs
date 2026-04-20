@@ -120,6 +120,8 @@ pub struct ToolContext<'a> {
     /// Used by read tools (e.g., `read_agent_file`) to detect redundant fetches.
     /// Empty in silent mode and tests by default.
     pub active_skill_paths: &'a [SkillPathInfo],
+    /// Maximum agent-created tasks per session (configurable, default 25).
+    pub max_tasks_per_session: i64,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

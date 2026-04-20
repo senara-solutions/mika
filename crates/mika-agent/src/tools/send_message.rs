@@ -198,6 +198,7 @@ mod tests {
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
+            max_tasks_per_session: 25,
         };
         let tool = SendMessageTool;
 
@@ -265,6 +266,7 @@ mod tests {
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
+            max_tasks_per_session: 25,
         };
         let tool = SendMessageTool;
 
@@ -314,6 +316,7 @@ mod tests {
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
+            max_tasks_per_session: 25,
         };
         let tool = SendMessageTool;
 
@@ -360,6 +363,7 @@ mod tests {
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
+            max_tasks_per_session: 25,
         };
         let tool = SendMessageTool;
 
