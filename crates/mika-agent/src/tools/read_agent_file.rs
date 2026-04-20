@@ -13,17 +13,23 @@ use crate::db::core_memory_section_names;
 /// Maximum file size that can be read from the agent home directory (100 KB).
 const MAX_READ_SIZE: u64 = 100 * 1024;
 
+/// Strip a single leading `./` or `~/` prefix from a path string.
+///
+/// Used by guards that compare user-supplied paths against known context paths.
+/// This is advisory normalization — `validate_and_resolve_path` handles security.
+fn normalize_path_prefix(path: &str) -> &str {
+    path.strip_prefix("./")
+        .or_else(|| path.strip_prefix("~/"))
+        .unwrap_or(path)
+}
+
 /// Check whether a path targets a core_memory section.
 ///
 /// Returns `Some(section_name)` if the path matches a core_memory section,
 /// `None` otherwise. Core memory is DB-backed and auto-injected into the
 /// system prompt — it has no filesystem representation.
 fn is_core_memory_path(path: &str) -> Option<&'static str> {
-    // Normalize: strip leading ./ and ~/
-    let normalized = path
-        .strip_prefix("./")
-        .or_else(|| path.strip_prefix("~/"))
-        .unwrap_or(path);
+    let normalized = normalize_path_prefix(path);
 
     // Check for core_memory/ or core-memory/ prefix
     let after_prefix = normalized
@@ -80,11 +86,7 @@ fn is_active_skill_prompt<'a>(
         return None;
     }
 
-    // Normalize: strip leading ./ and ~/
-    let normalized = path
-        .strip_prefix("./")
-        .or_else(|| path.strip_prefix("~/"))
-        .unwrap_or(path);
+    let normalized = normalize_path_prefix(path);
 
     for info in active_skill_paths {
         if normalized == info.prompt_relative_path {
@@ -548,6 +550,35 @@ mod tests {
             is_active_skill_prompt("skills/self-dev/handlers/run.sh", &paths),
             None
         );
+        assert_eq!(
+            is_active_skill_prompt("skills/other/system_prompt.md", &paths),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_active_skill_prompt_multiple_skills() {
+        let paths = vec![
+            SkillPathInfo {
+                skill_name: "self-dev".to_string(),
+                prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+            },
+            SkillPathInfo {
+                skill_name: "qa-review".to_string(),
+                prompt_relative_path: "skills/qa-review/system_prompt.md".to_string(),
+            },
+        ];
+        // Should match the second skill
+        assert_eq!(
+            is_active_skill_prompt("skills/qa-review/system_prompt.md", &paths),
+            Some("qa-review")
+        );
+        // Should match the first skill
+        assert_eq!(
+            is_active_skill_prompt("skills/self-dev/system_prompt.md", &paths),
+            Some("self-dev")
+        );
+        // Should not match either
         assert_eq!(
             is_active_skill_prompt("skills/other/system_prompt.md", &paths),
             None

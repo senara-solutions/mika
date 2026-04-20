@@ -1393,11 +1393,23 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         .iter()
         .filter(|e| !e.prompt_snippet.is_empty())
         .filter_map(|e| {
-            let rel = e.dir.strip_prefix(params.home_dir).ok()?;
-            Some(SkillPathInfo {
-                skill_name: e.manifest.skill.name.clone(),
-                prompt_relative_path: rel.join("system_prompt.md").to_string_lossy().into_owned(),
-            })
+            match e.dir.strip_prefix(params.home_dir) {
+                Ok(rel) => Some(SkillPathInfo {
+                    skill_name: e.manifest.skill.name.clone(),
+                    prompt_relative_path: rel
+                        .join("system_prompt.md")
+                        .to_string_lossy()
+                        .into_owned(),
+                }),
+                Err(_) => {
+                    warn!(
+                        skill = %e.manifest.skill.name,
+                        dir = %e.dir.display(),
+                        "active_skill_paths: skill dir not under home_dir, excluded from redundancy check"
+                    );
+                    None
+                }
+            }
         })
         .collect();
 

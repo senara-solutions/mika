@@ -72,8 +72,10 @@ impl Tool for SearchMemoryTool {
 
         let mut results = Vec::new();
 
-        // Non-indexed categories: always use LIKE
-        if category == "all" || category == "core_memory" {
+        // Non-indexed categories: always use LIKE.
+        // Note: category="core_memory" is handled by the early redirect above
+        // and never reaches here. The "all" path still sweeps core memory via LIKE.
+        if category == "all" {
             search_core_memory(ctx, query, &mut results).await?;
         }
         if category == "all" || category == "reminder" {
