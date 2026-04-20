@@ -96,7 +96,7 @@ After extracting, **persist immediately:** call `update_task_status` with the cu
 
 When you receive a callback result from a completed `run_claude_pilot` background task:
 
-> **CRITICAL: DO NOT end your turn after receiving a callback.** You MUST make at least one tool call before your turn ends. Generating a text summary without tool calls is a workflow failure.
+> **CRITICAL: DO NOT end your turn after receiving a callback.** You MUST make at least one tool call before your turn ends. Generating a text summary without tool calls is a workflow failure. This rule is structurally enforced by the engine — webhook turns (`[GitHub]` messages) with zero successful tool calls will be rejected and you will be re-prompted (#696).
 
 > **SCOPE RULE: Post-callback turns handle ONLY the task that triggered the callback.** Do NOT call `list_tasks` to check sprint progress, do NOT pick up unrelated issues, do NOT review the backlog. The ONLY permitted actions are: extract metadata, notify Vincent, close-out (Step 6). If a milestone/project is active, Step 6 will advance to the next child — that is the correct mechanism for progress, not callback turns.
 

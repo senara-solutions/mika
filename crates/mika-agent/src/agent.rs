@@ -612,6 +612,9 @@ async fn run_loop(
     // Guards against turns that produce institutional knowledge without calling
     // store_fact/update_fact/update_core_memory (#648).
     let mut persistence_eval_retry_done = false;
+    // Whether we already injected a webhook zero-tools correction. Only allow one retry.
+    // Guards against webhook turns where the agent narrates instead of acting (#696).
+    let mut webhook_zero_tools_retry_done = false;
     // Capture the user's input text for persistence evaluation guard (#648).
     // Extracted once before the loop starts so it always reflects the real user
     // message, not synthetic messages injected by guards during re-prompts.
@@ -1003,6 +1006,44 @@ async fn run_loop(
                                  Call the appropriate tool now to actually perform the action, \
                                  or explain that you cannot perform it.]",
                             )),
+                        });
+                        continue;
+                    }
+
+                    // Webhook zero-tools guard: if the user message is a webhook
+                    // event (starts with `[GitHub]`) and the agent responded with
+                    // zero successful tool calls, reject and re-prompt once. Webhook
+                    // events require action — text-only responses are fabrications.
+                    // See #696.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !webhook_zero_tools_retry_done
+                        && user_input_text.starts_with("[GitHub]")
+                        && !all_tool_summaries.iter().any(|s| s.success)
+                    {
+                        webhook_zero_tools_retry_done = true;
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            "Webhook turn with zero successful tool calls — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                "[Your response was rejected because you received a GitHub \
+                                 webhook event but responded with text only and zero tool calls. \
+                                 Webhook events require action — you MUST call at least one tool \
+                                 (send_message, update_task_status, list_tasks, check_task, etc.) \
+                                 to process the event. Re-read the webhook payload above and use \
+                                 the appropriate tools to handle it.]"
+                                    .to_string(),
+                            ),
                         });
                         continue;
                     }
