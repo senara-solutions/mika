@@ -225,6 +225,55 @@ async fn test_text_based_tool_call_retry() {
     assert_exact_steps(&trace, 3);
 }
 
+// --- prose-style tool call guard (#569) ---
+
+#[tokio::test]
+async fn test_prose_style_tool_call_retry() {
+    // First response: LLM outputs a prose-style tool call as text instead of
+    // using the structured API — e.g. `search_memory({"query": "meetings"})`.
+    // The agent loop should detect this (the identifier matches a registered
+    // tool) and re-prompt.
+    // Second response: proper structured tool call.
+    // Third response: text summary after tool execution.
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            text_response("search_memory({\"query\": \"meetings\"})"),
+            tool_call_response("search_memory", json!({"query": "meetings"})),
+            text_response("Here are your meetings."),
+        ])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("What meetings do I have?").await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "meetings");
+    assert_tools_include(&trace, &["search_memory"]);
+    // 3 steps: text (retry), tool call, final response
+    assert_exact_steps(&trace, 3);
+}
+
+#[tokio::test]
+async fn test_prose_style_tool_call_unknown_tool_no_retry() {
+    // The prose pattern uses an identifier that is NOT a registered tool.
+    // The guard should NOT fire — the response passes through as normal text.
+    let harness = EvalHarness::builder()
+        .responses(vec![text_response(
+            "You can test it by running my_function({\"key\": \"value\"}).",
+        )])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("How do I test this?").await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "my_function");
+    // 1 step: no retry — the identifier is not a registered tool
+    assert_exact_steps(&trace, 1);
+}
+
 // --- send_message gateway error surfacing (#581) ---
 
 /// Test sender returning a configurable outcome for eval harness tests.

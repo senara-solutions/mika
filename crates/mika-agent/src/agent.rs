@@ -573,6 +573,21 @@ async fn run_loop(
     let effective_required_tools =
         filter_available_required_tools(required_tools, tools, skill_tool_map, mcp_manager);
 
+    // All registered tool names (builtins + skills + MCP) for prose-style tool call
+    // detection (#569). Built once before the loop — the tool set is stable across
+    // iterations.
+    let available_tool_names: HashSet<String> = tools
+        .definitions()
+        .iter()
+        .map(|d| d.name.clone())
+        .chain(skill_tool_map.keys().cloned())
+        .chain(
+            mcp_manager
+                .into_iter()
+                .flat_map(|m| m.tool_definitions().iter().map(|d| d.name.clone())),
+        )
+        .collect();
+
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
     let mut last_usage = None;
@@ -590,6 +605,9 @@ async fn run_loop(
     // Whether we already injected a fabricated-action correction. Only allow one retry.
     // Guards against fabricated action claims with URLs but zero tool calls (#308).
     let mut fabricated_action_retry_done = false;
+    // Whether we already injected a prose-style tool call correction. Only allow one retry.
+    // Guards against prose-style tool call leaks like `tool_name({"key": "val"})` (#569).
+    let mut prose_tool_call_retry_done = false;
     // Whether we already nudged the agent to persist knowledge. Only allow one nudge.
     // Guards against turns that produce institutional knowledge without calling
     // store_fact/update_fact/update_core_memory (#648).
@@ -756,6 +774,43 @@ async fn run_loop(
                                  you. Call the tool now using the proper API.]"
                                     .to_string(),
                             ),
+                        });
+                        continue;
+                    }
+
+                    // Prose-style tool call detection: if the LLM output a tool
+                    // invocation as prose text — e.g. `tool_name({"key": "val"})` —
+                    // instead of using the structured API, re-prompt once.
+                    // Gated against the registered tool set to avoid false positives
+                    // on code examples or explanatory prose. See #569.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !prose_tool_call_retry_done
+                        && let Some(tool_name) =
+                            detect_prose_style_tool_call(&text, &available_tool_names)
+                    {
+                        prose_tool_call_retry_done = true;
+                        warn!(
+                            step,
+                            tool = %tool_name,
+                            label = mode.label(),
+                            "LLM output prose-style tool call instead of using structured API — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[Your response contained a prose-style tool call for \
+                                 '{tool_name}' (e.g., {tool_name}({{...}})) instead of \
+                                 using the structured tool calling API. Do NOT output \
+                                 tool calls as text. Use the tool calling mechanism \
+                                 provided to you. Call {tool_name} now using the proper \
+                                 API.]",
+                            )),
                         });
                         continue;
                     }
@@ -3228,6 +3283,33 @@ fn detect_text_based_tool_call(text: &str) -> bool {
     text.contains("<function=") && (text.contains("</function>") || text.contains("</tool_call>"))
 }
 
+/// Regex matching `identifier(  {` — a function-call-style pattern with a JSON object arg.
+/// Capture group 1 is the identifier (potential tool name).
+static PROSE_TOOL_CALL_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\b(\w+)\s*\(\s*\{").unwrap());
+
+/// Detect prose-style tool call leaks: `tool_name({"key": "value"})`.
+///
+/// Returns `Some(tool_name)` when the text contains a pattern matching
+/// `<identifier>\s*\(\s*\{` AND the identifier is present in the given tool
+/// name set.  Gating against the registered tool set eliminates false
+/// positives on general code examples and explanatory prose.
+fn detect_prose_style_tool_call(text: &str, tool_names: &HashSet<String>) -> Option<String> {
+    // Fast-path: any prose-style tool call must contain a `(` character.
+    if !text.contains('(') {
+        return None;
+    }
+    for caps in PROSE_TOOL_CALL_RE.captures_iter(text) {
+        if let Some(m) = caps.get(1) {
+            let candidate = m.as_str();
+            if tool_names.contains(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5082,6 +5164,105 @@ mod tests {
         assert!(!detect_text_based_tool_call(
             "Use <function=search_memory to find things"
         ));
+    }
+
+    // -- detect_prose_style_tool_call tests (#569) --
+
+    /// Helper: build a tool name set from a slice of names.
+    fn tool_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_known_tool() {
+        let tools = tool_set(&["check_work_item"]);
+        assert_eq!(
+            detect_prose_style_tool_call(
+                r#"check_work_item({"task_id": "48cbb025-6d8e-430f-a957-9ce2e32800bb"})"#,
+                &tools,
+            ),
+            Some("check_work_item".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_whitespace_between_parens_and_brace() {
+        let tools = tool_set(&["search_memory"]);
+        assert_eq!(
+            detect_prose_style_tool_call(r#"search_memory( {"query": "test"} )"#, &tools,),
+            Some("search_memory".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_multiline_json() {
+        let tools = tool_set(&["store_fact"]);
+        let text = "store_fact(\n{\"key\": \"val\",\n\"key2\": \"val2\"}\n)";
+        assert_eq!(
+            detect_prose_style_tool_call(text, &tools),
+            Some("store_fact".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_unknown_identifier() {
+        let tools = tool_set(&["search_memory"]);
+        assert_eq!(
+            detect_prose_style_tool_call(r#"my_function({"key": "val"})"#, &tools,),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_empty_text() {
+        let tools = tool_set(&["search_memory"]);
+        assert_eq!(detect_prose_style_tool_call("", &tools), None);
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_parens_but_no_tool_pattern() {
+        let tools = tool_set(&["search_memory"]);
+        assert_eq!(
+            detect_prose_style_tool_call("I found some information (see details).", &tools,),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_tool_name_without_invocation() {
+        let tools = tool_set(&["check_work_item"]);
+        assert_eq!(
+            detect_prose_style_tool_call("Use check_work_item to verify the task status.", &tools,),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_generic_function_not_in_toolset() {
+        let tools = tool_set(&["search_memory"]);
+        assert_eq!(
+            detect_prose_style_tool_call(r#"Run my_func({"x": 1}) to test"#, &tools,),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_returns_first_match() {
+        let tools = tool_set(&["search_memory", "store_fact"]);
+        let text = r#"search_memory({"query": "a"}) and store_fact({"text": "b"})"#;
+        assert_eq!(
+            detect_prose_style_tool_call(text, &tools),
+            Some("search_memory".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_detect_prose_tool_call_underscores_and_digits() {
+        let tools = tool_set(&["tool_v2"]);
+        assert_eq!(
+            detect_prose_style_tool_call(r#"tool_v2({"a": 1})"#, &tools),
+            Some("tool_v2".to_string()),
+        );
     }
 
     // -- detect_completion_claim tests (#483) --
