@@ -47,9 +47,9 @@ pub struct WebhookCorrelation {
 }
 
 /// Regex for parsing check_suite events from gateway-formatted text.
-/// Format: `[GitHub] Check suite (conclusion) on repo (branch: branch_name)`
+/// Format: `[GitHub] Check suite {conclusion} on {repo} (branch: {branch})`
 static CHECK_SUITE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\[GitHub\] Check suite \(([^)]+)\) on (\S+) \(branch: ([^)]+)\)")
+    Regex::new(r"^\[GitHub\] Check suite (\S+) on (\S+) \(branch: ([^)]+)\)")
         .expect("check_suite regex")
 });
 
@@ -123,7 +123,7 @@ pub async fn should_defer_webhook(
 }
 
 /// Check if a task has any active (pending or in_progress) callback child tasks.
-async fn has_active_callback_child(db: &AsyncDatabase, task_id: &str) -> bool {
+pub(crate) async fn has_active_callback_child(db: &AsyncDatabase, task_id: &str) -> bool {
     match db.get_child_tasks(task_id).await {
         Ok(children) => children.iter().any(|c| {
             c.trigger_type == trigger_type::CALLBACK
@@ -250,14 +250,36 @@ mod tests {
     }
 
     #[test]
-    fn test_correlate_check_suite() {
-        let text = "[GitHub] Check suite (failure) on senara-solutions/mika (branch: feat/my-feature)\nhttps://github.com/...";
+    fn test_correlate_check_suite_failure() {
+        // Matches actual gateway format: no parentheses around conclusion
+        let text = "[GitHub] Check suite failure on senara-solutions/mika (branch: feat/my-feature)\nhttps://github.com/...";
         let result = correlate_webhook(text);
         assert!(result.is_some());
         let c = result.unwrap();
         assert!(c.pr_url.is_none());
         assert_eq!(c.branch, Some("feat/my-feature".to_string()));
         assert!(c.event_desc.contains("check_suite"));
+        assert!(c.event_desc.contains("failure"));
+    }
+
+    #[test]
+    fn test_correlate_check_suite_success() {
+        let text = "[GitHub] Check suite success on org/repo (branch: main)";
+        let result = correlate_webhook(text);
+        assert!(result.is_some());
+        let c = result.unwrap();
+        assert_eq!(c.branch, Some("main".to_string()));
+        assert!(c.event_desc.contains("success"));
+    }
+
+    #[test]
+    fn test_correlate_check_suite_timed_out() {
+        let text = "[GitHub] Check suite timed_out on org/repo (branch: feat/x)";
+        let result = correlate_webhook(text);
+        assert!(result.is_some());
+        let c = result.unwrap();
+        assert_eq!(c.branch, Some("feat/x".to_string()));
+        assert!(c.event_desc.contains("timed_out"));
     }
 
     #[test]
