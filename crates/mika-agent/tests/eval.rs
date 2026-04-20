@@ -15,6 +15,7 @@ mod eval {
     mod test_multi_step;
     mod test_persistence_eval_guard;
     mod test_phantom_retry_guard;
+    mod test_pr_review_idempotency;
     mod test_required_tools_gate;
     mod test_task_not_found_retry;
     mod test_tool_calling;

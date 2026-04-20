@@ -884,12 +884,29 @@ async fn run_loop(
                         }
                     }
 
+                    // PR review early-accept: if the turn already contains a
+                    // successful `gh pr review` call, skip guards #4–#6. The primary
+                    // action completed — forced continuation would risk duplicate
+                    // review submissions. See #695.
+                    let skip_remaining_guards =
+                        matches!(response.stop_reason, LlmStopReason::EndTurn)
+                            && has_successful_pr_review(&all_tool_summaries);
+
+                    if skip_remaining_guards {
+                        info!(
+                            step,
+                            label = mode.label(),
+                            "PR review already posted — accepting EndTurn (skipping guards #4-#6)"
+                        );
+                    }
+
                     // Completion-claim guard: if the agent claims work is done (e.g.,
                     // "merged", "deployed", "completed") but didn't call
                     // update_task_status, reject and re-prompt once. This catches
                     // fabricated completion claims that leave tasks stuck in
                     // in_progress. Only fires on EndTurn. See #483.
-                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !completion_claim_retry_done
                         && let Some(keyword) = detect_completion_claim(&text)
                     {
@@ -956,7 +973,8 @@ async fn run_loop(
                     // but made zero tool calls in this turn, reject and re-prompt.
                     // This catches hallucinated tool results where the agent fabricates
                     // resource URLs without executing any tool. See #308.
-                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !fabricated_action_retry_done
                         && tools_called.is_empty()
                         && let Some((verb, url)) = detect_fabricated_action_claim(&text)
@@ -993,7 +1011,8 @@ async fn run_loop(
                     // that appears to contain institutional knowledge but no
                     // persistence tool was called, nudge the model to consider
                     // calling store_fact. Only fires in conversation mode. See #648.
-                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && mode.is_conversation()
                         && !persistence_eval_retry_done
                         && !PERSISTENCE_WRITE_TOOLS
@@ -1552,6 +1571,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
     }
 
     let core_memory_edit_count = AtomicU32::new(0);
+    let pr_review_posted = AtomicBool::new(false);
     let tool_ctx = ToolContext {
         db,
         session_id: params.session_id,
@@ -1574,6 +1594,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         max_tasks_per_session: params
             .settings
             .map_or(25, |s| s.max_agent_tasks_per_session),
+        pr_review_posted: &pr_review_posted,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -2358,6 +2379,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     };
 
     let core_memory_edit_count = AtomicU32::new(0);
+    let pr_review_posted = AtomicBool::new(false);
     let tool_ctx = ToolContext {
         db,
         session_id: params.session_id,
@@ -2385,6 +2407,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         max_tasks_per_session: params
             .settings
             .map_or(25, |s| s.max_agent_tasks_per_session),
+        pr_review_posted: &pr_review_posted,
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
@@ -2686,6 +2709,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         .unwrap_or_else(mika_common::trace::generate_trace_id);
 
     let core_memory_edit_count = AtomicU32::new(0);
+    let pr_review_posted = AtomicBool::new(false);
     let tool_ctx = ToolContext {
         db: params.db,
         session_id: params.session_id,
@@ -2708,6 +2732,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         max_tasks_per_session: params
             .settings
             .map_or(25, |s| s.max_agent_tasks_per_session),
+        pr_review_posted: &pr_review_posted,
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
@@ -3063,6 +3088,24 @@ fn has_terminal_required_tool_failure(
 ) -> bool {
     summaries.iter().any(|s| {
         required.contains(&s.name) && !s.success && is_terminal_tool_error(&s.output_summary)
+    })
+}
+
+/// Check whether the turn already contains a successful `gh pr review` call.
+///
+/// Used by the post-condition chain to skip guards #4–#6 when the qa-review
+/// workflow's primary action already completed. This prevents forced continuation
+/// from causing duplicate PR review submissions. See #695.
+///
+/// Detection: looks for `run_gh` tool calls that succeeded where the
+/// `input_summary` contains both `"pr"` and `"review"` substrings (the positional
+/// args that identify a `gh pr review` invocation).
+fn has_successful_pr_review(summaries: &[ToolCallSummary]) -> bool {
+    summaries.iter().any(|s| {
+        s.name == "run_gh"
+            && s.success
+            && s.input_summary.contains("\"pr\"")
+            && s.input_summary.contains("\"review\"")
     })
 }
 
@@ -5808,5 +5851,53 @@ mod tests {
             make_summary("run_gh", "Exit code: 1\nHTTP 404: Not Found", false),
         ];
         assert!(has_terminal_required_tool_failure(&required, &summaries));
+    }
+
+    // -- has_successful_pr_review tests (#695) --
+
+    #[test]
+    fn pr_review_detected_when_run_gh_pr_review_succeeded() {
+        let summaries = vec![ToolCallSummary {
+            step: 1,
+            name: "run_gh".to_string(),
+            input_summary:
+                r#"{"command":["pr","review","455","--approve","--body","VERDICT: pass"]}"#
+                    .to_string(),
+            output_summary: "Review submitted".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(has_successful_pr_review(&summaries));
+    }
+
+    #[test]
+    fn pr_review_not_detected_for_failed_review() {
+        let summaries = vec![ToolCallSummary {
+            step: 1,
+            name: "run_gh".to_string(),
+            input_summary: r#"{"command":["pr","review","455","--approve"]}"#.to_string(),
+            output_summary: "Exit code: 1\nHTTP 422: Unprocessable Entity".to_string(),
+            success: false,
+            non_zero_exit: true,
+        }];
+        assert!(!has_successful_pr_review(&summaries));
+    }
+
+    #[test]
+    fn pr_review_not_detected_for_pr_list() {
+        let summaries = vec![ToolCallSummary {
+            step: 1,
+            name: "run_gh".to_string(),
+            input_summary: r#"{"command":["pr","list","--state","open"]}"#.to_string(),
+            output_summary: "PR #1 Fix bug".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(!has_successful_pr_review(&summaries));
+    }
+
+    #[test]
+    fn pr_review_not_detected_when_empty() {
+        assert!(!has_successful_pr_review(&[]));
     }
 }

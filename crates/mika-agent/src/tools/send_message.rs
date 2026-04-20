@@ -179,6 +179,7 @@ mod tests {
         let harness = TestHarness::new();
         let mock = Arc::new(MockSender::new());
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -199,6 +200,7 @@ mod tests {
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
             max_tasks_per_session: 25,
+            pr_review_posted: &pr_review_posted,
         };
         let tool = SendMessageTool;
 
@@ -247,6 +249,7 @@ mod tests {
             reason: "gateway /send returned 502 Bad Gateway".to_string(),
         }));
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -267,6 +270,7 @@ mod tests {
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
             max_tasks_per_session: 25,
+            pr_review_posted: &pr_review_posted,
         };
         let tool = SendMessageTool;
 
@@ -297,6 +301,7 @@ mod tests {
             "chat_id not configured — no Telegram pairing yet",
         ));
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -317,6 +322,7 @@ mod tests {
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
             max_tasks_per_session: 25,
+            pr_review_posted: &pr_review_posted,
         };
         let tool = SendMessageTool;
 
@@ -344,6 +350,7 @@ mod tests {
             reason: "gateway unreachable (connection error): connection refused".to_string(),
         }));
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -364,6 +371,7 @@ mod tests {
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
             max_tasks_per_session: 25,
+            pr_review_posted: &pr_review_posted,
         };
         let tool = SendMessageTool;
 

@@ -122,6 +122,10 @@ pub struct ToolContext<'a> {
     pub active_skill_paths: &'a [SkillPathInfo],
     /// Maximum agent-created tasks per session (configurable, default 25).
     pub max_tasks_per_session: i64,
+    /// Per-turn flag: set to `true` after a successful `gh pr review` call.
+    /// Used by `run_gh` to reject duplicate PR review submissions within the
+    /// same turn — prevents duplicate webhooks. See #695.
+    pub pr_review_posted: &'a AtomicBool,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
