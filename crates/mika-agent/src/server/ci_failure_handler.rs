@@ -262,7 +262,30 @@ pub async fn try_handle_ci_failure(
         };
     }
 
-    // 8. Increment ci_fix_count deterministically before constructing dispatch pre-digest
+    // 8. Fetch failing checks and job logs for context
+    //    Done BEFORE incrementing ci_fix_count so transient CI self-healing
+    //    doesn't waste a circuit-breaker slot (COR-002).
+    let failure_context = fetch_failure_context(pr.number, &event.repo, token).await;
+
+    // 8b. If CI self-healed between the event and our check, abort without
+    //     incrementing the counter — no dispatch needed.
+    if failure_context.failing_checks.is_empty() && failure_context.error.is_some() {
+        info!(
+            task_id = %task.id,
+            pr_number = pr.number,
+            note = failure_context.error.as_deref().unwrap_or("unknown"),
+            "CI failure handler: no failing checks at query time — aborting dispatch"
+        );
+        return VerdictAction::Passthrough {
+            enrichment: Some(format!(
+                "[ci_failure_handler] CI {} event on {}#{} (branch: {}) but no failing checks \
+                 found at query time (possible self-healing). No dispatch needed.\n\n",
+                event.conclusion, event.repo, pr.number, event.branch
+            )),
+        };
+    }
+
+    // 9. Increment ci_fix_count deterministically now that we've confirmed failures exist
     let new_count = ci_fix_count + 1;
     if let Err(e) = update_ci_fix_count(db, &task.id, &task.metadata, new_count).await {
         warn!(
@@ -271,9 +294,6 @@ pub async fn try_handle_ci_failure(
             "Failed to increment ci_fix_count — proceeding anyway"
         );
     }
-
-    // 9. Fetch failing checks and job logs for context
-    let failure_context = fetch_failure_context(pr.number, &event.repo, token).await;
 
     // 10. Check global dispatch guard (informational — included in pre-digest)
     let global_dispatch_busy = match db.has_active_callback_tasks_excluding(&task.id).await {
@@ -476,7 +496,7 @@ async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> Failu
     // Fetch job logs for up to MAX_FAILING_JOBS
     for check in failing.iter().take(MAX_FAILING_JOBS) {
         if let Some(ref link) = check.link
-            && let Some(log) = fetch_job_log(link, token).await
+            && let Some(log) = fetch_job_log(link, repo, token).await
         {
             ctx.job_logs.push((check.name.clone(), log));
         }
@@ -485,16 +505,39 @@ async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> Failu
     ctx
 }
 
+/// Parse a GitHub Actions check link URL into (run_id, job_id).
+///
+/// Expected format: `https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}`
+fn parse_check_link(url: &str) -> Option<(&str, &str)> {
+    // Split on "/job/" to separate run path from job_id
+    let (before_job, job_id) = url.rsplit_once("/job/")?;
+    // Extract run_id: last segment before "/job/"
+    let run_id = before_job.rsplit('/').next()?;
+    if run_id.is_empty() || job_id.is_empty() {
+        return None;
+    }
+    Some((run_id, job_id))
+}
+
 /// Fetch and truncate a failing job's log output.
 ///
 /// Extracts the run ID and job name from the check link URL, then runs
-/// `gh run view <run_id> --job <job_name> --log-failed`.
-async fn fetch_job_log(check_link: &str, token: &str) -> Option<String> {
+/// `gh run view <run_id> --repo <repo> --job <job_name> --log-failed`.
+async fn fetch_job_log(check_link: &str, repo: &str, token: &str) -> Option<String> {
     // check_link format: https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}
-    // We need the job_id for gh run view --job
-    let job_id = check_link.rsplit('/').next()?;
+    // gh run view requires: gh run view <run_id> --repo <repo> --job <job_id> --log-failed
+    let (run_id, job_id) = parse_check_link(check_link)?;
 
-    let args = vec!["run", "view", "--job", job_id, "--log-failed"];
+    let args = vec![
+        "run",
+        "view",
+        run_id,
+        "--repo",
+        repo,
+        "--job",
+        job_id,
+        "--log-failed",
+    ];
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -723,6 +766,27 @@ mod tests {
     fn parse_check_suite_unknown_conclusion_returns_none() {
         let text = "[GitHub] Check suite cancelled on org/repo (branch: feat/x)";
         assert!(parse_check_suite_failure(text).is_none());
+    }
+
+    // -- Check link parser tests --
+
+    #[test]
+    fn parse_check_link_valid() {
+        let url = "https://github.com/org/repo/actions/runs/12345/job/67890";
+        let (run_id, job_id) = parse_check_link(url).unwrap();
+        assert_eq!(run_id, "12345");
+        assert_eq!(job_id, "67890");
+    }
+
+    #[test]
+    fn parse_check_link_no_job_segment() {
+        let url = "https://github.com/org/repo/actions/runs/12345";
+        assert!(parse_check_link(url).is_none());
+    }
+
+    #[test]
+    fn parse_check_link_empty_returns_none() {
+        assert!(parse_check_link("").is_none());
     }
 
     // -- Metadata helpers --
