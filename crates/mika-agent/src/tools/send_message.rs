@@ -197,6 +197,7 @@ mod tests {
             is_callback_turn: false,
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
         };
         let tool = SendMessageTool;
 
@@ -263,6 +264,7 @@ mod tests {
             is_callback_turn: false,
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
         };
         let tool = SendMessageTool;
 
@@ -311,6 +313,7 @@ mod tests {
             is_callback_turn: false,
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
         };
         let tool = SendMessageTool;
 
@@ -356,6 +359,7 @@ mod tests {
             is_callback_turn: false,
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
         };
         let tool = SendMessageTool;
 

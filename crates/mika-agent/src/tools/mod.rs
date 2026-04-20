@@ -73,6 +73,16 @@ pub const MAX_INPUT_LEN: usize = 10_000;
 /// model-tuned skill prompts without truncation. Control fields keep the 10K cap.
 pub const MAX_PAYLOAD_BYTES: usize = 200 * 1024;
 
+/// Info about an active skill prompt that is already injected into the system prompt.
+/// Used by read tools to detect redundant fetches.
+#[derive(Debug, Clone)]
+pub struct SkillPathInfo {
+    /// Skill name (e.g., "self-dev").
+    pub skill_name: String,
+    /// Path relative to agent home (e.g., "skills/self-dev/system_prompt.md").
+    pub prompt_relative_path: String,
+}
+
 /// Context available to every tool during execution.
 pub struct ToolContext<'a> {
     pub db: &'a AsyncDatabase,
@@ -106,6 +116,10 @@ pub struct ToolContext<'a> {
     /// Current LLM model name (e.g., "claude-sonnet-4-6", "anthropic/claude-sonnet-4").
     /// Used by builtin handlers that need to know the agent's active model.
     pub model_name: &'a str,
+    /// Active skill prompts already injected into the system prompt.
+    /// Used by read tools (e.g., `read_agent_file`) to detect redundant fetches.
+    /// Empty in silent mode and tests by default.
+    pub active_skill_paths: &'a [SkillPathInfo],
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

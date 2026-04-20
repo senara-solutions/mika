@@ -764,6 +764,7 @@ async fn run_investigation(
         is_callback_turn: false,
         provider_name: llm.provider_name(),
         model_name: llm.model_name(),
+        active_skill_paths: &[],
     };
 
     let mut text_sent = false;

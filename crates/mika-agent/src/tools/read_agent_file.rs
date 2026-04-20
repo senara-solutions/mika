@@ -5,11 +5,23 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
-use super::{Tool, ToolContext, ToolOutput, resolve_agent_home, validate_and_resolve_path};
+use super::{
+    SkillPathInfo, Tool, ToolContext, ToolOutput, resolve_agent_home, validate_and_resolve_path,
+};
 use crate::db::core_memory_section_names;
 
 /// Maximum file size that can be read from the agent home directory (100 KB).
 const MAX_READ_SIZE: u64 = 100 * 1024;
+
+/// Strip a single leading `./` or `~/` prefix from a path string.
+///
+/// Used by guards that compare user-supplied paths against known context paths.
+/// This is advisory normalization — `validate_and_resolve_path` handles security.
+fn normalize_path_prefix(path: &str) -> &str {
+    path.strip_prefix("./")
+        .or_else(|| path.strip_prefix("~/"))
+        .unwrap_or(path)
+}
 
 /// Check whether a path targets a core_memory section.
 ///
@@ -17,11 +29,7 @@ const MAX_READ_SIZE: u64 = 100 * 1024;
 /// `None` otherwise. Core memory is DB-backed and auto-injected into the
 /// system prompt — it has no filesystem representation.
 fn is_core_memory_path(path: &str) -> Option<&'static str> {
-    // Normalize: strip leading ./ and ~/
-    let normalized = path
-        .strip_prefix("./")
-        .or_else(|| path.strip_prefix("~/"))
-        .unwrap_or(path);
+    let normalized = normalize_path_prefix(path);
 
     // Check for core_memory/ or core-memory/ prefix
     let after_prefix = normalized
@@ -65,6 +73,30 @@ fn is_core_memory_path(path: &str) -> Option<&'static str> {
     None
 }
 
+/// Check whether a path targets a skill prompt file that is already loaded in context.
+///
+/// Returns `Some(skill_name)` if the path matches an active skill's `system_prompt.md`,
+/// `None` otherwise. Skill prompts are pre-injected into the system prompt by the engine
+/// — re-reading them wastes tokens.
+fn is_active_skill_prompt<'a>(
+    path: &str,
+    active_skill_paths: &'a [SkillPathInfo],
+) -> Option<&'a str> {
+    if active_skill_paths.is_empty() {
+        return None;
+    }
+
+    let normalized = normalize_path_prefix(path);
+
+    for info in active_skill_paths {
+        if normalized == info.prompt_relative_path {
+            return Some(&info.skill_name);
+        }
+    }
+
+    None
+}
+
 pub struct ReadAgentFileTool;
 
 #[async_trait]
@@ -76,7 +108,7 @@ impl Tool for ReadAgentFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_agent_file".to_string(),
-            description: "Read a file from the agent's home directory. Returns the file contents as text. Files larger than 100 KB are rejected. Does NOT access core_memory — core_memory sections (self_model, user_summary, etc.) are auto-injected into your system prompt and cannot be read as files. To modify core_memory, use update_core_memory.".to_string(),
+            description: "Read a file from the agent's home directory. Returns the file contents as text. Files larger than 100 KB are rejected. Does NOT access core_memory — core_memory sections (self_model, user_summary, etc.) are auto-injected into your system prompt and cannot be read as files. Active skill prompts (system_prompt.md) are also already in your context — do not re-read them. To modify core_memory, use update_core_memory.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -111,6 +143,21 @@ impl Tool for ReadAgentFileTool {
                 } else {
                     format!("including '{section}'")
                 }
+            )));
+        }
+
+        // Reject paths targeting active skill prompts already in context
+        if let Some(skill_name) = is_active_skill_prompt(path, ctx.active_skill_paths) {
+            tracing::info!(
+                tool = "read_agent_file",
+                redirect_reason = "active_skill_prompt",
+                matched_source = skill_name,
+                "context redundancy redirect: skill prompt already in system prompt"
+            );
+            return Ok(ToolOutput::error(format!(
+                "The file '{path}' is already loaded as the '{skill_name}' skill prompt \
+                 in your system prompt context. Read it from the '<context type=\"skill\">' \
+                 block above instead of re-fetching."
             )));
         }
 
@@ -452,6 +499,182 @@ mod tests {
         let output = tool.execute(input, &ctx).await.unwrap();
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("my notes"));
+    }
+
+    // --- Active skill prompt path rejection tests ---
+
+    #[test]
+    fn test_is_active_skill_prompt_match() {
+        let paths = vec![SkillPathInfo {
+            skill_name: "self-dev".to_string(),
+            prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+        }];
+        assert_eq!(
+            is_active_skill_prompt("skills/self-dev/system_prompt.md", &paths),
+            Some("self-dev")
+        );
+    }
+
+    #[test]
+    fn test_is_active_skill_prompt_tilde_prefix() {
+        let paths = vec![SkillPathInfo {
+            skill_name: "self-dev".to_string(),
+            prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+        }];
+        assert_eq!(
+            is_active_skill_prompt("~/skills/self-dev/system_prompt.md", &paths),
+            Some("self-dev")
+        );
+    }
+
+    #[test]
+    fn test_is_active_skill_prompt_dot_prefix() {
+        let paths = vec![SkillPathInfo {
+            skill_name: "self-dev".to_string(),
+            prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+        }];
+        assert_eq!(
+            is_active_skill_prompt("./skills/self-dev/system_prompt.md", &paths),
+            Some("self-dev")
+        );
+    }
+
+    #[test]
+    fn test_is_active_skill_prompt_no_match() {
+        let paths = vec![SkillPathInfo {
+            skill_name: "self-dev".to_string(),
+            prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+        }];
+        assert_eq!(is_active_skill_prompt("notes.md", &paths), None);
+        assert_eq!(
+            is_active_skill_prompt("skills/self-dev/handlers/run.sh", &paths),
+            None
+        );
+        assert_eq!(
+            is_active_skill_prompt("skills/other/system_prompt.md", &paths),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_active_skill_prompt_multiple_skills() {
+        let paths = vec![
+            SkillPathInfo {
+                skill_name: "self-dev".to_string(),
+                prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+            },
+            SkillPathInfo {
+                skill_name: "qa-review".to_string(),
+                prompt_relative_path: "skills/qa-review/system_prompt.md".to_string(),
+            },
+        ];
+        // Should match the second skill
+        assert_eq!(
+            is_active_skill_prompt("skills/qa-review/system_prompt.md", &paths),
+            Some("qa-review")
+        );
+        // Should match the first skill
+        assert_eq!(
+            is_active_skill_prompt("skills/self-dev/system_prompt.md", &paths),
+            Some("self-dev")
+        );
+        // Should not match either
+        assert_eq!(
+            is_active_skill_prompt("skills/other/system_prompt.md", &paths),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_active_skill_prompt_empty_paths() {
+        assert_eq!(
+            is_active_skill_prompt("skills/self-dev/system_prompt.md", &[]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_active_skill_prompt_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let skill_dir = home.join("skills").join("self-dev");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("system_prompt.md"), "skill prompt content").unwrap();
+
+        let skill_paths = vec![SkillPathInfo {
+            skill_name: "self-dev".to_string(),
+            prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+        }];
+
+        let tool = ReadAgentFileTool;
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx_with_home(&home);
+        ctx.active_skill_paths = &skill_paths;
+        let input = serde_json::json!({ "path": "skills/self-dev/system_prompt.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("already loaded"),
+            "expected skill prompt redirect, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("self-dev"),
+            "expected skill name in error, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_non_skill_file_allowed_with_active_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("notes.md"), "my notes").unwrap();
+
+        let skill_paths = vec![SkillPathInfo {
+            skill_name: "self-dev".to_string(),
+            prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+        }];
+
+        let tool = ReadAgentFileTool;
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx_with_home(&home);
+        ctx.active_skill_paths = &skill_paths;
+        let input = serde_json::json!({ "path": "notes.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(!output.is_error, "should NOT reject: {}", output.content);
+        assert!(output.content.contains("my notes"));
+    }
+
+    #[tokio::test]
+    async fn test_core_memory_guard_fires_before_skill_prompt_guard() {
+        // Core memory paths should be rejected by the core_memory guard,
+        // not the skill prompt guard, even if active skills are loaded.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let skill_paths = vec![SkillPathInfo {
+            skill_name: "self-dev".to_string(),
+            prompt_relative_path: "skills/self-dev/system_prompt.md".to_string(),
+        }];
+
+        let tool = ReadAgentFileTool;
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx_with_home(&home);
+        ctx.active_skill_paths = &skill_paths;
+        let input = serde_json::json!({ "path": "core_memory/self_model.md" });
+
+        let output = tool.execute(input, &ctx).await.unwrap();
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not filesystem-accessible"),
+            "expected core_memory guard error, got: {}",
+            output.content
+        );
     }
 
     // --- Core memory path rejection tests ---
