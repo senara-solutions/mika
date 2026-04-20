@@ -85,7 +85,7 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 
 - **One container per customer** — per-customer isolation with SQLite
 - **Three-layer memory model** — core memory (system prompt) + structured facts + hybrid search (FTS5 + vector). See `crates/mika-agent/CLAUDE.md`.
-- **Agent loop** — max 20 tool steps, 5-min timeout, 6 post-condition guards on EndTurn. See `crates/mika-agent/CLAUDE.md`.
+- **Agent loop** — max 20 tool steps, 5-min timeout, 7 post-condition guards on EndTurn (includes intent-precondition registry). See `crates/mika-agent/CLAUDE.md`.
 - **Skills marketplace** — git-based distribution, per-provider/model prompt variants, dependency resolution. See `crates/mika-agent/CLAUDE.md`.
 - **Unified task engine** — SQLite-backed scheduler, callback/resume lifecycle, team suspend/resume. See `crates/mika-agent/CLAUDE.md`.
 - **HTTP server (mika-server)** — Axum, two auth layers, embedded dashboard. See `crates/mika-agent/CLAUDE.md`.

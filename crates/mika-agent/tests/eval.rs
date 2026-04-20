@@ -11,6 +11,7 @@ mod eval {
     mod test_basic_conversation;
     mod test_completion_claim_guard;
     mod test_error_handling;
+    mod test_intent_precondition_guard;
     mod test_internal_tagging;
     mod test_multi_step;
     mod test_persistence_eval_guard;
