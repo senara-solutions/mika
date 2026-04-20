@@ -337,7 +337,7 @@ The engine enforces a hard limit of one `run_claude_pilot` dispatch per turn and
 
 Never cite an issue number from memory when reporting completion. Cross-reference against the active task's label or `check_task` output before including any issue number in a completion claim, status notification, or close-out message. Related issues with similar numbers (e.g., #675 vs #682) are a known confusion source — the wrong number can cause incorrect task transitions and confuse Vincent.
 
-**Required verification:** Before any message containing "{repo}#{number} complete" or similar, call `check_task(task_id)` and extract the `reference_url` or `label` to confirm the issue number. If the number in your draft message does not match the tool output, use the tool output.
+**Required verification:** Before any message containing "{repo}#{number} complete" or similar, look up the task via `list_tasks` (see Rule 11), then call `check_task(task_id)` with the fresh UUID and extract the `reference_url` or `label` to confirm the issue number. If the number in your draft message does not match the tool output, use the tool output. This complements Rule 8 (PR numbers) — Rule 8 covers PR number fabrication; this rule covers issue number confusion in completion claims.
 
 **Incident:** 2026-04-20 — reported "mika#675 complete" when the completed issue was mika#682. The agent relied on a memorized issue number instead of checking the active task.
 
