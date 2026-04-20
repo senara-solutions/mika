@@ -8,5 +8,7 @@ timeout_secs = 60
 [triggers]
 keywords = []
 
+# required_tools enforcement only fires on MatchReason::Keyword (#265).
+# With empty keywords, this is a no-op — kept so it activates if keywords are restored.
 [constraints]
 required_tools = ["review_skill"]
