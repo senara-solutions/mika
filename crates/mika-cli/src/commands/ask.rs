@@ -32,7 +32,8 @@ pub async fn run(
     parent_task_id: Option<&str>,
     format: &OutputFormat,
     model_override: Option<&str>,
-    skill_always_on: &[String],
+    enable_skill: &[String],
+    disable_skill: &[String],
 ) -> Result<()> {
     let mut ctx = init::init_for_agent(agent_name)?;
 
@@ -243,18 +244,37 @@ pub async fn run(
     {
         skill_registry.apply_overrides(&overrides);
     }
-    // Apply transient always_on overrides from --skill-always-on CLI flags.
+    // Validate --enable-skill / --disable-skill don't conflict on the same skill name.
+    for enable_name in enable_skill {
+        if disable_skill
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(enable_name))
+        {
+            anyhow::bail!(
+                "Cannot both enable and disable skill '{enable_name}' in the same invocation"
+            );
+        }
+    }
+
+    // Apply transient overrides from --enable-skill / --disable-skill CLI flags.
     // Runs after apply_overrides() so it stacks on top of DB state.
-    if !skill_always_on.is_empty() {
-        let result = skill_registry.apply_transient_always_on(skill_always_on);
+    // Order: disable first, enable second (matches apply_overrides Phase 0/1 pattern).
+    if !disable_skill.is_empty() {
+        let result = skill_registry.apply_transient_disable(disable_skill);
+        for name in &result.not_found {
+            eprintln!("[mika] warning: --disable-skill '{name}' did not match any loaded skill");
+        }
+    }
+    if !enable_skill.is_empty() {
+        let result = skill_registry.apply_transient_always_on(enable_skill);
         for name in &result.disabled {
             eprintln!(
-                "[mika] warning: --skill-always-on '{name}' has no effect — \
+                "[mika] warning: --enable-skill '{name}' has no effect — \
                  skill is disabled. Run 'mika skills enable {name}' first."
             );
         }
         for name in &result.not_found {
-            eprintln!("[mika] warning: --skill-always-on '{name}' did not match any loaded skill");
+            eprintln!("[mika] warning: --enable-skill '{name}' did not match any loaded skill");
         }
     }
     skill_registry.validate_loaded();

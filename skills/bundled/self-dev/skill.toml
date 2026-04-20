@@ -2,7 +2,7 @@
 name = "self-dev"
 description = "Orchestrator: delegates implementation work to Claude Code via claude-pilot"
 version = "0.2.0"
-always_on = false
+always_on = true
 timeout_secs = 30
 max_prompt_size = 49152
 dependencies = [

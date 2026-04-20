@@ -978,13 +978,15 @@ Built-in skill `always_on` preferences are stored in the SQLite `skill_overrides
 2. For built-in skills, `always_on` changes are written to the DB via `set_skill_override()`
 3. For custom/marketplace skills, `always_on` is written to `skill.toml` as before
 4. After `scan_skills_dir()` loads manifests from disk, `SkillRegistry::apply_overrides()` applies DB overrides
-5. Optionally, `apply_transient_always_on()` applies CLI `--skill-always-on` overrides (runtime-only, not persisted)
+5. Optionally, `apply_transient_disable()` and `apply_transient_always_on()` apply CLI `--disable-skill` / `--enable-skill` overrides (runtime-only, not persisted)
 6. Setting `always_on` back to the bundled default automatically deletes the override row (prevents stale overrides from blocking future bundled default changes)
 7. `delete_skill` and `mika skills uninstall` clean up override rows
 
 **CLI transient override:**
 
-`mika ask --skill-always-on <name>` forces a skill to `always_on` for a single invocation without touching the database. Repeatable for multiple skills: `--skill-always-on self-dev --skill-always-on qa-review`. Useful for autonomous dispatch where the caller knows exactly which skills are needed. Cannot resurrect disabled or skipped skills — emits a warning instead.
+`mika ask --enable-skill <name>` forces a skill to `always_on` for a single invocation without touching the database. Repeatable for multiple skills: `--enable-skill self-dev --enable-skill qa-review`. Cannot resurrect disabled or skipped skills — emits a warning instead.
+
+`mika ask --disable-skill <name>` transiently evicts a skill from the registry for a single invocation. Repeatable for multiple skills: `--disable-skill self-dev --disable-skill qa-review`. Useful for interactive sessions where an `always_on` skill is not needed. A skill cannot appear in both `--enable-skill` and `--disable-skill` in the same invocation (hard error).
 
 **Viewing overrides:**
 
