@@ -252,6 +252,7 @@ async fn main() -> Result<()> {
                 args.parent_task_id.as_deref(),
                 &args.format,
                 args.model.as_deref(),
+                &args.skill_always_on,
             )
             .await
             {

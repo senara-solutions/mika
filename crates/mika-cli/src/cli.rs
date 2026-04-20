@@ -190,6 +190,12 @@ pub struct AskArgs {
     /// Use the most recent finished team run as context (requires --team)
     #[arg(long, requires = "team", conflicts_with = "run_id")]
     pub last_run: bool,
+
+    /// Force named skill(s) to always_on for this invocation (repeatable).
+    /// Example: --skill-always-on self-dev --skill-always-on qa-review
+    /// Not supported in team mode (use DB overrides instead).
+    #[arg(long, conflicts_with = "team")]
+    pub skill_always_on: Vec<String>,
 }
 
 #[derive(clap::Args)]
