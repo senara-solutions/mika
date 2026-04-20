@@ -145,6 +145,15 @@ impl TransientOverrideResult {
     }
 }
 
+/// Result of [`SkillRegistry::apply_transient_disable`].
+///
+/// Reports skill names that were not found in either the loaded or disabled lists.
+#[derive(Debug, Default)]
+pub struct TransientDisableResult {
+    /// Skill names that were not found in loaded or disabled lists.
+    pub not_found: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
@@ -484,6 +493,66 @@ impl SkillRegistry {
             } else {
                 result.not_found.push(name.clone());
             }
+        }
+
+        result
+    }
+
+    /// Apply transient disable overrides from CLI flags.
+    ///
+    /// For each skill name, finds the matching entry (case-insensitive) and evicts
+    /// it from the loaded skills list into the disabled list. This is a runtime-only
+    /// overlay — nothing is persisted to the database. Call this **after**
+    /// `apply_overrides()` so it stacks on top of both manifest defaults and DB
+    /// overrides.
+    ///
+    /// Skills that are already disabled (evicted by `apply_overrides()`) or not
+    /// found are treated as no-ops. Returns a structured result with skill names
+    /// that were not found anywhere.
+    pub fn apply_transient_disable(&mut self, skill_names: &[String]) -> TransientDisableResult {
+        let mut result = TransientDisableResult::default();
+
+        // Collect names to disable (case-insensitive), then evict using retain() + staging vec.
+        let disable_names: Vec<&String> = skill_names
+            .iter()
+            .filter(|name| {
+                // Check if the skill is loaded
+                let in_loaded = self
+                    .skills
+                    .iter()
+                    .any(|e| e.manifest.skill.name.eq_ignore_ascii_case(name));
+                // Check if already disabled (no-op)
+                let in_disabled = self
+                    .disabled
+                    .iter()
+                    .any(|d| d.name.eq_ignore_ascii_case(name));
+                if !in_loaded && !in_disabled {
+                    result.not_found.push((*name).clone());
+                    false
+                } else {
+                    in_loaded
+                }
+            })
+            .collect();
+
+        if !disable_names.is_empty() {
+            let mut evicted = Vec::new();
+            self.skills.retain(|entry| {
+                let is_disabled = disable_names
+                    .iter()
+                    .any(|n| entry.manifest.skill.name.eq_ignore_ascii_case(n));
+                if is_disabled {
+                    tracing::info!(
+                        skill = %entry.manifest.skill.name,
+                        "skill transiently disabled via CLI flag — evicted from registry"
+                    );
+                    evicted.push(DisabledSkill {
+                        name: entry.manifest.skill.name.clone(),
+                    });
+                }
+                !is_disabled
+            });
+            self.disabled.extend(evicted);
         }
 
         result
@@ -2344,5 +2413,156 @@ keywords = ["big-test"]
         let matched = match_skills(&registry.skills, "hello world");
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].reason, super::matcher::MatchReason::AlwaysOn);
+    }
+
+    // ── apply_transient_disable tests ──────────────────────────────────
+
+    #[test]
+    fn test_transient_disable_evicts_loaded_skill() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("self-dev", true, true),
+                make_entry("web-search", false, true),
+            ],
+        };
+
+        let result = registry.apply_transient_disable(&["self-dev".to_string()]);
+        assert!(result.not_found.is_empty());
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "web-search");
+        assert_eq!(registry.disabled.len(), 1);
+        assert_eq!(registry.disabled[0].name, "self-dev");
+    }
+
+    #[test]
+    fn test_transient_disable_multiple_skills() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("skill-a", false, true),
+                make_entry("skill-b", true, true),
+                make_entry("skill-c", false, true),
+            ],
+        };
+
+        let result =
+            registry.apply_transient_disable(&["skill-a".to_string(), "skill-c".to_string()]);
+        assert!(result.not_found.is_empty());
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "skill-b");
+        assert_eq!(registry.disabled.len(), 2);
+    }
+
+    #[test]
+    fn test_transient_disable_nonexistent_returns_not_found() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        let result = registry.apply_transient_disable(&["nonexistent".to_string()]);
+        assert_eq!(result.not_found, vec!["nonexistent"]);
+        // Existing skill unchanged
+        assert_eq!(registry.skills.len(), 1);
+    }
+
+    #[test]
+    fn test_transient_disable_already_db_disabled_is_noop() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: vec![DisabledSkill {
+                name: "self-dev".to_string(),
+            }],
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        let result = registry.apply_transient_disable(&["self-dev".to_string()]);
+        // Already disabled — not reported as not_found
+        assert!(result.not_found.is_empty());
+        // Still one disabled entry (not duplicated)
+        assert_eq!(registry.disabled.len(), 1);
+        assert_eq!(registry.skills.len(), 1);
+    }
+
+    #[test]
+    fn test_transient_disable_case_insensitive() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("Self-Dev", true, true)],
+        };
+
+        let result = registry.apply_transient_disable(&["self-dev".to_string()]);
+        assert!(result.not_found.is_empty());
+        assert!(registry.skills.is_empty());
+        assert_eq!(registry.disabled.len(), 1);
+        assert_eq!(registry.disabled[0].name, "Self-Dev");
+    }
+
+    #[test]
+    fn test_transient_disable_empty_input_noop() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("self-dev", true, true)],
+        };
+
+        let result = registry.apply_transient_disable(&[]);
+        assert!(result.not_found.is_empty());
+        assert_eq!(registry.skills.len(), 1);
+    }
+
+    #[test]
+    fn test_transient_disable_removes_from_match_skills() {
+        use super::matcher::match_skills;
+
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("self-dev", true, true)],
+        };
+
+        // Before: matches as AlwaysOn
+        let matched = match_skills(&registry.skills, "hello world");
+        assert_eq!(matched.len(), 1);
+
+        // Transiently disable
+        registry.apply_transient_disable(&["self-dev".to_string()]);
+
+        // After: no match
+        let matched = match_skills(&registry.skills, "hello world");
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_transient_disable_removes_from_always_on_skills() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("self-dev", true, true),
+                make_entry("qa-review", true, true),
+            ],
+        };
+
+        assert_eq!(registry.always_on_skills().len(), 2);
+
+        registry.apply_transient_disable(&["self-dev".to_string()]);
+
+        let always_on = registry.always_on_skills();
+        assert_eq!(always_on.len(), 1);
+        assert_eq!(always_on[0].manifest.skill.name, "qa-review");
     }
 }

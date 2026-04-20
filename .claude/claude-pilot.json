@@ -1,5 +1,5 @@
 {
   "command": "mika",
-  "args": ["--agent", "mika-dev", "ask", "--skill-always-on", "self-dev"],
+  "args": ["--agent", "mika-dev", "ask"],
   "timeout": 120000
 }

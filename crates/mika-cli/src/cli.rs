@@ -192,10 +192,17 @@ pub struct AskArgs {
     pub last_run: bool,
 
     /// Force named skill(s) to always_on for this invocation (repeatable).
-    /// Example: --skill-always-on self-dev --skill-always-on qa-review
+    /// Example: --enable-skill self-dev --enable-skill qa-review
     /// Not supported in team mode (use DB overrides instead).
     #[arg(long, conflicts_with = "team")]
-    pub skill_always_on: Vec<String>,
+    pub enable_skill: Vec<String>,
+
+    /// Transiently disable named skill(s) for this invocation (repeatable).
+    /// Evicts the skill from the registry — prevents both always_on and keyword activation.
+    /// Example: --disable-skill self-dev
+    /// Not supported in team mode (use DB overrides instead).
+    #[arg(long, conflicts_with = "team")]
+    pub disable_skill: Vec<String>,
 }
 
 #[derive(clap::Args)]
