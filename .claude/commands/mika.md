@@ -28,6 +28,8 @@ Before running the pipeline, set up an isolated worktree:
 
 ## Pipeline
 
+**Branch safety (MANDATORY):** You are already on the correct branch. Run `git branch --show-current` to confirm. Do NOT create, rename, or switch branches. All commits and the PR must use the current branch. This applies to every step below — including `/ce:plan`, `/ce:work`, `/ce:review`, and PR creation.
+
 1. `/ce:plan $ARGUMENTS` (if an issue was detected, pass the issue title + body instead of raw arguments)
 2. `/ce:work`
 3. `/ce:review`
