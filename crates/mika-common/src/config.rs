@@ -286,6 +286,14 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Enable embedded dashboard SPA at /dashboard/ (default: false)",
     },
+    // -- Task engine --
+    ConfigKeyInfo {
+        key: "max_agent_tasks_per_session",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_MAX_AGENT_TASKS_PER_SESSION"),
+        secret: false,
+        description: "Maximum agent-created tasks per session (default: 25)",
+    },
     // -- Observability --
     ConfigKeyInfo {
         key: "store_llm_calls",
@@ -511,6 +519,8 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
             .map(|_| "[SET]".to_string()),
         "home_dir" => Some(settings.home_dir.display().to_string()),
         "db_path" => Some(settings.db_path.display().to_string()),
+        // Task engine
+        "max_agent_tasks_per_session" => Some(settings.max_agent_tasks_per_session.to_string()),
         // Observability
         "store_llm_calls" => Some(settings.store_llm_calls.to_string()),
         "store_tool_calls" => Some(settings.store_tool_calls.to_string()),
@@ -719,6 +729,11 @@ pub struct Settings {
     #[serde(default)]
     pub otlp_auth_header: Option<SecretString>,
 
+    /// Maximum agent-created tasks per session (default: 25).
+    /// Guards against runaway task creation while allowing legitimate bulk operations.
+    #[serde(default = "default_max_agent_tasks_per_session")]
+    pub max_agent_tasks_per_session: i64,
+
     /// Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
     #[serde(default = "default_true")]
     pub store_llm_calls: bool,
@@ -746,6 +761,10 @@ fn default_llm_provider() -> ProviderKind {
 
 fn default_max_tokens() -> u32 {
     4096
+}
+
+fn default_max_agent_tasks_per_session() -> i64 {
+    25
 }
 
 fn default_db_path() -> PathBuf {

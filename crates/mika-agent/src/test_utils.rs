@@ -52,6 +52,7 @@ pub mod test_helpers {
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
+            max_tasks_per_session: 25,
         }
     }
 
@@ -123,6 +124,7 @@ pub mod test_helpers {
                 provider_name: "anthropic",
                 model_name: "claude-sonnet-4-6",
                 active_skill_paths: &[],
+                max_tasks_per_session: 25,
             }
         }
 
@@ -148,6 +150,7 @@ pub mod test_helpers {
                 provider_name: "anthropic",
                 model_name: "claude-sonnet-4-6",
                 active_skill_paths: &[],
+                max_tasks_per_session: 25,
             }
         }
         /// Create a ToolContext with custom home and global home directories.
@@ -177,6 +180,7 @@ pub mod test_helpers {
                 provider_name: "anthropic",
                 model_name: "claude-sonnet-4-6",
                 active_skill_paths: &[],
+                max_tasks_per_session: 25,
             }
         }
     }
@@ -279,6 +283,7 @@ pub mod test_helpers {
             telemetry_enabled: false,
             otlp_endpoint: None,
             otlp_auth_header: None,
+            max_agent_tasks_per_session: 25,
             store_llm_calls: true,
             store_tool_calls: true,
             log_llm_bodies: false,

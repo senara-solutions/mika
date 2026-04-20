@@ -249,7 +249,7 @@ remaining 9 tools (including task write tools) are added conditionally when `age
 | `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) | No |
 | `delete_team` | Delete a team definition and all its data (workspace, config). Irreversible. | default (30s) | No |
 | `update_team` | Update an existing team definition. Only provided fields are changed. | default (30s) | No |
-| `create_task` | Create a trackable task with optional parent, source, and reference_url. Max depth 3, max 5 agent-created per session (user_request exempt). Cannot be used in callback turns. | default (30s) | No |
+| `create_task` | Create a trackable task with optional parent, source, and reference_url. Max depth 3, max 25 agent-created per session (configurable via `max_agent_tasks_per_session`, user_request exempt). Cannot be used in callback turns. | default (30s) | No |
 | `update_task_status` | Update task status with validated transitions. Permitted: pending→any, in_progress→blocked/completed/cancelled, blocked→in_progress/completed/cancelled. Terminal states (completed, cancelled) are final. Logs audit event. | default (30s) | No |
 
 Management tools are NOT registered for team sub-agents or delegated agents,

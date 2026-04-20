@@ -28,9 +28,6 @@ fn format_dedup_response(existing: &Task) -> String {
     response
 }
 
-/// Maximum agent-created tasks per session (Guard 5).
-const MAX_TASKS_PER_SESSION: i64 = 5;
-
 const VALID_SOURCES: &[&str] = &["user_request", "github_issue", "team_run", "self_dev"];
 
 pub struct CreateTaskTool;
@@ -48,7 +45,7 @@ impl Tool for CreateTaskTool {
                 Tasks can be linked to external references (GitHub issues, URLs) \
                 and progressed through status stages. Use for significant tasks like \
                 feature implementation, research projects, or items waiting on external input. \
-                Cannot be used during callback turns. Max 5 agent-created tasks per session. \
+                Cannot be used during callback turns. Max 25 agent-created tasks per session (configurable). \
                 Max nesting depth of 3. Set 'type' to 'milestone' or 'project' to mark a parent \
                 container that aggregates child 'issue' tasks via parent_task_id."
                 .to_string(),
@@ -227,9 +224,10 @@ impl Tool for CreateTaskTool {
         // Guard 5: Cap agent-created tasks per session
         if source != Some("user_request") {
             let count = ctx.db.count_session_tasks(ctx.session_id).await?;
-            if count >= MAX_TASKS_PER_SESSION {
+            let limit = ctx.max_tasks_per_session;
+            if count >= limit {
                 return Ok(ToolOutput::error(format!(
-                    "Maximum of {MAX_TASKS_PER_SESSION} agent-created tasks per session reached."
+                    "Maximum of {limit} agent-created tasks per session reached."
                 )));
             }
         }
@@ -476,12 +474,14 @@ mod tests {
     #[tokio::test]
     async fn test_create_task_session_cap() {
         let harness = TestHarness::new();
-        let ctx = harness.ctx();
+        let mut ctx = harness.ctx();
+        // Use a small limit for test speed
+        ctx.max_tasks_per_session = 5;
         let tool = CreateTaskTool;
 
-        // Create MAX_TASKS_PER_SESSION items
+        // Create 5 items (the configured limit)
         let mut item_ids = Vec::new();
-        for i in 0..MAX_TASKS_PER_SESSION {
+        for i in 0..5 {
             let result = tool
                 .execute(serde_json::json!({"label": format!("Item {i}")}), &ctx)
                 .await
@@ -504,7 +504,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("Maximum"));
+        assert!(result.content.contains("Maximum of 5"));
 
         // Complete one item — should free up a slot
         ctx.db
@@ -527,11 +527,13 @@ mod tests {
     #[tokio::test]
     async fn test_create_task_session_cap_excludes_user_request() {
         let harness = TestHarness::new();
-        let ctx = harness.ctx();
+        let mut ctx = harness.ctx();
+        // Use a small limit for test speed
+        ctx.max_tasks_per_session = 5;
         let tool = CreateTaskTool;
 
-        // Create MAX items with source != user_request
-        for i in 0..MAX_TASKS_PER_SESSION {
+        // Create 5 items with source != user_request (at the limit)
+        for i in 0..5 {
             tool.execute(
                 serde_json::json!({"label": format!("Agent item {i}")}),
                 &ctx,
@@ -551,6 +553,36 @@ mod tests {
         assert!(
             !result.is_error,
             "user_request should bypass cap: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_task_session_cap_configurable() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        // Configure a custom limit of 3
+        ctx.max_tasks_per_session = 3;
+        let tool = CreateTaskTool;
+
+        // Create 3 items (at the custom limit)
+        for i in 0..3 {
+            let result = tool
+                .execute(serde_json::json!({"label": format!("Item {i}")}), &ctx)
+                .await
+                .unwrap();
+            assert!(!result.is_error, "item {i} failed: {}", result.content);
+        }
+
+        // 4th should be rejected at limit 3
+        let result = tool
+            .execute(serde_json::json!({"label": "Over custom limit"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("Maximum of 3"),
+            "error should reflect custom limit: {}",
             result.content
         );
     }
@@ -951,7 +983,8 @@ mod tests {
     #[tokio::test]
     async fn test_create_task_dedup_skips_session_counter() {
         let harness = TestHarness::new();
-        let ctx = harness.ctx();
+        let mut ctx = harness.ctx();
+        ctx.max_tasks_per_session = 5;
         let tool = CreateTaskTool;
 
         // Create 4 unique items (leaves 1 slot)

@@ -765,6 +765,7 @@ async fn run_investigation(
         provider_name: llm.provider_name(),
         model_name: llm.model_name(),
         active_skill_paths: &[],
+        max_tasks_per_session: 25,
     };
 
     let mut text_sent = false;
