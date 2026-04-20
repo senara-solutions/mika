@@ -272,6 +272,7 @@ async fn main() -> Result<()> {
         Some(Commands::Dashboard(args)) => commands::dashboard::run(args.command).await,
         Some(Commands::Provider(args)) => commands::provider::run(args, &agent_name).await,
         Some(Commands::Model(args)) => commands::model::run(args, &agent_name).await,
+        Some(Commands::Webhook(args)) => commands::webhook::run(args.command, &args.format).await,
         // Handled by early-exit above — unreachable, but listed for exhaustive match.
         Some(Commands::Token(_) | Commands::CredentialHelper(_)) => unreachable!(),
     }

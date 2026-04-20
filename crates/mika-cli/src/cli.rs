@@ -71,6 +71,8 @@ pub enum Commands {
     Provider(ProviderArgs),
     /// List or switch LLM models
     Model(ModelArgs),
+    /// Manage gateway webhook dead-letter queue
+    Webhook(WebhookArgs),
     /// Git credential helper (used by git, not directly by users)
     #[command(name = "credential-helper")]
     CredentialHelper(CredentialHelperArgs),
@@ -99,6 +101,7 @@ impl Commands {
             | Commands::Teams(_)
             | Commands::Dashboard(_)
             | Commands::Token(_)
+            | Commands::Webhook(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -124,6 +127,7 @@ impl Commands {
             | Commands::Token(_)
             | Commands::Provider(_)
             | Commands::Model(_)
+            | Commands::Webhook(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -727,4 +731,36 @@ pub fn resolve_model_alias(input: &str) -> String {
         }
     }
     input.to_string()
+}
+
+#[derive(clap::Args)]
+pub struct WebhookArgs {
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+
+    #[command(subcommand)]
+    pub command: WebhookCommand,
+}
+
+#[derive(Subcommand)]
+pub enum WebhookCommand {
+    /// List dead-letter queue entries (pending + dead)
+    #[command(name = "list-dead")]
+    ListDead {
+        /// Filter by status: "pending" or "dead" (omit for both)
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum entries to return (default 100)
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    /// Replay a single DLQ entry by delivery ID
+    Replay {
+        /// The delivery ID to replay
+        delivery_id: String,
+    },
+    /// Replay all dead DLQ entries
+    #[command(name = "replay-all")]
+    ReplayAll,
 }

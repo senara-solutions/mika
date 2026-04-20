@@ -38,6 +38,7 @@ hmac.workspace = true
 hex.workspace = true
 lru.workspace = true
 rand = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

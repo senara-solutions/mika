@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{Path, Query, Request, State},
     http::{self, HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -152,6 +152,28 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/a2a/{customer_id}/{agent_name}/agent.json",
             get(a2a_routes::handle_a2a_agent_card),
+        )
+        // DLQ endpoints (Bearer token auth, same as /send)
+        .route(
+            "/webhook/dlq",
+            get(handle_dlq_list).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
+        )
+        .route(
+            "/webhook/dlq/{delivery_id}/replay",
+            post(handle_dlq_replay).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
+        )
+        .route(
+            "/webhook/dlq/replay-all",
+            post(handle_dlq_replay_all).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
         )
         // Health probes and version (no auth)
         .route("/health", get(handle_readiness))
@@ -963,6 +985,78 @@ pub(crate) async fn handle_readiness(State(state): State<AppState>) -> StatusCod
     match sqlx::query("SELECT 1").execute(&state.pool).await {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+// -- DLQ endpoints --
+
+/// Query parameters for DLQ list endpoint.
+#[derive(serde::Deserialize)]
+pub(crate) struct DlqListParams {
+    /// Filter by status: "pending", "dead", or omit for both.
+    pub status: Option<String>,
+    /// Max entries to return (default 100).
+    pub limit: Option<i64>,
+}
+
+/// GET /webhook/dlq — List DLQ entries (pending + dead by default).
+pub(crate) async fn handle_dlq_list(
+    State(state): State<AppState>,
+    Query(params): Query<DlqListParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(100).min(1000);
+    match crate::dlq::list_deliveries(&state.pool, params.status.as_deref(), limit).await {
+        Ok(rows) => Json(serde_json::json!({
+            "deliveries": rows,
+            "count": rows.len(),
+        }))
+        .into_response(),
+        Err(e) => {
+            error!(error = %e, "DLQ list query failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /webhook/dlq/{delivery_id}/replay — Replay a single DLQ entry.
+pub(crate) async fn handle_dlq_replay(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<String>,
+) -> impl IntoResponse {
+    match crate::dlq::replay_delivery(&state, &delivery_id).await {
+        Ok(Some(delivery)) => Json(serde_json::json!({
+            "delivery": delivery,
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            error!(delivery_id = %delivery_id, error = %e, "DLQ replay failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Response for the replay-all endpoint.
+#[derive(serde::Serialize)]
+struct ReplayAllResponse {
+    succeeded: u32,
+    failed: u32,
+    total: u32,
+}
+
+/// POST /webhook/dlq/replay-all — Replay all dead DLQ entries.
+pub(crate) async fn handle_dlq_replay_all(State(state): State<AppState>) -> impl IntoResponse {
+    match crate::dlq::replay_all_dead(&state).await {
+        Ok((succeeded, failed)) => Json(ReplayAllResponse {
+            succeeded,
+            failed,
+            total: succeeded + failed,
+        })
+        .into_response(),
+        Err(e) => {
+            error!(error = %e, "DLQ replay-all failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

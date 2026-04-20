@@ -146,6 +146,7 @@ Optional (telemetry — requires `--features telemetry` build):
 
 Optional (CLI -> server communication):
 - `MIKA_SERVER_URL` — mika-server base URL for CLI dashboard commands (default: `http://localhost:8080`)
+- `MIKA_GATEWAY_URL` — mika-gateway base URL for CLI webhook DLQ commands (default: `http://localhost:3001`)
 
 Optional (dashboard): See `dashboard/CLAUDE.md`.
 

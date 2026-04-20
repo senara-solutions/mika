@@ -11,6 +11,9 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 | `/send` | POST | Internal token | Outbound relay with `agent_name` identification |
 | `/health`, `/readyz`, `/livez` | GET | None | Health probes |
 | `/version` | GET | None | Returns `{"version":"<semver>","git_hash":"<short-hash>"}` |
+| `/webhook/dlq` | GET | Internal token | List DLQ entries (pending + dead) |
+| `/webhook/dlq/{delivery_id}/replay` | POST | Internal token | Replay a single DLQ entry |
+| `/webhook/dlq/replay-all` | POST | Internal token | Replay all dead DLQ entries |
 | `/a2a/{customer_id}/{agent_name}` | POST | API key | A2A protocol proxy (2MB limit) |
 | `/a2a/{customer_id}/{agent_name}/agent.json` | GET | None | Agent Card proxy |
 
@@ -29,7 +32,13 @@ The spawned forwarding task retries on HTTP 429/5xx or request timeouts using th
 
 Semaphore lifecycle during retry: the 30-permit `webhook_semaphore` (shared with Telegram) is released during each retry sleep and re-acquired via `try_acquire_owned` before the next attempt. If the semaphore is full on re-acquire, the retry is abandoned with a dedicated ERROR log (`semaphore at capacity during retry`), distinct from the `retry budget exhausted` ERROR emitted when all 6 attempts return a retryable failure.
 
-The delivery LRU cache has no TTL (size-based eviction only). Under extreme webhook volume (>10k deliveries during a single 300s retry sleep), the `X-GitHub-Delivery` entry may be evicted and a GitHub redelivery would bypass gateway dedup. Agent-side idempotency (task unique index on `reference_url`) mitigates double-processing. Events that exhaust retries or are abandoned due to semaphore pressure are dropped with ERROR logs; persistent DLQ + replay CLI is tracked in #590.
+The delivery LRU cache has no TTL (size-based eviction only). Under extreme webhook volume (>10k deliveries during a single 300s retry sleep), the `X-GitHub-Delivery` entry may be evicted and a GitHub redelivery would bypass gateway dedup. Agent-side idempotency (task unique index on `reference_url`) mitigates double-processing.
+
+### Dead-letter queue (#590)
+
+Events that exhaust the retry budget or are abandoned due to semaphore pressure are persisted in the `webhook_deliveries` Postgres table (migration 006) with `status='pending'`. A background tokio task wakes every 30s, selects pending rows past their exponential backoff window (`30s * 2^attempts`, capped at 1h), and re-attempts delivery via the same `forward_to_resolved_route()` path. Route is re-resolved on each worker attempt (container URLs may change). After 10 worker attempts, status transitions to `'dead'`.
+
+The DLQ respects the shared 30-permit webhook semaphore — if all permits are held, the worker skips forwarding for that tick. Manual replay via `POST /webhook/dlq/{id}/replay` and `POST /webhook/dlq/replay-all` follows the same semaphore-gated delivery path. CLI: `mika webhook list-dead`, `mika webhook replay <id>`, `mika webhook replay-all`.
 
 ## Agent Identification & Reply Routing
 
@@ -51,6 +60,7 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 - Migration 003: creates `a2a_api_keys` table
 - Migration 004: creates `github_repos` table (maps `repo_full_name` -> `customer_id` for multi-tenant GitHub webhook routing)
 - Migration 005: adds `agent_mapping JSONB NOT NULL DEFAULT '{}'` to `github_repos` for per-repo agent name overrides (keys are default agent names from `route_event()`, values are customer's replacement names; `apply_agent_mapping()` validates names via `is_valid_agent_name()` and falls back to defaults for invalid values)
+- Migration 006: creates `webhook_deliveries` table for dead-letter queue (delivery_id PK, event_type, target_agent, repo_full_name, payload, request_id, status CHECK IN pending/delivered/dead, attempts, last_attempt_at, last_error). Partial indexes on `(status, last_attempt_at) WHERE status='pending'` and `(created_at DESC) WHERE status='dead'`.
 
 ## build.rs
 
