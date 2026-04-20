@@ -2957,7 +2957,6 @@ const TERMINAL_ERROR_PATTERNS: &[&str] = &[
     // Permission errors (specific phrases, not bare words)
     "insufficient permissions",
     "resource not accessible",
-    "permission denied",
 ];
 
 /// Check whether a tool's output text matches a known terminal (unrecoverable) error.
@@ -5435,8 +5434,12 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal_error_permission_denied() {
-        assert!(is_terminal_tool_error("permission denied"));
+    fn test_permission_denied_bare_is_not_terminal() {
+        // Bare "permission denied" removed from TERMINAL_ERROR_PATTERNS — too broad,
+        // matches Unix filesystem errors. Use "http 403", "insufficient permissions",
+        // or "resource not accessible" instead.
+        assert!(!is_terminal_tool_error("permission denied"));
+        assert!(!is_terminal_tool_error("permission denied: /tmp/data.json"));
     }
 
     #[test]
@@ -5490,9 +5493,9 @@ mod tests {
 
     #[test]
     fn test_retryable_overrides_terminal() {
-        // A 429 with "permission denied" text should still be retryable
+        // A 429 with "insufficient permissions" text should still be retryable
         assert!(!is_terminal_tool_error(
-            "HTTP 429: permission denied rate limit exceeded"
+            "HTTP 429: insufficient permissions rate limit exceeded"
         ));
     }
 
