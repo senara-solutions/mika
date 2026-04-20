@@ -612,9 +612,11 @@ async fn run_loop(
     // Guards against turns that produce institutional knowledge without calling
     // store_fact/update_fact/update_core_memory (#648).
     let mut persistence_eval_retry_done = false;
-    // Whether we already injected a webhook zero-tools correction. Only allow one retry.
-    // Guards against webhook turns where the agent narrates instead of acting (#696).
-    let mut webhook_zero_tools_retry_done = false;
+    // Intent-precondition registry retry tracking (#702). Each entry label
+    // gets inserted on first fire; presence prevents re-fire. Replaces the
+    // former `webhook_zero_tools_retry_done` boolean and generalizes to all
+    // intent guards in `INTENT_GUARDS`.
+    let mut intent_guard_retries: HashSet<&'static str> = HashSet::new();
     // Capture the user's input text for persistence evaluation guard (#648).
     // Extracted once before the loop starts so it always reflects the real user
     // message, not synthetic messages injected by guards during re-prompts.
@@ -1010,42 +1012,47 @@ async fn run_loop(
                         continue;
                     }
 
-                    // Webhook zero-tools guard: if the user message is a webhook
-                    // event (starts with `[GitHub]`) and the agent responded with
-                    // zero successful tool calls, reject and re-prompt once. Webhook
-                    // events require action — text-only responses are fabrications.
-                    // See #696.
+                    // Intent-precondition registry (#702): iterate INTENT_GUARDS
+                    // and reject EndTurn once per entry when the trigger matches but
+                    // the precondition is not satisfied.  Generalizes the former
+                    // inline webhook zero-tools guard (#696).
                     if !skip_remaining_guards
                         && matches!(response.stop_reason, LlmStopReason::EndTurn)
-                        && !webhook_zero_tools_retry_done
-                        && user_input_text.starts_with("[GitHub]")
-                        && !all_tool_summaries.iter().any(|s| s.success)
                     {
-                        webhook_zero_tools_retry_done = true;
-                        warn!(
-                            step,
-                            label = mode.label(),
-                            "Webhook turn with zero successful tool calls — re-prompting"
-                        );
-                        request.messages.push(LlmMessage {
-                            role: LlmRole::Assistant,
-                            content: LlmContent::Blocks(
-                                mika_common::llm::response_content_to_blocks(&response.content),
-                            ),
-                        });
-                        request.messages.push(LlmMessage {
-                            role: LlmRole::User,
-                            content: LlmContent::Text(
-                                "[Your response was rejected because you received a GitHub \
-                                 webhook event but responded with text only and zero tool calls. \
-                                 Webhook events require action — you MUST call at least one tool \
-                                 (send_message, update_task_status, list_tasks, check_task, etc.) \
-                                 to process the event. Re-read the webhook payload above and use \
-                                 the appropriate tools to handle it.]"
-                                    .to_string(),
-                            ),
-                        });
-                        continue;
+                        let mut intent_rejected = false;
+                        for guard in INTENT_GUARDS {
+                            if intent_guard_retries.contains(guard.label) {
+                                continue; // already fired once — single-retry semantics
+                            }
+                            if (guard.trigger)(&user_input_text)
+                                && !(guard.satisfied)(&all_tool_summaries)
+                            {
+                                intent_guard_retries.insert(guard.label);
+                                warn!(
+                                    step,
+                                    label = mode.label(),
+                                    intent_guard = guard.label,
+                                    "Intent-precondition guard fired — re-prompting"
+                                );
+                                request.messages.push(LlmMessage {
+                                    role: LlmRole::Assistant,
+                                    content: LlmContent::Blocks(
+                                        mika_common::llm::response_content_to_blocks(
+                                            &response.content,
+                                        ),
+                                    ),
+                                });
+                                request.messages.push(LlmMessage {
+                                    role: LlmRole::User,
+                                    content: LlmContent::Text(guard.correction_message.to_string()),
+                                });
+                                intent_rejected = true;
+                                break; // one rejection per LLM response; others re-evaluate next step
+                            }
+                        }
+                        if intent_rejected {
+                            continue;
+                        }
                     }
 
                     // Persistence evaluation guard: if the agent is ending a turn
@@ -3401,6 +3408,106 @@ fn detect_prose_style_tool_call(text: &str, tool_names: &HashSet<String>) -> Opt
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Intent-precondition registry (#702)
+//
+// Generalizes the webhook zero-tools guard (#696) into a registry-driven
+// pattern.  Each entry describes a class of user intent that requires the
+// agent to call specific tools before EndTurn.  The guard chain iterates
+// the registry; each entry gets an independent single-retry flag tracked
+// in a `HashSet<&'static str>` keyed by label.
+// ---------------------------------------------------------------------------
+
+/// A single intent-precondition entry in the guard registry.
+///
+/// When `trigger` matches the user message AND `satisfied` returns `false`
+/// for the current tool summaries, the guard rejects EndTurn once and injects
+/// `correction_message`.
+struct IntentPrecondition {
+    /// Unique label used as retry-tracking key and log tag.
+    label: &'static str,
+    /// Returns `true` when the user message expresses this intent.
+    trigger: fn(&str) -> bool,
+    /// Returns `true` when the agent's tool calls satisfy the precondition.
+    satisfied: fn(&[ToolCallSummary]) -> bool,
+    /// Correction text injected on first rejection.
+    correction_message: &'static str,
+}
+
+/// Registry of intent-precondition guards.  Evaluated in order; each entry
+/// gets an independent single-retry flag.  Guards that don't fit the
+/// "trigger + tool-signature" pattern (e.g. persistence nudge, completion
+/// claim) remain as inline code outside this registry.
+const INTENT_GUARDS: &[IntentPrecondition] = &[
+    // #696 — webhook events require at least one successful tool call.
+    IntentPrecondition {
+        label: "webhook_zero_tools",
+        trigger: |msg| msg.starts_with("[GitHub]"),
+        satisfied: |summaries| summaries.iter().any(|s| s.success),
+        correction_message: "[Your response was rejected because you received a GitHub \
+             webhook event but responded with text only and zero tool calls. \
+             Webhook events require action — you MUST call at least one tool \
+             (send_message, update_task_status, list_tasks, check_task, etc.) \
+             to process the event. Re-read the webhook payload above and use \
+             the appropriate tools to handle it.]",
+    },
+    // #702 — resume/continue intent for milestones/projects requires
+    // reconciliation via check_task or list_tasks before EndTurn.
+    IntentPrecondition {
+        label: "resume_reconcile",
+        trigger: detect_resume_intent,
+        satisfied: resume_reconcile_satisfied,
+        correction_message: "[Your response was rejected because you received a resume/continue \
+             instruction for a milestone or project but did not call any reconciliation \
+             tools. You MUST call check_task or list_tasks (with success) to reconcile \
+             the current state before ending your turn. Follow the Resume Semantics \
+             section in the self-dev skill prompt to find the parent task, locate the \
+             next child, and resume execution.]",
+    },
+];
+
+/// Regex matching resume/continue intent combined with a process reference.
+///
+/// Triggers on messages containing a resume verb (`resume`, `continue`) AND
+/// a process reference (`milestone#`, `project#`).  The process reference
+/// may have optional whitespace before the `#`.
+static RESUME_INTENT_VERB_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(resume|continue)\b").expect("resume verb regex must compile")
+});
+
+static RESUME_INTENT_PROCESS_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(milestone|project)\s*#\d+")
+            .expect("process ref regex must compile")
+    });
+
+/// Detects whether the user message expresses resume/continue intent for a
+/// milestone or project.
+///
+/// Requires BOTH a resume verb AND a process reference to avoid false
+/// positives on general conversation containing "continue" or "resume".
+fn detect_resume_intent(msg: &str) -> bool {
+    // Fast path: skip regex if no likely substrings present.
+    let lower = msg.to_lowercase();
+    if (!lower.contains("resume") && !lower.contains("continue"))
+        || (!lower.contains("milestone") && !lower.contains("project"))
+    {
+        return false;
+    }
+    RESUME_INTENT_VERB_RE.is_match(msg) && RESUME_INTENT_PROCESS_RE.is_match(msg)
+}
+
+/// Tools that satisfy the resume-reconcile precondition.
+const RESUME_RECONCILE_TOOLS: &[&str] = &["check_task", "list_tasks"];
+
+/// Returns `true` if at least one reconciliation tool (`check_task` or
+/// `list_tasks`) was called successfully during this turn.
+fn resume_reconcile_satisfied(summaries: &[ToolCallSummary]) -> bool {
+    summaries
+        .iter()
+        .any(|s| s.success && RESUME_RECONCILE_TOOLS.contains(&s.name.as_str()))
 }
 
 #[cfg(test)]
@@ -5940,5 +6047,99 @@ mod tests {
     #[test]
     fn pr_review_not_detected_when_empty() {
         assert!(!has_successful_pr_review(&[]));
+    }
+
+    // -- detect_resume_intent tests --
+
+    #[test]
+    fn resume_intent_detected_for_milestone() {
+        assert!(detect_resume_intent("resume mika milestone#8"));
+        assert!(detect_resume_intent("Resume mika milestone#8"));
+        assert!(detect_resume_intent("please resume mika milestone #8"));
+    }
+
+    #[test]
+    fn resume_intent_detected_for_project() {
+        assert!(detect_resume_intent("continue mika project#3"));
+        assert!(detect_resume_intent("Continue mika project #3"));
+    }
+
+    #[test]
+    fn resume_intent_not_detected_without_process_ref() {
+        assert!(!detect_resume_intent("resume the task"));
+        assert!(!detect_resume_intent("continue working on the feature"));
+        assert!(!detect_resume_intent("resume"));
+    }
+
+    #[test]
+    fn resume_intent_not_detected_without_verb() {
+        assert!(!detect_resume_intent("check mika milestone#8"));
+        assert!(!detect_resume_intent("milestone#8 status"));
+    }
+
+    #[test]
+    fn resume_intent_not_detected_on_regular_messages() {
+        assert!(!detect_resume_intent("How's the project going?"));
+        assert!(!detect_resume_intent("Can you explain the architecture?"));
+        assert!(!detect_resume_intent(""));
+    }
+
+    // -- resume_reconcile_satisfied tests --
+
+    #[test]
+    fn resume_satisfied_with_successful_list_tasks() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "list_tasks".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(resume_reconcile_satisfied(&summaries));
+    }
+
+    #[test]
+    fn resume_satisfied_with_successful_check_task() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "check_task".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(resume_reconcile_satisfied(&summaries));
+    }
+
+    #[test]
+    fn resume_not_satisfied_with_failed_list_tasks() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "list_tasks".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: false,
+            non_zero_exit: false,
+        }];
+        assert!(!resume_reconcile_satisfied(&summaries));
+    }
+
+    #[test]
+    fn resume_not_satisfied_with_unrelated_tool() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "send_message".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(!resume_reconcile_satisfied(&summaries));
+    }
+
+    #[test]
+    fn resume_not_satisfied_when_empty() {
+        assert!(!resume_reconcile_satisfied(&[]));
     }
 }

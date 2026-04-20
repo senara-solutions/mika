@@ -526,29 +526,14 @@ Same as Milestone Step M5.
 
 ## Resume Semantics
 
+> **Structurally enforced (#702):** The engine's intent-precondition guard
+> requires at least one successful `check_task` or `list_tasks` call before
+> EndTurn on resume/continue messages referencing a milestone or project.
+> Text-only responses without reconciliation will be rejected and re-prompted.
+
 ### Milestone/Project Resume
 
-If re-invoked while a parent is `in_progress` or `blocked`:
-
-1. **Find the parent:**
-   ```
-   list_tasks(status="in_progress")  # check for type="milestone" or type="project"
-   list_tasks(status="blocked")      # also check blocked
-   ```
-   Match by `reference_url` containing "milestone" or "projects/<n>".
-
-2. **Find next child to resume:**
-   ```
-   list_tasks(status="pending")      # not started
-   list_tasks(status="in_progress")  # interrupted mid-flight
-   list_tasks(status="blocked")      # manual unblock requested
-   ```
-   Filter by `parent_task_id=<parent_wi>`. Pick first by creation order.
-
-3. **Resume execution:**
-   - If child is `pending`: Start from Step M4/P4 step 1
-   - If child is `in_progress` or `blocked`: Check if PR exists, handle accordingly
-   - If no children remain: Close parent as `completed`
+When resuming, call `list_tasks` or `check_task` to find the parent (match by `reference_url` containing "milestone" or "projects/<n>"), locate the next child by `parent_task_id` (priority: `in_progress` > `blocked` > `pending`), and resume from the appropriate step (M4/P4 for pending, PR check for in-progress/blocked, close parent if no children remain).
 
 ### Manual Commands
 
