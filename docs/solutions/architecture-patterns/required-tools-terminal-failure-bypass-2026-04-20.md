@@ -58,7 +58,7 @@ Unknown errors (matching neither list) return `false` — conservative default p
 
 Key design decisions:
 - **Retryable patterns take priority** — a 429 with "permission denied" text is still retryable
-- **Patterns are intentionally specific** — bare words like "not found", "forbidden", "unauthorized" were excluded to avoid false positives on search results or diagnostic output
+- **Patterns are intentionally specific** — bare words like "not found", "forbidden", "unauthorized", and "permission denied" were excluded to avoid false positives on search results, diagnostic output, or Unix filesystem errors
 - **Any terminal failure on a required tool waives the entire gate** — required tools within a skill are part of the same workflow chain; if one fails terminally, remaining tools are likely pointless
 
 ## Why This Works
