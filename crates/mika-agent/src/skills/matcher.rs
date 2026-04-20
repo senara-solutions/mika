@@ -357,4 +357,69 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["skill-a"]);
     }
+
+    // --- Keyword false-positive prevention tests (#576) ---
+
+    #[test]
+    fn test_no_keywords_skill_not_matched_by_pr_discussing_it() {
+        // skill-review with empty keywords must NOT match when a PR body
+        // merely discusses skill-review (the feature itself).
+        let skills = vec![make_entry("skill-review", &[], false)];
+        let matched = match_skills(
+            &skills,
+            "[GitHub] PR opened: senara-solutions/mika#576 — skill-review fires on PRs \
+             that discuss skill-review (branch: feat/576/skill-review-fires)",
+        );
+        assert!(
+            matched.is_empty(),
+            "skill-review should not match on PR meta-discussion"
+        );
+    }
+
+    #[test]
+    fn test_no_keywords_skill_not_matched_by_review_skill_phrase() {
+        // Even a message containing "review skill" should not trigger
+        // skill-review when it has no keywords.
+        let skills = vec![make_entry("skill-review", &[], false)];
+        let matched = match_skills(&skills, "the review skill feature is broken");
+        assert!(
+            matched.is_empty(),
+            "skill-review with empty keywords should never keyword-match"
+        );
+    }
+
+    #[test]
+    fn test_no_keywords_skill_not_matched_by_old_keywords() {
+        // Phrases that would have matched the old keywords ("adapt skill",
+        // "generate variant", etc.) must not trigger skill-review.
+        let skills = vec![make_entry("skill-review", &[], false)];
+        for phrase in &[
+            "adapt skill for claude",
+            "generate variant of qa-review",
+            "tune prompt for self-dev",
+            "skill variant needed",
+        ] {
+            let matched = match_skills(&skills, phrase);
+            assert!(
+                matched.is_empty(),
+                "skill-review should not match on '{phrase}' with empty keywords"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_keywords_skill_loaded_as_dependency() {
+        // skill-review must still load when pulled in as a dependency
+        // of another matched skill — dependency loading is unaffected.
+        let skills = vec![
+            make_entry_with_deps("qa-review", &["review"], true, &["skill-review"]),
+            make_entry("skill-review", &[], false),
+        ];
+        let matched = match_skills(&skills, "review this PR");
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched[0].entry.manifest.skill.name, "qa-review");
+        assert_eq!(matched[0].reason, MatchReason::Keyword);
+        assert_eq!(matched[1].entry.manifest.skill.name, "skill-review");
+        assert_eq!(matched[1].reason, MatchReason::Dependency);
+    }
 }
