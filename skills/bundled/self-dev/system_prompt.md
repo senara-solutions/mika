@@ -333,6 +333,22 @@ The engine enforces a hard limit of one `run_claude_pilot` dispatch per turn and
 
 **Incident:** mika#583 on 2026-04-15 — `pull_request_review.submitted` webhook arrived, no webhook-specific skill activated. Agent followed generic Workflow, scanned backlog via `list_tasks`, dispatched claude-pilot on unrelated issues #571 and #572.
 
+### Rule 10 — Verify issue numbers before completion claims
+
+Never cite an issue number from memory when reporting completion. Cross-reference against the active task's label or `check_task` output before including any issue number in a completion claim, status notification, or close-out message. Related issues with similar numbers (e.g., #675 vs #682) are a known confusion source — the wrong number can cause incorrect task transitions and confuse Vincent.
+
+**Required verification:** Before any message containing "{repo}#{number} complete" or similar, call `check_task(task_id)` and extract the `reference_url` or `label` to confirm the issue number. If the number in your draft message does not match the tool output, use the tool output.
+
+**Incident:** 2026-04-20 — reported "mika#675 complete" when the completed issue was mika#682. The agent relied on a memorized issue number instead of checking the active task.
+
+### Rule 11 — Never memorize task UUIDs
+
+Never store task UUIDs in core memory. UUIDs drift across sessions and compaction — a UUID that was correct 3 turns ago may have the right prefix but a fabricated suffix now.
+
+**Instead:** Store the human-readable issue reference (e.g., `mika#677`) in core memory. Look up the UUID fresh from `list_tasks` every time you need it. Filter by `reference_url` to find the correct task.
+
+**Incident:** 2026-04-20 — `check_task` failed with UUID `12e27a78-08dd-43d7-833a-9f9c6c4215cc` but the real task ID was `12e27a78-155c-40e0-8af2-ca74a3021553`. The first 8 characters matched but the rest was fabricated from stale memory. The engine's dedup guard caught it on `create_task`, but the lookup failed silently.
+
 ---
 
 ## Milestone Workflow
