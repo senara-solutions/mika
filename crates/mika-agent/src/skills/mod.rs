@@ -126,6 +126,25 @@ pub async fn migrate_disabled_markers_async(
 }
 
 /// Registry of discovered skills, built once at startup.
+/// Result of [`SkillRegistry::apply_transient_always_on`].
+///
+/// Separates skills that are installed-but-disabled from skills that are
+/// not found at all, so callers can emit accurate user-facing warnings.
+#[derive(Debug, Default)]
+pub struct TransientOverrideResult {
+    /// Skill names that matched a disabled (evicted) entry.
+    pub disabled: Vec<String>,
+    /// Skill names that were not found in loaded or disabled lists.
+    pub not_found: Vec<String>,
+}
+
+impl TransientOverrideResult {
+    /// Returns true if all requested skills were resolved successfully.
+    pub fn is_empty(&self) -> bool {
+        self.disabled.is_empty() && self.not_found.is_empty()
+    }
+}
+
 #[derive(Debug)]
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
@@ -418,6 +437,46 @@ impl SkillRegistry {
                 }
             }
         }
+    }
+
+    /// Apply transient `always_on` overrides from CLI flags.
+    ///
+    /// For each skill name, finds the matching entry (case-insensitive) and sets
+    /// `always_on = true`. This is a runtime-only overlay — nothing is persisted
+    /// to the database. Call this **after** `apply_overrides()` so it stacks on
+    /// top of both manifest defaults and DB overrides.
+    ///
+    /// Skills that were disabled (evicted by `apply_overrides()`) or skipped
+    /// (oversized prompt, broken handler) cannot be resurrected. Returns a
+    /// structured result distinguishing not-found from disabled/skipped so the
+    /// caller can emit accurate warnings.
+    pub fn apply_transient_always_on(&mut self, skill_names: &[String]) -> TransientOverrideResult {
+        let mut result = TransientOverrideResult::default();
+
+        for name in skill_names {
+            if let Some(entry) = self
+                .skills
+                .iter_mut()
+                .find(|e| e.manifest.skill.name.eq_ignore_ascii_case(name))
+            {
+                entry.manifest.skill.always_on = true;
+                entry.has_override = true;
+            } else if self
+                .disabled
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(name))
+            {
+                tracing::warn!(
+                    skill = %name,
+                    "cannot force always_on — skill is disabled via DB override"
+                );
+                result.disabled.push(name.clone());
+            } else {
+                result.not_found.push(name.clone());
+            }
+        }
+
+        result
     }
 
     /// Return always-on skills that are safe for silent/background mode.
@@ -2136,5 +2195,144 @@ keywords = ["big-test"]
         use index::{SkillDiagnostic, is_skip_worthy_failure};
         let diag = SkillDiagnostic::ok("skill.toml valid");
         assert!(!is_skip_worthy_failure(&diag));
+    }
+
+    // ── apply_transient_always_on tests ──────────────────────────────────
+
+    #[test]
+    fn test_transient_always_on_sets_flag() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("self-dev", false, true)],
+        };
+
+        let result = registry.apply_transient_always_on(&["self-dev".to_string()]);
+        assert!(result.is_empty());
+        assert!(registry.skills[0].manifest.skill.always_on);
+        assert!(registry.skills[0].has_override);
+    }
+
+    #[test]
+    fn test_transient_always_on_multiple_skills() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("skill-a", false, true),
+                make_entry("skill-b", false, true),
+                make_entry("skill-c", false, true),
+            ],
+        };
+
+        let result =
+            registry.apply_transient_always_on(&["skill-a".to_string(), "skill-b".to_string()]);
+        assert!(result.is_empty());
+        assert!(registry.skills[0].manifest.skill.always_on);
+        assert!(registry.skills[1].manifest.skill.always_on);
+        assert!(!registry.skills[2].manifest.skill.always_on);
+    }
+
+    #[test]
+    fn test_transient_always_on_idempotent_on_already_on() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("self-dev", true, true)],
+        };
+
+        let result = registry.apply_transient_always_on(&["self-dev".to_string()]);
+        assert!(result.is_empty());
+        assert!(registry.skills[0].manifest.skill.always_on);
+        assert!(registry.skills[0].has_override);
+    }
+
+    #[test]
+    fn test_transient_always_on_nonexistent_returns_not_found() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        let result = registry.apply_transient_always_on(&["nonexistent".to_string()]);
+        assert_eq!(result.not_found, vec!["nonexistent"]);
+        assert!(result.disabled.is_empty());
+        // Existing skill unchanged
+        assert!(!registry.skills[0].manifest.skill.always_on);
+    }
+
+    #[test]
+    fn test_transient_always_on_case_insensitive() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("Self-Dev", false, true)],
+        };
+
+        let result = registry.apply_transient_always_on(&["self-dev".to_string()]);
+        assert!(result.is_empty());
+        assert!(registry.skills[0].manifest.skill.always_on);
+    }
+
+    #[test]
+    fn test_transient_always_on_disabled_skill_returns_disabled() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: vec![DisabledSkill {
+                name: "self-dev".to_string(),
+            }],
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("web-search", false, true)],
+        };
+
+        let result = registry.apply_transient_always_on(&["self-dev".to_string()]);
+        assert_eq!(result.disabled, vec!["self-dev"]);
+        assert!(result.not_found.is_empty());
+        // Loaded skill unchanged
+        assert!(!registry.skills[0].manifest.skill.always_on);
+    }
+
+    #[test]
+    fn test_transient_always_on_empty_input_noop() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("self-dev", false, true)],
+        };
+
+        let result = registry.apply_transient_always_on(&[]);
+        assert!(result.is_empty());
+        assert!(!registry.skills[0].manifest.skill.always_on);
+    }
+
+    #[test]
+    fn test_transient_always_on_affects_match_skills() {
+        use super::matcher::match_skills;
+
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("self-dev", false, true)],
+        };
+
+        // Before: no match on unrelated message
+        let matched = match_skills(&registry.skills, "hello world");
+        assert!(matched.is_empty());
+
+        // Apply transient always_on
+        registry.apply_transient_always_on(&["self-dev".to_string()]);
+
+        // After: matches as AlwaysOn
+        let matched = match_skills(&registry.skills, "hello world");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].reason, super::matcher::MatchReason::AlwaysOn);
     }
 }

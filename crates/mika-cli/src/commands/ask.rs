@@ -32,6 +32,7 @@ pub async fn run(
     parent_task_id: Option<&str>,
     format: &OutputFormat,
     model_override: Option<&str>,
+    skill_always_on: &[String],
 ) -> Result<()> {
     let mut ctx = init::init_for_agent(agent_name)?;
 
@@ -241,6 +242,20 @@ pub async fn run(
         .await
     {
         skill_registry.apply_overrides(&overrides);
+    }
+    // Apply transient always_on overrides from --skill-always-on CLI flags.
+    // Runs after apply_overrides() so it stacks on top of DB state.
+    if !skill_always_on.is_empty() {
+        let result = skill_registry.apply_transient_always_on(skill_always_on);
+        for name in &result.disabled {
+            eprintln!(
+                "[mika] warning: --skill-always-on '{name}' has no effect — \
+                 skill is disabled. Run 'mika skills enable {name}' first."
+            );
+        }
+        for name in &result.not_found {
+            eprintln!("[mika] warning: --skill-always-on '{name}' did not match any loaded skill");
+        }
     }
     skill_registry.validate_loaded();
     skill_registry.log_summary();
