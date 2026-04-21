@@ -413,7 +413,9 @@ pub fn validate_variant(
             .filter(|section| {
                 !content.lines().any(|line| {
                     let trimmed = line.trim_start();
-                    (trimmed.starts_with("# ") || trimmed.starts_with("## "))
+                    // Match any heading level (#, ##, ###, etc.)
+                    trimmed.starts_with('#')
+                        && trimmed.trim_start_matches('#').starts_with(' ')
                         && trimmed
                             .trim_start_matches('#')
                             .trim()
@@ -615,13 +617,13 @@ pub fn diff_variant(base_content: &str, variant_content: &str) -> DiffReport {
     }
 }
 
-/// Extract markdown headings (# or ##) from content.
+/// Extract markdown headings (any level) from content.
 fn extract_headings(content: &str) -> Vec<String> {
     content
         .lines()
         .filter(|line| {
             let t = line.trim_start();
-            t.starts_with("# ") || t.starts_with("## ")
+            t.starts_with('#') && t.trim_start_matches('#').starts_with(' ')
         })
         .map(|line| line.trim_start().trim_start_matches('#').trim().to_string())
         .collect()
@@ -634,13 +636,31 @@ fn is_whitespace_only_diff(a: &str, b: &str) -> bool {
     normalize(a) == normalize(b)
 }
 
-/// Count added and removed lines between two sets of lines.
+/// Count added and removed lines using frequency maps (handles duplicate lines correctly).
 fn count_diff_lines(base: &[&str], variant: &[&str]) -> (usize, usize) {
-    let base_set: HashSet<&str> = base.iter().copied().collect();
-    let variant_set: HashSet<&str> = variant.iter().copied().collect();
+    let mut base_freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in base {
+        *base_freq.entry(line).or_insert(0) += 1;
+    }
+    let mut variant_freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in variant {
+        *variant_freq.entry(line).or_insert(0) += 1;
+    }
 
-    let removed = base.iter().filter(|l| !variant_set.contains(**l)).count();
-    let added = variant.iter().filter(|l| !base_set.contains(**l)).count();
+    let mut removed = 0;
+    for (line, &count) in &base_freq {
+        let var_count = variant_freq.get(line).copied().unwrap_or(0);
+        if count > var_count {
+            removed += count - var_count;
+        }
+    }
+    let mut added = 0;
+    for (line, &count) in &variant_freq {
+        let base_count = base_freq.get(line).copied().unwrap_or(0);
+        if count > base_count {
+            added += count - base_count;
+        }
+    }
 
     (added, removed)
 }
@@ -1021,7 +1041,7 @@ fn timestamp_parts(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
         30,
         31,
     ];
-    let mut month = 0u64;
+    let mut month = 12u64; // Default to December; overwritten if days < month boundary
     for (i, &md) in month_days.iter().enumerate() {
         if days < md {
             month = i as u64 + 1;
