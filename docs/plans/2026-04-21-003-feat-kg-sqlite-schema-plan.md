@@ -147,6 +147,71 @@ This column lives in v25 directly (inlined before ship) rather than as a v25→v
 
 Resolved during planning. The existing "three-layer memory model" (core memory / structured facts / hybrid search) in `CLAUDE.md` is Layer 1/2/3 of agent memory. The KG has its own "three layers" (domain / lexical / subject). These are different concerns. Docs and comments must qualify — e.g., `KG domain layer`, not `domain layer` alone; `memory Layer 3`, not `hybrid layer` alone. Plan docs, module rustdoc, and ID convention doc all use `KG <layer_name>` explicitly to avoid reader confusion.
 
+### D11. `kg_subject_relationships` table for subject-to-subject edges (fact triples)
+
+Resolved during #690 planning (2026-04-21). Subject-to-subject edges (e.g., `ProblemType -[SOLVED_BY]-> SolutionPath`) are per-agent, LLM-extracted, prose-derived. They don't belong in `kg_relationships` (domain, no agent_id per D1). New table mirrors `kg_relationships` but with `agent_id`, `confidence`, and FKs into `kg_subject_entities`.
+
+```sql
+CREATE TABLE kg_subject_relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    from_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+    to_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    properties_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    trace_id TEXT,
+    UNIQUE (agent_id, from_entity_id, to_entity_id, type)
+);
+CREATE INDEX idx_kg_subj_rel_from ON kg_subject_relationships(agent_id, from_entity_id, type);
+CREATE INDEX idx_kg_subj_rel_to ON kg_subject_relationships(agent_id, to_entity_id, type);
+CREATE INDEX idx_kg_subj_rel_type ON kg_subject_relationships(agent_id, type);
+```
+
+Rationale: SRP at the schema level. `kg_relationships` holds deterministic domain edges; `kg_subject_relationships` holds LLM-extracted per-agent edges. Different sources of truth, different volatility, different scoping, different write contracts. Mixing them in one table conflates all of that and breaks the dual-write anti-pattern (two writers with different ownership). Alternatives rejected: extending `kg_relationships` with optional agent_id (breaks D1, FK targets differ), storing in `properties_json` (not traversable, O(N) reverse lookups).
+
+### D12. `kg_chunk_subjects` join table for entity provenance (chunk → subject entity)
+
+Resolved during #690 planning (2026-04-21). Many-to-many: one chunk yields multiple entities, one entity appears in multiple chunks. Provenance is a first-class relationship needing its own table with its own fields.
+
+```sql
+CREATE TABLE kg_chunk_subjects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+    subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+    extraction_trace_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, chunk_id, subject_entity_id)
+);
+CREATE INDEX idx_kg_cs_chunk ON kg_chunk_subjects(agent_id, chunk_id);
+CREATE INDEX idx_kg_cs_entity ON kg_chunk_subjects(agent_id, subject_entity_id);
+CREATE INDEX idx_kg_cs_trace ON kg_chunk_subjects(agent_id, extraction_trace_id);
+```
+
+Uses `extraction_trace_id` (not generic `trace_id`) to explicitly name the semantics: which extraction run produced this provenance record. No confidence field — provenance is a fact ("this entity was extracted from this chunk"), not a judgment.
+
+### D13. `kg_chunk_subject_relationships` join table for relationship provenance
+
+Resolved during #690 planning (2026-04-21). Symmetric to D12 but for relationships. Without this, relationship orphaning after doc edits can't distinguish "this relationship is asserted by a surviving doc" from "this relationship's asserting doc was changed."
+
+```sql
+CREATE TABLE kg_chunk_subject_relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+    subject_relationship_id INTEGER NOT NULL REFERENCES kg_subject_relationships(id) ON DELETE CASCADE,
+    extraction_trace_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, chunk_id, subject_relationship_id)
+);
+CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_id);
+CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
+```
+
+This completes the subject layer's provenance model. The recurring pattern across D11-D13: every first-class KG table has relationships to other first-class tables that need their own tables with their own provenance. This convention should be added to `kg-implementation-conventions.md`.
+
 ## Open Questions
 
 ### Resolved During Planning
@@ -161,6 +226,9 @@ Resolved during planning. The existing "three-layer memory model" (core memory /
 - kg_chunks has `source_doc_hash TEXT NOT NULL` for idempotency (see D10, surfaced from #689 planning).
 - Terminology disambiguation — use `KG <layer>` explicitly (see D8).
 - kg_subject_entities uniqueness — `UNIQUE (agent_id, entity_key)` in schema sketch (per-agent uniqueness; see schema sketch in High-Level Technical Design).
+- Subject-to-subject edges — `kg_subject_relationships` table (see D11, surfaced from #690 planning).
+- Entity provenance — `kg_chunk_subjects` join table (see D12, surfaced from #690 planning).
+- Relationship provenance — `kg_chunk_subject_relationships` join table (see D13, surfaced from #690 planning).
 
 ### Deferred to Implementation
 
@@ -262,6 +330,50 @@ CREATE TABLE kg_subject_resolutions (
 );
 CREATE INDEX idx_kg_resolutions_agent_subj ON kg_subject_resolutions(agent_id, subject_entity_id);
 CREATE INDEX idx_kg_resolutions_agent_dom ON kg_subject_resolutions(agent_id, domain_entity_id);
+
+-- Subject-to-subject edges / fact triples (per-agent, from #690 planning — D11)
+CREATE TABLE kg_subject_relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    from_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+    to_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    properties_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    trace_id TEXT,
+    UNIQUE (agent_id, from_entity_id, to_entity_id, type)
+);
+CREATE INDEX idx_kg_subj_rel_from ON kg_subject_relationships(agent_id, from_entity_id, type);
+CREATE INDEX idx_kg_subj_rel_to ON kg_subject_relationships(agent_id, to_entity_id, type);
+CREATE INDEX idx_kg_subj_rel_type ON kg_subject_relationships(agent_id, type);
+
+-- Entity provenance: chunk → subject entity (many-to-many, from #690 planning — D12)
+CREATE TABLE kg_chunk_subjects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+    subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+    extraction_trace_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, chunk_id, subject_entity_id)
+);
+CREATE INDEX idx_kg_cs_chunk ON kg_chunk_subjects(agent_id, chunk_id);
+CREATE INDEX idx_kg_cs_entity ON kg_chunk_subjects(agent_id, subject_entity_id);
+CREATE INDEX idx_kg_cs_trace ON kg_chunk_subjects(agent_id, extraction_trace_id);
+
+-- Relationship provenance: chunk → subject relationship (many-to-many, from #690 planning — D13)
+CREATE TABLE kg_chunk_subject_relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+    subject_relationship_id INTEGER NOT NULL REFERENCES kg_subject_relationships(id) ON DELETE CASCADE,
+    extraction_trace_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, chunk_id, subject_relationship_id)
+);
+CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_id);
+CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
 ```
 
 ### Chunk write pipeline
