@@ -78,18 +78,22 @@ Resolved during planning. When `query_knowledge_graph` returns `status: "startin
 
 Each fallback is narrow and specific — not a generic "if KG is sparse, read registries." Broad fallback would hide legitimate "KG says no" answers.
 
+**Tool fallback (not just `starting_entity_missing`):** The "What tools do I have?" row deserves special treatment. MCP tools added via dynamic connect since last boot are not in the KG but are in ToolRegistry. This isn't just a create_agent staleness case — it's the normal state for any agent with MCP connections. For tool queries, always supplement KG results with ToolRegistry diff (tools in ToolRegistry but not in `kg_entities WHERE type='tool'`). This runs on `status: "ok"` too, not just `starting_entity_missing`.
+
 **When NOT to fall back:**
 - `status: "traversal_empty"` — the entity exists in the KG, traversal found nothing. Trust the KG.
-- `status: "ok"` with results — use results directly.
+- `status: "ok"` with results — use results directly (except tool queries, which always supplement per above).
 - Questions about subject-layer entities (problem_type, solution_path) — these don't have registry fallbacks; the KG is the only source.
 
 ### D3. Data-provenance annotations
 
-Resolved during planning. Results carry source attribution so the LLM knows how fresh and complete the data is.
+Resolved during planning.
 
-- **KG results:** No annotation needed (default).
-- **Registry fallback results:** Annotated with "(from registry, not yet in KG — available after next restart)".
-- **Combined results:** When KG provides some answers and registry supplements others, each item carries its source.
+**Format:** Batch preamble for uniform-source results (all KG or all registry), per-item inline for mixed-source results.
+
+- **All-KG:** No annotation. Default.
+- **All-registry fallback:** Preamble: `"Note: the following results are from the live registry (not yet in KG — available after next restart):"` followed by the result list.
+- **Mixed (KG + ToolRegistry supplement for MCP tools):** Each item carries inline source: `"skill:self-dev (KG)"`, `"mcp__stitch__generate_screen (ToolRegistry — added via MCP since last restart)"`.
 
 Annotations appear in the result text that the LLM sees, not in a structured field — the LLM needs to reason about provenance in its natural-language response to the user.
 
@@ -101,9 +105,9 @@ Three cases the skill handles:
 
 1. **Agent not in KG yet** (KG empty for this agent, use registry entirely) — the create_agent case.
 2. **Skill disabled since last boot** (KG has it, `agent_context.enabled = false`) — the skill_overrides case. Handled by #688 D5 metadata, interpreted by the LLM.
-3. **MCP tool added since last boot** (ToolRegistry has it, KG doesn't) — not automatically detected. For "what tools do I have?" the skill could supplement KG results with ToolRegistry diff, but this is deferred until the use case is observed.
+3. **MCP tool added since last boot** (ToolRegistry has it, KG doesn't) — handled by ToolRegistry diff supplementation in D2. For "what tools do I have?", always supplement KG results with tools present in ToolRegistry but absent from `kg_entities`. This is the normal state for MCP-dynamic tools, not an edge case.
 
-Case 1 is handled by D2. Case 2 is handled by #688 D5. Case 3 is deferred.
+All three cases are handled in MVP: case 1 by D2 fallback, case 2 by #688 D5 metadata, case 3 by D2 tool supplementation.
 
 ### D5. Read-only — no KG mutations from self-knowledge
 
@@ -131,7 +135,6 @@ Rationale: "KG is derived, not authored" is the architectural framing from the m
 
 - Self-knowledge system prompt wording (routing guidance for KG vs doc queries).
 - Whether the skill explicitly parses question categories for fallback routing or relies on the LLM to chain tools based on the prompt.
-- MCP dynamic-tool staleness detection (case 3 in D4 — deferred until observed).
 - Cross-agent self-knowledge ("what does the team know about X?") — requires cross-agent subject resolution (deferred in #691 D8).
 - Integration with existing tool chaining patterns (does the skill's prompt guide multi-step tool use or is it a single-call wrapper?).
 
@@ -175,27 +178,44 @@ docs/plans/
 
 **Files:** `crates/mika-agent/templates/skills/self-knowledge/skill.toml`, optionally `tools.json`.
 
-**Approach:** `query_knowledge_graph` is a builtin tool registered in `default_tools()` — it's available to all agents regardless of skill. The self-knowledge skill doesn't need to declare it in `tools.json`. However, the skill's `system_prompt.md` references it, so the skill depends on the tool existing. If the KG tickets haven't been implemented, the tool doesn't exist and the prompt references a nonexistent tool — graceful degradation: the LLM can't call `query_knowledge_graph` and falls through to `get_documentation`.
+**Approach:** `query_knowledge_graph` is a builtin tool registered in `default_tools()` — it's available to all agents regardless of skill. The self-knowledge skill doesn't need to declare it in `tools.json`. The skill's `system_prompt.md` references it, so **#692 has a strict dependency on #688** — implement and ship #688 before #692. Do not attempt graceful degradation for the missing-tool case; LLMs hallucinate tool calls for nonexistent tools, producing worse behavior than not trying. The milestone ordering already enforces this (#692 is last).
 
 ---
 
-- [ ] **Unit 3: Fallback logic validation**
+- [ ] **Unit 3: Fallback logic and behavioral validation**
 
-**Goal:** Verify the fallback path works end-to-end: KG miss → registry fallback → annotated results.
+**Goal:** Verify (a) the tool chain runs correctly for each fallback case, and (b) the LLM produces responses that correctly reflect provenance and enablement metadata.
 
-**Requirements:** D2, D3.
+**Requirements:** D2, D3, D4.
 
-**Files:** Integration tests.
+**Files:** Integration tests, eval harness tests.
 
-**Approach:** Test with:
-- Agent in KG → `query_knowledge_graph` returns results → no fallback needed.
-- Agent not in KG (freshly created) → `starting_entity_missing` → fallback to SkillRegistry → results annotated.
-- Traversal empty (agent in KG, no edges) → no fallback → empty result trusted.
+**Approach:** Two test layers:
 
-**Test scenarios:**
-- New agent asks "what skills do I have?" → fallback fires, returns registry entries with annotation.
-- Established agent asks "what skills do I have?" → KG results with `agent_context`.
-- Agent asks "what solves fabrication?" → KG traversal, no fallback (subject-layer query, no registry equivalent).
+**Layer 1 — Tool chain correctness (integration tests):**
+- Agent in KG → `query_knowledge_graph` returns `status: "ok"` → no fallback.
+- Agent not in KG → `status: "starting_entity_missing"` → skill calls SkillRegistry/ToolRegistry as fallback.
+- Traversal empty → `status: "traversal_empty"` → no fallback, empty trusted.
+- Tool query with MCP dynamic tools → KG results supplemented with ToolRegistry diff.
+
+**Layer 2 — LLM behavioral tests (eval harness with MockLlmProvider):**
+
+The self-knowledge system prompt includes contractual requirements the LLM must follow. Tests verify the LLM's response text meets these requirements:
+
+| Scenario | Prompt contract | Response assertion |
+|----------|----------------|-------------------|
+| New agent, fallback fires | "When results come from registry, note this in your response" | Response contains "registry" or "not yet in KG" |
+| Skill with `enabled: false` in results | "When a skill is disabled, explicitly say so rather than omitting it" | Response mentions the disabled skill with its disabled status |
+| MCP tool from ToolRegistry supplement | "When tools were added since last restart, note they may not have KG context" | Response distinguishes KG-sourced from ToolRegistry-sourced tools |
+| Subject-layer query, no fallback available | "When the KG returns no results for a topic, say so rather than inventing" | Response does NOT fabricate an answer when KG returns empty |
+
+These are eval-style tests: seed MockLlmProvider with responses that follow/violate the prompt contracts, verify the system prompt's guidance produces correct behavior on representative inputs. Fragile by nature but the alternative is shipping untested LLM behavior.
+
+**Test scenarios (combining both layers):**
+- New agent asks "what skills do I have?" → fallback fires, response mentions registry source.
+- Established agent asks "what skills do I have?" → KG results with `agent_context`, response distinguishes enabled/disabled.
+- Agent asks "what tools do I have?" → KG + ToolRegistry diff, MCP tools annotated.
+- Agent asks "what solves fabrication?" → KG traversal, no fallback. If KG empty, response says "no structured knowledge about this."
 
 ## Error Handling & Edge Cases
 
