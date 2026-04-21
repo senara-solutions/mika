@@ -97,6 +97,7 @@ impl Tool for ToggleSkillTool {
 mod tests {
     use super::*;
     use crate::test_utils::test_helpers::TestHarness;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     fn setup_with_skill(name: &str) -> (TempDir, TestHarness) {
@@ -250,15 +251,37 @@ mod tests {
     #[tokio::test]
     async fn test_already_disabled() {
         let (tmp, harness) = setup_with_skill("my-skill");
-        let ctx = harness.ctx_with_home(tmp.path());
+        // Use local AtomicBools to avoid race with concurrent tests (the shared
+        // static in ctx_with_home is process-wide and set by other toggle_skill tests).
+        let skills_dirty = AtomicBool::new(false);
+        let pr_review_posted = AtomicBool::new(false);
+        let ctx = ToolContext {
+            db: &harness.db,
+            session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
+            home_dir: tmp.path(),
+            global_home_dir: None,
+            core_memory_edit_count: &harness.counter,
+            is_onboarding: false,
+            message_sender: None,
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            skills_dirty: &skills_dirty,
+            is_reflection: false,
+            is_task_context: false,
+            is_callback_turn: false,
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
+            max_tasks_per_session: 25,
+            pr_review_posted: &pr_review_posted,
+        };
         // Pre-disable via DB
         ctx.db
             .set_skill_enabled(ctx.db.agent_id(), "my-skill", false)
             .await
             .unwrap();
-
-        // Reset shared static before asserting (skills_dirty is a process-wide static)
-        ctx.skills_dirty.store(false, Ordering::Release);
 
         let tool = ToggleSkillTool;
         let result = tool
@@ -271,23 +294,45 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("already disabled"));
         // skills_dirty should NOT be set for a no-op
-        assert!(!ctx.skills_dirty.load(Ordering::Acquire));
+        assert!(!skills_dirty.load(Ordering::Acquire));
     }
 
     #[tokio::test]
     async fn test_disable_sets_skills_dirty() {
         let (tmp, harness) = setup_with_skill("my-skill");
-        let ctx = harness.ctx_with_home(tmp.path());
+        // Use local AtomicBools to avoid race with concurrent tests.
+        let skills_dirty = AtomicBool::new(false);
+        let pr_review_posted = AtomicBool::new(false);
+        let ctx = ToolContext {
+            db: &harness.db,
+            session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
+            home_dir: tmp.path(),
+            global_home_dir: None,
+            core_memory_edit_count: &harness.counter,
+            is_onboarding: false,
+            message_sender: None,
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            skills_dirty: &skills_dirty,
+            is_reflection: false,
+            is_task_context: false,
+            is_callback_turn: false,
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
+            max_tasks_per_session: 25,
+            pr_review_posted: &pr_review_posted,
+        };
         let tool = ToggleSkillTool;
 
-        // Reset shared static before asserting
-        ctx.skills_dirty.store(false, Ordering::Release);
         tool.execute(
             serde_json::json!({"name": "my-skill", "enabled": false}),
             &ctx,
         )
         .await
         .unwrap();
-        assert!(ctx.skills_dirty.load(Ordering::Acquire));
+        assert!(skills_dirty.load(Ordering::Acquire));
     }
 }
