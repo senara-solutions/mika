@@ -59,3 +59,13 @@ Three new tables:
 - Typed HTTP errors with status code downcast for retry logic
 - Input sanitization per engine's escaping rules (FTS5: double quotes)
 - Subquery bulk deletion (`DELETE WHERE id IN (SELECT ...)`) instead of per-row loops
+
+### KG Composition (schema v25)
+
+Knowledge Graph chunks plug into this pipeline as `source_type='kg_chunk'`. The
+`kg_chunks` table (schema v25) holds structural metadata (agent_id, seq_id,
+source_doc_path, source_doc_hash); text and embeddings flow through
+`search_content` and the existing backfill. No code changes to the
+FTS5/sqlite-vec pipeline are required — the pipeline is already polymorphic on
+`source_type`. See `crates/mika-agent/src/db/kg_schema.rs` for the write
+contract documentation.
