@@ -143,6 +143,8 @@ Hash is SHA-256 of the source doc content **after normalization** (LF line endin
 
 This column lives in v25 directly (inlined before ship) rather than as a v25→v26 migration — cheaper to fold in now than to migrate later, and it's load-bearing for #689's idempotency contract.
 
+The normalization rules are enforced at the application layer by the chunk ingestor (#689); there is no SQL-level CHECK validating hash format. The SQL constraint is only `NOT NULL` — the ingestor is trusted to compute the hash correctly. Code that bypasses the ingestor and inserts raw `kg_chunks` rows is responsible for computing the normalized SHA-256 hash itself.
+
 ### D8. Terminology: "KG layers" (not "memory layers") in docs
 
 Resolved during planning. The existing "three-layer memory model" (core memory / structured facts / hybrid search) in `CLAUDE.md` is Layer 1/2/3 of agent memory. The KG has its own "three layers" (domain / lexical / subject). These are different concerns. Docs and comments must qualify — e.g., `KG domain layer`, not `domain layer` alone; `memory Layer 3`, not `hybrid layer` alone. Plan docs, module rustdoc, and ID convention doc all use `KG <layer_name>` explicitly to avoid reader confusion.
@@ -266,28 +268,31 @@ CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
 
 Includes `source_extraction_trace_id` for detecting staleness when re-extraction regenerates an entity. See #691's plan D4 for the pending query and four staleness triggers.
 
+`UNIQUE (agent_id, subject_entity_id)` records latest outcome only; history of previous resolution attempts is not preserved. If re-resolution audit history becomes a requirement, a separate `kg_resolutions_history` table is the natural extension — do not relax this UNIQUE to accommodate history.
+
 The recurring pattern across D11-D16: processing state for each KG pipeline stage (extraction, resolution) belongs in its own tracking table with structured metadata. This convention should be added to `kg-implementation-conventions.md`.
 
 ## Open Questions
 
 ### Resolved During Planning
 
-- Agent scoping — per-layer (see D1).
-- Indexing strategy — composition with `search_content` (see D2).
-- Entity PK shape — INTEGER rowid with UNIQUE derived entity_key (see D3).
-- Properties as JSON vs typed columns — JSON (see D5).
-- trace_id on per-agent mutation tables including kg_chunks (see D6).
-- kg_chunks UNIQUE constraint on `(agent_id, source_doc_path, seq_id)` (see D7).
-- kg_chunks has no direct entity_id column — linkage via subject→resolution (see D9, surfaced from #689 planning).
-- kg_chunks has `source_doc_hash TEXT NOT NULL` for idempotency (see D10, surfaced from #689 planning).
-- Terminology disambiguation — use `KG <layer>` explicitly (see D8).
-- kg_subject_entities uniqueness — `UNIQUE (agent_id, entity_key)` in schema sketch (per-agent uniqueness; see schema sketch in High-Level Technical Design).
-- Subject-to-subject edges — `kg_subject_relationships` table (see D11, surfaced from #690 planning).
-- Entity provenance — `kg_chunk_subjects` join table (see D12, surfaced from #690 planning).
-- Relationship provenance — `kg_chunk_subject_relationships` join table (see D13, surfaced from #690 planning).
-- Extraction tracking — `kg_extractions` table (see D14, surfaced from #690 review).
-- Entity confidence as column — `kg_subject_entities.confidence` (see D15, surfaced from #690 review).
-- Resolution tracking — `kg_resolutions_log` table (see D16, surfaced from #691 planning).
+- D1: Agent scoping — per-layer.
+- D2: Indexing strategy — composition with `search_content`.
+- D3: Entity PK — INTEGER rowid with UNIQUE derived entity_key.
+- D4: Relationships — directed, no FTS5/embedding.
+- D5: Properties — JSON, not typed columns.
+- D6: trace_id on per-agent mutation tables.
+- D7: kg_chunks UNIQUE constraint on `(agent_id, source_doc_path, seq_id)`.
+- D8: Terminology — use `KG <layer>` explicitly.
+- D9: kg_chunks has no entity_id column — linkage via subject→resolution (from #689 planning).
+- D10: kg_chunks.source_doc_hash TEXT NOT NULL for idempotency (from #689 planning).
+- D11: kg_subject_relationships table — subject-to-subject edges (from #690 planning).
+- D12: kg_chunk_subjects join table — entity provenance (from #690 planning).
+- D13: kg_chunk_subject_relationships join table — relationship provenance (from #690 planning).
+- D14: kg_extractions table — extraction tracking (from #690 review).
+- D15: kg_subject_entities.confidence column (from #690 review).
+- D16: kg_resolutions_log table — resolution tracking (from #691 planning).
+- kg_subject_entities uniqueness — `UNIQUE (agent_id, entity_key)` in schema sketch.
 
 ### Deferred to Implementation
 
@@ -571,7 +576,7 @@ SELECT e.entity_key FROM kg_entities e JOIN deps d ON e.id = d.id;
 - `migrate_v21_to_v22` at (search `db.rs`) for a prior CREATE TABLE migration, if one exists; otherwise the v1 clean-slate path is the nearest template.
 
 **Test scenarios:**
-- Happy path: migration succeeds on a v24 DB; `schema_version` row with version=25 appears; all five tables exist with correct columns.
+- Happy path: migration succeeds on a v24 DB; `schema_version` row with version=25 appears; all ten new KG tables exist with correct columns.
 - Edge case: migration is idempotent — re-running does not error (relies on `IF NOT EXISTS` + the `version < N` guard in `migrate()`).
 - Integration: fresh `open_in_memory()` reaches v25 via `migrate_v1` and has the same schema as a v24 DB that ran `migrate_v24_to_v25`.
 - Error path: CHECK constraint on `kg_entities` rejects a row where `entity_key != type || ':' || name`.
@@ -581,7 +586,7 @@ SELECT e.entity_key FROM kg_entities e JOIN deps d ON e.id = d.id;
 **Verification:**
 - `db.rs` compiles; `cargo test -p mika-agent` passes.
 - `test_schema_version_is_current` (`db.rs:8989`) still passes with the bumped CURRENT_SCHEMA_VERSION.
-- All five new tables visible via `.schema` in a SQLite shell.
+- All ten new KG tables visible via `.schema` in a SQLite shell.
 
 ---
 
@@ -605,7 +610,7 @@ SELECT e.entity_key FROM kg_entities e JOIN deps d ON e.id = d.id;
   - For each index: capture `PRAGMA index_list(<table>)` + `PRAGMA index_info(<index>)` (unique flag, indexed columns in order).
   - Normalize into a deterministic struct (sorted column lists, sorted table lists) so equality comparison is stable across formatting.
 - **Rationale for PRAGMA over `sqlite_master` text comparison:** `sqlite_master.sql` stores the literal CREATE TABLE DDL including whitespace and column ordering exactly as written. `migrate_v1` and `migrate_v24_to_v25` write the same schema in different source locations and will differ by cosmetic whitespace even when semantically identical. Byte-level text comparison produces brittle false-negatives. PRAGMA introspection tests what actually matters — columns, types, constraints, indexes — and is robust to formatting drift.
-- Test `v24_to_v25_migration_adds_tables`: seed v24, run `migrate_v24_to_v25`, snapshot schema, assert the five new tables exist with expected columns, indexes, FK actions, CHECK constraints.
+- Test `v24_to_v25_migration_adds_tables`: seed v24, run `migrate_v24_to_v25`, snapshot schema, assert all ten new KG tables exist with expected columns, indexes, FK actions, CHECK constraints.
 - Test `v24_to_v25_migration_is_idempotent`: seed v24, run migration twice, assert no error and schema_version row count stays at 1 for version 25.
 - Test `v1_and_incremental_converge`: open two in-memory DBs — one via `migrate_v1()` (reaches v25 directly), one by seeding v24 then running `migrate_v24_to_v25`. Snapshot both schemas via `snapshot_schema()` and assert structural equality. Any drift between the two paths fails the test with a diff showing which column/index/constraint differs.
 
@@ -638,7 +643,7 @@ SELECT e.entity_key FROM kg_entities e JOIN deps d ON e.id = d.id;
 - Modify: `docs/adr/003-layer3-hybrid-vector-search.md` — append a short "KG composition" subsection noting that `kg_chunk` is a registered `source_type` using the same pipeline.
 
 **Approach:**
-- Rustdoc at the top of `kg_schema.rs` describes: the four-step transactional write (BEGIN, INSERT kg_chunks, INSERT search_content via `index_content`, COMMIT), the rollback semantics on embedding-call failure, the idempotency rule (re-ingesting the same `(agent_id, source_doc_path, seq_id)` should upsert rather than duplicate — flag the UNIQUE constraint question for #689 to resolve).
+- Rustdoc at the top of `kg_schema.rs` describes: the four-step transactional write (BEGIN, INSERT kg_chunks, INSERT search_content via `index_content`, COMMIT), the rollback semantics on embedding-call failure, the idempotency rule (the UNIQUE constraint on `(agent_id, source_doc_path, seq_id)` is in the v25 schema per D7; ingestors use `INSERT OR REPLACE` or explicit UPSERT against it).
 - ADR-003 update is one paragraph: "KG chunks plug into this pipeline as `source_type='kg_chunk'`. The kg_chunks table (schema v25) holds structural metadata; text and embeddings flow through `search_content` and the existing backfill."
 
 **Patterns to follow:**
