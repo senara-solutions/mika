@@ -137,7 +137,7 @@ The staleness window is bounded by the time until the next `mika-server` restart
 Consumer implications:
 
 - #688 query tool: document that "recent KG" means "last boot." If a user asks about a freshly created agent that hasn't been restarted into the graph yet, the query returns "not found." Acceptable — agents can be informed "this agent was just created; refresh after next restart to see it in the KG."
-- #692 self-knowledge upgrade: same caveat. `self-knowledge` queries over the KG reflect last-boot state.
+- #692 self-knowledge upgrade: same caveat, with a specific UX risk — an agent asking "who am I in the team?" between its own creation (via runtime `create_agent`) and the next restart gets "not found" from the KG. **#692's plan must include a fallback path:** when a self-knowledge query matches no KG agent node for the current agent_id, fall back to reading `agent_configs` directly. This keeps the UX graceful during the staleness window. Flag for #692; not this ticket's problem to solve, but #687's D4 is the reason #692 has to handle it.
 
 **This is an intentional design decision**, not an unfixed bug. The projection cadence matches the source cadence. If operational requirements evolve to demand live-updating domain graph semantics, that's a future ticket with its own design pass — not a silent requirement scope-creep on #687.
 
@@ -396,7 +396,8 @@ Test expectation: none — this unit is scaffolding. Compilation is the success 
   - For each desired edge, INSERT (looking up from/to entity_ids by entity_key via JOIN).
   - Returns count per type.
 - `prune_stale_entities(&self, desired_keys: &HashSet<String>) -> Result<u32>`:
-  - DELETE from `kg_entities` where `entity_key NOT IN (desired_keys)`. CASCADE removes edges; ON DELETE SET NULL on `kg_chunks.entity_id` preserves chunk rows.
+  - DELETE from `kg_entities` where `type IN ('skill', 'tool', 'agent', 'problem_type') AND entity_key NOT IN (desired_keys)`. **The type filter is load-bearing, not belt-and-suspenders** — it enforces the builder's sole-writer contract at the SQL level, so a future addition of a fifth entity type by another subsystem (currently only `kg_subject_entities` exists, but contracts can drift) doesn't get silently pruned. Source the type list from `KG_DOMAIN_ENTITY_TYPES` in `kg_schema.rs` (single source of truth).
+  - CASCADE removes edges; ON DELETE SET NULL on `kg_chunks.entity_id` preserves chunk rows.
   - Returns count of deleted entities.
 - All three operations happen within a single transaction — if any step fails, the whole rebuild rolls back and the graph remains in its previous state (stale but consistent).
 
@@ -499,7 +500,7 @@ See the seven tests above; each is an explicit test scenario.
 | Rebuild introduces a startup latency bump on servers with many skills | Entity count is bounded (low hundreds at most). Batch writes in one transaction. Measure in Unit 5 — if rebuild exceeds 500ms, revisit batching. |
 | Stale MCP tool state between boots surfaces as confused queries | Documented in D4. If it becomes a real operational problem, add a CLI force-rebuild subcommand (deferred). |
 | A skill's `dependencies` field references a skill that isn't loaded (missing dep) | Unit 3 skips edges with missing endpoints and logs a warning. The `kg_entities` table stays consistent; only the missing-dep edge is absent. |
-| Two skills expose the same tool with different descriptions | Unit 2 dedupes into one Tool entity, records both sources in `properties_json`. First-seen description wins — acceptable because descriptions for the same tool should match by convention. |
+| Two skills expose the same tool with different descriptions | Unit 2 dedupes into one Tool entity, records both sources in `properties_json`. First-seen description wins — acceptable because descriptions for the same tool should match by convention. **Emit a DEBUG log line when a duplicate with differing descriptions is encountered** so silent drift is at least traceable; conventions break quietly without instrumentation. |
 | `agents` table contains agents without matching config files (DB-only stubs) | Unit 2 enumerates from `agent_configs`, not the DB. DB-only stubs are invisible to the graph — acceptable, since the graph represents "agents with real config" as nodes. Document if this becomes confusing. |
 | HAS_SKILL is "accidentally" added by a future contributor | D1's "structure not state" heuristic + Unit 6 test 5 (explicit invariant assertion) block regression. |
 
