@@ -1345,7 +1345,10 @@ fn inject_task_id_field(schema: &mut serde_json::Value) {
         );
     }
     if let Some(required) = schema.get_mut("required").and_then(|r| r.as_array_mut()) {
-        required.push(serde_json::Value::String("task_id".to_string()));
+        let task_id_val = serde_json::Value::String("task_id".to_string());
+        if !required.contains(&task_id_val) {
+            required.push(task_id_val);
+        }
     } else {
         schema["required"] = serde_json::json!(["task_id"]);
     }
@@ -2549,6 +2552,67 @@ mod tests {
         assert!(
             required.contains(&serde_json::Value::String("task_id".to_string())),
             "task_id should be in required fields"
+        );
+        // no duplicates in required
+        let task_id_count = required
+            .iter()
+            .filter(|v| v.as_str() == Some("task_id"))
+            .count();
+        assert_eq!(
+            task_id_count, 1,
+            "task_id should appear exactly once in required"
+        );
+    }
+
+    #[test]
+    fn test_long_running_tool_with_preexisting_task_id_no_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("pilot");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+            [skill]
+            name = "pilot"
+            description = "Long-running pilot"
+            "#,
+        )
+        .unwrap();
+        // tools.json already has task_id in properties AND required
+        fs::write(
+            skill_dir.join("tools.json"),
+            r#"[{
+                "name": "run_pilot",
+                "description": "Run a pilot session",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "The prompt"},
+                        "task_id": {"type": "string", "description": "Task UUID"}
+                    },
+                    "required": ["prompt", "task_id"]
+                },
+                "handler": {"type": "exec", "command": "./run.sh", "long_running": true, "estimated_duration_secs": 300}
+            }]"#,
+        )
+        .unwrap();
+
+        let result = scan_skills_dir(tmp.path());
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].skill_tools.len(), 1);
+
+        let schema = &result.entries[0].skill_tools[0].definition.input_schema;
+        let required = schema["required"].as_array().unwrap();
+
+        // task_id must appear exactly once — no duplicate from inject
+        let task_id_count = required
+            .iter()
+            .filter(|v| v.as_str() == Some("task_id"))
+            .count();
+        assert_eq!(
+            task_id_count, 1,
+            "task_id must not be duplicated when already in required: got {:?}",
+            required
         );
     }
 
