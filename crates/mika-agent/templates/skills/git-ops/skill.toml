@@ -1,9 +1,9 @@
 [skill]
 name = "git-ops"
-description = "Git maintenance operations (rebase, merge, fetch) with structured results"
-version = "0.1.0"
+description = "Git operations (fetch, pull, rebase, merge, checkout, worktree management) with structured results"
+version = "0.2.0"
 always_on = false
 timeout_secs = 120
 
 [triggers]
-keywords = ["rebase", "merge main", "sync main", "git sync", "sync branch", "fast-forward", "git fetch", "rebase onto", "git rebase", "git merge"]
+keywords = ["rebase", "merge main", "sync main", "git sync", "sync branch", "fast-forward", "git fetch", "rebase onto", "git rebase", "git merge", "git pull", "pull main", "checkout", "switch branch", "git checkout", "git switch", "worktree", "git worktree"]

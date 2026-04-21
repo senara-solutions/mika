@@ -1,14 +1,14 @@
 [
   {
     "name": "git_ops",
-    "description": "Execute a git maintenance operation (fetch, rebase, or merge) on a repository. Use for syncing branches, rebasing onto main, and fetching updates. NOT for branching, committing, or creating PRs.",
+    "description": "Execute a git operation on a repository. Supports: fetch, rebase, merge, pull, checkout, worktree_add, worktree_remove, worktree_list, worktree_prune. Use for syncing branches, switching branches, and managing worktrees. NOT for committing or creating PRs.",
     "input_schema": {
       "type": "object",
       "properties": {
         "operation": {
           "type": "string",
-          "enum": ["fetch", "rebase", "merge"],
-          "description": "The git operation to perform: 'fetch' downloads remote refs, 'rebase' replays commits onto a base (auto-aborts on conflict), 'merge' fast-forwards to a base (fails if not fast-forwardable)"
+          "enum": ["fetch", "rebase", "merge", "pull", "checkout", "worktree_add", "worktree_remove", "worktree_list", "worktree_prune"],
+          "description": "The git operation to perform: 'fetch' downloads remote refs, 'rebase' replays commits onto a base (auto-aborts on conflict), 'merge' fast-forwards to a base, 'pull' fetches and fast-forward merges in one call, 'checkout' switches to a branch, 'worktree_add' creates a worktree, 'worktree_remove' removes a worktree, 'worktree_list' lists worktrees, 'worktree_prune' cleans up stale worktrees"
         },
         "repo_path": {
           "type": "string",
@@ -16,11 +16,19 @@
         },
         "base": {
           "type": "string",
-          "description": "Remote ref to target (e.g. 'origin/main', 'upstream/develop'). Default: 'origin/main'"
+          "description": "Remote ref to target (e.g. 'origin/main', 'upstream/develop'). Used by fetch, rebase, merge, pull, and worktree_add. Default: 'origin/main'"
         },
         "push": {
           "type": "boolean",
-          "description": "Force-push with lease after a successful rebase. Only allowed with 'rebase' operation. Rejected on 'merge' and 'fetch'. Refuses to push to main/master branches. Default: false"
+          "description": "Force-push with lease after a successful rebase. Only allowed with 'rebase' operation. Default: false"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Branch name. Required for 'checkout' (branch to switch to) and 'worktree_add' (branch to create or attach). For checkout, auto-creates a tracking branch if it exists on the remote."
+        },
+        "path": {
+          "type": "string",
+          "description": "Absolute filesystem path. Required for 'worktree_add' (where to create the worktree) and 'worktree_remove' (which worktree to remove)."
         }
       },
       "required": ["operation", "repo_path"]
