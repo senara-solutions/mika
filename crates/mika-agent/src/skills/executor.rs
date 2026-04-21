@@ -2798,7 +2798,7 @@ mod tests {
         )
         .await;
 
-        // PR reference → blocked-by check skipped (only issues have blockedByIssues)
+        // PR reference → blocked-by check skipped (only issues have blockedBy)
         let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token")).await;
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }

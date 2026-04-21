@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-/// Query GitHub's GraphQL API for `blockedByIssues` edges on an issue.
+/// Query GitHub's GraphQL API for `blockedBy` edges on an issue.
 ///
 /// Returns the issue numbers of any open (non-CLOSED) blockers. Returns an empty
 /// vec when there are no open blockers. Returns `Err` on API or network failures.
@@ -18,7 +18,7 @@ pub(crate) async fn fetch_open_blockers(
     let query_str = "query($owner:String!,$repo:String!,$number:Int!) { \
          repository(owner:$owner,name:$repo) { \
          issue(number:$number) { \
-         blockedByIssues(first:100) { nodes { number state } } \
+         blockedBy(first:100) { nodes { number state } } \
          } } }";
     let body = serde_json::json!({
         "query": query_str,
@@ -75,12 +75,12 @@ pub(crate) async fn fetch_open_blockers(
 
 /// Extract open (non-CLOSED) blocker issue numbers from a GitHub GraphQL response.
 ///
-/// Navigates `data.repository.issue.blockedByIssues.nodes` and returns issue numbers
+/// Navigates `data.repository.issue.blockedBy.nodes` and returns issue numbers
 /// where `state != "CLOSED"`. Returns an empty vec when the path is absent (e.g., repo
 /// does not support sub-issues).
 pub(crate) fn extract_open_blocker_numbers(body: &serde_json::Value) -> Vec<u64> {
     let nodes = body
-        .pointer("/data/repository/issue/blockedByIssues/nodes")
+        .pointer("/data/repository/issue/blockedBy/nodes")
         .and_then(|n| n.as_array());
 
     let Some(nodes) = nodes else {
@@ -108,7 +108,7 @@ mod tests {
             "data": {
                 "repository": {
                     "issue": {
-                        "blockedByIssues": {
+                        "blockedBy": {
                             "nodes": [
                                 {"number": 100, "state": "CLOSED"},
                                 {"number": 101, "state": "CLOSED"}
@@ -127,7 +127,7 @@ mod tests {
             "data": {
                 "repository": {
                     "issue": {
-                        "blockedByIssues": {
+                        "blockedBy": {
                             "nodes": [
                                 {"number": 689, "state": "OPEN"},
                                 {"number": 690, "state": "CLOSED"},
@@ -147,7 +147,7 @@ mod tests {
             "data": {
                 "repository": {
                     "issue": {
-                        "blockedByIssues": {
+                        "blockedBy": {
                             "nodes": []
                         }
                     }
