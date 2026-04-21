@@ -242,7 +242,31 @@ Resolved during #690 review (2026-04-21). Extraction-time confidence should be a
 -- ADD: confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0)
 ```
 
-The recurring pattern across D11-D15: every first-class KG table has relationships to other first-class tables that need their own tables with their own provenance. This convention should be added to `kg-implementation-conventions.md`.
+### D16. `kg_resolutions_log` tracking table for resolution state
+
+Resolved during #691 planning (2026-04-21). Dedicated tracking table for entity resolution attempts, separate from `kg_extractions` (different keys, metadata, invalidation triggers). Records outcome per (agent_id, subject_entity_id) — authoritative "has this been attempted?" and "what was the result?"
+
+```sql
+CREATE TABLE kg_resolutions_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'error'
+    )),
+    resolution_trace_id TEXT NOT NULL,
+    source_extraction_trace_id TEXT,
+    model TEXT,
+    duration_ms INTEGER,
+    resolved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, subject_entity_id)
+);
+CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
+```
+
+Includes `source_extraction_trace_id` for detecting staleness when re-extraction regenerates an entity. See #691's plan D4 for the pending query and four staleness triggers.
+
+The recurring pattern across D11-D16: processing state for each KG pipeline stage (extraction, resolution) belongs in its own tracking table with structured metadata. This convention should be added to `kg-implementation-conventions.md`.
 
 ## Open Questions
 
@@ -263,6 +287,7 @@ The recurring pattern across D11-D15: every first-class KG table has relationshi
 - Relationship provenance — `kg_chunk_subject_relationships` join table (see D13, surfaced from #690 planning).
 - Extraction tracking — `kg_extractions` table (see D14, surfaced from #690 review).
 - Entity confidence as column — `kg_subject_entities.confidence` (see D15, surfaced from #690 review).
+- Resolution tracking — `kg_resolutions_log` table (see D16, surfaced from #691 planning).
 
 ### Deferred to Implementation
 
@@ -423,6 +448,23 @@ CREATE TABLE kg_extractions (
     UNIQUE (agent_id, source_doc_path)
 );
 CREATE INDEX idx_kg_extractions_agent ON kg_extractions(agent_id);
+
+-- Resolution tracking (from #691 planning — D16)
+CREATE TABLE kg_resolutions_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'error'
+    )),
+    resolution_trace_id TEXT NOT NULL,
+    source_extraction_trace_id TEXT,
+    model TEXT,
+    duration_ms INTEGER,
+    resolved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, subject_entity_id)
+);
+CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
 ```
 
 Note: `kg_subject_entities.confidence` (D15) is inlined in the CREATE TABLE above.
