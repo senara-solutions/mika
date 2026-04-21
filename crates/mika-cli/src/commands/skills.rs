@@ -12,6 +12,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::cli::{SkillLlmAction, SkillsArgs, SkillsCommand};
+use crate::commands::skills_variants;
 
 pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     let global_home = home::resolve_home_dir()?;
@@ -77,6 +78,9 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         }
         Some(SkillsCommand::Llm { name, action }) => {
             run_skill_llm(&global_home, &skills_dir, agent_name, &name, action)?;
+        }
+        Some(SkillsCommand::Variants { action }) => {
+            skills_variants::run(action, &skills_dir)?;
         }
     }
     Ok(())

@@ -12,6 +12,7 @@ pub mod openapi;
 pub mod rewind;
 pub mod state;
 pub mod types;
+pub mod variants;
 pub(crate) mod verdict;
 pub mod verdict_handler;
 pub mod webhook_queue;
@@ -190,6 +191,34 @@ fn build_router(state: AppState) -> Router {
             post(embedded_dashboard::handle_disable),
         )
         .route("/dashboard/status", get(embedded_dashboard::handle_status))
+        // Variant management endpoints (read-only)
+        .route("/skills/variants", get(variants::handle_variants_summary))
+        .route(
+            "/skills/{skill}/variants",
+            get(variants::handle_skill_variants),
+        )
+        // Static route MUST come before {provider}/{model} wildcard
+        .route(
+            "/skills/{skill}/variants/reflect",
+            get(variants::handle_variant_reflect),
+        )
+        .route(
+            "/skills/{skill}/variants/{provider}/{model}",
+            get(variants::handle_variant_detail),
+        )
+        .route(
+            "/skills/{skill}/variants/{provider}/{model}/diff",
+            get(variants::handle_variant_diff),
+        )
+        // Variant mutation endpoints (still dashboard-auth for validate, promote needs internal)
+        .route(
+            "/skills/{skill}/variants/{provider}/{model}/validate",
+            post(variants::handle_variant_validate),
+        )
+        .route(
+            "/skills/{skill}/variants/{provider}/{model}/promote",
+            post(variants::handle_variant_promote),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_dashboard_or_internal_token,

@@ -442,6 +442,11 @@ pub enum SkillsCommand {
         #[command(subcommand)]
         action: SkillLlmAction,
     },
+    /// Manage per-provider/per-model prompt variants
+    Variants {
+        #[command(subcommand)]
+        action: SkillVariantsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -455,6 +460,67 @@ pub enum SkillLlmAction {
     Reset,
     /// Show the effective LLM provider/model and its source
     Show,
+}
+
+#[derive(Subcommand)]
+pub enum SkillVariantsAction {
+    /// List all variants for a skill
+    List {
+        /// Skill name
+        name: String,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Show cross-skill variant summary
+    Status {
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Show diff between variant and base prompt
+    Diff {
+        /// Skill name
+        name: String,
+        /// Variant specifier: provider/model (e.g. anthropic/claude-sonnet-4-6)
+        variant: String,
+        /// Variant source filter: hand-authored, generated, or experimental
+        #[arg(long)]
+        source: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Reflect on variant impact after base prompt edit
+    Reflect {
+        /// Skill name
+        name: String,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Validate variant prompts against the 4-rule gate
+    Validate {
+        /// Skill name (omit to validate all)
+        name: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Promote an experimental variant to generated (after validation)
+    Promote {
+        /// Skill name
+        name: String,
+        /// Variant specifier: provider/model (e.g. anthropic/claude-sonnet-4-6)
+        variant: String,
+    },
+    /// Print the command to regenerate a variant (prepare-only in v1)
+    Regen {
+        /// Skill name
+        name: String,
+        /// Variant specifier: provider/model (e.g. anthropic/claude-sonnet-4-6)
+        variant: String,
+    },
 }
 
 #[derive(clap::Args)]

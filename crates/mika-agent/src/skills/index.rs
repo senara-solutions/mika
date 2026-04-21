@@ -248,7 +248,7 @@ impl SkillEntry {
 /// Sanitize a model name for use as a directory name.
 /// Replaces '/' with '--' to avoid filesystem path conflicts.
 /// Applied at both scan time (directory discovery) and resolution time (lookup).
-pub(crate) fn sanitize_model_dir_name(model: &str) -> String {
+pub fn sanitize_model_dir_name(model: &str) -> String {
     model.replace('/', "--")
 }
 
