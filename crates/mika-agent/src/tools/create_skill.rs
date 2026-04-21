@@ -278,6 +278,7 @@ impl Tool for CreateSkillTool {
             llm: Default::default(),
             constraints: Default::default(),
             context: std::collections::HashMap::new(),
+            variants: Default::default(),
         };
 
         let skill_toml = match toml::to_string_pretty(&manifest) {

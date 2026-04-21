@@ -3714,6 +3714,7 @@ mod tests {
                     required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
                 },
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![name.to_lowercase()],

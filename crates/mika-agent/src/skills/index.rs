@@ -248,7 +248,7 @@ impl SkillEntry {
 /// Sanitize a model name for use as a directory name.
 /// Replaces '/' with '--' to avoid filesystem path conflicts.
 /// Applied at both scan time (directory discovery) and resolution time (lookup).
-pub(crate) fn sanitize_model_dir_name(model: &str) -> String {
+pub fn sanitize_model_dir_name(model: &str) -> String {
     model.replace('/', "--")
 }
 
@@ -1400,6 +1400,12 @@ fn scan_provider_variants(skill_dir: &Path, manifest: &SkillManifest) -> Variant
             Some(n) => n.to_string(),
             None => continue,
         };
+
+        // Skip reserved directory names (defense-in-depth — these also fail
+        // ProviderKind parse, but an explicit check prevents future regressions).
+        if super::variants::RESERVED_VARIANT_DIRS.contains(&subdir_name.as_str()) {
+            continue;
+        }
 
         // Only recognize subdirs that match a known ProviderKind
         if subdir_name.parse::<ProviderKind>().is_err() {
@@ -2855,6 +2861,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2894,6 +2901,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2929,6 +2937,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -2964,6 +2973,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -3664,6 +3674,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -3715,6 +3726,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -3758,6 +3770,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -3813,6 +3826,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -3874,6 +3888,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -3932,6 +3947,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -4582,6 +4598,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -4619,6 +4636,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -4663,6 +4681,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -4703,6 +4722,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
@@ -4749,6 +4769,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from("/skills/test"),
             keywords_lower: vec![],
