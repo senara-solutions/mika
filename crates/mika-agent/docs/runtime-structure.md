@@ -75,7 +75,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **PRAGMAs:** `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `auto_vacuum=INCREMENTAL`
 
-**Current schema version:** 23
+**Current schema version:** 26
 
 **Timestamp format:** All timestamp columns use ISO 8601 TEXT (`%Y-%m-%dT%H:%M:%SZ`) — not Unix epoch integers. SQL defaults use `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`. Fixed-width UTC format ensures correct lexicographic ordering.
 
@@ -143,11 +143,11 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20), `enabled INTEGER` (v24). Per-agent overrides: LLM overrides resolve as DB > manifest `[llm]` > agent default (`mika skills llm <name> set <provider>/<model>`). Enabled state is tri-state: `NULL`=default (enabled), `0`=disabled, `1`=explicitly enabled. `enabled=false` evicts the skill from `SkillRegistry.entries` during `apply_overrides()`. Replaces `.disabled` marker files (#629). Default-equals-delete: rows where all columns are NULL are pruned.
 
-### Knowledge Graph Tables (v25)
+### Knowledge Graph Tables (v25, widened v26)
 
 **Domain layer (global):**
 
-**kg_entities** — `id INTEGER PK`, `entity_key TEXT UNIQUE NOCASE` (format `type:name`, CHECK-enforced), `entity_type TEXT NOT NULL` (CHECK: person/org/project/place/concept/event), `name TEXT NOT NULL`, `description TEXT`, timestamps. Index: `idx_kg_entities_type`.
+**kg_entities** — `id INTEGER PK`, `entity_key TEXT UNIQUE NOCASE` (format `type:name`, CHECK-enforced), `entity_type TEXT NOT NULL` (CHECK: person/org/project/place/concept/event/skill/tool/agent/problem_type — widened in v26), `name TEXT NOT NULL`, `description TEXT`, `properties_json TEXT` (v26, structured metadata for domain entities), timestamps. Index: `idx_kg_entities_type`. Domain entity types (`skill`, `tool`, `agent`, `problem_type`) are populated at startup by `DomainGraphBuilder` in `crate::kg::domain_builder`.
 
 **kg_relationships** — `id INTEGER PK`, `source_entity_id FK→kg_entities ON DELETE CASCADE`, `target_entity_id FK→kg_entities ON DELETE CASCADE`, `relationship_type TEXT NOT NULL`, `weight REAL`, timestamps. Indexes: `idx_kg_rel_source(source_entity_id, relationship_type)`, `idx_kg_rel_target`.
 
