@@ -63,13 +63,15 @@ Without resolution, subject-layer queries can't compose with domain-layer traver
 
 Resolved during planning. No fuzzy string matching stage (Levenshtein, FTS5 ranking) — the LLM subsumes fuzzy matching with better judgment and explicit confidence.
 
-**Stage 1 — Exact match with sibling ambiguity check:**
+**Stage 1 — Exact match:**
 
 For each subject entity with a well-known type (skill, tool, agent, problem_type):
 
 1. Case-insensitive exact match: `SELECT id, entity_key FROM kg_entities WHERE LOWER(entity_key) = LOWER(?)`.
-2. If exactly one match AND extraction confidence > 0.9 AND no sibling ambiguity → resolve at confidence = extraction_confidence. No LLM call.
-3. **Sibling ambiguity check:** query `SELECT COUNT(*) FROM kg_entities WHERE type = ? AND (name LIKE ? || '%' OR ? LIKE name || '%')`. If siblings exist whose names share a prefix with the candidate, escalate to LLM disambiguation even on exact match — the extraction may have picked a close-but-wrong name from the domain graph.
+2. If exactly one match AND extraction confidence > 0.9 → resolve at confidence = extraction_confidence. No LLM call.
+3. If no match OR extraction confidence ≤ 0.9 → escalate to LLM disambiguation (stage 2).
+
+**Sibling ambiguity check dropped.** The original plan included a LIKE-based sibling check that escalated exact matches to LLM when similar-named domain entities existed. This was a micro-optimization with subtle failure modes: the LIKE patterns (`name LIKE ? || '%'`) fire on practically every short name (e.g., `self` matches `self-dev`, `self-knowledge`, `self-dev-webhook-ci`), producing false-positive escalations that defeat the purpose of exact match. If wrong resolutions from exact match turn out to be a measurable problem in production, add a sibling check then with real data on what names actually collide — with edit-distance or common-stem logic, not raw LIKE.
 
 **Stage 2 — LLM disambiguation:**
 
@@ -114,7 +116,7 @@ CREATE TABLE kg_resolutions_log (
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
     outcome TEXT NOT NULL CHECK (outcome IN (
-        'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'error'
+        'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
     )),
     resolution_trace_id TEXT NOT NULL,
     source_extraction_trace_id TEXT,
@@ -170,7 +172,9 @@ resolve_doc_entities(doc_entity_ids) → writes resolutions + tracking
 
 **Compound hook:** extraction runs synchronously (~2-3s), resolution spawns as background task after extraction commits. The authoring agent gets immediate subject entities and FTS5 queryability; resolutions appear shortly after (~2-5s background). Matches C1.1's bounded-staleness pattern (writes commit, enrichment lags).
 
-Rationale: compound hook resolution involves LLM calls for ~20-30% of entities. Synchronous resolution would add 2-5s latency for marginal immediate value — the authoring agent's most likely next query is "what did I just write about?" which is answered by FTS5/subject entities, not cross-layer traversal.
+Rationale: extraction is synchronous because the authoring agent may immediately query subject entities from their just-written doc — entity names and fact triples are useful for same-session self-knowledge queries even without domain resolution. Resolution is asynchronous because cross-layer traversal (subject → domain → structural edges) is typically not needed in the same session that wrote the doc.
+
+**Compound hook resolution failure:** if the spawned resolution task fails (LLM provider down, rate-limited, malformed response after retry), failures are logged per C2.3 and left pending. The next startup's `resolve_pending` picks them up. The extraction commit is not affected — subject entities from the compound doc remain queryable.
 
 **Concurrent resolution LLM calls within a doc's resolve pass:** fire N concurrent disambiguation calls (N = entity count needing LLM, typically 1-5). Per-agent parallelism still bounds total server-wide concurrency.
 
@@ -218,7 +222,7 @@ Budget for 20-30% LLM disambiguation rate. At ~10-15 subject entities per doc ac
 - 400-900 LLM calls per agent (20-30%)
 - At `MIKA_KG_RESOLUTION_MODEL` pricing: ~$0.05-0.10 per agent
 
-Measure actual rate in implementation. Tune the exact-match shortcircuit threshold (D1 step 2: extraction confidence > 0.9 AND no siblings) based on observed resolution quality.
+Measure actual rate in implementation. Tune the exact-match shortcircuit threshold (D1 step 2: extraction confidence > 0.9) based on observed resolution quality.
 
 ## Open Questions
 
@@ -238,8 +242,9 @@ Measure actual rate in implementation. Tune the exact-match shortcircuit thresho
 
 - Exact LLM prompt wording for disambiguation (empirical).
 - Resolution model default (`MIKA_KG_RESOLUTION_MODEL` default value).
-- Sibling ambiguity threshold (prefix/suffix matching depth).
-- Per-entity vs batched LLM calls (default per-entity; batching is an optimization if call rate is too high).
+- Sibling ambiguity check (dropped from MVP — add with edit-distance or common-stem logic if wrong-resolution rate is measurable in production).
+- Per-entity vs batched LLM calls (default per-entity; batching is an optimization if call rate is too high). Note: batching has a correctness concern — multiple entities in one call can bleed context between decisions. If batching is implemented, the prompt must explicitly structure decisions to prevent cross-contamination.
+- LLM rate investigation trigger: if LLM disambiguation rate exceeds 40%, investigate whether extraction prompt needs tuning to match domain naming conventions before accepting the cost. High LLM rate indicates extraction quality issue, not necessarily resolution issue.
 - Periodic re-resolution for staleness triggers 2-4 (deferred until observed).
 - Cross-agent subject → subject clustering for discovered types (future ticket if #692 surfaces the need).
 - Human-in-the-loop review queue for low-confidence resolutions (deferred — may surface via #692).
@@ -254,6 +259,7 @@ crates/mika-agent/src/
 └── kg/
     ├── mod.rs                       # MODIFY: add `pub mod entity_resolver;`
     ├── subject_extractor.rs         # MODIFY: call resolver after extraction
+    ├── ingestion_orchestrator.rs    # MODIFY: add phase 4 (re-resolution) — module created by #690
     └── entity_resolver.rs           # NEW: two-stage resolution pipeline
 
 crates/mika-agent/tests/
@@ -355,9 +361,9 @@ Candidates:
 
 ---
 
-- [ ] **Unit 2: Exact match with sibling ambiguity check**
+- [ ] **Unit 2: Exact match**
 
-**Goal:** Stage 1 of the resolution pipeline — case-insensitive exact match against `kg_entities`, with sibling ambiguity escalation.
+**Goal:** Stage 1 of the resolution pipeline — case-insensitive exact match against `kg_entities`.
 
 **Requirements:** D1 stage 1.
 
@@ -367,17 +373,17 @@ Candidates:
 
 **Approach:**
 1. `SELECT id, entity_key FROM kg_entities WHERE LOWER(entity_key) = LOWER(?)`.
-2. If match: check sibling ambiguity — `SELECT COUNT(*) FROM kg_entities WHERE type = ? AND name != ? AND (name LIKE ? || '%' OR ? LIKE name || '%')`.
-3. If match + extraction confidence > 0.9 + no siblings → resolve. Confidence = extraction_confidence.
-4. If match + siblings or low confidence → escalate to LLM (Unit 3).
-5. If no match → escalate to LLM (Unit 3).
+2. If match + extraction confidence > 0.9 → resolve. Confidence = extraction_confidence.
+3. If match + extraction confidence ≤ 0.9 → escalate to LLM (Unit 3).
+4. If no match → escalate to LLM (Unit 3).
+5. If no LLM configured → log with `outcome = 'skipped_no_llm'`.
 
 **Test scenarios:**
-- Exact match, no siblings → resolved at extraction confidence.
-- Exact match, siblings exist → escalated to LLM.
-- Exact match, extraction confidence < 0.9 → escalated to LLM.
+- Exact match, high confidence → resolved at extraction confidence.
+- Exact match, low confidence → escalated to LLM.
 - No match → escalated to LLM.
 - Case difference (skill:Self-Dev vs skill:self-dev) → exact match succeeds.
+- No LLM configured, no exact match → `skipped_no_llm` outcome logged.
 
 **Verification:** Unit tests against test DB with seeded domain entities.
 
@@ -487,7 +493,7 @@ Candidates:
 
 | Scenario | Expected behavior |
 |----------|------------------|
-| No resolution model configured (`MIKA_KG_RESOLUTION_MODEL` unset, no fallback) | Exact-match-only mode. Entities that don't exact-match remain unresolved. Log `warn!(event="resolution_llm_disabled")`. |
+| No resolution model configured (`MIKA_KG_RESOLUTION_MODEL` unset, no fallback) | Exact-match-only mode. Entities that don't exact-match get `kg_resolutions_log.outcome = 'skipped_no_llm'` — distinct from `no_match` (which means LLM was asked and said no). When a model is later configured, `skipped_no_llm` entities are picked up by the pending query for LLM disambiguation. Log `warn!(event="resolution_llm_disabled")`. |
 | Domain graph empty (first boot, #687 hasn't run yet) | No candidates → all resolutions produce `no_match`. Tracked in log; re-resolved after next startup when domain graph exists. |
 | Subject entity resolves to multiple domain entities | Valid — `UNIQUE(agent_id, subject_entity_id, domain_entity_id)` allows multiple rows. Example: `tool:search` could resolve to both `tool:search_memory` and `tool:search_skills` if LLM returns multiple matches. |
 | Domain entity deleted after resolution | `kg_subject_resolutions` row CASCADE-deleted. `kg_resolutions_log` row persists with stale `matched_*` outcome. Pending query detects inconsistency on next run. |
