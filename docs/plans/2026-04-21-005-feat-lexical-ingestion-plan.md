@@ -178,7 +178,9 @@ DELETE kg_chunks → unindex_content(source_type="kg_chunk", source_id=<kg_chunk
 pub fn unindex_content(&self, source_type: &str, source_id: i64) -> Result<()>;
 ```
 
-It deletes the `search_content` row for the given `(source_type, source_id)` and removes the corresponding FTS5 entry. The `vec_search` row is keyed by `search_content.id` (rowid), so it's pruned by the FK-less design of FTS5-external-content: the vec_search row remains as an orphan keyed on a now-deleted rowid, but vec_search doesn't reference back so this is benign (the vec row is unreferenced and can be pruned by a periodic GC or left alone — embeddings without a search_content row are never returned by `hybrid_search` because the join filters them).
+It deletes from three tables atomically: `search_content` row, corresponding `fts_search` entry, and the `vec_search` row (by rowid matching `search_content.id`). The vec0 virtual table supports DELETE by rowid — `DELETE FROM vec_search WHERE rowid = ?`. All three deletes run in the same transaction as the `kg_chunks` DELETE.
+
+Without explicit vec_search cleanup, orphan vec rows accumulate indefinitely on every re-ingestion. Over months of operation, `vec_search` would grow unboundedly relative to `search_content` — each orphan costing memory for vec0's index structure. Synchronous cleanup in `unindex_content` avoids the need for a periodic GC mechanism.
 
 Both `index_content()` and `unindex_content()` must run within the same transaction as the `kg_chunks` INSERT/DELETE for atomicity.
 
@@ -213,7 +215,7 @@ Hard ordering between #687 and #689 isn't required by FK (per D5 there's no dire
 
 - Exact scan-path list (today: `docs/solutions/**/*.md`; may extend to `docs/adr/` / `docs/architecture/` in a later ticket if usage shows value).
 - Whether `search_content.source_id` can hold the kg_chunks INTEGER id directly without any adapter (should — both are INTEGER). Verify in Unit 2.
-- Compound doc detection: does `/ce:compound` always land files in `docs/solutions/`, or are there subdirectory conventions we should trigger on? Probably same tree; confirm during implementation.
+- Compound doc detection: `/ce:compound` lands files in `docs/solutions/` under category subdirectories (e.g., `docs/solutions/best-practices/`, `docs/solutions/database-issues/`). This is the same tree the startup scan covers (`docs/solutions/**/*.md`). The compound hook path and the scan path must be the same — if compound ever writes outside `docs/solutions/`, the startup fallback won't pick up the doc. Confirm at implementation time that no compound output lands elsewhere.
 
 ## Output Structure
 
@@ -286,15 +288,17 @@ docs/plans/
 
 **Approach:**
 - `pub fn unindex_content(&self, source_type: &str, source_id: i64) -> Result<()>` in `db.rs`:
-  - `DELETE FROM fts_search WHERE rowid = (SELECT id FROM search_content WHERE source_type = ? AND source_id = ?)` — FTS5 external-content model requires explicit delete.
+  - Capture `search_content.id` for the given `(source_type, source_id)`.
+  - `DELETE FROM vec_search WHERE rowid = ?` — vec0 supports DELETE by rowid; prevents orphan accumulation.
+  - `DELETE FROM fts_search WHERE rowid = ?` — FTS5 external-content model requires explicit delete.
   - `DELETE FROM search_content WHERE source_type = ? AND source_id = ?`.
-  - `vec_search` rows are orphaned by design (no FK to delete against) — leave them; `hybrid_search` joins through `search_content` so orphan vec rows never surface.
 - All statements in one transaction (caller's responsibility if they wrap multiple unindex calls; single-call use is atomic on its own).
 - `AsyncDatabase::unindex_content()` thin wrapper for the async callers.
 
 **Test scenarios:**
-- Happy path: index content, then unindex → subsequent `fts_search` MATCH returns zero rows; `search_content` row is gone.
+- Happy path: index content (with embedding), then unindex → `fts_search` MATCH returns zero rows; `search_content` row gone; `vec_search` row gone. All three tables cleaned.
 - Idempotency: unindex a non-existent (source_type, source_id) → no error, no-op.
+- Vec cleanup: index content, verify vec_search row exists, unindex, verify vec_search row is deleted (not orphaned).
 - Isolation: unindex source_type="kg_chunk", source_id=X → person/commitment/preference/event rows with the same numeric source_id are untouched.
 
 **Verification:** `cargo test -p mika-agent db::unindex_content` green.
@@ -340,6 +344,7 @@ docs/plans/
 - Deletion: run ingest, delete a doc file, re-run → doc's chunks pruned, stats report docs_pruned=1.
 - Transactional failure: inject DB error mid-ingestion → no partial state; all rollback.
 - Cross-agent isolation: ingest for agent A, then agent B, same docs → each agent has their own chunk rows, no cross-contamination.
+- Defensive hash mismatch: directly insert chunks for a doc with mismatched `source_doc_hash` values across rows (simulated corruption) → hash-check query returns multiple rows → triggers full delete+reinsert, all chunks end up with consistent hash.
 
 **Verification:** `cargo test -p mika-agent --test kg` suite green.
 
@@ -382,9 +387,10 @@ docs/plans/
 - Identify the call site in the `/ce:compound` skill handler or the post-write hook and wire up. (Location TBD during implementation — depends on where compound docs land and what mechanism exists for post-write hooks. If no hook mechanism exists, the compound handler explicitly calls into the ingestor after writing the file.)
 
 **Approach:**
-- Caller passes `(agent_id, absolute_path_of_compound_doc)`.
+- Caller passes `(agent_id, absolute_path_of_compound_doc, trace_id: Option<&str>)`.
+- When `trace_id` is `Some`, the ingestor stamps it on all `kg_chunks` rows — preserving the compound turn's trace_id for end-to-end observability (compound → ingestion → search hit). When `None` (startup scan path), the ingestor generates a fresh trace_id per scan invocation.
 - Ingestor does the same hash-check + ingest-if-changed logic as the bulk path.
-- Returns `Result<()>`. Caller logs on error but does not fail the compound operation itself.
+- Returns `Result<DocStats>` (consistent with `ingest_all`'s `Result<IngestStats>`). Caller can log stats or discard them. Returning `()` discards useful information.
 - Per D1, failure is fail-silently-with-warn-log — the authoring agent gets "your doc is saved; search will pick it up after next restart at latest."
 
 **Test scenarios:**
@@ -448,7 +454,7 @@ docs/plans/
 | Hash normalization misses an edge case (e.g., Unicode normalization forms NFC vs NFD) | Start with the documented 4-step normalization (BOM / line endings / trailing ws / trailing newline). If false-positive re-ingestions appear in logs (D3 observability), extend normalization as needed. NFC is a plausible later addition. |
 | Per-agent duplication at scale (100+ agents) becomes a real storage problem | Accept per D3, instrument per D3 (duration + chunk count logging), optimize later with real data. Not a #689 concern unless it's observed at implementation time. |
 | Compound hook races with other writers (two compounds in quick succession) | `kg_chunks` UNIQUE(agent_id, source_doc_path, seq_id) prevents dup-inserts. Two hooks for the same doc ingest serially via the AsyncDatabase write thread. |
-| Very large docs exceed single-transaction limits | SQLite supports multi-MB transactions trivially. A 10MB doc → ~5000 chunks × ~2000 bytes ≈ 10MB write. Well within limits. If this ever becomes an issue, split ingestion into per-doc transactions. |
+| Very large docs exceed single-transaction limits | SQLite handles thousands of INSERTs per transaction trivially. A 10MB doc → ~5000 chunks → ~10000 statements (INSERT kg_chunks + index_content each). Well within SQLite's practical limits. If this ever becomes an issue, split ingestion into per-doc transactions. |
 | Docs tree has non-markdown files that happen to have `.md` extension but aren't conventional | Chunker handles any UTF-8 text; invalid UTF-8 files would fail the normalize step and log a warn. Non-fatal. |
 
 ## Documentation / Operational Notes
