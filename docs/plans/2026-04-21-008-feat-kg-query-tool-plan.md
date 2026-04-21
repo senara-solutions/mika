@@ -75,9 +75,11 @@ Resolved during planning. A single "semantic search → chunks → entities → 
 
 **Path B — Subject entity match:** Same match against `kg_subject_entities.name` for the querying agent. Captures entities that haven't resolved to domain yet, and discovered types (solution_path, failure_mode, pattern) that have no domain counterpart.
 
-**Path C — Semantic search via chunks:** `hybrid_search(query, source_type="kg_chunk")` → chunks → `kg_chunk_subjects` → subject entities → `kg_subject_resolutions` → domain entities. Captures cases where the entity name doesn't lexically match but the surrounding prose does.
+**Path C — Semantic search via chunks:** `hybrid_search(query, source_type="kg_chunk")` → chunks → `kg_chunk_subjects` → subject entities. For each subject entity, attempt resolution to domain via `kg_subject_resolutions`: if resolved, substitute the domain entity_id (layer=domain) before merge; if unresolved (discovered types), keep the subject entity_id (layer=subject). This prevents the merge step from producing duplicate conceptual entities when Path A finds a domain entity and Path C finds the same entity via its subject counterpart. Captures cases where the entity name doesn't lexically match but the surrounding prose does.
 
 **Path D — LLM query translation (deferred):** If paths A-C all fail to find a confident entry point, ask a resolution-tier LLM to map the query to domain entities from a candidate list. Deferred to future enhancement — MVP relies on A-C.
+
+**MVP limitation:** Queries whose wording doesn't match any entity name (paths A-B) and whose semantic content doesn't match any chunk (path C) will return `starting_entity_missing` even when relevant entities exist under different terminology. Example: "how do I debug token leaks?" when the KG has `problem_type:memory_leak` but no chunk containing "token leak." Path D addresses this; prioritize if the limitation surfaces as a real UX issue.
 
 Each path returns `(entity_id, layer: domain|subject, entry_confidence)` tuples. Merge, dedupe by entity_id, rank by entry_confidence, use top-K (default K=5) as traversal starting points.
 
@@ -85,7 +87,9 @@ Each path returns `(entity_id, layer: domain|subject, entry_confidence)` tuples.
 
 Resolved during planning.
 
-**Edge policy:** Default set of all relationship types in both domain and subject layers. Caller can restrict via `follow` parameter in `traversal` input. Traversal follows both `kg_relationships` (domain) and `kg_subject_relationships` (subject).
+**Edge policy:** Default set of commonly-useful relationship types: `["SOLVED_BY", "PROVIDES", "DEPENDS_ON", "USES", "CALLS"]`. This covers the primary query shapes (problem → solution → skill → tool) without noise from low-signal edge types (MENTIONS, PREVENTS). Caller can override via `follow` parameter to widen or narrow. Traversal follows both `kg_relationships` (domain) and `kg_subject_relationships` (subject).
+
+`query_knowledge_graph` searches only KG chunks, not Layer 2 memory. Queries about people, commitments, preferences, or events should use `search_memory` instead — the tools have distinct retrieval domains.
 
 **Max depth:** Default 2. Caller-overridable via `max_depth` parameter (cap at 4 to bound result size). Depth 2 covers the common query shape: problem → solution_path → skill/tool.
 
@@ -102,6 +106,8 @@ Resolved during planning.
 1. **Traversal distance:** 0-hop (starting entity) > 1-hop > 2-hop. Entities closer to entry point rank higher.
 2. **Cumulative edge confidence:** Product of confidence scores along the traversal path. A 2-hop path through two 0.9-confidence edges scores 0.81.
 3. **Provenance density:** Count of `kg_chunk_subjects`/`kg_chunk_subject_relationships` rows supporting each entity/edge. More provenance = stronger signal.
+
+Ranking uses **lexicographic sort** on `(hop ASC, -cumulative_confidence DESC, -provenance_count DESC)`. This guarantees D3's stated priority — distance always dominates over confidence, which always dominates over provenance, regardless of raw values. An additive weighted score would break ordering under realistic data (a 2-hop entity with 150 provenance entries would outrank a 1-hop entity with 20).
 
 Results are returned as a ranked list within each traversal level. Default top-K per level: 5 entities at hop 1, 3 per parent entity at hop 2. Caller can adjust via `result_limit`.
 
@@ -126,7 +132,7 @@ Resolved during planning.
 }
 ```
 
-`question` and `traversal.start` are either/or — `question` triggers entry-path resolution (D1), `traversal.start` bypasses it with a known entity_key. `agent_id` makes the query agent-scoped (D5). `include_context` enables chunk prose in results.
+**Exactly one of `question` or `traversal.start` must be provided.** Providing both is a validation error. `question` triggers entry-path resolution (D1); `traversal.start` bypasses it with a known entity_key. `agent_id` makes the query agent-scoped (D5). `include_context` enables chunk prose in results.
 
 **Return shape:**
 
@@ -178,7 +184,7 @@ LEFT JOIN skill_overrides so
 WHERE e.type = 'skill'
 ```
 
-`agent_context.enabled` is a boolean derived from the tri-state `skill_overrides.enabled` (NULL → true, 0 → false, 1 → true).
+`agent_context.enabled` is a boolean derived from the tri-state `skill_overrides.enabled` (NULL → true, 0 → false, 1 → true). The tri-state collapses to boolean via `COALESCE(so.enabled, 1)`: both "no override row" (LEFT JOIN produces NULL) and "row with NULL enabled" (explicit not-overridden state) default to enabled=1.
 
 **Rationale:** Filtering is a question about intent, not data. "What skills do I have?" wants enabled only. "What skills could I enable?" wants disabled. "What skills solved fabrication?" is intent-independent. The tool can't guess intent; the LLM can. Annotate, let the LLM decide.
 
@@ -250,14 +256,15 @@ docs/plans/
 **Approach:**
 - Path A: `SELECT id, entity_key FROM kg_entities WHERE LOWER(name) LIKE LOWER(?) OR LOWER(entity_key) = LOWER(?)`.
 - Path B: `SELECT id, entity_key FROM kg_subject_entities WHERE agent_id = ? AND (LOWER(name) LIKE LOWER(?) OR LOWER(entity_key) = LOWER(?))`.
-- Path C: `hybrid_search(query, source_type="kg_chunk")` → `kg_chunk_subjects` → entity_ids.
-- Merge, dedupe, assign entry_confidence (A: 1.0 for exact, 0.8 for LIKE; B: 0.9 for exact; C: search score).
+- Path C: `hybrid_search(query, source_type="kg_chunk")` → `kg_chunk_subjects` → subject entity_ids → resolve each via `kg_subject_resolutions` (substitute domain entity_id if resolved, keep subject entity_id if unresolved).
+- Merge all paths, dedupe on `(layer, entity_id)`. When Path A and Path C both find the same domain entity, keep highest confidence. Assign entry_confidence (A: 1.0 for exact, 0.8 for LIKE; B: 0.9 for exact; C: search score × resolution confidence).
 
 **Test scenarios:**
 - Exact domain match → Path A, confidence 1.0.
 - No domain match, subject match → Path B.
-- No name match, chunk matches → Path C.
+- No name match, chunk matches → Path C, subject entity resolved to domain before merge.
 - All paths return same entity → deduped, highest confidence wins.
+- Path C finds subject entity with no domain resolution → stays in subject layer, merged as `(subject, entity_id)`.
 
 ---
 
@@ -288,7 +295,7 @@ docs/plans/
 
 **Files:** `crates/mika-agent/src/kg/query.rs`.
 
-**Approach:** Score = `(max_depth - hop) * 100 + cumulative_confidence * 50 + provenance_count`. Top-K per hop level. Truncate to budget caps.
+**Approach:** Lexicographic sort on `(hop ASC, cumulative_confidence DESC, provenance_count DESC)`. This guarantees D3's priority order — distance always dominates, confidence breaks ties within a hop, provenance breaks confidence ties. Top-K per hop level. Truncate to budget caps.
 
 ---
 
