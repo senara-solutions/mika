@@ -343,6 +343,7 @@ CREATE TABLE kg_subject_entities (
     entity_key TEXT NOT NULL,
     type TEXT NOT NULL,
     name TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),  -- D15
     properties_json TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     trace_id TEXT,
@@ -424,7 +425,7 @@ CREATE TABLE kg_extractions (
 CREATE INDEX idx_kg_extractions_agent ON kg_extractions(agent_id);
 ```
 
-Note: `kg_subject_entities` also gains `confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0)` per D15.
+Note: `kg_subject_entities.confidence` (D15) is inlined in the CREATE TABLE above.
 
 ### Chunk write pipeline
 
