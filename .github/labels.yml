@@ -81,3 +81,12 @@
 - name: dashboard
   color: "7057ff"
   description: Observability dashboard (React SPA)
+
+# ── Sprint Hooks ───────────────────────────────────────��─────────────────────
+- name: needs-build
+  color: "d97706"
+  description: "Run build + test after merge, before next ticket in milestone/sprint"
+
+- name: needs-deploy
+  color: "d97706"
+  description: "Run make deploy after merge, before next ticket in milestone/sprint"

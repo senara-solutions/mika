@@ -31,6 +31,7 @@ pub(crate) mod pr_merge_with_gate;
 mod query_timeline;
 mod read_agent_file;
 mod read_workspace;
+mod resolve_issue_order;
 mod run_team;
 mod search_memory;
 mod search_tool_history;
@@ -660,6 +661,7 @@ pub fn default_tools() -> ToolRegistry {
     // spawned via claude-pilot are also gated. The tool itself never merges with failing
     // required checks regardless of caller. See #490.
     registry.register(Box::new(pr_merge_with_gate::PrMergeWithGateTool));
+    registry.register(Box::new(resolve_issue_order::ResolveIssueOrderTool));
     registry.register(Box::new(query_timeline::QueryTimelineTool));
     registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
     registry.register(Box::new(list_audit_events::ListAuditEventsTool));

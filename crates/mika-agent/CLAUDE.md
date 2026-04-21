@@ -75,6 +75,12 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 `pr_merge_with_gate` builtin tool — structural backstop against merging PRs with failing required CI checks. Registered in `default_tools()` (all agents, including delegates). Decision matrix: fail/cancel -> blocked; pending -> auto-merge; all pass -> immediate merge; already merged -> no-op. 60s timeout. Requires `ctx.github_token`. See #490.
 
+### Issue Dependency Resolution
+
+`resolve_issue_order` builtin tool — resolves dependency-aware execution order for a set of GitHub issues using `blockedByIssues` GraphQL edges. Input: `{ repo: "owner/repo", issues: [1, 2, 3] }`. For each issue, queries GitHub GraphQL API (via shared `github_graphql` module) for blocked-by relationships, builds a DAG, runs Kahn's algorithm with issue-number-ascending tiebreaker, and returns `{ sorted, edges, external_blockers, cycle }`. Cycle detection: if the DAG has a cycle, `sorted` is cleared and `cycle` lists the cycle members. External blockers (issues outside the input list) are tracked separately and do not affect the sort order. Fail-open: returns input order with a warning when no GitHub token is configured. 60s timeout. Used by the self-dev milestone workflow (M2b step) to order issues before dispatch. See #714.
+
+**Shared `github_graphql` module:** `fetch_open_blockers()` and `extract_open_blocker_numbers()` extracted from `skills/executor.rs` into `crate::github_graphql` for reuse by both the blocked-by dispatch guard (#713) and `resolve_issue_order`.
+
 ### Structural Verdict Handler
 
 `server::verdict_handler` — intercepts `pull_request_review.submitted` webhook events **before** the LLM turn in `handle_message`. Parses `VERDICT:` line from the review body. For `pass` verdicts with matching `in_progress` tasks: initiates merge via `run_gh_checks` + `run_gh_merge` (reused from `pr_merge_with_gate`), updates task metadata, logs `verdict_handled` audit event, sends notification. For `block[*]`/`hold[*]` verdicts: passes through to LLM. For missing `VERDICT:` line: passes through with `verdict_missing=true` enrichment. Parser in `server::verdict` depends on gateway's `format_event_text()` output format. 60s timeout on subprocess calls. See #524.

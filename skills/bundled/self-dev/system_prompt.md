@@ -92,9 +92,15 @@ After extracting, **persist immediately:** call `update_task_status` with the cu
 
 > **SCOPE RULE: This turn handles ONLY the task that triggered the callback.** Do NOT check sprint progress or pick up unrelated work. Heartbeat owns that responsibility.
 
-### Callback Entry Point (post-claude-pilot)
+### Callback Entry Point (post background task)
 
-When you receive a callback result from a completed `run_claude_pilot` background task:
+When you receive a callback result from a completed background task (`run_claude_pilot` or `deploy_mika`):
+
+> **CALLBACK TYPE DETECTION (MANDATORY — before any other processing):**
+> Call `check_task(task_id)` on the callback's task. Read the `label` field to determine the callback type:
+> - Label starts with `long_running:run_claude_pilot` → **claude-pilot callback**. Process using the claude-pilot handling below.
+> - Label starts with `long_running:deploy_mika` → **deploy hook callback**. Skip metadata extraction (no session/cost/turns data). Check milestone context via `parent_task_id` as normal. On success, advance to the next child in M4 (step 4). On failure, pause milestone per step 3b.5.
+> - Other labels → treat as claude-pilot callback (fallback).
 
 > **CRITICAL: DO NOT end your turn after receiving a callback.** You MUST make at least one tool call before your turn ends. Generating a text summary without tool calls is a workflow failure. This rule is structurally enforced by the engine — webhook turns (`[GitHub]` messages) with zero successful tool calls will be rejected and you will be re-prompted (#696).
 
@@ -357,7 +363,7 @@ When the user says "implement <repo> milestone#<n>":
 
 This workflow orchestrates a GitHub milestone as a parent task with child issue tasks.
 
-**CRITICAL: Steps M1 → M2 → M3 are setup. ALL THREE must complete before ANY dispatch.** Do NOT call `run_claude_pilot` until every child task exists. Do NOT skip M2. Do NOT create only one child. The milestone is a batch — create ALL children first, execute them later.
+**CRITICAL: Steps M1 → M2 → M2b → M3 are setup. ALL FOUR must complete before ANY dispatch.** Do NOT call `run_claude_pilot` until every child task exists. Do NOT skip M2 or M2b. Do NOT create only one child. The milestone is a batch — create ALL children first, resolve dependency order, then execute them later.
 
 **Incident (mika milestone#7, 2026-04-18):** Agent skipped M2, created only one child for #617, and immediately dispatched claude-pilot. The other 4 issues were never tracked. The milestone was stuck at pending with zero active children. Root cause: agent pattern-matched into single-issue dispatch mode instead of following the milestone batch workflow.
 
@@ -371,26 +377,61 @@ Call `create_task` with:
 
 Remember the returned `task_id` as `milestone_wi`.
 
-### Step M2 — Fetch milestone issues (MANDATORY — do NOT skip)
+### Step M2 — Fetch milestone issues and labels (MANDATORY — do NOT skip)
 
+Fetch milestone title (for grouping metadata):
 ```json
 run_gh({
-  "command": ["issue", "list", "--milestone", "<n>", "--state", "open", "--json", "number,title", "--jq", "sort_by(.number) | .[].number"],
+  "command": ["milestone", "list", "--json", "number,title", "--jq", ".[] | select(.number==<n>) | .title"],
+  "repo": "senara-solutions/<repo>"
+})
+```
+
+Store as `milestone_title`.
+
+Fetch open issues with labels:
+```json
+run_gh({
+  "command": ["issue", "list", "--milestone", "<n>", "--state", "open", "--json", "number,title,labels", "--jq", "."],
   "repo": "senara-solutions/<repo>"
 })
 ```
 
 Note: `repo` is a sibling parameter to `command`, never a flag inside the array.
 
-Store the ordered list of issue numbers as `milestone_issues`. This list drives M3 — without it you will create incomplete children.
+Parse the response and store:
+- `milestone_issues`: list of issue numbers
+- `issue_labels`: map of issue number → list of label names (e.g., `{715: ["needs-deploy", "enhancement"], 716: []}`)
 
-**GATE:** If `milestone_issues` is empty, notify Vincent and stop. If you did not run this command, you MUST run it now before proceeding to M3.
+This list drives M2b and M3 — without it you will create incomplete children.
+
+**GATE:** If `milestone_issues` is empty, notify Vincent and stop. If you did not run this command, you MUST run it now before proceeding to M2b.
+
+### Step M2b — Resolve dependency order (MANDATORY — do NOT skip)
+
+Call `resolve_issue_order` to get dependency-aware execution order:
+
+```json
+resolve_issue_order({
+  "repo": "senara-solutions/<repo>",
+  "issues": [<issue_numbers from M2>]
+})
+```
+
+Process the response:
+- If `cycle` is non-null: **STOP.** Notify Vincent: "Milestone <repo> milestone#<n> has a dependency cycle involving issues: #X, #Y. Cannot determine execution order. Please resolve the cycle on GitHub and retry." Pause milestone: `update_task_status(task_id=<milestone_wi>, status="blocked", note="Dependency cycle detected")`. Do NOT proceed.
+- If `external_blockers` is non-empty: Log warning — `store_fact(category="event", description="Milestone <repo> milestone#<n>: issues with external blockers: #X (blocked by #999), #Y (blocked by #888). These will be placed at the end of the execution order. Engine guard #713 will verify at dispatch time.")`. Notify Vincent with the warning.
+- Replace `milestone_issues` with the `sorted` array from the response. This is the **final execution order** — dependency-safe, with ties broken by issue number ascending.
+
+**GATE:** If you did not call `resolve_issue_order`, you MUST call it now before proceeding to M3. If `resolve_issue_order` fails (API error, timeout), fall back to issue-number-ascending order from M2 and log a warning. Do NOT skip M3.
+
+**Incident (mika#714):** Without dependency-aware ordering, the engine-level blocked-by guard (#713) catches violations at dispatch time, stalling the milestone and requiring manual intervention. M2b prevents this by ordering issues correctly upfront.
 
 ### Step M3 — Create ALL child tasks (MANDATORY — every issue, not just one)
 
 **PRE-FLIGHT CHECK (mandatory before every `create_task` call):** Call `list_tasks` filtered by matching `reference_url` to the GitHub issue URL (`https://github.com/senara-solutions/<repo>/issues/<issue_number>`). If a task already exists for that issue, reuse its `task_id` — do NOT create a duplicate. Append the existing `task_id` to `child_wis` and move to the next issue.
 
-For **each** issue number in `milestone_issues` (ALL of them, not just the first):
+For **each** issue number in `milestone_issues` (ALL of them, in the topo-sorted order from M2b, not just the first):
 1. **Call `create_task` with EXACTLY these 5 fields** — copy the JSON block as-is, substituting the angle-bracket placeholders:
    ```json
    {
@@ -402,13 +443,30 @@ For **each** issue number in `milestone_issues` (ALL of them, not just the first
    }
    ```
    ⚠️ **ALL 5 FIELDS ARE REQUIRED.** Omitting `parent_task_id` ORPHANS the child from the milestone tree — callback routing to Step M4 will fail and the milestone loop breaks. Omitting `reference_url` disables the pre-flight check on the next run, causing duplicates. Do not truncate the JSON to `{"label": "...", "type": "issue"}` — that form is INCOMPLETE.
-2. Store returned `task_id` in ordered list `child_wis`
+2. **Immediately persist grouping metadata** on the newly created child task:
+   ```json
+   update_task_status({
+     "task_id": "<child_task_id>",
+     "status": "pending",
+     "metadata": {
+       "grouping": {
+         "kind": "milestone",
+         "repo": "senara-solutions/<repo>",
+         "number": <n>,
+         "title": "<milestone_title from M2>"
+       },
+       "labels": ["<label1>", "<label2>"]
+     }
+   })
+   ```
+   Use the `issue_labels` map from M2 to populate the `labels` array for each issue. If the issue has no labels, use an empty array `[]`.
+3. Store returned `task_id` in ordered list `child_wis`
 
 **GATE:** Verify `len(child_wis) == len(milestone_issues)`. If not equal, you missed issues — go back and create the missing children. Do NOT proceed to M4 until every issue has a child task.
 
-**Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> initialized with {N} child issues: #X, #Y, #Z. Parent task: <milestone_wi>.")`
+**Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> initialized with {N} child issues: #X, #Y, #Z (topo-sorted). Parent task: <milestone_wi>.")`
 
-Notify Vincent: "Milestone <repo> milestone#<n> initialized with {N} issues. Starting sequential execution."
+Notify Vincent: "Milestone <repo> milestone#<n> initialized with {N} issues (dependency-sorted). Starting sequential execution."
 
 ### Step M4 — Serial execution loop
 
@@ -429,17 +487,43 @@ For each `child_task_id` in `child_wis` (in order):
 3. **Check child outcome:**
    | Child outcome | Milestone action |
    |---------------|------------------|
-   | `completed` (PR merged) | `store_fact(category="event", description="Milestone <repo> milestone#<n> child <repo> issue#<issue> completed. PR merged.")`. Continue to next child |
+   | `completed` (PR merged) | `store_fact(category="event", description="Milestone <repo> milestone#<n> child <repo> issue#<issue> completed. PR merged.")`. **Check deploy hook** (step 3b below), then continue to next child |
    | `blocked` | `store_fact(category="event", description="Milestone <repo> milestone#<n> child <repo> issue#<issue> blocked. Reason: <reason>.")`. **PAUSE milestone:** `update_task_status(task_id=<milestone_wi>, status="blocked", note="Child <repo> issue#<issue> blocked")`. Notify Vincent: "Milestone <repo> milestone#<n> paused — child <repo> issue#<issue> blocked. Reply 'continue' or 'skip <repo> issue#<issue>' to proceed." Stop execution. |
    | `failed` (exhausted retries) | `store_fact(category="event", description="Milestone <repo> milestone#<n> child <repo> issue#<issue> failed after retries.")`. Continue to next child (record failure in milestone metadata) |
+
+3b. **Deploy hook check (after child `completed`):**
+
+   Call `check_task(task_id=<child_task_id>)` on the completed child issue task (NOT the callback task) to retrieve its metadata. Read the `labels` field from the metadata (persisted in M3).
+
+   If `labels` includes `needs-build` OR `needs-deploy`:
+
+   1. Notify Vincent: "Deploy hook triggered for <repo> issue#<issue> (label: <label>). Running build+deploy before next ticket."
+   2. Call `deploy_mika` with the **milestone parent** task_id:
+      ```json
+      deploy_mika({
+        "task_id": "<milestone_wi>"
+      })
+      ```
+      The milestone parent is `in_progress`, which satisfies the dispatch-readiness guard. The deploy callback task becomes a child of the milestone parent.
+   3. **Wait for deploy callback.** The deploy result arrives as a new callback turn. Do NOT proceed to the next child until the deploy callback is received and processed.
+   4. On deploy callback success: `store_fact(category="event", description="Deploy hook completed for <repo> issue#<issue>.")`. Continue to next child.
+   5. On deploy callback failure: **PAUSE milestone:** `update_task_status(task_id=<milestone_wi>, status="blocked", note="Deploy hook failed after <repo> issue#<issue>")`. Notify Vincent: "Milestone <repo> milestone#<n> paused — deploy hook failed after <repo> issue#<issue>. Reply 'continue' to retry or 'skip' to proceed without deploy." Stop execution.
+
+   If `labels` does NOT include `needs-build` or `needs-deploy`, or if `labels` is empty/missing: skip deploy hook, continue directly to next child.
+
+   If both `needs-build` and `needs-deploy` are present: trigger a **single** deploy hook (deploy_mika includes the build step).
+
+   **GATE:** If the child's labels required a deploy hook and you did not call `deploy_mika`, STOP and call it now before proceeding to the next child.
+
+   > **Note:** Labels are fetched once at M2 time. If a label is added to an issue mid-milestone, the deploy hook will not trigger for that issue. This is a known limitation.
 
 4. **Loop** to next child
 
 ### Step M5 — Milestone completion
 
 When all children processed:
-1. Gather stats from child tasks via `list_tasks` filtered by `parent_task_id=<milestone_wi>`
-2. **Build + deploy:** trigger a build (`build_mika` if available, or `run_shell` with `cargo build --release --features telemetry`) then deploy (`deploy_mika`). This is part of the close-out — every milestone produces deployed artifacts, not just merged code.
+1. Gather stats from child tasks via `list_tasks` filtered by `parent_task_id=<milestone_wi>`. Count how many children reached `completed` status.
+2. **Build + deploy (gated on >=1 completed child):** If at least one child completed successfully, trigger a build (`build_mika` if available, or `run_shell` with `cargo build --release --features telemetry`) then deploy (`deploy_mika` with `task_id=<milestone_wi>`). This is part of the close-out — every milestone with successful work produces deployed artifacts, not just merged code. If zero children completed (all failed/blocked/cancelled), **skip build+deploy** and note in the summary: "No deploy — no children completed successfully."
 3. Transition parent: `update_task_status(task_id=<milestone_wi>, status="completed")`
 4. **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> completed. Completed: {N}, Failed: {N}, Blocked: {N}. Total cost: ${total_cost}.")`
 5. Notify Vincent with summary:
@@ -533,7 +617,17 @@ Same as Milestone Step M5.
 
 ### Milestone/Project Resume
 
-When resuming, call `list_tasks` or `check_task` to find the parent (match by `reference_url` containing "milestone" or "projects/<n>"), locate the next child by `parent_task_id` (priority: `in_progress` > `blocked` > `pending`), and resume from the appropriate step (M4/P4 for pending, PR check for in-progress/blocked, close parent if no children remain).
+When resuming, call `list_tasks` or `check_task` to find the parent (match by `reference_url` containing "milestone" or "projects/<n>"), then locate children via `list_tasks` filtered by `parent_task_id=<parent_wi>`.
+
+**Grouping metadata:** Each child's `metadata.grouping` contains the milestone context (`kind`, `repo`, `number`, `title`) and `metadata.labels` contains the issue's labels (for deploy hook detection). The children were created in topo-sorted order at M3 time — this ordering is the canonical execution sequence. Do not re-sort on resume.
+
+**Find next child** by priority: `in_progress` > `blocked` > `pending`. Filter out `deploy_mika` callback tasks (label starts with `long_running:`) — only consider issue-type children.
+
+Resume from the appropriate step:
+- `pending` child → resume from M4 (dispatch this child next)
+- `in_progress` child → check if a PR exists, handle per existing callback/close-out logic
+- `blocked` child → notify Vincent, wait for instruction
+- No children remaining (all completed/failed/cancelled) → proceed to M5
 
 ### Manual Commands
 
