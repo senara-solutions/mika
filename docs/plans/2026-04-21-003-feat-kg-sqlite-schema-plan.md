@@ -254,7 +254,7 @@ CREATE TABLE kg_resolutions_log (
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
     outcome TEXT NOT NULL CHECK (outcome IN (
-        'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'error'
+        'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
     )),
     resolution_trace_id TEXT NOT NULL,
     source_extraction_trace_id TEXT,
@@ -460,7 +460,7 @@ CREATE TABLE kg_resolutions_log (
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
     outcome TEXT NOT NULL CHECK (outcome IN (
-        'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'error'
+        'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
     )),
     resolution_trace_id TEXT NOT NULL,
     source_extraction_trace_id TEXT,
