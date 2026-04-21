@@ -158,6 +158,15 @@ impl McpManager {
         !self.connections.is_empty()
     }
 
+    /// Get the server name for a namespaced MCP tool name.
+    ///
+    /// Returns `Some("server_name")` if the tool exists, `None` otherwise.
+    pub fn tool_server_name(&self, namespaced_name: &str) -> Option<&str> {
+        self.tool_routing
+            .get(namespaced_name)
+            .map(|(server, _)| server.as_str())
+    }
+
     /// Execute an MCP tool call by namespaced name.
     ///
     /// Routes to the correct MCP server, strips the namespace prefix,

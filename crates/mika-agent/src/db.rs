@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 25;
+pub const CURRENT_SCHEMA_VERSION: i64 = 26;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -781,6 +781,10 @@ impl Database {
             self.migrate_v24_to_v25()?;
             info!(version = 25, "database migrated to v25");
         }
+        if (3..=25).contains(&version) {
+            self.migrate_v25_to_v26()?;
+            info!(version = 26, "database migrated to v26");
+        }
         Ok(())
     }
 
@@ -848,7 +852,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (25);
+            INSERT INTO schema_version (version) VALUES (26);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1231,9 +1235,10 @@ impl Database {
             CREATE TABLE kg_entities (
                 id INTEGER PRIMARY KEY,
                 entity_key TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'org', 'project', 'place', 'concept', 'event')),
+                entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'org', 'project', 'place', 'concept', 'event', 'skill', 'tool', 'agent', 'problem_type')),
                 name TEXT NOT NULL,
                 description TEXT,
+                properties_json TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 CHECK (entity_key = entity_type || ':' || name)
@@ -2735,9 +2740,10 @@ impl Database {
             CREATE TABLE IF NOT EXISTS kg_entities (
                 id INTEGER PRIMARY KEY,
                 entity_key TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'org', 'project', 'place', 'concept', 'event')),
+                entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'org', 'project', 'place', 'concept', 'event', 'skill', 'tool', 'agent', 'problem_type')),
                 name TEXT NOT NULL,
                 description TEXT,
+                properties_json TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 CHECK (entity_key = entity_type || ':' || name)
@@ -2852,6 +2858,46 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_kg_res_log_subject ON kg_resolutions_log(subject_entity_id);
 
             INSERT INTO schema_version (version) VALUES (25);
+            COMMIT;"
+        )?;
+        Ok(())
+    }
+
+    fn migrate_v25_to_v26(&self) -> Result<()> {
+        info!("migrating database schema v25 → v26 (domain graph entity types + properties_json)");
+
+        // SQLite cannot ALTER CHECK constraints, so we rebuild kg_entities with the
+        // widened entity_type CHECK and the new properties_json column. Since kg_entities
+        // just landed in v25, existing data is likely empty or near-empty.
+        //
+        // Rebuild strategy: rename → create new → copy → drop old → recreate indexes.
+        // Relationships and other FK references survive because rowids are preserved.
+        self.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+
+            ALTER TABLE kg_entities RENAME TO kg_entities_old;
+
+            CREATE TABLE kg_entities (
+                id INTEGER PRIMARY KEY,
+                entity_key TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'org', 'project', 'place', 'concept', 'event', 'skill', 'tool', 'agent', 'problem_type')),
+                name TEXT NOT NULL,
+                description TEXT,
+                properties_json TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                CHECK (entity_key = entity_type || ':' || name)
+            );
+
+            INSERT INTO kg_entities (id, entity_key, entity_type, name, description, created_at, updated_at)
+            SELECT id, entity_key, entity_type, name, description, created_at, updated_at
+            FROM kg_entities_old;
+
+            DROP TABLE kg_entities_old;
+
+            CREATE INDEX IF NOT EXISTS idx_kg_entities_type ON kg_entities(entity_type);
+
+            INSERT INTO schema_version (version) VALUES (26);
             COMMIT;"
         )?;
         Ok(())

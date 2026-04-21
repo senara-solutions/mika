@@ -711,6 +711,60 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         .db
         .clone();
 
+    // Domain graph rebuild — populate KG entities and relationships from
+    // skill manifests, tool registry, MCP connections, and agent configs.
+    // Runs once at startup after all agents are initialized. Failures are
+    // logged, not panicked — KG queries return stale/empty results until
+    // the next successful rebuild.
+    {
+        let default_state = agents
+            .get(&default_agent)
+            .expect("default agent must exist");
+
+        // Collect all data needed for the domain graph builder while holding locks,
+        // then release before the async rebuild to avoid holding std::sync::Mutex
+        // across await points.
+        let agent_rows = match dashboard_db.list_agents_db().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "failed to list agents for domain graph, using empty list");
+                Vec::new()
+            }
+        };
+
+        // Two-phase rebuild: enumerate (sync, holding the SkillRegistry lock)
+        // then write (async, lock released).
+        let pending = {
+            let skill_reg = default_state.skills.lock().expect("skills lock poisoned");
+            let mcp_ref = default_state.mcp_manager.as_ref();
+            let builder = crate::kg::DomainGraphBuilder::new(
+                &dashboard_db,
+                &skill_reg,
+                tool_registry.definitions(),
+                mcp_ref,
+                &agent_rows,
+            );
+            builder.enumerate_to_pending()
+        }; // lock released here
+
+        match pending.write(&dashboard_db).await {
+            Ok(stats) => {
+                info!(
+                    event = "domain_rebuild_complete",
+                    duration_ms = stats.duration_ms,
+                    total_removed = stats.total_removed,
+                    "domain graph ready"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "domain graph rebuild failed; KG queries may return stale results until next restart"
+                );
+            }
+        }
+    }
+
     let state = AppState {
         agents: Arc::new(agents),
         default_agent,

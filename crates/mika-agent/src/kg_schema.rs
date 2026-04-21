@@ -41,6 +41,18 @@ pub const ENTITY_TYPE_CONCEPT: &str = "concept";
 /// Entity type: an event (meeting, conference, milestone).
 pub const ENTITY_TYPE_EVENT: &str = "event";
 
+/// Entity type: a skill (from skill.toml manifests).
+pub const ENTITY_TYPE_SKILL: &str = "skill";
+
+/// Entity type: a tool (builtin, skill-provided, or MCP).
+pub const ENTITY_TYPE_TOOL: &str = "tool";
+
+/// Entity type: an agent (from agent configs).
+pub const ENTITY_TYPE_AGENT: &str = "agent";
+
+/// Entity type: a known problem category (seeded).
+pub const ENTITY_TYPE_PROBLEM_TYPE: &str = "problem_type";
+
 /// All valid entity types. The DB CHECK constraint enforces the same set.
 pub const VALID_ENTITY_TYPES: &[&str] = &[
     ENTITY_TYPE_PERSON,
@@ -49,6 +61,19 @@ pub const VALID_ENTITY_TYPES: &[&str] = &[
     ENTITY_TYPE_PLACE,
     ENTITY_TYPE_CONCEPT,
     ENTITY_TYPE_EVENT,
+    ENTITY_TYPE_SKILL,
+    ENTITY_TYPE_TOOL,
+    ENTITY_TYPE_AGENT,
+    ENTITY_TYPE_PROBLEM_TYPE,
+];
+
+/// Domain-layer entity types managed by the DomainGraphBuilder.
+/// Used to scope pruning queries so the builder only deletes entities it owns.
+pub const KG_DOMAIN_ENTITY_TYPES: &[&str] = &[
+    ENTITY_TYPE_SKILL,
+    ENTITY_TYPE_TOOL,
+    ENTITY_TYPE_AGENT,
+    ENTITY_TYPE_PROBLEM_TYPE,
 ];
 
 // --- Relationship types ---
@@ -68,6 +93,12 @@ pub const REL_RELATED_TO: &str = "related_to";
 /// Relationship: source is part of target.
 pub const REL_PART_OF: &str = "part_of";
 
+/// Relationship: skill depends on another skill.
+pub const REL_DEPENDS_ON: &str = "depends_on";
+
+/// Relationship: skill provides a tool.
+pub const REL_PROVIDES: &str = "provides";
+
 /// All valid relationship types.
 pub const VALID_RELATIONSHIP_TYPES: &[&str] = &[
     REL_WORKS_AT,
@@ -75,7 +106,13 @@ pub const VALID_RELATIONSHIP_TYPES: &[&str] = &[
     REL_LOCATED_IN,
     REL_RELATED_TO,
     REL_PART_OF,
+    REL_DEPENDS_ON,
+    REL_PROVIDES,
 ];
+
+/// Domain-layer relationship types managed by the DomainGraphBuilder.
+/// Used to scope relationship deletion during rebuild.
+pub const KG_DOMAIN_RELATIONSHIP_TYPES: &[&str] = &[REL_DEPENDS_ON, REL_PROVIDES];
 
 // --- Resolution types ---
 
@@ -203,6 +240,30 @@ mod tests {
         assert!(VALID_ENTITY_TYPES.contains(&ENTITY_TYPE_PLACE));
         assert!(VALID_ENTITY_TYPES.contains(&ENTITY_TYPE_CONCEPT));
         assert!(VALID_ENTITY_TYPES.contains(&ENTITY_TYPE_EVENT));
+        assert!(VALID_ENTITY_TYPES.contains(&ENTITY_TYPE_SKILL));
+        assert!(VALID_ENTITY_TYPES.contains(&ENTITY_TYPE_TOOL));
+        assert!(VALID_ENTITY_TYPES.contains(&ENTITY_TYPE_AGENT));
+        assert!(VALID_ENTITY_TYPES.contains(&ENTITY_TYPE_PROBLEM_TYPE));
+    }
+
+    #[test]
+    fn test_domain_entity_types_subset_of_valid() {
+        for t in KG_DOMAIN_ENTITY_TYPES {
+            assert!(
+                VALID_ENTITY_TYPES.contains(t),
+                "domain entity type '{t}' not in VALID_ENTITY_TYPES"
+            );
+        }
+    }
+
+    #[test]
+    fn test_domain_relationship_types_subset_of_valid() {
+        for t in KG_DOMAIN_RELATIONSHIP_TYPES {
+            assert!(
+                VALID_RELATIONSHIP_TYPES.contains(t),
+                "domain relationship type '{t}' not in VALID_RELATIONSHIP_TYPES"
+            );
+        }
     }
 
     #[test]
