@@ -125,6 +125,24 @@ Resolved during planning. The UNIQUE constraint is part of the v25 schema. Re-in
 
 Rationale: the uniqueness question is a schema concern, not an ingestor concern. Deferring it to #689 is a category error — if #689 decides "yes, upsert by `(agent_id, source_doc_path, seq_id)`" it costs a v25→v26 migration because v25 already shipped without the constraint. Adding it defensively now is cheap and matches the likely ingestor behavior. If #689 instead wants "each ingestion attempt creates a new row," the UNIQUE constraint forces an explicit `INSERT OR REPLACE` pattern at the ingestor — still workable. The cost of getting this wrong later (v26 migration + backfill) is much higher than the cost of adding the constraint now.
 
+### D9. kg_chunks has no direct entity_id column — linkage goes through subject→resolution
+
+Resolved during #689 planning (2026-04-21). Original v25 sketch included `kg_chunks.entity_id INTEGER REFERENCES kg_entities(id) ON DELETE SET NULL` as a direct chunk→domain linkage. **Removed.** #689's plan established that `entity_id` has no writer at any point in the pipeline — #689 doesn't infer domain entities from chunks (no inference at lexical layer), and #690/#691 link via the subject→resolution pipeline (per-agent subject entities, per-agent resolutions pointing at global domain entities). A column with no writer is dead weight that would silently be `NULL` forever.
+
+Rationale: the layers compose through the resolution pipeline, not through direct cross-layer columns. Chunks → subject entities → resolutions → domain entities is the canonical path. Any shortcut (a direct `kg_chunks.entity_id` column) would be a side-channel that drifts from the canonical path and produces inconsistent results (captures only one linkage per chunk when most chunks describe multiple domain entities).
+
+Queries like "chunks about skill X" use the multi-hop JOIN through `kg_subject_entities` + `kg_subject_resolutions`. See #689's plan for the canonical query shape. All joins are on indexed columns; at agent-scoped cardinality, SQLite handles multi-join queries efficiently.
+
+### D10. kg_chunks has a `source_doc_hash TEXT NOT NULL` column for idempotency
+
+Resolved during #689 planning (2026-04-21). The v25 schema adds `source_doc_hash TEXT NOT NULL` to `kg_chunks` to support content-change detection during ingestion.
+
+Hash is **required, not optional**. If nullable, there would be two code paths (hash present → compare; hash absent → re-ingest unconditionally) and the second path invites future "backward compat" silent fallbacks that defeat idempotency. NOT NULL forces the invariant: every chunk row has a source doc hash, period.
+
+Hash is SHA-256 of the source doc content **after normalization** (LF line endings, BOM stripped, per-line trailing whitespace stripped, single trailing newline enforced). This prevents false-positive re-ingestion from cross-platform line-ending differences, BOM insertions, or other cosmetic changes that don't reflect semantic content changes. The normalization rules are documented in #689's plan as the canonical hashing contract.
+
+This column lives in v25 directly (inlined before ship) rather than as a v25→v26 migration — cheaper to fold in now than to migrate later, and it's load-bearing for #689's idempotency contract.
+
 ### D8. Terminology: "KG layers" (not "memory layers") in docs
 
 Resolved during planning. The existing "three-layer memory model" (core memory / structured facts / hybrid search) in `CLAUDE.md` is Layer 1/2/3 of agent memory. The KG has its own "three layers" (domain / lexical / subject). These are different concerns. Docs and comments must qualify — e.g., `KG domain layer`, not `domain layer` alone; `memory Layer 3`, not `hybrid layer` alone. Plan docs, module rustdoc, and ID convention doc all use `KG <layer_name>` explicitly to avoid reader confusion.
@@ -139,6 +157,8 @@ Resolved during planning. The existing "three-layer memory model" (core memory /
 - Properties as JSON vs typed columns — JSON (see D5).
 - trace_id on per-agent mutation tables including kg_chunks (see D6).
 - kg_chunks UNIQUE constraint on `(agent_id, source_doc_path, seq_id)` (see D7).
+- kg_chunks has no direct entity_id column — linkage via subject→resolution (see D9, surfaced from #689 planning).
+- kg_chunks has `source_doc_hash TEXT NOT NULL` for idempotency (see D10, surfaced from #689 planning).
 - Terminology disambiguation — use `KG <layer>` explicitly (see D8).
 - kg_subject_entities uniqueness — `UNIQUE (agent_id, entity_key)` in schema sketch (per-agent uniqueness; see schema sketch in High-Level Technical Design).
 
@@ -203,15 +223,15 @@ CREATE INDEX idx_kg_rel_to ON kg_relationships(to_entity_id, type);
 CREATE TABLE kg_chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-    entity_id INTEGER REFERENCES kg_entities(id) ON DELETE SET NULL,
     seq_id INTEGER NOT NULL,
     source_doc_path TEXT NOT NULL,
+    source_doc_hash TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     trace_id TEXT,
     UNIQUE (agent_id, source_doc_path, seq_id)
     -- text + embedding live in search_content via source_type='kg_chunk', source_id=kg_chunks.id
+    -- chunk → domain entity linkage goes through kg_subject_entities → kg_subject_resolutions (see D9, D10)
 );
-CREATE INDEX idx_kg_chunks_agent_entity ON kg_chunks(agent_id, entity_id);
 CREATE INDEX idx_kg_chunks_agent_doc ON kg_chunks(agent_id, source_doc_path);
 
 -- Subject layer (per-agent)
