@@ -8,6 +8,7 @@ pub mod manifest;
 pub mod marketplace;
 pub mod matcher;
 pub mod review_filter;
+pub mod variants;
 
 use std::path::Path;
 
@@ -719,6 +720,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Default::default(),
                 context: std::collections::HashMap::new(),
+                variants: Default::default(),
             },
             dir: PathBuf::from(format!("/skills/{name}")),
             keywords_lower: vec![],

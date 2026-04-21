@@ -137,6 +137,7 @@ fn make_skill_with_required_tools(
                 required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
             },
             context: HashMap::new(),
+            variants: Default::default(),
         },
         dir: PathBuf::from(format!("/skills/{name}")),
         keywords_lower: keywords.iter().map(|s| s.to_lowercase()).collect(),

@@ -39,6 +39,11 @@ pub struct SkillManifest {
     /// in the system prompt. The engine pre-fetches the data before the LLM turn.
     #[serde(default)]
     pub context: std::collections::HashMap<String, ContextRequirement>,
+    /// Optional variant management configuration.
+    /// Declares which providers have variants, size limits, and required sections
+    /// for the validation gate. Backward-compatible — absent section defaults to empty.
+    #[serde(default)]
+    pub variants: VariantsConfig,
 }
 
 /// Per-skill LLM provider and model preferences.
@@ -192,6 +197,33 @@ pub struct ProviderSkillFields {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub max_prompt_size: Option<u64>,
+}
+
+/// Optional variant management configuration from `[variants]` in `skill.toml`.
+///
+/// Controls the validation gate and variant metadata. All fields are optional
+/// with backward-compatible defaults (existing skill.toml files parse without changes).
+///
+/// Example:
+/// ```toml
+/// [variants]
+/// required_sections = ["Tools", "Constraints"]
+/// max_prompt_size = 32768
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct VariantsConfig {
+    /// Providers that have (or are expected to have) variants for this skill.
+    /// Informational only — does not restrict variant creation.
+    #[serde(default)]
+    pub providers: Option<Vec<String>>,
+    /// Per-variant max prompt size override (bytes). If set, overrides
+    /// `skill.max_prompt_size` for the validation gate.
+    #[serde(default)]
+    pub max_prompt_size: Option<u64>,
+    /// Markdown section headings required in every variant prompt.
+    /// The validation gate checks that each heading appears as `# Heading` or `## Heading`.
+    #[serde(default)]
+    pub required_sections: Option<Vec<String>>,
 }
 
 /// A tool definition loaded from a skill's `tools.json`.
