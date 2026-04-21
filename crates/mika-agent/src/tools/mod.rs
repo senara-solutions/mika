@@ -2,6 +2,7 @@ mod a2a_call;
 mod cancel_reminder;
 mod cancel_task;
 mod check_task;
+pub(crate) use check_task::{GitHubRef, parse_github_ref};
 mod complete_task;
 mod create_agent;
 mod create_reminder;
