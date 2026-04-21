@@ -162,7 +162,7 @@ Resolved during planning. The extraction prompt produces a JSON object with thre
 **Key properties:**
 
 - `chunk_indices` on both entities and relationships. These map to the `[CHUNK N]` markers in the prompt and drive `kg_chunk_subjects` / `kg_chunk_subject_relationships` provenance rows.
-- `confidence` on both entities and relationships. Extraction-time confidence from the LLM. Stored on `kg_subject_entities.properties_json` (entities) and `kg_subject_relationships.confidence` (relationships). Downstream consumers (#688, #692) can filter by threshold.
+- `confidence` on both entities and relationships. Extraction-time confidence from the LLM. Stored as dedicated columns: `kg_subject_entities.confidence` (per D15) and `kg_subject_relationships.confidence`. Both have `CHECK (confidence >= 0.0 AND confidence <= 1.0)`. Downstream consumers (#688, #692) can filter by threshold via indexed column queries, not JSON extraction.
 - `type` + `name` on entities compose to `entity_key` via the `type || ':' || name` convention (per #686 D3).
 - Entity `description` is optional free text stored in `properties_json`.
 
@@ -227,33 +227,56 @@ Resolved during planning. `SubjectExtractor.extract_document(doc_path, agent_id,
 
 The extractor is invocation-context-agnostic — no assumptions about being on the main runtime, no coupling to server state. This keeps the migration path to a dedicated worker (Option 3 from planning) open if scale demands it.
 
-### D7. Pending-doc query drives extraction (idempotent)
+### D7. `kg_extractions` tracking table drives pending-doc query
 
-Resolved during planning. The extractor determines what needs extraction by querying data shape, not tracking explicit state:
+Resolved during planning, revised during review. The extractor tracks extraction state explicitly via a `kg_extractions` table — one row per (agent_id, source_doc_path) recording that extraction has completed.
 
 ```sql
--- Docs with chunks but no subject provenance
+CREATE TABLE kg_extractions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    source_doc_path TEXT NOT NULL,
+    extraction_model TEXT NOT NULL,
+    entities_extracted INTEGER NOT NULL DEFAULT 0,
+    relationships_extracted INTEGER NOT NULL DEFAULT 0,
+    extraction_trace_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, source_doc_path)
+);
+CREATE INDEX idx_kg_extractions_agent ON kg_extractions(agent_id);
+```
+
+**Pending-doc query:**
+
+```sql
 SELECT DISTINCT c.source_doc_path
 FROM kg_chunks c
 WHERE c.agent_id = ?
   AND NOT EXISTS (
-    SELECT 1 FROM kg_chunk_subjects cs
-    WHERE cs.chunk_id = c.id
+    SELECT 1 FROM kg_extractions e
+    WHERE e.agent_id = c.agent_id AND e.source_doc_path = c.source_doc_path
   )
 ```
 
-This query drives startup extraction and handles all failure modes:
-- Server crash mid-extraction: incomplete docs have chunks but no provenance → pending on next startup.
-- Provider down at startup: retries exhaust → docs remain pending → picked up on next startup.
-- New docs from compound hook: if hook extraction fails (C2.3 log-and-skip), doc stays pending → picked up at next startup.
+This query is authoritative regardless of how many entities a doc produces — zero-entity docs get a `kg_extractions` row with `entities_extracted = 0`, correctly marking them as "done." Without this table, zero-entity docs would re-extract on every startup (the provenance-absence query can't distinguish "not yet extracted" from "extracted, produced nothing").
 
-No explicit state enum, no `kg_extractions` tracking table. The data shape is the state. Matches C1.1's embedding backfill pattern (idempotent by `embedding_json IS NULL`).
+**Additional benefits:**
+- "Has this doc ever been extracted, when, with which model?" is a one-query answer.
+- Model-version invalidation: if extraction logic or model changes, `DELETE FROM kg_extractions WHERE extraction_model != ?` makes all docs pending for re-extraction under the new model.
+- Structured extraction observability that `audit_events` (log entries, not queryable state) can't provide.
 
-**Periodic retry (deferred):** A background task re-running the pending query every N hours would catch "provider was flaky at startup, recovered later." Deferred to implementation — build without it, add if "stale extraction due to startup-time provider failure" becomes an observed pattern.
+This is schema amendment D14 to #686, batched with D11-D13.
 
-### D8. Schema amendments to #686 — D11, D12, D13
+**Failure handling:**
+- Server crash mid-extraction: no `kg_extractions` row written → doc remains pending on next startup.
+- Provider down at startup: retries exhaust → doc stays pending → picked up on next startup.
+- Compound hook failure: doc stays pending → picked up at next startup.
 
-Surfaced during #690 planning. All three are new tables for subject-layer cross-table relationships. They follow the pattern identified across the milestone: *every first-class KG table has relationships to other first-class tables that need their own tables*.
+**Periodic retry (deferred):** A background task re-running the pending query every N hours would catch "provider was flaky at startup, recovered later." Deferred — build without it, add if observed.
+
+### D8. Schema amendments to #686 — D11, D12, D13, D14, D15
+
+Surfaced during #690 planning and review. D11-D13 are new tables for subject-layer cross-table relationships. D14 is the extraction tracking table. D15 is a column addition to `kg_subject_entities`. All follow the meta-principle: schema gaps surfaced by downstream tickets get folded into the pre-ship schema.
 
 **D11. `kg_subject_relationships`** — subject-to-subject edges (fact triples).
 
@@ -308,9 +331,30 @@ CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_
 CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
 ```
 
-These three tables complete the subject layer's provenance model. The convention to add to `kg-implementation-conventions.md`: "Every first-class KG table has relationships to other first-class tables; those relationships need their own tables with their own provenance." D11-D13 should be folded into #686's v25 schema if still pre-ship, or batched as v25→v26 if v25 has shipped.
+**D14. `kg_extractions`** — extraction tracking (per-agent, per-doc). See D7 for schema and rationale.
 
-### D9. Observability — per-doc audit_events + progress logging
+**D15. `confidence REAL NOT NULL` column on `kg_subject_entities`** — symmetric with `kg_subject_relationships.confidence`. Extraction-time confidence should be a queryable, constraint-checked column, not buried in `properties_json`. Downstream consumers (#688 query tool, #692 self-knowledge) will filter by confidence threshold — that needs an indexable column, not JSON extraction.
+
+```sql
+-- Amendment to kg_subject_entities (from #686 schema sketch):
+-- ADD: confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0)
+```
+
+These five amendments (D11-D15) complete the subject layer's schema. The convention to add to `kg-implementation-conventions.md`: "Every first-class KG table has relationships to other first-class tables; those relationships need their own tables with their own provenance." All five should be folded into #686's v25 schema if still pre-ship, or batched as a single v25→v26 migration if v25 has shipped.
+
+### D9. Orchestration ownership and provider scope
+
+Resolved during review.
+
+**Orchestration:** The ingestion orchestrator (a coordinator module, not #689's lexical ingestor directly) owns the re-extraction sequence. #689's role ends at chunk writes; #690's `extract_document` is called by the orchestrator with `previous_state` already captured. Neither #689 nor #690 has knowledge of the other's internals — the orchestrator calls `capture_previous_state → delete_old_chunks → write_new_chunks → extract_document(previous_state)`. This avoids tight coupling between #689 and #690 at the code level.
+
+**Provider scope:** One extraction `LlmProvider` instance per server, shared across all agents and all invocation contexts (startup background, compound hook, create_agent). Per-agent model overrides are not supported for extraction — that's the `skill_overrides` anti-pattern from C2.1. The "which model does extraction use?" question is answerable by reading one env var (`MIKA_KG_EXTRACTION_MODEL`), not N config files.
+
+### D10. Entity identity is the full entity_key — UPSERT does not merge across types
+
+Resolved during review. `entity_key = type || ':' || name` per the CHECK constraint. If the LLM extracts `problem_type:fabrication` in run 1 and hallucinates `failure_mode:fabrication` in run 2, these are **two different entities** with different entity_keys. UPSERT on `(agent_id, entity_key)` does not merge them — they coexist as independent subject entities. This is intentional: entity identity includes type, not just name.
+
+### D11. Observability — per-doc audit_events + progress logging
 
 Per C3.3. Each per-doc extraction emits one `audit_events` row:
 
@@ -338,11 +382,16 @@ Every LLM call emits an `llm_calls` row per C2.4.
 - Output schema — structured JSON with chunk-index annotations (see D4).
 - Re-extraction lifecycle — three-phase capture → reingest → reconcile (see D5).
 - Single extractor, multiple invokers (see D6).
-- Pending-doc detection — idempotent by data shape (see D7).
-- Schema amendments — D11/D12/D13 folded back into #686 (see D8).
-- Subject-to-subject relationship storage — `kg_subject_relationships` table, not `kg_relationships` extension (D11).
-- Chunk-subject provenance — `kg_chunk_subjects` join table with `extraction_trace_id` (D12).
-- Relationship-chunk provenance — `kg_chunk_subject_relationships` join table (D13, surfaced during re-extraction design).
+- Pending-doc detection — `kg_extractions` tracking table (see D7).
+- Schema amendments — D11-D15 folded back into #686 (see D8).
+- Subject-to-subject relationship storage — `kg_subject_relationships` table, not `kg_relationships` extension (#686 D11).
+- Chunk-subject provenance — `kg_chunk_subjects` join table with `extraction_trace_id` (#686 D12).
+- Relationship-chunk provenance — `kg_chunk_subject_relationships` join table (#686 D13, surfaced during re-extraction design).
+- Extraction tracking — `kg_extractions` table (#686 D14, surfaced during review).
+- Entity confidence as column — `kg_subject_entities.confidence` (#686 D15, surfaced during review).
+- Orchestration ownership — ingestion orchestrator owns re-extraction sequence, not #689 calling #690 (see D9).
+- Entity identity — full entity_key, UPSERT does not merge across types (see D10).
+- Provider scope — one extraction LlmProvider per server, shared across agents (see D9).
 
 ### Deferred to Implementation
 
@@ -352,6 +401,7 @@ Every LLM call emits an `llm_calls` row per C2.4.
 - Whether `create_agent` auto-triggers extraction immediately or waits for next startup (implement the cleaner version if straightforward, defer if not).
 - Large-doc section-level fallback threshold (suggested 30K tokens — implement only when trigger case exists).
 - Periodic retry for stale-at-startup extraction (deferred until failure mode is observed).
+- Chunk boundary marker format — `[CHUNK N]` may be ambiguous with literal content in source docs (e.g., someone pastes example output containing `[CHUNK 5]`). Consider `<<CHUNK_BOUNDARY idx="N">>` or similar unambiguous delimiter during prompt iteration.
 
 ## Output Structure
 
@@ -425,9 +475,10 @@ impl SubjectExtractor {
 
     /// Enumerate and extract all pending docs for an agent.
     pub async fn extract_pending(&self, agent_id: &str) -> Result<BatchStats> {
-        // Query: docs with chunks but no kg_chunk_subjects provenance (D7).
+        // Query: docs with chunks but no kg_extractions row (D7).
         // For each: extract_document(agent_id, doc_path, None).
-        // Log progress per D9.
+        // On success: write kg_extractions row.
+        // Log progress per D11.
     }
 }
 ```
@@ -451,11 +502,11 @@ Expected output: { "entities": [...], "relationships": [...] }
 
 ## Implementation Units
 
-- [ ] **Unit 1: Schema amendments (D11/D12/D13)**
+- [ ] **Unit 1: Schema amendments (#686 D11-D15)**
 
-**Goal:** Add `kg_subject_relationships`, `kg_chunk_subjects`, `kg_chunk_subject_relationships` tables to the KG schema migration. Column constants in `kg_schema.rs`.
+**Goal:** Add `kg_subject_relationships`, `kg_chunk_subjects`, `kg_chunk_subject_relationships`, `kg_extractions` tables, and `confidence` column on `kg_subject_entities`, to the KG schema migration. Column constants in `kg_schema.rs`.
 
-**Requirements:** D8 (D11/D12/D13).
+**Requirements:** D8 (#686 D11-D15).
 
 **Dependencies:** #686 schema (v25 base).
 
@@ -560,7 +611,7 @@ Expected output: { "entities": [...], "relationships": [...] }
 
 **Files:** `crates/mika-agent/src/kg/subject_extractor.rs`.
 
-**Approach:** Run the pending-doc query (D7). Iterate docs, call `extract_document` for each. Log progress every 10 docs or 60 seconds (whichever comes first). Log completion summary. Failures per doc are logged and skipped (C2.3) — they remain pending for next startup.
+**Approach:** Run the pending-doc query against `kg_extractions` (D7). Iterate docs, call `extract_document` for each. On success, write `kg_extractions` row. Log progress every 10 docs or 60 seconds (whichever comes first). Log completion summary. Failures per doc are logged and skipped (C2.3) — no `kg_extractions` row written, so they remain pending for next startup.
 
 **Test scenarios:**
 - 0 pending docs → returns immediately, logs "nothing to extract."
@@ -595,20 +646,21 @@ Expected output: { "entities": [...], "relationships": [...] }
 
 ---
 
-- [ ] **Unit 7: Re-extraction integration with #689**
+- [ ] **Unit 7: Re-extraction integration via ingestion orchestrator**
 
-**Goal:** Wire the three-phase re-extraction flow (D5) into #689's doc-change handler.
+**Goal:** Wire the three-phase re-extraction flow (D5) via an ingestion orchestrator that owns the sequence (D9).
 
-**Requirements:** D5.
+**Requirements:** D5, D9.
 
 **Dependencies:** Units 4, 6.
 
-**Files:** `crates/mika-agent/src/kg/lexical_ingestor.rs` (capture previous state before re-ingest), `crates/mika-agent/src/kg/subject_extractor.rs` (reconciliation).
+**Files:** `crates/mika-agent/src/kg/ingestion_orchestrator.rs` (NEW — coordinates #689 and #690), `crates/mika-agent/src/kg/subject_extractor.rs` (reconciliation).
 
-**Approach:**
-- Before #689 deletes old chunks for a changed doc, capture `PreviousState` (entity_ids and relationship_ids linked to this doc's chunks).
-- After #689 writes new chunks, call `extract_document(doc, Some(previous_state))`.
-- The single-transaction reconciliation in Unit 4 handles the rest.
+**Approach:** The ingestion orchestrator owns the re-extraction sequence. #689's lexical ingestor and #690's subject extractor are called by the orchestrator — neither calls the other directly.
+- Orchestrator calls `capture_previous_state(agent_id, doc_path)` → reads provenance before any deletion.
+- Orchestrator calls #689's `reingest_document(doc_path)` → deletes old chunks, writes new chunks.
+- Orchestrator calls #690's `extract_document(doc_path, Some(previous_state))` → extraction + reconciliation.
+- This decouples #689 from #690 at the code level.
 
 **Test scenarios:**
 - Doc edited, entity removed → entity with no other provenance is deleted.
@@ -627,13 +679,5 @@ Expected output: { "entities": [...], "relationships": [...] }
 | Doc exceeds 30K tokens | Log warning, skip extraction for this doc. Flag for future section-level fallback. |
 | LLM returns entities with names containing `:` | Validate `name` field does not contain `:` (would break `entity_key = type || ':' || name` CHECK constraint). Reject entity, log warning. |
 | Duplicate entity_key from same doc (LLM extracts `problem_type:fabrication` twice) | UPSERT handles — second insertion updates properties. Single provenance row per (chunk, entity) via UNIQUE constraint. |
-| Zero entities extracted from a doc | Valid outcome — some docs (e.g., pure configuration guides) may have no extractable entities. Write no rows, emit audit_event with `entities_extracted: 0`. Doc is marked as "extracted" by having been processed (no longer returned by pending query if we track extraction completion — see D7 note below). |
-
-**D7 edge case — zero-entity docs and the pending query:**
-
-The pending-doc query (D7) checks for absence of `kg_chunk_subjects` rows. A doc with zero extracted entities has no provenance rows — it would be re-extracted every startup. Two options:
-
-1. Accept the re-extraction cost (~$0.0003 per doc). It's idempotent and the cost is noise. Simplest.
-2. Write a sentinel `kg_chunk_subjects` row with a special `subject_entity_id` (e.g., pointing to a synthetic "no entities" sentinel entity).
-
-Option 1 is recommended — re-extracting a zero-entity doc costs less than the engineering complexity of a sentinel. If the fraction of zero-entity docs becomes large enough to matter, add the sentinel then. YAGNI.
+| Zero entities extracted from a doc | Valid outcome — some docs (e.g., pure configuration guides) may have no extractable entities. Write `kg_extractions` row with `entities_extracted: 0`. Doc is correctly marked as "done" and not re-extracted on next startup (D7). |
+| LLM extracts same name under different type across runs (e.g., `problem_type:fabrication` then `failure_mode:fabrication`) | These are two different entities (different entity_key). UPSERT does not merge them. Intentional — entity identity includes type, not just name (D10). |
