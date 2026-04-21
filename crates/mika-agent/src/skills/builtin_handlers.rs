@@ -450,6 +450,19 @@ async fn run_git(repo_path: &str, args: &[&str]) -> GitResult {
     }
 }
 
+/// All valid git_ops operations.
+const GIT_OPS_VALID_OPERATIONS: &[&str] = &[
+    "fetch",
+    "rebase",
+    "merge",
+    "pull",
+    "checkout",
+    "worktree_add",
+    "worktree_remove",
+    "worktree_list",
+    "worktree_prune",
+];
+
 /// Validate `git_ops` input and extract parameters.
 #[derive(Debug)]
 struct GitOpsInput {
@@ -457,6 +470,10 @@ struct GitOpsInput {
     repo_path: String,
     base: String,
     push: bool,
+    /// Branch name for checkout and worktree_add operations.
+    branch: Option<String>,
+    /// Filesystem path for worktree_add and worktree_remove operations.
+    path: Option<String>,
 }
 
 fn validate_git_ops_input(input: &serde_json::Value) -> Result<GitOpsInput, ToolOutput> {
@@ -466,15 +483,16 @@ fn validate_git_ops_input(input: &serde_json::Value) -> Result<GitOpsInput, Tool
         .filter(|s| !s.is_empty())
         .map(String::from)
         .ok_or_else(|| {
-            ToolOutput::error(
-                "Missing required 'operation' parameter. Must be one of: fetch, rebase, merge."
-                    .to_string(),
-            )
+            ToolOutput::error(format!(
+                "Missing required 'operation' parameter. Must be one of: {}.",
+                GIT_OPS_VALID_OPERATIONS.join(", ")
+            ))
         })?;
 
-    if !["fetch", "rebase", "merge"].contains(&operation.as_str()) {
+    if !GIT_OPS_VALID_OPERATIONS.contains(&operation.as_str()) {
         return Err(ToolOutput::error(format!(
-            "Unknown operation '{operation}'. Must be one of: fetch, rebase, merge."
+            "Unknown operation '{operation}'. Must be one of: {}.",
+            GIT_OPS_VALID_OPERATIONS.join(", ")
         )));
     }
 
@@ -520,11 +538,69 @@ fn validate_git_ops_input(input: &serde_json::Value) -> Result<GitOpsInput, Tool
         )));
     }
 
+    // Extract optional branch parameter
+    let branch = input
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    // Reject branch starting with '-' to prevent git argument injection
+    if let Some(ref b) = branch
+        && b.starts_with('-')
+    {
+        return Err(ToolOutput::error(
+            "Invalid branch name: must not start with '-'.".to_string(),
+        ));
+    }
+
+    // Branch is required for checkout and worktree_add
+    if (operation == "checkout" || operation == "worktree_add") && branch.is_none() {
+        return Err(ToolOutput::error(format!(
+            "Missing required 'branch' parameter for '{operation}' operation."
+        )));
+    }
+
+    // Extract optional path parameter
+    let path = input
+        .get("path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    // Reject path starting with '-' to prevent git argument injection
+    if let Some(ref p) = path
+        && p.starts_with('-')
+    {
+        return Err(ToolOutput::error(
+            "Invalid path: must not start with '-'.".to_string(),
+        ));
+    }
+
+    // Path is required for worktree_add and worktree_remove
+    if (operation == "worktree_add" || operation == "worktree_remove") && path.is_none() {
+        return Err(ToolOutput::error(format!(
+            "Missing required 'path' parameter for '{operation}' operation."
+        )));
+    }
+
+    // Path must be absolute for worktree operations
+    if let Some(ref p) = path
+        && (operation == "worktree_add" || operation == "worktree_remove")
+        && !std::path::Path::new(p).is_absolute()
+    {
+        return Err(ToolOutput::error(format!(
+            "path must be an absolute path (got '{p}')."
+        )));
+    }
+
     Ok(GitOpsInput {
         operation,
         repo_path,
         base,
         push,
+        branch,
+        path,
     })
 }
 
@@ -555,8 +631,8 @@ async fn git_ops_preflight(repo_path: &str, operation: &str) -> Result<(), ToolO
         )));
     }
 
-    // For rebase/merge, check working tree is clean
-    if operation == "rebase" || operation == "merge" {
+    // For rebase/merge/pull, check working tree is clean
+    if operation == "rebase" || operation == "merge" || operation == "pull" {
         let status_result = run_git(repo_path, &["status", "--porcelain"]).await;
         if status_result.success && !status_result.content.trim().is_empty() {
             return Err(ToolOutput::error(format!(
@@ -624,6 +700,27 @@ async fn git_ops(input: &serde_json::Value, _ctx: &ToolContext<'_>) -> ToolOutpu
         "fetch" => git_ops_fetch(&params.repo_path, remote).await,
         "rebase" => git_ops_rebase(&params.repo_path, remote, &params.base, params.push).await,
         "merge" => git_ops_merge(&params.repo_path, remote, &params.base).await,
+        "pull" => git_ops_pull(&params.repo_path, remote, &params.base).await,
+        "checkout" => {
+            // branch is guaranteed to be Some by validation
+            git_ops_checkout(&params.repo_path, params.branch.as_deref().unwrap()).await
+        }
+        "worktree_add" => {
+            // path and branch are guaranteed to be Some by validation
+            git_ops_worktree_add(
+                &params.repo_path,
+                params.path.as_deref().unwrap(),
+                params.branch.as_deref().unwrap(),
+                &params.base,
+            )
+            .await
+        }
+        "worktree_remove" => {
+            // path is guaranteed to be Some by validation
+            git_ops_worktree_remove(&params.repo_path, params.path.as_deref().unwrap()).await
+        }
+        "worktree_list" => git_ops_worktree_list(&params.repo_path).await,
+        "worktree_prune" => git_ops_worktree_prune(&params.repo_path).await,
         _ => ToolOutput::error(format!("Unknown operation: {}", params.operation)),
     }
 }
@@ -746,6 +843,132 @@ async fn git_ops_push(repo_path: &str) -> Result<String, ToolOutput> {
             "Force-push to '{branch}' failed.\n{}",
             push.content
         )))
+    }
+}
+
+/// Pull (fetch + fast-forward merge) from a remote.
+async fn git_ops_pull(repo_path: &str, remote: &str, base: &str) -> ToolOutput {
+    // Step 1: Fetch
+    let fetch = run_git(repo_path, &["fetch", remote]).await;
+    if !fetch.success {
+        return ToolOutput::error(format!("Fetch from '{remote}' failed.\n{}", fetch.content));
+    }
+
+    // Step 2: Merge --ff-only
+    let merge = run_git(repo_path, &["merge", "--ff-only", base]).await;
+
+    if merge.success {
+        let mut msg = format!("Pull (fast-forward) from '{base}' completed successfully.");
+        if !merge.content.trim().is_empty() {
+            let _ = write!(msg, "\n{}", merge.content.trim());
+        }
+        ToolOutput::success(msg)
+    } else {
+        ToolOutput::error(format!(
+            "Pull from '{base}' failed — not fast-forwardable. \
+             The branch may have diverged — try rebasing first.\n\n{}",
+            merge.content
+        ))
+    }
+}
+
+/// Switch to a branch using `git switch`.
+async fn git_ops_checkout(repo_path: &str, branch: &str) -> ToolOutput {
+    let result = run_git(repo_path, &["switch", branch]).await;
+
+    if result.success {
+        let mut msg = format!("Switched to branch '{branch}'.");
+        if !result.content.trim().is_empty() {
+            let _ = write!(msg, "\n{}", result.content.trim());
+        }
+        ToolOutput::success(msg)
+    } else {
+        ToolOutput::error(format!(
+            "Failed to switch to branch '{branch}'.\n{}",
+            result.content
+        ))
+    }
+}
+
+/// Create a worktree with a new branch.
+///
+/// Tries `git worktree add -b <branch> <path> <base>` first.
+/// If the branch already exists, falls back to `git worktree add <path> <branch>`.
+async fn git_ops_worktree_add(repo_path: &str, path: &str, branch: &str, base: &str) -> ToolOutput {
+    // Try creating with a new branch first
+    let result = run_git(repo_path, &["worktree", "add", "-b", branch, path, base]).await;
+
+    if result.success {
+        let mut msg =
+            format!("Worktree created at '{path}' on new branch '{branch}' (base: {base}).");
+        if !result.content.trim().is_empty() {
+            let _ = write!(msg, "\n{}", result.content.trim());
+        }
+        return ToolOutput::success(msg);
+    }
+
+    // If branch already exists, try attaching the worktree to the existing branch
+    let fallback = run_git(repo_path, &["worktree", "add", path, branch]).await;
+
+    if fallback.success {
+        let mut msg = format!("Worktree created at '{path}' on existing branch '{branch}'.");
+        if !fallback.content.trim().is_empty() {
+            let _ = write!(msg, "\n{}", fallback.content.trim());
+        }
+        ToolOutput::success(msg)
+    } else {
+        ToolOutput::error(format!(
+            "Failed to create worktree at '{path}'.\n{}",
+            fallback.content
+        ))
+    }
+}
+
+/// Remove a worktree.
+async fn git_ops_worktree_remove(repo_path: &str, path: &str) -> ToolOutput {
+    let result = run_git(repo_path, &["worktree", "remove", "--force", path]).await;
+
+    if result.success {
+        let mut msg = format!("Worktree at '{path}' removed.");
+        if !result.content.trim().is_empty() {
+            let _ = write!(msg, "\n{}", result.content.trim());
+        }
+        ToolOutput::success(msg)
+    } else {
+        ToolOutput::error(format!(
+            "Failed to remove worktree at '{path}'.\n{}",
+            result.content
+        ))
+    }
+}
+
+/// List all worktrees in porcelain format.
+async fn git_ops_worktree_list(repo_path: &str) -> ToolOutput {
+    let result = run_git(repo_path, &["worktree", "list", "--porcelain"]).await;
+
+    if result.success {
+        if result.content.trim().is_empty() {
+            ToolOutput::success("No worktrees found.".to_string())
+        } else {
+            ToolOutput::success(result.content)
+        }
+    } else {
+        ToolOutput::error(format!("Failed to list worktrees.\n{}", result.content))
+    }
+}
+
+/// Prune stale worktree references.
+async fn git_ops_worktree_prune(repo_path: &str) -> ToolOutput {
+    let result = run_git(repo_path, &["worktree", "prune"]).await;
+
+    if result.success {
+        let mut msg = "Worktree prune completed successfully.".to_string();
+        if !result.content.trim().is_empty() {
+            let _ = write!(msg, "\n{}", result.content.trim());
+        }
+        ToolOutput::success(msg)
+    } else {
+        ToolOutput::error(format!("Failed to prune worktrees.\n{}", result.content))
     }
 }
 
@@ -2123,6 +2346,453 @@ mod tests {
         // No remote configured → fetch fails
         assert!(output.is_error);
         assert!(output.content.contains("failed"));
+    }
+
+    // -- new operation validation tests --
+
+    #[test]
+    fn test_validate_git_ops_pull_valid() {
+        let input = serde_json::json!({"operation": "pull", "repo_path": "/tmp/repo"});
+        let result = validate_git_ops_input(&input).unwrap();
+        assert_eq!(result.operation, "pull");
+        assert_eq!(result.base, "origin/main");
+    }
+
+    #[test]
+    fn test_validate_git_ops_checkout_valid() {
+        let input = serde_json::json!({
+            "operation": "checkout",
+            "repo_path": "/tmp/repo",
+            "branch": "feat/my-feature"
+        });
+        let result = validate_git_ops_input(&input).unwrap();
+        assert_eq!(result.operation, "checkout");
+        assert_eq!(result.branch.as_deref(), Some("feat/my-feature"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_checkout_missing_branch() {
+        let input = serde_json::json!({"operation": "checkout", "repo_path": "/tmp/repo"});
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Missing required 'branch'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_add_valid() {
+        let input = serde_json::json!({
+            "operation": "worktree_add",
+            "repo_path": "/tmp/repo",
+            "path": "/tmp/worktree",
+            "branch": "feat/new-branch",
+            "base": "origin/main"
+        });
+        let result = validate_git_ops_input(&input).unwrap();
+        assert_eq!(result.operation, "worktree_add");
+        assert_eq!(result.path.as_deref(), Some("/tmp/worktree"));
+        assert_eq!(result.branch.as_deref(), Some("feat/new-branch"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_add_missing_path() {
+        let input = serde_json::json!({
+            "operation": "worktree_add",
+            "repo_path": "/tmp/repo",
+            "branch": "feat/new-branch"
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Missing required 'path'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_add_missing_branch() {
+        let input = serde_json::json!({
+            "operation": "worktree_add",
+            "repo_path": "/tmp/repo",
+            "path": "/tmp/worktree"
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Missing required 'branch'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_add_relative_path_rejected() {
+        let input = serde_json::json!({
+            "operation": "worktree_add",
+            "repo_path": "/tmp/repo",
+            "path": "relative/worktree",
+            "branch": "feat/new-branch"
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_remove_valid() {
+        let input = serde_json::json!({
+            "operation": "worktree_remove",
+            "repo_path": "/tmp/repo",
+            "path": "/tmp/worktree"
+        });
+        let result = validate_git_ops_input(&input).unwrap();
+        assert_eq!(result.operation, "worktree_remove");
+        assert_eq!(result.path.as_deref(), Some("/tmp/worktree"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_remove_missing_path() {
+        let input = serde_json::json!({
+            "operation": "worktree_remove",
+            "repo_path": "/tmp/repo"
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("Missing required 'path'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_remove_relative_path_rejected() {
+        let input = serde_json::json!({
+            "operation": "worktree_remove",
+            "repo_path": "/tmp/repo",
+            "path": "relative/worktree"
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_list_valid() {
+        let input = serde_json::json!({"operation": "worktree_list", "repo_path": "/tmp/repo"});
+        let result = validate_git_ops_input(&input).unwrap();
+        assert_eq!(result.operation, "worktree_list");
+    }
+
+    #[test]
+    fn test_validate_git_ops_worktree_prune_valid() {
+        let input = serde_json::json!({"operation": "worktree_prune", "repo_path": "/tmp/repo"});
+        let result = validate_git_ops_input(&input).unwrap();
+        assert_eq!(result.operation, "worktree_prune");
+    }
+
+    #[test]
+    fn test_validate_git_ops_branch_starting_with_dash_rejected() {
+        let input = serde_json::json!({
+            "operation": "checkout",
+            "repo_path": "/tmp/repo",
+            "branch": "--exec=malicious"
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_path_starting_with_dash_rejected() {
+        let input = serde_json::json!({
+            "operation": "worktree_add",
+            "repo_path": "/tmp/repo",
+            "path": "--malicious",
+            "branch": "feat/test"
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn test_validate_git_ops_push_on_pull_rejected() {
+        let input =
+            serde_json::json!({"operation": "pull", "repo_path": "/tmp/repo", "push": true});
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.content
+                .contains("push=true is only allowed with 'rebase'")
+        );
+    }
+
+    #[test]
+    fn test_validate_git_ops_push_on_checkout_rejected() {
+        let input = serde_json::json!({
+            "operation": "checkout",
+            "repo_path": "/tmp/repo",
+            "branch": "main",
+            "push": true
+        });
+        let result = validate_git_ops_input(&input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.content
+                .contains("push=true is only allowed with 'rebase'")
+        );
+    }
+
+    // -- new operation handler tests --
+
+    #[tokio::test]
+    async fn test_git_ops_pull_on_local_repo() {
+        // Pull on a repo with no remote will fail — verifies error handling
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = git_ops(
+            &serde_json::json!({
+                "operation": "pull",
+                "repo_path": repo
+            }),
+            &ctx,
+        )
+        .await;
+        // No remote configured → fetch fails
+        assert!(output.is_error);
+        assert!(output.content.contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_checkout_nonexistent_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = git_ops(
+            &serde_json::json!({
+                "operation": "checkout",
+                "repo_path": repo,
+                "branch": "nonexistent-branch"
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Failed to switch"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_worktree_list_on_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = git_ops(
+            &serde_json::json!({
+                "operation": "worktree_list",
+                "repo_path": repo
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error);
+        // The main worktree should be listed
+        assert!(output.content.contains("worktree"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_worktree_prune_on_clean_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = git_ops(
+            &serde_json::json!({
+                "operation": "worktree_prune",
+                "repo_path": repo
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error);
+        assert!(output.content.contains("prune completed"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_worktree_add_and_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+
+        let wt_path = tmp.path().join("my-worktree");
+        let wt_path_str = wt_path.to_str().unwrap();
+
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        // Add worktree
+        let output = git_ops(
+            &serde_json::json!({
+                "operation": "worktree_add",
+                "repo_path": repo,
+                "path": wt_path_str,
+                "branch": "test-wt-branch",
+                "base": "HEAD"
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(!output.is_error, "worktree_add failed: {}", output.content);
+        assert!(output.content.contains("Worktree created"));
+        assert!(wt_path.exists());
+
+        // Remove worktree
+        let output = git_ops(
+            &serde_json::json!({
+                "operation": "worktree_remove",
+                "repo_path": repo,
+                "path": wt_path_str
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(
+            !output.is_error,
+            "worktree_remove failed: {}",
+            output.content
+        );
+        assert!(output.content.contains("removed"));
+        assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_worktree_remove_nonexistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let output = git_ops(
+            &serde_json::json!({
+                "operation": "worktree_remove",
+                "repo_path": repo,
+                "path": "/tmp/nonexistent-worktree-path"
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("Failed to remove"));
+    }
+
+    #[tokio::test]
+    async fn test_git_ops_preflight_dirty_tree_blocks_pull() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+        // Create an uncommitted file
+        std::fs::write(tmp.path().join("dirty.txt"), "dirty").unwrap();
+        let result = git_ops_preflight(repo, "pull").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("uncommitted changes"));
     }
 
     /// Verify crate-local fallback copies match workspace-root docs.
