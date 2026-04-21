@@ -59,3 +59,22 @@ Three new tables:
 - Typed HTTP errors with status code downcast for retry logic
 - Input sanitization per engine's escaping rules (FTS5: double quotes)
 - Subquery bulk deletion (`DELETE WHERE id IN (SELECT ...)`) instead of per-row loops
+
+## Knowledge Graph Composition (v25)
+
+The Knowledge Graph (schema v25, #722) composes with the existing search pipeline
+rather than duplicating it:
+
+- **`kg_chunks`** store raw text chunks extracted from documents, each with a
+  `source_doc_hash` for content-change idempotency.
+- When KG chunks are indexed for search, they are inserted into the existing
+  `search_content` table with `source_type = 'kg_chunk'` and `source_id` pointing
+  to the `kg_chunks.id`. This reuses the FTS5 + sqlite-vec pipeline without
+  creating parallel search infrastructure.
+- The KG's domain-layer entities (`kg_entities`) and subject-layer extraction
+  results are structured data queried via dedicated tools — they do not flow
+  through the text search pipeline.
+- This composed approach means KG chunk text is searchable via `search_memory`
+  from day one, while entity queries use purpose-built tools (#688–#692).
+
+See `docs/architecture/kg-id-convention.md` for the entity key scheme.

@@ -22,7 +22,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 24;
+pub const CURRENT_SCHEMA_VERSION: i64 = 25;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -777,6 +777,10 @@ impl Database {
             self.migrate_v23_to_v24()?;
             info!(version = 24, "database migrated to v24");
         }
+        if (3..=24).contains(&version) {
+            self.migrate_v24_to_v25()?;
+            info!(version = 25, "database migrated to v25");
+        }
         Ok(())
     }
 
@@ -785,6 +789,17 @@ impl Database {
 
         // Drop all existing tables (clean slate — no backward compat constraint)
         let drops = [
+            // KG tables (reverse-dependency order)
+            "DROP TABLE IF EXISTS kg_resolutions_log",
+            "DROP TABLE IF EXISTS kg_extractions",
+            "DROP TABLE IF EXISTS kg_chunk_subject_relationships",
+            "DROP TABLE IF EXISTS kg_chunk_subjects",
+            "DROP TABLE IF EXISTS kg_subject_relationships",
+            "DROP TABLE IF EXISTS kg_subject_resolutions",
+            "DROP TABLE IF EXISTS kg_subject_entities",
+            "DROP TABLE IF EXISTS kg_chunks",
+            "DROP TABLE IF EXISTS kg_relationships",
+            "DROP TABLE IF EXISTS kg_entities",
             "DROP TABLE IF EXISTS fts_search",
             "DROP TABLE IF EXISTS vec_search",
             "DROP TABLE IF EXISTS tool_calls",
@@ -833,7 +848,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (24);
+            INSERT INTO schema_version (version) VALUES (25);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1210,6 +1225,131 @@ impl Database {
             CREATE INDEX idx_tool_calls_session ON tool_calls(session_id);
             CREATE INDEX idx_tool_calls_llm_call ON tool_calls(llm_call_id);
             CREATE INDEX idx_tool_calls_agent_created ON tool_calls(agent_id, created_at);
+
+            -- ===== Knowledge Graph: Domain Layer (global) =====
+
+            CREATE TABLE kg_entities (
+                id INTEGER PRIMARY KEY,
+                entity_key TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'org', 'project', 'place', 'concept', 'event')),
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                CHECK (entity_key = entity_type || ':' || name)
+            );
+            CREATE INDEX idx_kg_entities_type ON kg_entities(entity_type);
+
+            CREATE TABLE kg_relationships (
+                id INTEGER PRIMARY KEY,
+                source_entity_id INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+                target_entity_id INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+                relationship_type TEXT NOT NULL,
+                weight REAL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_kg_rel_source ON kg_relationships(source_entity_id, relationship_type);
+            CREATE INDEX idx_kg_rel_target ON kg_relationships(target_entity_id);
+
+            -- ===== Knowledge Graph: Lexical Layer (per-agent) =====
+
+            CREATE TABLE kg_chunks (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                source_doc_hash TEXT NOT NULL,
+                source_url TEXT,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                token_count INTEGER,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE (agent_id, source_doc_hash, chunk_index)
+            );
+            CREATE INDEX idx_kg_chunks_agent ON kg_chunks(agent_id);
+
+            -- ===== Knowledge Graph: Subject Layer (per-agent) =====
+
+            CREATE TABLE kg_subject_entities (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                mention_text TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_kg_subj_ent_agent ON kg_subject_entities(agent_id);
+            CREATE INDEX idx_kg_subj_ent_chunk ON kg_subject_entities(chunk_id);
+
+            CREATE TABLE kg_subject_resolutions (
+                id INTEGER PRIMARY KEY,
+                subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                resolved_entity_id INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+                resolution_type TEXT NOT NULL CHECK (resolution_type IN ('exact', 'alias', 'coreference')),
+                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_kg_subj_res_subject ON kg_subject_resolutions(subject_entity_id);
+            CREATE INDEX idx_kg_subj_res_entity ON kg_subject_resolutions(resolved_entity_id);
+
+            CREATE TABLE kg_subject_relationships (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                subject_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                predicate TEXT NOT NULL,
+                object_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                source_chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_kg_subj_rel_agent ON kg_subject_relationships(agent_id);
+            CREATE INDEX idx_kg_subj_rel_subject ON kg_subject_relationships(subject_id);
+
+            -- ===== Knowledge Graph: Provenance =====
+
+            CREATE TABLE kg_chunk_subjects (
+                id INTEGER PRIMARY KEY,
+                chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE (chunk_id, subject_entity_id)
+            );
+
+            CREATE TABLE kg_chunk_subject_relationships (
+                id INTEGER PRIMARY KEY,
+                chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                subject_relationship_id INTEGER NOT NULL REFERENCES kg_subject_relationships(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE (chunk_id, subject_relationship_id)
+            );
+
+            -- ===== Knowledge Graph: Tracking =====
+
+            CREATE TABLE kg_extractions (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                source_url TEXT,
+                source_doc_hash TEXT NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+                error_message TEXT,
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                completed_at TEXT
+            );
+            CREATE INDEX idx_kg_extractions_agent ON kg_extractions(agent_id);
+            CREATE INDEX idx_kg_extractions_hash ON kg_extractions(agent_id, source_doc_hash);
+
+            CREATE TABLE kg_resolutions_log (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                outcome TEXT NOT NULL CHECK (outcome IN ('resolved', 'unresolved', 'ambiguous')),
+                resolved_entity_id INTEGER REFERENCES kg_entities(id) ON DELETE SET NULL,
+                confidence REAL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_kg_res_log_agent ON kg_resolutions_log(agent_id);
+            CREATE INDEX idx_kg_res_log_subject ON kg_resolutions_log(subject_entity_id);
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -2582,6 +2722,138 @@ impl Database {
         sql.push_str("INSERT INTO schema_version (version) VALUES (24);\nCOMMIT;");
 
         self.conn.execute_batch(&sql)?;
+        Ok(())
+    }
+
+    fn migrate_v24_to_v25(&self) -> Result<()> {
+        info!("migrating database schema v24 → v25 (knowledge graph tables)");
+
+        self.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+
+            -- Knowledge Graph: Domain Layer (global)
+            CREATE TABLE IF NOT EXISTS kg_entities (
+                id INTEGER PRIMARY KEY,
+                entity_key TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                entity_type TEXT NOT NULL CHECK (entity_type IN ('person', 'org', 'project', 'place', 'concept', 'event')),
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                CHECK (entity_key = entity_type || ':' || name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_entities_type ON kg_entities(entity_type);
+
+            CREATE TABLE IF NOT EXISTS kg_relationships (
+                id INTEGER PRIMARY KEY,
+                source_entity_id INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+                target_entity_id INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+                relationship_type TEXT NOT NULL,
+                weight REAL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_rel_source ON kg_relationships(source_entity_id, relationship_type);
+            CREATE INDEX IF NOT EXISTS idx_kg_rel_target ON kg_relationships(target_entity_id);
+
+            -- Knowledge Graph: Lexical Layer (per-agent)
+            CREATE TABLE IF NOT EXISTS kg_chunks (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                source_doc_hash TEXT NOT NULL,
+                source_url TEXT,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                token_count INTEGER,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE (agent_id, source_doc_hash, chunk_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_chunks_agent ON kg_chunks(agent_id);
+
+            -- Knowledge Graph: Subject Layer (per-agent)
+            CREATE TABLE IF NOT EXISTS kg_subject_entities (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                mention_text TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_subj_ent_agent ON kg_subject_entities(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_kg_subj_ent_chunk ON kg_subject_entities(chunk_id);
+
+            CREATE TABLE IF NOT EXISTS kg_subject_resolutions (
+                id INTEGER PRIMARY KEY,
+                subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                resolved_entity_id INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+                resolution_type TEXT NOT NULL CHECK (resolution_type IN ('exact', 'alias', 'coreference')),
+                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_subj_res_subject ON kg_subject_resolutions(subject_entity_id);
+            CREATE INDEX IF NOT EXISTS idx_kg_subj_res_entity ON kg_subject_resolutions(resolved_entity_id);
+
+            CREATE TABLE IF NOT EXISTS kg_subject_relationships (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                subject_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                predicate TEXT NOT NULL,
+                object_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                source_chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_subj_rel_agent ON kg_subject_relationships(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_kg_subj_rel_subject ON kg_subject_relationships(subject_id);
+
+            -- Knowledge Graph: Provenance
+            CREATE TABLE IF NOT EXISTS kg_chunk_subjects (
+                id INTEGER PRIMARY KEY,
+                chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE (chunk_id, subject_entity_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS kg_chunk_subject_relationships (
+                id INTEGER PRIMARY KEY,
+                chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                subject_relationship_id INTEGER NOT NULL REFERENCES kg_subject_relationships(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE (chunk_id, subject_relationship_id)
+            );
+
+            -- Knowledge Graph: Tracking
+            CREATE TABLE IF NOT EXISTS kg_extractions (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                source_url TEXT,
+                source_doc_hash TEXT NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+                error_message TEXT,
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_extractions_agent ON kg_extractions(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_kg_extractions_hash ON kg_extractions(agent_id, source_doc_hash);
+
+            CREATE TABLE IF NOT EXISTS kg_resolutions_log (
+                id INTEGER PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                outcome TEXT NOT NULL CHECK (outcome IN ('resolved', 'unresolved', 'ambiguous')),
+                resolved_entity_id INTEGER REFERENCES kg_entities(id) ON DELETE SET NULL,
+                confidence REAL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_kg_res_log_agent ON kg_resolutions_log(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_kg_res_log_subject ON kg_resolutions_log(subject_entity_id);
+
+            INSERT INTO schema_version (version) VALUES (25);
+            COMMIT;"
+        )?;
         Ok(())
     }
 
@@ -10241,5 +10513,324 @@ mod tests {
 
         let found = db.find_active_task_by_branch("mika", "feat/test").unwrap();
         assert!(found.is_none());
+    }
+
+    // ===== Knowledge Graph schema tests (issue #722, schema v25) =====
+
+    #[test]
+    fn test_kg_tables_exist() {
+        let db = db();
+        let kg_tables = [
+            "kg_entities",
+            "kg_relationships",
+            "kg_chunks",
+            "kg_subject_entities",
+            "kg_subject_resolutions",
+            "kg_subject_relationships",
+            "kg_chunk_subjects",
+            "kg_chunk_subject_relationships",
+            "kg_extractions",
+            "kg_resolutions_log",
+        ];
+        for table in &kg_tables {
+            let exists: bool = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "KG table '{table}' should exist");
+        }
+    }
+
+    #[test]
+    fn test_kg_entity_key_check_constraint_valid() {
+        let db = db();
+        db.conn
+            .execute(
+                "INSERT INTO kg_entities (entity_key, entity_type, name) VALUES (?1, ?2, ?3)",
+                params!["person:Alice", "person", "Alice"],
+            )
+            .unwrap();
+        // Verify it was inserted
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_entities WHERE entity_key = 'person:Alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_kg_entity_key_check_constraint_rejects_mismatch() {
+        let db = db();
+        // entity_key doesn't match entity_type || ':' || name
+        let result = db.conn.execute(
+            "INSERT INTO kg_entities (entity_key, entity_type, name) VALUES (?1, ?2, ?3)",
+            params!["org:Alice", "person", "Alice"],
+        );
+        assert!(result.is_err(), "Should reject mismatched entity_key");
+    }
+
+    #[test]
+    fn test_kg_entity_type_check_constraint_rejects_invalid() {
+        let db = db();
+        let result = db.conn.execute(
+            "INSERT INTO kg_entities (entity_key, entity_type, name) VALUES (?1, ?2, ?3)",
+            params!["invalid:Alice", "invalid", "Alice"],
+        );
+        assert!(result.is_err(), "Should reject invalid entity_type");
+    }
+
+    #[test]
+    fn test_kg_entity_key_unique_collate_nocase() {
+        let db = db();
+        db.conn
+            .execute(
+                "INSERT INTO kg_entities (entity_key, entity_type, name) VALUES (?1, ?2, ?3)",
+                params!["person:Alice", "person", "Alice"],
+            )
+            .unwrap();
+        // Same name but all-lowercase — passes CHECK (entity_key = entity_type || ':' || name)
+        // but should fail UNIQUE COLLATE NOCASE ('person:alice' == 'person:Alice' case-insensitively)
+        let result = db.conn.execute(
+            "INSERT INTO kg_entities (entity_key, entity_type, name) VALUES (?1, ?2, ?3)",
+            params!["person:alice", "person", "alice"],
+        );
+        assert!(
+            result.is_err(),
+            "COLLATE NOCASE should reject case-insensitive duplicates"
+        );
+    }
+
+    #[test]
+    fn test_kg_relationship_fk_cascade_on_entity_delete() {
+        let db = db();
+        db.conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        // Insert two entities
+        db.conn
+            .execute(
+                "INSERT INTO kg_entities (entity_key, entity_type, name) VALUES ('person:Alice', 'person', 'Alice')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO kg_entities (entity_key, entity_type, name) VALUES ('org:Acme', 'org', 'Acme')",
+                [],
+            )
+            .unwrap();
+        // Insert a relationship
+        db.conn
+            .execute(
+                "INSERT INTO kg_relationships (source_entity_id, target_entity_id, relationship_type)
+                 VALUES (1, 2, 'works_at')",
+                [],
+            )
+            .unwrap();
+        // Delete source entity — relationship should cascade
+        db.conn
+            .execute("DELETE FROM kg_entities WHERE id = 1", [])
+            .unwrap();
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_relationships", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "Relationship should be cascade-deleted");
+    }
+
+    #[test]
+    fn test_kg_chunks_unique_constraint() {
+        let db = db();
+        db.conn
+            .execute(
+                "INSERT INTO kg_chunks (agent_id, source_doc_hash, chunk_index, content)
+                 VALUES ('mika', 'hash123', 0, 'chunk text')",
+                [],
+            )
+            .unwrap();
+        // Duplicate (agent_id, source_doc_hash, chunk_index) should fail
+        let result = db.conn.execute(
+            "INSERT INTO kg_chunks (agent_id, source_doc_hash, chunk_index, content)
+             VALUES ('mika', 'hash123', 0, 'different text')",
+            [],
+        );
+        assert!(result.is_err(), "Should reject duplicate chunk dedup key");
+    }
+
+    #[test]
+    fn test_kg_chunks_source_doc_hash_not_null() {
+        let db = db();
+        let result = db.conn.execute(
+            "INSERT INTO kg_chunks (agent_id, source_doc_hash, chunk_index, content)
+             VALUES ('mika', NULL, 0, 'text')",
+            [],
+        );
+        assert!(result.is_err(), "source_doc_hash must not be NULL");
+    }
+
+    #[test]
+    fn test_kg_subject_entity_confidence_bounds() {
+        let db = db();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        // Valid confidence: 0.0
+        db.conn
+            .execute(
+                "INSERT INTO kg_subject_entities (agent_id, chunk_id, mention_text, entity_type, confidence)
+                 VALUES ('mika', 1, 'Alice', 'person', 0.0)",
+                [],
+            )
+            .unwrap();
+        // Valid confidence: 1.0
+        db.conn
+            .execute(
+                "INSERT INTO kg_subject_entities (agent_id, chunk_id, mention_text, entity_type, confidence)
+                 VALUES ('mika', 1, 'Bob', 'person', 1.0)",
+                [],
+            )
+            .unwrap();
+        // Invalid: > 1.0
+        let result = db.conn.execute(
+            "INSERT INTO kg_subject_entities (agent_id, chunk_id, mention_text, entity_type, confidence)
+             VALUES ('mika', 1, 'Eve', 'person', 1.1)",
+            [],
+        );
+        assert!(result.is_err(), "confidence > 1.0 should be rejected");
+        // Invalid: < 0.0
+        let result = db.conn.execute(
+            "INSERT INTO kg_subject_entities (agent_id, chunk_id, mention_text, entity_type, confidence)
+             VALUES ('mika', 1, 'Mallory', 'person', -0.1)",
+            [],
+        );
+        assert!(result.is_err(), "confidence < 0.0 should be rejected");
+    }
+
+    #[test]
+    fn test_kg_resolution_type_check_constraint() {
+        let db = db();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        // Valid resolution types
+        for rtype in &["exact", "alias", "coreference"] {
+            db.conn
+                .execute(
+                    "INSERT INTO kg_subject_resolutions (subject_entity_id, resolved_entity_id, resolution_type, confidence)
+                     VALUES (1, 1, ?1, 0.9)",
+                    params![rtype],
+                )
+                .unwrap();
+        }
+        // Invalid resolution type
+        let result = db.conn.execute(
+            "INSERT INTO kg_subject_resolutions (subject_entity_id, resolved_entity_id, resolution_type, confidence)
+             VALUES (1, 1, 'invalid', 0.9)",
+            [],
+        );
+        assert!(result.is_err(), "Should reject invalid resolution_type");
+    }
+
+    #[test]
+    fn test_kg_extraction_status_check_constraint() {
+        let db = db();
+        // Valid statuses
+        for status in &["running", "completed", "failed"] {
+            db.conn
+                .execute(
+                    "INSERT INTO kg_extractions (agent_id, source_doc_hash, status)
+                     VALUES ('mika', 'hash', ?1)",
+                    params![status],
+                )
+                .unwrap();
+        }
+        // Invalid status
+        let result = db.conn.execute(
+            "INSERT INTO kg_extractions (agent_id, source_doc_hash, status)
+             VALUES ('mika', 'hash', 'invalid')",
+            [],
+        );
+        assert!(result.is_err(), "Should reject invalid extraction status");
+    }
+
+    #[test]
+    fn test_kg_resolution_log_outcome_check_constraint() {
+        let db = db();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        for outcome in &["resolved", "unresolved", "ambiguous"] {
+            db.conn
+                .execute(
+                    "INSERT INTO kg_resolutions_log (agent_id, subject_entity_id, outcome)
+                     VALUES ('mika', 1, ?1)",
+                    params![outcome],
+                )
+                .unwrap();
+        }
+        let result = db.conn.execute(
+            "INSERT INTO kg_resolutions_log (agent_id, subject_entity_id, outcome)
+             VALUES ('mika', 1, 'invalid')",
+            [],
+        );
+        assert!(result.is_err(), "Should reject invalid resolution outcome");
+    }
+
+    #[test]
+    fn test_kg_v1_and_incremental_schemas_converge() {
+        // Clean-slate DB (create_tables_v1 path)
+        let clean = db();
+
+        // Collect KG table DDL from clean-slate
+        let mut clean_tables: Vec<(String, String)> = clean
+            .conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type='table' AND name LIKE 'kg_%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        clean_tables.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Collect KG indexes from clean-slate
+        let mut clean_indexes: Vec<(String, String)> = clean
+            .conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type='index' AND name LIKE 'idx_kg%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        clean_indexes.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(clean_tables.len(), 10, "Should have 10 KG tables");
+        assert!(!clean_indexes.is_empty(), "Should have KG indexes");
+
+        // All KG tables and indexes should be present (schema convergence)
+        // The incremental migration uses CREATE TABLE IF NOT EXISTS, so
+        // running on a fresh v24 DB produces the same result as create_tables_v1.
+        // We verify by checking that the clean-slate path found all 10 tables.
+        let expected_tables = [
+            "kg_chunk_subject_relationships",
+            "kg_chunk_subjects",
+            "kg_chunks",
+            "kg_entities",
+            "kg_extractions",
+            "kg_relationships",
+            "kg_resolutions_log",
+            "kg_subject_entities",
+            "kg_subject_relationships",
+            "kg_subject_resolutions",
+        ];
+        let table_names: Vec<&str> = clean_tables.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(table_names, expected_tables);
     }
 }

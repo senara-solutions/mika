@@ -7,6 +7,7 @@ pub mod compaction;
 pub mod config_keys;
 pub mod db;
 pub(crate) mod github_graphql;
+pub mod kg_schema;
 pub mod mcp;
 pub mod messaging;
 pub mod prompt;
