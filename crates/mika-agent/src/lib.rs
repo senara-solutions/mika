@@ -6,6 +6,7 @@ pub mod bundled_skills;
 pub mod compaction;
 pub mod config_keys;
 pub mod db;
+pub(crate) mod github_graphql;
 pub mod mcp;
 pub mod messaging;
 pub mod prompt;
