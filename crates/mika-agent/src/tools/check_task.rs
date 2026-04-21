@@ -11,7 +11,7 @@ use crate::db::format_ts;
 
 /// A reference parsed from a GitHub URL.
 #[derive(Debug, PartialEq)]
-enum GitHubRef {
+pub(crate) enum GitHubRef {
     PullRequest {
         owner: String,
         repo: String,
@@ -31,7 +31,7 @@ enum GitHubRef {
 /// - `https://github.com/{owner}/{repo}/issues/{number}`
 ///
 /// Only `github.com` is supported (no enterprise domains).
-fn parse_github_ref(url: &str) -> Option<GitHubRef> {
+pub(crate) fn parse_github_ref(url: &str) -> Option<GitHubRef> {
     let url = url.trim();
 
     // Strip optional trailing slash and fragment/query

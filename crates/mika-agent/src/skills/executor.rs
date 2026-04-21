@@ -18,7 +18,7 @@ use super::manifest::ToolHandler;
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
 use crate::task_engine::types::{action_type, trigger_type};
-use crate::tools::{ImageData, ToolOutput};
+use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
 
 /// Maximum output size from a skill tool (10,000 characters).
 const MAX_OUTPUT_LEN: usize = 10_000;
@@ -551,6 +551,99 @@ fn truncate_output(s: &str) -> String {
     }
 }
 
+/// Query GitHub's GraphQL API for `blockedByIssues` edges on an issue.
+///
+/// Returns the issue numbers of any open (non-CLOSED) blockers. Returns an empty
+/// vec when there are no open blockers. Returns `Err` on API or network failures.
+async fn fetch_open_blockers(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Vec<u64>, String> {
+    let query_str = "query($owner:String!,$repo:String!,$number:Int!) { \
+         repository(owner:$owner,name:$repo) { \
+         issue(number:$number) { \
+         blockedByIssues(first:10) { nodes { number state } } \
+         } } }";
+    let body = serde_json::json!({
+        "query": query_str,
+        "variables": {
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let response = client
+        .post("https://api.github.com/graphql")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "mika-agent")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("GitHub GraphQL request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "token invalid or expired".to_string(),
+            403 => "token lacks required permissions".to_string(),
+            429 => "rate limit exceeded".to_string(),
+            _ => format!("HTTP {status}"),
+        };
+        return Err(format!("GitHub GraphQL API error: {msg}"));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse GraphQL response: {e}"))?;
+
+    // Check for GraphQL-level errors
+    if let Some(errors) = body.get("errors") {
+        let msg = errors
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown GraphQL error");
+        return Err(format!("GitHub GraphQL error: {msg}"));
+    }
+
+    Ok(extract_open_blocker_numbers(&body))
+}
+
+/// Extract open (non-CLOSED) blocker issue numbers from a GitHub GraphQL response.
+///
+/// Navigates `data.repository.issue.blockedByIssues.nodes` and returns issue numbers
+/// where `state != "CLOSED"`. Returns an empty vec when the path is absent (e.g., repo
+/// does not support sub-issues).
+fn extract_open_blocker_numbers(body: &serde_json::Value) -> Vec<u64> {
+    let nodes = body
+        .pointer("/data/repository/issue/blockedByIssues/nodes")
+        .and_then(|n| n.as_array());
+
+    let Some(nodes) = nodes else {
+        return vec![];
+    };
+
+    nodes
+        .iter()
+        .filter(|node| {
+            node.get("state")
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| s != "CLOSED")
+        })
+        .filter_map(|node| node.get("number").and_then(|n| n.as_u64()))
+        .collect()
+}
+
 /// Validate that a task is in a dispatchable state for long-running execution.
 ///
 /// Stricter than `validate_task()` (which also allows `blocked` for delegation).
@@ -559,7 +652,11 @@ fn truncate_output(s: &str) -> String {
 ///
 /// Returns `Err(json_error_string)` on rejection, `Ok(status)` with the task's
 /// current status if dispatch may proceed.
-async fn validate_dispatch_readiness(db: &AsyncDatabase, task_id: &str) -> Result<String, String> {
+async fn validate_dispatch_readiness(
+    db: &AsyncDatabase,
+    task_id: &str,
+    github_token: Option<&str>,
+) -> Result<String, String> {
     // Re-fetch the task to get the full struct (validate_task confirmed existence)
     let task = match db.get_task(task_id).await {
         Ok(Some(t)) => t,
@@ -667,6 +764,55 @@ async fn validate_dispatch_readiness(db: &AsyncDatabase, task_id: &str) -> Resul
         }
     }
 
+    // Blocked-by guard (#713): reject dispatch if the ticket's GitHub blockers
+    // are still open. This is the most expensive check (external API call) so it
+    // runs last, after all cheap DB checks have passed.
+    if let Some(GitHubRef::Issue {
+        owner,
+        repo,
+        number,
+    }) = task.reference_url.as_deref().and_then(parse_github_ref)
+    {
+        match github_token {
+            Some(token) => match fetch_open_blockers(token, &owner, &repo, number).await {
+                Ok(blockers) if !blockers.is_empty() => {
+                    return Err(serde_json::json!({
+                        "error": "dispatch_blocked_by",
+                        "task_id": task_id,
+                        "blocking_issues": blockers,
+                        "message": format!(
+                            "ticket #{number} is blocked by {} which {} still open",
+                            blockers.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", "),
+                            if blockers.len() == 1 { "is" } else { "are" }
+                        )
+                    })
+                    .to_string());
+                }
+                Ok(_) => { /* No open blockers — proceed */ }
+                Err(e) => {
+                    // Fail-closed: if we can't verify blocker state, reject dispatch
+                    warn!(
+                        task_id = task_id,
+                        error = %e,
+                        "blocked-by check failed, rejecting dispatch"
+                    );
+                    return Err(serde_json::json!({
+                        "error": "dispatch_check_failed",
+                        "task_id": task_id,
+                        "reason": format!("Failed to check blocked-by status: {e}")
+                    })
+                    .to_string());
+                }
+            },
+            None => {
+                warn!(
+                    task_id = task_id,
+                    "Skipping blocked-by check: no GitHub token configured"
+                );
+            }
+        }
+    }
+
     Ok(task.status.clone())
 }
 
@@ -715,7 +861,7 @@ async fn execute_long_running(
     // allows `blocked` (needed by delegate_task). Long-running dispatch only permits
     // `pending` and `in_progress`. Returns the current status on success to avoid
     // a redundant DB read in the auto-transition below.
-    let wi_status = match validate_dispatch_readiness(&ctx.db, task_id).await {
+    let wi_status = match validate_dispatch_readiness(&ctx.db, task_id, github_token).await {
         Ok(status) => status,
         Err(err) => return ToolOutput::error(err),
     };
@@ -2678,5 +2824,165 @@ mod tests {
         let (parent_id, found_callback_id) = result.unwrap();
         assert_eq!(parent_id, wi);
         assert_eq!(found_callback_id, callback_id);
+    }
+
+    // -- Blocked-by guard tests (#713) --
+
+    /// Helper: create a task with `reference_url` set and transition to a given status.
+    async fn create_task_with_ref_url(
+        db: &crate::async_db::AsyncDatabase,
+        status: &str,
+        reference_url: Option<&str>,
+    ) -> String {
+        use crate::db::NewTask;
+        use crate::task_engine::types::{action_type, trigger_type};
+
+        let task = NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test task with ref".to_string(),
+            trigger_type: trigger_type::MANUAL.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::NONE.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: reference_url.map(|u| u.to_string()),
+            source: None,
+            metadata: None,
+            r#type: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        if status != "pending" {
+            db.update_manual_task_status(&id, status).await.unwrap();
+        }
+        id
+    }
+
+    #[tokio::test]
+    async fn test_blocked_by_guard_skips_when_no_reference_url() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        // No reference_url → blocked-by check skipped, dispatch proceeds
+        let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token")).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_blocked_by_guard_skips_when_reference_is_pr() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(
+            &async_db,
+            "in_progress",
+            Some("https://github.com/senara-solutions/mika/pull/100"),
+        )
+        .await;
+
+        // PR reference → blocked-by check skipped (only issues have blockedByIssues)
+        let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token")).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_blocked_by_guard_skips_when_no_github_token() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(
+            &async_db,
+            "in_progress",
+            Some("https://github.com/senara-solutions/mika/issues/713"),
+        )
+        .await;
+
+        // No token → blocked-by check skipped (fail-open), dispatch proceeds
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    // -- extract_open_blocker_numbers tests (#713) --
+    // These test the production parsing function directly (no duplication).
+
+    #[test]
+    fn test_parse_blockers_all_closed() {
+        let body = serde_json::json!({
+            "data": {
+                "repository": {
+                    "issue": {
+                        "blockedByIssues": {
+                            "nodes": [
+                                {"number": 100, "state": "CLOSED"},
+                                {"number": 101, "state": "CLOSED"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_open_blocker_numbers(&body), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn test_parse_blockers_some_open() {
+        let body = serde_json::json!({
+            "data": {
+                "repository": {
+                    "issue": {
+                        "blockedByIssues": {
+                            "nodes": [
+                                {"number": 689, "state": "OPEN"},
+                                {"number": 690, "state": "CLOSED"},
+                                {"number": 691, "state": "OPEN"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_open_blocker_numbers(&body), vec![689, 691]);
+    }
+
+    #[test]
+    fn test_parse_blockers_empty_nodes() {
+        let body = serde_json::json!({
+            "data": {
+                "repository": {
+                    "issue": {
+                        "blockedByIssues": {
+                            "nodes": []
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(extract_open_blocker_numbers(&body), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn test_parse_blockers_missing_blocked_by_field() {
+        let body = serde_json::json!({
+            "data": {
+                "repository": {
+                    "issue": {}
+                }
+            }
+        });
+        assert_eq!(extract_open_blocker_numbers(&body), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn test_parse_blockers_no_data() {
+        let body = serde_json::json!({"errors": [{"message": "not found"}]});
+        assert_eq!(extract_open_blocker_numbers(&body), Vec::<u64>::new());
     }
 }
