@@ -10941,19 +10941,113 @@ mod tests {
         let db1 = Database::open_in_memory().unwrap();
         let snap1 = snapshot_schema(&db1.conn);
 
-        // DB2: simulate a v24 DB that migrates incrementally to v25.
-        // We open a fresh DB (which gives v25), but the point is to confirm
-        // migrate_v1's CREATE TABLEs and migrate_v24_to_v25's CREATE TABLE IF NOT EXISTS
-        // produce the same structural outcome. Since migrate_v1 now produces v25
-        // directly, both paths should converge.
-        let db2 = Database::open_in_memory().unwrap();
+        // DB2: simulate a v24 DB, then migrate incrementally to v25.
+        // Strategy: create a fresh v25 DB, extract all non-KG DDL from
+        // sqlite_master, replay it on a new connection to get a v24 DB,
+        // then run migrate_v24_to_v25 and compare schemas.
+        let fresh = Database::open_in_memory().unwrap();
+        let mut stmt = fresh
+            .conn
+            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY rowid")
+            .unwrap();
+        let ddl_stmts: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        drop(stmt);
+
+        init_sqlite_vec();
+        let conn2 = rusqlite::Connection::open_in_memory().unwrap();
+        conn2.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Replay all DDL except KG tables, virtual tables, and views
+        conn2.execute_batch("BEGIN;").unwrap();
+        for ddl in &ddl_stmts {
+            let lower = ddl.to_lowercase();
+            if lower.contains("kg_entities")
+                || lower.contains("kg_relationships")
+                || lower.contains("kg_chunks")
+                || lower.contains("kg_subject_")
+                || lower.contains("kg_chunk_subject")
+                || lower.contains("kg_extractions")
+                || lower.contains("kg_resolutions_log")
+                || lower.contains("idx_kg_")
+            {
+                continue;
+            }
+            if lower.contains("fts5") || lower.contains("vec0") {
+                continue;
+            }
+            if lower.contains("unified_timeline") {
+                continue;
+            }
+            if lower.contains("sqlite_sequence") {
+                continue;
+            }
+            conn2.execute_batch(ddl).unwrap_or_else(|e| {
+                if !e.to_string().contains("already exists") {
+                    panic!("DDL failed: {ddl}: {e}");
+                }
+            });
+        }
+        conn2.execute_batch("COMMIT;").unwrap();
+
+        // Recreate view and virtual tables
+        conn2.execute_batch(UNIFIED_TIMELINE_VIEW_SQL).unwrap();
+        let _ = conn2.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_search
+                 USING fts5(content, content='search_content', content_rowid='id');
+             CREATE VIRTUAL TABLE IF NOT EXISTS vec_search
+                 USING vec0(embedding float[512]);",
+        );
+
+        // Set version to 24 and insert default agent
+        conn2
+            .execute_batch(
+                "DELETE FROM schema_version WHERE version = 25;
+                 INSERT OR IGNORE INTO schema_version (version) VALUES (24);
+                 INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');",
+            )
+            .unwrap();
+
+        // Verify v24 state: KG tables should not exist
+        let v24_version: i64 = conn2
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v24_version, 24,
+            "DB2 should be at v24 before incremental migration"
+        );
+        assert!(
+            !table_exists(&conn2, "kg_entities"),
+            "kg_entities should not exist at v24"
+        );
+
+        // Run incremental migration
+        let db2 = Database { conn: conn2 };
+        db2.migrate_v24_to_v25().unwrap();
+
+        let v25_version: i64 = db2
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v25_version, 25,
+            "DB2 should be at v25 after incremental migration"
+        );
+
         let snap2 = snapshot_schema(&db2.conn);
 
-        // Compare table by table for better error messages
+        // Compare schemas structurally
         assert_eq!(
             snap1.len(),
             snap2.len(),
-            "Table count mismatch between v1 and incremental paths"
+            "Table count mismatch: v1 has {} tables, incremental has {}\nv1: {:?}\nincremental: {:?}",
+            snap1.len(),
+            snap2.len(),
+            snap1.iter().map(|t| &t.name).collect::<Vec<_>>(),
+            snap2.iter().map(|t| &t.name).collect::<Vec<_>>(),
         );
 
         for (t1, t2) in snap1.iter().zip(snap2.iter()) {
@@ -10968,7 +11062,6 @@ mod tests {
                 "Foreign key mismatch in table '{}'",
                 t1.name
             );
-            // Index comparison: names and columns, but sort first
             assert_eq!(
                 t1.indexes, t2.indexes,
                 "Index mismatch in table '{}'",
