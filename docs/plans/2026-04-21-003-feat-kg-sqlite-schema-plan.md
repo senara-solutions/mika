@@ -210,7 +210,39 @@ CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_
 CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
 ```
 
-This completes the subject layer's provenance model. The recurring pattern across D11-D13: every first-class KG table has relationships to other first-class tables that need their own tables with their own provenance. This convention should be added to `kg-implementation-conventions.md`.
+This completes the subject layer's provenance model.
+
+### D14. `kg_extractions` tracking table for extraction completion state
+
+Resolved during #690 review (2026-04-21). The subject extractor needs to know "which docs have been extracted" authoritatively. Without explicit tracking, zero-entity docs (valid outcome — some docs have no extractable content) look identical to "not yet extracted" docs, causing unnecessary re-extraction every startup.
+
+```sql
+CREATE TABLE kg_extractions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    source_doc_path TEXT NOT NULL,
+    extraction_model TEXT NOT NULL,
+    entities_extracted INTEGER NOT NULL DEFAULT 0,
+    relationships_extracted INTEGER NOT NULL DEFAULT 0,
+    extraction_trace_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, source_doc_path)
+);
+CREATE INDEX idx_kg_extractions_agent ON kg_extractions(agent_id);
+```
+
+Additional benefits beyond fixing the zero-entity bug: model-version invalidation (`DELETE FROM kg_extractions WHERE extraction_model != ?`), structured extraction observability, and explicit "has this doc been extracted?" query.
+
+### D15. `confidence` column on `kg_subject_entities`
+
+Resolved during #690 review (2026-04-21). Extraction-time confidence should be a queryable, constraint-checked column on `kg_subject_entities`, symmetric with `kg_subject_relationships.confidence`. Downstream consumers (#688 query tool, #692 self-knowledge) will filter by confidence threshold — that requires an indexable column, not JSON extraction via `properties_json`.
+
+```sql
+-- Amendment to kg_subject_entities:
+-- ADD: confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0)
+```
+
+The recurring pattern across D11-D15: every first-class KG table has relationships to other first-class tables that need their own tables with their own provenance. This convention should be added to `kg-implementation-conventions.md`.
 
 ## Open Questions
 
@@ -229,6 +261,8 @@ This completes the subject layer's provenance model. The recurring pattern acros
 - Subject-to-subject edges — `kg_subject_relationships` table (see D11, surfaced from #690 planning).
 - Entity provenance — `kg_chunk_subjects` join table (see D12, surfaced from #690 planning).
 - Relationship provenance — `kg_chunk_subject_relationships` join table (see D13, surfaced from #690 planning).
+- Extraction tracking — `kg_extractions` table (see D14, surfaced from #690 review).
+- Entity confidence as column — `kg_subject_entities.confidence` (see D15, surfaced from #690 review).
 
 ### Deferred to Implementation
 
@@ -374,7 +408,23 @@ CREATE TABLE kg_chunk_subject_relationships (
 );
 CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_id);
 CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
+
+-- Extraction tracking (from #690 review — D14)
+CREATE TABLE kg_extractions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    source_doc_path TEXT NOT NULL,
+    extraction_model TEXT NOT NULL,
+    entities_extracted INTEGER NOT NULL DEFAULT 0,
+    relationships_extracted INTEGER NOT NULL DEFAULT 0,
+    extraction_trace_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE (agent_id, source_doc_path)
+);
+CREATE INDEX idx_kg_extractions_agent ON kg_extractions(agent_id);
 ```
+
+Note: `kg_subject_entities` also gains `confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0)` per D15.
 
 ### Chunk write pipeline
 
