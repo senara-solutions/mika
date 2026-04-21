@@ -143,6 +143,38 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20), `enabled INTEGER` (v24). Per-agent overrides: LLM overrides resolve as DB > manifest `[llm]` > agent default (`mika skills llm <name> set <provider>/<model>`). Enabled state is tri-state: `NULL`=default (enabled), `0`=disabled, `1`=explicitly enabled. `enabled=false` evicts the skill from `SkillRegistry.entries` during `apply_overrides()`. Replaces `.disabled` marker files (#629). Default-equals-delete: rows where all columns are NULL are pruned.
 
+### Knowledge Graph Tables (v25)
+
+**Domain layer (global):**
+
+**kg_entities** — `id INTEGER PK`, `entity_key TEXT UNIQUE NOCASE` (format `type:name`, CHECK-enforced), `entity_type TEXT NOT NULL` (CHECK: person/org/project/place/concept/event), `name TEXT NOT NULL`, `description TEXT`, timestamps. Index: `idx_kg_entities_type`.
+
+**kg_relationships** — `id INTEGER PK`, `source_entity_id FK→kg_entities ON DELETE CASCADE`, `target_entity_id FK→kg_entities ON DELETE CASCADE`, `relationship_type TEXT NOT NULL`, `weight REAL`, timestamps. Indexes: `idx_kg_rel_source(source_entity_id, relationship_type)`, `idx_kg_rel_target`.
+
+**Lexical layer (per-agent):**
+
+**kg_chunks** — `id INTEGER PK`, `agent_id TEXT NOT NULL`, `source_doc_hash TEXT NOT NULL`, `source_url TEXT`, `chunk_index INTEGER NOT NULL`, `content TEXT NOT NULL`, `token_count INTEGER`, `created_at TEXT`. UNIQUE `(agent_id, source_doc_hash, chunk_index)`. Designed to compose with `search_content` via `source_type='kg_chunk'`. Index: `idx_kg_chunks_agent`.
+
+**Subject layer (per-agent):**
+
+**kg_subject_entities** — `id INTEGER PK`, `agent_id TEXT NOT NULL`, `chunk_id FK→kg_chunks ON DELETE CASCADE`, `mention_text TEXT NOT NULL`, `entity_type TEXT NOT NULL`, `confidence REAL NOT NULL` (CHECK 0.0–1.0), `created_at TEXT`. Indexes: `idx_kg_subj_ent_agent`, `idx_kg_subj_ent_chunk`.
+
+**kg_subject_resolutions** — `id INTEGER PK`, `subject_entity_id FK→kg_subject_entities ON DELETE CASCADE`, `resolved_entity_id FK→kg_entities ON DELETE CASCADE`, `resolution_type TEXT NOT NULL` (CHECK: exact/alias/coreference), `confidence REAL NOT NULL` (CHECK 0.0–1.0), `created_at TEXT`. Indexes: `idx_kg_subj_res_subject`, `idx_kg_subj_res_entity`.
+
+**kg_subject_relationships** — `id INTEGER PK`, `agent_id TEXT NOT NULL`, `subject_id FK→kg_subject_entities ON DELETE CASCADE`, `predicate TEXT NOT NULL`, `object_id FK→kg_subject_entities ON DELETE CASCADE`, `confidence REAL NOT NULL` (CHECK 0.0–1.0), `source_chunk_id FK→kg_chunks ON DELETE CASCADE`, `created_at TEXT`. Indexes: `idx_kg_subj_rel_agent`, `idx_kg_subj_rel_subject`.
+
+**Provenance:**
+
+**kg_chunk_subjects** — `id INTEGER PK`, `chunk_id FK→kg_chunks ON DELETE CASCADE`, `subject_entity_id FK→kg_subject_entities ON DELETE CASCADE`, `created_at TEXT`. UNIQUE `(chunk_id, subject_entity_id)`.
+
+**kg_chunk_subject_relationships** — `id INTEGER PK`, `chunk_id FK→kg_chunks ON DELETE CASCADE`, `subject_relationship_id FK→kg_subject_relationships ON DELETE CASCADE`, `created_at TEXT`. UNIQUE `(chunk_id, subject_relationship_id)`.
+
+**Tracking:**
+
+**kg_extractions** — `id INTEGER PK`, `agent_id TEXT NOT NULL`, `source_url TEXT`, `source_doc_hash TEXT NOT NULL`, `chunk_count INTEGER DEFAULT 0`, `status TEXT NOT NULL` (CHECK: running/completed/failed), `error_message TEXT`, `started_at TEXT`, `completed_at TEXT`. Indexes: `idx_kg_extractions_agent`, `idx_kg_extractions_hash(agent_id, source_doc_hash)`.
+
+**kg_resolutions_log** — `id INTEGER PK`, `agent_id TEXT NOT NULL`, `subject_entity_id FK→kg_subject_entities ON DELETE CASCADE`, `outcome TEXT NOT NULL` (CHECK: resolved/unresolved/ambiguous), `resolved_entity_id FK→kg_entities ON DELETE SET NULL`, `confidence REAL`, `created_at TEXT`. Indexes: `idx_kg_res_log_agent`, `idx_kg_res_log_subject`.
+
 ### View
 
 **unified_timeline** — `UNION ALL` across `messages`, `audit_events`, `tasks`, `team_workspace`. Columns: `trace_id`, `session_id`, `agent_id`, `event_type`, `event_subtype`, `summary` (truncated to 200 chars), `created_at`. Task leg uses `COALESCE(execution_trace_id, created_trace_id)` as `trace_id` for accurate correlation. Team workspace entries use `event_type='team_workspace'`, synthetic `session_id='team-{run_id}'`, and `agent_id=NULL`.
