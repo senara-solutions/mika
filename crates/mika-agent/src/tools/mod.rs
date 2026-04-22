@@ -28,6 +28,7 @@ mod list_tasks;
 mod list_teams;
 mod list_workspace;
 pub(crate) mod pr_merge_with_gate;
+mod query_knowledge_graph;
 mod query_timeline;
 mod read_agent_file;
 mod read_workspace;
@@ -662,6 +663,7 @@ pub fn default_tools() -> ToolRegistry {
     // required checks regardless of caller. See #490.
     registry.register(Box::new(pr_merge_with_gate::PrMergeWithGateTool));
     registry.register(Box::new(resolve_issue_order::ResolveIssueOrderTool));
+    registry.register(Box::new(query_knowledge_graph::QueryKnowledgeGraphTool));
     registry.register(Box::new(query_timeline::QueryTimelineTool));
     registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
     registry.register(Box::new(list_audit_events::ListAuditEventsTool));
