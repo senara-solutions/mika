@@ -203,6 +203,22 @@ Each scenario file has a single `fn scenario_X()` body parameterized by the prov
 - **mika#742** — consumes this ticket's baseline as the reference for weekly drift detection
 - Future model-calibration tickets (one per additional provider under test) will cite specific scenarios from this dataset
 
+## Cost envelope (design-time, class-average)
+
+Matching the design-time pricing discipline from `#740` and `#741`, but applied at class-level rather than per-scenario (25 scenarios is too speculative to price individually before implementation). Class-average rates reflect typical scenario shapes:
+
+| Class | Count | Avg cost / scenario (single provider) | Class subtotal |
+|---|---|---|---|
+| Memory | 8 | ~$0.02 (single-turn, modest context) | ~$0.16 |
+| Tool selection | 8 | ~$0.02 (single-turn, multi-step variant at top end) | ~$0.16 |
+| Conversation quality | 5 | ~$0.03 (multi-turn, more context carried) | ~$0.15 |
+| Skill-specific | 4 | ~$0.04 (self-dev/qa-review prompts are longer) | ~$0.16 |
+| **Per-provider integration run** | **25** | — | **~$0.63** |
+
+Against `#338`'s four-provider matrix ({Anthropic, OpenAI, Kimi, Groq}), full-matrix integration run ≈ **~$2.52**. Authors set per-scenario `expected_tokens` metadata (D7) at implementation; those refine the class-average into real numbers. The plan-level class bound is the acknowledged ceiling — if an author lands a scenario that measurably breaks their class average by >2×, `eval-diff` flags it in CI logs (per `#338` D7 token-count observability).
+
+**Bound honesty:** these numbers rot. They exist as *design-time cost envelope decisions*, not as runtime guarantees. The structural enforcement for cost is `MIKA_EVAL_REAL_PROVIDERS` + `#[ignore]` + workflow timeout per `#338` D8. This class-average table is the asymmetric-pricing resolution for a large-ticket plan — small tickets price per-scenario, large tickets price per-class.
+
 ## Cross-cutting notes
 
 - **Judge-tag vocabulary is ticket-namespaced, not globally frozen.** #339 owns `quality:*` only. #740 will define `self-knowledge:*` in its own plan; #741 will define `grounding:*`. Calibration artifact preserves namespace structure so aggregation works at the tooling layer. This ticket deliberately does NOT attempt to freeze cross-ticket vocabulary authority.
@@ -224,3 +240,7 @@ Each scenario file has a single `fn scenario_X()` body parameterized by the prov
 - **#338 dependency pinned to commit `fa54d950`:** plan cites the specific SHA of the #338 plan it depends on, so upstream drift is a grep-findable version bump rather than implicit breakage.
 
 **Friend principle extended from #338:** "pin the decision you're depending on, make changes explicit as version bumps rather than implicit drift." Applied to judge model (D4), vocabulary namespace (D4), PR-description format (D5), scenario registration (D7), and upstream plan SHA.
+
+**Milestone-level friend review pass 2 (2026-04-23, relayed by Vincent):**
+
+- **Cost envelope added at class-average granularity.** Previous plan deferred all per-scenario pricing to implementation-time — asymmetric with `#740`/`#741` which priced at design time. Class-average pricing (25 scenarios aggregated to 4 classes) delivers a plan-level ceiling (~$0.63 per provider, ~$2.52 full-matrix) without the speculation cost of pricing 25 scenarios individually. Per-scenario `expected_tokens` refines during implementation; class bound is the acknowledged ceiling. Fed into `#741`'s milestone rollup.
