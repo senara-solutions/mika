@@ -15,7 +15,10 @@ Run these steps in order. Do not do anything else. Do not stop between steps —
 
 Before running the pipeline, set up an isolated worktree:
 
-1. **Parse branch:** If `$ARGUMENTS` starts with `branch:<name>`, extract `<name>` as the branch name and strip the `branch:<name>` prefix from `$ARGUMENTS`. Otherwise, derive the branch name from args (issue → `feat|fix|chore/<number>/<kebab-title>`, free-text → `feat/<kebab>`).
+1. **Parse branch:** Determine the branch name using this priority order (first match wins):
+   a. **Explicit `branch:` prefix:** If `$ARGUMENTS` starts with `branch:<name>`, extract `<name>` and strip the prefix.
+   b. **Issue body callout:** If an issue was fetched above, search the issue body for a line matching `> - **Branch:**` followed by a backtick-wrapped branch name (e.g., `` `feat/687/domain-graph-builder` ``). Extract that branch name. This is how pre-planned tickets communicate their branch — **always use it when present**.
+   c. **Derive from args:** Only if (a) and (b) both miss, derive from args (issue → `feat|fix|chore/<number>/<kebab-title>`, free-text → `feat/<kebab>`).
 2. **Skip if no branch or no args:** If there are no arguments (backlog eval mode), skip worktree creation and run the pipeline in the current directory.
 3. **Detect existing worktree (MANDATORY):** Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`. If they differ, you are ALREADY inside a worktree. **STOP worktree setup immediately** — set `CREATED_WORKTREE=false`, run `command -v lefthook >/dev/null 2>&1 && lefthook install` (non-blocking — skip silently if lefthook is not installed), and proceed directly to the Pipeline section below. Do NOT attempt to create, remove, or modify any worktree. Do NOT clean up or recreate. Just use the current directory as-is.
 4. **Sync main:** Run `git fetch origin main:main` to fast-forward local `main` to match remote. This ensures the worktree branches from the latest code. If it fails (e.g., `main` is checked out with uncommitted changes), fall back to `git fetch origin` and use `origin/main` as the base ref in the next step.
