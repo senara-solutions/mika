@@ -22,7 +22,7 @@ tags:
 
 ## Context
 
-The autonomous dev loop requires `mika-dev` and `mika-qa` agents with specific configurations: identity files (soul.md), skill assignments, and per-agent env vars. Previously these had to be created manually. Missing agents caused silent degradation. Wrong skill assignments caused active interference (qa-review's run_gh allowlist blocked mika-dev's `gh pr create`).
+The autonomous dev loop requires `mika-dev`, `mika-qa`, and `mika-relay` agents with specific configurations: identity files (soul.md), skill assignments, model overrides, and per-agent env vars. Previously these had to be created manually. Missing agents caused silent degradation. Wrong skill assignments caused active interference (qa-review's run_gh allowlist blocked mika-dev's `gh pr create`).
 
 The provisioning system follows a two-phase design to work within the existing startup sequence where filesystem operations happen before the DB is available.
 
@@ -30,7 +30,7 @@ The provisioning system follows a two-phase design to work within the existing s
 
 ### Two-phase provisioning
 
-**Phase 1 (filesystem):** `provision_well_known_agents()` runs after `migrate_to_multi_agent()` but before `list_agents()` in server startup. For each well-known agent spec, it checks `agent_exists()`, calls `bootstrap_agent()` to create the directory structure, then overwrites `identity.toml` and `soul.md` with agent-specific content.
+**Phase 1 (filesystem):** `provision_well_known_agents()` runs after `migrate_to_multi_agent()` but before `list_agents()` in server startup. For each well-known agent spec, it checks `agent_exists()`, calls `bootstrap_agent()` to create the directory structure, then overwrites `identity.toml` and `soul.md` with agent-specific content. If the spec provides `config_toml`, the default `config.toml` is also overwritten with agent-specific LLM settings (e.g., mika-relay uses haiku for cheap permission classification).
 
 **Phase 2 (DB overrides):** `seed_well_known_skill_overrides()` runs inside `init_agent()` after the DB is opened and `seed_bundled_skills_if_needed()` has written all skill files. It writes `set_skill_enabled(false)` for skills the agent should not have. Both phases are gated on `settings.dev_mode`.
 
@@ -46,7 +46,7 @@ The provisioning system follows a two-phase design to work within the existing s
 
 ### Adding a new well-known agent
 
-1. Add a `WellKnownAgent` static spec in `crates/mika-agent/src/well_known_agents.rs` with name, display_name, emoji, soul content, and `disabled_skills` list
+1. Add a `WellKnownAgent` static spec in `crates/mika-agent/src/well_known_agents.rs` with name, display_name, emoji, soul content, `disabled_skills` list, and optional `config_toml`
 2. Add a reference to `WELL_KNOWN_AGENTS` static slice
 3. The agent is automatically provisioned on next startup with `dev_mode = true`
 
@@ -59,6 +59,17 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
     emoji: "...",
     soul: MIKA_DEV_SOUL,
     disabled_skills: &["qa-review", "qa-review-build-callback", "skill-review"],
+    config_toml: None,  // uses default config
+};
+```
+
+For agents needing a specific LLM model (e.g., mika-relay uses haiku for cheap permission classification):
+
+```rust
+pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
+    name: "mika-relay",
+    // ...
+    config_toml: Some(MIKA_RELAY_CONFIG),  // overrides config.toml with haiku model
 };
 ```
 
@@ -100,5 +111,6 @@ for each agent:
 
 - Issue #254 -- original feature request
 - Issue #602 -- skill interference incident that motivated per-agent skill filtering
+- Issue #721 -- mika-relay agent for permission relay (first agent with `config_toml` override)
 - `docs/solutions/architecture-patterns/skill-enabled-state-db-eviction.md` -- how skill overrides work
 - `docs/solutions/architecture-patterns/per-agent-dotenv-config-injection.md` -- per-agent config loading

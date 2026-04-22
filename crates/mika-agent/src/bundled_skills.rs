@@ -194,6 +194,15 @@ pub fn is_bundled_skill(name: &str) -> bool {
         || ENTRIES.iter().any(|s| s.name.eq_ignore_ascii_case(name))
 }
 
+/// Returns the names of all bundled skills (both legacy hardcoded and
+/// directory-sourced), deduplicated with ENTRIES-wins semantics.
+///
+/// Used by well-known agent tests to verify that mika-relay's `disabled_skills`
+/// list stays in sync with the full bundled skill set.
+pub fn all_bundled_skill_names() -> Vec<&'static str> {
+    all_bundled_skills().iter().map(|s| s.name).collect()
+}
+
 /// Trust-critical bundled skills whose prompts must NOT be reviewed or adapted.
 ///
 /// These skills govern the agent's self-awareness, security posture, or ability
