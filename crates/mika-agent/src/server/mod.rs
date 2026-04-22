@@ -711,6 +711,50 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         .db
         .clone();
 
+    // Domain graph rebuild: populate kg_entities and kg_relationships from
+    // authoritative sources (skill manifests, tool registry, MCP, agent configs).
+    // Runs once per server boot, after all agents are initialized. Failures are
+    // logged — the server continues to boot with stale or empty KG data.
+    {
+        let default_state = agents
+            .get(&default_agent)
+            .expect("default agent must exist");
+        // Clone the Arc<SkillRegistry> and drop the MutexGuard before the await
+        // to avoid holding a std::sync::Mutex across an async boundary.
+        let skill_reg = default_state.skills.lock().expect("skills lock").clone();
+        let agent_infos: Vec<crate::kg::domain_builder::AgentInfo> = agents
+            .iter()
+            .map(|(name, state)| crate::kg::domain_builder::AgentInfo {
+                name: name.clone(),
+                role: None,
+                model: Some(state.llm.model_name().to_string()),
+            })
+            .collect();
+        let builder = crate::kg::domain_builder::DomainGraphBuilder::new(
+            &dashboard_db,
+            &skill_reg,
+            &tool_registry,
+            default_state.mcp_manager.as_ref(),
+            &agent_infos,
+        );
+        match builder.rebuild().await {
+            Ok(stats) => info!(
+                event = "domain_rebuild_complete",
+                added = stats.entities_added,
+                updated = stats.entities_updated,
+                removed = stats.entities_removed,
+                depends_on = stats.edges_depends_on,
+                provides = stats.edges_provides,
+                duration_ms = stats.duration_ms,
+                "domain graph ready"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                "domain graph rebuild failed; KG queries may return stale results until next restart"
+            ),
+        }
+    }
+
     let state = AppState {
         agents: Arc::new(agents),
         default_agent,

@@ -139,6 +139,22 @@ Git-based and local skill distribution via `mika skills install/uninstall/update
 
 Connects to external MCP servers at startup via `McpManager`. Configured in `{agent_home}/mcp.json`. Supports stdio and Streamable HTTP transports. Tools namespaced as `mcp__{server}__{tool}`. Dispatch chain: builtins -> skills -> MCP -> unknown error. MCP tools excluded from silent/heartbeat mode. Child processes use `env_clear()` + allowlist.
 
+## Knowledge Graph — Domain Graph Builder
+
+`src/kg/domain_builder.rs` — Deterministic startup-time builder that populates `kg_entities` and `kg_relationships` from four authoritative sources: `SkillRegistry`, `ToolRegistry`, `McpManager`, and agent configs. Runs once per server boot in `run_server()` after all agents are initialized. No LLM calls — pure code projection.
+
+**Entity types:** Skill, Tool, Agent, ProblemType (5 seeds: `ci_failure`, `merge_conflict`, `duplicate_pr`, `stale_uuid`, `fabrication`). **Relationship types:** `DEPENDS_ON` (Skill→Skill from `skill.toml` dependencies), `PROVIDES` (Skill→Tool from skill tools).
+
+**Sole-writer contract:** This module is the sole writer of `skill:*`, `tool:*`, `agent:*`, and `problem_type:*` entity_keys. No other code path writes these namespaces.
+
+**Idempotency:** Entity UPSERT via `INSERT ... ON CONFLICT(entity_key) DO UPDATE` preserves rowids (protects `kg_subject_resolutions.domain_entity_id` FK references). Relationships are DELETE-all-then-INSERT per rebuild. Stale entities are pruned with a type-scoped DELETE that only touches `KG_DOMAIN_ENTITY_TYPES`.
+
+**Failure policy:** Rebuild failures log `warn!` — the server continues to boot. KG queries return stale or empty results until the next successful rebuild. **Staleness contract:** Domain graph reflects registry state as of the last server boot.
+
+**Observability:** Single `trace_id` per rebuild invocation, INFO-level structured logs (`domain_rebuild_start`, `domain_rebuild_entities`, `domain_rebuild_edges`, `domain_rebuild_complete`). No `audit_events` rows (per conventions C3.1).
+
+**Cross-cutting conventions:** See `docs/architecture/kg-implementation-conventions.md` (C1–C3) and `docs/architecture/kg-id-convention.md` for the `<type>:<name>` entity key format.
+
 ## Silent Mode Agent Loop
 
 Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.

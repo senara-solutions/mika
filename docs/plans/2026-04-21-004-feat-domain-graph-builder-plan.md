@@ -1,7 +1,7 @@
 ---
 title: "feat: domain graph builder — deterministic import from skill manifests and tool registry"
 type: feat
-status: active
+status: completed
 date: 2026-04-21
 ---
 
@@ -274,7 +274,7 @@ Rebuild failures are **logged, not panicked**. If the builder fails (DB error, u
 
 ## Implementation Units
 
-- [ ] **Unit 1: `kg` module scaffolding + DomainGraphBuilder skeleton**
+- [x] **Unit 1: `kg` module scaffolding + DomainGraphBuilder skeleton**
 
 **Goal:** Create the module structure and the builder type signature with stubbed `rebuild()`. No logic yet — just the shape and the rustdoc that documents the invariants (sole writer, startup-only, idempotent).
 
@@ -307,7 +307,7 @@ Test expectation: none — this unit is scaffolding. Compilation is the success 
 
 ---
 
-- [ ] **Unit 2: Entity enumeration from authoritative sources**
+- [x] **Unit 2: Entity enumeration from authoritative sources**
 
 **Goal:** Implement `enumerate_sources()` — walks the four registries/configs and produces a `DesiredState` struct listing every entity that should exist in the graph.
 
@@ -343,7 +343,7 @@ Test expectation: none — this unit is scaffolding. Compilation is the success 
 
 ---
 
-- [ ] **Unit 3: Relationship enumeration**
+- [x] **Unit 3: Relationship enumeration**
 
 **Goal:** Extend `enumerate_sources()` (or add a companion method) to compute `DEPENDS_ON` and `PROVIDES` edges.
 
@@ -375,7 +375,7 @@ Test expectation: none — this unit is scaffolding. Compilation is the success 
 
 ---
 
-- [ ] **Unit 4: Idempotent write — UPSERT entities + rebuild relationships**
+- [x] **Unit 4: Idempotent write — UPSERT entities + rebuild relationships**
 
 **Goal:** Implement the write side. `upsert_entities` uses `INSERT ... ON CONFLICT(entity_key) DO UPDATE`. `rebuild_relationships` deletes all domain-sourced relationships and re-inserts. `prune_stale_entities` DELETEs entities no longer in sources.
 
@@ -419,7 +419,7 @@ Test expectation: none — this unit is scaffolding. Compilation is the success 
 
 ---
 
-- [ ] **Unit 5: Startup integration + failure policy**
+- [x] **Unit 5: Startup integration + failure policy**
 
 **Goal:** Hook `DomainGraphBuilder::rebuild()` into the server startup sequence after `apply_overrides()`. Failures log a warning and allow startup to continue — KG queries return stale or empty results rather than blocking the server.
 
@@ -449,7 +449,7 @@ Test expectation: none — this unit is scaffolding. Compilation is the success 
 
 ---
 
-- [ ] **Unit 6: Integration test suite**
+- [x] **Unit 6: Integration test suite**
 
 **Goal:** End-to-end tests that exercise the builder against realistic mock registries, covering idempotency, staleness, and cross-ticket invariants.
 
