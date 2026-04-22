@@ -798,6 +798,65 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 "docs/solutions not found — skipping lexical ingestion"
             );
         }
+
+        // Subject graph extraction: LLM-based NER + fact triples from
+        // previously-ingested chunks (#690). Runs asynchronously in the
+        // background after lexical ingestion — does not block server readiness.
+        // Per D2: startup extraction spawns one background task per agent.
+        match settings.make_kg_extraction_provider() {
+            Some(Ok(extraction_llm)) => {
+                for (agent_name, agent_state) in &agents {
+                    let db = agent_state.db.clone();
+                    let llm = extraction_llm.clone();
+                    let docs_root_clone = docs_root.clone();
+                    let agent_name_clone = agent_name.clone();
+
+                    tokio::spawn(async move {
+                        let extractor = crate::kg::subject_extractor::SubjectExtractor::new(
+                            db,
+                            llm,
+                            docs_root_clone,
+                            None,
+                        );
+                        match extractor.extract_pending().await {
+                            Ok(stats) => {
+                                if stats.docs_extracted > 0 || stats.docs_failed > 0 {
+                                    info!(
+                                        event = "subject_extraction_ready",
+                                        agent_id = %agent_name_clone,
+                                        docs_extracted = stats.docs_extracted,
+                                        docs_failed = stats.docs_failed,
+                                        entities = stats.total_entities,
+                                        relationships = stats.total_relationships,
+                                        duration_ms = stats.duration_ms,
+                                        "subject extraction complete"
+                                    );
+                                }
+                            }
+                            Err(e) => warn!(
+                                error = %e,
+                                agent_id = %agent_name_clone,
+                                "subject extraction failed; entities may be stale until next restart"
+                            ),
+                        }
+                    });
+                }
+            }
+            Some(Err(e)) => {
+                warn!(
+                    error = %e,
+                    event = "extraction_disabled",
+                    "failed to create KG extraction provider — subject extraction disabled"
+                );
+            }
+            None => {
+                info!(
+                    event = "extraction_disabled",
+                    reason = "no extraction model configured",
+                    "subject extraction disabled — set MIKA_KG_EXTRACTION_MODEL or MIKA_KG_INGESTION_MODEL to enable"
+                );
+            }
+        }
     }
 
     let state = AppState {

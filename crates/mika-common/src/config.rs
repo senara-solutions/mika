@@ -746,6 +746,18 @@ pub struct Settings {
     #[serde(default)]
     pub log_llm_bodies: bool,
 
+    // -- KG (Knowledge Graph) model settings --
+    /// KG ingestion model — shared fallback for extraction and resolution models.
+    /// Format: `provider/model` (e.g., `anthropic/claude-haiku-4-5-20251001`).
+    /// If unset, KG features requiring LLM calls are disabled.
+    #[serde(default)]
+    pub kg_ingestion_model: Option<String>,
+
+    /// KG extraction model — used for NER + fact-triple extraction (#690).
+    /// Falls back to `kg_ingestion_model` if unset.
+    #[serde(default)]
+    pub kg_extraction_model: Option<String>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -986,6 +998,42 @@ impl Settings {
             api_key: api_key.map(String::from),
         };
         crate::llm::create_provider(&spec, self.llm_max_tokens)
+    }
+
+    /// Create an LLM provider for KG extraction (NER + fact triples).
+    ///
+    /// Resolution order: `MIKA_KG_EXTRACTION_MODEL` → `MIKA_KG_INGESTION_MODEL` → `None`.
+    /// Format: `provider/model` (e.g., `anthropic/claude-haiku-4-5-20251001`).
+    /// Returns `None` when no KG model is configured (extraction disabled).
+    pub fn make_kg_extraction_provider(
+        &self,
+    ) -> Option<anyhow::Result<Arc<dyn crate::llm::LlmProvider>>> {
+        let model_str = self
+            .kg_extraction_model
+            .as_deref()
+            .or(self.kg_ingestion_model.as_deref())?;
+
+        Some(self.make_provider_from_model_string(model_str))
+    }
+
+    /// Parse a `provider/model` string and create an LLM provider.
+    ///
+    /// Reusable by `make_kg_extraction_provider` and future `make_kg_resolution_provider`.
+    fn make_provider_from_model_string(
+        &self,
+        model_str: &str,
+    ) -> anyhow::Result<Arc<dyn crate::llm::LlmProvider>> {
+        let (provider_str, model) = model_str
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!(
+                "KG model string must be in 'provider/model' format (e.g., 'anthropic/claude-haiku-4-5-20251001'), got: {model_str}"
+            ))?;
+
+        let provider: crate::llm::ProviderKind = provider_str
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))?;
+
+        self.make_provider_for(provider, Some(model))
     }
 
     /// Create an EmbeddingClient if OpenAI API key is configured.
