@@ -1,7 +1,7 @@
 //! # Knowledge Graph Layer
 //!
 //! The KG layer provides a graph-structured view of Mika's domain knowledge,
-//! split into three tiers:
+//! split into three tiers plus a cross-layer bridge:
 //!
 //! - **Domain graph** (this module, [`domain_builder`]): Deterministic, container-wide
 //!   projection of structural facts from skill manifests, tool registry, MCP connections,
@@ -16,9 +16,15 @@
 //! - **Subject graph** ([`subject_extractor`], #690): Per-agent LLM-extracted
 //!   entities and fact triples from compound docs. Uses constrained NER with
 //!   approved entity/relationship types.
+//!
+//! - **Entity resolution** ([`entity_resolver`], #691): Bridges subject graph to
+//!   domain graph by resolving extracted entity mentions to canonical domain nodes.
+//!   Two-stage pipeline: exact match + LLM disambiguation. Writes `SAME_AS` edges
+//!   in `kg_subject_resolutions` with confidence scores.
 
 pub mod chunker;
 pub mod domain_builder;
+pub mod entity_resolver;
 pub mod ingestion_orchestrator;
 pub mod lexical_ingestor;
 pub mod subject_extractor;

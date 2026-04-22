@@ -113,6 +113,7 @@ Optional (web search):
 Optional (Knowledge Graph LLM):
 - `MIKA_KG_INGESTION_MODEL` — Shared fallback model for KG extraction and resolution. Format: `provider/model` (e.g., `anthropic/claude-haiku-4-5-20251001`). If unset, KG features requiring LLM calls are disabled.
 - `MIKA_KG_EXTRACTION_MODEL` — Model for NER + fact-triple extraction (#690). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Task is mechanical JSON extraction — cheap/fast tier recommended.
+- `MIKA_KG_RESOLUTION_MODEL` — Model for entity resolution disambiguation (#691). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Mid-tier model recommended for better judgment on ambiguous matches.
 
 Optional (GitHub App — preferred over PAT for agent operations):
 - `MIKA_GITHUB_APP_ID` — GitHub App ID (u64). Required for GitHub App authentication.
