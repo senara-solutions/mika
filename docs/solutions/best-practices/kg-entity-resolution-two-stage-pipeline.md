@@ -1,6 +1,7 @@
 ---
 module: kg
 date: 2026-04-22
+last_updated: 2026-04-22
 problem_type: best_practice
 component: database
 severity: medium
@@ -35,9 +36,10 @@ The entity resolution module (#691) bridges subject graph entities to domain gra
 - If no match or low confidence, escalate to LLM (stage 2)
 
 **Stage 2 — LLM disambiguation** with bounded candidates:
-- Fetch all domain entities of the same type (max 50 candidates)
+- Fetch domain candidates via range query (`entity_key >= '{type}:' AND entity_key < '{type};'`) instead of LIKE to avoid underscore wildcard issues, bounded to 50 candidates
 - Include source chunk prose for context (via `kg_chunk_subjects` -> `kg_chunks` -> `search_content`)
 - LLM returns `{"match": "<entity_key>" | null, "confidence": 0.0-1.0}`
+- Candidate validation uses case-insensitive comparison (`eq_ignore_ascii_case`) — LLMs may return different casing than the canonical entity_key
 - `no_match` is an authorized first-class response — the prompt must not bias toward forced matching
 - Combined confidence = `min(extraction_confidence, llm_confidence)` — the chain is only as confident as its weakest link
 
