@@ -91,6 +91,7 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 - **HTTP server (mika-server)** — Axum, two auth layers, embedded dashboard. See `crates/mika-agent/CLAUDE.md`.
 - **Gateway** — Telegram + GitHub webhook routing, A2A proxy, Postgres. See `crates/mika-gateway/CLAUDE.md`.
 - **A2A protocol** — v0.3, JSON-RPC, task state machine. See `crates/mika-a2a/CLAUDE.md`.
+- **Knowledge Graph** — Three-layer KG (domain/lexical/subject) in SQLite. Domain graph builder runs at startup, deterministically projecting skills, tools, agents, and problem types into `kg_entities`/`kg_relationships`. See `crates/mika-agent/CLAUDE.md`.
 - **Docker images:** Multi-stage builds with BuildKit cache. `Dockerfile.agent` (95MB) for per-customer containers. `Dockerfile.gateway` for the stateless gateway. Both use rustls, non-root user `mika` (UID 1000). Release profile: LTO + strip. `docker-compose.yml` defines agent, gateway, and postgres services. **Host dependency:** `jq` is required by all skill handler scripts.
 - **CI/CD:** Four GitHub Actions workflows: `ci.yml` (PR checks), `release-plz.yml` (versioning/changelog), `release.yml` (cross-platform binaries), `publish-ui.yml` (`@senara-solutions/ui` to GitHub Packages). All actions pinned to commit SHAs.
 
