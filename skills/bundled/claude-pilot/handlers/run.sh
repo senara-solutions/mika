@@ -182,8 +182,8 @@ if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
         exit 1
     fi
 
-    # Fetch issue — validates it exists and is open, gets labels + title
-    ISSUE_JSON=$(gh issue view "$ISSUE_NUM" --repo "senara-solutions/$REPO" --json state,title,labels 2>/dev/null) || {
+    # Fetch issue — validates it exists and is open, gets labels + title + body
+    ISSUE_JSON=$(gh issue view "$ISSUE_NUM" --repo "senara-solutions/$REPO" --json state,title,labels,body 2>/dev/null) || {
         echo "Error: Issue #${ISSUE_NUM} not found in senara-solutions/${REPO}. Aborting." >&2
         exit 1
     }
@@ -194,19 +194,30 @@ if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
         exit 1
     fi
 
-    # Derive branch type from labels
-    LABELS=$(printf '%s' "$ISSUE_JSON" | jq -r '.labels[].name' 2>/dev/null)
-    BRANCH_TYPE="feat"
-    if printf '%s' "$LABELS" | grep -qi '^bug$'; then
-        BRANCH_TYPE="fix"
-    elif printf '%s' "$LABELS" | grep -qi '^chore$'; then
-        BRANCH_TYPE="chore"
-    fi
+    # Check issue body for a pre-committed branch callout (from planning sessions).
+    # Format: > - **Branch:** `feat/687/domain-graph-builder`
+    # This takes priority over title-derived branch names so claude-pilot lands
+    # on the branch where the plan file was committed.
+    ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // empty')
+    CALLOUT_BRANCH=$(printf '%s' "$ISSUE_BODY" | grep -oP '>\s*-?\s*\*\*Branch:\*\*\s*`\K[^`]+' | head -1)
 
-    # Derive branch name: type/number/kebab-title
-    ISSUE_TITLE=$(printf '%s' "$ISSUE_JSON" | jq -r '.title')
-    KEBAB_TITLE=$(printf '%s' "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | cut -c1-40)
-    BRANCH="${BRANCH_TYPE}/${ISSUE_NUM}/${KEBAB_TITLE}"
+    if [ -n "$CALLOUT_BRANCH" ]; then
+        BRANCH="$CALLOUT_BRANCH"
+    else
+        # Derive branch type from labels
+        LABELS=$(printf '%s' "$ISSUE_JSON" | jq -r '.labels[].name' 2>/dev/null)
+        BRANCH_TYPE="feat"
+        if printf '%s' "$LABELS" | grep -qi '^bug$'; then
+            BRANCH_TYPE="fix"
+        elif printf '%s' "$LABELS" | grep -qi '^chore$'; then
+            BRANCH_TYPE="chore"
+        fi
+
+        # Derive branch name: type/number/kebab-title
+        ISSUE_TITLE=$(printf '%s' "$ISSUE_JSON" | jq -r '.title')
+        KEBAB_TITLE=$(printf '%s' "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | cut -c1-40)
+        BRANCH="${BRANCH_TYPE}/${ISSUE_NUM}/${KEBAB_TITLE}"
+    fi
 
     # Sync main before branching to avoid stale worktrees.
     # Use plain `fetch origin main` (not the `main:main` refspec form) because the
