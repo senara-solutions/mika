@@ -64,12 +64,13 @@ mod outcome {
 
 /// A subject entity pending resolution.
 #[derive(Debug, Clone)]
-pub struct PendingEntity {
-    pub id: i64,
-    pub entity_key: String,
-    pub entity_type: String,
-    pub name: String,
-    pub confidence: f64,
+struct PendingEntity {
+    id: i64,
+    entity_key: String,
+    entity_type: String,
+    #[allow(dead_code)] // Loaded from DB schema; may be used in future diagnostics.
+    name: String,
+    confidence: f64,
 }
 
 /// A domain entity candidate for disambiguation.
@@ -111,22 +112,10 @@ enum ResolutionResult {
     Error(String),
 }
 
-/// Statistics from a resolution pass.
+/// Statistics from a resolution pass (used by both per-doc and batch resolution).
 #[derive(Debug, Clone, Default)]
 pub struct ResolutionStats {
     pub total: usize,
-    pub matched_exact: usize,
-    pub matched_llm: usize,
-    pub no_match: usize,
-    pub skipped_discovered: usize,
-    pub skipped_no_llm: usize,
-    pub errors: usize,
-}
-
-/// Statistics from a batch (startup) resolution.
-#[derive(Debug, Clone, Default)]
-pub struct BatchResolutionStats {
-    pub entities_total: usize,
     pub matched_exact: usize,
     pub matched_llm: usize,
     pub no_match: usize,
@@ -190,134 +179,24 @@ impl SubjectEntityResolver {
         entity_ids: &[i64],
         extraction_trace_id: &str,
     ) -> Result<ResolutionStats> {
-        let agent_id = self.db.agent_id.clone();
-
         if entity_ids.is_empty() {
             return Ok(ResolutionStats::default());
         }
 
-        // Fetch the subject entities by ID.
         let entities = self.get_entities_by_ids(entity_ids).await?;
-        let mut stats = ResolutionStats {
-            total: entities.len(),
-            ..Default::default()
-        };
+        let trace_lookup = |_id: i64| extraction_trace_id.to_owned();
+        let stats = self
+            .resolve_entities(&entities, &trace_lookup, "resolution_doc_complete")
+            .await;
 
-        for entity in &entities {
-            let start = Instant::now();
-            let result = self.resolve_single_entity(entity).await;
-            let duration_ms = start.elapsed().as_millis() as i64;
-
-            match &result {
-                ResolutionResult::ExactMatch {
-                    domain_entity_id,
-                    confidence,
-                } => {
-                    self.write_resolution(entity.id, *domain_entity_id, *confidence)
-                        .await;
-                    self.write_log(
-                        entity.id,
-                        outcome::MATCHED_EXACT,
-                        extraction_trace_id,
-                        None,
-                        Some(duration_ms),
-                    )
-                    .await;
-                    stats.matched_exact += 1;
-                }
-                ResolutionResult::LlmMatch {
-                    domain_entity_id,
-                    confidence,
-                } => {
-                    self.write_resolution(entity.id, *domain_entity_id, *confidence)
-                        .await;
-                    let model = self.llm.as_ref().map(|l| l.model_name().to_string());
-                    self.write_log(
-                        entity.id,
-                        outcome::MATCHED_LLM,
-                        extraction_trace_id,
-                        model.as_deref(),
-                        Some(duration_ms),
-                    )
-                    .await;
-                    stats.matched_llm += 1;
-                }
-                ResolutionResult::NoMatch => {
-                    let model = self.llm.as_ref().map(|l| l.model_name().to_string());
-                    self.write_log(
-                        entity.id,
-                        outcome::NO_MATCH,
-                        extraction_trace_id,
-                        model.as_deref(),
-                        Some(duration_ms),
-                    )
-                    .await;
-                    stats.no_match += 1;
-                }
-                ResolutionResult::SkippedDiscoveredType => {
-                    self.write_log(
-                        entity.id,
-                        outcome::SKIPPED_DISCOVERED_TYPE,
-                        extraction_trace_id,
-                        None,
-                        Some(duration_ms),
-                    )
-                    .await;
-                    stats.skipped_discovered += 1;
-                }
-                ResolutionResult::SkippedNoLlm => {
-                    self.write_log(
-                        entity.id,
-                        outcome::SKIPPED_NO_LLM,
-                        extraction_trace_id,
-                        None,
-                        Some(duration_ms),
-                    )
-                    .await;
-                    stats.skipped_no_llm += 1;
-                }
-                ResolutionResult::Error(msg) => {
-                    warn!(
-                        trace_id = %self.trace_id,
-                        agent_id = %agent_id,
-                        entity_key = %entity.entity_key,
-                        error = %msg,
-                        event = "resolution_entity_error",
-                    );
-                    self.write_log(
-                        entity.id,
-                        outcome::ERROR,
-                        extraction_trace_id,
-                        None,
-                        Some(duration_ms),
-                    )
-                    .await;
-                    stats.errors += 1;
-                }
-            }
-        }
-
-        // Emit audit event for the batch.
+        // Emit audit event for the per-doc batch.
         self.emit_audit_event(&stats).await;
-
-        info!(
-            trace_id = %self.trace_id,
-            agent_id = %agent_id,
-            total = stats.total,
-            matched_exact = stats.matched_exact,
-            matched_llm = stats.matched_llm,
-            no_match = stats.no_match,
-            skipped_discovered = stats.skipped_discovered,
-            skipped_no_llm = stats.skipped_no_llm,
-            errors = stats.errors,
-            event = "resolution_doc_complete",
-        );
 
         Ok(stats)
     }
 
     /// Resolve all pending entities for an agent (startup or re-resolution).
-    pub async fn resolve_pending(&self) -> Result<BatchResolutionStats> {
+    pub async fn resolve_pending(&self) -> Result<ResolutionStats> {
         let start = Instant::now();
         let agent_id = self.db.agent_id.clone();
 
@@ -331,137 +210,180 @@ impl SubjectEntityResolver {
         );
 
         if pending.is_empty() {
-            return Ok(BatchResolutionStats {
+            return Ok(ResolutionStats {
                 duration_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             });
         }
 
-        let mut batch_stats = BatchResolutionStats {
-            entities_total: pending.len(),
-            ..Default::default()
-        };
-
         // Get the latest extraction trace_id for each entity.
         let entity_ids: Vec<i64> = pending.iter().map(|e| e.id).collect();
         let trace_map = self.get_extraction_trace_ids(&entity_ids).await?;
+        let fallback_trace = self.trace_id.clone();
+        let trace_lookup = |id: i64| {
+            trace_map
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| fallback_trace.clone())
+        };
 
-        for entity in &pending {
-            let extraction_trace_id = trace_map
-                .get(&entity.id)
-                .map(|s| s.as_str())
-                .unwrap_or(&self.trace_id);
+        let mut stats = self
+            .resolve_entities(&pending, &trace_lookup, "resolution_pending_complete")
+            .await;
+        stats.duration_ms = start.elapsed().as_millis() as u64;
 
+        Ok(stats)
+    }
+
+    /// Shared resolution loop for both per-doc and batch paths.
+    ///
+    /// `trace_lookup` maps entity ID → extraction trace ID for staleness tracking.
+    async fn resolve_entities<F>(
+        &self,
+        entities: &[PendingEntity],
+        trace_lookup: &F,
+        completion_event: &str,
+    ) -> ResolutionStats
+    where
+        F: Fn(i64) -> String,
+    {
+        let agent_id = self.db.agent_id.clone();
+        let mut stats = ResolutionStats {
+            total: entities.len(),
+            ..Default::default()
+        };
+
+        for entity in entities {
+            let extraction_trace_id = trace_lookup(entity.id);
             let entity_start = Instant::now();
             let result = self.resolve_single_entity(entity).await;
             let duration_ms = entity_start.elapsed().as_millis() as i64;
 
-            match &result {
-                ResolutionResult::ExactMatch {
-                    domain_entity_id,
-                    confidence,
-                } => {
-                    self.write_resolution(entity.id, *domain_entity_id, *confidence)
-                        .await;
-                    self.write_log(
-                        entity.id,
-                        outcome::MATCHED_EXACT,
-                        extraction_trace_id,
-                        None,
-                        Some(duration_ms),
-                    )
-                    .await;
-                    batch_stats.matched_exact += 1;
-                }
-                ResolutionResult::LlmMatch {
-                    domain_entity_id,
-                    confidence,
-                } => {
-                    self.write_resolution(entity.id, *domain_entity_id, *confidence)
-                        .await;
-                    let model = self.llm.as_ref().map(|l| l.model_name().to_string());
-                    self.write_log(
-                        entity.id,
-                        outcome::MATCHED_LLM,
-                        extraction_trace_id,
-                        model.as_deref(),
-                        Some(duration_ms),
-                    )
-                    .await;
-                    batch_stats.matched_llm += 1;
-                }
-                ResolutionResult::NoMatch => {
-                    let model = self.llm.as_ref().map(|l| l.model_name().to_string());
-                    self.write_log(
-                        entity.id,
-                        outcome::NO_MATCH,
-                        extraction_trace_id,
-                        model.as_deref(),
-                        Some(duration_ms),
-                    )
-                    .await;
-                    batch_stats.no_match += 1;
-                }
-                ResolutionResult::SkippedDiscoveredType => {
-                    self.write_log(
-                        entity.id,
-                        outcome::SKIPPED_DISCOVERED_TYPE,
-                        extraction_trace_id,
-                        None,
-                        Some(duration_ms),
-                    )
-                    .await;
-                    batch_stats.skipped_discovered += 1;
-                }
-                ResolutionResult::SkippedNoLlm => {
-                    self.write_log(
-                        entity.id,
-                        outcome::SKIPPED_NO_LLM,
-                        extraction_trace_id,
-                        None,
-                        Some(duration_ms),
-                    )
-                    .await;
-                    batch_stats.skipped_no_llm += 1;
-                }
-                ResolutionResult::Error(msg) => {
-                    warn!(
-                        trace_id = %self.trace_id,
-                        agent_id = %agent_id,
-                        entity_key = %entity.entity_key,
-                        error = %msg,
-                        event = "resolution_pending_entity_error",
-                    );
-                    self.write_log(
-                        entity.id,
-                        outcome::ERROR,
-                        extraction_trace_id,
-                        None,
-                        Some(duration_ms),
-                    )
-                    .await;
-                    batch_stats.errors += 1;
-                }
+            self.apply_result(
+                entity,
+                &result,
+                &extraction_trace_id,
+                duration_ms,
+                &mut stats,
+            )
+            .await;
+
+            if let ResolutionResult::Error(msg) = &result {
+                warn!(
+                    trace_id = %self.trace_id,
+                    agent_id = %agent_id,
+                    entity_key = %entity.entity_key,
+                    error = %msg,
+                    event = "resolution_entity_error",
+                );
             }
         }
-
-        batch_stats.duration_ms = start.elapsed().as_millis() as u64;
 
         info!(
             trace_id = %self.trace_id,
             agent_id = %agent_id,
-            total = batch_stats.entities_total,
-            matched_exact = batch_stats.matched_exact,
-            matched_llm = batch_stats.matched_llm,
-            no_match = batch_stats.no_match,
-            skipped_discovered = batch_stats.skipped_discovered,
-            skipped_no_llm = batch_stats.skipped_no_llm,
-            errors = batch_stats.errors,
-            duration_ms = batch_stats.duration_ms,
-            event = "resolution_pending_complete",
+            total = stats.total,
+            matched_exact = stats.matched_exact,
+            matched_llm = stats.matched_llm,
+            no_match = stats.no_match,
+            skipped_discovered = stats.skipped_discovered,
+            skipped_no_llm = stats.skipped_no_llm,
+            errors = stats.errors,
+            event = %completion_event,
         );
 
-        Ok(batch_stats)
+        stats
+    }
+
+    /// Write resolution and log rows for a single entity result, update stats.
+    async fn apply_result(
+        &self,
+        entity: &PendingEntity,
+        result: &ResolutionResult,
+        extraction_trace_id: &str,
+        duration_ms: i64,
+        stats: &mut ResolutionStats,
+    ) {
+        match result {
+            ResolutionResult::ExactMatch {
+                domain_entity_id,
+                confidence,
+            } => {
+                self.write_resolution(entity.id, *domain_entity_id, *confidence)
+                    .await;
+                self.write_log(
+                    entity.id,
+                    outcome::MATCHED_EXACT,
+                    extraction_trace_id,
+                    None,
+                    Some(duration_ms),
+                )
+                .await;
+                stats.matched_exact += 1;
+            }
+            ResolutionResult::LlmMatch {
+                domain_entity_id,
+                confidence,
+            } => {
+                self.write_resolution(entity.id, *domain_entity_id, *confidence)
+                    .await;
+                let model = self.llm.as_ref().map(|l| l.model_name().to_string());
+                self.write_log(
+                    entity.id,
+                    outcome::MATCHED_LLM,
+                    extraction_trace_id,
+                    model.as_deref(),
+                    Some(duration_ms),
+                )
+                .await;
+                stats.matched_llm += 1;
+            }
+            ResolutionResult::NoMatch => {
+                let model = self.llm.as_ref().map(|l| l.model_name().to_string());
+                self.write_log(
+                    entity.id,
+                    outcome::NO_MATCH,
+                    extraction_trace_id,
+                    model.as_deref(),
+                    Some(duration_ms),
+                )
+                .await;
+                stats.no_match += 1;
+            }
+            ResolutionResult::SkippedDiscoveredType => {
+                self.write_log(
+                    entity.id,
+                    outcome::SKIPPED_DISCOVERED_TYPE,
+                    extraction_trace_id,
+                    None,
+                    Some(duration_ms),
+                )
+                .await;
+                stats.skipped_discovered += 1;
+            }
+            ResolutionResult::SkippedNoLlm => {
+                self.write_log(
+                    entity.id,
+                    outcome::SKIPPED_NO_LLM,
+                    extraction_trace_id,
+                    None,
+                    Some(duration_ms),
+                )
+                .await;
+                stats.skipped_no_llm += 1;
+            }
+            ResolutionResult::Error(_) => {
+                self.write_log(
+                    entity.id,
+                    outcome::ERROR,
+                    extraction_trace_id,
+                    None,
+                    Some(duration_ms),
+                )
+                .await;
+                stats.errors += 1;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -589,7 +511,7 @@ impl SubjectEntityResolver {
         let latency_ms = start.elapsed().as_millis() as u64;
 
         // 5. Parse and validate response. Semantic retry on malformed JSON (C2.2).
-        let parsed = match self.parse_disambiguation_response(&response_text) {
+        let parsed = match parse_disambiguation_json(&response_text) {
             Ok(p) => p,
             Err(parse_err) => {
                 warn!(
@@ -621,7 +543,10 @@ impl SubjectEntityResolver {
         match parsed.matched {
             Some(matched_key) => {
                 // Validate: matched entity_key must be in the candidate list.
-                if let Some(candidate) = candidates.iter().find(|c| c.entity_key == matched_key) {
+                if let Some(candidate) = candidates
+                    .iter()
+                    .find(|c| c.entity_key.eq_ignore_ascii_case(&matched_key))
+                {
                     if (0.0..=1.0).contains(&parsed.confidence) {
                         Ok(Some((candidate.id, parsed.confidence)))
                     } else {
@@ -731,20 +656,28 @@ impl SubjectEntityResolver {
     }
 
     /// Get domain candidates of a given type.
+    ///
+    /// Uses range comparison instead of LIKE to avoid underscore wildcard issues
+    /// (e.g., `problem_type:%` would match `problemXtype:foo` with LIKE).
     async fn get_domain_candidates(&self, entity_type: &str) -> Result<Vec<DomainCandidate>> {
-        let type_prefix = format!("{entity_type}:%");
+        let range_start = format!("{entity_type}:");
+        let range_end = format!("{entity_type};"); // ';' is one codepoint above ':' in ASCII
 
         self.db
             .with_db(move |db| {
                 let mut stmt = db.conn.prepare(
                     "SELECT id, entity_key, properties_json FROM kg_entities
-                     WHERE entity_key LIKE ?1
+                     WHERE entity_key >= ?1 AND entity_key < ?2
                      ORDER BY entity_key ASC
-                     LIMIT ?2",
+                     LIMIT ?3",
                 )?;
                 let candidates: Vec<DomainCandidate> = stmt
                     .query_map(
-                        rusqlite::params![type_prefix, MAX_DISAMBIGUATION_CANDIDATES as i64],
+                        rusqlite::params![
+                            range_start,
+                            range_end,
+                            MAX_DISAMBIGUATION_CANDIDATES as i64
+                        ],
                         |row| {
                             Ok(DomainCandidate {
                                 id: row.get(0)?,
@@ -788,6 +721,9 @@ impl SubjectEntityResolver {
     }
 
     /// Get the latest extraction trace IDs for a set of entity IDs.
+    ///
+    /// Uses a single batched query with dynamic IN clause (same pattern as
+    /// `get_entities_by_ids`) instead of N individual queries.
     async fn get_extraction_trace_ids(
         &self,
         entity_ids: &[i64],
@@ -797,21 +733,31 @@ impl SubjectEntityResolver {
 
         self.db
             .with_db(move |db| {
+                if ids.is_empty() {
+                    return Ok(std::collections::HashMap::new());
+                }
+
+                let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
+                    "SELECT subject_entity_id, extraction_trace_id
+                     FROM kg_chunk_subjects
+                     WHERE agent_id = ? AND subject_entity_id IN ({})
+                     ORDER BY created_at DESC",
+                    placeholders.join(",")
+                );
+                let mut stmt = db.conn.prepare(&sql)?;
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(agent_id)];
+                for id in &ids {
+                    params.push(Box::new(*id));
+                }
+
                 let mut map = std::collections::HashMap::new();
-                for &entity_id in &ids {
-                    let trace_id: Option<String> = db
-                        .conn
-                        .query_row(
-                            "SELECT extraction_trace_id FROM kg_chunk_subjects
-                             WHERE agent_id = ?1 AND subject_entity_id = ?2
-                             ORDER BY created_at DESC LIMIT 1",
-                            rusqlite::params![agent_id, entity_id],
-                            |row| row.get(0),
-                        )
-                        .ok();
-                    if let Some(tid) = trace_id {
-                        map.insert(entity_id, tid);
-                    }
+                let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows.flatten() {
+                    // First row per entity_id wins (ORDER BY created_at DESC).
+                    map.entry(row.0).or_insert(row.1);
                 }
                 Ok(map)
             })
@@ -962,11 +908,6 @@ impl SubjectEntityResolver {
                 Ok(None)
             }
         }
-    }
-
-    /// Parse LLM disambiguation response JSON.
-    fn parse_disambiguation_response(&self, text: &str) -> Result<DisambiguationResponse> {
-        parse_disambiguation_json(text)
     }
 
     /// Retry disambiguation with prompt reinforcement after semantic failure (C2.2).
@@ -1238,6 +1179,7 @@ mod tests {
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.matched, Some("tool:run_gh".to_string()));
+        assert!((parsed.confidence - 0.92).abs() < f64::EPSILON);
     }
 
     #[test]
