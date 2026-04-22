@@ -43,3 +43,9 @@ Seven eval harness tests (`test_self_knowledge_kg.rs`) verify loop integration f
 ## Pattern
 
 This is a "skill as orchestrator" pattern: the skill doesn't implement new tool logic — it provides routing guidance in the system prompt that helps the LLM choose between existing tools. The fallback table pattern (question category → specific tool to use) is reusable for any skill that needs to handle tool unavailability gracefully.
+
+## Related
+
+- [`workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md) — KG milestone retrospective; #692 is the capstone ticket that makes the KG queryable via agent-facing skills.
+- [`688-kg-query-tool-graph-traversal.md`](688-kg-query-tool-graph-traversal.md) — the `query_knowledge_graph` tool this skill orchestrates.
+- [`best-practices/kg-domain-graph-startup-projection-2026-04-22.md`](best-practices/kg-domain-graph-startup-projection-2026-04-22.md) — deterministic domain entities the skill's fallback routes to via `list_skills`/`list_agents`.

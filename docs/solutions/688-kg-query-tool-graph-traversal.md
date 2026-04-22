@@ -53,3 +53,9 @@ The initial implementation included `cross_layer: bool` in the tool schema but n
 - `crates/mika-agent/src/tools/query_knowledge_graph.rs` — Tool wrapper: input parsing, validation, output formatting
 - `crates/mika-agent/src/tools/mod.rs` — Tool registration
 - `crates/mika-agent/src/kg/mod.rs` — Module export
+
+## Related
+
+- [`workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md) — KG milestone retrospective; #688 is where the silent callback failure occurred (attributed to kimi-k2.5 conflating relay events with conversational turns; motivates `mika#721`).
+- [`692-self-knowledge-kg-upgrade.md`](692-self-knowledge-kg-upgrade.md) — consumer of this tool; uses the three-value status for fallback routing.
+- [`best-practices/kg-entity-resolution-two-stage-pipeline.md`](best-practices/kg-entity-resolution-two-stage-pipeline.md) — resolution edges this traversal uses for cross-layer hops.

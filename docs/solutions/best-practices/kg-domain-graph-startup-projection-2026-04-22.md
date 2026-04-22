@@ -71,6 +71,7 @@ WHERE type IN ('skill', 'tool', 'agent', 'problem_type')
 
 ## Related
 
+- [`../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md) — KG milestone retrospective (Socratic planning, dispatcher-side failures, follow-up tickets).
 - `docs/solutions/logic-errors/a2a-dual-write-duplicate-rows.md` — dual-write anti-pattern
 - `docs/solutions/database-issues/sql-column-mismatch-trace-detail-view.md` — column constants
 - `docs/solutions/database-issues/trace-id-as-observability-join-key.md` — trace_id pattern

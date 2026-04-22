@@ -99,3 +99,10 @@ Subject entity: solution_path:validate_before_write (confidence: 0.90)
 → Skipped: discovered types have no domain counterpart (D8)
 → kg_resolutions_log.outcome = 'skipped_discovered_type'
 ```
+
+## Related
+
+- [`../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md) — KG milestone retrospective; this ticket (#691) is where the LIKE wildcard bug and case-insensitivity bug were caught by `/ce:review`.
+- [`kg-subject-extraction-constrained-ner-2026-04-22.md`](kg-subject-extraction-constrained-ner-2026-04-22.md) — upstream extractor populating `kg_subject_entities`.
+- [`kg-domain-graph-startup-projection-2026-04-22.md`](kg-domain-graph-startup-projection-2026-04-22.md) — domain entities this layer resolves against.
+- `docs/architecture/kg-implementation-conventions.md` — cross-cutting KG conventions (C2 LLM policy, C4 confidence composition).

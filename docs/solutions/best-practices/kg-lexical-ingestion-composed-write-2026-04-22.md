@@ -83,3 +83,10 @@ See `crates/mika-agent/src/kg/lexical_ingestor.rs` for the canonical implementat
 - `ingest_single_doc_inner()` — single-transaction hash check + delete + insert
 - `delete_doc_chunks()` — symmetric cleanup using `db.delete_search_content()`
 - `normalize_content()` + `compute_hash()` — content normalization for idempotent hashing
+
+## Related
+
+- [`../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md) — KG milestone retrospective.
+- [`kg-subject-extraction-constrained-ner-2026-04-22.md`](kg-subject-extraction-constrained-ner-2026-04-22.md) — next KG layer, follows the same composed-write pattern.
+- [`kg-entity-resolution-two-stage-pipeline.md`](kg-entity-resolution-two-stage-pipeline.md) — bridges subject graph to domain graph.
+- `docs/architecture/kg-implementation-conventions.md` — cross-cutting KG conventions.

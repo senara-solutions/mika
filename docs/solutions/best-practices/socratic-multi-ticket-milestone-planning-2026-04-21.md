@@ -2,6 +2,7 @@
 title: "Socratic multi-ticket milestone planning in Claude Code"
 module: development_workflow
 date: 2026-04-21
+last_updated: 2026-04-22
 problem_type: best_practice
 component: development_workflow
 severity: low
@@ -122,6 +123,18 @@ If you catch yourself about to `git checkout -b` for a handoff artifact, stop an
 
 **Planning without Socratic iteration produces thin plans.** In a prior single-turn `/ce:plan` use for mika#628 (session `4cad7617`, 2026-04-17), the skill ran in a short-circuit path — "this is a lightweight config change, no research needed" — and jumped straight to `/ce:work`. That path is correct for trivial tickets but would have produced a surface-level plan if applied to KG-scale architectural work. (session history)
 
+## Post-Execution Notes (2026-04-22)
+
+The pattern was carried through all 7 tickets of milestone #14 and produced roughly 60 D-numbered decisions across the milestone's plan docs — not 23 as captured mid-milestone. Schema amendments D9–D10 (folded back from #689) were joined by D11–D15 (folded back from #690), confirming the fold-back mechanic scales past two tickets. Execution produced a clean sweep: seven PRs merged, no rolled-back designs. Details in [`../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md).
+
+**What the planner-side discipline did not prevent.** This doc covers the planner-side contract — plan on a branch, callout in the issue body, amendments fold upstream. The retrospective surfaced three classes of failure that sit on the *dispatcher* side and were invisible from here:
+
+- **Branch callout was not parsed by `/mika` or the claude-pilot handler.** #686 followed its plan by coincidence (derived slug matched the plan branch); #687 diverged and `mika-dev` reimplemented from the issue body alone, ignoring the D-decisions on that branch. Fix in `.claude/commands/mika.md` + `skills/bundled/claude-pilot/handlers/run.sh` landed mid-milestone and was cherry-picked to the remaining plan branches.
+- **Re-dispatch by PR number, not issue number**, produced a wrong reimplementation (PR #723) and forced a force-push revert of main. Always re-dispatch the issue.
+- **`blockedByIssues` GraphQL field does not exist** — the blocked-by dispatch guard (#713/#715) silently fell back to issue-number order, putting #688 before its dependencies. Fixed as `blockedBy` in PR #720.
+
+The planner-side pattern remains correct, but a milestone that passes every planner-side check can still dispatch wrong if the handler, dispatcher guards, and merge verification are buggy. Open follow-ups: `mika#721` (dedicated relay agent), `mika#727` (auto-merge vs merged), `mika#732` (`current_priorities` drift), and the unticketed callback→dispatch gap.
+
 ## When to Apply
 
 Apply this workflow when **all** of the following hold:
@@ -139,7 +152,7 @@ Apply partially (research + D-numbered plan + feature-branch commit, skipping th
 **Skip** this workflow when:
 
 - The ticket is a pure bug fix with a known root cause.
-- The ticket is a config tweak or one-line change (use the lightweight path — see `feedback_pipeline_scaling.md`).
+- The ticket is a config tweak or one-line change — skip this workflow, but note the `/mika` pipeline itself still runs in full. This doc only covers when to skip the **Socratic planning step**, not the pipeline. See `feedback_full_pipeline_always.md` (supersedes `feedback_pipeline_scaling.md`).
 - The ticket's acceptance criteria fully prescribe the design.
 - No architect is available — dispatch with notes on open questions and let `mika-dev` escalate via `canUseTool`.
 
@@ -222,6 +235,7 @@ Typed task references used throughout (per `feedback_task_reference_format.md`):
 
 ## Related Documentation
 
+- [`../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md) — hindsight companion to this forward-looking doc; the 7-ticket execution, what broke on the dispatcher side, and the tickets filed as follow-ups.
 - [`docs/architecture/kg-implementation-conventions.md`](../../architecture/kg-implementation-conventions.md) — the concrete conventions doc produced by this session's workflow; the shape to emulate for future milestones.
 - `../../plans/2026-04-21-003-feat-kg-sqlite-schema-plan.md`, `../../plans/2026-04-21-004-feat-domain-graph-builder-plan.md`, `../../plans/2026-04-21-005-feat-lexical-ingestion-plan.md` — the three plans this workflow produced; cite them as shape references when planning future KG tickets #690/#691/#688/#692.
 - `docs/solutions/architecture-patterns/2026-04-17-internalize-ce-pipeline-into-mika-skills.md` (meta-repo) — future direction for internalizing `/ce:plan` into a Mika-native skill; the Socratic pattern documented here is what such a skill should preserve.

@@ -87,6 +87,7 @@ Ok(ExtractionOutput {
 
 ## Related
 
+- [`../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md) — KG milestone retrospective; this ticket (#690) is where schema amendments D11–D15 to #686 originated.
 - `docs/solutions/best-practices/kg-lexical-ingestion-composed-write-2026-04-22.md` — lexical layer composed write pattern
 - `docs/solutions/best-practices/kg-domain-graph-startup-projection-2026-04-22.md` — domain layer deterministic projection
 - `docs/architecture/kg-implementation-conventions.md` — cross-cutting KG conventions (C2 LLM policy, C3 observability)

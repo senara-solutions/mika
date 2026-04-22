@@ -66,3 +66,4 @@ This pattern catches drift between the two migration paths that text-level DDL c
 - Plan: `docs/plans/2026-04-21-003-feat-kg-sqlite-schema-plan.md`
 - Issue: mika#686
 - Milestone: mika milestone#14 (Knowledge Graph)
+- Milestone retrospective: [`../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md`](../workflow-issues/kg-milestone-14-autonomous-execution-retrospective-2026-04-22.md) — covers the schema amendments D9–D15 that folded back from #689/#690.
