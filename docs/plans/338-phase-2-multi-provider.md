@@ -127,7 +127,7 @@ A **separate opt-in** real-API test (`#[test] #[ignore] fn real_api_schema_diver
 }
 ```
 
-A comparison command `cargo run --bin eval-diff -- {old.json} {new.json}` diffs two calibration artifacts and exits non-zero if a previously-tolerated divergence became a reject (or vice versa).
+A comparison command `cargo run --bin eval-diff -- {old.json} {new.json}` diffs two calibration artifacts and exits non-zero if a previously-tolerated divergence became a reject (or vice versa). **`eval-diff` output additionally includes per-scenario request token counts** so a PR reviewer adding a scenario can see when it dominates the matrix (e.g., "scenario X is 4.2× the matrix average at 47K tokens"). Observability, not enforcement — the goal is feedback-loop cost awareness for scenario authors, not a structural budget cap.
 
 **Committed baseline explicitly deferred.** A versioned `tests/fixtures/eval-baseline.json` is the obvious next step — but committing a reference without a maintenance loop is "an artifact that lies": it looks authoritative while silently rotting the moment a provider changes tolerance and no one regenerates. Two paths:
 - Ship the CI maintenance loop in #338 scope — ~40 lines of GitHub Actions YAML for a weekly calibration run that auto-opens a baseline-drift PR
@@ -139,21 +139,25 @@ A comparison command `cargo run --bin eval-diff -- {old.json} {new.json}` diffs 
 
 **Rejected alternatives:** (a) Commit the baseline with no maintenance loop — rejected as theater per friend review. (b) Ship the maintenance CI job in #338 scope — rejected to preserve scope narrowness; the job is meaningful enough work to warrant its own ticket (#742).
 
-### D8 — Cost controls: documented budget + structural intent gate, no runtime enforcement
+### D8 — Cost controls: structural intent gates only, no plan-level dollar estimate
 
 **Problem:** Real-API runs cost money. How do we prevent accidental $50 runs from a developer laptop?
 
-**Decision:** Two structural layers + one documentation layer. No runtime budget enforcement.
+**Decision:** Two structural layers. No runtime budget enforcement. No plan-level dollar estimate.
 
 - **Structural intent gate (Layer 1):** Every real-API test carries `#[ignore]`. The env var (`MIKA_EVAL_REAL_PROVIDERS`) alone does not trigger real API calls — a test invocation must explicitly pass `--ignored` (or `--include-ignored`). Accidentally running `cargo test` on a laptop with the env set still doesn't burn budget. This is the same principle as `feedback_prompt_enforcement_fragile.md`: structural > prompt-level. Cost protection is intent-based, not token-based.
 - **Structural env gate (Layer 2):** `MIKA_EVAL_REAL_PROVIDERS` controls which providers actually attempt real calls. Tests for unconfigured providers skip with a clear message.
-- **Documentation layer:** Cost baseline in test module doc + `crates/mika-agent/CLAUDE.md` eval section.
 
-Baseline estimate: Phase 2 full matrix against Anthropic+OpenAI+Kimi+Groq ≈ $0.40-0.65 per run (4 providers × ~5 scenarios × ~$0.02-0.03/scenario). Calibration mode doubles this if it also runs divergence probes.
+**No plan-level cost estimate.** A stated "$0.40-0.65/run" range in a plan doc is a commitment to accuracy the doc can't keep. Per-provider per-scenario pricing rots (Kimi via openrouter has non-obvious multi-layer billing; Anthropic output-token pricing shifts; scenarios can grow unexpectedly). A number that rots is doc-level cost enforcement — exactly the class of control rejected elsewhere via `feedback_prompt_enforcement_fragile.md`. Instead: **matrix cost is workflow-controlled via job timeout and scenario-count caps set in `.github/workflows/eval-matrix.yml`. Actual spend is observable on the CI run. No plan-level estimate.**
 
-**Rationale:** Cost enforcement via runtime token-counting is premature optimization for a risk that hasn't manifested. Intent-based structural gating (`#[ignore]` + env) makes accidental burn impossible without an explicit opt-in by the operator. CI workflows set their own per-run timeouts as a backstop.
+Observability for cost awareness lives in D7 (per-scenario token counts in `eval-diff` output), so PR reviewers see when a new scenario dominates the matrix.
 
-**Rejected alternative:** In-test token accumulator with hard cap. Adds plumbing and changes test failure semantics (cost-exceeded ≠ test-failed). Structural intent gate is the simpler correct answer.
+**Rationale:** Cost enforcement via runtime token-counting is premature optimization for a risk that hasn't manifested. Intent-based structural gating (`#[ignore]` + env) makes accidental burn impossible without explicit operator opt-in. Dollar estimates in plan docs age into lies and teach operators to distrust plan-level guidance.
+
+**Rejected alternatives:**
+- In-test token accumulator with hard cap. Adds plumbing and changes test failure semantics (cost-exceeded ≠ test-failed).
+- Per-provider cost table in `crates/mika-agent/CLAUDE.md`. Same rot problem as the dollar estimate; maintenance burden without structural value.
+- Per-scenario max-tokens cap at the harness level (`EvalScenario.max_request_tokens`). Not YAGNI-worthy for #338; revisit as a follow-up if D7 observability surfaces actual budget blowouts.
 
 ### D9 — Request-side JSON-schema well-formedness assertions (the layer that catches `task_id`)
 
@@ -187,9 +191,11 @@ Collapsing any two of these into one misses a bug class. Friend review was expli
 - [ ] D4: Harness tests (mock-based) for 4 schema divergence classes on the response-handling layer. Separate real-API calibration test `#[ignore]`-gated.
 - [ ] D5: `test_per_skill_provider_override.rs` exists, uses two mock providers with distinct names, trace asserts provider attribution per call.
 - [ ] D6: Three new test files — max-steps continuation, required-tools gate, multi-turn persistence — all mock-based.
-- [ ] D7: Calibration artifact schema stable (versioned); `eval-diff` binary present and tested against fixture artifacts. Baseline is **ephemeral** (gitignored in `target/eval-calibration/`); committed baseline deferred to **mika#742**.
-- [ ] D8: Cost baseline documented in `crates/mika-agent/CLAUDE.md` eval section and test module doc. **Every real-API test carries `#[ignore]`** — intent-based structural gate.
-- [ ] D9: `test_request_wellformedness.rs` exists. Tests for required-array dedup, schema-properties coherence, enum membership, reserved-name shadowing. Runs in CI on every push. Retro-validates: would have caught the `task_id` bug (commit `440a9d59`).
+- [ ] D7: Calibration artifact schema stable (versioned); `eval-diff` binary present and tested against fixture artifacts. Baseline is **ephemeral** (gitignored in `target/eval-calibration/`); committed baseline deferred to **mika#742**. **`eval-diff` output includes per-scenario request token counts** flagging scenarios that dominate the matrix (observability-only; no enforcement).
+- [ ] D8: **Every real-API test carries `#[ignore]`** — intent-based structural gate. No plan-level cost estimate; workflow-level controls only (job timeout + scenario caps in `.github/workflows/eval-matrix.yml`). Documentation references workflow configuration, not dollar figures.
+- [ ] **D9a — Frozen regression fixture:** `test_request_wellformedness.rs` includes a committed fixture that reproduces the pre-fix `task_id` schema output — the exact duplicate-entry-in-`required` shape from `inject_task_id_field` at commit `440a9d59`. Test MUST fail against the fixture when the dedup assertion is removed; MUST pass with it. Fixture is frozen (checked-in JSON), not regenerated from current code — so a future refactor of `inject_task_id_field` that narrows coverage does not silently retain a green test.
+- [ ] **D9b — Emitter code-path enumeration:** Assertions run against schemas produced by *every* code path that emits tool schemas to the provider. At minimum: `default_tools()`, skill-injected tools via `inject_task_id_field`, MCP-exposed tools via `McpManager`. Test module enumerates covered emitters explicitly in a doc comment; adding a new emitter path elsewhere in the codebase without adding it here is a review-blocking oversight.
+- [ ] D9c — Additional harness-level well-formedness rules: schema-properties/required coherence (`required` entries exist in `properties`), enum non-emptiness + no-duplicates, reserved-name shadowing (tool names don't collide with builtins like `run_agent`).
 - [ ] Existing 13 Phase 1 tests still pass.
 - [ ] `cargo test -p mika-agent --test eval` green (mock + D9 subsets). Real-API tests pass when invoked with `--ignored` + env + keys.
 - [ ] `cargo clippy` clean.
@@ -221,3 +227,10 @@ Collapsing any two of these into one misses a bug class. Friend review was expli
 - **D9 (new):** Request-side JSON-schema well-formedness assertions. Friend's sharpest push: the `task_id` bug lived at request construction; no response-handling test would have caught it. Three layers now (D9 well-formedness / D4.1 mock rejection handling / D4.2 real-API drift) — each catches a different bug class; collapsing any two misses a class.
 
 **Friend principle adopted across amendments:** "what would have actually caught the motivating incident" > "what seems reasonable to test." D9 is the direct application.
+
+**Second friend review pass (2026-04-22, relayed by Vincent):**
+
+- **D8 cost estimate dropped.** A doc-stated "$0.40-0.65/run" is a rotting commitment to accuracy. Replaced with workflow-controlled language referencing `.github/workflows/eval-matrix.yml` — numbers live where rot is expected (CI logs, PR descriptions), not in plan docs that future tickets cite.
+- **D9 AC split into D9a (frozen regression fixture) + D9b (emitter enumeration) + D9c (remaining rules).** Sharpest change: "would have caught `task_id`" is a claim; a committed fixture reproducing the pre-fix schema that fails without the assertion is a structural proof. Same structural-over-prompt principle driving the rest of the milestone. Bonus: the fixture becomes the natural landing place for future schema-construction bug regressions — D9 is a fixture catalog, not a single assertion.
+- **D7 gets per-scenario token counts in `eval-diff` output.** Observability-only. Feedback loop for scenario authors via PR logs, not a structural cap. Per-scenario `max_request_tokens` guardrail explicitly deferred as a follow-up (file only if D7 observability shows authors actually blowing budget).
+- **Edge direction sanity-checked:** `#742 blockedBy #338` confirmed via GraphQL query (`#338.blockedBy` returns `#340` only; `#742.blockedBy` returns `#338`). Mutation went the intended direction.
