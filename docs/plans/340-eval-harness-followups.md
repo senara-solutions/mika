@@ -83,7 +83,7 @@ Not a runtime assertion, not in CLAUDE.md — doc comment next to the code that 
 
 **Rationale:** Test needs are simple — "is this agent resilient when health check fails?". Sequence-based mock health (first fails, then succeeds) is YAGNI for current scenarios; can be added later if a scenario demands it.
 
-**Rejected alternative:** A `Vec<Option<LlmError>>` sequence matching the responses. Complexity premium not justified.
+**Rejected alternative:** A `Vec<Option<LlmError>>` sequence matching the responses. Complexity premium not justified today. If a future scenario needs retry-with-recovery semantics ("health fails once, agent retries, succeeds"), extend to `health_errors(Vec<Option<LlmError>>)` at that point — non-breaking addition alongside the single-error method, not a replacement.
 
 ### D6 — One PR, no item split
 
@@ -93,17 +93,15 @@ Not a runtime assertion, not in CLAUDE.md — doc comment next to the code that 
 
 1. D2 first — `Settings::test_defaults()` — trivial, reduces noise in subsequent diffs
 2. D1 — four DI builders — the structural change
-3. D3 — callback-turn test — depends on D1 being in place (won't use it directly but shares the builder pattern)
-4. D5 — `health_error()` — standalone in `mock.rs`
-5. D4 — doc comment on `trace.rs` — last
+3. D3, D5, D4 — independent of D1 and of each other, order immaterial
 
-**Rationale:** The review's rationale (same files) still holds. A multi-PR split would paper-cut reviewers without reducing risk. CI will cover the individual tests.
+**Rationale:** The review's rationale (same files) still holds. A multi-PR split would paper-cut reviewers without reducing risk. CI will cover the individual tests. Only real ordering constraint is D2 → everything else (reduces diff noise against `Settings` churn); the rest can land in any order.
 
 ## Acceptance Criteria
 
 Maps 1:1 to the issue's five items:
 
-- [ ] D1: four builder methods on `EvalHarnessBuilder` present, threaded into `AgentParams`, default `None`. At least one existing test uses each new builder (smoke test, can be in one scenario exercising all four set to non-None mocks).
+- [ ] D1: four builder methods on `EvalHarnessBuilder` present, threaded into `AgentParams`, default `None`. **Wiring smoke test** — one scenario sets all four to non-None mocks and asserts they appear in the trace. This proves the builder chain compiles and threads into `AgentParams`; it is explicitly NOT behavioral test coverage (that lands with the downstream callers in #338/#740/#741 that actually exercise the deps).
 - [ ] D2: `Settings::test_defaults()` exists in `mika-common`, gated by `test-utils` feature; `harness.rs::dummy_settings()` removed; all 13 existing eval tests still pass.
 - [ ] D3: `test_callback_turn.rs` with the two assertions described. Trace validates `SilentTrigger::Callback` path.
 - [ ] D4: doc comment present on `AgentTrace::from_run`.
@@ -126,10 +124,11 @@ Maps 1:1 to the issue's five items:
 - Plan follows KG-milestone Socratic pattern: D-numbered decisions with rationale and rejected alternatives so downstream plans can cite upstream decisions by number.
 - Branch name `feat/340/eval-harness-followups` is the canonical dispatch branch. Issue body carries a `> **Branch:** \`feat/340/eval-harness-followups\`` callout so `/mika` handlers resolve to this branch on dispatch.
 
-## Open questions (for Vincent before dispatch)
+## Review log
 
-Flag anything you want amended before I dispatch to mika-dev. Specifically:
-
-1. D1 — should the four DI builders also be exposed via a single aggregate method (e.g., `.dependencies(deps)`) for tests that want all four at once? Or is four parallel methods final?
-2. D3 — one callback scenario is minimal. Should there be a second for the error-path case (callback delivers failure)?
-3. D5 — should `health_error()` also support "fail N times, then succeed" for retry-loop tests?
+**Vincent review 2026-04-22:**
+- D1 AC reworded from "test coverage" to explicit "wiring smoke test" — honest about what the smoke test does and doesn't prove. Real validation is in downstream callers (#338/#740/#741).
+- D6 ordering: dropped the false D3→D1 dependency. Only real constraint is D2 → everything else.
+- D3: single-scenario call stands. Sanity check against #741 confirmed none of its scenarios touch callback error paths; the hypothetical "debug a ghost" risk is not load-bearing. Revisit if a later ticket actually exercises callback failures.
+- D5: single-error stays; rejected alternative note expanded to signal `health_errors(Vec<Option<LlmError>>)` as a non-breaking future extension, so the door isn't closed.
+- D1 aggregate method explicitly rejected — one way to do it.
