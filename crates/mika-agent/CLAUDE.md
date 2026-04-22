@@ -99,7 +99,7 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 ### Introspection Tools
 
-4 read-only tools: `query_timeline`, `get_session_messages`, `list_audit_events`, `search_tool_history` (30-day retention, 500-char field truncation, 10KB output cap). Non-orchestrator agents scoped to their own agent_id/sessions.
+5 read-only tools: `query_timeline`, `get_session_messages`, `list_audit_events`, `search_tool_history` (30-day retention, 500-char field truncation, 10KB output cap), `query_knowledge_graph`. Non-orchestrator agents scoped to their own agent_id/sessions.
 
 ## Skills System
 
@@ -188,6 +188,26 @@ Connects to external MCP servers at startup via `McpManager`. Configured in `{ag
 **LLM policy (C2):** Model from `MIKA_KG_RESOLUTION_MODEL` → `MIKA_KG_INGESTION_MODEL` fallback. Mid-tier model recommended. Same C2.2 retry taxonomy as extraction. `no_match` is a first-class LLM response (not an error). `llm_calls` rows per C2.4. Per-batch audit events per C3.3.
 
 **Failure policy:** Resolution failures are log-and-skip per C2.3. Failed entities stay pending for next startup's `resolve_pending`. No resolution model configured → exact-match-only mode with `outcome = 'skipped_no_llm'`.
+
+## Knowledge Graph — Query Tool
+
+`src/kg/query.rs` + `src/tools/query_knowledge_graph.rs` — Read-only graph traversal tool that lets agents discover capabilities, find solution paths, and reason about their environment (#688). Registered in `default_tools()`.
+
+**Query modes:** Exactly one of `question` (free-text → entry path resolution) or `traversal.start` (known `entity_key` → direct traversal). `agent_id` enables agent-scoped context enrichment. `include_context` returns chunk prose text. `result_limit` caps output (max 20 entities, 30 edges, 10 chunks).
+
+**Hybrid entry paths (D1):** Three parallel strategies find starting entities from a free-text question:
+- **Path A** — Direct domain entity match: case-insensitive LIKE on `kg_entities.name`/`entity_key`. Confidence: 1.0 (exact) / 0.8 (LIKE).
+- **Path B** — Subject entity match (agent-scoped): same against `kg_subject_entities`. Confidence scaled by extraction confidence.
+- **Path C** — Semantic search via chunks: `hybrid_search(source_type="kg_chunk")` → `kg_chunk_subjects` → subject entities → resolve to domain via `kg_subject_resolutions` (substitutes domain entity when resolved, keeps subject when unresolved).
+Results merged, deduped by `(layer, entity_id)` keeping highest confidence, top-K (5) as traversal starting points.
+
+**Graph traversal (D2):** Recursive CTE over `kg_relationships` (domain) and `kg_subject_relationships` (subject). Delimiter-bounded cycle detection (`INSTR(',' || path || ',', ...)`). Default depth 2, cap 4. Default edge types: `SOLVED_BY`, `PROVIDES`, `DEPENDS_ON`, `USES`, `CALLS` (overridable via `follow`).
+
+**Ranking (D3):** Lexicographic sort on `(hop ASC, cumulative_confidence DESC)`. Distance always dominates.
+
+**Agent context (D5):** Annotate, don't filter. Skill entities enriched with `agent_context.enabled` (tri-state from `skill_overrides.enabled` via `COALESCE`). Non-skill entities have no context.
+
+**Status values (D4):** `ok` (results found), `starting_entity_missing` (all entry paths failed), `traversal_empty` (entity found, no edges). Status enables #692 self-knowledge skill fallback logic.
 
 ## Silent Mode Agent Loop
 
