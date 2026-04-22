@@ -348,6 +348,8 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
 | `brave_api_key` | `Option<String>` | None | `MIKA_BRAVE_API_KEY` | Brave Search API key for `web_search` builtin skill. Get a free key at https://brave.com/search/api/. |
+| `kg_ingestion_model` | `Option<String>` | None | `MIKA_KG_INGESTION_MODEL` | Shared fallback model for KG extraction and resolution. Format: `provider/model` (e.g., `anthropic/claude-haiku-4-5-20251001`). If unset, KG features requiring LLM calls are disabled. |
+| `kg_extraction_model` | `Option<String>` | None | `MIKA_KG_EXTRACTION_MODEL` | Model for NER + fact-triple extraction (#690). Falls back to `kg_ingestion_model` if unset. Cheap/fast tier recommended. |
 | `github_token` | `Option<String>` | None | `MIKA_GITHUB_TOKEN` | GitHub Personal Access Token for agent operations (context injection, work item enrichment, PR merge). Needs Pull requests R/W, Issues R/W, Contents R scopes. |
 | `investigate_github_token` | `Option<String>` | None | `MIKA_INVESTIGATE_GITHUB_TOKEN` | GitHub Personal Access Token for the investigation panel's issue creation tool only. Needs `repo` scope for private repos or `public_repo` for public. Both `investigate_github_token` and `github_repo` must be set to enable the tool. |
 | `github_repo` | `Option<String>` | None | `MIKA_GITHUB_REPO` | Target GitHub repository in `owner/repo` format (e.g. `senara-solutions/mika`). Validated at registration time — must contain exactly one `/`. |
@@ -528,6 +530,8 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
 | `MIKA_OPENAI_API_KEY` | No | OpenAI API key (LLM + Layer 3 vector search) |
 | `MIKA_BRAVE_API_KEY` | No | Brave Search API key for web search skill |
+| `MIKA_KG_INGESTION_MODEL` | No | Shared fallback KG model (`provider/model` format) |
+| `MIKA_KG_EXTRACTION_MODEL` | No | KG extraction model (falls back to `MIKA_KG_INGESTION_MODEL`) |
 | `MIKA_GITHUB_TOKEN` | No | GitHub token for agent operations |
 | `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation only |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |
