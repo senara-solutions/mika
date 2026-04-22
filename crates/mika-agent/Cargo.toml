@@ -52,6 +52,7 @@ mika-a2a.workspace = true
 dashmap.workspace = true
 url.workspace = true
 regex.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
