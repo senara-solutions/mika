@@ -43,9 +43,6 @@ pub struct TraversalInput {
     pub follow: Option<Vec<String>>,
     /// Max traversal depth (default: 2, cap: 4).
     pub max_depth: Option<u32>,
-    /// Enable cross-layer hops (default: false).
-    #[serde(default)]
-    pub cross_layer: bool,
 }
 
 /// Query result returned to the tool.
@@ -126,14 +123,13 @@ struct TraversedEntity {
     layer: Layer,
     hop: u32,
     cumulative_confidence: f64,
-    provenance_count: i64,
 }
 
 /// Internal representation of a traversed edge.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct TraversedEdge {
     from_entity_id: i64,
+    #[allow(dead_code)]
     to_entity_id: i64,
     to_entity_key: String,
     edge_type: String,
@@ -161,8 +157,7 @@ const DEFAULT_FOLLOW: &[&str] = &["SOLVED_BY", "PROVIDES", "DEPENDS_ON", "USES",
 const DEFAULT_MAX_DEPTH: u32 = 2;
 const MAX_DEPTH_CAP: u32 = 4;
 const DEFAULT_ENTRY_TOP_K: usize = 5;
-const DEFAULT_RESULT_LIMIT: usize = 20;
-const MAX_ENTITIES: usize = 20;
+const MAX_RESULT_ENTITIES: usize = 20;
 const MAX_EDGES: usize = 30;
 const MAX_CHUNKS: usize = 10;
 
@@ -207,8 +202,8 @@ pub async fn query_knowledge_graph(
 
     let result_limit = input
         .result_limit
-        .unwrap_or(DEFAULT_RESULT_LIMIT)
-        .min(MAX_ENTITIES);
+        .unwrap_or(MAX_RESULT_ENTITIES)
+        .min(MAX_RESULT_ENTITIES);
 
     let agent_id = input.agent_id.as_deref();
 
@@ -267,7 +262,8 @@ pub async fn query_knowledge_graph(
     let (traversed, edges) =
         traverse_graph(db, &starting_entities, &follow_types, max_depth, agent_id).await?;
 
-    if edges.is_empty() && traversed.len() <= starting_entities.len() {
+    let has_traversed_neighbors = traversed.iter().any(|e| e.hop > 0);
+    if !has_traversed_neighbors {
         // Starting entities found but no edges to follow
         let entries = starting_entities
             .iter()
@@ -437,7 +433,11 @@ async fn resolve_entry_paths(
     }
 
     // Sort by confidence descending, take top-K
-    deduped.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+    deduped.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     deduped.truncate(DEFAULT_ENTRY_TOP_K);
 
     let method = deduped.first().map(|e| e.entry_method);
@@ -576,11 +576,10 @@ async fn find_entities_via_chunks(
 
     // Find subject entities linked to these chunks via kg_chunk_subjects
     let aid = agent_id.map(|s| s.to_owned());
-    let scores: HashMap<i64, f64> = search_results
+    let chunk_scores: HashMap<i64, f64> = search_results
         .iter()
         .filter_map(|r| r.source_id.map(|id| (id, r.score)))
         .collect();
-    let scores_clone = scores.clone();
 
     let subject_entities: Vec<(i64, String, String, String, f64, i64)> = db
         .with_db(move |db| {
@@ -631,7 +630,7 @@ async fn find_entities_via_chunks(
         if !seen_subject_ids.insert(*se_id) {
             continue;
         }
-        let search_score = scores_clone.get(chunk_id).copied().unwrap_or(0.5);
+        let search_score = chunk_scores.get(chunk_id).copied().unwrap_or(0.5);
 
         // Try to resolve subject entity to domain via kg_subject_resolutions
         let resolved = resolve_subject_to_domain(db, *se_id, agent_id).await?;
@@ -723,7 +722,6 @@ async fn traverse_graph(
                 layer: entry.layer,
                 hop: 0,
                 cumulative_confidence: entry.confidence,
-                provenance_count: 0,
             });
         }
     }
@@ -799,7 +797,7 @@ async fn traverse_domain_layer(
                 JOIN traverse t ON t.entity_id = r.from_entity_id \
                 WHERE t.hop < ? \
                   AND r.type IN ({type_placeholders}) \
-                  AND INSTR(t.path, CAST(r.to_entity_id AS TEXT)) = 0 \
+                  AND INSTR(',' || t.path || ',', ',' || CAST(r.to_entity_id AS TEXT) || ',') = 0 \
             ) \
             SELECT DISTINCT t.entity_id, t.hop, t.cumulative_conf, \
                    e.entity_key, e.name, e.type \
@@ -834,7 +832,6 @@ async fn traverse_domain_layer(
                 name: row.get::<_, String>(4)?,
                 entity_type: row.get::<_, String>(5)?,
                 layer: Layer::Domain,
-                provenance_count: 0,
             });
         }
         drop(raw_rows);
@@ -927,7 +924,7 @@ async fn traverse_subject_layer(
                 WHERE t.hop < ? \
                   AND r.type IN ({type_placeholders}) \
                   AND r.agent_id = ? \
-                  AND INSTR(t.path, CAST(r.to_entity_id AS TEXT)) = 0 \
+                  AND INSTR(',' || t.path || ',', ',' || CAST(r.to_entity_id AS TEXT) || ',') = 0 \
             ) \
             SELECT DISTINCT t.entity_id, t.hop, t.cumulative_conf, \
                    e.entity_key, e.name, e.type \
@@ -965,7 +962,6 @@ async fn traverse_subject_layer(
                 name: row.get::<_, String>(4)?,
                 entity_type: row.get::<_, String>(5)?,
                 layer: Layer::Subject,
-                provenance_count: 0,
             });
         }
         drop(raw_rows);
@@ -1030,22 +1026,19 @@ async fn traverse_subject_layer(
 
 // ── Ranking and Budgeting (Unit 3) ──────────────────────────────────────────
 
-/// Rank results by (hop ASC, cumulative_confidence DESC, provenance_count DESC).
+/// Rank results by (hop ASC, cumulative_confidence DESC).
 /// Apply result budget caps.
 fn rank_and_budget(mut entities: Vec<TraversedEntity>, limit: usize) -> Vec<TraversedEntity> {
-    // Lexicographic sort: hop ascending, then confidence descending, then provenance descending
+    // Lexicographic sort: hop ascending, then confidence descending
     entities.sort_by(|a, b| {
-        a.hop
-            .cmp(&b.hop)
-            .then_with(|| {
-                b.cumulative_confidence
-                    .partial_cmp(&a.cumulative_confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| b.provenance_count.cmp(&a.provenance_count))
+        a.hop.cmp(&b.hop).then_with(|| {
+            b.cumulative_confidence
+                .partial_cmp(&a.cumulative_confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
 
-    entities.truncate(limit.min(MAX_ENTITIES));
+    entities.truncate(limit.min(MAX_RESULT_ENTITIES));
     entities
 }
 
@@ -1399,7 +1392,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: None,
                 max_depth: Some(1),
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1470,7 +1462,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: None,
                 max_depth: Some(1),
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1511,7 +1502,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: None,
                 max_depth: Some(2),
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1540,7 +1530,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: Some(vec!["PROVIDES".to_string()]),
                 max_depth: Some(2),
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1562,7 +1551,6 @@ mod tests {
                 start: Some("solution_path:webhook_ci_handler".to_string()),
                 follow: Some(vec!["SOLVED_BY".to_string()]),
                 max_depth: Some(1),
-                cross_layer: false,
             }),
             agent_id: Some("mika".to_string()),
             include_context: false,
@@ -1589,7 +1577,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: None,
                 max_depth: Some(0),
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1621,7 +1608,6 @@ mod tests {
                 start: Some("agent:lonely".to_string()),
                 follow: None,
                 max_depth: Some(2),
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1645,7 +1631,6 @@ mod tests {
                 layer: Layer::Domain,
                 hop: 2,
                 cumulative_confidence: 1.0,
-                provenance_count: 100,
             },
             TraversedEntity {
                 entity_id: 2,
@@ -1655,7 +1640,6 @@ mod tests {
                 layer: Layer::Domain,
                 hop: 1,
                 cumulative_confidence: 0.5,
-                provenance_count: 0,
             },
         ];
 
@@ -1675,7 +1659,6 @@ mod tests {
                 layer: Layer::Domain,
                 hop: 1,
                 cumulative_confidence: 0.5,
-                provenance_count: 0,
             },
             TraversedEntity {
                 entity_id: 2,
@@ -1685,7 +1668,6 @@ mod tests {
                 layer: Layer::Domain,
                 hop: 1,
                 cumulative_confidence: 0.9,
-                provenance_count: 0,
             },
         ];
 
@@ -1705,12 +1687,11 @@ mod tests {
                 layer: Layer::Domain,
                 hop: 0,
                 cumulative_confidence: 1.0,
-                provenance_count: 0,
             });
         }
 
         let ranked = rank_and_budget(entities, 20);
-        assert!(ranked.len() <= MAX_ENTITIES);
+        assert!(ranked.len() <= MAX_RESULT_ENTITIES);
     }
 
     // ── Unit 4: Agent context enrichment tests ──────────────────────────
@@ -1726,7 +1707,6 @@ mod tests {
                 start: Some("skill:build-mika".to_string()),
                 follow: None,
                 max_depth: Some(0),
-                cross_layer: false,
             }),
             agent_id: Some("mika".to_string()),
             include_context: false,
@@ -1766,7 +1746,6 @@ mod tests {
                 start: Some("skill:build-mika".to_string()),
                 follow: None,
                 max_depth: Some(0),
-                cross_layer: false,
             }),
             agent_id: Some("mika".to_string()),
             include_context: false,
@@ -1794,7 +1773,6 @@ mod tests {
                 start: Some("skill:build-mika".to_string()),
                 follow: None,
                 max_depth: Some(0),
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1821,7 +1799,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: None,
                 max_depth: Some(0),
-                cross_layer: false,
             }),
             agent_id: Some("mika".to_string()),
             include_context: false,
@@ -1846,7 +1823,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: None,
                 max_depth: None,
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1884,7 +1860,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: None,
                 max_depth: Some(100), // should be capped to 4
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1908,7 +1883,6 @@ mod tests {
                 start: Some("problem_type:ci_failure".to_string()),
                 follow: None,
                 max_depth: Some(2),
-                cross_layer: false,
             }),
             agent_id: None,
             include_context: false,
@@ -1928,5 +1902,108 @@ mod tests {
                 .iter()
                 .any(|e| e.edge_type == "SOLVED_BY" && e.target == "skill:build-mika")
         );
+    }
+
+    // ── Cycle detection tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cycle_detection_prevents_infinite_loop() {
+        let db = test_db();
+        db.with_db(|db| {
+            let conn = &db.conn;
+            conn.execute(
+                "INSERT INTO kg_entities (entity_key, type, name) VALUES ('a:one', 'a', 'one')",
+                [],
+            )?;
+            let id_one = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO kg_entities (entity_key, type, name) VALUES ('a:two', 'a', 'two')",
+                [],
+            )?;
+            let id_two = conn.last_insert_rowid();
+            // Create a cycle: one -> two -> one
+            conn.execute(
+                "INSERT INTO kg_relationships (from_entity_id, to_entity_id, type) VALUES (?1, ?2, 'USES')",
+                rusqlite::params![id_one, id_two],
+            )?;
+            conn.execute(
+                "INSERT INTO kg_relationships (from_entity_id, to_entity_id, type) VALUES (?1, ?2, 'USES')",
+                rusqlite::params![id_two, id_one],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let input = KgQueryInput {
+            question: None,
+            traversal: Some(TraversalInput {
+                start: Some("a:one".to_string()),
+                follow: Some(vec!["USES".to_string()]),
+                max_depth: Some(4),
+            }),
+            agent_id: None,
+            include_context: false,
+            result_limit: None,
+        };
+        let result = query_knowledge_graph(&db, &input).await.unwrap();
+        assert_eq!(result.status, KgQueryStatus::Ok);
+        // Should have exactly 2 entities (one + two), not infinite
+        assert_eq!(result.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cycle_detection_no_substring_false_positives() {
+        // Regression test: entity ID 2 should not be falsely blocked when
+        // path contains "12" (INSTR("12", "2") != 0 with naive check)
+        let db = test_db();
+        db.with_db(|db| {
+            let conn = &db.conn;
+            // Insert entities with IDs that will be sequential
+            conn.execute(
+                "INSERT INTO kg_entities (id, entity_key, type, name) VALUES (11, 'a:eleven', 'a', 'eleven')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO kg_entities (id, entity_key, type, name) VALUES (12, 'a:twelve', 'a', 'twelve')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO kg_entities (id, entity_key, type, name) VALUES (2, 'a:two', 'a', 'two')",
+                [],
+            )?;
+            // eleven -> twelve -> two (path "11,12" should NOT block entity 2)
+            conn.execute(
+                "INSERT INTO kg_relationships (from_entity_id, to_entity_id, type) VALUES (11, 12, 'USES')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO kg_relationships (from_entity_id, to_entity_id, type) VALUES (12, 2, 'USES')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let input = KgQueryInput {
+            question: None,
+            traversal: Some(TraversalInput {
+                start: Some("a:eleven".to_string()),
+                follow: Some(vec!["USES".to_string()]),
+                max_depth: Some(2),
+            }),
+            agent_id: None,
+            include_context: false,
+            result_limit: None,
+        };
+        let result = query_knowledge_graph(&db, &input).await.unwrap();
+        assert_eq!(result.status, KgQueryStatus::Ok);
+        // Entity 2 must be reachable despite path "11,12" containing substring "2"
+        assert!(
+            result.entries.iter().any(|e| e.entity_key == "a:two"),
+            "Entity 'a:two' (ID 2) should not be blocked by substring match in path '11,12'"
+        );
+        assert_eq!(result.entries.len(), 3); // eleven, twelve, two
     }
 }

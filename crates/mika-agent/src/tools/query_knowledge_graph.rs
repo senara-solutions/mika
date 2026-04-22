@@ -10,7 +10,7 @@ use mika_common::claude::ToolDefinition;
 use serde_json::Value;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
-use crate::kg::query::{KgQueryInput, KgQueryStatus, TraversalInput, query_knowledge_graph};
+use crate::kg::query::{KgQueryInput, TraversalInput, query_knowledge_graph};
 
 pub struct QueryKnowledgeGraphTool;
 
@@ -53,10 +53,6 @@ impl Tool for QueryKnowledgeGraphTool {
                             "max_depth": {
                                 "type": "integer",
                                 "description": "Max traversal depth (0-4). Default: 2."
-                            },
-                            "cross_layer": {
-                                "type": "boolean",
-                                "description": "Enable cross-layer hops between domain and subject layers. Default: false."
                             }
                         }
                     },
@@ -98,13 +94,11 @@ impl Tool for QueryKnowledgeGraphTool {
                     .collect()
             });
             let max_depth = input["traversal"]["max_depth"].as_u64().map(|d| d as u32);
-            let cross_layer = input["traversal"]["cross_layer"].as_bool().unwrap_or(false);
 
             Some(TraversalInput {
                 start,
                 follow,
                 max_depth,
-                cross_layer,
             })
         } else {
             None
@@ -126,12 +120,9 @@ impl Tool for QueryKnowledgeGraphTool {
             Ok(result) => {
                 let json = serde_json::to_string_pretty(&result)
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
-
-                match result.status {
-                    KgQueryStatus::Ok => Ok(ToolOutput::success(json)),
-                    KgQueryStatus::StartingEntityMissing => Ok(ToolOutput::success(json)),
-                    KgQueryStatus::TraversalEmpty => Ok(ToolOutput::success(json)),
-                }
+                // Status (ok/starting_entity_missing/traversal_empty) is in the JSON
+                // for the LLM to interpret — all are success from the tool's perspective
+                Ok(ToolOutput::success(json))
             }
             Err(e) => Ok(ToolOutput::error(format!(
                 "Knowledge graph query failed: {e}"
