@@ -755,6 +755,51 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         }
     }
 
+    // Lexical graph ingestion: chunk docs/solutions/**/*.md per agent, index
+    // into search_content for hybrid search. Runs after domain rebuild so each
+    // KG layer's startup work composes cleanly for #690+.
+    //
+    // docs_root is relative to the server working directory. In containers,
+    // the Dockerfile copies docs/ into the workdir.
+    {
+        let docs_root = std::env::current_dir()
+            .unwrap_or_default()
+            .join("docs")
+            .join("solutions");
+        if docs_root.exists() {
+            for (agent_name, agent_state) in &agents {
+                let ingestor = crate::kg::lexical_ingestor::LexicalIngestor::new(
+                    agent_state.db.clone(),
+                    docs_root.clone(),
+                    None,
+                );
+                match ingestor.ingest_all().await {
+                    Ok(stats) => info!(
+                        event = "lexical_ingest_complete",
+                        agent_id = %agent_name,
+                        docs_scanned = stats.docs_scanned,
+                        docs_ingested = stats.docs_ingested,
+                        docs_skipped = stats.docs_skipped_unchanged,
+                        docs_pruned = stats.docs_pruned,
+                        chunks_added = stats.chunks_added,
+                        duration_ms = stats.duration_ms,
+                        "lexical ingestion ready"
+                    ),
+                    Err(e) => warn!(
+                        error = %e,
+                        agent_id = %agent_name,
+                        "lexical ingestion failed; chunks may be stale until next restart"
+                    ),
+                }
+            }
+        } else {
+            info!(
+                docs_root = %docs_root.display(),
+                "docs/solutions not found — skipping lexical ingestion"
+            );
+        }
+    }
+
     let state = AppState {
         agents: Arc::new(agents),
         default_agent,

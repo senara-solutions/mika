@@ -9,10 +9,13 @@
 //!   `docs/architecture/kg-implementation-conventions.md` for cross-cutting conventions
 //!   and `crates/mika-agent/src/db/kg_schema.rs` for schema constants and ID format.
 //!
-//! - **Lexical graph** (future, #689): Per-agent chunk ingestion linking prose content
-//!   to domain entities.
+//! - **Lexical graph** ([`lexical_ingestor`], #689): Per-agent chunk ingestion of
+//!   `docs/solutions/**/*.md` into `kg_chunks` + `search_content`. Content-hash
+//!   idempotent, runs at startup after domain rebuild.
 //!
 //! - **Subject graph** (future, #690/#691): Per-agent LLM-extracted entities, fact
 //!   triples, and resolution edges linking subject mentions to domain nodes.
 
+pub mod chunker;
 pub mod domain_builder;
+pub mod lexical_ingestor;
