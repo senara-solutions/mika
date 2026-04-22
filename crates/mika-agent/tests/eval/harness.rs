@@ -303,5 +303,7 @@ fn dummy_settings() -> Settings {
         store_llm_calls: true,
         store_tool_calls: true,
         log_llm_bodies: false,
+        kg_ingestion_model: None,
+        kg_extraction_model: None,
     }
 }

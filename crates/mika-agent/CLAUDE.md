@@ -155,6 +155,24 @@ Connects to external MCP servers at startup via `McpManager`. Configured in `{ag
 
 **Cross-cutting conventions:** See `docs/architecture/kg-implementation-conventions.md` (C1–C3) and `docs/architecture/kg-id-convention.md` for the `<type>:<name>` entity key format.
 
+## Knowledge Graph — Subject Extractor
+
+`src/kg/subject_extractor.rs` — Per-agent LLM-based extraction of named entities and fact triples from previously-ingested documents (#690). Uses constrained NER with approved entity/relationship types and structural validation (not just prompt-based).
+
+**Approved entity types:** `skill`, `tool`, `agent`, `problem_type`, `solution_path`, `failure_mode`, `pattern`. **Approved relationship types:** `SOLVED_BY`, `USES`, `CALLS`, `INDICATES`, `PREVENTS`, `CAUSED_BY`, `MENTIONS` — each with from/to type constraints enforced in code.
+
+**Sole-writer contract:** This module is the sole writer of `kg_subject_entities`, `kg_subject_relationships`, `kg_chunk_subjects`, `kg_chunk_subject_relationships`, and `kg_extractions` rows.
+
+**Execution contexts (D2):** (1) Startup: background `tokio::spawn` per agent after lexical ingestion, non-blocking. (2) Compound hook: synchronous inline after doc write via `IngestionOrchestrator`, failure non-fatal (C2.3 log-and-skip).
+
+**Extraction flow (D1, D4):** Read full doc from disk → insert `[CHUNK N]` markers at chunk boundaries → LLM call → parse/validate JSON output → UPSERT entities and relationships with provenance in single transaction.
+
+**Re-extraction (D5):** Three-phase capture → reingest → reconcile. `IngestionOrchestrator` (`src/kg/ingestion_orchestrator.rs`) coordinates #689 and #690 — neither module calls the other directly. Scoped orphan sweep deletes entities/relationships that lost all provenance after doc change.
+
+**Pending-doc detection (D7):** `kg_extractions` tracking table — one row per (agent_id, source_doc_path) recording completed extraction. Pending query: docs with `kg_chunks` rows but no `kg_extractions` row.
+
+**LLM policy (C2):** Model from `MIKA_KG_EXTRACTION_MODEL` → `MIKA_KG_INGESTION_MODEL` fallback. Retry taxonomy per C2.2 (transport: 3 attempts with backoff; semantic: one retry with prompt reinforcement; config: no retry). Log-and-skip per C2.3. `llm_calls` rows per C2.4. Audit events per C3.3.
+
 ## Silent Mode Agent Loop
 
 Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.

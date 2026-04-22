@@ -13,9 +13,12 @@
 //!   `docs/solutions/**/*.md` into `kg_chunks` + `search_content`. Content-hash
 //!   idempotent, runs at startup after domain rebuild.
 //!
-//! - **Subject graph** (future, #690/#691): Per-agent LLM-extracted entities, fact
-//!   triples, and resolution edges linking subject mentions to domain nodes.
+//! - **Subject graph** ([`subject_extractor`], #690): Per-agent LLM-extracted
+//!   entities and fact triples from compound docs. Uses constrained NER with
+//!   approved entity/relationship types.
 
 pub mod chunker;
 pub mod domain_builder;
+pub mod ingestion_orchestrator;
 pub mod lexical_ingestor;
+pub mod subject_extractor;
