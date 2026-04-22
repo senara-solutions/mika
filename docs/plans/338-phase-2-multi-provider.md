@@ -26,21 +26,32 @@ Out of scope: golden dataset curation (→ #339), KG-specific scenarios (→ #74
 
 **Problem:** How do tests opt into real API calls?
 
-**Decision:** One master env `MIKA_EVAL_REAL_PROVIDERS=anthropic,openai,groq` (comma-separated list). Empty/unset → all real-provider tests `#[ignore]`-respected. `MIKA_EVAL_REAL_PROVIDERS=all` → every configured provider runs.
+**Decision:** One master env `MIKA_EVAL_REAL_PROVIDERS=anthropic,openai,kimi,groq` (comma-separated list). Empty/unset → all real-provider tests `#[ignore]`-respected. `MIKA_EVAL_REAL_PROVIDERS=all` → every configured provider runs.
 
-**Rationale:** A single var with a subset list beats per-provider flags (`MIKA_EVAL_ANTHROPIC=1` + `MIKA_EVAL_OPENAI=1`) because the common case is "run the matrix against the providers I have keys for today." The list form lets CI pick a subset per workflow without rewriting test lists. Parsing is one line: `env::var("MIKA_EVAL_REAL_PROVIDERS").split(',').filter_map(...)`.
+**Unknown provider names hard-fail.** The parser rejects unknown names with an error listing valid providers. Silent-skip on unknowns is how CI workflows end up green while testing nothing — exactly the regression class #338 exists to catch. Explicit over implicit.
+
+**Rationale:** A single var with a subset list beats per-provider flags (`MIKA_EVAL_ANTHROPIC=1` + `MIKA_EVAL_OPENAI=1`) because the common case is "run the matrix against the providers I have keys for today." The list form lets CI pick a subset per workflow without rewriting test lists. Parsing is ~5 lines: `env::var("MIKA_EVAL_REAL_PROVIDERS").split(',').map(parse_or_error)` — the `parse_or_error` returns `Err` on unknown names, propagated as a test-setup failure.
 
 **Rejected alternative:** Per-provider flags. Scales linearly with provider count; already 11 providers in `ProviderKind`, picking 3 via 3 flags is ergonomically worse than one list.
 
-### D2 — Initial provider set: three, document the next two
+### D2 — Initial provider set: four providers chosen for orthogonal validation profiles
 
 **Problem:** 11 providers in `ProviderKind`; how many does Phase 2 cover?
 
-**Decision:** Phase 2 ships matrix support for three — **Anthropic, OpenAI, Groq**. These cover: Anthropic prompt-cache path + strict JSON schema; OpenAI-compatible adapter path + different schema tolerance; Groq + speed-tier characteristics. Document that adding a fourth (Kimi, DeepSeek, OpenRouter) requires: (a) adding the provider to the matrix parameter table, (b) verifying its `create_provider` path, (c) one provider-calibration scenario. No code change needed per provider beyond config.
+**Decision:** Phase 2 ships matrix support for four — **Anthropic, OpenAI, Kimi, Groq**. Selection logic:
 
-**Rationale:** Three providers cover the two adapter paths (native Anthropic + OpenAI-compatible) and one speed-tier data point. Adding the remaining eight adds CI cost linearly without covering new behavior classes at this layer (they're variations of the OpenAI-compatible adapter).
+- **Anthropic** — native adapter path, strict JSON-schema validator, prompt-cache semantics. Non-negotiable: primary dev target.
+- **OpenAI** — OpenAI-compatible adapter canonical, strict validator. Non-negotiable: baseline for adapter-path behavior.
+- **Kimi** (via openrouter) — the current mika-dev runtime (per `project_mika_dev_model_switch.md`). Permissive validator; its tolerance is what masked the `task_id` incident. Including it makes "the bug Kimi hides" a matrix data point, not an exploratory encounter on the next migration.
+- **Groq** — OpenAI-compatible adapter with a different server-side validation profile than both OpenAI and Kimi. Orthogonal permissive data point — different model family, different tolerance surface.
 
-**Follow-up tickets to file post-merge:** one per additional provider-calibration run, each tracked separately; this ticket doesn't try to cover all eleven.
+**Detection matrix shape:** two strict validators (Anthropic, OpenAI) + two permissive with distinct profiles (Kimi, Groq). Strict surfaces bugs; permissive-pair surfaces provider-specific drift without reducing to a single permissive point of failure. Adding the remaining seven providers doesn't cover new behavior classes at this layer (variations of OpenAI-compatible).
+
+**Rationale for four not three:** The marginal cost of one more provider slot in a matrix already being built is small (~$0.10/run). The cost of picking three wrong — either excluding Kimi (bug-hiding profile un-tested) or excluding Groq (no orthogonal permissive data point) — is re-litigation in 6 weeks when a Kimi-specific incident or a Groq-tolerance drift lands in production. Four resolves the Kimi-vs-Groq tension cleanly.
+
+**Rejected alternative:** Three providers (Anthropic, OpenAI, Groq) with Kimi added later via the documented extension path. Rejected because #338 is the middle tier of the milestone — downstream scenarios (#339, #740, #741) build on this matrix. Getting the matrix wrong here forces every downstream ticket to add Kimi individually.
+
+**Follow-up tickets to file post-merge:** one per additional provider-calibration run if/when a specific need arises (DeepSeek, OpenRouter, Mistral, etc.); this ticket doesn't try to cover all eleven.
 
 ### D3 — Matrix shape: scenarios as functions, providers as runtime parameter
 
@@ -95,11 +106,11 @@ A **separate opt-in** real-API test (`#[test] #[ignore] fn real_api_schema_diver
 
 **Cross-reference:** `test_max_steps_continuation.rs` exercises the same path as `attempt_continuation_turn()` helper; its existing coverage in `test_required_tools_gate.rs` is the eval-harness-level assertion that the engine's own tests don't provide.
 
-### D7 — Calibration mode: JSON artifact, not a live dashboard
+### D7 — Calibration mode: ephemeral artifact + diff CLI; committed baseline explicitly NOT in scope
 
-**Problem:** The issue describes "calibration mode" as comparing mock expectations vs real provider behavior. How does this operationally surface?
+**Problem:** The issue describes "calibration mode" as comparing mock expectations vs real provider behavior. How does this operationally surface, and where does the baseline live?
 
-**Decision:** Calibration mode is a **write-mode** of the real-API test runner. When run with `MIKA_EVAL_CALIBRATE=1` alongside `MIKA_EVAL_REAL_PROVIDERS`, the test captures per-(provider, scenario) outcome into `target/eval-calibration/{timestamp}.json`. The file schema:
+**Decision:** Calibration mode is a **write-mode** of the real-API test runner. When run with `MIKA_EVAL_CALIBRATE=1` alongside `MIKA_EVAL_REAL_PROVIDERS`, the test captures per-(provider, scenario) outcome into `target/eval-calibration/{timestamp}.json` (gitignored; ephemeral). The file schema:
 
 ```json
 {
@@ -116,36 +127,71 @@ A **separate opt-in** real-API test (`#[test] #[ignore] fn real_api_schema_diver
 }
 ```
 
-Separately, a comparison command `cargo run --bin eval-diff -- {old.json} {new.json}` diffs two calibration artifacts and exits non-zero if a previously-tolerated divergence became a reject (or vice versa). This is the "provider drift" detection the issue asks for, delivered as a diff tool not a dashboard.
+A comparison command `cargo run --bin eval-diff -- {old.json} {new.json}` diffs two calibration artifacts and exits non-zero if a previously-tolerated divergence became a reject (or vice versa).
 
-**Rationale:** File + diff tool is the simplest thing that could work. Langfuse / dashboard integration can come later (explicitly out of scope); file-based drift detection covers the weekly-regression use case.
+**Committed baseline explicitly deferred.** A versioned `tests/fixtures/eval-baseline.json` is the obvious next step — but committing a reference without a maintenance loop is "an artifact that lies": it looks authoritative while silently rotting the moment a provider changes tolerance and no one regenerates. Two paths:
+- Ship the CI maintenance loop in #338 scope — ~40 lines of GitHub Actions YAML for a weekly calibration run that auto-opens a baseline-drift PR
+- Keep #338 narrow to machinery + file a follow-up ticket for the maintenance loop
 
-**Rejected alternative:** Write to a DB table (complex migration, not needed), emit to stdout as a table (loses the comparison capability without manual parsing).
+**This ticket takes the second path.** Follow-up tracked as **mika#742** (weekly calibration CI + drift-detection PR automation). Until #742 merges, calibration artifacts stay ephemeral (uploaded to CI run as workflow artifacts, not committed). Downstream scenarios (#339/#740/#741) that want regression gating on provider behavior can cite #742 as their gate blocker.
 
-### D8 — Cost controls: documented budget, no runtime enforcement
+**Rationale:** Machinery ships now, trust-the-baseline ships separately. Preserves the #338 scope boundary ("ships the matrix runner + divergence harness; does NOT ship the scenario catalog or the trust infrastructure"). Friend review explicitly flagged committed-but-unmaintained as the worst of both worlds.
 
-**Problem:** Real-API runs cost money. How do we prevent accidental $50 runs?
+**Rejected alternatives:** (a) Commit the baseline with no maintenance loop — rejected as theater per friend review. (b) Ship the maintenance CI job in #338 scope — rejected to preserve scope narrowness; the job is meaningful enough work to warrant its own ticket (#742).
 
-**Decision:** Document estimated cost per run in the test module doc comment and in `crates/mika-agent/CLAUDE.md` eval section. No runtime enforcement (no token counting + early-exit). CI workflows that invoke real-API tests explicitly opt in via the `MIKA_EVAL_REAL_PROVIDERS` env and can set their own per-run budgets via workflow timeout.
+### D8 — Cost controls: documented budget + structural intent gate, no runtime enforcement
 
-Baseline estimate to include in docs: Phase 2 full matrix against Anthropic+OpenAI+Groq ≈ $0.30-0.50 per run (3 providers × ~5 scenarios × ~$0.02-0.03/scenario). Calibration mode doubles this if it also runs divergence probes.
+**Problem:** Real-API runs cost money. How do we prevent accidental $50 runs from a developer laptop?
 
-**Rationale:** Runtime budget enforcement is a YAGNI for a test suite operators run intentionally. CI cost controls live at the workflow layer.
+**Decision:** Two structural layers + one documentation layer. No runtime budget enforcement.
 
-**Rejected alternative:** In-test token accumulator with hard cap. Adds plumbing for a risk that hasn't manifested.
+- **Structural intent gate (Layer 1):** Every real-API test carries `#[ignore]`. The env var (`MIKA_EVAL_REAL_PROVIDERS`) alone does not trigger real API calls — a test invocation must explicitly pass `--ignored` (or `--include-ignored`). Accidentally running `cargo test` on a laptop with the env set still doesn't burn budget. This is the same principle as `feedback_prompt_enforcement_fragile.md`: structural > prompt-level. Cost protection is intent-based, not token-based.
+- **Structural env gate (Layer 2):** `MIKA_EVAL_REAL_PROVIDERS` controls which providers actually attempt real calls. Tests for unconfigured providers skip with a clear message.
+- **Documentation layer:** Cost baseline in test module doc + `crates/mika-agent/CLAUDE.md` eval section.
+
+Baseline estimate: Phase 2 full matrix against Anthropic+OpenAI+Kimi+Groq ≈ $0.40-0.65 per run (4 providers × ~5 scenarios × ~$0.02-0.03/scenario). Calibration mode doubles this if it also runs divergence probes.
+
+**Rationale:** Cost enforcement via runtime token-counting is premature optimization for a risk that hasn't manifested. Intent-based structural gating (`#[ignore]` + env) makes accidental burn impossible without an explicit opt-in by the operator. CI workflows set their own per-run timeouts as a backstop.
+
+**Rejected alternative:** In-test token accumulator with hard cap. Adds plumbing and changes test failure semantics (cost-exceeded ≠ test-failed). Structural intent gate is the simpler correct answer.
+
+### D9 — Request-side JSON-schema well-formedness assertions (the layer that catches `task_id`)
+
+**Problem:** The `task_id` incident happened at the **request-construction** layer (`inject_task_id_field`). The damage manifested at the provider-validation layer. Mika's handling of the provider rejection was fine. A harness-level test of Mika's handling would NOT have caught `task_id` — because the handling wasn't the bug.
+
+D4 as originally drafted covers two classes: Mika's handling of rejection (mock-based) and provider-tolerance drift (real-API calibration). It does not cover: **"our request is well-formed before it leaves the process."** That's the layer where `task_id` lived for six weeks.
+
+**Decision:** Add request-side well-formedness assertions to the harness. Deterministic, fast, no API calls. Cover:
+
+- **Required-array deduplication:** `assert_eq!(dedup(required), required)` on every tool definition emitted by the request builder. Would have caught `task_id`.
+- **Schema-properties / required coherence:** every entry in `required` exists as a key in `properties`.
+- **Enum membership:** each property declaring an `enum` has `len > 0` and no duplicates.
+- **Reserved-name shadowing:** tool names don't collide with reserved builtins (e.g., `run_agent`).
+
+Tests live in a new `test_request_wellformedness.rs` — one test per rule, exercised against `default_tools()` and a synthetic per-skill tool set. Runs in CI on every push (no `#[ignore]`, no env gate, no real API).
+
+**Rationale:** Three layers, three bug classes:
+1. **D9 (new, harness):** our request is well-formed. Catches `task_id`-class bugs.
+2. **D4 part 1 (harness):** we handle provider rejection correctly. Catches dispatch-path bugs.
+3. **D4 part 2 (real-API, opt-in):** provider tolerance drifts over time. Catches silent provider-side changes.
+
+Collapsing any two of these into one misses a bug class. Friend review was explicit: *"A harness-level test of 'our request builder preserves dups as-is' would have passed on every provider switch; the actual defect was in `inject_task_id_field`."*
+
+**Rejected alternative:** Add well-formedness assertions to `inject_task_id_field` itself (in-code invariant check via `debug_assert!`). Rejected because the point of eval harness tests is they run in CI on release builds, not only in debug. Also: other request-builders besides `inject_task_id_field` produce tool schemas — the harness test covers all of them uniformly.
 
 ## Acceptance Criteria
 
-- [ ] D1: `MIKA_EVAL_REAL_PROVIDERS` env gate implemented; parses comma-separated list or `all`; empty/unset → all real-provider tests respect `#[ignore]`.
-- [ ] D2: Matrix runs Anthropic + OpenAI + Groq; documentation includes "how to add a provider" section.
+- [ ] D1: `MIKA_EVAL_REAL_PROVIDERS` env gate implemented; parses comma-separated list or `all`; **unknown provider names hard-fail with a listing of valid names**; empty/unset → all real-provider tests respect `#[ignore]`.
+- [ ] D2: Matrix runs Anthropic + OpenAI + Kimi + Groq; documentation includes "how to add a provider" section explaining the three-step extension.
 - [ ] D3: Scenarios as `async fn`, invoked from per-provider tests AND matrix runner. Both paths present and tested.
-- [ ] D4: Harness tests (mock-based) for 4 schema divergence classes. Separate real-API calibration test `#[ignore]`-gated.
+- [ ] D4: Harness tests (mock-based) for 4 schema divergence classes on the response-handling layer. Separate real-API calibration test `#[ignore]`-gated.
 - [ ] D5: `test_per_skill_provider_override.rs` exists, uses two mock providers with distinct names, trace asserts provider attribution per call.
 - [ ] D6: Three new test files — max-steps continuation, required-tools gate, multi-turn persistence — all mock-based.
-- [ ] D7: Calibration artifact schema stable (versioned); `eval-diff` binary present and tested against fixture artifacts.
-- [ ] D8: Cost baseline documented in `crates/mika-agent/CLAUDE.md` eval section and test module doc.
+- [ ] D7: Calibration artifact schema stable (versioned); `eval-diff` binary present and tested against fixture artifacts. Baseline is **ephemeral** (gitignored in `target/eval-calibration/`); committed baseline deferred to **mika#742**.
+- [ ] D8: Cost baseline documented in `crates/mika-agent/CLAUDE.md` eval section and test module doc. **Every real-API test carries `#[ignore]`** — intent-based structural gate.
+- [ ] D9: `test_request_wellformedness.rs` exists. Tests for required-array dedup, schema-properties coherence, enum membership, reserved-name shadowing. Runs in CI on every push. Retro-validates: would have caught the `task_id` bug (commit `440a9d59`).
 - [ ] Existing 13 Phase 1 tests still pass.
-- [ ] `cargo test -p mika-agent --test eval` green (mock subset). Real-API tests pass when invoked with env + keys.
+- [ ] `cargo test -p mika-agent --test eval` green (mock + D9 subsets). Real-API tests pass when invoked with `--ignored` + env + keys.
 - [ ] `cargo clippy` clean.
 
 ## Dependencies
@@ -164,9 +210,14 @@ Baseline estimate to include in docs: Phase 2 full matrix against Anthropic+Open
 - Matrix runner is not a new test runner — it's a `#[test]` function that iterates. Keeps `cargo test` the sole entry point.
 - Calibration artifacts live in `target/eval-calibration/` (gitignored). The diff tool emits pass/fail based on semantic change, not byte-level diff.
 
-## Open questions (for Vincent before dispatch)
+## Review log
 
-1. **D1 env format:** comma-separated list good, or prefer `MIKA_EVAL_REAL_PROVIDERS=anthropic openai groq` (space-separated)? Shell escaping / CI workflow ergonomics.
-2. **D2 initial set:** confirm Anthropic/OpenAI/Groq is the right three. Alternative: Anthropic/OpenAI/Kimi (since Kimi is the current mika-dev runtime provider — highest practical value for calibration).
-3. **D7 calibration artifact format:** JSON file in `target/` works but is ephemeral across CI runs. Worth checking in a canonical calibration under `tests/fixtures/eval-baseline.json` so `eval-diff` has a stable baseline to compare against?
-4. **D8 cost controls:** acceptable to have zero runtime enforcement, or want a soft warn (stderr log at 80% of estimated budget)?
+**Vincent review + friend feedback (2026-04-22, relayed by Vincent):**
+
+- **D1:** Comma-separated list confirmed. Added hard-fail on unknown provider names — silent-skip is how CI stays green while testing nothing.
+- **D2:** Expanded from three providers to **four** — Anthropic / OpenAI / Kimi / Groq. Friend's detection argument: two strict + two orthogonal permissive profiles is the right regression-detection matrix. Kimi included because it's the current mika-dev runtime and its tolerance is what masked the `task_id` incident; Groq included for an orthogonal permissive data point. Tradeoff: ~$0.10/run extra cost vs the re-litigation cost of excluding the wrong one in 6 weeks.
+- **D7:** Committed baseline explicitly deferred. Shipping committed-but-unmaintained was called out as theater. #338 ships ephemeral; maintenance loop tracked as **mika#742** (weekly calibration CI + drift-PR automation). Downstream scenarios citing regression gating must block on #742.
+- **D8:** Added **structural intent gate** via `#[ignore]` on every real-API test. Matches `feedback_prompt_enforcement_fragile.md` — structural > documentation for intent protection. Cost baseline updated to four-provider estimate ($0.40-0.65/run).
+- **D9 (new):** Request-side JSON-schema well-formedness assertions. Friend's sharpest push: the `task_id` bug lived at request construction; no response-handling test would have caught it. Three layers now (D9 well-formedness / D4.1 mock rejection handling / D4.2 real-API drift) — each catches a different bug class; collapsing any two misses a class.
+
+**Friend principle adopted across amendments:** "what would have actually caught the motivating incident" > "what seems reasonable to test." D9 is the direct application.
