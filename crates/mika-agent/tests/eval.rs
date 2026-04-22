@@ -18,6 +18,7 @@ mod eval {
     mod test_phantom_retry_guard;
     mod test_pr_review_idempotency;
     mod test_required_tools_gate;
+    mod test_self_knowledge_kg;
     mod test_task_not_found_retry;
     mod test_tool_calling;
     mod test_verdict_handler;
