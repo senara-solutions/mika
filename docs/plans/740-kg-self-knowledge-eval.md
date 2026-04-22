@@ -124,6 +124,13 @@ All other scenarios (A, B, C without Stage 2 dependency, Stage 1 exact match, ag
 
 **Scope boundary with `#741`.** `self-knowledge:*` tags cover the code path from tool-invocation through resolver. Agent *response quality* given a successful KG result — specifically "KG returned correct result but agent ignored it and answered from training data anyway" — is a **grounding failure**, not a self-knowledge failure. That case is routed to `#741`'s `grounding:*` namespace. The apparent vocabulary gap in #740 (no tag for "agent-ignores-correct-KG-result") is the namespace boundary working as intended, not a missing tag.
 
+**Tag attribution rule — cause-location, not symptom.** Tags identify *where in the code path* a failure originated, not the user-visible symptom. A user seeing "agent stated a falsehood" is a symptom; the tag attributes to the cause. Three worked examples:
+- KG returned wrong result → `self-knowledge:*` (resolver returned wrong data)
+- KG returned right result, agent ignored it → `grounding:*` (response construction ignored evidence)
+- KG state itself is stale/corrupt → hard-assertion fail or data-integrity ticket, NOT a soft tag (this is a data-quality problem, not a behavior failure)
+
+When a new ambiguous case surfaces, apply this rule *before* expanding vocabulary: trace the failure to the code path it originated in, attribute the tag to that path. Symptoms cross namespace boundaries; causes do not. Mirror rule lives in `#741` D4.
+
 **Vocabulary review checkpoint.** After all seven scenarios are implemented, revisit this vocabulary before merging. If any scenario's outcome doesn't fit one of the six tags AND the case isn't cleanly routable to `#741`'s namespace, expand this vocabulary (add a seventh tag with rationale) rather than stretching an existing tag. Review is an explicit AC, not a handshake.
 
 Vocabulary is defined in `crates/mika-agent/tests/eval/kg_self_knowledge/README.md` (per #339 D8 — README-next-to-tests, not a separate doc tree). Calibration artifact (#338 D7) preserves the namespace structure; aggregation across tickets works at the tooling layer.
@@ -244,3 +251,7 @@ Extracting status checks into their own scenarios would duplicate fixture setup 
 - **Cost envelope priced at design time** (~$0.015 per integration run for this ticket's scenarios): 3 Stage-2 variants × ~$0.0045 each + negligible embedding cost. Fixture shape fixed as design decision; scenario-author doesn't "declare" cost at implementation time.
 
 **Friend principle extended:** "pin the decision you're depending on" now applies to cost envelope (design-time fixture shape) and assertion messages (actionable on failure), not just upstream plan SHAs and vocabulary namespaces.
+
+**Milestone-level friend review pass 2 (2026-04-23, relayed by Vincent):**
+
+- **D4 extended with tag-attribution cause-location rule.** Previously the scope boundary with #741 worked case-by-case ("agent-ignores-KG-result → grounding"); now there's an explicit rule ("tags attribute to cause-location, not symptom") with three worked examples and a procedure for new ambiguous cases. Converts a handshake decision into a structural convention. Mirror rule landing in #741 D4 simultaneously.
