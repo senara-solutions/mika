@@ -1,22 +1,24 @@
 //! # Ingestion Orchestrator
 //!
-//! Coordinates the lexical ingestor (#689) and subject extractor (#690).
-//! Neither module has knowledge of the other's internals — the orchestrator
-//! owns the sequencing (per D9 in the #690 plan).
+//! Coordinates the lexical ingestor (#689), subject extractor (#690), and
+//! entity resolver (#691). None of the modules have knowledge of each other's
+//! internals — the orchestrator owns the sequencing.
 //!
 //! ## Responsibilities
 //!
 //! 1. **Compound hook** — after a doc is written, ingest chunks then extract
-//!    subjects synchronously inline.
-//! 2. **Re-extraction on doc change** — three-phase capture → reingest →
-//!    reconcile (D5).
+//!    subjects synchronously inline, then spawn async resolution.
+//! 2. **Re-extraction on doc change** — four-phase capture → reingest →
+//!    reconcile → re-resolve (D6 in #691 plan).
 //!
 //! ## Sole-Writer Separation
 //!
 //! - `LexicalIngestor` is the sole writer of `kg_chunks` and `search_content`.
 //! - `SubjectExtractor` is the sole writer of `kg_subject_entities`,
 //!   `kg_subject_relationships`, and provenance tables.
-//! - This module calls both but writes nothing itself.
+//! - `SubjectEntityResolver` is the sole writer of `kg_subject_resolutions`
+//!   and `kg_resolutions_log`.
+//! - This module calls all three but writes nothing itself.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,10 +30,11 @@ use mika_common::llm::LlmProvider;
 
 use crate::async_db::AsyncDatabase;
 
+use super::entity_resolver::SubjectEntityResolver;
 use super::lexical_ingestor::LexicalIngestor;
 use super::subject_extractor::SubjectExtractor;
 
-/// Coordinates lexical ingestion and subject extraction.
+/// Coordinates lexical ingestion, subject extraction, and entity resolution.
 ///
 /// Provides the compound hook entry point and re-extraction flow.
 pub struct IngestionOrchestrator {
@@ -40,6 +43,9 @@ pub struct IngestionOrchestrator {
     /// LLM provider for extraction. `None` when extraction is disabled
     /// (no `MIKA_KG_EXTRACTION_MODEL` configured).
     extraction_llm: Option<Arc<dyn LlmProvider>>,
+    /// LLM provider for entity resolution disambiguation. `None` when
+    /// resolution LLM is disabled (exact-match-only mode).
+    resolution_llm: Option<Arc<dyn LlmProvider>>,
     trace_id: String,
     session_id: String,
 }
@@ -49,10 +55,12 @@ impl IngestionOrchestrator {
     ///
     /// - `extraction_llm`: `None` to disable extraction (lexical ingestion
     ///   still runs).
+    /// - `resolution_llm`: `None` for exact-match-only resolution mode.
     pub fn new(
         db: AsyncDatabase,
         docs_root: PathBuf,
         extraction_llm: Option<Arc<dyn LlmProvider>>,
+        resolution_llm: Option<Arc<dyn LlmProvider>>,
         trace_id: Option<&str>,
         session_id: Option<&str>,
     ) -> Self {
@@ -63,17 +71,21 @@ impl IngestionOrchestrator {
             db,
             docs_root,
             extraction_llm,
+            resolution_llm,
             trace_id,
             session_id: session_id.unwrap_or("compound").to_owned(),
         }
     }
 
-    /// Compound hook: ingest a freshly-written document, then extract subjects.
+    /// Compound hook: ingest a freshly-written document, then extract subjects,
+    /// then spawn async resolution.
     ///
     /// Called after `/ce:compound` writes a doc. Lexical ingestion is synchronous
     /// and must succeed. Subject extraction is synchronous but failure is
     /// non-fatal (log-and-skip per C2.3) — the doc stays pending for next
-    /// startup extraction.
+    /// startup extraction. Entity resolution is spawned as a background task
+    /// (D5 in #691 plan) — the authoring agent gets immediate subject entities
+    /// and FTS5 queryability; resolutions appear shortly after.
     pub async fn ingest_and_extract(&self, abs_path: &Path) -> Result<CompoundResult> {
         let agent_id = self.db.agent_id.clone();
 
@@ -118,6 +130,13 @@ impl IngestionOrchestrator {
                             stats.relationships_upserted,
                         )
                         .await;
+
+                    // 3. Spawn async resolution for extracted entities (D5 in #691).
+                    // The compound write returns immediately; resolutions appear shortly after.
+                    if stats.entities_upserted > 0 {
+                        self.spawn_resolution(&rel_path);
+                    }
+
                     Some(stats)
                 }
                 Err(e) => {
@@ -142,11 +161,13 @@ impl IngestionOrchestrator {
         })
     }
 
-    /// Re-extraction on doc change: three-phase capture → reingest → reconcile.
+    /// Re-extraction on doc change: four-phase capture → reingest → reconcile →
+    /// re-resolve (D6 in #691 plan).
     ///
     /// Phase 1: Capture previous provenance state.
     /// Phase 2: Re-ingest chunks (handled by `LexicalIngestor`).
     /// Phase 3: Re-extract with previous state for orphan sweep.
+    /// Phase 4: Re-resolve entities touched by re-extraction.
     pub async fn reingest_and_reextract(&self, abs_path: &Path) -> Result<CompoundResult> {
         let rel_path = self.relative_path(abs_path);
 
@@ -193,6 +214,14 @@ impl IngestionOrchestrator {
                                 stats.relationships_upserted,
                             )
                             .await;
+
+                        // Phase 4: Re-resolve entities touched by re-extraction (D6).
+                        // Coarse re-resolution — all entities from this doc re-resolve.
+                        // Failures: C2.3 log-and-skip, pending for next startup.
+                        if stats.entities_upserted > 0 {
+                            self.spawn_resolution(&rel_path);
+                        }
+
                         Some(stats)
                     }
                     Err(e) => {
@@ -214,6 +243,48 @@ impl IngestionOrchestrator {
             ingest_stats,
             extraction_stats,
         })
+    }
+
+    /// Spawn background resolution for entities from a doc.
+    ///
+    /// Resolution runs as a background task so the compound write returns
+    /// immediately. Failures are logged per C2.3 — entities stay pending
+    /// for next startup's `resolve_pending`.
+    fn spawn_resolution(&self, doc_path: &str) {
+        let db = self.db.clone();
+        let resolution_llm = self.resolution_llm.clone();
+        let trace_id = self.trace_id.clone();
+        let agent_id = self.db.agent_id.clone();
+        let doc_path = doc_path.to_owned();
+
+        tokio::spawn(async move {
+            let resolver = SubjectEntityResolver::new(db, resolution_llm, Some(&trace_id));
+
+            match resolver.resolve_pending().await {
+                Ok(stats) => {
+                    if stats.matched_exact > 0 || stats.matched_llm > 0 || stats.errors > 0 {
+                        info!(
+                            agent_id = %agent_id,
+                            doc = %doc_path,
+                            matched_exact = stats.matched_exact,
+                            matched_llm = stats.matched_llm,
+                            no_match = stats.no_match,
+                            errors = stats.errors,
+                            event = "compound_resolution_complete",
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        agent_id = %agent_id,
+                        doc = %doc_path,
+                        error = %e,
+                        event = "compound_resolution_failed",
+                        "resolution failed — entities stay pending per C2.3"
+                    );
+                }
+            }
+        });
     }
 
     /// Convert an absolute path to a repo-relative path.

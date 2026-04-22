@@ -857,6 +857,63 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 );
             }
         }
+
+        // Entity resolution: resolve pending subject entities to domain graph
+        // nodes (#691). Runs after extraction to catch both newly-extracted
+        // entities and previously-pending ones. Spawns one background task per
+        // agent. Resolution LLM is optional — without it, exact-match-only mode.
+        {
+            let resolution_llm = match settings.make_kg_resolution_provider() {
+                Some(Ok(llm)) => Some(llm),
+                Some(Err(e)) => {
+                    warn!(
+                        error = %e,
+                        event = "resolution_llm_disabled",
+                        "failed to create KG resolution provider — exact-match-only mode"
+                    );
+                    None
+                }
+                None => None,
+            };
+
+            for (agent_name, agent_state) in &agents {
+                let db = agent_state.db.clone();
+                let llm = resolution_llm.clone();
+                let agent_name_clone = agent_name.clone();
+
+                tokio::spawn(async move {
+                    // Small delay to let extraction tasks commit first.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                    let resolver =
+                        crate::kg::entity_resolver::SubjectEntityResolver::new(db, llm, None);
+                    match resolver.resolve_pending().await {
+                        Ok(stats) => {
+                            if stats.matched_exact > 0 || stats.matched_llm > 0 || stats.errors > 0
+                            {
+                                info!(
+                                    event = "entity_resolution_ready",
+                                    agent_id = %agent_name_clone,
+                                    matched_exact = stats.matched_exact,
+                                    matched_llm = stats.matched_llm,
+                                    no_match = stats.no_match,
+                                    skipped_discovered = stats.skipped_discovered,
+                                    skipped_no_llm = stats.skipped_no_llm,
+                                    errors = stats.errors,
+                                    duration_ms = stats.duration_ms,
+                                    "entity resolution complete"
+                                );
+                            }
+                        }
+                        Err(e) => warn!(
+                            error = %e,
+                            agent_id = %agent_name_clone,
+                            "entity resolution failed; resolutions may be stale until next restart"
+                        ),
+                    }
+                });
+            }
+        }
     }
 
     let state = AppState {

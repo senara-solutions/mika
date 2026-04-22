@@ -66,7 +66,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~2540 tests)
+- `cargo test` — Run all tests (~2815 tests)
 - `cargo test -p mika-agent --test eval` — Run agent loop integration tests (eval harness)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
@@ -91,7 +91,7 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 - **HTTP server (mika-server)** — Axum, two auth layers, embedded dashboard. See `crates/mika-agent/CLAUDE.md`.
 - **Gateway** — Telegram + GitHub webhook routing, A2A proxy, Postgres. See `crates/mika-gateway/CLAUDE.md`.
 - **A2A protocol** — v0.3, JSON-RPC, task state machine. See `crates/mika-a2a/CLAUDE.md`.
-- **Knowledge Graph** — Three-layer KG (domain/lexical/subject) in SQLite. Domain graph builder (deterministic, startup) projects skills/tools/agents/problem_types into `kg_entities`/`kg_relationships`. Lexical ingestor (#689) chunks `docs/solutions/**/*.md` per-agent into `kg_chunks` + FTS5/vec search. Subject extractor (#690) runs LLM-based NER to extract entities and fact triples from chunks into `kg_subject_entities`/`kg_subject_relationships` with provenance tracking. Extraction runs async at startup (background per-agent) and sync on compound hook. See `crates/mika-agent/CLAUDE.md`.
+- **Knowledge Graph** — Three-layer KG (domain/lexical/subject) in SQLite. Domain graph builder (deterministic, startup) projects skills/tools/agents/problem_types into `kg_entities`/`kg_relationships`. Lexical ingestor (#689) chunks `docs/solutions/**/*.md` per-agent into `kg_chunks` + FTS5/vec search. Subject extractor (#690) runs LLM-based NER to extract entities and fact triples from chunks into `kg_subject_entities`/`kg_subject_relationships` with provenance tracking. Extraction runs async at startup (background per-agent) and sync on compound hook. Entity resolver (#691) bridges subject graph to domain graph via two-stage pipeline (exact-match then LLM disambiguation) into `kg_subject_resolutions`/`kg_resolutions_log`. Resolution runs async at startup and as background spawn after compound extraction. See `crates/mika-agent/CLAUDE.md`.
 - **Docker images:** Multi-stage builds with BuildKit cache. `Dockerfile.agent` (95MB) for per-customer containers. `Dockerfile.gateway` for the stateless gateway. Both use rustls, non-root user `mika` (UID 1000). Release profile: LTO + strip. `docker-compose.yml` defines agent, gateway, and postgres services. **Host dependency:** `jq` is required by all skill handler scripts.
 - **CI/CD:** Four GitHub Actions workflows: `ci.yml` (PR checks), `release-plz.yml` (versioning/changelog), `release.yml` (cross-platform binaries), `publish-ui.yml` (`@senara-solutions/ui` to GitHub Packages). All actions pinned to commit SHAs.
 
@@ -113,6 +113,7 @@ Optional (web search):
 Optional (Knowledge Graph LLM):
 - `MIKA_KG_INGESTION_MODEL` — Shared fallback model for KG extraction and resolution. Format: `provider/model` (e.g., `anthropic/claude-haiku-4-5-20251001`). If unset, KG features requiring LLM calls are disabled.
 - `MIKA_KG_EXTRACTION_MODEL` — Model for NER + fact-triple extraction (#690). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Task is mechanical JSON extraction — cheap/fast tier recommended.
+- `MIKA_KG_RESOLUTION_MODEL` — Model for entity resolution disambiguation (#691). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Mid-tier model recommended for better judgment on ambiguous matches.
 
 Optional (GitHub App — preferred over PAT for agent operations):
 - `MIKA_GITHUB_APP_ID` — GitHub App ID (u64). Required for GitHub App authentication.

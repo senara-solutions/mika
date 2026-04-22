@@ -305,5 +305,6 @@ fn dummy_settings() -> Settings {
         log_llm_bodies: false,
         kg_ingestion_model: None,
         kg_extraction_model: None,
+        kg_resolution_model: None,
     }
 }

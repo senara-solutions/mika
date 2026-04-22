@@ -143,6 +143,28 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20), `enabled INTEGER` (v24). Per-agent overrides: LLM overrides resolve as DB > manifest `[llm]` > agent default (`mika skills llm <name> set <provider>/<model>`). Enabled state is tri-state: `NULL`=default (enabled), `0`=disabled, `1`=explicitly enabled. `enabled=false` evicts the skill from `SkillRegistry.entries` during `apply_overrides()`. Replaces `.disabled` marker files (#629). Default-equals-delete: rows where all columns are NULL are pruned.
 
+### Knowledge Graph Tables (v25)
+
+**kg_entities** — `id INTEGER PK AUTO`, `entity_key TEXT UNIQUE`, `type TEXT NOT NULL`, `name TEXT NOT NULL`, `properties_json TEXT`, `created_at TEXT`, `updated_at TEXT`. Domain-layer entities (skill, tool, agent, problem_type). No `agent_id` — global scope.
+
+**kg_relationships** — `id INTEGER PK AUTO`, `source_entity_id FK→kg_entities`, `target_entity_id FK→kg_entities`, `relationship_type TEXT NOT NULL`, `properties_json TEXT`, `created_at TEXT`. Domain-layer edges (DEPENDS_ON, PROVIDES).
+
+**kg_chunks** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `source_doc_path TEXT NOT NULL`, `chunk_index INTEGER NOT NULL`, `content_hash TEXT NOT NULL`, `created_at TEXT`. Lexical-layer chunks. UNIQUE on `(agent_id, source_doc_path, chunk_index)`.
+
+**kg_subject_entities** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `entity_key TEXT NOT NULL`, `type TEXT NOT NULL`, `name TEXT NOT NULL`, `confidence REAL NOT NULL`, `properties_json TEXT`, `created_at TEXT`. Subject-layer entities extracted by LLM NER.
+
+**kg_subject_relationships** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `source_entity_id FK→kg_subject_entities`, `target_entity_id FK→kg_subject_entities`, `relationship_type TEXT NOT NULL`, `confidence REAL`, `properties_json TEXT`, `created_at TEXT`. Subject-layer fact triples.
+
+**kg_chunk_subjects** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `chunk_id FK→kg_chunks`, `subject_entity_id FK→kg_subject_entities`, `extraction_trace_id TEXT`, `created_at TEXT`. Provenance: which chunk produced which entity.
+
+**kg_chunk_subject_relationships** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `chunk_id FK→kg_chunks`, `subject_relationship_id FK→kg_subject_relationships`, `extraction_trace_id TEXT`, `created_at TEXT`. Provenance: which chunk produced which relationship.
+
+**kg_extractions** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `source_doc_path TEXT NOT NULL`, `entities_extracted INTEGER`, `relationships_extracted INTEGER`, `extraction_trace_id TEXT`, `model TEXT`, `duration_ms INTEGER`, `created_at TEXT`. Tracking: one row per completed extraction. UNIQUE on `(agent_id, source_doc_path)`.
+
+**kg_subject_resolutions** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `subject_entity_id FK→kg_subject_entities`, `domain_entity_id FK→kg_entities`, `confidence REAL NOT NULL CHECK(0.0..1.0)`, `trace_id TEXT`, `created_at TEXT`. Resolution edges bridging subject→domain. UNIQUE on `(agent_id, subject_entity_id, domain_entity_id)`. CASCADE on both FKs. Sole writer: `SubjectEntityResolver` (#691).
+
+**kg_resolutions_log** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `subject_entity_id FK→kg_subject_entities`, `outcome TEXT NOT NULL CHECK(matched_exact|matched_llm|no_match|skipped_discovered_type|skipped_no_llm|error)`, `resolution_trace_id TEXT NOT NULL`, `source_extraction_trace_id TEXT`, `model TEXT`, `duration_ms INTEGER`, `resolved_at TEXT`. Resolution tracking. UNIQUE on `(agent_id, subject_entity_id)`. Sole writer: `SubjectEntityResolver` (#691).
+
 ### View
 
 **unified_timeline** — `UNION ALL` across `messages`, `audit_events`, `tasks`, `team_workspace`. Columns: `trace_id`, `session_id`, `agent_id`, `event_type`, `event_subtype`, `summary` (truncated to 200 chars), `created_at`. Task leg uses `COALESCE(execution_trace_id, created_trace_id)` as `trace_id` for accurate correlation. Team workspace entries use `event_type='team_workspace'`, synthetic `session_id='team-{run_id}'`, and `agent_id=NULL`.

@@ -758,6 +758,12 @@ pub struct Settings {
     #[serde(default)]
     pub kg_extraction_model: Option<String>,
 
+    /// KG resolution model — used for entity disambiguation (#691).
+    /// Falls back to `kg_ingestion_model` if unset. Mid-tier model recommended
+    /// for better judgment on ambiguous entity matches.
+    #[serde(default)]
+    pub kg_resolution_model: Option<String>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
@@ -1016,9 +1022,25 @@ impl Settings {
         Some(self.make_provider_from_model_string(model_str))
     }
 
+    /// Create an LLM provider for KG entity resolution (disambiguation).
+    ///
+    /// Resolution order: `MIKA_KG_RESOLUTION_MODEL` → `MIKA_KG_INGESTION_MODEL` → `None`.
+    /// Format: `provider/model` (e.g., `anthropic/claude-haiku-4-5-20251001`).
+    /// Returns `None` when no KG model is configured (resolution LLM disabled).
+    pub fn make_kg_resolution_provider(
+        &self,
+    ) -> Option<anyhow::Result<Arc<dyn crate::llm::LlmProvider>>> {
+        let model_str = self
+            .kg_resolution_model
+            .as_deref()
+            .or(self.kg_ingestion_model.as_deref())?;
+
+        Some(self.make_provider_from_model_string(model_str))
+    }
+
     /// Parse a `provider/model` string and create an LLM provider.
     ///
-    /// Reusable by `make_kg_extraction_provider` and future `make_kg_resolution_provider`.
+    /// Reusable by `make_kg_extraction_provider` and `make_kg_resolution_provider`.
     fn make_provider_from_model_string(
         &self,
         model_str: &str,

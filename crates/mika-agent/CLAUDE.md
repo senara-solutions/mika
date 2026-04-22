@@ -173,6 +173,22 @@ Connects to external MCP servers at startup via `McpManager`. Configured in `{ag
 
 **LLM policy (C2):** Model from `MIKA_KG_EXTRACTION_MODEL` → `MIKA_KG_INGESTION_MODEL` fallback. Retry taxonomy per C2.2 (transport: 3 attempts with backoff; semantic: one retry with prompt reinforcement; config: no retry). Log-and-skip per C2.3. `llm_calls` rows per C2.4. Audit events per C3.3.
 
+## Knowledge Graph — Entity Resolver
+
+`src/kg/entity_resolver.rs` — Per-agent entity resolution that bridges subject graph entities to domain graph nodes (#691). Two-stage pipeline: exact match (case-insensitive) then LLM disambiguation for unresolved or ambiguous cases.
+
+**Sole-writer contract:** This module is the sole writer of `kg_subject_resolutions` (subject → domain edges with confidence scores) and `kg_resolutions_log` (resolution tracking with outcome enum). No other code path writes these tables.
+
+**Two-stage pipeline (D1):** Stage 1: case-insensitive exact match against `kg_entities.entity_key`. If match found and extraction confidence > 0.9, resolve immediately (confidence = extraction_confidence). Stage 2: LLM disambiguation with candidate list (max 50) and source chunk prose context. Combined confidence = min(extraction_confidence, llm_confidence). Discovered types (solution_path, failure_mode, pattern) skip resolution entirely — no domain counterpart exists.
+
+**Execution contexts (D5):** (1) Startup: background `tokio::spawn` per agent after extraction tasks, non-blocking. (2) Compound hook: `IngestionOrchestrator` spawns async resolution after extraction commits. (3) `resolve_pending()` catches entities missed by either path.
+
+**Pending-entity detection (D4):** `kg_resolutions_log` tracking table with `UNIQUE(agent_id, subject_entity_id)`. Pending query: subject entities with well-known types that have no log row, or whose `source_extraction_trace_id` differs from the latest `kg_chunk_subjects` extraction.
+
+**LLM policy (C2):** Model from `MIKA_KG_RESOLUTION_MODEL` → `MIKA_KG_INGESTION_MODEL` fallback. Mid-tier model recommended. Same C2.2 retry taxonomy as extraction. `no_match` is a first-class LLM response (not an error). `llm_calls` rows per C2.4. Per-batch audit events per C3.3.
+
+**Failure policy:** Resolution failures are log-and-skip per C2.3. Failed entities stay pending for next startup's `resolve_pending`. No resolution model configured → exact-match-only mode with `outcome = 'skipped_no_llm'`.
+
 ## Silent Mode Agent Loop
 
 Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.
@@ -239,7 +255,7 @@ All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). Th
 
 ## Schema Version
 
-**Current: v24.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls, tool_calls, team_runs. `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
+**Current: v25.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls, tool_calls, team_runs, kg_entities, kg_relationships, kg_chunks, kg_subject_entities, kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions, kg_subject_resolutions, kg_resolutions_log. `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
 
 Recent migrations:
 - v18->v19: `sessions.task_id` column for reverse session->task lookups. `get_sessions_for_task_tree()`.
@@ -248,5 +264,6 @@ Recent migrations:
 - v21->v22: `messages.internal` column (`INTEGER NOT NULL DEFAULT 0`) for agent-to-agent message visibility. TUI inbox mode filters internal messages at the DB level. Set by `delegate_task` tool and by `mika ask --task-id` relay sessions (without `--task-complete`). `AgentParams.internal` threads the flag through `run_loop` to all message save paths.
 - v22->v23: `tasks.type` column (`TEXT NOT NULL DEFAULT 'issue' CHECK (type IN ('issue', 'milestone', 'project'))`). Foundational for milestone/project dispatch (mika#595): `create_task` accepts an optional `type` parameter; `list_tasks` and `check_task` surface it. mika core stays a dumb task store — orchestration logic lives in self-dev (mika-skills#149). `NewTask.r#type: Option<String>` defaults to `'issue'` via SQL DEFAULT when `None`. Constants: `TASK_TYPE_ISSUE`/`TASK_TYPE_MILESTONE`/`TASK_TYPE_PROJECT`/`VALID_TASK_TYPES` in `db.rs`.
 - v23->v24: `skill_overrides.enabled` column (`INTEGER`, nullable tri-state). `NULL` = default (enabled), `0` = disabled, `1` = explicitly enabled. Replaces `.disabled` marker files (#629). `SkillOverride.enabled: Option<bool>`. `set_skill_enabled()` with default-equals-delete (row deleted when all columns are NULL). `apply_overrides()` evicts disabled skills from `SkillRegistry.entries` into `disabled: Vec<DisabledSkill>`. One-shot `migrate_disabled_markers()` converts legacy `.disabled` marker files to DB rows at startup (fail-open on marker removal).
+- v24->v25: Knowledge graph tables. Domain layer: `kg_entities`, `kg_relationships`. Lexical layer: `kg_chunks` + `search_content` integration. Subject layer: `kg_subject_entities`, `kg_subject_relationships`, provenance tables (`kg_chunk_subjects`, `kg_chunk_subject_relationships`), `kg_extractions` tracking. Resolution layer (#691): `kg_subject_resolutions` (subject → domain edges with confidence, UNIQUE on agent_id+subject_entity_id+domain_entity_id), `kg_resolutions_log` (resolution tracking with outcome CHECK constraint, UNIQUE on agent_id+subject_entity_id).
 
 Full migration history: see `docs/runtime-structure.md`.
