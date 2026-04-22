@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
-use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -220,77 +219,94 @@ impl LexicalIngestor {
 
     /// Core single-doc ingestion logic shared by `ingest_all` and
     /// `ingest_single_doc`.
+    ///
+    /// All DB mutations (hash check → delete old chunks → insert new chunks →
+    /// index for FTS) happen in a **single `with_db` transaction** so readers
+    /// never see a flash-of-empty state for the document.
     async fn ingest_single_doc_inner(&self, abs_path: &Path) -> Result<DocStats> {
         let raw = std::fs::read(abs_path)?;
         let normalized = normalize_content(&raw);
-
-        if normalized.trim().is_empty() {
-            return Ok(DocStats {
-                outcome: DocOutcome::Skipped,
-                chunks_added: 0,
-                chunks_deleted: 0,
-            });
-        }
-
-        let new_hash = compute_hash(&normalized);
         let rel_path = self
             .relative_path(abs_path)
             .unwrap_or_else(|| abs_path.to_string_lossy().to_string());
 
-        // Check existing hash in DB.
-        let agent_id = self.db.agent_id.clone();
-        let rel_path_for_query = rel_path.clone();
-        let existing_hash: Option<String> = self
-            .db
-            .with_db(move |db| {
-                let mut stmt = db.conn.prepare(
-                    "SELECT DISTINCT source_doc_hash FROM kg_chunks
-                     WHERE agent_id = ?1 AND source_doc_path = ?2",
-                )?;
-                let hashes: Vec<String> = stmt
-                    .query_map(rusqlite::params![agent_id, rel_path_for_query], |row| {
-                        row.get(0)
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                if hashes.len() == 1 {
-                    Ok(Some(hashes.into_iter().next().unwrap()))
-                } else {
-                    // Empty or multiple distinct hashes — force re-ingest.
-                    Ok(None)
-                }
-            })
-            .await?;
-
-        // Skip if unchanged.
-        if existing_hash.as_deref() == Some(&new_hash) {
+        // If the file is empty after normalization, clean up any stale chunks
+        // from a previous run where the doc had content.
+        if normalized.trim().is_empty() {
+            let chunks_deleted = self.delete_doc_chunks(&rel_path).await.unwrap_or(0);
             return Ok(DocStats {
                 outcome: DocOutcome::Skipped,
                 chunks_added: 0,
-                chunks_deleted: 0,
+                chunks_deleted,
             });
         }
 
-        // Delete existing chunks for this doc (if any) before re-inserting.
-        let chunks_deleted = if existing_hash.is_some() {
-            self.delete_doc_chunks(&rel_path).await?
-        } else {
-            0
-        };
-
-        // Chunk and insert.
+        let new_hash = compute_hash(&normalized);
         let chunks = chunk_doc(&normalized);
-        let chunks_added = chunks.len();
 
         let agent_id = self.db.agent_id.clone();
-        let rel_path_for_insert = rel_path.clone();
-        let new_hash_for_insert = new_hash;
+        let rel_path_owned = rel_path.clone();
+        let new_hash_owned = new_hash;
         let trace_id = self.trace_id.clone();
 
-        self.db
+        // Single with_db call: hash check + delete + insert are one transaction.
+        // This eliminates the empty-window gap between delete and insert.
+        let (chunks_added, chunks_deleted, was_skipped) = self
+            .db
             .with_db(move |db| {
+                // 1. Hash check: is the doc unchanged?
+                let existing_hashes: Vec<String> = {
+                    let mut stmt = db.conn.prepare(
+                        "SELECT DISTINCT source_doc_hash FROM kg_chunks
+                         WHERE agent_id = ?1 AND source_doc_path = ?2",
+                    )?;
+                    stmt.query_map(rusqlite::params![agent_id, rel_path_owned], |row| {
+                        row.get(0)
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect()
+                };
+
+                // Single matching hash → unchanged, skip.
+                if existing_hashes.len() == 1 && existing_hashes[0] == new_hash_owned {
+                    return Ok((0usize, 0usize, true));
+                }
+
+                // 2. Atomic delete + insert in one transaction.
                 let tx = db.conn.unchecked_transaction()?;
 
+                // Delete existing chunks (if any). Always delete when chunks
+                // exist — handles both the normal re-ingest case and the
+                // inconsistent-hashes corruption case.
+                let mut deleted = 0usize;
+                if !existing_hashes.is_empty() {
+                    // Clean up search_content/FTS/vec for each chunk.
+                    let chunk_ids: Vec<i64> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT id FROM kg_chunks WHERE agent_id = ?1 AND source_doc_path = ?2",
+                        )?;
+                        stmt.query_map(rusqlite::params![agent_id, rel_path_owned], |row| {
+                            row.get(0)
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect()
+                    };
+
+                    for &chunk_id in &chunk_ids {
+                        // Call delete_search_content on the Database which uses
+                        // the same connection as the transaction (unchecked_transaction
+                        // borrows the connection, so db.conn writes are inside tx).
+                        db.delete_search_content(&agent_id, KG_CHUNK_SOURCE_TYPE, chunk_id)?;
+                    }
+
+                    deleted = chunk_ids.len();
+                    tx.execute(
+                        "DELETE FROM kg_chunks WHERE agent_id = ?1 AND source_doc_path = ?2",
+                        rusqlite::params![agent_id, rel_path_owned],
+                    )?;
+                }
+
+                // 3. Insert new chunks + index_content in the same transaction.
                 for chunk in &chunks {
                     tx.execute(
                         "INSERT INTO kg_chunks (agent_id, seq_id, source_doc_path, source_doc_hash, trace_id)
@@ -298,17 +314,18 @@ impl LexicalIngestor {
                         rusqlite::params![
                             agent_id,
                             chunk.seq_id,
-                            rel_path_for_insert,
-                            new_hash_for_insert,
+                            rel_path_owned,
+                            new_hash_owned,
                             trace_id,
                         ],
                     )?;
 
                     let chunk_rowid = tx.last_insert_rowid();
 
-                    // Index the chunk text for FTS + embedding backfill.
-                    // Call index_content directly on the Database, which uses
-                    // the same underlying connection (inside the transaction).
+                    // SAFETY: db.index_content uses db.conn which is the same
+                    // connection that tx wraps (via unchecked_transaction). All
+                    // writes through db.conn are inside this transaction and
+                    // will commit or rollback atomically.
                     db.index_content(
                         &agent_id,
                         KG_CHUNK_SOURCE_TYPE,
@@ -318,9 +335,17 @@ impl LexicalIngestor {
                 }
 
                 tx.commit()?;
-                Ok(())
+                Ok((chunks.len(), deleted, false))
             })
             .await?;
+
+        if was_skipped {
+            return Ok(DocStats {
+                outcome: DocOutcome::Skipped,
+                chunks_added: 0,
+                chunks_deleted: 0,
+            });
+        }
 
         Ok(DocStats {
             outcome: DocOutcome::Ingested,
@@ -330,6 +355,10 @@ impl LexicalIngestor {
     }
 
     /// Delete all chunks for a document, including search_content cleanup.
+    ///
+    /// Uses [`Database::delete_search_content`] for the symmetric cleanup of
+    /// `search_content` + `fts_search` + `vec_search` to avoid duplicating
+    /// delete logic that would diverge when new search tables are added.
     ///
     /// Returns the number of chunks deleted.
     async fn delete_doc_chunks(&self, rel_path: &str) -> Result<usize> {
@@ -350,31 +379,12 @@ impl LexicalIngestor {
                         .collect()
                 };
 
-                // For each chunk, clean up search_content + FTS + vec.
+                // Symmetric delete: use the canonical delete_search_content which
+                // handles search_content + fts_search + vec_search cleanup.
+                // db.delete_search_content uses db.conn which is the same connection
+                // as tx (via unchecked_transaction), so writes are transactional.
                 for &chunk_id in &chunk_ids {
-                    let existing: Option<(i64, String)> = tx
-                        .query_row(
-                            "SELECT id, content FROM search_content
-                              WHERE agent_id = ?1 AND source_type = ?2 AND source_id = ?3",
-                            rusqlite::params![agent_id, KG_CHUNK_SOURCE_TYPE, chunk_id],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
-                        )
-                        .optional()?;
-
-                    if let Some((sc_id, content)) = existing {
-                        let _ = tx.execute(
-                            "INSERT INTO fts_search(fts_search, rowid, content) VALUES ('delete', ?1, ?2)",
-                            rusqlite::params![sc_id, content],
-                        );
-                        let _ = tx.execute(
-                            "DELETE FROM vec_search WHERE rowid = ?1",
-                            rusqlite::params![sc_id],
-                        );
-                        tx.execute(
-                            "DELETE FROM search_content WHERE id = ?1",
-                            rusqlite::params![sc_id],
-                        )?;
-                    }
+                    db.delete_search_content(&agent_id, KG_CHUNK_SOURCE_TYPE, chunk_id)?;
                 }
 
                 let count = chunk_ids.len();
