@@ -5,9 +5,9 @@
 **Milestone:** Evaluation (#16)
 **Blocked by:**
 - `#338` at plan commit **`fa54d950`** (matrix machinery, calibration artifact, env gates, `#[ignore]` intent gate)
-- `#339` at plan commit **`5fb14662`** (three-tier execution model, `register_scenario` idiom + uniqueness guard, ticket-namespaced vocabulary, README structure, paired-assertions pattern precedent)
+- `#339` at plan commit **`4d28352e`** (three-tier execution model, `register_scenario` idiom + uniqueness guard, ticket-namespaced vocabulary, README structure, paired-assertions pattern precedent, class-average cost envelope)
 - `#340` item #5 (`MockLlmProvider::health_error` builder for controlled failure injection on scenario 4)
-- `#740` at plan commit **`871fe06c`** (imports shared `kg_fixtures` module at `tests/eval/kg_fixtures/mod.rs` for scenario 5's seeded KG state)
+- `#740` at plan commit **`20f61c9e`** (imports shared `kg_fixtures` module at `tests/eval/kg_fixtures/mod.rs` for scenario 5's seeded KG state; tag-attribution cause-location rule mirrored)
 
 **Status:** Groomed draft — pending Vincent review
 
@@ -118,6 +118,13 @@ Fixtures are committed JSON/text files under `tests/eval/grounding_regressions/f
 
 **Scope boundary with `#740` `self-knowledge:*`.** Self-knowledge covers tool-invocation-through-resolver code paths (does `query_knowledge_graph` get called, does the resolver return the right result). Grounding covers response-to-evidence paths (does the agent USE the evidence or IGNORE it). Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags in `grounding:*` because the failure mode is response-generation, not query-invocation.
 
+**Tag attribution rule — cause-location, not symptom** (mirrors `#740` D4). Tags identify *where in the code path* a failure originated, not the user-visible symptom. Three worked examples:
+- KG returned wrong result → `self-knowledge:*` (resolver returned wrong data)
+- KG returned right result, agent ignored it → `grounding:*` (response construction ignored evidence)
+- KG state itself stale/corrupt → hard-assertion fail or data-integrity ticket, NOT a soft tag
+
+When a new ambiguous case surfaces, apply the rule *before* expanding vocabulary: trace the failure to the code path it originated in, attribute the tag to that path. Symptoms cross namespace boundaries; causes do not. This rule lives in both `#740` D4 and `#741` D4 — shared convention across the milestone.
+
 **Vocabulary review checkpoint.** Same pattern as `#740` D4: after all five scenarios are implemented, revisit vocabulary. If any scenario's outcome doesn't fit a tag, expand rather than stretch. Review is an explicit AC before merge.
 
 **Rationale:** Tags map to the six behavioral states (five desirable, one failure) that grounding regressions produce. Ticket-namespacing preserves aggregation capability across the milestone's full eval surface.
@@ -190,9 +197,23 @@ Mock tool output for grounding scenarios extends `MockLlmProvider`'s scripted-re
 
 **Decision:** Scenario 5 imports `kg_fixtures::{seed_domain_entity, seed_subject_entity, seed_resolution}` directly from `#740`'s module. No duplication. No re-implementation. If `#740` lands first in the DAG, the imports work; if the order flips for any reason, `#741` adds a note but still imports (the helpers' shape is stable per `#740`'s D1 decision).
 
-**Rationale:** The shared-surface discipline from `#740` D1's crate-shared placement exists precisely for this. Cargo-cult duplication would silently drift; import enforces single source of truth.
+**Verified signature compatibility (2026-04-23).** Cross-checked `#740` D1 helper signatures against scenario 5's concrete fixture needs. Scenario 5 makes three calls:
 
-**Rejected alternative:** Duplicate minimal seed helpers for scenario 5's narrow needs. Rejected — the whole point of `#740`'s D1 decision was to prevent this.
+```rust
+let domain_id = seed_domain_entity(db, DomainEntitySpec { type_: "skill", name: "self-dev" })?;
+let subject_id = seed_subject_entity(db, "test-agent", SubjectEntitySpec { type_: "problem_type", name: "pr-merge-skill-routing", confidence: 0.9 })?;
+seed_resolution(db, "test-agent", subject_id, domain_id, 0.85, "matched_llm")?;
+```
+
+All three call signatures match `#740` D1's documented shapes. The `spec` parameters' concrete field shape (`type_`, `name`, `confidence` for subject; `type_`, `name` for domain) follow the `<type>:<name>` entity-key convention `#740` D1 explicitly commits to. No extension of `#740`'s helpers required. Chunks + chunk-subject helpers are NOT needed for scenario 5 — it doesn't exercise Path C. This verification converts the cross-plan coupling from documented-assumption into structural precondition.
+
+**Dispatch-order contract-freeze rule.** The three leaf tickets (`#339`, `#740`, `#741`) are parallel-dispatchable in the DAG. `#741` imports `#740`'s helpers, so `#740`'s D1 signatures are a **frozen public contract at `#740` dispatch time**. Any amendment to `#740`'s D1 during implementation bumps `#740`'s plan SHA, which means this plan's SHA-pin becomes a grep-findable drift signal. Amendments to a dispatched plan's shared-surface decisions require a downstream amendment review — enforced by SHA-pinning, not by policy. This lets the three leaves dispatch in parallel without coupling implementation cadence. If a downstream amendment is required, it's visible at review, not in production.
+
+**Rationale:** The shared-surface discipline from `#740` D1's crate-shared placement exists precisely for this. Cargo-cult duplication would silently drift; import enforces single source of truth. Signature verification at plan-time converts the coupling into a structural guarantee; contract freeze at dispatch-time preserves parallelism without hidden drift.
+
+**Rejected alternatives:**
+- Duplicate minimal seed helpers for scenario 5's narrow needs. Rejected — the whole point of `#740`'s D1 decision was to prevent this.
+- Sequential dispatch of leaves (`#740` must ship before `#741` starts). Rejected in favor of parallel + contract-freeze; sequential adds calendar days for no structural gain when SHA-pinning already provides the drift signal.
 
 ## Acceptance Criteria
 
@@ -218,11 +239,11 @@ Mock tool output for grounding scenarios extends `MockLlmProvider`'s scripted-re
 Five pins (four plan-level SHAs plus one sub-item):
 
 - `#338` at `fa54d950` — matrix machinery, `#[ignore]` gate, calibration artifact
-- `#339` at `5fb14662` — three-tier model, `register_scenario`, vocabulary namespacing, README structure, paired-assertions-within-capability pattern
+- `#339` at `4d28352e` — three-tier model, `register_scenario`, vocabulary namespacing, README structure, paired-assertions-within-capability pattern, class-average cost envelope
 - `#340` item #5 — `MockLlmProvider::health_error` for scenario 4
-- `#740` at `871fe06c` — `kg_fixtures` shared module for scenario 5
+- `#740` at `20f61c9e` — `kg_fixtures` shared module for scenario 5; tag-attribution cause-location rule
 
-All four pins are explicit: upstream drift on any is a grep-findable version bump, not implicit breakage.
+All four pins are explicit: upstream drift on any is a grep-findable version bump, not implicit breakage. Dispatch-order policy documented in D8: parallel leaves with contract-freeze semantics enforced by SHA-pinning.
 
 ## Downstream
 
@@ -236,19 +257,33 @@ All four pins are explicit: upstream drift on any is a grep-findable version bum
 - **Shared-surface discipline:** `#741` imports from `#740`'s `kg_fixtures` and `#340`'s `MockLlmProvider::health_error`, and exports nothing (terminal plan). The milestone's shared surfaces are now: `kg_fixtures` (#740) + `grounding_assertions` (this plan) + the tag-namespacing convention. Three modules, one convention, no duplication.
 - **Vocabulary boundary with `#740`:** `self-knowledge:*` = query-invocation-through-resolver code paths; `grounding:*` = response-to-evidence paths. Scenario 5 explicitly sits at the boundary and is routed by failure class, not scenario proximity.
 
-## Cost envelope (milestone-level rollup, for friend review)
+## Cost envelope (milestone-level rollup)
 
-- `#340` — no real-API cost (harness-level cleanup)
-- `#338` — machinery; integration-tier cost bounded by workflow timeout (per #338 D8)
-- `#339` — golden dataset; 25 scenarios × TBD cost per scenario (estimated in #339 implementation; bounded by `MIKA_EVAL_REAL_PROVIDERS` + `#[ignore]` gates)
-- `#740` — ~$0.015 per integration run (scenarios 4 + 6 only)
-- `#741` — ~$0.023 per integration run (scenarios 2/3/4/5)
+Per-provider per-run integration-tier cost for each ticket:
 
-**Milestone integration-tier cost per run:** low-tens-of-cents for the cross-ticket portion; `#339`'s dataset dominates only if its scenarios run expensively. All gated by `MIKA_EVAL_REAL_PROVIDERS` + `#[ignore]` + workflow timeout. Accidental-burn is structurally impossible per `#338` D8.
+- `#340` — **$0** (harness-level cleanup; no real API)
+- `#338` — **machinery**; integration-tier cost bounded by workflow timeout + scenario-count caps per #338 D8 (no authoritative per-run number — machinery scenarios are shape/structure tests, not LLM behavior tests)
+- `#339` — **~$0.63 per provider** / **~$2.52 full 4-provider matrix** (class-average estimate from #339 cost envelope section: 8 memory × $0.02 + 8 tool-selection × $0.02 + 5 conversation-quality × $0.03 + 4 skill-specific × $0.04)
+- `#740` — **~$0.015 per integration run** (scenarios 4 + 6 only)
+- `#741` — **~$0.023 per integration run** (scenarios 2/3/4/5)
 
-## Open questions (for Vincent before dispatch)
+**Milestone integration-tier rollup (single provider):** `#339` dominates at ~$0.63; `#740` + `#741` combined add ~$0.04; `#338`/`#340` add ~$0. Full matrix across 4 providers: `#339` × 4 = ~$2.52, plus `#740` + `#741` each once (they don't parameterize across the matrix the same way — they're scenarios that use a single provider per run), totaling **~$2.57 per full-matrix run**. Weekly calibration via `#742` runs this full-matrix once per week at the high end — that's a lower bound for annualized cost (~$134/yr) if scenarios and providers don't grow. Upper bound depends on how often CI triggers; `#338` D8's workflow-timeout backstop prevents unbounded runs.
 
-1. **D2 scenario count at 5** — comfortable, or does the routing-from-`#740` scenario 5 feel too cross-cutting and should stay in `#740` as an eighth scenario there? My call: keep in `#741` because the failure class is grounding (agent-ignores-evidence), not self-knowledge (agent-doesn't-know-to-query), per D4 scope boundary.
-2. **D3 fixtures** — five frozen pre-fix JSON/text fixtures checked in under `fixtures/`. Acceptable, or should the fixtures live in the incident solution docs they cite (e.g., `docs/solutions/agent-quality/mika-727.md`) and be loaded from there? My default: checked-in fixtures in the test tree, because solution docs are prose-heavy and the test needs structured data.
-3. **D1 helper placement** — `tests/eval/grounding_assertions/mod.rs` as crate-shared (no current downstream). Overkill for a terminal plan's helpers, or right per the #740 precedent ("shared today, might be shared tomorrow")? My default: keep crate-shared; future fabrication-detection tickets are likely and will want these helpers.
-4. **Cost envelope milestone rollup** — included for the friend's milestone-level read. If you want it moved elsewhere (a separate milestone summary doc), flag and I'll relocate.
+All gated by `MIKA_EVAL_REAL_PROVIDERS` + `#[ignore]` + workflow timeout. Accidental-burn is structurally impossible per `#338` D8.
+
+## Review log
+
+**Vincent + friend review pass 1 (2026-04-22, relayed by Vincent):**
+
+- D2: scenario 5 stays in `#741` per failure-class routing
+- D3: frozen fixtures in `tests/eval/grounding_regressions/fixtures/`, not inline in solution docs
+- D8: helpers at crate-shared `tests/eval/grounding_assertions/mod.rs` per `#740` precedent
+- Milestone cost rollup stays in `#741` as terminal plan's natural location
+
+**Milestone-level friend review pass 2 (2026-04-23, relayed by Vincent):**
+
+- **D4 extended with tag-attribution cause-location rule** (mirror of `#740` D4 amendment). Converts the vocabulary boundary from case-by-case handshake into structural convention.
+- **D8 verified signature compatibility** at plan-time: cross-checked `#740` D1 helper signatures against scenario 5's three concrete calls (`seed_domain_entity`, `seed_subject_entity`, `seed_resolution`). All fit; no extension of `#740` required. Coupling converted from documented-assumption to structural precondition.
+- **D8 dispatch-order contract-freeze rule:** parallel leaves with SHA-pinning as the contract-freeze enforcement. Amendments to a dispatched plan's shared-surface decisions bump its SHA, which surfaces as a grep-findable drift signal in downstream plans. Preserves parallelism without hidden coupling. Sequential dispatch explicitly rejected.
+- **Milestone cost rollup now quantifies `#339`** via its class-average envelope (~$0.63/provider, ~$2.52 full matrix). Previous TBD replaced with real number. Annualized lower-bound for weekly calibration included.
+- **SHA pins refreshed** to `#339` `4d28352e` and `#740` `20f61c9e`. All upstream amendments now explicit version bumps in this plan's dep declaration.
