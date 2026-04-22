@@ -24,6 +24,10 @@ pub struct AgentTrace {
 
 impl AgentTrace {
     /// Build an `AgentTrace` by querying the DB and reading captured mock requests.
+    ///
+    /// All DB writes by `run_agent()` are synchronous — LLM calls and tool calls are
+    /// persisted before `run_agent()` returns. `AgentTrace::from_run` can query them
+    /// immediately without waiting or polling.
     pub async fn from_run(
         db: &AsyncDatabase,
         trace_id: &str,

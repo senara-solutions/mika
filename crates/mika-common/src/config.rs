@@ -1158,6 +1158,87 @@ impl Settings {
 
         Ok(settings)
     }
+
+    /// Minimal `Settings` for deterministic tests — no API keys, no network, no secrets.
+    ///
+    /// Lives on `Settings` itself so that any new field addition produces a compile
+    /// error here rather than in scattered test helpers.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_defaults() -> Self {
+        Self {
+            llm_provider: ProviderKind::Anthropic,
+            llm_max_tokens: 4096,
+            // Per-provider fields (all None = use defaults)
+            anthropic_model: None,
+            anthropic_api_key: None,
+            anthropic_base_url: None,
+            openai_model: None,
+            openai_base_url: None,
+            openrouter_model: None,
+            openrouter_api_key: None,
+            openrouter_base_url: None,
+            groq_model: None,
+            groq_api_key: None,
+            groq_base_url: None,
+            ollama_model: None,
+            ollama_api_key: None,
+            ollama_base_url: None,
+            mistral_model: None,
+            mistral_api_key: None,
+            mistral_base_url: None,
+            google_model: None,
+            google_api_key: None,
+            google_base_url: None,
+            deepseek_model: None,
+            deepseek_api_key: None,
+            deepseek_base_url: None,
+            minimax_model: None,
+            minimax_api_key: None,
+            minimax_base_url: None,
+            kimi_model: None,
+            kimi_api_key: None,
+            kimi_base_url: None,
+            qwen_model: None,
+            qwen_api_key: None,
+            qwen_base_url: None,
+            // Non-provider settings
+            db_path: PathBuf::from("test.db"),
+            log_level: "info".to_string(),
+            log_format: "json".to_string(),
+            routing_url: None,
+            customer_id: None,
+            server_port: 8080,
+            internal_token: None,
+            dashboard_token: None,
+            openai_api_key: None,
+            embedding_model: "text-embedding-3-small".to_string(),
+            embedding_dimensions: 512,
+            brave_api_key: None,
+            github_token: None,
+            investigate_github_token: None,
+            github_repo: None,
+            github_app_id: None,
+            github_app_private_key: None,
+            github_app_installation_id: None,
+            github_app_login: None,
+            home_dir: PathBuf::from("/tmp"),
+            server_log_file: None,
+            dashboard_enabled: false,
+            disable_bundled_skills: false,
+            dev_mode: false,
+            disable_agent_provisioning: false,
+            telemetry_enabled: false,
+            otlp_endpoint: None,
+            otlp_auth_header: None,
+            max_agent_tasks_per_session: 25,
+            store_llm_calls: true,
+            store_tool_calls: true,
+            log_llm_bodies: false,
+            kg_ingestion_model: None,
+            kg_extraction_model: None,
+            kg_resolution_model: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Settings {
