@@ -588,8 +588,26 @@ impl SubjectEntityResolver {
         };
         let latency_ms = start.elapsed().as_millis() as u64;
 
-        // 5. Parse and validate response.
-        let parsed = self.parse_disambiguation_response(&response_text)?;
+        // 5. Parse and validate response. Semantic retry on malformed JSON (C2.2).
+        let parsed = match self.parse_disambiguation_response(&response_text) {
+            Ok(p) => p,
+            Err(parse_err) => {
+                warn!(
+                    trace_id = %self.trace_id,
+                    entity_key = %entity.entity_key,
+                    error = %parse_err,
+                    event = "resolution_parse_failed_retry",
+                    "malformed JSON from LLM — retrying with reinforcement"
+                );
+                match self
+                    .retry_disambiguation_with_reinforcement(llm, &request, &response_text)
+                    .await
+                {
+                    Ok(Some(p)) => p,
+                    Ok(None) | Err(_) => return Ok(None), // Log-and-skip per C2.3.
+                }
+            }
+        };
 
         // Store llm_calls row (C2.4).
         self.store_llm_call(
@@ -949,6 +967,57 @@ impl SubjectEntityResolver {
     /// Parse LLM disambiguation response JSON.
     fn parse_disambiguation_response(&self, text: &str) -> Result<DisambiguationResponse> {
         parse_disambiguation_json(text)
+    }
+
+    /// Retry disambiguation with prompt reinforcement after semantic failure (C2.2).
+    async fn retry_disambiguation_with_reinforcement(
+        &self,
+        llm: &Arc<dyn LlmProvider>,
+        original_request: &LlmRequest,
+        bad_output: &str,
+    ) -> Result<Option<DisambiguationResponse>> {
+        let reinforcement = format!(
+            "Your previous response was not valid JSON. The output was:\n{}\n\n\
+             Please return ONLY a valid JSON object: {{\"match\": \"<entity_key>\" | null, \"confidence\": 0.0-1.0}}\n\
+             No markdown fencing, no explanation, no text outside the JSON.",
+            &bad_output[..bad_output.len().min(500)]
+        );
+
+        let mut retry_request = original_request.clone();
+        retry_request.messages.push(LlmMessage {
+            role: LlmRole::Assistant,
+            content: mika_common::llm::LlmContent::Text(bad_output.to_string()),
+        });
+        retry_request.messages.push(LlmMessage {
+            role: LlmRole::User,
+            content: mika_common::llm::LlmContent::Text(reinforcement),
+        });
+
+        match llm.send_message(&retry_request).await {
+            Ok(response) => {
+                let text = text_content(&response);
+                match parse_disambiguation_json(&text) {
+                    Ok(parsed) => Ok(Some(parsed)),
+                    Err(e) => {
+                        warn!(
+                            trace_id = %self.trace_id,
+                            error = %e,
+                            event = "resolution_semantic_exhausted",
+                            "semantic retry also failed — log-and-skip per C2.3"
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    trace_id = %self.trace_id,
+                    error = %e,
+                    event = "resolution_retry_transport_failed",
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Store an llm_calls row (C2.4).
