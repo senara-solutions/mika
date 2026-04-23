@@ -21,11 +21,15 @@ async fn test_disabled_skill_annotated_not_filtered() {
     assert_schema_version(&db).await;
 
     // Seed domain entity
-    seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "self-dev",
-        properties_json: None,
-    }).await;
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "self-dev",
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Disable the skill for mika-dev
     disable_skill(&db, "mika-dev", "self-dev").await;
@@ -68,11 +72,15 @@ async fn test_disabled_skill_annotated_not_filtered() {
 async fn test_enabled_skill_annotated_true() {
     let db = test_db();
 
-    seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "build-mika",
-        properties_json: None,
-    }).await;
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "build-mika",
+            properties_json: None,
+        },
+    )
+    .await;
 
     // No skill_overrides row — default is enabled
 
@@ -103,11 +111,15 @@ async fn test_enabled_skill_annotated_true() {
 async fn test_non_skill_entity_no_agent_context() {
     let db = test_db();
 
-    seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "problem_type",
-        name: "ci_failure",
-        properties_json: None,
-    }).await;
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "problem_type",
+            name: "ci_failure",
+            properties_json: None,
+        },
+    )
+    .await;
 
     let input = KgQueryInput {
         question: None,
@@ -135,11 +147,15 @@ async fn test_non_skill_entity_no_agent_context() {
 async fn test_no_agent_id_no_agent_context() {
     let db = test_db();
 
-    seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "self-dev",
-        properties_json: None,
-    }).await;
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "self-dev",
+            properties_json: None,
+        },
+    )
+    .await;
 
     let input = KgQueryInput {
         question: None,

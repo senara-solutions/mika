@@ -29,10 +29,10 @@ pub use super::harness::EvalHarness;
 pub use super::kg_fixtures;
 
 // --- Scenario modules (one per scenario, D2) ---
-pub mod tool_selection_query_knowledge_graph;
+pub mod agent_context_annotation_disabled;
 pub mod path_a_direct_domain_match;
 pub mod path_b_subject_match_agent_scoped;
 pub mod path_c_semantic_via_chunks;
 pub mod stage_1_exact_match;
 pub mod stage_2_llm_disambiguation;
-pub mod agent_context_annotation_disabled;
+pub mod tool_selection_query_knowledge_graph;

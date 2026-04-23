@@ -21,20 +21,28 @@ async fn test_stage_1_exact_match_case_insensitive() {
     assert_schema_version(&db).await;
 
     // Seed domain entity (lowercase)
-    let domain_id = seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "self-dev",
-        properties_json: None,
-    }).await;
+    let domain_id = seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "self-dev",
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Seed subject entity with case variant (PascalCase)
     // Confidence > 0.9 to trigger immediate exact match
-    let subject_id = seed_subject_entity(&db, &SubjectEntitySpec {
-        entity_type: "skill",
-        name: "Self-Dev",
-        confidence: 0.95,
-        properties_json: None,
-    }).await;
+    let subject_id = seed_subject_entity(
+        &db,
+        &SubjectEntitySpec {
+            entity_type: "skill",
+            name: "Self-Dev",
+            confidence: 0.95,
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Run resolver — no LLM needed for exact match
     let resolver = SubjectEntityResolver::new(db.clone(), None, Some("test-stage-1"));
@@ -42,9 +50,15 @@ async fn test_stage_1_exact_match_case_insensitive() {
 
     // Hard assertions on stats
     assert_eq!(stats.total, 1, "Should process exactly one pending entity");
-    assert_eq!(stats.matched_exact, 1, "Should match via exact (case-insensitive) match");
+    assert_eq!(
+        stats.matched_exact, 1,
+        "Should match via exact (case-insensitive) match"
+    );
     assert_eq!(stats.matched_llm, 0, "Should NOT use LLM for exact match");
-    assert_eq!(stats.skipped_no_llm, 0, "Should NOT skip — exact match found");
+    assert_eq!(
+        stats.skipped_no_llm, 0,
+        "Should NOT skip — exact match found"
+    );
 
     // Check resolution log
     let log = get_resolution_log(&db, subject_id).await;
@@ -57,7 +71,10 @@ async fn test_stage_1_exact_match_case_insensitive() {
     let resolution = get_resolution(&db, subject_id).await;
     assert!(resolution.is_some(), "Resolution row should exist");
     let (resolved_domain_id, confidence) = resolution.unwrap();
-    assert_eq!(resolved_domain_id, domain_id, "Should resolve to the domain entity");
+    assert_eq!(
+        resolved_domain_id, domain_id,
+        "Should resolve to the domain entity"
+    );
     assert!(
         (confidence - 0.95).abs() < f64::EPSILON,
         "Confidence should equal extraction confidence (0.95), got {}",
@@ -72,19 +89,27 @@ async fn test_stage_1_low_confidence_escalates_to_stage_2() {
     let db = test_db();
 
     // Seed domain entity
-    seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "self-dev",
-        properties_json: None,
-    }).await;
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "self-dev",
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Seed subject with confidence BELOW threshold (0.9)
-    let subject_id = seed_subject_entity(&db, &SubjectEntitySpec {
-        entity_type: "skill",
-        name: "Self-Dev",
-        confidence: 0.85, // Below 0.9 threshold
-        properties_json: None,
-    }).await;
+    let subject_id = seed_subject_entity(
+        &db,
+        &SubjectEntitySpec {
+            entity_type: "skill",
+            name: "Self-Dev",
+            confidence: 0.85, // Below 0.9 threshold
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Run resolver with no LLM — exact match found but low confidence,
     // escalates to Stage 2 which skips because no LLM.
@@ -92,8 +117,14 @@ async fn test_stage_1_low_confidence_escalates_to_stage_2() {
     let stats = resolver.resolve_pending().await.unwrap();
 
     assert_eq!(stats.total, 1);
-    assert_eq!(stats.matched_exact, 0, "Low confidence should NOT resolve via exact match");
-    assert_eq!(stats.skipped_no_llm, 1, "Should skip to skipped_no_llm when no LLM configured");
+    assert_eq!(
+        stats.matched_exact, 0,
+        "Low confidence should NOT resolve via exact match"
+    );
+    assert_eq!(
+        stats.skipped_no_llm, 1,
+        "Should skip to skipped_no_llm when no LLM configured"
+    );
 
     // Check log
     let log = get_resolution_log(&db, subject_id).await;
@@ -108,12 +139,16 @@ async fn test_stage_1_discovered_type_skipped() {
     let db = test_db();
 
     // Seed subject with a discovered type (no domain counterpart)
-    let subject_id = seed_subject_entity(&db, &SubjectEntitySpec {
-        entity_type: "solution_path",
-        name: "ci-fix-workflow",
-        confidence: 0.9,
-        properties_json: None,
-    }).await;
+    let subject_id = seed_subject_entity(
+        &db,
+        &SubjectEntitySpec {
+            entity_type: "solution_path",
+            name: "ci-fix-workflow",
+            confidence: 0.9,
+            properties_json: None,
+        },
+    )
+    .await;
 
     let resolver = SubjectEntityResolver::new(db.clone(), None, Some("test-discovered"));
     // Use resolve_doc_entities which takes explicit IDs (no SQL type filter)
@@ -123,7 +158,10 @@ async fn test_stage_1_discovered_type_skipped() {
         .unwrap();
 
     assert_eq!(stats.total, 1);
-    assert_eq!(stats.skipped_discovered, 1, "Discovered types should be skipped");
+    assert_eq!(
+        stats.skipped_discovered, 1,
+        "Discovered types should be skipped"
+    );
     assert_eq!(stats.matched_exact, 0);
 
     let log = get_resolution_log(&db, subject_id).await;

@@ -21,11 +21,15 @@ async fn test_path_a_direct_domain_entity_match() {
     assert_schema_version(&db).await;
 
     // Seed a domain entity
-    seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "self-dev",
-        properties_json: None,
-    }).await;
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "self-dev",
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Query by entity_key (direct lookup, not free-text)
     let input = KgQueryInput {
@@ -44,7 +48,11 @@ async fn test_path_a_direct_domain_entity_match() {
 
     // Hard assertions
     assert_eq!(result.status, KgQueryStatus::Ok);
-    assert_eq!(result.entries.len(), 1, "Expected exactly one result for direct domain match");
+    assert_eq!(
+        result.entries.len(),
+        1,
+        "Expected exactly one result for direct domain match"
+    );
 
     let entry = &result.entries[0];
     assert_eq!(entry.entity_key, "skill:self-dev");
@@ -70,18 +78,26 @@ async fn test_path_a_direct_domain_entity_match() {
 async fn test_path_a_name_match_via_question() {
     let db = test_db();
 
-    let self_dev_id = seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "self-dev",
-        properties_json: None,
-    }).await;
+    let self_dev_id = seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "self-dev",
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Add a relationship so traversal succeeds
-    let dep_id = seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "claude-pilot",
-        properties_json: None,
-    }).await;
+    let dep_id = seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "claude-pilot",
+            properties_json: None,
+        },
+    )
+    .await;
     seed_domain_relationship(&db, self_dev_id, dep_id, "DEPENDS_ON").await;
 
     // Query via free-text question that matches the name
@@ -97,11 +113,18 @@ async fn test_path_a_name_match_via_question() {
 
     assert_eq!(result.status, KgQueryStatus::Ok);
     assert!(
-        result.entries.iter().any(|e| e.entity_key == "skill:self-dev"),
+        result
+            .entries
+            .iter()
+            .any(|e| e.entity_key == "skill:self-dev"),
         "Path A should find skill:self-dev via name match"
     );
 
-    let entry = result.entries.iter().find(|e| e.entity_key == "skill:self-dev").unwrap();
+    let entry = result
+        .entries
+        .iter()
+        .find(|e| e.entity_key == "skill:self-dev")
+        .unwrap();
     assert_eq!(entry.entity_type, "skill");
     assert_eq!(entry.hop, 0);
     assert_eq!(entry.layer, "domain");

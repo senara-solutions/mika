@@ -20,12 +20,16 @@ async fn test_path_b_subject_match_correct_agent() {
     assert_schema_version(&db).await;
 
     // Seed a subject entity for mika-dev only
-    seed_subject_entity(&db, &SubjectEntitySpec {
-        entity_type: "pattern",
-        name: "fabrication-guard",
-        confidence: 0.92,
-        properties_json: None,
-    }).await;
+    seed_subject_entity(
+        &db,
+        &SubjectEntitySpec {
+            entity_type: "pattern",
+            name: "fabrication-guard",
+            confidence: 0.92,
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Query as mika-dev (should find it)
     let input = KgQueryInput {
@@ -45,11 +49,16 @@ async fn test_path_b_subject_match_correct_agent() {
         result.status
     );
     assert!(
-        result.entries.iter().any(|e| e.entity_key == "pattern:fabrication-guard"),
+        result
+            .entries
+            .iter()
+            .any(|e| e.entity_key == "pattern:fabrication-guard"),
         "mika-dev should see its own subject entity"
     );
 
-    let entry = result.entries.iter()
+    let entry = result
+        .entries
+        .iter()
         .find(|e| e.entity_key == "pattern:fabrication-guard")
         .unwrap();
     assert_eq!(entry.layer, "subject");
@@ -63,12 +72,16 @@ async fn test_path_b_agent_scoped_isolation() {
     assert_schema_version(&db).await;
 
     // Seed a subject entity for mika-dev
-    seed_subject_entity(&db, &SubjectEntitySpec {
-        entity_type: "pattern",
-        name: "fabrication-guard",
-        confidence: 0.92,
-        properties_json: None,
-    }).await;
+    seed_subject_entity(
+        &db,
+        &SubjectEntitySpec {
+            entity_type: "pattern",
+            name: "fabrication-guard",
+            confidence: 0.92,
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Query as mika-qa (different agent) — should NOT find it
     let input = KgQueryInput {
@@ -98,12 +111,16 @@ async fn test_path_b_no_agent_id_skips_subject_layer() {
     let db = test_db();
 
     // Seed subject entity
-    seed_subject_entity(&db, &SubjectEntitySpec {
-        entity_type: "pattern",
-        name: "fabrication-guard",
-        confidence: 0.92,
-        properties_json: None,
-    }).await;
+    seed_subject_entity(
+        &db,
+        &SubjectEntitySpec {
+            entity_type: "pattern",
+            name: "fabrication-guard",
+            confidence: 0.92,
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Query without agent_id — Path B won't run
     let input = KgQueryInput {

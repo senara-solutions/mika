@@ -23,28 +23,40 @@ async fn test_path_c_chunk_to_subject_to_domain_bridge() {
     assert_schema_version(&db).await;
 
     // Seed domain entity
-    let domain_id = seed_domain_entity(&db, &DomainEntitySpec {
-        entity_type: "skill",
-        name: "self-dev",
-        properties_json: None,
-    }).await;
+    let domain_id = seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "self-dev",
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Seed subject entity (extracted from a doc)
-    let subject_id = seed_subject_entity(&db, &SubjectEntitySpec {
-        entity_type: "skill",
-        name: "self-dev",
-        confidence: 0.95,
-        properties_json: None,
-    }).await;
+    let subject_id = seed_subject_entity(
+        &db,
+        &SubjectEntitySpec {
+            entity_type: "skill",
+            name: "self-dev",
+            confidence: 0.95,
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Seed chunk with text that mentions "self-dev"
-    let chunk_id = seed_chunk(&db, &ChunkSpec {
-        seq_id: 0,
-        source_doc_path: "docs/solutions/self-dev-workflow.md",
-        source_doc_hash: "abc123",
-        text: "The self-dev skill orchestrates the autonomous development loop. \
+    let chunk_id = seed_chunk(
+        &db,
+        &ChunkSpec {
+            seq_id: 0,
+            source_doc_path: "docs/solutions/self-dev-workflow.md",
+            source_doc_hash: "abc123",
+            text: "The self-dev skill orchestrates the autonomous development loop. \
                It coordinates claude-pilot sessions and manages PR lifecycle.",
-    }).await;
+        },
+    )
+    .await;
 
     // Link chunk to subject entity
     seed_chunk_subject(&db, chunk_id, subject_id).await;
@@ -72,9 +84,16 @@ async fn test_path_c_chunk_to_subject_to_domain_bridge() {
     );
     // Should find the domain entity (via Path A direct match or Path C bridge)
     assert!(
-        result.entries.iter().any(|e| e.entity_key == "skill:self-dev" && e.layer == "domain"),
+        result
+            .entries
+            .iter()
+            .any(|e| e.entity_key == "skill:self-dev" && e.layer == "domain"),
         "Should find domain entity skill:self-dev via bridge or direct match. Got: {:?}",
-        result.entries.iter().map(|e| (&e.entity_key, &e.layer)).collect::<Vec<_>>()
+        result
+            .entries
+            .iter()
+            .map(|e| (&e.entity_key, &e.layer))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -86,21 +105,29 @@ async fn test_path_c_no_resolution_yields_subject_only() {
     assert_schema_version(&db).await;
 
     // Seed subject entity (no domain counterpart, no resolution)
-    let subject_id = seed_subject_entity(&db, &SubjectEntitySpec {
-        entity_type: "solution_path",
-        name: "webhook-ci-handler",
-        confidence: 0.88,
-        properties_json: None,
-    }).await;
+    let subject_id = seed_subject_entity(
+        &db,
+        &SubjectEntitySpec {
+            entity_type: "solution_path",
+            name: "webhook-ci-handler",
+            confidence: 0.88,
+            properties_json: None,
+        },
+    )
+    .await;
 
     // Seed chunk
-    let chunk_id = seed_chunk(&db, &ChunkSpec {
-        seq_id: 0,
-        source_doc_path: "docs/solutions/webhook-ci-handler.md",
-        source_doc_hash: "def456",
-        text: "The webhook-ci-handler solution path describes how CI failure webhooks \
+    let chunk_id = seed_chunk(
+        &db,
+        &ChunkSpec {
+            seq_id: 0,
+            source_doc_path: "docs/solutions/webhook-ci-handler.md",
+            source_doc_hash: "def456",
+            text: "The webhook-ci-handler solution path describes how CI failure webhooks \
                are processed by the agent to dispatch autonomous fixes.",
-    }).await;
+        },
+    )
+    .await;
 
     // Link chunk to subject
     seed_chunk_subject(&db, chunk_id, subject_id).await;
@@ -125,15 +152,24 @@ async fn test_path_c_no_resolution_yields_subject_only() {
         result.status
     );
     // Should find the subject entity (no domain bridge available)
-    let subject_entry = result.entries.iter()
+    let subject_entry = result
+        .entries
+        .iter()
         .find(|e| e.entity_key == "solution_path:webhook-ci-handler");
 
     assert!(
         subject_entry.is_some(),
         "Should find subject entity via Path C without domain bridge. Got: {:?}",
-        result.entries.iter().map(|e| (&e.entity_key, &e.layer)).collect::<Vec<_>>()
+        result
+            .entries
+            .iter()
+            .map(|e| (&e.entity_key, &e.layer))
+            .collect::<Vec<_>>()
     );
 
     let entry = subject_entry.unwrap();
-    assert_eq!(entry.layer, "subject", "Without resolution, result should be in subject layer");
+    assert_eq!(
+        entry.layer, "subject",
+        "Without resolution, result should be in subject layer"
+    );
 }

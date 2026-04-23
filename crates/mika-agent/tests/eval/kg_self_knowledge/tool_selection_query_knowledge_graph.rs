@@ -55,9 +55,7 @@ async fn test_tool_selection_kg_for_dependency_question() -> anyhow::Result<()> 
                 "query_knowledge_graph",
                 json!({"question": "what does self-dev depend on?"}),
             ),
-            text_response(
-                "The self-dev skill depends on claude-pilot and build-mika skills.",
-            ),
+            text_response("The self-dev skill depends on claude-pilot and build-mika skills."),
         ])
         .build()
         .await?;
