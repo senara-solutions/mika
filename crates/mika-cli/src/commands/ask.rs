@@ -179,8 +179,10 @@ pub async fn run(
             return Ok(());
         }
 
-        // Correlation-only path: validate task exists, emit deprecation warning if needed
-        match ctx.async_db.get_task(tid).await {
+        // Correlation-only path: validate task exists, emit deprecation warning if needed.
+        // Uses unscoped lookup because the caller (e.g., mika-relay) may not own the task.
+        // See Database::get_task_unscoped for the ownership-vs-correlation distinction.
+        match ctx.async_db.get_task_unscoped(tid).await {
             Ok(Some(task)) => {
                 // Deprecation bridge: warn if this looks like an old-style completion call
                 if task.trigger_type == "callback"

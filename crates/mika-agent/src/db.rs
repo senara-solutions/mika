@@ -7118,7 +7118,13 @@ impl Database {
 
     // ===== Dashboard: Paginated Task Listing =====
 
-    /// Get a single task by ID without agent_id scoping (for dashboard).
+    /// Cross-agent task lookup — for correlation and observability only.
+    ///
+    /// Does NOT enforce agent ownership. For state-mutating agent tools that require
+    /// the caller own the task, use [`crate::tools::validate_task_exists`] instead.
+    ///
+    /// Current callers: `mika ask --task-id` correlation branch at
+    /// `crates/mika-cli/src/commands/ask.rs`, dashboard task detail endpoint.
     pub fn get_task_unscoped(&self, id: &str) -> Result<Option<Task>> {
         let sql = format!("SELECT {} FROM tasks WHERE id = ?1", Self::TASK_COLUMNS);
         self.conn
