@@ -1056,7 +1056,7 @@ mod tests {
         assert!(result.contains("bytes total"));
         assert!(result.contains("base64 image data"));
         // First 1000 chars of input should be preserved
-        assert!(result.starts_with(&input[..1000]));
+        assert!(result.starts_with(mika_common::text::safe_truncate(&input, 1000)));
     }
 
     #[test]
