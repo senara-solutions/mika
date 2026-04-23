@@ -11,6 +11,9 @@ mod eval {
     pub mod scenarios;
     pub mod trace;
 
+    // Golden dataset: 25 curated scenarios for end-to-end quality testing (#339)
+    pub mod golden;
+
     mod test_basic_conversation;
     mod test_callback_turn;
     mod test_completion_claim_guard;

@@ -4,7 +4,7 @@
 **Branch:** `feat/339/golden-dataset`
 **Milestone:** Evaluation (#16)
 **Blocked by:** `#338` at plan commit **`fa54d950`** (multi-provider machinery required for real-API scenarios). Pinned SHA so downstream drift in #338's shape is a grep-findable version bump rather than implicit.
-**Status:** Groomed draft — pending Vincent review
+**Status:** active
 
 ## Context
 
