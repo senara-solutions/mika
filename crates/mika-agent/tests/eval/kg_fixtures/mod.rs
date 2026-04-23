@@ -10,15 +10,19 @@
 //!
 //! ## Schema Pin
 //!
-//! Fixtures are pinned to schema v25 (the KG schema version). If the schema advances,
+//! Fixtures are pinned to the current KG schema version. If the schema advances,
 //! the assertion below fails with an actionable message pointing here.
+//!
+//! v26 (#757) added `kg_extractions.source_doc_hash` — no fixture-helper signature
+//! change needed because `seed_*` helpers write via positional SQL that ignores
+//! the new column (it stays NULL for fixture rows, which is the correct default).
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
 
 /// Current schema version this fixture module is pinned to.
 /// Bump this when updating fixtures for a new schema version.
-const PINNED_SCHEMA_VERSION: i32 = 25;
+const PINNED_SCHEMA_VERSION: i32 = 26;
 
 // ---------------------------------------------------------------------------
 // Test DB Factory

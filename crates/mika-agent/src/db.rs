@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 25;
+pub const CURRENT_SCHEMA_VERSION: i64 = 26;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -822,6 +822,10 @@ impl Database {
             self.migrate_v24_to_v25()?;
             info!(version = 25, "database migrated to v25");
         }
+        if (3..=25).contains(&version) {
+            self.migrate_v25_to_v26()?;
+            info!(version = 26, "database migrated to v26");
+        }
         Ok(())
     }
 
@@ -878,7 +882,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (25);
+            INSERT INTO schema_version (version) VALUES (26);
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1366,11 +1370,12 @@ impl Database {
             CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_id);
             CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
 
-            -- KG extraction tracking
+            -- KG extraction tracking (source_doc_hash added in v26 — #757)
             CREATE TABLE kg_extractions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                 source_doc_path TEXT NOT NULL,
+                source_doc_hash TEXT,
                 extraction_model TEXT NOT NULL,
                 entities_extracted INTEGER NOT NULL DEFAULT 0,
                 relationships_extracted INTEGER NOT NULL DEFAULT 0,
@@ -2897,11 +2902,12 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_id);
                 CREATE INDEX IF NOT EXISTS idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
 
-                -- KG extraction tracking
+                -- KG extraction tracking (source_doc_hash added in v26 — #757)
                 CREATE TABLE IF NOT EXISTS kg_extractions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                     source_doc_path TEXT NOT NULL,
+                    source_doc_hash TEXT,
                     extraction_model TEXT NOT NULL,
                     entities_extracted INTEGER NOT NULL DEFAULT 0,
                     relationships_extracted INTEGER NOT NULL DEFAULT 0,
@@ -2932,6 +2938,37 @@ impl Database {
                 COMMIT;",
             )
             .context("failed to migrate v24 -> v25 (knowledge graph tables)")?;
+
+        Ok(())
+    }
+
+    /// v25 -> v26: add nullable `source_doc_hash` column to `kg_extractions`
+    /// so the pending-doc query can skip re-extraction when chunk content is
+    /// unchanged (#757). Pre-existing rows get NULL and will re-extract once
+    /// on the next run (bounded by MIKA_KG_BATCH_BUDGET), then populate the
+    /// hash on success so subsequent runs are no-ops.
+    ///
+    /// Idempotent at the migration-chain level (the version gate in
+    /// `run_migrations` prevents re-run); `column_exists` guards the inner
+    /// ALTER against manual invocation.
+    fn migrate_v25_to_v26(&self) -> Result<()> {
+        info!("migrating database schema v25 -> v26 (kg_extractions.source_doc_hash)");
+
+        if !self.column_exists("kg_extractions", "source_doc_hash")? {
+            self.conn
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                 ALTER TABLE kg_extractions ADD COLUMN source_doc_hash TEXT;
+                 INSERT INTO schema_version (version) VALUES (26);
+                 COMMIT;",
+                )
+                .context("failed to migrate v25 -> v26 (add kg_extractions.source_doc_hash)")?;
+        } else {
+            // Column already exists (manual re-run in a test / recovery scenario).
+            // Just record the version bump.
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (26)", [])?;
+        }
 
         Ok(())
     }
@@ -10982,14 +11019,14 @@ mod tests {
 
     #[test]
     fn test_v1_and_incremental_schemas_converge() {
-        // DB1: fresh install via migrate_v1 (reaches v25 directly)
+        // DB1: fresh install via migrate_v1 (reaches CURRENT_SCHEMA_VERSION directly).
         let db1 = Database::open_in_memory().unwrap();
         let snap1 = snapshot_schema(&db1.conn);
 
-        // DB2: simulate a v24 DB, then migrate incrementally to v25.
-        // Strategy: create a fresh v25 DB, extract all non-KG DDL from
-        // sqlite_master, replay it on a new connection to get a v24 DB,
-        // then run migrate_v24_to_v25 and compare schemas.
+        // DB2: simulate a v24 DB, then migrate incrementally through v25 and
+        // v26 (#757). Strategy: create a fresh DB, extract all non-KG DDL from
+        // sqlite_master, replay it on a new connection to get a v24 DB, then
+        // run migrate_v24_to_v25 and migrate_v25_to_v26 and compare schemas.
         let fresh = Database::open_in_memory().unwrap();
         let mut stmt = fresh
             .conn
@@ -11050,7 +11087,7 @@ mod tests {
         // Set version to 24 and insert default agent
         conn2
             .execute_batch(
-                "DELETE FROM schema_version WHERE version = 25;
+                "DELETE FROM schema_version WHERE version > 24;
                  INSERT OR IGNORE INTO schema_version (version) VALUES (24);
                  INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');",
             )
@@ -11069,17 +11106,25 @@ mod tests {
             "kg_entities should not exist at v24"
         );
 
-        // Run incremental migration
+        // Run incremental migrations: v24 -> v25 -> v26
         let db2 = Database { conn: conn2 };
         db2.migrate_v24_to_v25().unwrap();
+        db2.migrate_v25_to_v26().unwrap();
 
-        let v25_version: i64 = db2
+        let final_version: i64 = db2
             .conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            v25_version, 25,
-            "DB2 should be at v25 after incremental migration"
+            final_version, CURRENT_SCHEMA_VERSION,
+            "DB2 should be at CURRENT_SCHEMA_VERSION after incremental migrations"
+        );
+
+        // #757: kg_extractions.source_doc_hash must exist after v26 migration.
+        assert!(
+            db2.column_exists("kg_extractions", "source_doc_hash")
+                .unwrap(),
+            "kg_extractions.source_doc_hash should exist after v26 migration"
         );
 
         let snap2 = snapshot_schema(&db2.conn);

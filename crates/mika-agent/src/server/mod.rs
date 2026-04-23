@@ -819,6 +819,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         // previously-ingested chunks (#690). Runs asynchronously in the
         // background after lexical ingestion — does not block server readiness.
         // Per D2: startup extraction spawns one background task per agent.
+        let kg_batch_budget = settings.effective_kg_batch_budget();
         match settings.make_kg_extraction_provider() {
             Some(Ok(extraction_llm)) => {
                 // #757 R4: advise operators when KG extraction resolves to
@@ -843,6 +844,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     let llm = extraction_llm.clone();
                     let docs_root_clone = docs_root.clone();
                     let agent_name_clone = agent_name.clone();
+                    let budget = kg_batch_budget;
 
                     tokio::spawn(async move {
                         let extractor = crate::kg::subject_extractor::SubjectExtractor::new(
@@ -851,7 +853,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                             docs_root_clone,
                             None,
                         );
-                        match extractor.extract_pending().await {
+                        match extractor.extract_pending(budget).await {
                             Ok(stats) => {
                                 if stats.docs_extracted > 0 || stats.docs_failed > 0 {
                                     info!(
