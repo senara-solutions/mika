@@ -56,11 +56,11 @@
 //!
 //! Extraction is **whole-doc**: one LLM call per source doc, with `[CHUNK N]`
 //! markers in the prompt (see `subject_extractor::extract_document`). The unit
-//! of idempotency is therefore the doc, not the chunk. This is the deliberate
-//! interpretation of AC #1 ("skip any `kg_chunks` row that already has rows in
-//! `kg_chunk_subjects`") — chunk-level markers would be structurally redundant
-//! given whole-doc extraction. `kg_chunk_subjects` stays what it has always
-//! been: provenance, not an idempotency marker.
+//! of idempotency is therefore the doc, not the chunk. `kg_chunk_subjects`
+//! is provenance data (which chunks mentioned which subject entities), not an
+//! idempotency marker — per-chunk markers would be structurally redundant
+//! given whole-doc extraction. See the #757 plan for the alternatives
+//! considered.
 //!
 //! The idempotency contract is:
 //!

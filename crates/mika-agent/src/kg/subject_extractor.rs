@@ -481,9 +481,33 @@ impl SubjectExtractor {
             self.store_llm_call(doc_path, latency_ms, raw_output).await;
         }
 
-        // 7. Write entities, relationships, provenance in single transaction.
+        // Read the per-doc source hash so the idempotency marker can be
+        // written atomically with the extraction results (#757 review P1).
+        // Missing hash is non-fatal — stored as NULL, doc re-extracts once
+        // next run (bounded by budget) and populates on the next success.
+        let source_doc_hash = self.get_doc_hash(doc_path).await.unwrap_or_else(|e| {
+            warn!(
+                trace_id = %self.trace_id,
+                agent_id = %agent_id,
+                doc = %doc_path,
+                error = %e,
+                event = "extraction_doc_hash_read_failed",
+            );
+            None
+        });
+        let model_name = self.llm.model_name().to_string();
+
+        // 7. Write entities, relationships, provenance, and idempotency
+        //    marker in a single transaction.
         let final_stats = self
-            .write_extraction_results(doc_path, &validated, &chunks, previous_state)
+            .write_extraction_results(
+                doc_path,
+                source_doc_hash.as_deref(),
+                &model_name,
+                &validated,
+                &chunks,
+                previous_state,
+            )
             .await
             .with_context(|| format!("failed to write extraction results for {doc_path}"))?;
 
@@ -521,7 +545,6 @@ impl SubjectExtractor {
     pub async fn extract_pending(&self, budget: u32) -> Result<BatchStats> {
         let start = Instant::now();
         let agent_id = self.db.agent_id.clone();
-        let model_name = self.llm.model_name().to_string();
 
         // Query pending docs via kg_extractions tracking table.
         let pending_docs = self.get_pending_docs().await?;
@@ -578,36 +601,15 @@ impl SubjectExtractor {
                 break;
             }
 
-            // Capture the per-doc hash before extraction so we can persist it
-            // alongside the kg_extractions row (#757 R1). If read fails we fall
-            // back to None — extraction still happens; the idempotency marker
-            // will simply re-fire next run (bounded by the budget).
-            let doc_hash = self.get_doc_hash(doc_path).await.unwrap_or_else(|e| {
-                warn!(
-                    trace_id = %self.trace_id,
-                    agent_id = %agent_id,
-                    doc = %doc_path,
-                    error = %e,
-                    event = "extraction_doc_hash_read_failed",
-                );
-                None
-            });
-
+            // extract_document writes the kg_extractions idempotency marker
+            // atomically with the extraction results (#757 review P1). No
+            // separate record_extraction call here — on Err, no marker is
+            // written and the doc stays pending (budget-bounded retry).
             match self.extract_document(doc_path, None).await {
                 Ok(doc_stats) => {
                     stats.docs_extracted += 1;
                     stats.total_entities += doc_stats.entities_upserted;
                     stats.total_relationships += doc_stats.relationships_upserted;
-
-                    // Write kg_extractions tracking row with the hash we consumed.
-                    self.record_extraction(
-                        doc_path,
-                        doc_hash.as_deref(),
-                        &model_name,
-                        doc_stats.entities_upserted,
-                        doc_stats.relationships_upserted,
-                    )
-                    .await;
                 }
                 Err(e) => {
                     stats.docs_failed += 1;
@@ -657,23 +659,6 @@ impl SubjectExtractor {
         );
 
         Ok(stats)
-    }
-
-    /// Public wrapper for `record_extraction` — used by the ingestion
-    /// orchestrator to mark a doc as extracted after compound hook extraction.
-    ///
-    /// Passes `source_doc_hash = None`; the orchestrator calls
-    /// [`Self::get_doc_hash_public`] separately if it needs hash persistence.
-    pub async fn record_extraction_public(
-        &self,
-        doc_path: &str,
-        model: &str,
-        entities: usize,
-        relationships: usize,
-    ) {
-        let hash = self.get_doc_hash(doc_path).await.unwrap_or(None);
-        self.record_extraction(doc_path, hash.as_deref(), model, entities, relationships)
-            .await;
     }
 
     /// Capture previous provenance state before re-ingestion (D5, Phase 1).
@@ -982,16 +967,32 @@ Rules:
         })
     }
 
-    /// Write extraction results to DB in a single transaction (D5).
+    /// Write extraction results to DB in a single transaction (D5 + #757).
+    ///
+    /// The `kg_extractions` idempotency marker is written inside the same
+    /// transaction as the entity/relationship UPSERTs. If any write fails,
+    /// the whole transaction rolls back and the doc remains pending —
+    /// preventing the "LLM paid but no marker written" cascade where a
+    /// pathological doc would burn budget on every restart (#757 review P1).
+    ///
+    /// `source_doc_hash` may be `None` if the chunk-hash read failed; the
+    /// column is nullable. The pending-doc query rejects NULL matches so the
+    /// doc will re-extract once (bounded by the budget) until a real hash is
+    /// written.
     async fn write_extraction_results(
         &self,
-        _doc_path: &str,
+        doc_path: &str,
+        source_doc_hash: Option<&str>,
+        model: &str,
         output: &ExtractionOutput,
         chunks: &[ChunkBoundary],
         previous_state: Option<PreviousState>,
     ) -> Result<ExtractionStats> {
         let agent_id = self.db.agent_id.clone();
         let trace_id = self.trace_id.clone();
+        let doc_path_owned = doc_path.to_owned();
+        let hash_owned = source_doc_hash.map(str::to_owned);
+        let model_owned = model.to_owned();
         let entities = output.entities.clone();
         let relationships = output.relationships.clone();
         let chunk_lookup: HashMap<usize, i64> =
@@ -1147,11 +1148,38 @@ Rules:
                             .iter()
                             .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
                             .collect();
-                        params.push(Box::new(agent_id));
+                        params.push(Box::new(agent_id.clone()));
                         stats.orphans_removed +=
                             stmt.execute(rusqlite::params_from_iter(params))? as usize;
                     }
                 }
+
+                // -- Idempotency marker (#757): written atomically with the
+                // extraction results. A crash or write failure between
+                // writing entities and writing the marker is the cascade
+                // path that burns budget forever; keeping both in one
+                // transaction eliminates that window.
+                tx.execute(
+                    "INSERT INTO kg_extractions
+                        (agent_id, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(agent_id, source_doc_path) DO UPDATE SET
+                        source_doc_hash = excluded.source_doc_hash,
+                        extraction_model = excluded.extraction_model,
+                        entities_extracted = excluded.entities_extracted,
+                        relationships_extracted = excluded.relationships_extracted,
+                        extraction_trace_id = excluded.extraction_trace_id,
+                        created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+                    rusqlite::params![
+                        agent_id,
+                        doc_path_owned,
+                        hash_owned,
+                        model_owned,
+                        stats.entities_upserted as i64,
+                        stats.relationships_upserted as i64,
+                        trace_id,
+                    ],
+                )?;
 
                 tx.commit()?;
                 Ok(stats)
@@ -1219,49 +1247,6 @@ Rules:
                 Ok(hash)
             })
             .await
-    }
-
-    /// Record a successful extraction in kg_extractions (D7 + #757 hash).
-    async fn record_extraction(
-        &self,
-        doc_path: &str,
-        source_doc_hash: Option<&str>,
-        model: &str,
-        entities: usize,
-        relationships: usize,
-    ) {
-        let agent_id = self.db.agent_id.clone();
-        let doc_path_owned = doc_path.to_owned();
-        let hash_owned = source_doc_hash.map(str::to_owned);
-        let model = model.to_owned();
-        let trace_id = self.trace_id.clone();
-
-        if let Err(e) = self
-            .db
-            .with_db(move |db| {
-                db.conn.execute(
-                    "INSERT INTO kg_extractions
-                        (agent_id, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(agent_id, source_doc_path) DO UPDATE SET
-                        source_doc_hash = excluded.source_doc_hash,
-                        extraction_model = excluded.extraction_model,
-                        entities_extracted = excluded.entities_extracted,
-                        relationships_extracted = excluded.relationships_extracted,
-                        extraction_trace_id = excluded.extraction_trace_id,
-                        created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
-                    rusqlite::params![agent_id, doc_path_owned, hash_owned, model, entities as i64, relationships as i64, trace_id],
-                )?;
-                Ok(())
-            })
-            .await
-        {
-            warn!(
-                trace_id = %self.trace_id,
-                error = %e,
-                event = "extraction_record_failed",
-            );
-        }
     }
 
     /// Store an llm_calls row (C2.4).

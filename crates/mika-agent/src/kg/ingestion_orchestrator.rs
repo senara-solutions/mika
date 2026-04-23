@@ -130,15 +130,9 @@ impl IngestionOrchestrator {
 
             match extractor.extract_document(&rel_path, None).await {
                 Ok(stats) => {
-                    // Record extraction so it's not re-extracted at startup.
-                    extractor
-                        .record_extraction_public(
-                            &rel_path,
-                            llm.model_name(),
-                            stats.entities_upserted,
-                            stats.relationships_upserted,
-                        )
-                        .await;
+                    // extract_document writes the kg_extractions marker
+                    // atomically with the extraction results (#757 review P1),
+                    // so no separate record_extraction call is needed here.
 
                     // 3. Spawn async resolution for extracted entities (D5 in #691).
                     // The compound write returns immediately; resolutions appear shortly after.
@@ -215,14 +209,8 @@ impl IngestionOrchestrator {
 
                 match extractor.extract_document(&rel_path, Some(prev)).await {
                     Ok(stats) => {
-                        extractor
-                            .record_extraction_public(
-                                &rel_path,
-                                llm.model_name(),
-                                stats.entities_upserted,
-                                stats.relationships_upserted,
-                            )
-                            .await;
+                        // extract_document writes the kg_extractions marker
+                        // atomically with the extraction results (#757 review P1).
 
                         // Phase 4: Re-resolve entities touched by re-extraction (D6).
                         // Coarse re-resolution — all entities from this doc re-resolve.

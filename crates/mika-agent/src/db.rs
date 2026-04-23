@@ -2902,12 +2902,17 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_id);
                 CREATE INDEX IF NOT EXISTS idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
 
-                -- KG extraction tracking (source_doc_hash added in v26 — #757)
+                -- KG extraction tracking.
+                -- Historical shape as shipped at v25. `source_doc_hash` is
+                -- added at v26 via ALTER TABLE in migrate_v25_to_v26 (#757);
+                -- keeping migrate_v24_to_v25 as the record of v25's actual
+                -- schema preserves migration immutability and means the
+                -- convergence test exercises the ALTER path rather than
+                -- skipping it.
                 CREATE TABLE IF NOT EXISTS kg_extractions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                     source_doc_path TEXT NOT NULL,
-                    source_doc_hash TEXT,
                     extraction_model TEXT NOT NULL,
                     entities_extracted INTEGER NOT NULL DEFAULT 0,
                     relationships_extracted INTEGER NOT NULL DEFAULT 0,

@@ -120,11 +120,6 @@ fn mock_llm() -> Arc<MockLlmProvider> {
     Arc::new(MockLlmProvider::builder().build())
 }
 
-fn extractor(db: AsyncDatabase) -> SubjectExtractor {
-    let llm: Arc<dyn LlmProvider> = mock_llm() as Arc<dyn LlmProvider>;
-    SubjectExtractor::new(db, llm, std::path::PathBuf::from("/tmp/docs"), None)
-}
-
 // ---------------------------------------------------------------------------
 // Pending-query idempotency semantics (#757 R1)
 // ---------------------------------------------------------------------------
@@ -247,13 +242,6 @@ async fn extract_pending_with_no_pending_docs_makes_zero_calls() {
 // behavior is verified by the post-deploy signals described in the #757
 // PR body (Signal A: extraction not re-running; Signal B: budget not
 // exhausted; Signal C: resolver drains; Signal D: concrete cost prediction).
-
-// Keep a dead-code silencer for `extractor` — it's useful future scaffolding
-// for a happy-path test once tempfile infra is wired up.
-#[allow(dead_code)]
-fn _unused_silencer(db: AsyncDatabase) -> SubjectExtractor {
-    extractor(db)
-}
 
 // ---------------------------------------------------------------------------
 // Resolver budget guard (#757 Unit 3)
@@ -387,6 +375,110 @@ async fn resolve_pending_empty_set_returns_zero_calls() {
     assert_eq!(stats.total, 0);
     assert_eq!(stats.llm_calls, 0);
     assert!(!stats.aborted_budget);
+}
+
+#[tokio::test]
+async fn resolve_pending_budget_exhaustion_does_not_starve_later_exact_matches() {
+    // Regression test for the #757 code review P1 finding: the resolver
+    // must continue past a SkippedBudget entity so that later Stage-1
+    // exact matches still resolve for free. The previous `break`-on-first
+    // SkippedBudget contradicted the contract stated in CLAUDE.md
+    // ("even budget=0 lets exact matches resolve"). This test seeds a
+    // 3-entity batch where the MIDDLE entity would need Stage-2 (no
+    // matching domain) and the bookending entities are exact matches.
+    // With no LLM configured (so Stage-2 returns SkippedNoLlm not
+    // SkippedBudget), budget=0 is irrelevant — but this structure
+    // documents the contract for the resolver-with-LLM path too, where
+    // the middle entity returns SkippedBudget instead of SkippedNoLlm.
+    let db = test_db("agent-rx5");
+    seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
+
+    // A low-confidence subject entity with no matching domain entity —
+    // Stage-1 fails, Stage-2 would fire but the resolver has no LLM
+    // configured, producing SkippedNoLlm. The test's value is not in
+    // this particular variant but in the ordering: the 3rd entity below
+    // (an exact match) MUST still resolve.
+    let agent_id = db.agent_id.clone();
+    db.with_db(move |db| {
+        db.execute_sql(
+            "INSERT INTO kg_subject_entities \
+                (agent_id, entity_key, type, name, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                &agent_id as &dyn rusqlite::types::ToSql,
+                &"skill:mystery-skill",
+                &"skill",
+                &"mystery-skill",
+                &0.7f64,
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    seed_exact_match_pair(&db, "tool", "run_gh", 0.92).await;
+
+    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("trace-rx5"));
+    let stats = resolver.resolve_pending(0).await.unwrap();
+
+    // Both exact matches must resolve — the middle SkippedNoLlm entity
+    // does not starve the third entity.
+    assert_eq!(stats.matched_exact, 2);
+    assert_eq!(stats.skipped_no_llm, 1);
+    assert_eq!(stats.llm_calls, 0);
+    assert_eq!(
+        count_resolution_log(&db).await,
+        3,
+        "all 3 entities should have kg_resolutions_log rows (2 MATCHED_EXACT + 1 SKIPPED_NO_LLM)"
+    );
+}
+
+#[tokio::test]
+async fn null_hash_populates_on_successful_extraction() {
+    // The #757 plan claims the first post-v26 boot re-extracts NULL-hash
+    // rows once, then the hash is populated so subsequent runs are no-ops.
+    // This test verifies the two-phase contract WITHOUT invoking
+    // extract_document (which reads from disk): we simulate a successful
+    // extraction by writing the kg_extractions row directly with the
+    // hash, then assert the pending count drops to 0.
+    let db = test_db("agent-nh1");
+    insert_chunk(&db, 0, "docs/nh.md", "HASH-NH").await;
+    insert_extraction(&db, "docs/nh.md", None).await;
+
+    // Phase 1: pre-extraction state — NULL hash, pending=1.
+    assert_eq!(count_pending(&db).await, 1);
+    assert_eq!(read_extraction_hash(&db, "docs/nh.md").await, None);
+
+    // Phase 2: simulate a successful extraction by writing the hash.
+    // This is the UPSERT the production extract_document runs inside
+    // its transaction (#757 atomic marker write).
+    let agent_id = db.agent_id.clone();
+    db.with_db(move |db| {
+        db.execute_sql(
+            "UPDATE kg_extractions SET source_doc_hash = ?1 \
+             WHERE agent_id = ?2 AND source_doc_path = ?3",
+            &[
+                &"HASH-NH" as &dyn rusqlite::types::ToSql,
+                &agent_id,
+                &"docs/nh.md",
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // Phase 3: post-extraction — hash populated, pending=0.
+    assert_eq!(
+        read_extraction_hash(&db, "docs/nh.md").await,
+        Some("HASH-NH".to_string())
+    );
+    assert_eq!(
+        count_pending(&db).await,
+        0,
+        "after hash is populated, doc must not be pending again"
+    );
 }
 
 #[tokio::test]

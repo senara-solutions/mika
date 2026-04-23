@@ -831,7 +831,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 {
                     warn!(
                         event = "kg_anthropic_provider",
-                        role = "extraction",
+                        scope = "extraction",
                         provider = "anthropic",
                         model = %extraction_llm.model_name(),
                         "KG extraction is using Anthropic — typically ~10× more expensive than \
@@ -905,7 +905,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     if llm.provider_name().eq_ignore_ascii_case("anthropic") {
                         warn!(
                             event = "kg_anthropic_provider",
-                            role = "resolution",
+                            scope = "resolution",
                             provider = "anthropic",
                             model = %llm.model_name(),
                             "KG resolution is using Anthropic — consider \

@@ -289,8 +289,11 @@ impl SubjectEntityResolver {
         for (i, entity) in entities.iter().enumerate() {
             // Stage-2 budget guard: would we call the LLM if needed?
             // `llm_call_allowed = false` tells resolve_single_entity to
-            // short-circuit before a Stage-2 call. Pre-budget-exhaustion
-            // Stage-1 exact matches still process for free.
+            // short-circuit before a Stage-2 call with `SkippedBudget`.
+            // Stage-1 exact matches still process for free even when the
+            // budget is exhausted — they cost no LLM calls, so skipping
+            // remaining entities when one needs Stage-2 would defer free
+            // work (#757 review finding P1).
             let llm_call_allowed = stats.llm_calls < budget;
 
             let extraction_trace_id = trace_lookup(entity.id);
@@ -302,22 +305,25 @@ impl SubjectEntityResolver {
                 stats.llm_calls = stats.llm_calls.saturating_add(1);
             }
 
-            // If the entity was skipped because the budget prevented a
-            // Stage-2 call, stop the batch here — subsequent entities would
-            // also need LLM calls and we've committed to aborting cleanly.
+            // If the budget prevented a Stage-2 call, record the abort once
+            // and continue — remaining entities may still resolve via Stage-1
+            // exact match for free. Entities that return SkippedBudget leave
+            // no `kg_resolutions_log` row, so they stay pending for next run.
             if matches!(result, ResolutionResult::SkippedBudget) {
-                stats.aborted_budget = true;
-                warn!(
-                    trace_id = %self.trace_id,
-                    agent_id = %agent_id,
-                    scope = "resolution",
-                    calls_made = stats.llm_calls,
-                    budget = budget,
-                    remaining = entities.len() - i,
-                    event = "kg_budget_exhausted",
-                    "resolution hit per-batch LLM call cap — remaining entities stay pending for next run"
-                );
-                break;
+                if !stats.aborted_budget {
+                    stats.aborted_budget = true;
+                    warn!(
+                        trace_id = %self.trace_id,
+                        agent_id = %agent_id,
+                        scope = "resolution",
+                        calls_made = stats.llm_calls,
+                        budget = budget,
+                        remaining = entities.len() - i,
+                        event = "kg_budget_exhausted",
+                        "resolution hit per-batch LLM call cap — entities needing LLM disambiguation stay pending; Stage-1 exact matches still proceed"
+                    );
+                }
+                continue;
             }
 
             self.apply_result(
