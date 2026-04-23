@@ -36,7 +36,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docs/adr/` — Architecture Decision Records (numbered)
 - `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
 - `docs/solutions/` — Documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when debugging or implementing in documented areas.
-- `skills/bundled/` — Source tree for engine-coupled bundled skills discovered at build time via `crates/mika-agent/build.rs` (currently empty; migration of engine-coupled skills from `mika-skills/` is tracked separately — see `crates/mika-agent/CLAUDE.md` Skills System).
+- `skills/bundled/` — Source tree for engine-coupled bundled skills discovered at build time via `crates/mika-agent/build.rs`. See `crates/mika-agent/CLAUDE.md` Skills System for details.
 - `scripts/` — Utility scripts (sync-agent-docs.sh for crates.io publish prep)
 - `Makefile` — Development workflow targets: `make build`, `make deploy` (dashboard+build+stop+install), `make test`, `make lint`, `make fmt`, `make check`
 - `todos/` — Code review findings (tracked as markdown files)
@@ -207,14 +207,17 @@ Skills are bundled and discovered at build time via `crates/mika-agent/build.rs`
 
 ```
 skills/bundled/
-├── self-dev/              # Main self-development orchestration
-│   ├── skill.toml
-│   └── system_prompt.md   # Per-issue + milestone + project workflows
+├── self-dev/              # Main self-development orchestration (per-issue + milestone + project workflows)
+├── self-dev-iterate/      # PR iteration handler for self-dev
 ├── self-dev-webhook-qa/   # QA webhook handler for self-dev
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
-├── claude-pilot/          # Claude Code integration
+├── claude-pilot/          # Claude Code integration (worktree setup, rebase-or-abort guard, claude-pilot dispatch)
 ├── qa-review/             # PR review skill
+├── qa-review-build-callback/ # Build callback handler for QA review
 ├── permission-policy/     # Permission handler for claude-pilot sessions
+├── resolve-pr-conflicts/  # Rebase + conflict resolution for CONFLICTING PRs
+├── address-pr-comments/   # Address PR review comments
+├── self-check/            # Self-check/health verification
 ├── build-mika/            # Build verification
 ├── deploy-mika/           # Deployment
 ├── agents-teams/          # Agent/team management
