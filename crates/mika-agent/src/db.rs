@@ -651,6 +651,45 @@ impl Database {
         Ok(db)
     }
 
+    /// Execute raw SQL with params. Returns the number of rows changed.
+    ///
+    /// Intended for test fixture seeding from integration tests where `conn`
+    /// is not directly accessible (`pub(crate)`).
+    pub fn execute_sql(&self, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> Result<usize> {
+        Ok(self.conn.execute(sql, params)?)
+    }
+
+    /// Returns the last inserted rowid.
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.conn.last_insert_rowid()
+    }
+
+    /// Query a single scalar value. Returns `None` if no rows match.
+    pub fn query_scalar<T: rusqlite::types::FromSql>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+    ) -> Result<Option<T>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(sql, params, |row| row.get(0))
+            .optional()?)
+    }
+
+    /// Query a single row and return two columns. Returns `None` if no rows match.
+    pub fn query_row_2<T1: rusqlite::types::FromSql, T2: rusqlite::types::FromSql>(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+    ) -> Result<Option<(T1, T2)>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(sql, params, |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?)
+    }
+
     fn current_version(&self) -> Result<i64> {
         let exists: bool = self
             .conn
