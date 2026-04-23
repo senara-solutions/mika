@@ -48,11 +48,8 @@ pub fn test_db_with_agent(agent_id: &str) -> AsyncDatabase {
 pub async fn assert_schema_version(db: &AsyncDatabase) {
     let version: i32 = db
         .with_db(|db| {
-            db.query_scalar::<i32>(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-                &[],
-            )
-            .map(|v| v.unwrap_or(0))
+            db.query_scalar::<i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version", &[])
+                .map(|v| v.unwrap_or(0))
         })
         .await
         .unwrap();
@@ -170,7 +167,14 @@ pub struct ChunkSpec {
     pub text: &'static str,
 }
 
-/// Seed a chunk into `kg_chunks` and its text into `search_content`. Returns the chunk row ID.
+/// Seed a chunk into `kg_chunks` and index its text via `Database::index_content`.
+/// Returns the chunk row ID.
+///
+/// Mirrors the lexical ingestor's insert pattern (kg_chunks + index_content in the
+/// same transaction) so FTS5 (`fts_search`) — and vec_search when embeddings are
+/// supplied — stay in parity with `search_content`. Path C semantic retrieval
+/// depends on `fts_search` being populated; a raw insert into `search_content`
+/// silently breaks Path C tests.
 ///
 /// Agent ID is taken from `db.agent_id`.
 pub async fn seed_chunk(db: &AsyncDatabase, spec: &ChunkSpec) -> i64 {
@@ -193,15 +197,13 @@ pub async fn seed_chunk(db: &AsyncDatabase, spec: &ChunkSpec) -> i64 {
         )?;
         let chunk_id = db.last_insert_rowid();
 
-        // Insert into search_content for FTS5/hybrid search
-        db.execute_sql(
-            "INSERT INTO search_content (agent_id, content, source_type, source_id) \
-             VALUES (?1, ?2, 'kg_chunk', ?3)",
-            &[
-                &agent_id as &dyn rusqlite::types::ToSql,
-                &text,
-                &chunk_id,
-            ],
+        // Index via the canonical path: updates search_content + fts_search
+        // (and vec_search via index_embedding when embeddings are available).
+        db.index_content(
+            &agent_id,
+            mika_agent::db::kg_schema::KG_CHUNK_SOURCE_TYPE,
+            Some(chunk_id),
+            &text,
         )?;
 
         Ok(chunk_id)
@@ -211,11 +213,7 @@ pub async fn seed_chunk(db: &AsyncDatabase, spec: &ChunkSpec) -> i64 {
 }
 
 /// Link a chunk to a subject entity via `kg_chunk_subjects`. Returns the row ID.
-pub async fn seed_chunk_subject(
-    db: &AsyncDatabase,
-    chunk_id: i64,
-    subject_entity_id: i64,
-) -> i64 {
+pub async fn seed_chunk_subject(db: &AsyncDatabase, chunk_id: i64, subject_entity_id: i64) -> i64 {
     let agent_id = db.agent_id.clone();
 
     db.with_db(move |db| {
@@ -314,10 +312,7 @@ pub async fn get_resolution_log(
 }
 
 /// Read a resolution for a subject entity. Returns (domain_entity_id, confidence).
-pub async fn get_resolution(
-    db: &AsyncDatabase,
-    subject_entity_id: i64,
-) -> Option<(i64, f64)> {
+pub async fn get_resolution(db: &AsyncDatabase, subject_entity_id: i64) -> Option<(i64, f64)> {
     let agent_id = db.agent_id.clone();
 
     db.with_db(move |db| {
