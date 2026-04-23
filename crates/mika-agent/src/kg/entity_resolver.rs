@@ -108,6 +108,8 @@ enum ResolutionResult {
     SkippedDiscoveredType,
     /// No LLM configured and exact match failed.
     SkippedNoLlm,
+    /// Per-batch LLM budget exhausted — entity stays pending for next run (#757).
+    SkippedBudget,
     /// Error during resolution.
     Error(String),
 }
@@ -123,6 +125,12 @@ pub struct ResolutionStats {
     pub skipped_no_llm: usize,
     pub errors: usize,
     pub duration_ms: u64,
+    /// True when the batch stopped early because the LLM call budget was
+    /// exhausted (#757). Remaining entities stay pending for the next run.
+    pub aborted_budget: bool,
+    /// Number of LLM disambiguation calls made. Stage 1 exact matches do NOT
+    /// debit this counter — only Stage 2 LLM calls.
+    pub llm_calls: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,10 +182,16 @@ impl SubjectEntityResolver {
     /// Called as per-doc follow-on after `extract_document()`.
     /// `entity_ids` are the IDs of subject entities to resolve.
     /// `extraction_trace_id` is recorded for staleness tracking.
+    ///
+    /// `budget` caps Stage 2 LLM disambiguation calls (#757). The compound
+    /// hook path is bounded-by-construction (one doc's entities), so callers
+    /// typically pass the configured budget; the cap still defends against a
+    /// pathological single doc that produces thousands of entities.
     pub async fn resolve_doc_entities(
         &self,
         entity_ids: &[i64],
         extraction_trace_id: &str,
+        budget: u32,
     ) -> Result<ResolutionStats> {
         if entity_ids.is_empty() {
             return Ok(ResolutionStats::default());
@@ -186,7 +200,7 @@ impl SubjectEntityResolver {
         let entities = self.get_entities_by_ids(entity_ids).await?;
         let trace_lookup = |_id: i64| extraction_trace_id.to_owned();
         let stats = self
-            .resolve_entities(&entities, &trace_lookup, "resolution_doc_complete")
+            .resolve_entities(&entities, &trace_lookup, "resolution_doc_complete", budget)
             .await;
 
         // Emit audit event for the per-doc batch.
@@ -195,8 +209,15 @@ impl SubjectEntityResolver {
         Ok(stats)
     }
 
-    /// Resolve all pending entities for an agent (startup or re-resolution).
-    pub async fn resolve_pending(&self) -> Result<ResolutionStats> {
+    /// Resolve all pending entities for an agent (startup or re-resolution),
+    /// capped by `budget` Stage-2 LLM disambiguation calls (#757 R2).
+    ///
+    /// `budget == 0` short-circuits with no LLM calls. On overflow the method
+    /// aborts cleanly, emits a `kg_budget_exhausted` WARN, and leaves
+    /// remaining entities pending for the next run. Stage-1 exact matches do
+    /// not consume the budget, so entities that resolve without the LLM still
+    /// make progress even when `budget` is tight.
+    pub async fn resolve_pending(&self, budget: u32) -> Result<ResolutionStats> {
         let start = Instant::now();
         let agent_id = self.db.agent_id.clone();
 
@@ -206,6 +227,7 @@ impl SubjectEntityResolver {
             trace_id = %self.trace_id,
             agent_id = %agent_id,
             pending = pending.len(),
+            budget = budget,
             event = "resolution_pending_start",
         );
 
@@ -228,7 +250,12 @@ impl SubjectEntityResolver {
         };
 
         let mut stats = self
-            .resolve_entities(&pending, &trace_lookup, "resolution_pending_complete")
+            .resolve_entities(
+                &pending,
+                &trace_lookup,
+                "resolution_pending_complete",
+                budget,
+            )
             .await;
         stats.duration_ms = start.elapsed().as_millis() as u64;
 
@@ -238,11 +265,17 @@ impl SubjectEntityResolver {
     /// Shared resolution loop for both per-doc and batch paths.
     ///
     /// `trace_lookup` maps entity ID → extraction trace ID for staleness tracking.
+    /// `budget` caps Stage-2 LLM disambiguation calls (#757). Stage-1 exact
+    /// matches do not debit the budget. When the budget is hit, remaining
+    /// entities that would need Stage-2 are left unprocessed — they stay
+    /// pending via the absence of a `kg_resolutions_log` row — and
+    /// `aborted_budget` is set on the returned stats.
     async fn resolve_entities<F>(
         &self,
         entities: &[PendingEntity],
         trace_lookup: &F,
         completion_event: &str,
+        budget: u32,
     ) -> ResolutionStats
     where
         F: Fn(i64) -> String,
@@ -253,11 +286,45 @@ impl SubjectEntityResolver {
             ..Default::default()
         };
 
-        for entity in entities {
+        for (i, entity) in entities.iter().enumerate() {
+            // Stage-2 budget guard: would we call the LLM if needed?
+            // `llm_call_allowed = false` tells resolve_single_entity to
+            // short-circuit before a Stage-2 call with `SkippedBudget`.
+            // Stage-1 exact matches still process for free even when the
+            // budget is exhausted — they cost no LLM calls, so skipping
+            // remaining entities when one needs Stage-2 would defer free
+            // work (#757 review finding P1).
+            let llm_call_allowed = stats.llm_calls < budget;
+
             let extraction_trace_id = trace_lookup(entity.id);
             let entity_start = Instant::now();
-            let result = self.resolve_single_entity(entity).await;
+            let (result, used_llm) = self.resolve_single_entity(entity, llm_call_allowed).await;
             let duration_ms = entity_start.elapsed().as_millis() as i64;
+
+            if used_llm {
+                stats.llm_calls = stats.llm_calls.saturating_add(1);
+            }
+
+            // If the budget prevented a Stage-2 call, record the abort once
+            // and continue — remaining entities may still resolve via Stage-1
+            // exact match for free. Entities that return SkippedBudget leave
+            // no `kg_resolutions_log` row, so they stay pending for next run.
+            if matches!(result, ResolutionResult::SkippedBudget) {
+                if !stats.aborted_budget {
+                    stats.aborted_budget = true;
+                    warn!(
+                        trace_id = %self.trace_id,
+                        agent_id = %agent_id,
+                        scope = "resolution",
+                        calls_made = stats.llm_calls,
+                        budget = budget,
+                        remaining = entities.len() - i,
+                        event = "kg_budget_exhausted",
+                        "resolution hit per-batch LLM call cap — entities needing LLM disambiguation stay pending; Stage-1 exact matches still proceed"
+                    );
+                }
+                continue;
+            }
 
             self.apply_result(
                 entity,
@@ -289,6 +356,8 @@ impl SubjectEntityResolver {
             skipped_discovered = stats.skipped_discovered,
             skipped_no_llm = stats.skipped_no_llm,
             errors = stats.errors,
+            llm_calls = stats.llm_calls,
+            aborted_budget = stats.aborted_budget,
             event = %completion_event,
         );
 
@@ -372,6 +441,11 @@ impl SubjectEntityResolver {
                 .await;
                 stats.skipped_no_llm += 1;
             }
+            ResolutionResult::SkippedBudget => {
+                // Entity stays pending — do NOT write a kg_resolutions_log row.
+                // The outer loop breaks as soon as it sees this variant and
+                // records aborted_budget=true in ResolutionStats (#757).
+            }
             ResolutionResult::Error(_) => {
                 self.write_log(
                     entity.id,
@@ -391,10 +465,24 @@ impl SubjectEntityResolver {
     // -----------------------------------------------------------------------
 
     /// Resolve a single entity through the two-stage pipeline.
-    async fn resolve_single_entity(&self, entity: &PendingEntity) -> ResolutionResult {
+    ///
+    /// Returns `(result, used_llm)`. `used_llm` is `true` iff a Stage-2 LLM
+    /// disambiguation call was actually issued. Stage-1 exact matches and all
+    /// early returns (discovered type, no-LLM mode, DB error) report `false`
+    /// so the caller can debit the per-batch budget correctly (#757).
+    ///
+    /// When `llm_call_allowed = false`, the function short-circuits before a
+    /// Stage-2 call and returns `SkippedBudget`. The caller treats this as
+    /// "entity stays pending; abort the batch." Stage-1 exact matches still
+    /// proceed under this flag — they cost nothing.
+    async fn resolve_single_entity(
+        &self,
+        entity: &PendingEntity,
+        llm_call_allowed: bool,
+    ) -> (ResolutionResult, bool) {
         // D8: Discovered types skip resolution entirely.
         if !KG_DOMAIN_ENTITY_TYPES.contains(&entity.entity_type.as_str()) {
-            return ResolutionResult::SkippedDiscoveredType;
+            return (ResolutionResult::SkippedDiscoveredType, false);
         }
 
         // Stage 1: Exact match (D1).
@@ -402,10 +490,13 @@ impl SubjectEntityResolver {
             Ok(Some(domain)) => {
                 // Exact match found. If extraction confidence > threshold, resolve.
                 if entity.confidence > EXACT_MATCH_CONFIDENCE_THRESHOLD {
-                    return ResolutionResult::ExactMatch {
-                        domain_entity_id: domain.id,
-                        confidence: entity.confidence,
-                    };
+                    return (
+                        ResolutionResult::ExactMatch {
+                            domain_entity_id: domain.id,
+                            confidence: entity.confidence,
+                        },
+                        false,
+                    );
                 }
                 // Low confidence — escalate to LLM for verification.
             }
@@ -413,26 +504,40 @@ impl SubjectEntityResolver {
                 // No exact match — escalate to LLM.
             }
             Err(e) => {
-                return ResolutionResult::Error(format!("exact match query failed: {e}"));
+                return (
+                    ResolutionResult::Error(format!("exact match query failed: {e}")),
+                    false,
+                );
             }
         }
 
         // Stage 2: LLM disambiguation (D1 stage 2).
         let Some(ref llm) = self.llm else {
-            return ResolutionResult::SkippedNoLlm;
+            return (ResolutionResult::SkippedNoLlm, false);
         };
+
+        // #757: respect per-batch budget before issuing the LLM call.
+        if !llm_call_allowed {
+            return (ResolutionResult::SkippedBudget, false);
+        }
 
         match self.disambiguate_with_llm(llm, entity).await {
             Ok(Some((domain_id, llm_confidence))) => {
                 // D2: confidence = min(extraction_confidence, llm_confidence).
                 let combined_confidence = entity.confidence.min(llm_confidence);
-                ResolutionResult::LlmMatch {
-                    domain_entity_id: domain_id,
-                    confidence: combined_confidence,
-                }
+                (
+                    ResolutionResult::LlmMatch {
+                        domain_entity_id: domain_id,
+                        confidence: combined_confidence,
+                    },
+                    true,
+                )
             }
-            Ok(None) => ResolutionResult::NoMatch,
-            Err(e) => ResolutionResult::Error(format!("LLM disambiguation failed: {e}")),
+            Ok(None) => (ResolutionResult::NoMatch, true),
+            Err(e) => (
+                ResolutionResult::Error(format!("LLM disambiguation failed: {e}")),
+                true,
+            ),
         }
     }
 

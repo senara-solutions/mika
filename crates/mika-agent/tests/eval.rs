@@ -27,6 +27,7 @@ mod eval {
     mod test_error_handling;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
+    mod test_kg_budget_757;
     mod test_max_steps_continuation;
     mod test_multi_step;
     mod test_multi_turn_persistence;

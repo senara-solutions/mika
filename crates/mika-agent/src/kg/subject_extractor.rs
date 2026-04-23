@@ -344,6 +344,13 @@ pub struct BatchStats {
     pub total_entities: usize,
     pub total_relationships: usize,
     pub duration_ms: u64,
+    /// True when the batch stopped early because the LLM call budget was
+    /// exhausted (#757). Remaining docs stay pending for the next run.
+    pub aborted_budget: bool,
+    /// Number of LLM calls made against the budget. A `call` here is one
+    /// `extract_document` invocation (whole-doc extraction). Retries inside
+    /// `call_llm_with_retry` count as the same call for budget purposes.
+    pub llm_calls: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -474,9 +481,33 @@ impl SubjectExtractor {
             self.store_llm_call(doc_path, latency_ms, raw_output).await;
         }
 
-        // 7. Write entities, relationships, provenance in single transaction.
+        // Read the per-doc source hash so the idempotency marker can be
+        // written atomically with the extraction results (#757 review P1).
+        // Missing hash is non-fatal — stored as NULL, doc re-extracts once
+        // next run (bounded by budget) and populates on the next success.
+        let source_doc_hash = self.get_doc_hash(doc_path).await.unwrap_or_else(|e| {
+            warn!(
+                trace_id = %self.trace_id,
+                agent_id = %agent_id,
+                doc = %doc_path,
+                error = %e,
+                event = "extraction_doc_hash_read_failed",
+            );
+            None
+        });
+        let model_name = self.llm.model_name().to_string();
+
+        // 7. Write entities, relationships, provenance, and idempotency
+        //    marker in a single transaction.
         let final_stats = self
-            .write_extraction_results(doc_path, &validated, &chunks, previous_state)
+            .write_extraction_results(
+                doc_path,
+                source_doc_hash.as_deref(),
+                &model_name,
+                &validated,
+                &chunks,
+                previous_state,
+            )
             .await
             .with_context(|| format!("failed to write extraction results for {doc_path}"))?;
 
@@ -503,11 +534,17 @@ impl SubjectExtractor {
         })
     }
 
-    /// Enumerate and extract all pending docs for the agent (D7).
-    pub async fn extract_pending(&self) -> Result<BatchStats> {
+    /// Enumerate and extract all pending docs for the agent (D7), capped by
+    /// `budget` LLM calls.
+    ///
+    /// `budget == 0` returns immediately with no LLM calls — the extraction
+    /// phase is effectively disabled for this invocation. On overflow the
+    /// method aborts cleanly, emits a `kg_budget_exhausted` WARN, and leaves
+    /// remaining docs pending for the next run (#757 R2). The aborted flag is
+    /// surfaced via `BatchStats::aborted_budget`.
+    pub async fn extract_pending(&self, budget: u32) -> Result<BatchStats> {
         let start = Instant::now();
         let agent_id = self.db.agent_id.clone();
-        let model_name = self.llm.model_name().to_string();
 
         // Query pending docs via kg_extractions tracking table.
         let pending_docs = self.get_pending_docs().await?;
@@ -516,6 +553,7 @@ impl SubjectExtractor {
             trace_id = %self.trace_id,
             agent_id = %agent_id,
             pending_docs = pending_docs.len(),
+            budget = budget,
             event = "subject_extraction_start",
         );
 
@@ -531,21 +569,47 @@ impl SubjectExtractor {
             ..Default::default()
         };
 
+        if budget == 0 {
+            warn!(
+                trace_id = %self.trace_id,
+                agent_id = %agent_id,
+                scope = "extraction",
+                budget = 0,
+                pending_docs = pending_docs.len(),
+                event = "kg_budget_exhausted",
+                "MIKA_KG_BATCH_BUDGET=0 — skipping extraction (all docs stay pending)"
+            );
+            stats.aborted_budget = true;
+            stats.duration_ms = start.elapsed().as_millis() as u64;
+            return Ok(stats);
+        }
+
         for (i, doc_path) in pending_docs.iter().enumerate() {
+            // Budget guard: abort cleanly once we've made `budget` LLM calls.
+            if stats.llm_calls >= budget {
+                warn!(
+                    trace_id = %self.trace_id,
+                    agent_id = %agent_id,
+                    scope = "extraction",
+                    calls_made = stats.llm_calls,
+                    budget = budget,
+                    remaining = pending_docs.len() - i,
+                    event = "kg_budget_exhausted",
+                    "extraction hit per-batch LLM call cap — remaining docs stay pending for next run"
+                );
+                stats.aborted_budget = true;
+                break;
+            }
+
+            // extract_document writes the kg_extractions idempotency marker
+            // atomically with the extraction results (#757 review P1). No
+            // separate record_extraction call here — on Err, no marker is
+            // written and the doc stays pending (budget-bounded retry).
             match self.extract_document(doc_path, None).await {
                 Ok(doc_stats) => {
                     stats.docs_extracted += 1;
                     stats.total_entities += doc_stats.entities_upserted;
                     stats.total_relationships += doc_stats.relationships_upserted;
-
-                    // Write kg_extractions tracking row.
-                    self.record_extraction(
-                        doc_path,
-                        &model_name,
-                        doc_stats.entities_upserted,
-                        doc_stats.relationships_upserted,
-                    )
-                    .await;
                 }
                 Err(e) => {
                     stats.docs_failed += 1;
@@ -559,6 +623,11 @@ impl SubjectExtractor {
                     );
                 }
             }
+
+            // Every attempted doc debits the budget — a validated-as-empty
+            // extraction still spent an LLM call (C2 retry taxonomy runs
+            // inside extract_document regardless of outcome).
+            stats.llm_calls = stats.llm_calls.saturating_add(1);
 
             // Progress logging every 10 docs.
             if (i + 1) % 10 == 0 {
@@ -583,24 +652,13 @@ impl SubjectExtractor {
             failed = stats.docs_failed,
             entities = stats.total_entities,
             relationships = stats.total_relationships,
+            llm_calls = stats.llm_calls,
+            aborted_budget = stats.aborted_budget,
             duration_ms = stats.duration_ms,
             event = "subject_extraction_complete",
         );
 
         Ok(stats)
-    }
-
-    /// Public wrapper for `record_extraction` — used by the ingestion
-    /// orchestrator to mark a doc as extracted after compound hook extraction.
-    pub async fn record_extraction_public(
-        &self,
-        doc_path: &str,
-        model: &str,
-        entities: usize,
-        relationships: usize,
-    ) {
-        self.record_extraction(doc_path, model, entities, relationships)
-            .await;
     }
 
     /// Capture previous provenance state before re-ingestion (D5, Phase 1).
@@ -909,16 +967,32 @@ Rules:
         })
     }
 
-    /// Write extraction results to DB in a single transaction (D5).
+    /// Write extraction results to DB in a single transaction (D5 + #757).
+    ///
+    /// The `kg_extractions` idempotency marker is written inside the same
+    /// transaction as the entity/relationship UPSERTs. If any write fails,
+    /// the whole transaction rolls back and the doc remains pending —
+    /// preventing the "LLM paid but no marker written" cascade where a
+    /// pathological doc would burn budget on every restart (#757 review P1).
+    ///
+    /// `source_doc_hash` may be `None` if the chunk-hash read failed; the
+    /// column is nullable. The pending-doc query rejects NULL matches so the
+    /// doc will re-extract once (bounded by the budget) until a real hash is
+    /// written.
     async fn write_extraction_results(
         &self,
-        _doc_path: &str,
+        doc_path: &str,
+        source_doc_hash: Option<&str>,
+        model: &str,
         output: &ExtractionOutput,
         chunks: &[ChunkBoundary],
         previous_state: Option<PreviousState>,
     ) -> Result<ExtractionStats> {
         let agent_id = self.db.agent_id.clone();
         let trace_id = self.trace_id.clone();
+        let doc_path_owned = doc_path.to_owned();
+        let hash_owned = source_doc_hash.map(str::to_owned);
+        let model_owned = model.to_owned();
         let entities = output.entities.clone();
         let relationships = output.relationships.clone();
         let chunk_lookup: HashMap<usize, i64> =
@@ -1074,11 +1148,38 @@ Rules:
                             .iter()
                             .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
                             .collect();
-                        params.push(Box::new(agent_id));
+                        params.push(Box::new(agent_id.clone()));
                         stats.orphans_removed +=
                             stmt.execute(rusqlite::params_from_iter(params))? as usize;
                     }
                 }
+
+                // -- Idempotency marker (#757): written atomically with the
+                // extraction results. A crash or write failure between
+                // writing entities and writing the marker is the cascade
+                // path that burns budget forever; keeping both in one
+                // transaction eliminates that window.
+                tx.execute(
+                    "INSERT INTO kg_extractions
+                        (agent_id, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(agent_id, source_doc_path) DO UPDATE SET
+                        source_doc_hash = excluded.source_doc_hash,
+                        extraction_model = excluded.extraction_model,
+                        entities_extracted = excluded.entities_extracted,
+                        relationships_extracted = excluded.relationships_extracted,
+                        extraction_trace_id = excluded.extraction_trace_id,
+                        created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+                    rusqlite::params![
+                        agent_id,
+                        doc_path_owned,
+                        hash_owned,
+                        model_owned,
+                        stats.entities_upserted as i64,
+                        stats.relationships_upserted as i64,
+                        trace_id,
+                    ],
+                )?;
 
                 tx.commit()?;
                 Ok(stats)
@@ -1086,7 +1187,14 @@ Rules:
             .await
     }
 
-    /// Get pending docs (D7 — docs with chunks but no kg_extractions row).
+    /// Get pending docs (D7 + #757 content-hash check).
+    ///
+    /// A doc is pending when it has `kg_chunks` rows but either has no
+    /// `kg_extractions` row, or the row's `source_doc_hash` disagrees with
+    /// the chunk's current `source_doc_hash` (which is per-doc — all chunk
+    /// rows of a given doc share one hash, see `lexical_ingestor`). The
+    /// direct hash-equality predicate catches both the "never extracted"
+    /// and "extracted-but-stale" cases without aggregation.
     async fn get_pending_docs(&self) -> Result<Vec<String>> {
         let agent_id = self.db.agent_id.clone();
 
@@ -1098,7 +1206,9 @@ Rules:
                      WHERE c.agent_id = ?1
                        AND NOT EXISTS (
                          SELECT 1 FROM kg_extractions e
-                         WHERE e.agent_id = c.agent_id AND e.source_doc_path = c.source_doc_path
+                         WHERE e.agent_id        = c.agent_id
+                           AND e.source_doc_path = c.source_doc_path
+                           AND e.source_doc_hash = c.source_doc_hash
                        )
                      ORDER BY c.source_doc_path",
                 )?;
@@ -1111,44 +1221,32 @@ Rules:
             .await
     }
 
-    /// Record a successful extraction in kg_extractions (D7).
-    async fn record_extraction(
-        &self,
-        doc_path: &str,
-        model: &str,
-        entities: usize,
-        relationships: usize,
-    ) {
+    /// Read the per-doc `source_doc_hash` from `kg_chunks` (#757).
+    ///
+    /// Returns `Ok(None)` when no chunks exist for the doc. Callers treat
+    /// missing-hash as "write NULL into `kg_extractions.source_doc_hash`,"
+    /// which the pending query rejects → the doc re-extracts once next run.
+    async fn get_doc_hash(&self, doc_path: &str) -> Result<Option<String>> {
         let agent_id = self.db.agent_id.clone();
-        let doc_path_owned = doc_path.to_owned();
-        let model = model.to_owned();
-        let trace_id = self.trace_id.clone();
+        let doc_path = doc_path.to_owned();
 
-        if let Err(e) = self
-            .db
+        self.db
             .with_db(move |db| {
-                db.conn.execute(
-                    "INSERT INTO kg_extractions
-                        (agent_id, source_doc_path, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(agent_id, source_doc_path) DO UPDATE SET
-                        extraction_model = excluded.extraction_model,
-                        entities_extracted = excluded.entities_extracted,
-                        relationships_extracted = excluded.relationships_extracted,
-                        extraction_trace_id = excluded.extraction_trace_id,
-                        created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
-                    rusqlite::params![agent_id, doc_path_owned, model, entities as i64, relationships as i64, trace_id],
-                )?;
-                Ok(())
+                use rusqlite::OptionalExtension;
+                let hash: Option<String> = db
+                    .conn
+                    .query_row(
+                        "SELECT source_doc_hash
+                         FROM kg_chunks
+                         WHERE agent_id = ?1 AND source_doc_path = ?2
+                         LIMIT 1",
+                        rusqlite::params![agent_id, doc_path],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Ok(hash)
             })
             .await
-        {
-            warn!(
-                trace_id = %self.trace_id,
-                error = %e,
-                event = "extraction_record_failed",
-            );
-        }
     }
 
     /// Store an llm_calls row (C2.4).

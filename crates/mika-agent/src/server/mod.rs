@@ -766,6 +766,22 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             .unwrap_or_default()
             .join("docs")
             .join("solutions");
+
+        // Fan-out cost advisory (#757 R3). All agents use the same docs_root,
+        // so per-agent extraction/resolution scales N× with agent count.
+        // Only emit when there's actually a multiplier to warn about.
+        if docs_root.exists() && agents.len() >= 2 {
+            let shared_agents: Vec<&str> = agents.keys().map(|s| s.as_str()).collect();
+            info!(
+                event = "kg_shared_docs_root",
+                docs_root = %docs_root.display(),
+                agents = ?shared_agents,
+                agent_count = agents.len(),
+                "KG extraction and resolution run per agent; sharing docs_root means cost scales N×. \
+                 See MIKA_KG_BATCH_BUDGET (default 500) for the per-batch cap."
+            );
+        }
+
         if docs_root.exists() {
             for (agent_name, agent_state) in &agents {
                 let ingestor = crate::kg::lexical_ingestor::LexicalIngestor::new(
@@ -803,13 +819,32 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         // previously-ingested chunks (#690). Runs asynchronously in the
         // background after lexical ingestion — does not block server readiness.
         // Per D2: startup extraction spawns one background task per agent.
+        let kg_batch_budget = settings.effective_kg_batch_budget();
         match settings.make_kg_extraction_provider() {
             Some(Ok(extraction_llm)) => {
+                // #757 R4: advise operators when KG extraction resolves to
+                // Anthropic (expensive for bulk NER). Fires once per startup
+                // by virtue of the surrounding `match` arm running once.
+                if extraction_llm
+                    .provider_name()
+                    .eq_ignore_ascii_case("anthropic")
+                {
+                    warn!(
+                        event = "kg_anthropic_provider",
+                        scope = "extraction",
+                        provider = "anthropic",
+                        model = %extraction_llm.model_name(),
+                        "KG extraction is using Anthropic — typically ~10× more expensive than \
+                         OpenRouter equivalents for bulk NER. Consider \
+                         MIKA_KG_EXTRACTION_MODEL=openrouter/<model> for cost-sensitive deployments."
+                    );
+                }
                 for (agent_name, agent_state) in &agents {
                     let db = agent_state.db.clone();
                     let llm = extraction_llm.clone();
                     let docs_root_clone = docs_root.clone();
                     let agent_name_clone = agent_name.clone();
+                    let budget = kg_batch_budget;
 
                     tokio::spawn(async move {
                         let extractor = crate::kg::subject_extractor::SubjectExtractor::new(
@@ -818,7 +853,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                             docs_root_clone,
                             None,
                         );
-                        match extractor.extract_pending().await {
+                        match extractor.extract_pending(budget).await {
                             Ok(stats) => {
                                 if stats.docs_extracted > 0 || stats.docs_failed > 0 {
                                     info!(
@@ -864,7 +899,21 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         // agent. Resolution LLM is optional — without it, exact-match-only mode.
         {
             let resolution_llm = match settings.make_kg_resolution_provider() {
-                Some(Ok(llm)) => Some(llm),
+                Some(Ok(llm)) => {
+                    // #757 R4: advise when resolution resolves to Anthropic.
+                    // Fires at most once per startup.
+                    if llm.provider_name().eq_ignore_ascii_case("anthropic") {
+                        warn!(
+                            event = "kg_anthropic_provider",
+                            scope = "resolution",
+                            provider = "anthropic",
+                            model = %llm.model_name(),
+                            "KG resolution is using Anthropic — consider \
+                             MIKA_KG_RESOLUTION_MODEL=openrouter/<model> for cost-sensitive deployments."
+                        );
+                    }
+                    Some(llm)
+                }
                 Some(Err(e)) => {
                     warn!(
                         error = %e,
@@ -880,6 +929,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 let db = agent_state.db.clone();
                 let llm = resolution_llm.clone();
                 let agent_name_clone = agent_name.clone();
+                let budget = kg_batch_budget;
 
                 tokio::spawn(async move {
                     // Small delay to let extraction tasks commit first.
@@ -887,7 +937,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
                     let resolver =
                         crate::kg::entity_resolver::SubjectEntityResolver::new(db, llm, None);
-                    match resolver.resolve_pending().await {
+                    match resolver.resolve_pending(budget).await {
                         Ok(stats) => {
                             if stats.matched_exact > 0 || stats.matched_llm > 0 || stats.errors > 0
                             {

@@ -57,9 +57,19 @@ Two environment variables cover the two distinct ingestion call types:
 
 Both fall back to a shared `MIKA_KG_INGESTION_MODEL` if only that is set, so operators who want one knob can set one and move on.
 
+**Provider recommendation (#757).** OpenRouter is the recommended default for KG models. Anthropic direct is typically ~10× more expensive than equivalent OpenRouter routes for bulk NER; a startup `kg_anthropic_provider` WARN fires when extraction or resolution resolves to `anthropic/*` so the cost is visible before it accrues.
+
 **Do not** route ingestion calls through the agent's primary conversational model (`MIKA_PROVIDER` / `MIKA_MODEL`). Interactive reasoning and bulk extraction have different quality, latency, and cost profiles; coupling them means every model upgrade for conversational quality drags ingestion cost along, and every ingestion cost optimization risks degrading conversational quality.
 
 **Do not** use per-skill `skill_overrides` as the default for ingestion category selection. Per-skill overrides are the right escape hatch if one specific skill needs a different model, but they scatter global ingestion policy across skill manifests — the "which model does ingestion use in this container" question should be answerable by reading one env var, not N files.
+
+### C2.5 Per-batch LLM call budget (#757)
+
+`MIKA_KG_BATCH_BUDGET` (default 500) caps the number of LLM calls per extraction batch and per resolution batch. Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next restart. `0` disables the phase entirely. Worst-case per-startup cost is `2 × N_agents × budget` — extraction batch plus resolution batch, one of each per agent.
+
+Stage-1 exact-match resolutions do not debit the budget (they cost no LLM calls), so entities that resolve via exact match still make progress even when the budget is exhausted. The budget guard is a structural caller-side counter, not a prompt-level instruction — LLMs rationalize crossing prompt-level budgets; structural constraints don't.
+
+**Idempotency pairs with the budget guard.** `kg_extractions.source_doc_hash` (added at schema v26) is compared against `kg_chunks.source_doc_hash` in the pending-doc query, so content-unchanged docs are skipped entirely. Pre-v26 rows have NULL hash and re-extract exactly once under the budget, then populate. The idempotency marker is written atomically with the extraction results — a write failure or crash between the LLM call and the marker would otherwise burn budget on the same doc every restart.
 
 ### C2.2 Retry taxonomy — four failure categories
 

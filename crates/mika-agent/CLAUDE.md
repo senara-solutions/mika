@@ -186,7 +186,9 @@ See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, 
 
 **Re-extraction (D5):** Three-phase capture → reingest → reconcile. `IngestionOrchestrator` (`src/kg/ingestion_orchestrator.rs`) coordinates #689 and #690 — neither module calls the other directly. Scoped orphan sweep deletes entities/relationships that lost all provenance after doc change.
 
-**Pending-doc detection (D7):** `kg_extractions` tracking table — one row per (agent_id, source_doc_path) recording completed extraction. Pending query: docs with `kg_chunks` rows but no `kg_extractions` row.
+**Pending-doc detection (D7 + #757 hash check):** `kg_extractions` tracking table with `UNIQUE(agent_id, source_doc_path)` and a `source_doc_hash TEXT` column (nullable, added in v26). A doc is pending when it either has no `kg_extractions` row OR `kg_extractions.source_doc_hash != kg_chunks.source_doc_hash` — direct equality, no aggregation, because the lexical ingestor writes one identical per-doc hash across every chunk row. See `src/db/kg_schema.rs` for the full idempotency contract.
+
+**Budget guard (#757):** `extract_pending(budget: u32)` caps per-batch LLM calls. `budget == 0` short-circuits with zero calls. On overflow, emits `kg_budget_exhausted` WARN with `scope="extraction"` and leaves remaining docs pending. Stats carry `aborted_budget: bool` + `llm_calls: u32`. Default budget: `MIKA_KG_BATCH_BUDGET` (500).
 
 **LLM policy (C2):** Model from `MIKA_KG_EXTRACTION_MODEL` → `MIKA_KG_INGESTION_MODEL` fallback. Retry taxonomy per C2.2 (transport: 3 attempts with backoff; semantic: one retry with prompt reinforcement; config: no retry). Log-and-skip per C2.3. `llm_calls` rows per C2.4. Audit events per C3.3.
 
@@ -201,6 +203,8 @@ See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, 
 **Execution contexts (D5):** (1) Startup: background `tokio::spawn` per agent after extraction tasks, non-blocking. (2) Compound hook: `IngestionOrchestrator` spawns async resolution after extraction commits. (3) `resolve_pending()` catches entities missed by either path.
 
 **Pending-entity detection (D4):** `kg_resolutions_log` tracking table with `UNIQUE(agent_id, subject_entity_id)`. Pending query: subject entities with well-known types that have no log row, or whose `source_extraction_trace_id` differs from the latest `kg_chunk_subjects` extraction.
+
+**Budget guard (#757):** `resolve_pending(budget: u32)` caps per-batch **Stage-2** LLM disambiguation calls. Stage-1 exact matches cost no LLM calls and are NOT debited against the budget — even `budget=0` lets exact matches resolve. On overflow, emits `kg_budget_exhausted` WARN with `scope="resolution"` and the remaining entities stay pending (no `kg_resolutions_log` row written). Stats carry `aborted_budget: bool` + `llm_calls: u32`. Default budget: `MIKA_KG_BATCH_BUDGET` (500).
 
 **LLM policy (C2):** Model from `MIKA_KG_RESOLUTION_MODEL` → `MIKA_KG_INGESTION_MODEL` fallback. Mid-tier model recommended. Same C2.2 retry taxonomy as extraction. `no_match` is a first-class LLM response (not an error). `llm_calls` rows per C2.4. Per-batch audit events per C3.3.
 
@@ -228,7 +232,7 @@ Results merged, deduped by `(layer, entity_id)` keeping highest confidence, top-
 
 ## Knowledge Graph — Eval Fixture Seeding (#740)
 
-`tests/eval/kg_fixtures/mod.rs` — crate-shared helpers for seeding a known KG state into a test `AsyncDatabase`. Used by `#740` (self-knowledge scenarios) and available for `#741` (grounding scenarios). Schema pin lives in the module (currently v25) with an actionable assertion message on drift.
+`tests/eval/kg_fixtures/mod.rs` — crate-shared helpers for seeding a known KG state into a test `AsyncDatabase`. Used by `#740` (self-knowledge scenarios) and available for `#741` (grounding scenarios). Schema pin lives in the module (currently v26) with an actionable assertion message on drift.
 
 **Spec-struct pattern.** Each seed helper takes a `*Spec` struct and returns the inserted row ID: `seed_domain_entity`, `seed_domain_relationship`, `seed_subject_entity`, `seed_chunk`, `seed_chunk_subject`, `seed_resolution`, `disable_skill`. Query helpers (`get_resolution_log`, `get_resolution`) read rows back for assertions.
 
@@ -302,7 +306,7 @@ All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). Th
 
 ## Schema Version
 
-**Current: v25.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls, tool_calls, team_runs, kg_entities, kg_relationships, kg_chunks, kg_subject_entities, kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions, kg_subject_resolutions, kg_resolutions_log. `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
+**Current: v26.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls, tool_calls, team_runs, kg_entities, kg_relationships, kg_chunks, kg_subject_entities, kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions (with `source_doc_hash` for content-aware idempotency), kg_subject_resolutions, kg_resolutions_log. `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
 
 Recent migrations:
 - v18->v19: `sessions.task_id` column for reverse session->task lookups. `get_sessions_for_task_tree()`.
@@ -312,5 +316,6 @@ Recent migrations:
 - v22->v23: `tasks.type` column (`TEXT NOT NULL DEFAULT 'issue' CHECK (type IN ('issue', 'milestone', 'project'))`). Foundational for milestone/project dispatch (mika#595): `create_task` accepts an optional `type` parameter; `list_tasks` and `check_task` surface it. mika core stays a dumb task store — orchestration logic lives in self-dev (mika-skills#149). `NewTask.r#type: Option<String>` defaults to `'issue'` via SQL DEFAULT when `None`. Constants: `TASK_TYPE_ISSUE`/`TASK_TYPE_MILESTONE`/`TASK_TYPE_PROJECT`/`VALID_TASK_TYPES` in `db.rs`.
 - v23->v24: `skill_overrides.enabled` column (`INTEGER`, nullable tri-state). `NULL` = default (enabled), `0` = disabled, `1` = explicitly enabled. Replaces `.disabled` marker files (#629). `SkillOverride.enabled: Option<bool>`. `set_skill_enabled()` with default-equals-delete (row deleted when all columns are NULL). `apply_overrides()` evicts disabled skills from `SkillRegistry.entries` into `disabled: Vec<DisabledSkill>`. One-shot `migrate_disabled_markers()` converts legacy `.disabled` marker files to DB rows at startup (fail-open on marker removal).
 - v24->v25: Knowledge graph tables. Domain layer: `kg_entities`, `kg_relationships`. Lexical layer: `kg_chunks` + `search_content` integration. Subject layer: `kg_subject_entities`, `kg_subject_relationships`, provenance tables (`kg_chunk_subjects`, `kg_chunk_subject_relationships`), `kg_extractions` tracking. Resolution layer (#691): `kg_subject_resolutions` (subject → domain edges with confidence, UNIQUE on agent_id+subject_entity_id+domain_entity_id), `kg_resolutions_log` (resolution tracking with outcome CHECK constraint, UNIQUE on agent_id+subject_entity_id).
+- v25->v26: `kg_extractions.source_doc_hash TEXT` (nullable) for #757 extraction idempotency. Pending-doc query now compares the stored hash against `kg_chunks.source_doc_hash` directly; pre-v26 rows get NULL and re-extract once under the budget before populating. Additive-nullable; no backfill needed. See `src/db/kg_schema.rs` → **Idempotency key** for the full contract.
 
 Full migration history: see `docs/runtime-structure.md`.

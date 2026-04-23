@@ -58,7 +58,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Grounding rule:** The system prompt prohibits the agent from claiming downstream system state unless a tool result confirms it. Reinforced in `format_callback_framing` and `SilentTrigger::Callback`.
 - **Confirmation before action:** The system prompt instructs the agent to answer informational questions directly without starting multi-step workflows.
 - **Context priority:** current user message > core memory > active skill context > conversation summary > conversation history > search results. See `docs/memory-classification.md`.
-- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v25. See `crates/mika-agent/CLAUDE.md` for schema details.
+- **Database:** Case-insensitive COLLATE NOCASE on unique text columns. Schema v26. See `crates/mika-agent/CLAUDE.md` for schema details.
 - **Secrets:** All API keys and tokens in `Settings` use `secrecy::SecretString` (`Option<SecretString>`) for compile-time exposure safety and zeroize-on-drop. Secrets are exposed at the `Settings` accessor boundary (e.g., `provider_fields()`, `agent_github_token()`) via `.expose_secret()` — downstream types use plain `String`/`&str`. `Settings` has manual `Debug` impl that redacts all secret fields. `get_effective_value()` returns `"[SET]"` for secret-flagged fields (never raw values). Exec handler executor scrubs all MIKA_* env vars from child processes. MCP child processes use `env_clear()` + allowlist. Git subprocesses scrub MIKA_* vars and set `GIT_TERMINAL_PROMPT=0`.
 - **Labels:** `.github/labels.yml` is the canonical label taxonomy (type, priority, component). All issue-creation paths reference it.
 - **Async DB:** `AsyncDatabase` wraps sync `Database` with dedicated OS thread + `sync_channel(512)` mpsc channel (closure-based dispatch). Clone-able, Send+Sync. `with_db` releases the mutex before calling `send()` to avoid deadlocks.
@@ -112,9 +112,19 @@ Optional (web search):
 - `MIKA_BRAVE_API_KEY` — Brave Search API key for `web_search` builtin skill (get free key at https://brave.com/search/api/)
 
 Optional (Knowledge Graph LLM):
-- `MIKA_KG_INGESTION_MODEL` — Shared fallback model for KG extraction and resolution. Format: `provider/model` (e.g., `anthropic/claude-haiku-4-5-20251001`). If unset, KG features requiring LLM calls are disabled.
+- `MIKA_KG_INGESTION_MODEL` — Shared fallback model for KG extraction and resolution. Format: `provider/model`. **OpenRouter is recommended** — Anthropic direct is ~10× more expensive for bulk NER and triggers a `kg_anthropic_provider` WARN at startup. Example: `openrouter/deepseek/deepseek-v3`. If unset, KG features requiring LLM calls are disabled.
 - `MIKA_KG_EXTRACTION_MODEL` — Model for NER + fact-triple extraction (#690). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Task is mechanical JSON extraction — cheap/fast tier recommended.
 - `MIKA_KG_RESOLUTION_MODEL` — Model for entity resolution disambiguation (#691). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Mid-tier model recommended for better judgment on ambiguous matches.
+- `MIKA_KG_BATCH_BUDGET` — Per-batch LLM call cap on KG startup extraction and resolution (#757). Default `500`. Worst-case per-startup cost is `2 × N_agents × budget` (extraction batch + resolution batch, one of each per agent). Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next restart. `0` disables the phase entirely. Extraction idempotency (see `crates/mika-agent/src/db/kg_schema.rs` → **Idempotency key**) keeps the second and subsequent restarts free of extraction calls once marker rows are populated.
+
+### Post-restart safety check (#757)
+
+After KG-related deploys, four signals tell you the fix is working. The second restart after deploy is the steady-state signal — the first restart backfills NULL `source_doc_hash` rows from v26 under the budget.
+
+- **Signal A — extraction not re-running.** `grep subject_extraction_start server.log | jq 'select(.pending_docs == 0)'` should list every agent by the second post-deploy restart. Note: does NOT imply resolver is caught up — see Signal C.
+- **Signal B — budget not exhausted.** `grep kg_budget_exhausted server.log` returns zero lines on a healthy restart.
+- **Signal C — resolver backlog drains over time.** `SELECT agent_id, COUNT(*) FROM kg_subject_entities se WHERE NOT EXISTS (SELECT 1 FROM kg_resolutions_log rl WHERE rl.agent_id = se.agent_id AND rl.subject_entity_id = se.id) GROUP BY agent_id;` → count trends to 0 across restarts (bounded by per-restart budget). May take multiple restart cycles for agents starting > 3,000 pending.
+- **Signal D — concrete cost prediction.** With OpenRouter configured, expect ~`N_agents × budget` resolution LLM calls on the first restart + ~0 extraction calls. At OpenRouter cheap-tier pricing (~\$0.0001/call) that's **\$0.05–\$0.50 per restart** until the backlog drains. Substantially more than \$1 per restart indicates budget-guard failure, stale idempotency, or provider routing regression.
 
 Optional (GitHub App — preferred over PAT for agent operations):
 - `MIKA_GITHUB_APP_ID` — GitHub App ID (u64). Required for GitHub App authentication.

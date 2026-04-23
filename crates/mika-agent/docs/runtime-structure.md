@@ -143,7 +143,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20), `enabled INTEGER` (v24). Per-agent overrides: LLM overrides resolve as DB > manifest `[llm]` > agent default (`mika skills llm <name> set <provider>/<model>`). Enabled state is tri-state: `NULL`=default (enabled), `0`=disabled, `1`=explicitly enabled. `enabled=false` evicts the skill from `SkillRegistry.entries` during `apply_overrides()`. Replaces `.disabled` marker files (#629). Default-equals-delete: rows where all columns are NULL are pruned.
 
-### Knowledge Graph Tables (v25)
+### Knowledge Graph Tables (v25; `kg_extractions.source_doc_hash` added v26)
 
 **kg_entities** — `id INTEGER PK AUTO`, `entity_key TEXT UNIQUE`, `type TEXT NOT NULL`, `name TEXT NOT NULL`, `properties_json TEXT`, `created_at TEXT`, `updated_at TEXT`. Domain-layer entities (skill, tool, agent, problem_type). No `agent_id` — global scope.
 
@@ -159,7 +159,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **kg_chunk_subject_relationships** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `chunk_id FK→kg_chunks`, `subject_relationship_id FK→kg_subject_relationships`, `extraction_trace_id TEXT`, `created_at TEXT`. Provenance: which chunk produced which relationship.
 
-**kg_extractions** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `source_doc_path TEXT NOT NULL`, `entities_extracted INTEGER`, `relationships_extracted INTEGER`, `extraction_trace_id TEXT`, `model TEXT`, `duration_ms INTEGER`, `created_at TEXT`. Tracking: one row per completed extraction. UNIQUE on `(agent_id, source_doc_path)`.
+**kg_extractions** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `source_doc_path TEXT NOT NULL`, `source_doc_hash TEXT` (added v26, #757), `extraction_model TEXT NOT NULL`, `entities_extracted INTEGER`, `relationships_extracted INTEGER`, `extraction_trace_id TEXT`, `created_at TEXT`. Tracking: one row per completed extraction. UNIQUE on `(agent_id, source_doc_path)`. The hash enables content-aware idempotency — the pending-doc query compares the stored hash against `kg_chunks.source_doc_hash` and only re-extracts when they diverge (including the NULL-hash case for pre-v26 rows). Written atomically inside the extraction transaction alongside entity/relationship upserts.
 
 **kg_subject_resolutions** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `subject_entity_id FK→kg_subject_entities`, `domain_entity_id FK→kg_entities`, `confidence REAL NOT NULL CHECK(0.0..1.0)`, `trace_id TEXT`, `created_at TEXT`. Resolution edges bridging subject→domain. UNIQUE on `(agent_id, subject_entity_id, domain_entity_id)`. CASCADE on both FKs. Sole writer: `SubjectEntityResolver` (#691).
 
