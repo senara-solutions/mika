@@ -20,6 +20,12 @@ mod eval {
     // KG self-knowledge: 7 scenarios for KG-backed self-knowledge (#740)
     pub mod kg_self_knowledge;
 
+    // Grounding assertion helpers: shared for fabrication-detection scenarios (#741)
+    pub mod grounding_assertions;
+
+    // Grounding + fabrication regression: 5 scenarios from KG retrospective (#741)
+    pub mod grounding_regressions;
+
     mod test_basic_conversation;
     mod test_callback_turn;
     mod test_completion_claim_guard;
