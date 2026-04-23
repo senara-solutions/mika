@@ -139,6 +139,23 @@ Git-based and local skill distribution via `mika skills install/uninstall/update
 
 Connects to external MCP servers at startup via `McpManager`. Configured in `{agent_home}/mcp.json`. Supports stdio and Streamable HTTP transports. Tools namespaced as `mcp__{server}__{tool}`. Dispatch chain: builtins -> skills -> MCP -> unknown error. MCP tools excluded from silent/heartbeat mode. Child processes use `env_clear()` + allowlist.
 
+## Evaluation — Golden Dataset (#339)
+
+`tests/eval/golden/` — 25 curated end-to-end quality scenarios across 4 capability classes: Memory (8), Tool Selection (8), Conversation Quality (5), Skill-Specific (4). Each scenario has hard assertions (regression-gating) and optional soft tags (`quality:*` namespace, observability-only). Sibling tickets own their namespaces: #740 `self-knowledge:*`, #741 `grounding:*`.
+
+**Three-tier execution model (D6):**
+1. **Unit** — `MockLlmProvider`, runs on every CI push: `cargo test -p mika-agent --test eval golden`
+2. **Integration** — real providers via `MIKA_EVAL_REAL_PROVIDERS` + `--ignored`
+3. **Calibration** — integration + `MIKA_EVAL_CALIBRATE=1` artifact capture for weekly drift detection (#742)
+
+**Scenario registration (D7):** Each scenario calls `register()` on `GoldenRegistry`. `HashMap::insert` uniqueness guard panics on duplicate names at test binary load time — protects against copy-paste-without-rename.
+
+**Scoring (D4):** `GoldenOutcome` carries `hard_assertions: Vec<HardAssertion>` (pass/fail) + `soft_tags: Vec<SoftTag>` (LLM-judged quality signals). Judge model pinned to `claude-sonnet-4-6` with `MIKA_EVAL_JUDGE_MODEL` override. Tag-based judging — no free-form 0-10 scores. Judge-deprecation-as-reset protocol: when pinned model is EOL'd, baseline resets via explicit PR.
+
+**Ticket-namespaced vocabulary (D4):** #339 owns `quality:concise`, `quality:verbose`, `quality:uncertain`, `quality:actionable`, `quality:off-topic`. Each sibling ticket defines its own namespace.
+
+See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, assertion style, how to add scenarios).
+
 ## Knowledge Graph — Domain Graph Builder
 
 `src/kg/domain_builder.rs` — Deterministic startup-time builder that populates `kg_entities` and `kg_relationships` from four authoritative sources: `SkillRegistry`, `ToolRegistry`, `McpManager`, and agent configs. Runs once per server boot in `run_server()` after all agents are initialized. No LLM calls — pure code projection.
