@@ -246,6 +246,26 @@ if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
         fi
     fi
 
+    # Rebase-or-abort guard: catch up branches pre-committed from stale main.
+    # At this point origin/main is fresh (line 233 fetched it) and WORKTREE_DIR is set.
+    # If the branch is behind origin/main, auto-rebase. On conflict, capture the
+    # conflicted-file list BEFORE abort (abort resets the index) and exit with a
+    # structured STATUS=REBASE_CONFLICT discriminator so the EXIT trap delivers it.
+    BEHIND=$(git -C "$WORKTREE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+    if [ "$BEHIND" -gt 0 ]; then
+        if git -C "$WORKTREE_DIR" rebase origin/main 2>/dev/null; then
+            echo "Rebased ${BRANCH} onto origin/main (${BEHIND} commits caught up)." >&2
+        else
+            CONFLICTS=$(git -C "$WORKTREE_DIR" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')
+            git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
+            RESULT="STATUS=REBASE_CONFLICT
+Branch ${BRANCH} is ${BEHIND} commits behind origin/main.
+Conflicted files: ${CONFLICTS:-<unable to capture>}
+Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
+            exit 1
+        fi
+    fi
+
     # Copy gitignored .claude/ config into worktree (relay + permissions only)
     # NOTE: Do NOT copy .claude/commands/ — Claude Code discovers commands from
     # the repo's own .claude/commands/. Copying the meta-repo's commands overwrites
