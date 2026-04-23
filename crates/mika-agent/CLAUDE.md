@@ -156,6 +156,20 @@ Connects to external MCP servers at startup via `McpManager`. Configured in `{ag
 
 See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, assertion style, how to add scenarios).
 
+## Evaluation — Grounding Regressions (#741)
+
+`tests/eval/grounding_regressions/` — 5 fabrication-detection scenarios from the KG milestone #14 retrospective. Each tests a concrete fabrication class with hard assertions (forbidden-word, required-tool, contains-in-order). No LLM-judge gating — each class has objectively checkable signals.
+
+**Scenarios:** GraphQL field fabrication (#720), auto-merge vs merged (#727), core memory priority drift (#732), fabricated shell errors (feedback doc), KG result ignored (#740 D4).
+
+**Assertion helpers:** `tests/eval/grounding_assertions/mod.rs` — `assert_response_forbids`, `assert_any_tool_called_from`, `assert_response_contains_in_order`, `assert_response_contains`, `assert_tool_called_before_response`, `assert_response_contains_question`.
+
+**Frozen regression fixtures:** Each scenario has a `fixtures/{scenario}_pre_fix.json` file with the pre-fix response that demonstrates the failure class. Regression-reproduction tests prove assertions catch the failure.
+
+**Tag vocabulary (`grounding:*`):** `fabricated-ref-suppressed`, `completion-claim-suppressed`, `source-cited-correctly`, `verification-before-claim`, `uncertainty-admitted`, `training-data-hallucination` (failure). Scope boundary with #740 `self-knowledge:*`: self-knowledge = query-invocation code paths; grounding = response-to-evidence paths.
+
+See `tests/eval/grounding_regressions/README.md` for the full vocabulary, capability matrix, and how to add scenarios.
+
 ## Knowledge Graph — Domain Graph Builder
 
 `src/kg/domain_builder.rs` — Deterministic startup-time builder that populates `kg_entities` and `kg_relationships` from four authoritative sources: `SkillRegistry`, `ToolRegistry`, `McpManager`, and agent configs. Runs once per server boot in `run_server()` after all agents are initialized. No LLM calls — pure code projection.

@@ -1,0 +1,36 @@
+//! # Grounding + Fabrication Regression Scenarios (#741)
+//!
+//! Five scenarios, each testing a concrete fabrication class from the KG milestone
+//! retrospective. Each scenario has hard assertions on tool calls and response text.
+//! All gated behind `#[ignore]` + `MIKA_EVAL_GROUNDING=1` for integration tier.
+//!
+//! ## Tag Vocabulary (`grounding:*`)
+//!
+//! See `README.md` in this directory for the full vocabulary, scope boundary
+//! against `#740` `self-knowledge:*`, and capability x status matrix.
+//!
+//! ## Fixture Helpers
+//!
+//! Scenarios use `grounding_assertions` for hard negative/positive checks and
+//! `kg_fixtures` (from #740) for scenario 5's KG state seeding.
+//!
+//! ## Reference
+//!
+//! - Issue: mika#741
+//! - Plan: `docs/plans/741-grounding-regressions.md`
+
+// Re-export common test dependencies for scenario files
+pub use mika_common::llm::mock::*;
+pub use serde_json::json;
+
+pub use super::assertions::*;
+pub use super::grounding_assertions;
+pub use super::harness::EvalHarness;
+pub use super::kg_fixtures;
+
+// --- Scenario modules (one per fabrication class, D2) ---
+pub mod auto_merge_vs_merged;
+pub mod current_priorities_drift;
+pub mod fabricated_shell_errors;
+pub mod graphql_field_fabrication;
+pub mod kg_result_ignored;

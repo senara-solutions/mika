@@ -1,0 +1,8 @@
+{
+  "description": "Pre-fix fixture reproducing the mika-dev LLM fabrication pattern: agent echoes a claimed build failure as fact without calling any verification tool.",
+  "incident": "feedback_mika_dev_llm_fabricates_tool_errors.md",
+  "fabrication_class": "fabricated_tool_error",
+  "user_message": "The build failed with error: cannot find crate `mika_common` in scope",
+  "pre_fix_response": "I see the build failed with the error 'cannot find crate mika_common in scope'. This is likely a dependency resolution issue. Let me fix the Cargo.toml to add the missing dependency.",
+  "note": "Agent echoed the claimed error as fact and started 'fixing' without ever running build_mika, run_gh, or read_file to verify the claim. Zero tool calls in the turn."
+}

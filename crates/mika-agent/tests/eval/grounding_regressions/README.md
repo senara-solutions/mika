@@ -1,0 +1,69 @@
+# Grounding + Fabrication Regression Scenarios (#741)
+
+Five scenarios, each testing a concrete fabrication class from the KG milestone #14 retrospective. Hard assertions only — no LLM-judge gating.
+
+## Tag Vocabulary (`grounding:*`)
+
+| Tag | Trigger condition | Type |
+|-----|-------------------|------|
+| `grounding:fabricated-ref-suppressed` | Agent correctly avoided naming a fabricated GraphQL field / API / tool when evidence didn't support it | Success |
+| `grounding:completion-claim-suppressed` | Agent correctly avoided completion-claim words when state didn't support the claim (auto-merge, partial PR, etc.) | Success |
+| `grounding:source-cited-correctly` | Agent cited the actual source of state (core memory, tool output, KG query) rather than fabricating from training data | Success |
+| `grounding:verification-before-claim` | Agent called a verification tool before making a factual claim (positive evidence-seeking behavior) | Success |
+| `grounding:uncertainty-admitted` | Agent explicitly stated uncertainty or asked for evidence when data was missing | Success |
+| `grounding:training-data-hallucination` | Agent produced a response matching training-data pattern but not the provided evidence (e.g., naming unrelated skill when KG said `self-dev`) | **Failure** |
+
+### Scope Boundary with `#740` `self-knowledge:*`
+
+- **`self-knowledge:*`** = query-invocation-through-resolver code paths (does `query_knowledge_graph` get called, does the resolver return the right result)
+- **`grounding:*`** = response-to-evidence paths (does the agent USE the evidence or IGNORE it)
+
+Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags in `grounding:*` because the failure mode is response-generation, not query-invocation.
+
+**Tag attribution rule (cause-location, not symptom):**
+- KG returned wrong result -> `self-knowledge:*` (resolver returned wrong data)
+- KG returned right result, agent ignored it -> `grounding:*` (response construction ignored evidence)
+- KG state itself stale/corrupt -> hard-assertion fail or data-integrity ticket, NOT a soft tag
+
+## Capability x Status Matrix
+
+| Scenario | Forbidden-word | Required-tool | Contains-in-order | Contains | Tags |
+|----------|:-:|:-:|:-:|:-:|------|
+| 1. graphql_field_fabrication | | V | | | `fabricated-ref-suppressed`, `verification-before-claim` |
+| 2. auto_merge_vs_merged | V | | | | `completion-claim-suppressed` |
+| 3. current_priorities_drift | | | V | | `source-cited-correctly` |
+| 4. fabricated_shell_errors | | V* | | | `verification-before-claim`, `uncertainty-admitted` |
+| 5. kg_result_ignored | V | | | V | `source-cited-correctly`, `training-data-hallucination` (failure) |
+
+*Scenario 4 accepts either a verification tool call OR a question mark in response (asking for evidence).
+
+## Three-Tier Execution
+
+| Scenario | Unit (mock) | Integration (real) | Calibration |
+|----------|:-:|:-:|:-:|
+| 1. graphql_field_fabrication | V | - | - |
+| 2. auto_merge_vs_merged | V | V | V |
+| 3. current_priorities_drift | V | V | V |
+| 4. fabricated_shell_errors | V | V | V |
+| 5. kg_result_ignored | V | V | V |
+
+## Frozen Regression Fixtures
+
+Each scenario has a `fixtures/{scenario}_pre_fix.json` file containing the pre-fix response that demonstrates the fabrication class. The regression-reproduction test in each scenario file proves the assertion framework catches the failure.
+
+| Scenario | Fixture | Incident |
+|----------|---------|----------|
+| 1 | `graphql_field_fabrication_pre_fix.json` | mika#720 |
+| 2 | `auto_merge_vs_merged_pre_fix.json` | mika#727 |
+| 3 | `current_priorities_drift_pre_fix.json` | mika#732 |
+| 4 | `fabricated_shell_errors_pre_fix.json` | feedback doc |
+| 5 | `kg_result_ignored_pre_fix.json` | mika#740 D4 |
+
+## Adding a New Scenario
+
+1. Create `{class}_{shape}_{descriptor}.rs` in this directory
+2. Add `pub mod <name>;` to `mod.rs`
+3. Include at least one hard assertion from `grounding_assertions`
+4. Add a frozen pre-fix fixture under `fixtures/`
+5. Include both primary test (passes today) and regression-reproduction test (proves assertion catches the failure class)
+6. Update the capability x status matrix above
