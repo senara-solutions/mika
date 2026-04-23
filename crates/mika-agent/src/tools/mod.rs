@@ -294,9 +294,17 @@ pub(crate) fn validate_uuid(
     })
 }
 
-/// Validate that a UUID-typed task parameter references an existing task owned by
+/// Agent-scoped task lookup — for intra-agent state mutation only.
+///
+/// Validates that a UUID-typed task parameter references an existing task owned by
 /// the calling agent. Combines format validation ([`validate_uuid`]) with a DB
 /// existence + agent-scope check in a single call.
+///
+/// For correlation-only / observability existence checks that cross agent boundaries
+/// (e.g., `mika ask --task-id` from a relay agent referencing a task owned by another
+/// agent), use [`crate::db::Database::get_task_unscoped`] instead. This function will
+/// return `task_not_found` if the task exists but belongs to a different agent, which
+/// is the intended behavior for ownership checks and the wrong behavior for correlation.
 ///
 /// Returns `Ok(Task)` on success, or `Err(ToolOutput)` with structured JSON:
 /// - Format error: `{"error": "invalid_uuid", "field": ..., ...}` (from `validate_uuid`)
