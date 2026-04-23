@@ -14,6 +14,12 @@ mod eval {
     // Golden dataset: 25 curated scenarios for end-to-end quality testing (#339)
     pub mod golden;
 
+    // KG fixture helpers: shared seeding for KG eval scenarios (#740, #741)
+    pub mod kg_fixtures;
+
+    // KG self-knowledge: 7 scenarios for KG-backed self-knowledge (#740)
+    pub mod kg_self_knowledge;
+
     mod test_basic_conversation;
     mod test_callback_turn;
     mod test_completion_claim_guard;
