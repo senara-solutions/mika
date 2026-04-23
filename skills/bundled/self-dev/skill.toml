@@ -10,6 +10,7 @@ dependencies = [
     "deploy-mika",
     "claude-pilot",
     "browser-control",
+    "resolve-pr-conflicts",
 ]
 
 [constraints]

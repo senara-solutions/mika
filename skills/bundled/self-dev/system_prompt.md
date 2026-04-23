@@ -132,8 +132,9 @@ When you receive a callback result from a completed background task (`run_claude
 **On success (no "PIPELINE FAILURE:" prefix):**
 1. Extract metadata and persist immediately (see "Metadata extraction" above).
 2. If `pr_url` was not extracted from the callback text (no "PR: ..." line), discover it now: `run_gh("pr list --head <branch> --repo senara-solutions/<repo> --json url --jq '.[0].url'")`. Update metadata with the discovered URL.
-3. Notify Vincent: "claude-pilot completed for {repo}#{issue_number}. PR: {url}. QA will review automatically."
-4. Proceed to Step 6 (close-out) with status `in_progress` and note "PR open, awaiting QA review. PR: {url}". mika-qa will be triggered automatically by the GitHub webhook when the PR is created — no delegation needed.
+3. Before treating the PR as ready or attempting merge, check mergeable state via `run_gh("pr view <number> --repo senara-solutions/<repo> --json mergeable --jq '.mergeable'")` — if `CONFLICTING`, invoke `resolve_pr_conflicts` per that skill's documented routing table before proceeding.
+4. Notify Vincent: "claude-pilot completed for {repo}#{issue_number}. PR: {url}. QA will review automatically."
+5. Proceed to Step 6 (close-out) with status `in_progress` and note "PR open, awaiting QA review. PR: {url}". mika-qa will be triggered automatically by the GitHub webhook when the PR is created — no delegation needed.
 
 **On failure (non-zero exit, "FAILED", or "not structured JSON"):** Before blocking the task, **always check if a PR was created** by running `run_gh("pr list --head <branch> --json url,number,state,reviewDecision")`. If a PR exists (especially if already approved by mika-qa), the run succeeded regardless of what the callback text says — treat it as a success, merge the PR, and close out normally. Only proceed to Step 4.5 if no PR exists on the branch.
 
