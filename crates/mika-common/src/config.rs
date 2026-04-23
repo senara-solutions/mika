@@ -764,10 +764,23 @@ pub struct Settings {
     #[serde(default)]
     pub kg_resolution_model: Option<String>,
 
+    /// KG per-batch LLM call budget — structural cap on startup extraction and
+    /// resolution batches (#757). Unset = default of [`DEFAULT_KG_BATCH_BUDGET`].
+    /// `0` disables the phase entirely (no LLM calls).
+    ///
+    /// Worst-case per-startup cost is `2 × N_agents × budget` — extraction batch
+    /// plus resolution batch, one of each per agent. See `kg_schema.rs` for the
+    /// fan-out cost model.
+    #[serde(default)]
+    pub kg_batch_budget: Option<u32>,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
 }
+
+/// Default per-batch LLM call budget for KG extraction and resolution (#757).
+pub const DEFAULT_KG_BATCH_BUDGET: u32 = 500;
 
 fn default_true() -> bool {
     true
@@ -1038,6 +1051,15 @@ impl Settings {
         Some(self.make_provider_from_model_string(model_str))
     }
 
+    /// Effective KG per-batch LLM call budget (#757).
+    ///
+    /// Returns the configured value or [`DEFAULT_KG_BATCH_BUDGET`] when unset.
+    /// A return value of `0` means "disabled — the extraction or resolution
+    /// phase makes zero LLM calls per batch and returns immediately."
+    pub fn effective_kg_batch_budget(&self) -> u32 {
+        self.kg_batch_budget.unwrap_or(DEFAULT_KG_BATCH_BUDGET)
+    }
+
     /// Parse a `provider/model` string and create an LLM provider.
     ///
     /// Reusable by `make_kg_extraction_provider` and `make_kg_resolution_provider`.
@@ -1237,6 +1259,7 @@ impl Settings {
             kg_ingestion_model: None,
             kg_extraction_model: None,
             kg_resolution_model: None,
+            kg_batch_budget: None,
         }
     }
 }
@@ -1734,5 +1757,58 @@ mod tests {
 
         assert_eq!(model, Some("claude-sonnet-4-20250514"));
         assert_eq!(api_key, Some("sk-ant-provider-test"));
+    }
+
+    // -- KG batch budget (#757) --
+
+    #[test]
+    #[serial]
+    fn kg_batch_budget_defaults_to_500() {
+        clean_env();
+        unsafe { std::env::remove_var("MIKA_KG_BATCH_BUDGET") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.kg_batch_budget, None);
+        assert_eq!(
+            settings.effective_kg_batch_budget(),
+            DEFAULT_KG_BATCH_BUDGET
+        );
+        assert_eq!(settings.effective_kg_batch_budget(), 500);
+    }
+
+    #[test]
+    #[serial]
+    fn kg_batch_budget_env_override() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_BATCH_BUDGET", "100") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.kg_batch_budget, Some(100));
+        assert_eq!(settings.effective_kg_batch_budget(), 100);
+
+        unsafe { std::env::remove_var("MIKA_KG_BATCH_BUDGET") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_batch_budget_zero_disables_phase() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_BATCH_BUDGET", "0") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        // 0 is a valid configured value meaning "disable" — extractor/resolver
+        // honor this as an immediate-return signal (verified in their own tests).
+        assert_eq!(settings.kg_batch_budget, Some(0));
+        assert_eq!(settings.effective_kg_batch_budget(), 0);
+
+        unsafe { std::env::remove_var("MIKA_KG_BATCH_BUDGET") };
     }
 }
