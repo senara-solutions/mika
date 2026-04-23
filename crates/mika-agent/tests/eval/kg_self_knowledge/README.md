@@ -8,10 +8,35 @@ Seven scenarios verifying that agents correctly query the knowledge graph before
 # Unit tier (mock LLM, every CI push)
 cargo test -p mika-agent --test eval kg_self_knowledge
 
-# Integration tier (real providers, opt-in)
+# Integration tier (real providers, opt-in — future work, no `#[ignore]` tests yet)
 MIKA_EVAL_REAL_PROVIDERS=anthropic MIKA_KG_RESOLUTION_MODEL=anthropic/claude-haiku-4-5-20251001 \
   cargo test -p mika-agent --test eval kg_self_knowledge -- --ignored
 ```
+
+Integration tier hooks are reserved for Stage 2 LLM disambiguation against a real
+`MIKA_KG_RESOLUTION_MODEL` and Path C semantic retrieval with a real embedding
+client. No `#[ignore]`-gated tests exist yet — the unit tier covers all seven
+scenarios via `MockLlmProvider` and a populated FTS5 index.
+
+## Baseline Scores
+
+Scores are captured from a clean run of the mock-LLM subset on the commit
+recorded in the heading. Re-capture whenever a scenario changes hard assertions.
+
+**Baseline — mock-LLM subset (commit `57f8b1b9` + Path C fixture fix, 2026-04-23):**
+
+| # | Scenario | Tests | Mock unit | Real integration |
+|---|----------|:-----:|:---------:|:----------------:|
+| 1 | tool_selection_query_knowledge_graph | 2 | pass | not run locally |
+| 2 | path_a_direct_domain_match | 2 | pass | not run locally |
+| 3 | path_b_subject_match_agent_scoped | 3 | pass | not run locally |
+| 4 | path_c_semantic_via_chunks | 2 | pass | not run locally |
+| 5 | stage_1_exact_match | 3 | pass | not run locally |
+| 6 | stage_2_llm_disambiguation | 3 | pass | not run locally |
+| 7 | agent_context_annotation_disabled | 4 | pass | not run locally |
+
+Totals: 19/19 mock-LLM unit tests pass, 0 ignored, 0 silently skipped.
+Integration tier: no `#[ignore]`-gated tests exist yet.
 
 ## Fixture Helpers
 
@@ -22,7 +47,7 @@ Shared helpers live at `tests/eval/kg_fixtures/mod.rs` (crate-shared, not nested
 | `seed_domain_entity(db, spec)` | `kg_entities` | row ID |
 | `seed_domain_relationship(db, from, to, type)` | `kg_relationships` | row ID |
 | `seed_subject_entity(db, spec)` | `kg_subject_entities` | row ID |
-| `seed_chunk(db, spec)` | `kg_chunks` + `search_content` | chunk ID |
+| `seed_chunk(db, spec)` | `kg_chunks` + `search_content` + `fts_search` (via `Database::index_content`) | chunk ID |
 | `seed_chunk_subject(db, chunk_id, subject_id)` | `kg_chunk_subjects` | row ID |
 | `seed_resolution(db, subject_id, domain_id, conf, outcome)` | `kg_subject_resolutions` + `kg_resolutions_log` | — |
 | `disable_skill(db, agent_id, skill_name)` | `skill_overrides` | — |

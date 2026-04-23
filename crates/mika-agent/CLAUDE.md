@@ -226,6 +226,16 @@ Results merged, deduped by `(layer, entity_id)` keeping highest confidence, top-
 
 **Status values (D4):** `ok` (results found), `starting_entity_missing` (all entry paths failed), `traversal_empty` (entity found, no edges). Status enables #692 self-knowledge skill fallback logic.
 
+## Knowledge Graph — Eval Fixture Seeding (#740)
+
+`tests/eval/kg_fixtures/mod.rs` — crate-shared helpers for seeding a known KG state into a test `AsyncDatabase`. Used by `#740` (self-knowledge scenarios) and available for `#741` (grounding scenarios). Schema pin lives in the module (currently v25) with an actionable assertion message on drift.
+
+**Spec-struct pattern.** Each seed helper takes a `*Spec` struct and returns the inserted row ID: `seed_domain_entity`, `seed_domain_relationship`, `seed_subject_entity`, `seed_chunk`, `seed_chunk_subject`, `seed_resolution`, `disable_skill`. Query helpers (`get_resolution_log`, `get_resolution`) read rows back for assertions.
+
+**FTS/vec parity.** `seed_chunk` writes to `kg_chunks` and calls `Database::index_content(agent_id, KG_CHUNK_SOURCE_TYPE, Some(chunk_id), text)` so `search_content` and `fts_search` stay in parity — Path C semantic retrieval depends on FTS5 being populated. A raw insert into `search_content` silently breaks Path C.
+
+**Where scenarios live.** `tests/eval/kg_self_knowledge/` holds the seven #740 scenarios (one file per scenario, named `{class}_{shape}_{descriptor}.rs`). New scenarios: add the file, register it as `pub mod <name>;` in `kg_self_knowledge/mod.rs`, import `kg_fixtures::*`, call `assert_schema_version(&db).await` in setup, and update the capability-×-status matrix in the README. See `tests/eval/kg_self_knowledge/README.md` for the fixture table, tag vocabulary, and baseline scores.
+
 ## Silent Mode Agent Loop
 
 Background tasks (heartbeat, reminders) where text output is NOT delivered. Agent must use `send_message` tool explicitly. Separate `run_silent_agent` function with `SilentPromptContext`.
