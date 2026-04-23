@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "ID of the task tracking this work. Create one first using create_task."
+    },
+    "command": {
+      "type": "string",
+      "description": "The command to execute."
+    }
+  },
+  "required": ["command", "task_id", "task_id"]
+}

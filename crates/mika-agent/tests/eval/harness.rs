@@ -15,6 +15,7 @@ use mika_agent::skills::SkillRegistry;
 use mika_agent::tools::{ToolRegistry, default_tools};
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
+use mika_common::llm::LlmProvider;
 use mika_common::llm::mock::{MockLlmProvider, MockResponse};
 
 use super::trace::AgentTrace;
@@ -25,7 +26,11 @@ use super::trace::AgentTrace;
 /// Use `EvalHarness::builder()` to configure, then `.run("message")` to execute.
 pub struct EvalHarness {
     pub db: AsyncDatabase,
-    pub mock_provider: Arc<MockLlmProvider>,
+    /// The LLM provider used for the agent run (mock or real).
+    pub llm: Arc<dyn LlmProvider>,
+    /// The mock provider, if one was created. `None` when using a real provider.
+    /// Used for `captured_requests()` inspection in mock-based tests.
+    pub mock_provider: Option<Arc<MockLlmProvider>>,
     pub tools: ToolRegistry,
     pub skills: SkillRegistry,
     pub home_dir: TempDir,
@@ -50,11 +55,20 @@ impl EvalHarness {
         EvalHarnessBuilder::default()
     }
 
+    /// Get a reference to the mock provider, panicking if using a real provider.
+    ///
+    /// Used by tests that need to call `clear_and_set()` or `captured_requests()`.
+    pub fn mock(&self) -> &MockLlmProvider {
+        self.mock_provider
+            .as_ref()
+            .expect("mock() called on EvalHarness with a real provider")
+    }
+
     /// Run the agent loop with a user message and return the execution trace.
     pub async fn run(&self, message: &str) -> Result<AgentTrace> {
         let params = AgentParams {
             db: &self.db,
-            llm: self.mock_provider.as_ref(),
+            llm: self.llm.as_ref(),
             tools: &self.tools,
             skills: &self.skills,
             user_message: message,
@@ -81,7 +95,63 @@ impl EvalHarness {
         };
 
         let output = run_agent(&params).await?;
-        AgentTrace::from_run(&self.db, &self.trace_id, &self.mock_provider, output).await
+        AgentTrace::from_run(
+            &self.db,
+            &self.trace_id,
+            self.mock_provider.as_deref(),
+            output,
+        )
+        .await
+    }
+
+    /// Run a subsequent turn on the same session with fresh mock responses.
+    ///
+    /// Uses `MockLlmProvider::clear_and_set()` to replace the response sequence.
+    /// Panics if the harness was created with a real provider (no mock to reset).
+    pub async fn run_turn(
+        &self,
+        message: &str,
+        responses: Vec<MockResponse>,
+    ) -> Result<AgentTrace> {
+        let mock = self
+            .mock_provider
+            .as_ref()
+            .expect("run_turn requires a mock provider — cannot be used with real providers");
+        mock.clear_and_set(responses);
+
+        // Generate a new trace_id for the new turn so DB queries are scoped
+        let turn_trace_id = uuid::Uuid::new_v4().as_simple().to_string();
+
+        let params = AgentParams {
+            db: &self.db,
+            llm: self.llm.as_ref(),
+            tools: &self.tools,
+            skills: &self.skills,
+            user_message: message,
+            channel_type: "test",
+            session_id: &self.session_id,
+            home_dir: self.home_dir.path(),
+            is_onboarding: false,
+            message_sender: self.message_sender.clone(),
+            skip_compaction: self.skip_compaction,
+            embedding_client: None,
+            thinking: None,
+            user_images: &[],
+            brave_api_key: None,
+            github_token: None,
+            github_app: None,
+            skills_dirty: &self.skills_dirty,
+            mcp_manager: None,
+            global_home_dir: None,
+            is_callback_turn: false,
+            settings: Some(&self.settings),
+            trace_id: Some(turn_trace_id.clone()),
+            correlated_task_id: None,
+            internal: self.internal,
+        };
+
+        let output = run_agent(&params).await?;
+        AgentTrace::from_run(&self.db, &turn_trace_id, Some(mock.as_ref()), output).await
     }
 }
 
@@ -98,6 +168,8 @@ pub struct EvalHarnessBuilder {
     provider_name: Option<String>,
     model_name: Option<String>,
     message_sender: Option<Arc<dyn MessageSender>>,
+    /// When set, uses this real provider instead of creating a MockLlmProvider.
+    real_llm_provider: Option<Arc<dyn LlmProvider>>,
     embedding_client: Option<EmbeddingClient>,
     brave_api_key: Option<String>,
     github_token: Option<String>,
@@ -118,6 +190,7 @@ impl Default for EvalHarnessBuilder {
             provider_name: None,
             model_name: None,
             message_sender: None,
+            real_llm_provider: None,
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
@@ -193,6 +266,14 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Use a real LLM provider instead of a mock. When set, `responses()` is ignored.
+    ///
+    /// Use this for real-API matrix tests. `captured_requests()` will be unavailable.
+    pub fn llm_provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
+        self.real_llm_provider = Some(provider);
+        self
+    }
+
     /// Set an embedding client for Layer 3 hybrid search testing. Default: `None`.
     pub fn embedding_client(mut self, client: EmbeddingClient) -> Self {
         self.embedding_client = Some(client);
@@ -237,15 +318,21 @@ impl EvalHarnessBuilder {
         db.create_session(&session_id, "mika", "test")?;
         let async_db = AsyncDatabase::new(db);
 
-        // Build mock provider
-        let mut builder = MockLlmProvider::builder();
-        if let Some(name) = self.provider_name {
-            builder = builder.provider_name(name);
-        }
-        if let Some(name) = self.model_name {
-            builder = builder.model_name(name);
-        }
-        let mock_provider = Arc::new(builder.responses(self.responses).build());
+        // Build provider — either real or mock
+        let (llm, mock_provider): (Arc<dyn LlmProvider>, Option<Arc<MockLlmProvider>>) =
+            if let Some(real_provider) = self.real_llm_provider {
+                (real_provider, None)
+            } else {
+                let mut builder = MockLlmProvider::builder();
+                if let Some(name) = self.provider_name {
+                    builder = builder.provider_name(name);
+                }
+                if let Some(name) = self.model_name {
+                    builder = builder.model_name(name);
+                }
+                let mock = Arc::new(builder.responses(self.responses).build());
+                (mock.clone() as Arc<dyn LlmProvider>, Some(mock))
+            };
 
         let trace_id = uuid::Uuid::new_v4().as_simple().to_string();
 
@@ -253,6 +340,7 @@ impl EvalHarnessBuilder {
 
         Ok(EvalHarness {
             db: async_db,
+            llm,
             mock_provider,
             tools: self.tools.unwrap_or_else(default_tools),
             skills: self.skills.unwrap_or_else(SkillRegistry::empty),

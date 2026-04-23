@@ -126,7 +126,7 @@ async fn phantom_retry_rejected_during_active_dispatch() {
     create_callback_child(&harness, &task_id, "pending").await;
 
     // Replace the mock responses with ones that use the real task ID
-    harness.mock_provider.clear_and_set(vec![
+    harness.mock().clear_and_set(vec![
         tool_call_response(
             "update_task_status",
             json!({
@@ -181,7 +181,7 @@ async fn retry_metadata_allowed_after_callback_completes() {
     create_callback_child(&harness, &task_id, "completed").await;
 
     // Replace with real IDs
-    harness.mock_provider.clear_and_set(vec![
+    harness.mock().clear_and_set(vec![
         tool_call_response(
             "update_task_status",
             json!({

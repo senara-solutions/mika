@@ -108,7 +108,7 @@ async fn task_not_found_triggers_list_and_retry() {
     // 2. Call list_tasks to find the correct task
     // 3. Call update_task_status with the correct ID → success
     // 4. End turn with summary text
-    harness.mock_provider.clear_and_set(vec![
+    harness.mock().clear_and_set(vec![
         tool_call_response(
             "update_task_status",
             json!({

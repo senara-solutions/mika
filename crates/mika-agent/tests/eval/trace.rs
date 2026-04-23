@@ -25,18 +25,22 @@ pub struct AgentTrace {
 impl AgentTrace {
     /// Build an `AgentTrace` by querying the DB and reading captured mock requests.
     ///
+    /// When `mock_provider` is `None` (real-provider tests), `captured_requests` will be empty.
+    ///
     /// All DB writes by `run_agent()` are synchronous — LLM calls and tool calls are
     /// persisted before `run_agent()` returns. `AgentTrace::from_run` can query them
     /// immediately without waiting or polling.
     pub async fn from_run(
         db: &AsyncDatabase,
         trace_id: &str,
-        mock_provider: &MockLlmProvider,
+        mock_provider: Option<&MockLlmProvider>,
         output: AgentOutput,
     ) -> anyhow::Result<Self> {
         let llm_calls = db.query_llm_calls_by_trace(trace_id).await?;
         let tool_calls = db.query_tool_calls_by_trace(trace_id).await?;
-        let captured_requests = mock_provider.captured_requests();
+        let captured_requests = mock_provider
+            .map(|m| m.captured_requests())
+            .unwrap_or_default();
         let llm_call_count = llm_calls.len();
 
         Ok(Self {
