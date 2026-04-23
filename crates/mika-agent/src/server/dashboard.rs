@@ -351,6 +351,7 @@ pub struct MessageResponse {
     pub content: String,
     pub channel_type: String,
     pub metadata: Option<String>,
+    pub trace_id: Option<String>,
     pub created_at: String,
 }
 
@@ -365,6 +366,7 @@ impl From<SessionMessage> for MessageResponse {
             content: strip_base64_images(&m.content),
             channel_type: m.channel_type,
             metadata: m.metadata,
+            trace_id: m.trace_id,
             created_at: m.created_at,
         }
     }
