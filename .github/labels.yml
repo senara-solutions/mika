@@ -157,3 +157,20 @@
 - name: release
   color: "6e40c9"
   description: Release PR created by CI (release-pr workflow)
+
+# ── Eval Calibration ─────────────────────────────────────────────────────────
+- name: eval-calibration
+  color: "c2e0c6"
+  description: "Weekly eval calibration CI run"
+
+- name: drift-detected
+  color: "fbca04"
+  description: "Provider tolerance drift detected in calibration"
+
+- name: calibration-bootstrap
+  color: "0e8a16"
+  description: "Initial baseline bootstrap from first calibration run"
+
+- name: calibration-reset
+  color: "d93f0b"
+  description: "Baseline reset due to judge model deprecation"

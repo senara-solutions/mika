@@ -20,6 +20,10 @@ path = "src/bin/mika-spirit.rs"
 name = "calibrate"
 path = "src/bin/calibrate.rs"
 
+[[bin]]
+name = "eval-diff"
+path = "src/bin/eval-diff.rs"
+
 [features]
 telemetry = ["mika-common/telemetry"]
 
