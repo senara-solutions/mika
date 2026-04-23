@@ -1,5 +1,11 @@
 //! Golden scenario: Search for an existing fact, then update it.
 //!
+//! **Unit-tier note:** The update_fact tool call will fail against the empty
+//! in-memory DB (no fact with id "1" exists). This is expected — the unit tier
+//! validates tool *invocation patterns* (correct tools called in correct order),
+//! not tool *success*. Integration tier with real providers tests actual end-to-end
+//! fact persistence.
+//!
 //! Class: Memory | Expected tokens: 2000
 
 use super::*;

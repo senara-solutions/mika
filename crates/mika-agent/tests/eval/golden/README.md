@@ -177,6 +177,8 @@ let trace2 = harness.run_turn(
 
 All 25 scenarios should pass. A failure means the agent loop wiring changed — a mock response sequence that used to work no longer does. Fix the scenario or the agent code.
 
+**Important limitation:** Unit-tier tests verify tool *invocation patterns* (correct tools called in correct order), NOT tool *success*. Tools execute against an empty in-memory DB, so tools that require pre-existing data (e.g., `update_fact` with a fact_id) will return errors. This is by design — the unit tier proves the agent calls the right tools; the integration tier proves the tools produce correct results with real providers.
+
 ### Integration Tier
 
 Some scenarios may fail with specific providers due to model quirks. This is expected. The calibration artifact tracks which scenarios pass/fail per provider.

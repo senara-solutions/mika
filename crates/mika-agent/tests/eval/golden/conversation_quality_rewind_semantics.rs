@@ -1,4 +1,8 @@
-//! Golden scenario: Multi-turn context maintains coherence around state changes.
+//! Golden scenario: Agent handles correction/undo requests gracefully.
+//!
+//! Tests that when a user says "actually, undo that" or "that was wrong",
+//! the agent acknowledges the correction and takes appropriate action
+//! (e.g., updating or searching for the fact to correct it).
 //!
 //! Class: ConversationQuality | Expected tokens: 3000
 
@@ -10,7 +14,7 @@ pub fn register(registry: &GoldenRegistry) {
         GoldenScenarioMeta {
             class: ScenarioClass::ConversationQuality,
             expected_tokens: 3000,
-            description: "Turn 1: agent stores a fact via tool; Turn 2: user asks about the stored fact",
+            description: "Agent handles correction/undo: stores fact, then user corrects it",
         },
     );
 }
@@ -23,8 +27,8 @@ async fn test_conversation_quality_rewind_semantics() {
             tool_call_response(
                 "store_fact",
                 json!({
-                    "content": "Meeting at 3pm",
-                    "category": "Events"
+                    "category": "commitment",
+                    "description": "Meeting at 3pm"
                 }),
             ),
             // Turn 1, Step 2: Agent confirms
@@ -36,23 +40,34 @@ async fn test_conversation_quality_rewind_semantics() {
 
     // Turn 1: User tells agent about a meeting
     let trace1 = harness.run("I have a meeting at 3pm today").await.unwrap();
-
     assert_tools_include(&trace1, &["store_fact"]);
     assert_has_output(&trace1);
 
-    // Turn 2: User asks about the stored fact
+    // Turn 2: User corrects — "actually that was wrong, it's at 4pm"
+    // Agent should acknowledge the correction and search for the original fact
     let trace2 = harness
         .run_turn(
-            "What meeting do I have today?",
+            "Actually, I got that wrong. The meeting is at 4pm, not 3pm.",
             vec![
-                // Agent recalls from context
-                text_response("You have a meeting at 3pm."),
+                // Agent searches for the existing fact to correct it
+                tool_call_response("search_memory", json!({"query": "meeting 3pm"})),
+                // Agent stores the corrected fact
+                tool_call_response(
+                    "store_fact",
+                    json!({
+                        "category": "commitment",
+                        "description": "Meeting at 4pm"
+                    }),
+                ),
+                // Agent confirms the correction
+                text_response("Updated! Your meeting is now at 4pm, not 3pm."),
             ],
         )
         .await
         .unwrap();
 
-    // Hard assertions
+    // Hard assertions: agent should search for the original and store correction
+    assert_tools_include(&trace2, &["search_memory"]);
     assert_has_output(&trace2);
-    assert_output_contains(&trace2, "3pm");
+    assert_output_contains(&trace2, "4pm");
 }

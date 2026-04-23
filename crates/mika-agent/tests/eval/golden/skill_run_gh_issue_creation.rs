@@ -6,7 +6,7 @@ use super::*;
 
 pub fn register(registry: &GoldenRegistry) {
     registry.register(
-        "skill_run_gh_pr_formatting",
+        "skill_run_gh_issue_creation",
         GoldenScenarioMeta {
             class: ScenarioClass::SkillSpecific,
             expected_tokens: 3500,
@@ -16,7 +16,7 @@ pub fn register(registry: &GoldenRegistry) {
 }
 
 #[tokio::test]
-async fn test_skill_run_gh_pr_formatting() {
+async fn test_skill_run_gh_issue_creation() {
     let harness = EvalHarness::builder()
         .github_token("test-token")
         .responses(vec![

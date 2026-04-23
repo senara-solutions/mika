@@ -59,7 +59,7 @@ pub mod conversation_quality_rewind_semantics;
 // Skill-specific scenarios (4)
 pub mod skill_google_workspace_calendar;
 pub mod skill_qa_review_bug_catch;
-pub mod skill_run_gh_pr_formatting;
+pub mod skill_run_gh_issue_creation;
 pub mod skill_self_dev_plan_coherence;
 
 // ─── Scenario classification (D1) ───
@@ -184,7 +184,7 @@ pub fn default_golden_registry() -> GoldenRegistry {
     skill_self_dev_plan_coherence::register(&registry);
     skill_qa_review_bug_catch::register(&registry);
     skill_google_workspace_calendar::register(&registry);
-    skill_run_gh_pr_formatting::register(&registry);
+    skill_run_gh_issue_creation::register(&registry);
 
     registry
 }
@@ -230,7 +230,15 @@ pub struct GoldenOutcomeParams {
 
 impl GoldenOutcome {
     /// Create an outcome from assertion results.
+    ///
+    /// # Panics
+    /// Panics if `hard_assertions` is empty — every scenario MUST have ≥1 hard assertion.
     pub fn from_params(params: GoldenOutcomeParams) -> Self {
+        assert!(
+            !params.hard_assertions.is_empty(),
+            "GoldenOutcome requires at least one hard assertion (scenario: {})",
+            params.scenario
+        );
         let passed = params.hard_assertions.iter().all(|a| a.passed);
         Self {
             scenario: params.scenario,
