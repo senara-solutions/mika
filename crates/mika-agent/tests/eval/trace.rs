@@ -26,6 +26,10 @@ impl AgentTrace {
     /// Build an `AgentTrace` by querying the DB and reading captured mock requests.
     ///
     /// When `mock_provider` is `None` (real-provider tests), `captured_requests` will be empty.
+    ///
+    /// All DB writes by `run_agent()` are synchronous — LLM calls and tool calls are
+    /// persisted before `run_agent()` returns. `AgentTrace::from_run` can query them
+    /// immediately without waiting or polling.
     pub async fn from_run(
         db: &AsyncDatabase,
         trace_id: &str,

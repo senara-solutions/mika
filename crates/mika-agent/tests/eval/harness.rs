@@ -1,6 +1,5 @@
 //! EvalHarness — builder for running `run_agent()` with a `MockLlmProvider`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -10,12 +9,14 @@ use tempfile::TempDir;
 use mika_agent::agent::{AgentParams, run_agent};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
+use mika_agent::mcp::McpManager;
 use mika_agent::messaging::MessageSender;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::tools::{ToolRegistry, default_tools};
 use mika_common::config::Settings;
+use mika_common::embedding::EmbeddingClient;
+use mika_common::llm::LlmProvider;
 use mika_common::llm::mock::{MockLlmProvider, MockResponse};
-use mika_common::llm::{LlmProvider, ProviderKind};
 
 use super::trace::AgentTrace;
 
@@ -42,6 +43,10 @@ pub struct EvalHarness {
     skip_compaction: bool,
     internal: bool,
     message_sender: Option<Arc<dyn MessageSender>>,
+    embedding_client: Option<EmbeddingClient>,
+    brave_api_key: Option<String>,
+    github_token: Option<String>,
+    mcp_manager: Option<McpManager>,
 }
 
 impl EvalHarness {
@@ -73,14 +78,14 @@ impl EvalHarness {
             is_onboarding: self.is_onboarding,
             message_sender: self.message_sender.clone(),
             skip_compaction: self.skip_compaction,
-            embedding_client: None,
+            embedding_client: self.embedding_client.as_ref(),
             thinking: None,
             user_images: &[],
-            brave_api_key: None,
-            github_token: None,
+            brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
             github_app: None,
             skills_dirty: &self.skills_dirty,
-            mcp_manager: None,
+            mcp_manager: self.mcp_manager.as_ref(),
             global_home_dir: None,
             is_callback_turn: self.is_callback_turn,
             settings: Some(&self.settings),
@@ -165,6 +170,10 @@ pub struct EvalHarnessBuilder {
     message_sender: Option<Arc<dyn MessageSender>>,
     /// When set, uses this real provider instead of creating a MockLlmProvider.
     real_llm_provider: Option<Arc<dyn LlmProvider>>,
+    embedding_client: Option<EmbeddingClient>,
+    brave_api_key: Option<String>,
+    github_token: Option<String>,
+    mcp_manager: Option<McpManager>,
 }
 
 impl Default for EvalHarnessBuilder {
@@ -182,6 +191,10 @@ impl Default for EvalHarnessBuilder {
             model_name: None,
             message_sender: None,
             real_llm_provider: None,
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            mcp_manager: None,
         }
     }
 }
@@ -261,6 +274,30 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Set an embedding client for Layer 3 hybrid search testing. Default: `None`.
+    pub fn embedding_client(mut self, client: EmbeddingClient) -> Self {
+        self.embedding_client = Some(client);
+        self
+    }
+
+    /// Set a Brave Search API key for `web_search` tool testing. Default: `None`.
+    pub fn brave_api_key(mut self, key: impl Into<String>) -> Self {
+        self.brave_api_key = Some(key.into());
+        self
+    }
+
+    /// Set a GitHub token for GitHub tool testing. Default: `None`.
+    pub fn github_token(mut self, token: impl Into<String>) -> Self {
+        self.github_token = Some(token.into());
+        self
+    }
+
+    /// Set an MCP manager for MCP tool testing. Default: `None`.
+    pub fn mcp_manager(mut self, mgr: McpManager) -> Self {
+        self.mcp_manager = Some(mgr);
+        self
+    }
+
     /// Build the harness, creating the in-memory DB and temp directories.
     pub async fn build(self) -> Result<EvalHarness> {
         // Create temp directory with minimal agent structure
@@ -299,7 +336,7 @@ impl EvalHarnessBuilder {
 
         let trace_id = uuid::Uuid::new_v4().as_simple().to_string();
 
-        let settings = dummy_settings();
+        let settings = Settings::test_defaults();
 
         Ok(EvalHarness {
             db: async_db,
@@ -317,81 +354,10 @@ impl EvalHarnessBuilder {
             skip_compaction: self.skip_compaction,
             internal: self.internal,
             message_sender: self.message_sender,
+            embedding_client: self.embedding_client,
+            brave_api_key: self.brave_api_key,
+            github_token: self.github_token,
+            mcp_manager: self.mcp_manager,
         })
-    }
-}
-
-/// Minimal Settings for eval tests (mirrors test_utils::dummy_settings).
-fn dummy_settings() -> Settings {
-    Settings {
-        llm_provider: ProviderKind::Anthropic,
-        llm_max_tokens: 4096,
-        anthropic_model: None,
-        anthropic_api_key: None,
-        anthropic_base_url: None,
-        openai_model: None,
-        openai_base_url: None,
-        openrouter_model: None,
-        openrouter_api_key: None,
-        openrouter_base_url: None,
-        groq_model: None,
-        groq_api_key: None,
-        groq_base_url: None,
-        ollama_model: None,
-        ollama_api_key: None,
-        ollama_base_url: None,
-        mistral_model: None,
-        mistral_api_key: None,
-        mistral_base_url: None,
-        google_model: None,
-        google_api_key: None,
-        google_base_url: None,
-        deepseek_model: None,
-        deepseek_api_key: None,
-        deepseek_base_url: None,
-        minimax_model: None,
-        minimax_api_key: None,
-        minimax_base_url: None,
-        kimi_model: None,
-        kimi_api_key: None,
-        kimi_base_url: None,
-        qwen_model: None,
-        qwen_api_key: None,
-        qwen_base_url: None,
-        db_path: PathBuf::from("test.db"),
-        log_level: "info".to_string(),
-        log_format: "json".to_string(),
-        routing_url: None,
-        customer_id: None,
-        server_port: 8080,
-        internal_token: None,
-        dashboard_token: None,
-        openai_api_key: None,
-        embedding_model: "text-embedding-3-small".to_string(),
-        embedding_dimensions: 512,
-        brave_api_key: None,
-        github_token: None,
-        investigate_github_token: None,
-        github_repo: None,
-        github_app_id: None,
-        github_app_private_key: None,
-        github_app_installation_id: None,
-        github_app_login: None,
-        home_dir: PathBuf::from("/tmp"),
-        server_log_file: None,
-        dashboard_enabled: false,
-        disable_bundled_skills: false,
-        dev_mode: false,
-        disable_agent_provisioning: false,
-        telemetry_enabled: false,
-        otlp_endpoint: None,
-        otlp_auth_header: None,
-        max_agent_tasks_per_session: 25,
-        store_llm_calls: true,
-        store_tool_calls: true,
-        log_llm_bodies: false,
-        kg_ingestion_model: None,
-        kg_extraction_model: None,
-        kg_resolution_model: None,
     }
 }

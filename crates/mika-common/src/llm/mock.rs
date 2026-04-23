@@ -41,6 +41,8 @@ pub struct MockProviderConfig {
     pub supports_tool_calling: bool,
     pub supports_vision: bool,
     pub supports_extended_thinking: bool,
+    /// When set, `check_health()` returns this error instead of `Ok(())`.
+    pub health_error: Option<LlmError>,
 }
 
 impl Default for MockProviderConfig {
@@ -52,6 +54,7 @@ impl Default for MockProviderConfig {
             supports_tool_calling: true,
             supports_vision: false,
             supports_extended_thinking: false,
+            health_error: None,
         }
     }
 }
@@ -142,7 +145,10 @@ impl LlmProvider for MockLlmProvider {
     }
 
     async fn check_health(&self) -> Result<(), LlmError> {
-        Ok(())
+        match &self.config.health_error {
+            Some(err) => Err(err.clone()),
+            None => Ok(()),
+        }
     }
 }
 
@@ -193,6 +199,15 @@ impl MockLlmProviderBuilder {
     /// Set whether tool calling is supported.
     pub fn supports_tool_calling(mut self, supports: bool) -> Self {
         self.config.supports_tool_calling = supports;
+        self
+    }
+
+    /// Configure `check_health()` to return an error on every call.
+    ///
+    /// When set, `check_health()` returns `Err(error.clone())` instead of `Ok(())`.
+    /// Useful for simulating degraded-provider scenarios in eval tests.
+    pub fn health_error(mut self, error: LlmError) -> Self {
+        self.config.health_error = Some(error);
         self
     }
 
@@ -481,5 +496,24 @@ mod tests {
         assert!(!provider.supports_vision());
         assert!(!provider.supports_extended_thinking());
         assert!(provider.check_health().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mock_provider_health_error() {
+        let provider = MockLlmProvider::builder()
+            .health_error(LlmError::HttpError {
+                status: 503,
+                message: "service unavailable".into(),
+                retryable: true,
+            })
+            .build();
+
+        let result = provider.check_health().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            LlmError::HttpError { status, .. } => assert_eq!(status, 503),
+            _ => panic!("Expected HttpError"),
+        }
     }
 }
