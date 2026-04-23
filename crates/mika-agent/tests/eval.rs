@@ -5,7 +5,10 @@
 #[allow(dead_code)]
 mod eval {
     pub mod assertions;
+    pub mod calibration;
     pub mod harness;
+    pub mod providers;
+    pub mod scenarios;
     pub mod trace;
 
     mod test_basic_conversation;
@@ -13,11 +16,17 @@ mod eval {
     mod test_error_handling;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
+    mod test_max_steps_continuation;
     mod test_multi_step;
+    mod test_multi_turn_persistence;
+    mod test_per_skill_provider_override;
     mod test_persistence_eval_guard;
     mod test_phantom_retry_guard;
     mod test_pr_review_idempotency;
+    mod test_real_provider_matrix;
+    mod test_request_wellformedness;
     mod test_required_tools_gate;
+    mod test_schema_divergence;
     mod test_self_knowledge_kg;
     mod test_task_not_found_retry;
     mod test_tool_calling;
