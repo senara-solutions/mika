@@ -29,6 +29,7 @@ interface ToolCall {
   input_summary: string
   output_summary: string
   success: boolean
+  non_zero_exit?: boolean
 }
 
 function parseToolCalls(metadata: string | null): ToolCall[] {
@@ -168,13 +169,29 @@ function CopyButton({
 }
 
 function ToolCallsTable({
+  traceId,
   metadata,
   onInvestigate,
 }: {
+  traceId?: string | null
   metadata: string | null
   onInvestigate?: (toolCallIndex: number, toolName: string) => void
 }) {
-  const toolCalls = parseToolCalls(metadata)
+  const { data: apiToolCalls } = useTraceToolCalls(traceId ?? '')
+  const metadataToolCalls = parseToolCalls(metadata)
+
+  // Prefer API data (authoritative, no 4KB cap) over metadata (truncated)
+  const toolCalls: ToolCall[] = (apiToolCalls && apiToolCalls.length > 0)
+    ? apiToolCalls.map(tc => ({
+        step: tc.step,
+        name: tc.tool_name,
+        input_summary: tc.input ?? '',
+        output_summary: tc.output ?? '',
+        success: tc.success,
+        non_zero_exit: tc.non_zero_exit,
+      }))
+    : metadataToolCalls
+
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
   if (toolCalls.length === 0) return null
@@ -426,6 +443,7 @@ function MessageCard({
         </div>
         {msg.role === 'assistant' && (
           <ToolCallsTable
+            traceId={msg.trace_id}
             metadata={msg.metadata}
             onInvestigate={(toolCallIndex, toolName) =>
               onInvestigate(msg.id, toolCallIndex, toolName)

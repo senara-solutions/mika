@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import { useSessionLlmCalls } from '../api/llmCalls.ts'
-import { useSessionToolCalls, useSessionSkills } from '../api/toolCalls.ts'
+import { useSessionToolCalls, useSessionSkills, useTraceToolCalls } from '../api/toolCalls.ts'
 import { CopyButton, Pagination, EmptyState, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
@@ -34,6 +34,7 @@ interface ToolCall {
   input_summary: string
   output_summary: string
   success: boolean
+  non_zero_exit?: boolean
 }
 
 function parseToolCalls(metadata: string | null): ToolCall[] {
@@ -101,13 +102,29 @@ function truncateText(text: string, maxLen = 80): string {
 }
 
 function ToolCallsTable({
+  traceId,
   metadata,
   onInvestigate,
 }: {
+  traceId?: string | null
   metadata: string | null
   onInvestigate?: (toolCallIndex: number, toolName: string) => void
 }) {
-  const toolCalls = parseToolCalls(metadata)
+  const { data: apiToolCalls } = useTraceToolCalls(traceId ?? '')
+  const metadataToolCalls = parseToolCalls(metadata)
+
+  // Prefer API data (authoritative, no 4KB cap) over metadata (truncated)
+  const toolCalls: ToolCall[] = (apiToolCalls && apiToolCalls.length > 0)
+    ? apiToolCalls.map(tc => ({
+        step: tc.step,
+        name: tc.tool_name,
+        input_summary: tc.input ?? '',
+        output_summary: tc.output ?? '',
+        success: tc.success,
+        non_zero_exit: tc.non_zero_exit,
+      }))
+    : metadataToolCalls
+
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
   if (toolCalls.length === 0) return null
@@ -640,6 +657,7 @@ export default function SessionDetail() {
 
         {/* Tool calls */}
         <ToolCallsTable
+          traceId={msg.trace_id}
           metadata={msg.metadata}
           onInvestigate={(toolCallIndex, toolName) =>
             openInvestigation(msg.id, toolCallIndex, toolName)
@@ -649,7 +667,7 @@ export default function SessionDetail() {
     )
   }
 
-  const renderRegularMessageCard = (msg: { id: number; role: string; content: string; metadata: string | null; created_at: string }) => {
+  const renderRegularMessageCard = (msg: { id: number; role: string; content: string; metadata: string | null; trace_id: string | null; created_at: string }) => {
     const config = roleConfig(msg.role)
     return (
       <div key={msg.id} className={config.align}>
@@ -684,6 +702,7 @@ export default function SessionDetail() {
           </div>
           {msg.role === 'assistant' && (
             <ToolCallsTable
+              traceId={msg.trace_id}
               metadata={msg.metadata}
               onInvestigate={(toolCallIndex, toolName) =>
                 openInvestigation(msg.id, toolCallIndex, toolName)

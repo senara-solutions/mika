@@ -56,6 +56,7 @@ export interface TraceMessage {
   content: string
   channel_type: string
   metadata: string | null
+  trace_id: string | null
   created_at: string
 }
 

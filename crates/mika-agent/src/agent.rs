@@ -4273,6 +4273,85 @@ mod tests {
         assert!(entries.len() < 20, "some entries should have been dropped");
     }
 
+    /// Regression test for #744: milestone-workflow turns with 21+ tool calls have
+    /// their tail entries dropped by the 4KB metadata cap. This is acceptable because
+    /// the dashboard now fetches from the `tool_calls` table (via `useTraceToolCalls`)
+    /// instead of parsing this metadata. The metadata path is only used for the LLM
+    /// history builder's `format_tool_summary_block()`.
+    #[test]
+    fn test_metadata_cap_drops_tail_on_milestone_workflow_turns() {
+        // Simulate a milestone-workflow turn: 14 bookkeeping calls + 7 status updates + 1 dispatch
+        // Use INPUT_SUMMARY_MAX/OUTPUT_SUMMARY_MAX length strings to guarantee the 4KB cap is hit
+        let tool_names = [
+            "run_gh",
+            "create_task",
+            "run_gh",
+            "resolve_issue_order",
+            "run_gh",
+            "list_tasks",
+            "list_tasks",
+            "create_task",
+            "create_task",
+            "create_task",
+            "create_task",
+            "create_task",
+            "create_task",
+            "update_task_status",
+            "update_task_status",
+            "update_task_status",
+            "update_task_status",
+            "update_task_status",
+            "update_task_status",
+            "update_task_status",
+            "run_claude_pilot",
+        ];
+        let summaries: Vec<ToolCallSummary> = tool_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ToolCallSummary {
+                step: i as u32 / 3, // group into steps like the real agent loop
+                name: name.to_string(),
+                input_summary: truncate_summary(&"x".repeat(10_000), INPUT_SUMMARY_MAX),
+                output_summary: truncate_summary(&"y".repeat(10_000), OUTPUT_SUMMARY_MAX),
+                success: true,
+                non_zero_exit: false,
+            })
+            .collect();
+
+        assert_eq!(
+            summaries.len(),
+            21,
+            "milestone-workflow turn should have 21 calls"
+        );
+
+        let json = tool_calls_metadata_json(&summaries).unwrap();
+        assert!(
+            json.len() <= TOOL_METADATA_MAX,
+            "metadata must respect cap: {} chars",
+            json.len()
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["tool_calls"].as_array().unwrap();
+
+        // With max-length fields, the 4KB cap forces tail-drop — fewer entries than input.
+        // This is the documented limitation (#744). The dashboard uses the tool_calls table
+        // instead of this metadata, so tail-drop is acceptable for the LLM history context.
+        assert!(!entries.is_empty(), "must retain at least one entry");
+        assert!(
+            entries.len() < summaries.len(),
+            "4KB cap should force tail-drop: got {} entries from {} inputs",
+            entries.len(),
+            summaries.len()
+        );
+
+        // Verify structural integrity of kept entries
+        for entry in entries {
+            assert!(entry["name"].is_string(), "entries must have name");
+            assert!(entry["step"].is_number(), "entries must have step");
+        }
+    }
+
     #[test]
     fn test_format_tool_summary_block_valid_json() {
         let json = r#"{"tool_calls":[{"step":0,"name":"tmux_send_command","input_summary":"{\"session\":\"mika\",\"text\":\"cargo test\"}","output_summary":"Command sent","success":true}]}"#;
