@@ -101,7 +101,10 @@ async fn task_not_found_triggers_list_and_retry() {
         .unwrap();
 
     // Fabricate a wrong UUID (same first 8 chars, different suffix)
-    let wrong_id = format!("{}-0000-0000-0000-000000000000", &real_task_id[..8]);
+    let wrong_id = format!(
+        "{}-0000-0000-0000-000000000000",
+        mika_common::text::safe_truncate(&real_task_id, 8)
+    );
 
     // Mock LLM sequence:
     // 1. Call update_task_status with wrong ID → tool returns task_not_found
@@ -167,6 +170,6 @@ async fn task_not_found_triggers_list_and_retry() {
     assert!(
         !second_output.contains("task_not_found"),
         "Second update_task_status should have succeeded, but got: {}",
-        &second_output[..second_output.len().min(300)]
+        mika_common::text::safe_truncate(second_output, 300)
     );
 }

@@ -99,7 +99,11 @@ impl Tool for GetSessionMessagesTool {
             let ts = format_ts(&msg.created_at);
             // Truncate long messages for readability
             let content = if msg.content.len() > 500 {
-                format!("{}... ({} chars)", &msg.content[..500], msg.content.len())
+                format!(
+                    "{}... ({} chars)",
+                    mika_common::text::safe_truncate(&msg.content, 500),
+                    msg.content.len()
+                )
             } else {
                 msg.content.clone()
             };

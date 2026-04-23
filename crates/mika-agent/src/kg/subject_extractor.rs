@@ -909,7 +909,7 @@ Rules:
             "Your previous response was not valid JSON. The output was:\n{}\n\n\
              Please return ONLY a valid JSON object with \"entities\" and \"relationships\" arrays. \
              No markdown fencing, no explanation, no text outside the JSON.",
-            &bad_output[..bad_output.len().min(500)]
+            mika_common::text::safe_truncate(bad_output, 500)
         );
 
         let mut retry_request = original_request.clone();
@@ -962,7 +962,7 @@ Rules:
         serde_json::from_str(cleaned).with_context(|| {
             format!(
                 "failed to parse extraction JSON: {}",
-                &cleaned[..cleaned.len().min(200)]
+                mika_common::text::safe_truncate(cleaned, 200)
             )
         })
     }

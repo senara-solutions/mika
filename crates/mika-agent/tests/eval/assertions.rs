@@ -243,7 +243,7 @@ pub fn assert_tool_output_contains(
             tool_name,
             call_index,
             substring,
-            &output[..output.len().min(500)]
+            mika_common::text::safe_truncate(output, 500)
         );
     }
 }

@@ -12,6 +12,7 @@ Shared library used by all Mika crates: config, LLM providers, Claude API client
 - **GitHub App auth:** `github_app.rs` — RS256 JWT signing, installation token exchange and caching with `tokio::sync::RwLock` double-checked locking, `GitHubApp::from_settings()` constructor, file-based token cache at `{home_dir}/github_app_token.json` for short-lived CLI processes via `installation_token_with_file_cache()` — per-agent when `--agent` flag resolves to agent home dir
 - **Logging:** tracing + tracing-subscriber setup
 - **Telemetry:** Feature-gated OTel export. See `crates/mika-agent/CLAUDE.md` for observability architecture.
+- **Text:** `text.rs` — `safe_truncate(s, max_bytes)` for UTF-8-safe byte-budget truncation using `floor_char_boundary`. Returns `&str`, never panics on multi-byte characters. Use for log line widths, prompt size budgets, and error message previews. Distinct from `db::truncate_chars` (char-count-based, appends "...", returns `String`).
 - **Home directory:** Resolution utilities
 - **Model list cache:** `llm/models.rs` — `get_models()` fetches from provider `/models` API with 24h TTL file cache at `{agent_home}/cache/models/{provider}.json`, hardcoded lists for Anthropic/Google, `ModelCache`/`ModelInfo` types
 

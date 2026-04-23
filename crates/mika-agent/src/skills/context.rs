@@ -262,7 +262,7 @@ async fn fetch_pr_diff(
             owner,
             repo,
             number,
-            &body[..body.len().min(200)]
+            mika_common::text::safe_truncate(&body, 200)
         );
     }
 

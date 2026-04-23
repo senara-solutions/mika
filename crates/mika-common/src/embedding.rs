@@ -173,11 +173,7 @@ impl EmbeddingClient {
         if !status.is_success() {
             let status_code = status.as_u16();
             let body = response.text().await.unwrap_or_default();
-            let truncated_body: &str = if body.len() > 500 {
-                &body[..500]
-            } else {
-                &body
-            };
+            let truncated_body = crate::text::safe_truncate(&body, 500);
             warn!(status = status_code, body = %truncated_body, "embedding API error response");
             return Err(EmbeddingApiError { status_code }.into());
         }
