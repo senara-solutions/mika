@@ -710,7 +710,7 @@ fn build_rewind_marker(result: &RewindResult, originating_session_id: Option<&st
         marker.push_str("\n</rewind_reversals>");
     }
     if let Some(orig) = originating_session_id {
-        let truncated = &orig[..orig.len().min(8)];
+        let truncated = mika_common::text::safe_truncate(orig, 8);
         marker.push_str(&format!(
             "\nThis rewind was initiated from a different session ({truncated})."
         ));

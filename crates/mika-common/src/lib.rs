@@ -10,5 +10,6 @@ pub mod logging;
 pub mod oauth;
 pub mod team;
 pub mod telemetry;
+pub mod text;
 pub mod trace;
 pub mod validation;

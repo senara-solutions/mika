@@ -99,12 +99,13 @@ impl Tool for ListAuditEventsTool {
     }
 }
 
-/// Truncate a string to `max_len` characters, appending "..." if truncated.
+/// Truncate a string to at most `max_len` bytes, appending "..." if truncated.
+/// Rounds down to the nearest char boundary to avoid panics on multi-byte UTF-8.
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        format!("{}...", mika_common::text::safe_truncate(s, max_len))
     }
 }
 

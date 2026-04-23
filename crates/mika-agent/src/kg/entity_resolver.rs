@@ -1026,7 +1026,7 @@ impl SubjectEntityResolver {
             "Your previous response was not valid JSON. The output was:\n{}\n\n\
              Please return ONLY a valid JSON object: {{\"match\": \"<entity_key>\" | null, \"confidence\": 0.0-1.0}}\n\
              No markdown fencing, no explanation, no text outside the JSON.",
-            &bad_output[..bad_output.len().min(500)]
+            mika_common::text::safe_truncate(bad_output, 500)
         );
 
         let mut retry_request = original_request.clone();
@@ -1153,7 +1153,7 @@ fn parse_disambiguation_json(text: &str) -> Result<DisambiguationResponse> {
     serde_json::from_str(cleaned).with_context(|| {
         format!(
             "failed to parse disambiguation JSON: {}",
-            &cleaned[..cleaned.len().min(200)]
+            mika_common::text::safe_truncate(cleaned, 200)
         )
     })
 }
@@ -1191,7 +1191,7 @@ Rules:
     if !chunk_context.is_empty() {
         user.push_str(&format!(
             "\nSource prose:\n{}\n",
-            &chunk_context[..chunk_context.len().min(2000)]
+            mika_common::text::safe_truncate(chunk_context, 2000)
         ));
     }
 

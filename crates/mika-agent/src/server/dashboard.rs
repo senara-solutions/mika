@@ -382,7 +382,7 @@ fn strip_base64_images(content: &str) -> String {
     // For very large content with base64 data, truncate to a reasonable size
     // and add a note. This prevents multi-MB payloads.
     if content.len() > 50_000 {
-        let truncated = &content[..1000];
+        let truncated = mika_common::text::safe_truncate(content, 1000);
         return format!(
             "{}... [content truncated, {} bytes total — contains base64 image data]",
             truncated,

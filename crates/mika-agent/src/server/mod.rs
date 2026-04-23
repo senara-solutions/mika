@@ -34,7 +34,7 @@ use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Carries HTTP method and path from request to response extensions,
 /// making them available to TraceLayer's `on_response` callback as
@@ -846,7 +846,8 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     let agent_name_clone = agent_name.clone();
                     let budget = kg_batch_budget;
 
-                    tokio::spawn(async move {
+                    let extraction_agent = agent_name_clone.clone();
+                    let handle = tokio::spawn(async move {
                         let extractor = crate::kg::subject_extractor::SubjectExtractor::new(
                             db,
                             llm,
@@ -872,6 +873,38 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                                 error = %e,
                                 agent_id = %agent_name_clone,
                                 "subject extraction failed; entities may be stale until next restart"
+                            ),
+                        }
+                    });
+                    tokio::spawn(async move {
+                        match handle.await {
+                            Ok(()) => {}
+                            Err(e) if e.is_panic() => {
+                                let payload = e.into_panic();
+                                let msg = payload
+                                    .downcast_ref::<&str>()
+                                    .map(|s| (*s).to_string())
+                                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                                error!(
+                                    panic_message = %msg,
+                                    agent_id = %extraction_agent,
+                                    event = "extraction_panicked",
+                                    "subject extraction task panicked"
+                                );
+                            }
+                            Err(e) if e.is_cancelled() => {
+                                debug!(
+                                    agent_id = %extraction_agent,
+                                    event = "extraction_cancelled",
+                                    "subject extraction task was cancelled"
+                                );
+                            }
+                            Err(e) => warn!(
+                                error = %e,
+                                agent_id = %extraction_agent,
+                                event = "extraction_join_error",
+                                "subject extraction task join error"
                             ),
                         }
                     });
@@ -931,7 +964,8 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 let agent_name_clone = agent_name.clone();
                 let budget = kg_batch_budget;
 
-                tokio::spawn(async move {
+                let resolution_agent = agent_name_clone.clone();
+                let handle = tokio::spawn(async move {
                     // Small delay to let extraction tasks commit first.
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
@@ -959,6 +993,38 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                             error = %e,
                             agent_id = %agent_name_clone,
                             "entity resolution failed; resolutions may be stale until next restart"
+                        ),
+                    }
+                });
+                tokio::spawn(async move {
+                    match handle.await {
+                        Ok(()) => {}
+                        Err(e) if e.is_panic() => {
+                            let payload = e.into_panic();
+                            let msg = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| (*s).to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "<non-string panic>".to_string());
+                            error!(
+                                panic_message = %msg,
+                                agent_id = %resolution_agent,
+                                event = "resolution_panicked",
+                                "entity resolution task panicked"
+                            );
+                        }
+                        Err(e) if e.is_cancelled() => {
+                            debug!(
+                                agent_id = %resolution_agent,
+                                event = "resolution_cancelled",
+                                "entity resolution task was cancelled"
+                            );
+                        }
+                        Err(e) => warn!(
+                            error = %e,
+                            agent_id = %resolution_agent,
+                            event = "resolution_join_error",
+                            "entity resolution task join error"
                         ),
                     }
                 });
