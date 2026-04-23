@@ -254,3 +254,186 @@ async fn extract_pending_with_no_pending_docs_makes_zero_calls() {
 fn _unused_silencer(db: AsyncDatabase) -> SubjectExtractor {
     extractor(db)
 }
+
+// ---------------------------------------------------------------------------
+// Resolver budget guard (#757 Unit 3)
+// ---------------------------------------------------------------------------
+
+use mika_agent::kg::entity_resolver::SubjectEntityResolver;
+
+/// Seed a domain entity + a case-matching subject entity so Stage-1 exact
+/// match succeeds (no LLM needed). Returns the subject entity row ID.
+async fn seed_exact_match_pair(
+    db: &AsyncDatabase,
+    entity_type: &str,
+    name: &str,
+    subject_confidence: f64,
+) -> i64 {
+    let agent_id = db.agent_id.clone();
+    let domain_key = format!("{entity_type}:{name}");
+    let subject_key = domain_key.clone();
+    let entity_type_owned = entity_type.to_owned();
+    let name_owned = name.to_owned();
+
+    db.with_db(move |db| {
+        // Domain entity
+        db.execute_sql(
+            "INSERT INTO kg_entities (entity_key, type, name) VALUES (?1, ?2, ?3)",
+            &[
+                &domain_key as &dyn rusqlite::types::ToSql,
+                &entity_type_owned,
+                &name_owned,
+            ],
+        )?;
+        // Matching subject entity with high confidence (above exact-match threshold)
+        db.execute_sql(
+            "INSERT INTO kg_subject_entities \
+                (agent_id, entity_key, type, name, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                &agent_id as &dyn rusqlite::types::ToSql,
+                &subject_key,
+                &entity_type_owned,
+                &name_owned,
+                &subject_confidence,
+            ],
+        )?;
+        Ok(db.last_insert_rowid())
+    })
+    .await
+    .unwrap()
+}
+
+async fn count_resolution_log(db: &AsyncDatabase) -> i64 {
+    let agent_id = db.agent_id.clone();
+    db.with_db(move |db| {
+        Ok(db
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM kg_resolutions_log WHERE agent_id = ?1",
+                &[&agent_id as &dyn rusqlite::types::ToSql],
+            )?
+            .unwrap_or(0))
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn resolve_pending_with_zero_budget_still_processes_exact_matches() {
+    // Stage-1 exact matches do NOT consume the budget. Even with budget=0,
+    // entities whose name matches a domain entity exactly should resolve.
+    let db = test_db("agent-rx1");
+    seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
+    seed_exact_match_pair(&db, "tool", "run_gh", 0.92).await;
+
+    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("trace-rx1"));
+    let stats = resolver.resolve_pending(0).await.unwrap();
+
+    assert_eq!(stats.matched_exact, 2, "two exact matches should resolve");
+    assert_eq!(stats.llm_calls, 0, "exact matches do not debit the budget");
+    assert!(
+        !stats.aborted_budget,
+        "budget=0 with all exact matches should not abort"
+    );
+    assert_eq!(
+        count_resolution_log(&db).await,
+        2,
+        "both resolution log rows should be written"
+    );
+}
+
+#[tokio::test]
+async fn resolve_pending_with_no_llm_and_no_exact_match_skips_cleanly() {
+    // With no LLM configured and no exact match, entities get SkippedNoLlm
+    // (not SkippedBudget). The budget does not fire because the code path
+    // exits at Stage-2-entry with SkippedNoLlm before the budget guard.
+    let db = test_db("agent-rx2");
+    // Subject entity with no matching domain entity
+    let agent_id = db.agent_id.clone();
+    db.with_db(move |db| {
+        db.execute_sql(
+            "INSERT INTO kg_subject_entities \
+                (agent_id, entity_key, type, name, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                &agent_id as &dyn rusqlite::types::ToSql,
+                &"skill:does-not-exist",
+                &"skill",
+                &"does-not-exist",
+                &0.7f64,
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("trace-rx2"));
+    let stats = resolver.resolve_pending(10).await.unwrap();
+
+    assert_eq!(stats.skipped_no_llm, 1);
+    assert_eq!(stats.llm_calls, 0);
+    assert!(!stats.aborted_budget);
+}
+
+#[tokio::test]
+async fn resolve_pending_empty_set_returns_zero_calls() {
+    // No kg_subject_entities → pending query returns empty → early return.
+    let db = test_db("agent-rx3");
+
+    let resolver = SubjectEntityResolver::new(db, None, Some("trace-rx3"));
+    let stats = resolver.resolve_pending(10).await.unwrap();
+
+    assert_eq!(stats.total, 0);
+    assert_eq!(stats.llm_calls, 0);
+    assert!(!stats.aborted_budget);
+}
+
+#[tokio::test]
+async fn resolve_pending_zero_budget_with_exact_match_mix_still_logs_exact() {
+    // Mix exact-match (budget-free) and potential LLM-entity (budget-gated).
+    // budget=0 → exact matches resolve; LLM-entity never gets to Stage-2
+    // because there's no LLM configured (SubjectEntityResolver built with
+    // None). So SkippedNoLlm fires, not SkippedBudget. Budget is orthogonal
+    // here — the test documents the composition.
+    let db = test_db("agent-rx4");
+    seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
+    let agent_id = db.agent_id.clone();
+    db.with_db(move |db| {
+        db.execute_sql(
+            "INSERT INTO kg_subject_entities \
+                (agent_id, entity_key, type, name, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                &agent_id as &dyn rusqlite::types::ToSql,
+                &"skill:unknown-skill",
+                &"skill",
+                &"unknown-skill",
+                &0.7f64,
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let resolver = SubjectEntityResolver::new(db, None, Some("trace-rx4"));
+    let stats = resolver.resolve_pending(0).await.unwrap();
+
+    assert_eq!(stats.matched_exact, 1);
+    assert_eq!(stats.skipped_no_llm, 1);
+    assert_eq!(stats.llm_calls, 0);
+    assert!(
+        !stats.aborted_budget,
+        "no LLM configured → SkippedNoLlm never triggers budget abort"
+    );
+}
+
+// Note: we do not test Stage-2 budget exhaustion with a mock LLM here because
+// the resolver's LLM prompt interface expects a specific JSON response shape
+// (validated in `entity_resolver::tests`). Stage-2 budget behavior is covered
+// by the structural contract of `resolve_single_entity(entity, llm_call_allowed=false)`
+// returning `SkippedBudget` without touching `self.llm` — this contract is
+// verified at the module boundary in entity_resolver.rs unit tests. Post-deploy
+// Signal B (kg_budget_exhausted WARN does not appear on healthy restarts)
+// covers the real-world integration path.

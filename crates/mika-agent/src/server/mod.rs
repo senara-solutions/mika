@@ -929,6 +929,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 let db = agent_state.db.clone();
                 let llm = resolution_llm.clone();
                 let agent_name_clone = agent_name.clone();
+                let budget = kg_batch_budget;
 
                 tokio::spawn(async move {
                     // Small delay to let extraction tasks commit first.
@@ -936,7 +937,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
                     let resolver =
                         crate::kg::entity_resolver::SubjectEntityResolver::new(db, llm, None);
-                    match resolver.resolve_pending().await {
+                    match resolver.resolve_pending(budget).await {
                         Ok(stats) => {
                             if stats.matched_exact > 0 || stats.matched_llm > 0 || stats.errors > 0
                             {

@@ -86,7 +86,7 @@ async fn test_stage_2_synonyms_disambiguation() {
     let llm = mock_disambiguation_llm("skill:qa-review", 0.9);
 
     let resolver = SubjectEntityResolver::new(db.clone(), Some(llm), Some("test-synonyms"));
-    let stats = resolver.resolve_pending().await.unwrap();
+    let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
 
     assert_eq!(stats.total, 1);
     assert_eq!(
@@ -162,7 +162,7 @@ async fn test_stage_2_case_variant_low_confidence() {
     let llm = mock_disambiguation_llm("skill:self-dev", 0.95);
 
     let resolver = SubjectEntityResolver::new(db.clone(), Some(llm), Some("test-case-variants"));
-    let stats = resolver.resolve_pending().await.unwrap();
+    let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
 
     assert_eq!(stats.total, 1);
     assert_eq!(
@@ -224,7 +224,7 @@ async fn test_stage_2_skipped_no_llm() {
 
     // No LLM configured
     let resolver = SubjectEntityResolver::new(db.clone(), None, Some("test-no-llm"));
-    let stats = resolver.resolve_pending().await.unwrap();
+    let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
 
     assert_eq!(stats.total, 1);
     assert_eq!(

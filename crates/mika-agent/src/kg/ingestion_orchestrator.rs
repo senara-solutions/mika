@@ -46,6 +46,11 @@ pub struct IngestionOrchestrator {
     /// LLM provider for entity resolution disambiguation. `None` when
     /// resolution LLM is disabled (exact-match-only mode).
     resolution_llm: Option<Arc<dyn LlmProvider>>,
+    /// Per-batch LLM call budget for Stage-2 resolution (#757). The compound
+    /// hook path is already bounded-by-construction (one doc's entities); the
+    /// budget is defensive against a pathological doc that produces thousands
+    /// of subject entities at once.
+    resolution_budget: u32,
     trace_id: String,
     session_id: String,
 }
@@ -56,11 +61,14 @@ impl IngestionOrchestrator {
     /// - `extraction_llm`: `None` to disable extraction (lexical ingestion
     ///   still runs).
     /// - `resolution_llm`: `None` for exact-match-only resolution mode.
+    /// - `resolution_budget`: per-batch Stage-2 LLM call cap (#757). Callers
+    ///   typically pass `settings.effective_kg_batch_budget()`.
     pub fn new(
         db: AsyncDatabase,
         docs_root: PathBuf,
         extraction_llm: Option<Arc<dyn LlmProvider>>,
         resolution_llm: Option<Arc<dyn LlmProvider>>,
+        resolution_budget: u32,
         trace_id: Option<&str>,
         session_id: Option<&str>,
     ) -> Self {
@@ -72,6 +80,7 @@ impl IngestionOrchestrator {
             docs_root,
             extraction_llm,
             resolution_llm,
+            resolution_budget,
             trace_id,
             session_id: session_id.unwrap_or("compound").to_owned(),
         }
@@ -256,11 +265,12 @@ impl IngestionOrchestrator {
         let trace_id = self.trace_id.clone();
         let agent_id = self.db.agent_id.clone();
         let doc_path = doc_path.to_owned();
+        let budget = self.resolution_budget;
 
         tokio::spawn(async move {
             let resolver = SubjectEntityResolver::new(db, resolution_llm, Some(&trace_id));
 
-            match resolver.resolve_pending().await {
+            match resolver.resolve_pending(budget).await {
                 Ok(stats) => {
                     if stats.matched_exact > 0 || stats.matched_llm > 0 || stats.errors > 0 {
                         info!(
