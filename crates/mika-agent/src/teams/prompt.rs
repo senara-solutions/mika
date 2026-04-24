@@ -108,6 +108,11 @@ pub fn build_orchestrator_context(
          or casual conversation), respond with: {{\"reply\": \"your response\"}}\n\
          \n\
          For actionable goals, decompose into tasks for your team members. \
+         Consider every team member's mandate before responding. It's fine to \
+         leave a member out if their expertise doesn't fit the goal, but make \
+         that decision deliberately — don't default to the first one or two \
+         that come to mind.\n\
+         \n\
          Respond with a JSON array of task assignments. Each assignment has:\n\
          - \"agent\": the team member's name\n\
          - \"task\": a clear, specific description of what to do\n\
@@ -380,6 +385,21 @@ mod tests {
     }
 
     #[test]
+    fn test_orchestrator_context_roster_awareness_instruction() {
+        let def = test_def();
+        let ctx = build_orchestrator_context(&def, "", None, &[], None);
+        // Semantic check: prompt must instruct the orchestrator to consider every member
+        let lower = ctx.to_lowercase();
+        assert!(
+            lower.contains("every") && lower.contains("member"),
+            "orchestrator prompt must contain roster-awareness instruction with 'every' and 'member'"
+        );
+        // Existing response format must still be present
+        assert!(ctx.contains("Respond with a JSON array"));
+        assert!(ctx.contains("Respond ONLY with compact"));
+    }
+
+    #[test]
     fn test_orchestrator_context_with_feedback() {
         let def = test_def();
         let ctx = build_orchestrator_context(&def, "", Some("Needs more detail"), &[], None);
@@ -473,6 +493,7 @@ mod tests {
             started_at: "2025-02-25T11:00:00Z".to_string(),
             ended_at: None,
             deliverable: None,
+            coverage_retry_fired: false,
         };
 
         let def = test_def();
@@ -496,6 +517,7 @@ mod tests {
             started_at: "2025-02-25T11:00:00Z".to_string(),
             ended_at: None,
             deliverable: None,
+            coverage_retry_fired: false,
         };
 
         let ctx = build_deliverable_context(&run);

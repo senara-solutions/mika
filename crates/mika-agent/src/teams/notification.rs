@@ -150,6 +150,7 @@ mod tests {
             started_at: "2026-04-24T12:00:00Z".to_string(),
             ended_at: Some("2026-04-24T12:05:00Z".to_string()),
             deliverable,
+            coverage_retry_fired: false,
         }
     }
 

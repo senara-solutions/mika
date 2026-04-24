@@ -85,7 +85,7 @@ The cited failure (run `fd7ef7ef`, inner-circle, 5-agent team) is one observed i
 
 **Sequencing:** Ship Unit 1 (prompt) alone as the first commit. Reproduce the failing scenario against the prompt-only build (see Validation Gate below) and record the result in the PR description. Only then commit Unit 2 (structural retry). This orders the evidence: we'll know whether the prompt is sufficient before spending any complexity budget on the retry path. Unit 3 (observability) lands with Unit 2.
 
-- [ ] **Unit 1: Prompt reinforcement (ships first)**
+- [x] **Unit 1: Prompt reinforcement (ships first)**
 
 **Goal:** Bias the orchestrator toward roster-aware responses on the first try so the retry path — if we build one — rarely fires.
 
@@ -129,7 +129,7 @@ This is a manual observation step, not an automated test. One run is enough to i
 
 ---
 
-- [ ] **Unit 2: Coverage-check helper + `decompose()` retry integration**
+- [x] **Unit 2: Coverage-check helper + `decompose()` retry integration**
 
 **Goal:** Detect silent omissions after `parse_task_assignments` returns `Tasks(...)`, re-prompt once with the missing list, fall through with a `warn!` log on second failure. No changes to `DecomposeResult` or `parse_task_assignments` signature.
 
@@ -196,7 +196,7 @@ warn!(
 
 ---
 
-- [ ] **Unit 3: `coverage_retry_fired` on `TeamRun` (if trivial)**
+- [x] **Unit 3: `coverage_retry_fired` on `TeamRun` (if trivial)**
 
 **Goal:** Expose the retry signal beyond the log line — a boolean post-hoc tooling can query without parsing logs.
 
