@@ -158,41 +158,59 @@ Global config is the right level (docs tree is repo-scoped, not agent-scoped), a
 - Test: `crates/mika-agent/src/kg/config.rs` (inline `#[cfg(test)] mod tests`)
 
 **Approach:**
-- Signature: `pub fn resolve_kg_docs_root(settings: &Settings) -> PathBuf`
+- Signature: `pub fn resolve_kg_docs_root(settings: &Settings) -> (PathBuf, PathSource)`
+- `PathSource` enum, defined adjacent to the function:
+  ```
+  pub enum PathSource {
+      EnvVar,       // path came from MIKA_KG_DOCS_ROOT env var
+      ConfigFile,   // path came from settings.kg_docs_root (config.toml)
+      CwdDefault,   // path fell through to std::env::current_dir().join("docs/solutions")
+  }
+  ```
 - Body:
   ```
-  settings
-      .kg_docs_root
-      .clone()
-      .unwrap_or_else(|| {
-          std::env::current_dir()
-              .unwrap_or_default()
-              .join("docs")
-              .join("solutions")
-      })
+  // Env var check first (config-rs resolves MIKA_KG_DOCS_ROOT into settings.kg_docs_root,
+  // but we need to know whether the value came from env vs config file, so re-inspect env).
+  if let Ok(env_path) = std::env::var("MIKA_KG_DOCS_ROOT") {
+      return (PathBuf::from(env_path), PathSource::EnvVar);
+  }
+  if let Some(config_path) = settings.kg_docs_root.clone() {
+      return (config_path, PathSource::ConfigFile);
+  }
+  let cwd_default = std::env::current_dir()
+      .unwrap_or_default()
+      .join("docs")
+      .join("solutions");
+  (cwd_default, PathSource::CwdDefault)
   ```
 - No existence check, no canonicalization — callers remain responsible for I/O and for distinguishing empty-path vs nonexistent-path (see Unit 3).
-- Doc comment must explain two things:
-  1. Env > config precedence is handled by `Settings` loading (config-rs cascade); this function only covers the `None` → CWD-based default branch.
+- Doc comment must explain three things:
+  1. Env > config precedence: the resolver re-inspects `MIKA_KG_DOCS_ROOT` directly (not just `settings.kg_docs_root`) to distinguish the env-var case from the config-file case. Config-rs already merges env into `settings.kg_docs_root`, so `Some` could be either source — the re-inspection gives the true source.
   2. **Public contract consumed by #778's per-agent resolver** — signature changes require coordinated update across both tickets. Compile-time binding in `tests` module catches the mechanical drift; this comment addresses the human side.
+  3. **Source-of-origin exposed for #778's per-agent policy classifier.** #778 uses `PathSource::{EnvVar, ConfigFile}` to distinguish "operator explicitly set this path; hard-error if it doesn't exist" from `PathSource::CwdDefault` → "fell through to container-friendly default; warn-and-skip if it doesn't exist". **If you add a new source here (e.g., workspace-level config), update `resolve_per_agent_docs_root` in kg/config.rs to classify it correctly.** The exhaustive match on `PathSource` in `resolve_per_agent_docs_root` will force a compile error if variants are added, but this breadcrumb names the why.
 
 **Technical design** (directional, not implementation spec):
 ```
-Settings (from config-rs cascade)
+Settings (from config-rs cascade) + process env
     │
-    ├─ kg_docs_root: Some(path)  ──►  return path
+    ├─ MIKA_KG_DOCS_ROOT env var set  ──►  (PathBuf::from(env_val), EnvVar)
     │
-    └─ kg_docs_root: None        ──►  CWD-join("docs/solutions")
+    ├─ settings.kg_docs_root = Some(path)  ──►  (path, ConfigFile)
+    │
+    └─ (neither)                           ──►  (CWD-join("docs/solutions"), CwdDefault)
 ```
 
 **Patterns to follow:**
 - `crates/mika-agent/src/kg/mod.rs` re-export style for existing sibling modules.
 
 **Test scenarios:**
-- Happy path: `settings.kg_docs_root = Some(PathBuf::from("/x"))` → returns `/x` regardless of CWD.
-- Happy path: `settings.kg_docs_root = None`, CWD = `/tmp/fake-repo` → returns `/tmp/fake-repo/docs/solutions`.
-- Edge: `settings.kg_docs_root = Some(PathBuf::from(""))` → returns empty path verbatim. The caller (Unit 3) is responsible for detecting this and emitting a distinct warn — the resolver is pure.
-- Contract: compile-time signature binding — `let _: fn(&Settings) -> PathBuf = resolve_kg_docs_root;` inside a `#[test]` module. Compiles-or-fails; no runtime assertion. Prevents silent drift from the public contract #778 depends on.
+- Happy path (env var wins): env `MIKA_KG_DOCS_ROOT=/e`, `settings.kg_docs_root = Some(PathBuf::from("/c"))` → returns `(PathBuf::from("/e"), PathSource::EnvVar)`. Env takes precedence over config file even when both are set.
+- Happy path (config file): env unset, `settings.kg_docs_root = Some(PathBuf::from("/x"))` → returns `(PathBuf::from("/x"), PathSource::ConfigFile)`.
+- Happy path (CWD fallback): env unset, `settings.kg_docs_root = None`, CWD = `/tmp/fake-repo` → returns `(/tmp/fake-repo/docs/solutions, PathSource::CwdDefault)`.
+- Edge: env set to empty string → `(PathBuf::from(""), PathSource::EnvVar)`. Empty-path classification still applies (Unit 3's distinct warn handles the empty-path case). Source is EnvVar because the operator did explicitly set it to an empty value — policy still "hard-error downstream" if the consumer cares about existence.
+- Edge: `settings.kg_docs_root = Some(PathBuf::from(""))` (config file set to empty) → `(PathBuf::from(""), PathSource::ConfigFile)`. Same semantics as above — empty but explicit.
+- Contract (signature binding): `let _: fn(&Settings) -> (PathBuf, PathSource) = resolve_kg_docs_root;` inside a `#[test]` module. Compiles-or-fails; no runtime assertion. Prevents silent drift from the public contract #778 depends on.
+- Contract (PathSource exhaustiveness): a `#[test]` that matches on all three `PathSource` variants — `match source { PathSource::EnvVar => (), PathSource::ConfigFile => (), PathSource::CwdDefault => () }`. Adding a future variant without updating this test (and by extension, `resolve_per_agent_docs_root` in #778) produces a compile error. Belt-and-suspenders for the breadcrumb in the doc comment.
 
 **Not tested** (preserved by construction, not by induction): the `unwrap_or_default()` branch on `std::env::current_dir()` failure. Today's code uses the same expression; peer review flagged that inducing CWD failure via `tempdir()` + `remove_dir` is platform-dependent (Linux returns the stale path, macOS behavior varies) and flaky on CI. Diff-reading the `unwrap_or_default()` expression against the pre-plan implementation is the verification; test induction would be brittle theatre.
 
@@ -215,10 +233,12 @@ Settings (from config-rs cascade)
 - Test: Create `crates/mika-agent/tests/kg_docs_root_resolution.rs` (new file). One test file, one owner, unambiguous. A future ticket may consolidate startup-flow integration tests — that is a consolidation ticket's concern, not this one.
 
 **Approach:**
-- Import: `use crate::kg::config::resolve_kg_docs_root;`
+- Import: `use crate::kg::config::{resolve_kg_docs_root, PathSource};`
 - Call:
   ```
-  let docs_root = resolve_kg_docs_root(&settings);
+  let (docs_root, _source) = resolve_kg_docs_root(&settings);
+  // #738 itself doesn't care about `_source` — the warn-and-skip downstream behavior is
+  // the same for all three sources. #778 is the consumer that branches on PathSource.
   ```
 - Before the existing existence check, distinguish the empty-path case so operators don't chase a misleading `docs/solutions not found` log when the real problem is an empty config value:
   ```
