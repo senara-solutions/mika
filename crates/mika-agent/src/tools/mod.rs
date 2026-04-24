@@ -1,4 +1,5 @@
 mod a2a_call;
+mod add_team_member;
 mod cancel_reminder;
 mod cancel_task;
 mod check_task;
@@ -32,6 +33,7 @@ mod query_knowledge_graph;
 mod query_timeline;
 mod read_agent_file;
 mod read_workspace;
+mod remove_team_member;
 mod resolve_issue_order;
 mod run_team;
 mod search_memory;
@@ -726,6 +728,12 @@ pub fn management_tools_if_needed(
             home_dir: home_dir.to_path_buf(),
         }));
         tools.push(Box::new(update_team::UpdateTeamTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
+        tools.push(Box::new(add_team_member::AddTeamMemberTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
+        tools.push(Box::new(remove_team_member::RemoveTeamMemberTool {
             home_dir: home_dir.to_path_buf(),
         }));
         // Task write tools — orchestrator-only (delegates receive
