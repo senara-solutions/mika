@@ -156,6 +156,18 @@ Connects to external MCP servers at startup via `McpManager`. Configured in `{ag
 
 See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, assertion style, how to add scenarios).
 
+## Evaluation — KG Provider Comparison (#762)
+
+`tests/eval/kg_provider_eval/` — reproducible harness comparing LLM providers for the two KG call types (entity extraction and entity resolution). Uses direct LLM calls with the *production* KG prompts (not the full agent loop) so results reflect prompt-level provider behavior.
+
+**Gating:** `#[ignore]` + `MIKA_EVAL_KG_PROVIDERS` env var (separate from `MIKA_EVAL_REAL_PROVIDERS` to avoid accidentally running during the basic provider matrix). Format: comma-separated `provider/model` strings (e.g. `anthropic/claude-haiku-4-5-20251001,openrouter/deepseek/deepseek-v3`) or `default` for the four-provider minimum set (Anthropic Haiku + Sonnet, OpenRouter DeepSeek + Kimi). Each referenced provider must have its API key set.
+
+**Fixtures:** 15 sample docs (`docs/solutions/kg/eval-fixtures-2026-04-24/extraction_sample_docs.toml`) and 30 hand-labeled resolution ground-truth cases (`resolution_ground_truth.toml`). Scoring: extraction uses entity-set F1 + triple-set F1 against annotated expectations; resolution uses exact-match accuracy against the labeled correct candidate.
+
+**Outputs:** per-run report with per-provider quality/cost/latency tables. Decision matrix lives at `docs/solutions/kg/kg-provider-evaluation-2026-04-24.md` (populated by running the eval with API keys). Compound pattern doc at `docs/solutions/best-practices/kg-provider-eval-harness-reproducible-comparison-2026-04-24.md`.
+
+**Run:** `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval`
+
 ## Evaluation — Grounding Regressions (#741)
 
 `tests/eval/grounding_regressions/` — 5 fabrication-detection scenarios from the KG milestone #14 retrospective. Each tests a concrete fabrication class with hard assertions (forbidden-word, required-tool, contains-in-order). No LLM-judge gating — each class has objectively checkable signals.
