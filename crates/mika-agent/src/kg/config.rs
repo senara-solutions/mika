@@ -76,6 +76,18 @@ pub fn resolve_per_agent_docs_root(
     // Fall back to global resolver (#738).
     let (resolved_path, source) = resolve_kg_docs_root(settings);
 
+    // Empty-path guard (#738): an empty string in env/config is a misconfiguration,
+    // not a valid path. Warn-and-skip per CLAUDE.md contract: "If set to an empty
+    // string, lexical ingestion skips with a distinct warn."
+    if resolved_path.as_os_str().is_empty() {
+        tracing::warn!(
+            source = ?source,
+            "kg_docs_root is set to empty string — check MIKA_KG_DOCS_ROOT env var or \
+             kg_docs_root in config.toml; skipping KG for this agent"
+        );
+        return Ok(KgAgentConfig::Disabled);
+    }
+
     match source {
         // Explicit global sources — hard-error on missing.
         PathSource::EnvVar | PathSource::ConfigFile => validate_explicit_path(&resolved_path),
@@ -120,13 +132,13 @@ fn validate_explicit_path(path: &Path) -> Result<KgAgentConfig, KgConfigError> {
 
 /// Source of the resolved docs root path.
 ///
-/// Exposed so downstream consumers (e.g., #778's per-agent policy classifier)
-/// can distinguish "operator explicitly set this path; hard-error if missing"
-/// from "fell through to container-friendly default; warn-and-skip if missing".
+/// Exposed so `resolve_per_agent_docs_root` (in this module) can distinguish
+/// "operator explicitly set this path; hard-error if missing" from "fell
+/// through to container-friendly default; warn-and-skip if missing".
 ///
 /// **If you add a new variant**, update `resolve_per_agent_docs_root` in this
-/// module (when #778 lands) to classify it correctly. The exhaustive match
-/// will force a compile error, but this breadcrumb names the _why_.
+/// module to classify it correctly. The exhaustive match will force a compile
+/// error, but this breadcrumb names the _why_.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathSource {
     /// Path came from `MIKA_KG_DOCS_ROOT` env var.
@@ -153,15 +165,14 @@ pub enum PathSource {
 ///
 /// # Public contract
 ///
-/// This function is consumed by #778's per-agent resolver. Signature changes
-/// require coordinated update across both tickets. The `signature_binding`
-/// test below catches mechanical drift at compile time.
+/// This function is consumed by `resolve_per_agent_docs_root` in this module.
+/// The `signature_binding` test below catches mechanical drift at compile time.
 ///
 /// # No validation
 ///
-/// Path existence is **not** checked here — the consumer site (`server/mod.rs`)
-/// owns the warn-and-skip policy. This keeps the resolver pure and allows
-/// #778 to apply a different policy (hard-error) downstream.
+/// Path existence is **not** checked here. `resolve_per_agent_docs_root`
+/// applies hard-error for explicit sources (EnvVar/ConfigFile);
+/// `server/mod.rs` handles CwdDefault warn-and-skip.
 pub fn resolve_kg_docs_root(settings: &Settings) -> (PathBuf, PathSource) {
     // 1. Env var (highest priority).
     if let Ok(env_path) = std::env::var("MIKA_KG_DOCS_ROOT") {
@@ -548,6 +559,20 @@ mod tests {
             }
             KgAgentConfig::Disabled => panic!("expected Enabled"),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_per_agent_empty_env_returns_disabled() {
+        clean_kg_env();
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOT", "") };
+
+        let identity = identity_with_kg(true, None);
+        let settings = Settings::test_defaults();
+        // Empty string env var should warn-and-skip, not hard-error.
+        let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
+        assert!(matches!(result, KgAgentConfig::Disabled));
+        clean_kg_env();
     }
 
     /// Signature binding for the per-agent resolver.

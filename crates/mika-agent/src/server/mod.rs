@@ -17,6 +17,7 @@ pub(crate) mod verdict;
 pub mod verdict_handler;
 pub mod webhook_queue;
 
+use crate::kg::config::KgAgentConfig;
 use anyhow::{Context as _, Result, anyhow};
 use axum::{
     Router,
@@ -767,7 +768,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // Agents with [kg] enabled=false are skipped entirely.
     {
         for (agent_name, agent_state) in &agents {
-            let crate::kg::config::KgAgentConfig::Enabled {
+            let KgAgentConfig::Enabled {
                 ref docs_root,
                 ref docs_root_hash,
             } = agent_state.kg_config
@@ -782,15 +783,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 continue;
             };
 
-            // Empty-path guard (#738).
-            if docs_root.as_os_str().is_empty() {
-                warn!(
-                    agent = agent_name.as_str(),
-                    "kg_docs_root is set to empty string — skipping lexical ingestion"
-                );
-                continue;
-            }
-
+            // KgAgentConfig::Enabled guarantees a non-empty docs_root (empty paths
+            // are caught by the empty-path guard in resolve_per_agent_docs_root).
+            // CwdDefault paths may not exist on disk — warn-and-skip per #738 policy.
             if !docs_root.exists() {
                 info!(
                     agent = agent_name.as_str(),
@@ -876,7 +871,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     );
                 }
                 for (agent_name, agent_state) in &agents {
-                    let crate::kg::config::KgAgentConfig::Enabled {
+                    let KgAgentConfig::Enabled {
                         ref docs_root,
                         docs_root_hash: _,
                     } = agent_state.kg_config
@@ -1008,7 +1003,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             };
 
             for (agent_name, agent_state) in &agents {
-                let crate::kg::config::KgAgentConfig::Enabled {
+                let KgAgentConfig::Enabled {
                     docs_root: _,
                     ref docs_root_hash,
                 } = agent_state.kg_config
