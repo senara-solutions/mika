@@ -4,7 +4,7 @@
 //!
 //! - `extract_pending(budget)` honors the per-batch LLM call cap.
 //! - `budget == 0` short-circuits with zero LLM calls and `aborted_budget = true`.
-//! - The pending-doc query matches on `(agent_id, source_doc_path,
+//! - The pending-doc query matches on `(docs_root_hash, source_doc_path,
 //!   source_doc_hash)` so stale markers re-fire only on actual content drift.
 //! - `record_extraction` persists `source_doc_hash` so subsequent runs see a
 //!   populated marker.
@@ -31,16 +31,25 @@ fn test_db(agent_id: &str) -> AsyncDatabase {
     AsyncDatabase::new_with_agent(db, agent_id)
 }
 
+/// Default docs_root used by SubjectExtractor in these tests.
+const TEST_DOCS_ROOT: &str = "/tmp/docs";
+
+/// Pre-computed docs_root_hash for TEST_DOCS_ROOT.
+fn test_docs_root_hash() -> String {
+    mika_agent::kg::config::hash_docs_root(std::path::Path::new(TEST_DOCS_ROOT))
+}
+
 async fn insert_chunk(db: &AsyncDatabase, seq_id: i64, doc_path: &str, hash: &str) {
-    let agent_id = db.agent_id.clone();
     let doc_path = doc_path.to_owned();
     let hash = hash.to_owned();
+    let drh = test_docs_root_hash();
     db.with_db(move |db| {
         db.execute_sql(
-            "INSERT INTO kg_chunks (agent_id, seq_id, source_doc_path, source_doc_hash) \
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &drh as &dyn rusqlite::types::ToSql,
+                &TEST_DOCS_ROOT,
                 &seq_id,
                 &doc_path,
                 &hash,
@@ -53,17 +62,17 @@ async fn insert_chunk(db: &AsyncDatabase, seq_id: i64, doc_path: &str, hash: &st
 }
 
 async fn insert_extraction(db: &AsyncDatabase, doc_path: &str, hash: Option<&str>) {
-    let agent_id = db.agent_id.clone();
     let doc_path = doc_path.to_owned();
     let hash = hash.map(|s| s.to_owned());
     db.with_db(move |db| {
         db.execute_sql(
             "INSERT INTO kg_extractions \
-               (agent_id, source_doc_path, source_doc_hash, extraction_model, \
+               (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model, \
                 entities_extracted, relationships_extracted, extraction_trace_id) \
-             VALUES (?1, ?2, ?3, ?4, 0, 0, 'trace-test')",
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'trace-test')",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &test_docs_root_hash() as &dyn rusqlite::types::ToSql,
+                &TEST_DOCS_ROOT,
                 &doc_path,
                 &hash,
                 &"mock/test",
@@ -76,22 +85,21 @@ async fn insert_extraction(db: &AsyncDatabase, doc_path: &str, hash: Option<&str
 }
 
 async fn count_pending(db: &AsyncDatabase) -> i64 {
-    let agent_id = db.agent_id.clone();
     db.with_db(move |db| {
         Ok(db
             .query_scalar::<i64>(
                 "SELECT COUNT(*) FROM (
                    SELECT DISTINCT c.source_doc_path
                    FROM kg_chunks c
-                   WHERE c.agent_id = ?1
+                   WHERE c.docs_root_hash = ?1
                      AND NOT EXISTS (
                        SELECT 1 FROM kg_extractions e
-                       WHERE e.agent_id        = c.agent_id
+                       WHERE e.docs_root_hash   = c.docs_root_hash
                          AND e.source_doc_path = c.source_doc_path
                          AND e.source_doc_hash = c.source_doc_hash
                      )
                  )",
-                &[&agent_id as &dyn rusqlite::types::ToSql],
+                &[&test_docs_root_hash() as &dyn rusqlite::types::ToSql],
             )?
             .unwrap_or(0))
     })
@@ -100,13 +108,15 @@ async fn count_pending(db: &AsyncDatabase) -> i64 {
 }
 
 async fn read_extraction_hash(db: &AsyncDatabase, doc_path: &str) -> Option<String> {
-    let agent_id = db.agent_id.clone();
     let doc_path = doc_path.to_owned();
     db.with_db(move |db| {
         db.query_scalar::<Option<String>>(
             "SELECT source_doc_hash FROM kg_extractions \
-             WHERE agent_id = ?1 AND source_doc_path = ?2",
-            &[&agent_id as &dyn rusqlite::types::ToSql, &doc_path],
+             WHERE docs_root_hash = ?1 AND source_doc_path = ?2",
+            &[
+                &test_docs_root_hash() as &dyn rusqlite::types::ToSql,
+                &doc_path,
+            ],
         )
         .map(|v| v.flatten())
     })
@@ -176,7 +186,7 @@ async fn pending_query_treats_drifted_hash_as_stale() {
     );
 }
 
-// Note on agent-scope: the pending query filters by `agent_id`, so agent
+// Note on corpus-scope: the pending query filters by `docs_root_hash`, so corpus
 // isolation is by construction. Not testing it here would require sharing a
 // single Database across two AsyncDatabase handles, which the current
 // AsyncDatabase API does not support (it takes ownership of the Database).
@@ -257,7 +267,6 @@ async fn seed_exact_match_pair(
     name: &str,
     subject_confidence: f64,
 ) -> i64 {
-    let agent_id = db.agent_id.clone();
     let domain_key = format!("{entity_type}:{name}");
     let subject_key = domain_key.clone();
     let entity_type_owned = entity_type.to_owned();
@@ -276,10 +285,11 @@ async fn seed_exact_match_pair(
         // Matching subject entity with high confidence (above exact-match threshold)
         db.execute_sql(
             "INSERT INTO kg_subject_entities \
-                (agent_id, entity_key, type, name, confidence) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &test_docs_root_hash() as &dyn rusqlite::types::ToSql,
+                &TEST_DOCS_ROOT,
                 &subject_key,
                 &entity_type_owned,
                 &name_owned,
@@ -314,7 +324,8 @@ async fn resolve_pending_with_zero_budget_still_processes_exact_matches() {
     seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
     seed_exact_match_pair(&db, "tool", "run_gh", 0.92).await;
 
-    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("trace-rx1"));
+    let resolver =
+        SubjectEntityResolver::new(db.clone(), None, test_docs_root_hash(), Some("trace-rx1"));
     let stats = resolver.resolve_pending(0).await.unwrap();
 
     assert_eq!(stats.matched_exact, 2, "two exact matches should resolve");
@@ -337,14 +348,14 @@ async fn resolve_pending_with_no_llm_and_no_exact_match_skips_cleanly() {
     // exits at Stage-2-entry with SkippedNoLlm before the budget guard.
     let db = test_db("agent-rx2");
     // Subject entity with no matching domain entity
-    let agent_id = db.agent_id.clone();
     db.with_db(move |db| {
         db.execute_sql(
             "INSERT INTO kg_subject_entities \
-                (agent_id, entity_key, type, name, confidence) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &test_docs_root_hash() as &dyn rusqlite::types::ToSql,
+                &TEST_DOCS_ROOT,
                 &"skill:does-not-exist",
                 &"skill",
                 &"does-not-exist",
@@ -356,7 +367,8 @@ async fn resolve_pending_with_no_llm_and_no_exact_match_skips_cleanly() {
     .await
     .unwrap();
 
-    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("trace-rx2"));
+    let resolver =
+        SubjectEntityResolver::new(db.clone(), None, test_docs_root_hash(), Some("trace-rx2"));
     let stats = resolver.resolve_pending(10).await.unwrap();
 
     assert_eq!(stats.skipped_no_llm, 1);
@@ -369,7 +381,7 @@ async fn resolve_pending_empty_set_returns_zero_calls() {
     // No kg_subject_entities → pending query returns empty → early return.
     let db = test_db("agent-rx3");
 
-    let resolver = SubjectEntityResolver::new(db, None, Some("trace-rx3"));
+    let resolver = SubjectEntityResolver::new(db, None, test_docs_root_hash(), Some("trace-rx3"));
     let stats = resolver.resolve_pending(10).await.unwrap();
 
     assert_eq!(stats.total, 0);
@@ -398,14 +410,14 @@ async fn resolve_pending_budget_exhaustion_does_not_starve_later_exact_matches()
     // configured, producing SkippedNoLlm. The test's value is not in
     // this particular variant but in the ordering: the 3rd entity below
     // (an exact match) MUST still resolve.
-    let agent_id = db.agent_id.clone();
     db.with_db(move |db| {
         db.execute_sql(
             "INSERT INTO kg_subject_entities \
-                (agent_id, entity_key, type, name, confidence) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &test_docs_root_hash() as &dyn rusqlite::types::ToSql,
+                &TEST_DOCS_ROOT,
                 &"skill:mystery-skill",
                 &"skill",
                 &"mystery-skill",
@@ -419,7 +431,8 @@ async fn resolve_pending_budget_exhaustion_does_not_starve_later_exact_matches()
 
     seed_exact_match_pair(&db, "tool", "run_gh", 0.92).await;
 
-    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("trace-rx5"));
+    let resolver =
+        SubjectEntityResolver::new(db.clone(), None, test_docs_root_hash(), Some("trace-rx5"));
     let stats = resolver.resolve_pending(0).await.unwrap();
 
     // Both exact matches must resolve — the middle SkippedNoLlm entity
@@ -453,14 +466,13 @@ async fn null_hash_populates_on_successful_extraction() {
     // Phase 2: simulate a successful extraction by writing the hash.
     // This is the UPSERT the production extract_document runs inside
     // its transaction (#757 atomic marker write).
-    let agent_id = db.agent_id.clone();
     db.with_db(move |db| {
         db.execute_sql(
             "UPDATE kg_extractions SET source_doc_hash = ?1 \
-             WHERE agent_id = ?2 AND source_doc_path = ?3",
+             WHERE docs_root_hash = ?2 AND source_doc_path = ?3",
             &[
                 &"HASH-NH" as &dyn rusqlite::types::ToSql,
-                &agent_id,
+                &test_docs_root_hash(),
                 &"docs/nh.md",
             ],
         )?;
@@ -490,14 +502,14 @@ async fn resolve_pending_zero_budget_with_exact_match_mix_still_logs_exact() {
     // here — the test documents the composition.
     let db = test_db("agent-rx4");
     seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
-    let agent_id = db.agent_id.clone();
     db.with_db(move |db| {
         db.execute_sql(
             "INSERT INTO kg_subject_entities \
-                (agent_id, entity_key, type, name, confidence) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &test_docs_root_hash() as &dyn rusqlite::types::ToSql,
+                &TEST_DOCS_ROOT,
                 &"skill:unknown-skill",
                 &"skill",
                 &"unknown-skill",
@@ -509,7 +521,7 @@ async fn resolve_pending_zero_budget_with_exact_match_mix_still_logs_exact() {
     .await
     .unwrap();
 
-    let resolver = SubjectEntityResolver::new(db, None, Some("trace-rx4"));
+    let resolver = SubjectEntityResolver::new(db, None, test_docs_root_hash(), Some("trace-rx4"));
     let stats = resolver.resolve_pending(0).await.unwrap();
 
     assert_eq!(stats.matched_exact, 1);

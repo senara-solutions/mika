@@ -26,7 +26,12 @@ pub struct KgQueryInput {
     /// Explicit traversal starting point and parameters.
     pub traversal: Option<TraversalInput>,
     /// Agent ID for scoped queries and context enrichment.
+    /// Used for per-agent tables (resolutions) and skill enablement context.
     pub agent_id: Option<String>,
+    /// Shared-corpus hash for filtering shared-layer tables (v27).
+    /// When set, subject entities, chunks, and provenance tables are scoped
+    /// to this corpus. When `None`, shared-layer queries are unscoped.
+    pub docs_root_hash: Option<String>,
     /// Include chunk prose text in results (default: false).
     #[serde(default)]
     pub include_context: bool,
@@ -206,6 +211,7 @@ pub async fn query_knowledge_graph(
         .min(MAX_RESULT_ENTITIES);
 
     let agent_id = input.agent_id.as_deref();
+    let docs_root_hash = input.docs_root_hash.as_deref();
 
     // Phase 1: Find starting entities
     let (starting_entities, entry_method) = if has_start {
@@ -217,7 +223,7 @@ pub async fn query_knowledge_graph(
             .as_ref()
             .unwrap()
             .trim();
-        let entities = find_by_entity_key(db, start_key, agent_id).await?;
+        let entities = find_by_entity_key(db, start_key, docs_root_hash).await?;
         let method = if entities.is_empty() {
             None
         } else {
@@ -226,7 +232,7 @@ pub async fn query_knowledge_graph(
         (entities, method)
     } else {
         let question = input.question.as_ref().unwrap().trim();
-        resolve_entry_paths(db, question, agent_id).await?
+        resolve_entry_paths(db, question, agent_id, docs_root_hash).await?
     };
 
     if starting_entities.is_empty() {
@@ -259,8 +265,14 @@ pub async fn query_knowledge_graph(
     }
 
     // Phase 3: Graph traversal
-    let (traversed, edges) =
-        traverse_graph(db, &starting_entities, &follow_types, max_depth, agent_id).await?;
+    let (traversed, edges) = traverse_graph(
+        db,
+        &starting_entities,
+        &follow_types,
+        max_depth,
+        docs_root_hash,
+    )
+    .await?;
 
     let has_traversed_neighbors = traversed.iter().any(|e| e.hop > 0);
     if !has_traversed_neighbors {
@@ -287,7 +299,7 @@ pub async fn query_knowledge_graph(
 
     // Phase 6: Optionally include chunk context
     let chunks = if input.include_context {
-        collect_chunks(db, &ranked, agent_id).await?
+        collect_chunks(db, &ranked, docs_root_hash).await?
     } else {
         vec![]
     };
@@ -306,10 +318,10 @@ pub async fn query_knowledge_graph(
 async fn find_by_entity_key(
     db: &AsyncDatabase,
     entity_key: &str,
-    agent_id: Option<&str>,
+    docs_root_hash: Option<&str>,
 ) -> anyhow::Result<Vec<EntryEntity>> {
     let key = entity_key.to_owned();
-    let agent = agent_id.map(|s| s.to_owned());
+    let drh = docs_root_hash.map(|s| s.to_owned());
     let mut results = Vec::new();
 
     // Path A: domain entity exact match
@@ -347,19 +359,19 @@ async fn find_by_entity_key(
         });
     }
 
-    // Path B: subject entity exact match (if agent_id provided)
-    if let Some(ref aid) = agent {
+    // Path B: subject entity exact match (if docs_root_hash provided)
+    if let Some(ref hash) = drh {
         let key_b = key.clone();
-        let aid_b = aid.clone();
+        let hash_b = hash.clone();
         let subject_results: Vec<(i64, String, String, String, f64)> = db
             .with_db(move |db| {
                 let conn = &db.conn;
                 let mut stmt = conn.prepare(
                     "SELECT id, entity_key, name, type, confidence FROM kg_subject_entities \
-                     WHERE agent_id = ?1 AND LOWER(entity_key) = LOWER(?2)",
+                     WHERE docs_root_hash = ?1 AND LOWER(entity_key) = LOWER(?2)",
                 )?;
                 let rows = stmt
-                    .query_map(rusqlite::params![&aid_b, &key_b], |row| {
+                    .query_map(rusqlite::params![&hash_b, &key_b], |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
@@ -394,6 +406,7 @@ async fn resolve_entry_paths(
     db: &AsyncDatabase,
     question: &str,
     agent_id: Option<&str>,
+    docs_root_hash: Option<&str>,
 ) -> anyhow::Result<(Vec<EntryEntity>, Option<&'static str>)> {
     // Run paths A, B, C and merge
     let mut all_entries = Vec::new();
@@ -402,14 +415,14 @@ async fn resolve_entry_paths(
     let path_a = find_domain_entities_by_name(db, question).await?;
     all_entries.extend(path_a);
 
-    // Path B: Subject entity match (if agent_id)
-    if let Some(aid) = agent_id {
-        let path_b = find_subject_entities_by_name(db, question, aid).await?;
+    // Path B: Subject entity match (if docs_root_hash)
+    if let Some(drh) = docs_root_hash {
+        let path_b = find_subject_entities_by_name(db, question, drh).await?;
         all_entries.extend(path_b);
     }
 
     // Path C: Semantic search via chunks -> chunk_subjects -> subject entities -> resolve
-    let path_c = find_entities_via_chunks(db, question, agent_id).await?;
+    let path_c = find_entities_via_chunks(db, question, docs_root_hash, agent_id).await?;
     all_entries.extend(path_c);
 
     if all_entries.is_empty() {
@@ -500,23 +513,23 @@ async fn find_domain_entities_by_name(
 async fn find_subject_entities_by_name(
     db: &AsyncDatabase,
     question: &str,
-    agent_id: &str,
+    docs_root_hash: &str,
 ) -> anyhow::Result<Vec<EntryEntity>> {
     let q = question.to_lowercase();
     let q_like = format!("%{q}%");
     let q_for_closure = q.clone();
-    let aid = agent_id.to_owned();
+    let drh = docs_root_hash.to_owned();
 
     let rows: Vec<(i64, String, String, String, f64)> = db
         .with_db(move |db| {
             let conn = &db.conn;
             let mut stmt = conn.prepare(
                 "SELECT id, entity_key, name, type, confidence FROM kg_subject_entities \
-                 WHERE agent_id = ?1 AND (LOWER(name) LIKE ?2 OR LOWER(entity_key) = ?3) \
+                 WHERE docs_root_hash = ?1 AND (LOWER(name) LIKE ?2 OR LOWER(entity_key) = ?3) \
                  LIMIT 20",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![&aid, &q_like, &q_for_closure], |row| {
+                .query_map(rusqlite::params![&drh, &q_like, &q_for_closure], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -555,6 +568,7 @@ async fn find_subject_entities_by_name(
 async fn find_entities_via_chunks(
     db: &AsyncDatabase,
     question: &str,
+    docs_root_hash: Option<&str>,
     agent_id: Option<&str>,
 ) -> anyhow::Result<Vec<EntryEntity>> {
     // Use hybrid search scoped to kg_chunk source type
@@ -575,7 +589,7 @@ async fn find_entities_via_chunks(
     }
 
     // Find subject entities linked to these chunks via kg_chunk_subjects
-    let aid = agent_id.map(|s| s.to_owned());
+    let drh = docs_root_hash.map(|s| s.to_owned());
     let chunk_scores: HashMap<i64, f64> = search_results
         .iter()
         .filter_map(|r| r.source_id.map(|id| (id, r.score)))
@@ -589,9 +603,9 @@ async fn find_entities_via_chunks(
                 "SELECT DISTINCT se.id, se.entity_key, se.name, se.type, se.confidence, cs.chunk_id \
                  FROM kg_chunk_subjects cs \
                  JOIN kg_subject_entities se ON se.id = cs.subject_entity_id \
-                 WHERE cs.chunk_id IN ({placeholders}){agent_filter}",
-                agent_filter = if aid.is_some() {
-                    " AND cs.agent_id = ?"
+                 WHERE cs.chunk_id IN ({placeholders}){hash_filter}",
+                hash_filter = if drh.is_some() {
+                    " AND cs.docs_root_hash = ?"
                 } else {
                     ""
                 },
@@ -603,8 +617,8 @@ async fn find_entities_via_chunks(
                 stmt.raw_bind_parameter(param_idx, cid)?;
                 param_idx += 1;
             }
-            if let Some(ref a) = aid {
-                stmt.raw_bind_parameter(param_idx, a.as_str())?;
+            if let Some(ref h) = drh {
+                stmt.raw_bind_parameter(param_idx, h.as_str())?;
             }
 
             let mut rows = Vec::new();
@@ -705,7 +719,7 @@ async fn traverse_graph(
     starting: &[EntryEntity],
     follow_types: &[&str],
     max_depth: u32,
-    agent_id: Option<&str>,
+    docs_root_hash: Option<&str>,
 ) -> anyhow::Result<(Vec<TraversedEntity>, Vec<TraversedEdge>)> {
     let mut all_entities: Vec<TraversedEntity> = Vec::new();
     let mut all_edges: Vec<TraversedEdge> = Vec::new();
@@ -744,8 +758,8 @@ async fn traverse_graph(
         all_edges.extend(edges);
     }
 
-    // Traverse subject layer edges (if agent_id provided)
-    if let Some(aid) = agent_id {
+    // Traverse subject layer edges (if docs_root_hash provided)
+    if let Some(drh) = docs_root_hash {
         let subject_starts: Vec<(i64, f64)> = starting
             .iter()
             .filter(|e| e.layer == Layer::Subject)
@@ -754,7 +768,7 @@ async fn traverse_graph(
 
         if !subject_starts.is_empty() {
             let (entities, edges) =
-                traverse_subject_layer(db, &subject_starts, follow_types, max_depth, aid).await?;
+                traverse_subject_layer(db, &subject_starts, follow_types, max_depth, drh).await?;
             for e in entities {
                 if seen_entity_ids.insert((Layer::Subject, e.entity_id)) {
                     all_entities.push(e);
@@ -898,12 +912,12 @@ async fn traverse_subject_layer(
     starts: &[(i64, f64)],
     follow_types: &[&str],
     max_depth: u32,
-    agent_id: &str,
+    docs_root_hash: &str,
 ) -> anyhow::Result<(Vec<TraversedEntity>, Vec<TraversedEdge>)> {
     let start_ids: Vec<i64> = starts.iter().map(|(id, _)| *id).collect();
     let types: Vec<String> = follow_types.iter().map(|s| s.to_string()).collect();
     let depth = max_depth;
-    let aid = agent_id.to_owned();
+    let drh = docs_root_hash.to_owned();
 
     db.with_db(move |db| {
         let conn = &db.conn;
@@ -911,11 +925,11 @@ async fn traverse_subject_layer(
         let id_placeholders: String = start_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let type_placeholders: String = types.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
-        // All parameters use positional ? — bind order: start_ids..., aid, depth, types..., aid
+        // All parameters use positional ? — bind order: start_ids..., drh, depth, types..., drh
         let sql = format!(
             "WITH RECURSIVE traverse(entity_id, hop, cumulative_conf, path) AS ( \
                 SELECT id, 0, confidence, CAST(id AS TEXT) \
-                FROM kg_subject_entities WHERE id IN ({id_placeholders}) AND agent_id = ? \
+                FROM kg_subject_entities WHERE id IN ({id_placeholders}) AND docs_root_hash = ? \
               UNION ALL \
                 SELECT r.to_entity_id, t.hop + 1, t.cumulative_conf * r.confidence, \
                        t.path || ',' || CAST(r.to_entity_id AS TEXT) \
@@ -923,7 +937,7 @@ async fn traverse_subject_layer(
                 JOIN traverse t ON t.entity_id = r.from_entity_id \
                 WHERE t.hop < ? \
                   AND r.type IN ({type_placeholders}) \
-                  AND r.agent_id = ? \
+                  AND r.docs_root_hash = ? \
                   AND INSTR(',' || t.path || ',', ',' || CAST(r.to_entity_id AS TEXT) || ',') = 0 \
             ) \
             SELECT DISTINCT t.entity_id, t.hop, t.cumulative_conf, \
@@ -941,7 +955,7 @@ async fn traverse_subject_layer(
             stmt.raw_bind_parameter(param_idx, id)?;
             param_idx += 1;
         }
-        stmt.raw_bind_parameter(param_idx, aid.as_str())?;
+        stmt.raw_bind_parameter(param_idx, drh.as_str())?;
         param_idx += 1;
         stmt.raw_bind_parameter(param_idx, depth)?;
         param_idx += 1;
@@ -949,7 +963,7 @@ async fn traverse_subject_layer(
             stmt.raw_bind_parameter(param_idx, t.as_str())?;
             param_idx += 1;
         }
-        stmt.raw_bind_parameter(param_idx, aid.as_str())?;
+        stmt.raw_bind_parameter(param_idx, drh.as_str())?;
 
         let mut entities = Vec::new();
         let mut raw_rows = stmt.raw_query();
@@ -988,7 +1002,7 @@ async fn traverse_subject_layer(
              WHERE r.from_entity_id IN ({eid_placeholders}) \
                AND r.to_entity_id IN ({eid_placeholders}) \
                AND r.type IN ({type_placeholders}) \
-               AND r.agent_id = ?"
+               AND r.docs_root_hash = ?"
         );
 
         let mut stmt = conn.prepare(&edge_sql)?;
@@ -1005,7 +1019,7 @@ async fn traverse_subject_layer(
             stmt.raw_bind_parameter(param_idx, t.as_str())?;
             param_idx += 1;
         }
-        stmt.raw_bind_parameter(param_idx, aid.as_str())?;
+        stmt.raw_bind_parameter(param_idx, drh.as_str())?;
 
         let mut edges = Vec::new();
         let mut raw_rows = stmt.raw_query();
@@ -1165,7 +1179,7 @@ async fn build_entries_with_edges(
 async fn collect_chunks(
     db: &AsyncDatabase,
     entities: &[TraversedEntity],
-    agent_id: Option<&str>,
+    docs_root_hash: Option<&str>,
 ) -> anyhow::Result<Vec<KgChunkResult>> {
     // Find subject entity IDs in the result set
     let subject_entity_ids: Vec<i64> = entities
@@ -1178,7 +1192,7 @@ async fn collect_chunks(
         return Ok(vec![]);
     }
 
-    let aid = agent_id.map(|s| s.to_owned());
+    let drh = docs_root_hash.map(|s| s.to_owned());
 
     let chunks: Vec<KgChunkResult> = db
         .with_db(move |db| {
@@ -1194,10 +1208,10 @@ async fn collect_chunks(
                  FROM kg_chunk_subjects cs \
                  JOIN kg_chunks c ON c.id = cs.chunk_id \
                  LEFT JOIN search_content sc ON sc.source_type = 'kg_chunk' AND sc.source_id = c.id \
-                 WHERE cs.subject_entity_id IN ({placeholders}){agent_filter} \
+                 WHERE cs.subject_entity_id IN ({placeholders}){hash_filter} \
                  LIMIT ?",
-                agent_filter = if aid.is_some() {
-                    " AND cs.agent_id = ?"
+                hash_filter = if drh.is_some() {
+                    " AND cs.docs_root_hash = ?"
                 } else {
                     ""
                 },
@@ -1209,8 +1223,8 @@ async fn collect_chunks(
                 stmt.raw_bind_parameter(param_idx, id)?;
                 param_idx += 1;
             }
-            if let Some(ref a) = aid {
-                stmt.raw_bind_parameter(param_idx, a.as_str())?;
+            if let Some(ref h) = drh {
+                stmt.raw_bind_parameter(param_idx, h.as_str())?;
                 param_idx += 1;
             }
             stmt.raw_bind_parameter(param_idx, MAX_CHUNKS as i64)?;
@@ -1284,29 +1298,33 @@ mod tests {
         .unwrap();
     }
 
+    /// Test docs_root_hash constant for inline tests.
+    const TEST_DRH: &str = "0000000000000000";
+    const TEST_DR: &str = "/test/docs/solutions";
+
     /// Seed subject entities and relationships for tests.
     async fn seed_subject_graph(db: &AsyncDatabase) {
         db.with_db(|db| {
             let conn = &db.conn;
 
             conn.execute(
-                "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence) \
-                 VALUES ('mika', 'solution_path:webhook_ci_handler', 'solution_path', 'webhook_ci_handler', 0.85)",
-                [],
+                "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+                 VALUES (?1, ?2, 'solution_path:webhook_ci_handler', 'solution_path', 'webhook_ci_handler', 0.85)",
+                rusqlite::params![TEST_DRH, TEST_DR],
             )?;
             let sp_id = conn.last_insert_rowid();
 
             conn.execute(
-                "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence) \
-                 VALUES ('mika', 'failure_mode:flaky_test', 'failure_mode', 'flaky_test', 0.9)",
-                [],
+                "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+                 VALUES (?1, ?2, 'failure_mode:flaky_test', 'failure_mode', 'flaky_test', 0.9)",
+                rusqlite::params![TEST_DRH, TEST_DR],
             )?;
             let fm_id = conn.last_insert_rowid();
 
             conn.execute(
-                "INSERT INTO kg_subject_relationships (agent_id, from_entity_id, to_entity_id, type, confidence) \
-                 VALUES ('mika', ?1, ?2, 'SOLVED_BY', 0.8)",
-                rusqlite::params![sp_id, fm_id],
+                "INSERT INTO kg_subject_relationships (docs_root_hash, docs_root, from_entity_id, to_entity_id, type, confidence) \
+                 VALUES (?1, ?2, ?3, ?4, 'SOLVED_BY', 0.8)",
+                rusqlite::params![TEST_DRH, TEST_DR, sp_id, fm_id],
             )?;
 
             Ok(())
@@ -1326,6 +1344,7 @@ mod tests {
             question: Some("ci_failure".to_string()),
             traversal: None,
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1345,6 +1364,7 @@ mod tests {
             question: Some("ci".to_string()),
             traversal: None,
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1368,6 +1388,7 @@ mod tests {
             question: Some("webhook_ci_handler".to_string()),
             traversal: None,
             agent_id: Some("mika".to_string()),
+            docs_root_hash: Some(TEST_DRH.to_string()),
             include_context: false,
             result_limit: None,
         };
@@ -1394,6 +1415,7 @@ mod tests {
                 max_depth: Some(1),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1416,6 +1438,7 @@ mod tests {
             question: Some("nonexistent_entity".to_string()),
             traversal: None,
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1435,6 +1458,7 @@ mod tests {
             question: Some("build-mika".to_string()),
             traversal: None,
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1464,6 +1488,7 @@ mod tests {
                 max_depth: Some(1),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1504,6 +1529,7 @@ mod tests {
                 max_depth: Some(2),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1532,6 +1558,7 @@ mod tests {
                 max_depth: Some(2),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1553,6 +1580,7 @@ mod tests {
                 max_depth: Some(1),
             }),
             agent_id: Some("mika".to_string()),
+            docs_root_hash: Some(TEST_DRH.to_string()),
             include_context: false,
             result_limit: None,
         };
@@ -1579,6 +1607,7 @@ mod tests {
                 max_depth: Some(0),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1610,6 +1639,7 @@ mod tests {
                 max_depth: Some(2),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1709,6 +1739,7 @@ mod tests {
                 max_depth: Some(0),
             }),
             agent_id: Some("mika".to_string()),
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1748,6 +1779,7 @@ mod tests {
                 max_depth: Some(0),
             }),
             agent_id: Some("mika".to_string()),
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1775,6 +1807,7 @@ mod tests {
                 max_depth: Some(0),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1801,6 +1834,7 @@ mod tests {
                 max_depth: Some(0),
             }),
             agent_id: Some("mika".to_string()),
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1825,6 +1859,7 @@ mod tests {
                 max_depth: None,
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1841,6 +1876,7 @@ mod tests {
             question: None,
             traversal: None,
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1862,6 +1898,7 @@ mod tests {
                 max_depth: Some(100), // should be capped to 4
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1885,6 +1922,7 @@ mod tests {
                 max_depth: Some(2),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1943,6 +1981,7 @@ mod tests {
                 max_depth: Some(4),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };
@@ -1994,6 +2033,7 @@ mod tests {
                 max_depth: Some(2),
             }),
             agent_id: None,
+            docs_root_hash: None,
             include_context: false,
             result_limit: None,
         };

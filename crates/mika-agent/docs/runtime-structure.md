@@ -143,27 +143,39 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20), `enabled INTEGER` (v24). Per-agent overrides: LLM overrides resolve as DB > manifest `[llm]` > agent default (`mika skills llm <name> set <provider>/<model>`). Enabled state is tri-state: `NULL`=default (enabled), `0`=disabled, `1`=explicitly enabled. `enabled=false` evicts the skill from `SkillRegistry.entries` during `apply_overrides()`. Replaces `.disabled` marker files (#629). Default-equals-delete: rows where all columns are NULL are pruned.
 
-### Knowledge Graph Tables (v25; `kg_extractions.source_doc_hash` added v26)
+### Knowledge Graph Tables (v25; v26 added `source_doc_hash`; v27 shared-corpus `docs_root_hash`)
+
+**Domain layer (global, no agent_id or docs_root_hash):**
 
 **kg_entities** — `id INTEGER PK AUTO`, `entity_key TEXT UNIQUE`, `type TEXT NOT NULL`, `name TEXT NOT NULL`, `properties_json TEXT`, `created_at TEXT`, `updated_at TEXT`. Domain-layer entities (skill, tool, agent, problem_type). No `agent_id` — global scope.
 
 **kg_relationships** — `id INTEGER PK AUTO`, `source_entity_id FK→kg_entities`, `target_entity_id FK→kg_entities`, `relationship_type TEXT NOT NULL`, `properties_json TEXT`, `created_at TEXT`. Domain-layer edges (DEPENDS_ON, PROVIDES).
 
-**kg_chunks** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `source_doc_path TEXT NOT NULL`, `chunk_index INTEGER NOT NULL`, `content_hash TEXT NOT NULL`, `created_at TEXT`. Lexical-layer chunks. UNIQUE on `(agent_id, source_doc_path, chunk_index)`.
+**Shared-corpus layer (keyed by `docs_root_hash` — v27, #786):**
 
-**kg_subject_entities** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `entity_key TEXT NOT NULL`, `type TEXT NOT NULL`, `name TEXT NOT NULL`, `confidence REAL NOT NULL`, `properties_json TEXT`, `created_at TEXT`. Subject-layer entities extracted by LLM NER.
+Agents with the same `docs_root` share these tables. `docs_root_hash` is a 16-hex-char SHA-256 prefix of `fs::canonicalize(docs_root)`, computed by `kg::config::hash_docs_root`. `docs_root TEXT` is a debug column (advisory, not indexed).
 
-**kg_subject_relationships** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `source_entity_id FK→kg_subject_entities`, `target_entity_id FK→kg_subject_entities`, `relationship_type TEXT NOT NULL`, `confidence REAL`, `properties_json TEXT`, `created_at TEXT`. Subject-layer fact triples.
+**kg_chunks** — `id INTEGER PK AUTO`, `docs_root_hash TEXT NOT NULL`, `docs_root TEXT NOT NULL`, `seq_id INTEGER NOT NULL`, `source_doc_path TEXT NOT NULL`, `source_doc_hash TEXT NOT NULL`, `created_at TEXT`, `trace_id TEXT`. Lexical-layer chunks. UNIQUE on `(docs_root_hash, source_doc_path, seq_id)`.
 
-**kg_chunk_subjects** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `chunk_id FK→kg_chunks`, `subject_entity_id FK→kg_subject_entities`, `extraction_trace_id TEXT`, `created_at TEXT`. Provenance: which chunk produced which entity.
+**kg_subject_entities** — `id INTEGER PK AUTO`, `docs_root_hash TEXT NOT NULL`, `docs_root TEXT NOT NULL`, `entity_key TEXT NOT NULL`, `type TEXT NOT NULL`, `name TEXT NOT NULL`, `confidence REAL NOT NULL`, `properties_json TEXT`, `created_at TEXT`, `trace_id TEXT`. Subject-layer entities extracted by LLM NER. UNIQUE on `(docs_root_hash, entity_key)`.
 
-**kg_chunk_subject_relationships** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `chunk_id FK→kg_chunks`, `subject_relationship_id FK→kg_subject_relationships`, `extraction_trace_id TEXT`, `created_at TEXT`. Provenance: which chunk produced which relationship.
+**kg_subject_relationships** — `id INTEGER PK AUTO`, `docs_root_hash TEXT NOT NULL`, `docs_root TEXT NOT NULL`, `from_entity_id FK→kg_subject_entities`, `to_entity_id FK→kg_subject_entities`, `type TEXT NOT NULL`, `confidence REAL`, `properties_json TEXT`, `created_at TEXT`, `trace_id TEXT`. Subject-layer fact triples. UNIQUE on `(docs_root_hash, from_entity_id, to_entity_id, type)`.
 
-**kg_extractions** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `source_doc_path TEXT NOT NULL`, `source_doc_hash TEXT` (added v26, #757), `extraction_model TEXT NOT NULL`, `entities_extracted INTEGER`, `relationships_extracted INTEGER`, `extraction_trace_id TEXT`, `created_at TEXT`. Tracking: one row per completed extraction. UNIQUE on `(agent_id, source_doc_path)`. The hash enables content-aware idempotency — the pending-doc query compares the stored hash against `kg_chunks.source_doc_hash` and only re-extracts when they diverge (including the NULL-hash case for pre-v26 rows). Written atomically inside the extraction transaction alongside entity/relationship upserts.
+**kg_chunk_subjects** — `id INTEGER PK AUTO`, `docs_root_hash TEXT NOT NULL`, `docs_root TEXT NOT NULL`, `chunk_id FK→kg_chunks`, `subject_entity_id FK→kg_subject_entities`, `extraction_trace_id TEXT`, `created_at TEXT`. Provenance: which chunk produced which entity. UNIQUE on `(docs_root_hash, chunk_id, subject_entity_id)`.
+
+**kg_chunk_subject_relationships** — `id INTEGER PK AUTO`, `docs_root_hash TEXT NOT NULL`, `docs_root TEXT NOT NULL`, `chunk_id FK→kg_chunks`, `subject_relationship_id FK→kg_subject_relationships`, `extraction_trace_id TEXT`, `created_at TEXT`. Provenance: which chunk produced which relationship. UNIQUE on `(docs_root_hash, chunk_id, subject_relationship_id)`.
+
+**kg_extractions** — `id INTEGER PK AUTO`, `docs_root_hash TEXT NOT NULL`, `docs_root TEXT NOT NULL`, `source_doc_path TEXT NOT NULL`, `source_doc_hash TEXT` (added v26, #757), `extraction_model TEXT NOT NULL`, `entities_extracted INTEGER`, `relationships_extracted INTEGER`, `extraction_trace_id TEXT`, `created_at TEXT`. Tracking: one row per completed extraction. UNIQUE on `(docs_root_hash, source_doc_path)`. First-writer-wins via `INSERT OR IGNORE` — cost N× → 1× for identical corpora. The hash enables content-aware idempotency — the pending-doc query compares the stored hash against `kg_chunks.source_doc_hash` and only re-extracts when they diverge.
+
+**Per-agent layer (keyed by `agent_id`):**
 
 **kg_subject_resolutions** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `subject_entity_id FK→kg_subject_entities`, `domain_entity_id FK→kg_entities`, `confidence REAL NOT NULL CHECK(0.0..1.0)`, `trace_id TEXT`, `created_at TEXT`. Resolution edges bridging subject→domain. UNIQUE on `(agent_id, subject_entity_id, domain_entity_id)`. CASCADE on both FKs. Sole writer: `SubjectEntityResolver` (#691).
 
 **kg_resolutions_log** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `subject_entity_id FK→kg_subject_entities`, `outcome TEXT NOT NULL CHECK(matched_exact|matched_llm|no_match|skipped_discovered_type|skipped_no_llm|error)`, `resolution_trace_id TEXT NOT NULL`, `source_extraction_trace_id TEXT`, `model TEXT`, `duration_ms INTEGER`, `resolved_at TEXT`. Resolution tracking. UNIQUE on `(agent_id, subject_entity_id)`. Sole writer: `SubjectEntityResolver` (#691).
+
+**Migration state tracking (v27+):**
+
+**schema_meta** — `key TEXT PK`, `value TEXT NOT NULL`. Stores migration state markers. Key row: `v27_coalesce_complete` = `'1'` — written by `migrate_v1` (fresh installs) or by #787's coalesce step (upgrades). The v27 startup guard in `Database::open()` refuses to return a handle when this marker is absent at `schema_version == 27`.
 
 ### View
 

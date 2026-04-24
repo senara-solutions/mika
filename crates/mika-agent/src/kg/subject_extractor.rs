@@ -378,6 +378,8 @@ pub struct SubjectExtractor {
     llm: Arc<dyn LlmProvider>,
     trace_id: String,
     docs_root: PathBuf,
+    /// Precomputed `hash_docs_root(&docs_root)` — shared-corpus key for v27 KG tables.
+    docs_root_hash: String,
 }
 
 impl SubjectExtractor {
@@ -396,12 +398,19 @@ impl SubjectExtractor {
         let trace_id = trace_id
             .map(|s| s.to_owned())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let docs_root_hash = super::config::hash_docs_root(&docs_root);
         Self {
             db,
             llm,
             trace_id,
             docs_root,
+            docs_root_hash,
         }
+    }
+
+    /// Returns the precomputed docs_root_hash (shared-corpus key for v27 KG tables).
+    pub fn docs_root_hash(&self) -> &str {
+        &self.docs_root_hash
     }
 
     /// Core extraction entry point — invocation-context-agnostic.
@@ -663,7 +672,7 @@ impl SubjectExtractor {
 
     /// Capture previous provenance state before re-ingestion (D5, Phase 1).
     pub async fn capture_previous_state(&self, doc_path: &str) -> Result<PreviousState> {
-        let agent_id = self.db.agent_id.clone();
+        let docs_root_hash = self.docs_root_hash.clone();
         let doc_path = doc_path.to_owned();
 
         self.db
@@ -673,11 +682,13 @@ impl SubjectExtractor {
                         "SELECT DISTINCT cs.subject_entity_id
                          FROM kg_chunk_subjects cs
                          JOIN kg_chunks c ON cs.chunk_id = c.id
-                         WHERE c.agent_id = ?1 AND c.source_doc_path = ?2",
+                         WHERE c.docs_root_hash = ?1 AND c.source_doc_path = ?2",
                     )?;
-                    stmt.query_map(rusqlite::params![agent_id, doc_path], |row| row.get(0))?
-                        .filter_map(|r| r.ok())
-                        .collect()
+                    stmt.query_map(rusqlite::params![docs_root_hash, doc_path], |row| {
+                        row.get(0)
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect()
                 };
 
                 let relationship_ids: Vec<i64> = {
@@ -685,11 +696,13 @@ impl SubjectExtractor {
                         "SELECT DISTINCT csr.subject_relationship_id
                          FROM kg_chunk_subject_relationships csr
                          JOIN kg_chunks c ON csr.chunk_id = c.id
-                         WHERE c.agent_id = ?1 AND c.source_doc_path = ?2",
+                         WHERE c.docs_root_hash = ?1 AND c.source_doc_path = ?2",
                     )?;
-                    stmt.query_map(rusqlite::params![agent_id, doc_path], |row| row.get(0))?
-                        .filter_map(|r| r.ok())
-                        .collect()
+                    stmt.query_map(rusqlite::params![docs_root_hash, doc_path], |row| {
+                        row.get(0)
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect()
                 };
 
                 Ok(PreviousState {
@@ -715,18 +728,18 @@ impl SubjectExtractor {
 
     /// Get chunk boundaries from kg_chunks for this doc.
     async fn get_chunk_boundaries(&self, doc_path: &str) -> Result<Vec<ChunkBoundary>> {
-        let agent_id = self.db.agent_id.clone();
+        let docs_root_hash = self.docs_root_hash.clone();
         let doc_path = doc_path.to_owned();
 
         self.db
             .with_db(move |db| {
                 let mut stmt = db.conn.prepare(
                     "SELECT id, seq_id FROM kg_chunks
-                     WHERE agent_id = ?1 AND source_doc_path = ?2
+                     WHERE docs_root_hash = ?1 AND source_doc_path = ?2
                      ORDER BY seq_id ASC",
                 )?;
                 let chunks: Vec<ChunkBoundary> = stmt
-                    .query_map(rusqlite::params![agent_id, doc_path], |row| {
+                    .query_map(rusqlite::params![docs_root_hash, doc_path], |row| {
                         Ok(ChunkBoundary {
                             id: row.get(0)?,
                             _seq_id: row.get(1)?,
@@ -988,7 +1001,8 @@ Rules:
         chunks: &[ChunkBoundary],
         previous_state: Option<PreviousState>,
     ) -> Result<ExtractionStats> {
-        let agent_id = self.db.agent_id.clone();
+        let docs_root_hash = self.docs_root_hash.clone();
+        let docs_root_display = self.docs_root.display().to_string();
         let trace_id = self.trace_id.clone();
         let doc_path_owned = doc_path.to_owned();
         let hash_owned = source_doc_hash.map(str::to_owned);
@@ -1013,14 +1027,15 @@ Rules:
                         .map(|d| format!(r#"{{"description":{}}}"#, serde_json::to_string(d).unwrap_or_default()));
 
                     tx.execute(
-                        "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence, properties_json, trace_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                         ON CONFLICT(agent_id, entity_key) DO UPDATE SET
+                        "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence, properties_json, trace_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                         ON CONFLICT(docs_root_hash, entity_key) DO UPDATE SET
                             confidence = MAX(excluded.confidence, kg_subject_entities.confidence),
                             properties_json = COALESCE(excluded.properties_json, kg_subject_entities.properties_json),
                             trace_id = excluded.trace_id",
                         rusqlite::params![
-                            agent_id,
+                            docs_root_hash,
+                            docs_root_display,
                             entity_key,
                             entity.entity_type,
                             entity.name,
@@ -1032,8 +1047,8 @@ Rules:
 
                     // Get the entity ID (whether inserted or existing).
                     let entity_id: i64 = tx.query_row(
-                        "SELECT id FROM kg_subject_entities WHERE agent_id = ?1 AND entity_key = ?2",
-                        rusqlite::params![agent_id, entity_key],
+                        "SELECT id FROM kg_subject_entities WHERE docs_root_hash = ?1 AND entity_key = ?2",
+                        rusqlite::params![docs_root_hash, entity_key],
                         |row| row.get(0),
                     )?;
                     entity_id_map.insert(entity_key, entity_id);
@@ -1044,9 +1059,9 @@ Rules:
                         if let Some(&chunk_id) = chunk_lookup.get(&chunk_idx) {
                             tx.execute(
                                 "INSERT OR IGNORE INTO kg_chunk_subjects
-                                    (agent_id, chunk_id, subject_entity_id, extraction_trace_id)
-                                 VALUES (?1, ?2, ?3, ?4)",
-                                rusqlite::params![agent_id, chunk_id, entity_id, trace_id],
+                                    (docs_root_hash, docs_root, chunk_id, subject_entity_id, extraction_trace_id)
+                                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                                rusqlite::params![docs_root_hash, docs_root_display, chunk_id, entity_id, trace_id],
                             )?;
                         }
                     }
@@ -1068,14 +1083,15 @@ Rules:
 
                     tx.execute(
                         "INSERT INTO kg_subject_relationships
-                            (agent_id, from_entity_id, to_entity_id, type, confidence, properties_json, trace_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                         ON CONFLICT(agent_id, from_entity_id, to_entity_id, type) DO UPDATE SET
+                            (docs_root_hash, docs_root, from_entity_id, to_entity_id, type, confidence, properties_json, trace_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                         ON CONFLICT(docs_root_hash, from_entity_id, to_entity_id, type) DO UPDATE SET
                             confidence = MAX(excluded.confidence, kg_subject_relationships.confidence),
                             properties_json = COALESCE(excluded.properties_json, kg_subject_relationships.properties_json),
                             trace_id = excluded.trace_id",
                         rusqlite::params![
-                            agent_id,
+                            docs_root_hash,
+                            docs_root_display,
                             from_id,
                             to_id,
                             rel.rel_type,
@@ -1087,8 +1103,8 @@ Rules:
 
                     let rel_id: i64 = tx.query_row(
                         "SELECT id FROM kg_subject_relationships
-                         WHERE agent_id = ?1 AND from_entity_id = ?2 AND to_entity_id = ?3 AND type = ?4",
-                        rusqlite::params![agent_id, from_id, to_id, rel.rel_type],
+                         WHERE docs_root_hash = ?1 AND from_entity_id = ?2 AND to_entity_id = ?3 AND type = ?4",
+                        rusqlite::params![docs_root_hash, from_id, to_id, rel.rel_type],
                         |row| row.get(0),
                     )?;
                     stats.relationships_upserted += 1;
@@ -1098,9 +1114,9 @@ Rules:
                         if let Some(&chunk_id) = chunk_lookup.get(&chunk_idx) {
                             tx.execute(
                                 "INSERT OR IGNORE INTO kg_chunk_subject_relationships
-                                    (agent_id, chunk_id, subject_relationship_id, extraction_trace_id)
-                                 VALUES (?1, ?2, ?3, ?4)",
-                                rusqlite::params![agent_id, chunk_id, rel_id, trace_id],
+                                    (docs_root_hash, docs_root, chunk_id, subject_relationship_id, extraction_trace_id)
+                                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                                rusqlite::params![docs_root_hash, docs_root_display, chunk_id, rel_id, trace_id],
                             )?;
                         }
                     }
@@ -1115,7 +1131,7 @@ Rules:
                         let sql = format!(
                             "DELETE FROM kg_subject_entities
                              WHERE id IN ({placeholders})
-                               AND id NOT IN (SELECT subject_entity_id FROM kg_chunk_subjects WHERE agent_id = ?)",
+                               AND id NOT IN (SELECT subject_entity_id FROM kg_chunk_subjects WHERE docs_root_hash = ?)",
                             placeholders = placeholders.join(",")
                         );
                         let mut stmt = tx.prepare(&sql)?;
@@ -1124,7 +1140,7 @@ Rules:
                             .iter()
                             .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
                             .collect();
-                        params.push(Box::new(agent_id.clone()));
+                        params.push(Box::new(docs_root_hash.clone()));
                         stats.orphans_removed +=
                             stmt.execute(rusqlite::params_from_iter(params))? as usize;
                     }
@@ -1139,7 +1155,7 @@ Rules:
                         let sql = format!(
                             "DELETE FROM kg_subject_relationships
                              WHERE id IN ({placeholders})
-                               AND id NOT IN (SELECT subject_relationship_id FROM kg_chunk_subject_relationships WHERE agent_id = ?)",
+                               AND id NOT IN (SELECT subject_relationship_id FROM kg_chunk_subject_relationships WHERE docs_root_hash = ?)",
                             placeholders = placeholders.join(",")
                         );
                         let mut stmt = tx.prepare(&sql)?;
@@ -1148,7 +1164,7 @@ Rules:
                             .iter()
                             .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
                             .collect();
-                        params.push(Box::new(agent_id.clone()));
+                        params.push(Box::new(docs_root_hash.clone()));
                         stats.orphans_removed +=
                             stmt.execute(rusqlite::params_from_iter(params))? as usize;
                     }
@@ -1160,18 +1176,12 @@ Rules:
                 // path that burns budget forever; keeping both in one
                 // transaction eliminates that window.
                 tx.execute(
-                    "INSERT INTO kg_extractions
-                        (agent_id, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(agent_id, source_doc_path) DO UPDATE SET
-                        source_doc_hash = excluded.source_doc_hash,
-                        extraction_model = excluded.extraction_model,
-                        entities_extracted = excluded.entities_extracted,
-                        relationships_extracted = excluded.relationships_extracted,
-                        extraction_trace_id = excluded.extraction_trace_id,
-                        created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+                    "INSERT OR IGNORE INTO kg_extractions
+                        (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     rusqlite::params![
-                        agent_id,
+                        docs_root_hash,
+                        docs_root_display,
                         doc_path_owned,
                         hash_owned,
                         model_owned,
@@ -1196,24 +1206,24 @@ Rules:
     /// direct hash-equality predicate catches both the "never extracted"
     /// and "extracted-but-stale" cases without aggregation.
     async fn get_pending_docs(&self) -> Result<Vec<String>> {
-        let agent_id = self.db.agent_id.clone();
+        let docs_root_hash = self.docs_root_hash.clone();
 
         self.db
             .with_db(move |db| {
                 let mut stmt = db.conn.prepare(
                     "SELECT DISTINCT c.source_doc_path
                      FROM kg_chunks c
-                     WHERE c.agent_id = ?1
+                     WHERE c.docs_root_hash = ?1
                        AND NOT EXISTS (
                          SELECT 1 FROM kg_extractions e
-                         WHERE e.agent_id        = c.agent_id
+                         WHERE e.docs_root_hash  = c.docs_root_hash
                            AND e.source_doc_path = c.source_doc_path
                            AND e.source_doc_hash = c.source_doc_hash
                        )
                      ORDER BY c.source_doc_path",
                 )?;
                 let paths: Vec<String> = stmt
-                    .query_map(rusqlite::params![agent_id], |row| row.get(0))?
+                    .query_map(rusqlite::params![docs_root_hash], |row| row.get(0))?
                     .filter_map(|r| r.ok())
                     .collect();
                 Ok(paths)
@@ -1227,7 +1237,7 @@ Rules:
     /// missing-hash as "write NULL into `kg_extractions.source_doc_hash`,"
     /// which the pending query rejects → the doc re-extracts once next run.
     async fn get_doc_hash(&self, doc_path: &str) -> Result<Option<String>> {
-        let agent_id = self.db.agent_id.clone();
+        let docs_root_hash = self.docs_root_hash.clone();
         let doc_path = doc_path.to_owned();
 
         self.db
@@ -1238,9 +1248,9 @@ Rules:
                     .query_row(
                         "SELECT source_doc_hash
                          FROM kg_chunks
-                         WHERE agent_id = ?1 AND source_doc_path = ?2
+                         WHERE docs_root_hash = ?1 AND source_doc_path = ?2
                          LIMIT 1",
-                        rusqlite::params![agent_id, doc_path],
+                        rusqlite::params![docs_root_hash, doc_path],
                         |row| row.get(0),
                     )
                     .optional()?;

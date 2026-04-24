@@ -4,9 +4,10 @@
 //! lexical ingestor at server startup and (in the future) by #778's
 //! per-agent resolver.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mika_common::config::Settings;
+use sha2::{Digest, Sha256};
 
 /// Source of the resolved docs root path.
 ///
@@ -69,6 +70,41 @@ pub fn resolve_kg_docs_root(settings: &Settings) -> (PathBuf, PathSource) {
         .join("docs")
         .join("solutions");
     (cwd_default, PathSource::CwdDefault)
+}
+
+/// Compute a 16-hex-char hash of a docs root path for use as a shared-corpus
+/// key in the KG schema (v27+).
+///
+/// # Semantics
+///
+/// - `sha256(fs::canonicalize(path))[:16]` — 16 hex chars = 64 bits.
+/// - If canonicalization fails (e.g., path does not exist), the raw path
+///   bytes are hashed instead. Consumers that care about path existence
+///   (e.g., #778's per-agent resolver) check separately.
+/// - **Per-host stability only.** `~/.mika/data/mika.db` is machine-local
+///   (same category as `~/.cache`). The hash is stable across restarts on
+///   the same host but NOT portable across hosts with different filesystem
+///   layouts.
+/// - Canonicalization is OS-dependent — on Windows, `fs::canonicalize`
+///   yields UNC-prefixed paths (`\\?\C:\...`). The codebase targets
+///   Linux/macOS; Windows behavior is documented, not tested.
+///
+/// # Public contract
+///
+/// Consumed by #778's per-agent resolver and #779's KG CLI status output.
+/// Signature changes require coordinated update across those tickets. The
+/// `signature_binding` test below catches mechanical drift at compile time.
+pub fn hash_docs_root(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize();
+    // First 8 bytes = 16 hex chars = 64 bits.
+    // Use per-byte formatting to guarantee zero-padded 16-char output.
+    digest[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 #[cfg(test)]
@@ -177,5 +213,69 @@ mod tests {
             PathSource::ConfigFile => (),
             PathSource::CwdDefault => (),
         }
+    }
+
+    // ── hash_docs_root tests ──────────────────────────────────────────────
+
+    #[test]
+    fn hash_docs_root_returns_16_hex_chars() {
+        let hash = hash_docs_root(Path::new("/tmp/foo"));
+        assert_eq!(hash.len(), 16, "hash must be exactly 16 hex chars");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must contain only hex digits, got: {hash}"
+        );
+    }
+
+    #[test]
+    fn hash_docs_root_deterministic() {
+        let a = hash_docs_root(Path::new("/tmp/foo"));
+        let b = hash_docs_root(Path::new("/tmp/foo"));
+        assert_eq!(a, b, "same path must produce same hash");
+    }
+
+    #[test]
+    fn hash_docs_root_canonicalization() {
+        // Create real directories so canonicalize resolves both paths identically.
+        // Both `target` AND `aux` must exist for `aux/../target` to canonicalize.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let aux = dir.path().join("aux");
+        std::fs::create_dir_all(&aux).unwrap();
+
+        let via_dotdot = dir.path().join("aux").join("..").join("target");
+        assert_eq!(
+            hash_docs_root(&target),
+            hash_docs_root(&via_dotdot),
+            "canonicalized paths to the same directory must produce the same hash"
+        );
+    }
+
+    #[test]
+    fn hash_docs_root_nonexistent_path_no_panic() {
+        let hash = hash_docs_root(Path::new("/does/not/exist/xyz"));
+        assert_eq!(
+            hash.len(),
+            16,
+            "non-existent path still returns 16-char hash"
+        );
+        // Determinism holds even on non-existent paths.
+        let hash2 = hash_docs_root(Path::new("/does/not/exist/xyz"));
+        assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn hash_docs_root_different_paths_differ() {
+        let a = hash_docs_root(Path::new("/a"));
+        let b = hash_docs_root(Path::new("/b"));
+        assert_ne!(a, b, "different paths should produce different hashes");
+    }
+
+    /// Signature binding — prevents silent drift from the public contract
+    /// that #778 and #779 depend on.
+    #[test]
+    fn hash_docs_root_signature_binding() {
+        let _: fn(&Path) -> String = hash_docs_root;
     }
 }

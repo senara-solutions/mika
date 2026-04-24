@@ -53,6 +53,8 @@ pub struct IngestionOrchestrator {
     resolution_budget: u32,
     trace_id: String,
     session_id: String,
+    /// Precomputed `hash_docs_root(&docs_root)` — shared-corpus key for v27 KG tables.
+    docs_root_hash: String,
 }
 
 impl IngestionOrchestrator {
@@ -75,6 +77,7 @@ impl IngestionOrchestrator {
         let trace_id = trace_id
             .map(|s| s.to_owned())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let docs_root_hash = super::config::hash_docs_root(&docs_root);
         Self {
             db,
             docs_root,
@@ -83,6 +86,7 @@ impl IngestionOrchestrator {
             resolution_budget,
             trace_id,
             session_id: session_id.unwrap_or("compound").to_owned(),
+            docs_root_hash,
         }
     }
 
@@ -254,9 +258,11 @@ impl IngestionOrchestrator {
         let agent_id = self.db.agent_id.clone();
         let doc_path = doc_path.to_owned();
         let budget = self.resolution_budget;
+        let docs_root_hash = self.docs_root_hash.clone();
 
         tokio::spawn(async move {
-            let resolver = SubjectEntityResolver::new(db, resolution_llm, Some(&trace_id));
+            let resolver =
+                SubjectEntityResolver::new(db, resolution_llm, docs_root_hash, Some(&trace_id));
 
             match resolver.resolve_pending(budget).await {
                 Ok(stats) => {

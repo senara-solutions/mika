@@ -72,6 +72,9 @@ const STARTUP_SESSION_ID: &str = "startup";
 pub struct LexicalIngestor {
     db: AsyncDatabase,
     docs_root: PathBuf,
+    /// Precomputed `hash_docs_root(&docs_root)` — used as the shared-corpus
+    /// key in v27 KG tables instead of `agent_id`.
+    docs_root_hash: String,
     trace_id: String,
     /// Session ID for audit events. Defaults to [`STARTUP_SESSION_ID`] for
     /// startup scans; compound hook callers may pass the active session.
@@ -89,12 +92,19 @@ impl LexicalIngestor {
         let trace_id = trace_id
             .map(|s| s.to_owned())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let docs_root_hash = super::config::hash_docs_root(&docs_root);
         Self {
             db,
             docs_root,
+            docs_root_hash,
             trace_id,
             session_id: STARTUP_SESSION_ID.to_owned(),
         }
+    }
+
+    /// Returns the precomputed docs_root_hash (shared-corpus key for v27 KG tables).
+    pub fn docs_root_hash(&self) -> &str {
+        &self.docs_root_hash
     }
 
     /// Create an ingestor with a specific session ID (for compound hook use).
@@ -245,6 +255,8 @@ impl LexicalIngestor {
         let chunks = chunk_doc(&normalized);
 
         let agent_id = self.db.agent_id.clone();
+        let docs_root_hash = self.docs_root_hash.clone();
+        let docs_root_display = self.docs_root.display().to_string();
         let rel_path_owned = rel_path.clone();
         let new_hash_owned = new_hash;
         let trace_id = self.trace_id.clone();
@@ -258,11 +270,12 @@ impl LexicalIngestor {
                 let existing_hashes: Vec<String> = {
                     let mut stmt = db.conn.prepare(
                         "SELECT DISTINCT source_doc_hash FROM kg_chunks
-                         WHERE agent_id = ?1 AND source_doc_path = ?2",
+                         WHERE docs_root_hash = ?1 AND source_doc_path = ?2",
                     )?;
-                    stmt.query_map(rusqlite::params![agent_id, rel_path_owned], |row| {
-                        row.get(0)
-                    })?
+                    stmt.query_map(
+                        rusqlite::params![docs_root_hash, rel_path_owned],
+                        |row| row.get(0),
+                    )?
                     .filter_map(|r| r.ok())
                     .collect()
                 };
@@ -283,11 +296,12 @@ impl LexicalIngestor {
                     // Clean up search_content/FTS/vec for each chunk.
                     let chunk_ids: Vec<i64> = {
                         let mut stmt = tx.prepare(
-                            "SELECT id FROM kg_chunks WHERE agent_id = ?1 AND source_doc_path = ?2",
+                            "SELECT id FROM kg_chunks WHERE docs_root_hash = ?1 AND source_doc_path = ?2",
                         )?;
-                        stmt.query_map(rusqlite::params![agent_id, rel_path_owned], |row| {
-                            row.get(0)
-                        })?
+                        stmt.query_map(
+                            rusqlite::params![docs_root_hash, rel_path_owned],
+                            |row| row.get(0),
+                        )?
                         .filter_map(|r| r.ok())
                         .collect()
                     };
@@ -301,18 +315,19 @@ impl LexicalIngestor {
 
                     deleted = chunk_ids.len();
                     tx.execute(
-                        "DELETE FROM kg_chunks WHERE agent_id = ?1 AND source_doc_path = ?2",
-                        rusqlite::params![agent_id, rel_path_owned],
+                        "DELETE FROM kg_chunks WHERE docs_root_hash = ?1 AND source_doc_path = ?2",
+                        rusqlite::params![docs_root_hash, rel_path_owned],
                     )?;
                 }
 
                 // 3. Insert new chunks + index_content in the same transaction.
                 for chunk in &chunks {
                     tx.execute(
-                        "INSERT INTO kg_chunks (agent_id, seq_id, source_doc_path, source_doc_hash, trace_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        "INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash, trace_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         rusqlite::params![
-                            agent_id,
+                            docs_root_hash,
+                            docs_root_display,
                             chunk.seq_id,
                             rel_path_owned,
                             new_hash_owned,
@@ -363,6 +378,7 @@ impl LexicalIngestor {
     /// Returns the number of chunks deleted.
     async fn delete_doc_chunks(&self, rel_path: &str) -> Result<usize> {
         let agent_id = self.db.agent_id.clone();
+        let docs_root_hash = self.docs_root_hash.clone();
         let rel_path = rel_path.to_owned();
 
         self.db
@@ -372,11 +388,13 @@ impl LexicalIngestor {
                 // Get chunk IDs for this doc.
                 let chunk_ids: Vec<i64> = {
                     let mut stmt = tx.prepare(
-                        "SELECT id FROM kg_chunks WHERE agent_id = ?1 AND source_doc_path = ?2",
+                        "SELECT id FROM kg_chunks WHERE docs_root_hash = ?1 AND source_doc_path = ?2",
                     )?;
-                    stmt.query_map(rusqlite::params![agent_id, rel_path], |row| row.get(0))?
-                        .filter_map(|r| r.ok())
-                        .collect()
+                    stmt.query_map(rusqlite::params![docs_root_hash, rel_path], |row| {
+                        row.get(0)
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect()
                 };
 
                 // Symmetric delete: use the canonical delete_search_content which
@@ -389,8 +407,8 @@ impl LexicalIngestor {
 
                 let count = chunk_ids.len();
                 tx.execute(
-                    "DELETE FROM kg_chunks WHERE agent_id = ?1 AND source_doc_path = ?2",
-                    rusqlite::params![agent_id, rel_path],
+                    "DELETE FROM kg_chunks WHERE docs_root_hash = ?1 AND source_doc_path = ?2",
+                    rusqlite::params![docs_root_hash, rel_path],
                 )?;
 
                 tx.commit()?;
@@ -402,15 +420,15 @@ impl LexicalIngestor {
     /// Find and delete chunks for docs no longer on disk.
     async fn prune_removed_docs(&self, on_disk_paths: &HashSet<String>) -> Result<(usize, usize)> {
         // Get all tracked doc paths from DB.
-        let agent_id = self.db.agent_id.clone();
+        let docs_root_hash = self.docs_root_hash.clone();
         let tracked_paths: Vec<String> = self
             .db
             .with_db(move |db| {
                 let mut stmt = db.conn.prepare(
-                    "SELECT DISTINCT source_doc_path FROM kg_chunks WHERE agent_id = ?1",
+                    "SELECT DISTINCT source_doc_path FROM kg_chunks WHERE docs_root_hash = ?1",
                 )?;
                 let paths: Vec<String> = stmt
-                    .query_map(rusqlite::params![agent_id], |row| row.get(0))?
+                    .query_map(rusqlite::params![docs_root_hash], |row| row.get(0))?
                     .filter_map(|r| r.ok())
                     .collect();
                 Ok(paths)

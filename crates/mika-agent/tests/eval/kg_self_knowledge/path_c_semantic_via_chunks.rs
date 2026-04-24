@@ -69,6 +69,7 @@ async fn test_path_c_chunk_to_subject_to_domain_bridge() {
         question: Some("self-dev".to_string()),
         traversal: None,
         agent_id: Some("mika-dev".to_string()),
+        docs_root_hash: None,
         include_context: false,
         result_limit: None,
     };
@@ -139,6 +140,7 @@ async fn test_path_c_no_resolution_yields_subject_only() {
         question: Some("webhook-ci-handler".to_string()),
         traversal: None,
         agent_id: Some("mika-dev".to_string()),
+        docs_root_hash: Some("0000000000000000".to_string()),
         include_context: false,
         result_limit: None,
     };

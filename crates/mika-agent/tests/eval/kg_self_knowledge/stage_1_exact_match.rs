@@ -45,7 +45,12 @@ async fn test_stage_1_exact_match_case_insensitive() {
     .await;
 
     // Run resolver — no LLM needed for exact match
-    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("test-stage-1"));
+    let resolver = SubjectEntityResolver::new(
+        db.clone(),
+        None,
+        "0000000000000000".to_string(),
+        Some("test-stage-1"),
+    );
     let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
 
     // Hard assertions on stats
@@ -113,7 +118,12 @@ async fn test_stage_1_low_confidence_escalates_to_stage_2() {
 
     // Run resolver with no LLM — exact match found but low confidence,
     // escalates to Stage 2 which skips because no LLM.
-    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("test-stage-1-low"));
+    let resolver = SubjectEntityResolver::new(
+        db.clone(),
+        None,
+        "0000000000000000".to_string(),
+        Some("test-stage-1-low"),
+    );
     let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
 
     assert_eq!(stats.total, 1);
@@ -150,7 +160,12 @@ async fn test_stage_1_discovered_type_skipped() {
     )
     .await;
 
-    let resolver = SubjectEntityResolver::new(db.clone(), None, Some("test-discovered"));
+    let resolver = SubjectEntityResolver::new(
+        db.clone(),
+        None,
+        "0000000000000000".to_string(),
+        Some("test-discovered"),
+    );
     // Use resolve_doc_entities which takes explicit IDs (no SQL type filter)
     let stats = resolver
         .resolve_doc_entities(&[subject_id], "test-extraction-trace", u32::MAX)

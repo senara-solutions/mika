@@ -31,11 +31,12 @@ async fn test_path_b_subject_match_correct_agent() {
     )
     .await;
 
-    // Query as mika-dev (should find it)
+    // Query with the correct docs_root_hash (should find it)
     let input = KgQueryInput {
         question: Some("fabrication-guard".to_string()),
         traversal: None,
         agent_id: Some("mika-dev".to_string()),
+        docs_root_hash: Some("0000000000000000".to_string()),
         include_context: false,
         result_limit: None,
     };
@@ -83,11 +84,12 @@ async fn test_path_b_agent_scoped_isolation() {
     )
     .await;
 
-    // Query as mika-qa (different agent) — should NOT find it
+    // Query with a different docs_root_hash — should NOT find it (corpus-scoped isolation)
     let input = KgQueryInput {
         question: Some("fabrication-guard".to_string()),
         traversal: None,
         agent_id: Some("mika-qa".to_string()),
+        docs_root_hash: Some("ffffffffffffffff".to_string()),
         include_context: false,
         result_limit: None,
     };
@@ -97,11 +99,11 @@ async fn test_path_b_agent_scoped_isolation() {
     assert_eq!(
         result.status,
         KgQueryStatus::StartingEntityMissing,
-        "Different agent should not see mika-dev's subject entities (agent-scoped isolation)"
+        "Different docs_root_hash should not see entities from another corpus (v27 corpus-scoped isolation)"
     );
     assert!(
         result.entries.is_empty(),
-        "No entries should be returned for a different agent"
+        "No entries should be returned for a different corpus"
     );
 }
 
@@ -127,6 +129,7 @@ async fn test_path_b_no_agent_id_skips_subject_layer() {
         question: Some("fabrication-guard".to_string()),
         traversal: None,
         agent_id: None,
+        docs_root_hash: None,
         include_context: false,
         result_limit: None,
     };
