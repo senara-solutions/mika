@@ -5,7 +5,7 @@ use chrono::{DateTime, NaiveTime, Utc};
 use mika_common::{agent, team};
 use serde::Deserialize;
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Configuration for periodic memory reflection.
 #[derive(Debug, Deserialize, Clone)]
@@ -43,6 +43,38 @@ impl ReflectionConfig {
     }
 }
 
+/// Per-agent Knowledge Graph configuration from `[kg]` section of `identity.toml`.
+///
+/// Controls whether the KG subsystem runs for this agent and which docs root
+/// it reads from. When `enabled` is `false`, no KG subsystem components
+/// (`LexicalIngestor`, `SubjectExtractor`, `SubjectEntityResolver`) are
+/// constructed for the agent. When `docs_root` is `None`, the global fallback
+/// chain applies (#738): `MIKA_KG_DOCS_ROOT` env > `kg_docs_root` config >
+/// `<CWD>/docs/solutions`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct KgIdentityConfig {
+    /// Whether KG ingestion/extraction/resolution runs for this agent.
+    /// Default: `true` (preserves current behavior for existing agents).
+    #[serde(default = "default_kg_enabled")]
+    pub enabled: bool,
+    /// Absolute path to the docs root this agent's KG reads from.
+    /// When `None`, falls back to the global resolver (#738).
+    pub docs_root: Option<PathBuf>,
+}
+
+fn default_kg_enabled() -> bool {
+    true
+}
+
+impl Default for KgIdentityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_kg_enabled(),
+            docs_root: None,
+        }
+    }
+}
+
 /// Agent identity loaded from ~/.mika/identity.toml.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Identity {
@@ -52,6 +84,8 @@ pub struct Identity {
     pub emoji: String,
     #[serde(default)]
     pub reflection: Option<ReflectionConfig>,
+    #[serde(default)]
+    pub kg: KgIdentityConfig,
 }
 
 fn default_name() -> String {
@@ -68,6 +102,7 @@ impl Default for Identity {
             name: default_name(),
             emoji: default_emoji(),
             reflection: None,
+            kg: KgIdentityConfig::default(),
         }
     }
 }
@@ -736,6 +771,7 @@ mod tests {
             name: "Mika".to_string(),
             emoji: "✦".to_string(),
             reflection: None,
+            kg: KgIdentityConfig::default(),
         }
     }
 
@@ -813,6 +849,7 @@ mod tests {
             name: "TestBot".to_string(),
             emoji: "🤖".to_string(),
             reflection: None,
+            kg: KgIdentityConfig::default(),
         };
         let ctx = PromptContext {
             soul_content: "",
@@ -2004,5 +2041,91 @@ notify = true
         assert!(prompt.contains("current user message > core memory > active skill context"));
         assert!(prompt.contains("conversation summary"));
         assert!(prompt.contains("conversation history > search results"));
+    }
+
+    // ── KgIdentityConfig deserialization tests (#778) ─────────────────────
+
+    #[test]
+    fn kg_identity_config_empty_toml_defaults() {
+        let identity: Identity = toml::from_str("").unwrap();
+        assert!(identity.kg.enabled);
+        assert!(identity.kg.docs_root.is_none());
+    }
+
+    #[test]
+    fn kg_identity_config_existing_agent_without_kg() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Mika"
+emoji = "✦"
+"#,
+        )
+        .unwrap();
+        assert_eq!(identity.name, "Mika");
+        assert_eq!(identity.emoji, "✦");
+        assert!(identity.kg.enabled);
+        assert!(identity.kg.docs_root.is_none());
+    }
+
+    #[test]
+    fn kg_identity_config_both_fields() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "X"
+
+[kg]
+enabled = true
+docs_root = "/data/docs"
+"#,
+        )
+        .unwrap();
+        assert!(identity.kg.enabled);
+        assert_eq!(
+            identity.kg.docs_root.as_deref(),
+            Some(Path::new("/data/docs"))
+        );
+    }
+
+    #[test]
+    fn kg_identity_config_only_enabled_false() {
+        let identity: Identity = toml::from_str(
+            r#"
+[kg]
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(!identity.kg.enabled);
+        assert!(identity.kg.docs_root.is_none());
+    }
+
+    #[test]
+    fn kg_identity_config_only_docs_root() {
+        let identity: Identity = toml::from_str(
+            r#"
+[kg]
+docs_root = "/path"
+"#,
+        )
+        .unwrap();
+        assert!(identity.kg.enabled);
+        assert_eq!(identity.kg.docs_root.as_deref(), Some(Path::new("/path")));
+    }
+
+    #[test]
+    fn kg_identity_config_malformed_falls_back_via_load() {
+        // Malformed [kg] causes Identity::default() via load_identity's
+        // unwrap_or_default — kg defaults to enabled=true, docs_root=None.
+        let result: Result<Identity, _> = toml::from_str(
+            r#"
+[kg]
+docs_root = 42
+"#,
+        );
+        assert!(result.is_err(), "malformed [kg] should fail toml parse");
+        // load_identity wraps with unwrap_or_default:
+        let identity = result.unwrap_or_default();
+        assert!(identity.kg.enabled);
+        assert!(identity.kg.docs_root.is_none());
     }
 }

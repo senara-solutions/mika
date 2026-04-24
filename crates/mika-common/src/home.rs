@@ -263,6 +263,10 @@ log_level = "info"
 
 pub const DEFAULT_IDENTITY: &str = r#"name = "Mika"
 emoji = "✦"
+
+# [kg]
+# enabled = true                    # default: true — set false to skip KG for this agent
+# docs_root = "/path/to/docs"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions
 "#;
 
 pub const DEFAULT_SOUL: &str = r#"# Mika — Executive Assistant

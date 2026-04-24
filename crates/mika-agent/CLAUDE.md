@@ -204,7 +204,31 @@ If a database restart between #786 and #787 deployments leaves the DB stuck at v
 
 ## Knowledge Graph — Docs Root Configuration
 
-`src/kg/config.rs` — Resolution chain for the docs root path the lexical ingestor reads (#738). Resolution order (first hit wins): `MIKA_KG_DOCS_ROOT` env var > `kg_docs_root` config.toml field > `<CWD>/docs/solutions` (container-native default). `resolve_kg_docs_root(&Settings) -> (PathBuf, PathSource)` is the public API. For OpenRC hosts where the service starts with CWD ≠ repo root, set `MIKA_KG_DOCS_ROOT=/path/to/mika-repo/docs/solutions` in the service config, or use the existing `--chdir` init-script workaround.
+`src/kg/config.rs` — Resolution chain for the docs root path the lexical ingestor reads (#738, #778). Two levels of resolution:
+
+**Global fallback** (#738): `resolve_kg_docs_root(&Settings) -> (PathBuf, PathSource)`. Resolution order (first hit wins): `MIKA_KG_DOCS_ROOT` env var > `kg_docs_root` config.toml field > `<CWD>/docs/solutions` (container-native default).
+
+**Per-agent resolution** (#778): `resolve_per_agent_docs_root(&Identity, &Settings) -> Result<KgAgentConfig, KgConfigError>`. Each agent's `identity.toml` gains a `[kg]` section:
+
+```toml
+[kg]
+enabled = true                    # default: true
+docs_root = "/absolute/path"      # optional; falls back to global chain above
+```
+
+**Behavior matrix:**
+
+| `enabled` | `docs_root` set | Behavior |
+|-----------|-----------------|----------|
+| `true` (default) | set | Validate path exists as directory; hard-error if not; else use it with computed `docs_root_hash`. |
+| `true` | unset | Fall back to global resolver. Hard-error on explicit env/config source if missing; warn-and-skip on CWD default. |
+| `false` | any | Skip KG entirely (no `LexicalIngestor`, no `SubjectExtractor`, no `SubjectEntityResolver`). Existing shared-corpus rows preserved. |
+
+**Types:** `KgAgentConfig` enum (`Disabled` / `Enabled { docs_root, docs_root_hash }`), `KgConfigError` via `thiserror`. Resolved at `init_agent` time, cached on `AgentState.kg_config`. Per-agent failure isolation: a single agent's KG misconfiguration skips that agent; others start normally.
+
+**Hard-error policy:** Explicit paths (per-agent or global config/env) that don't exist fail loud. CWD-based default uses warn-and-skip per #738's policy. `enabled=false` does NOT delete existing rows — cleanup via #779's CLI.
+
+For OpenRC hosts where the service starts with CWD ≠ repo root, set `MIKA_KG_DOCS_ROOT=/path/to/mika-repo/docs/solutions` in the service config, or use the existing `--chdir` init-script workaround.
 
 ## Knowledge Graph — Subject Extractor
 

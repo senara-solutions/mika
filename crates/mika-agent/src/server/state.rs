@@ -14,6 +14,7 @@ use secrecy::SecretString;
 use tokio::sync::{OnceCell, broadcast};
 
 use crate::async_db::AsyncDatabase;
+use crate::kg::config::KgAgentConfig;
 use crate::mcp::McpManager;
 use crate::server::webhook_queue::DeferredWebhook;
 use crate::skills::SkillRegistry;
@@ -45,6 +46,10 @@ pub struct AgentState {
     /// Webhooks targeting a task with an in-flight callback are held here until
     /// the callback completes or the 60s timeout expires.
     pub webhook_queue: Arc<tokio::sync::Mutex<Vec<DeferredWebhook>>>,
+    /// Per-agent KG configuration resolved at init time (#778). `Disabled` skips
+    /// all KG subsystem construction; `Enabled` provides the validated docs_root
+    /// and precomputed docs_root_hash for the three KG startup loops.
+    pub kg_config: KgAgentConfig,
 }
 
 /// Shared application state for the Axum HTTP server.

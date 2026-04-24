@@ -396,19 +396,27 @@ defaults to `~/.mika/`.
 
 ## identity.toml
 
-Defines the assistant's display identity.
+Defines the assistant's display identity and per-agent Knowledge Graph configuration.
 
 **Default content:**
 
 ```toml
 name = "Mika"
 emoji = "✦"
+
+# [kg]
+# enabled = true                    # default: true — set false to skip KG for this agent
+# docs_root = "/path/to/docs"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions
 ```
 
 | Field | Description |
 |-------|-------------|
 | `name` | The assistant's display name, used in prompts and UI. |
 | `emoji` | A single character or emoji shown alongside the assistant's name in the TUI. |
+| `[kg].enabled` | Whether KG ingestion/extraction/resolution runs for this agent. Default: `true`. |
+| `[kg].docs_root` | Absolute path to the docs root this agent's KG reads from. Optional; falls back to the global resolver chain (`MIKA_KG_DOCS_ROOT` env > `kg_docs_root` config > `<CWD>/docs/solutions`). |
+
+**`[kg]` behavior:** When `enabled = false`, no KG subsystem components are constructed for the agent. Existing shared-corpus rows are preserved (cleanup via `mika kg purge`). When `docs_root` is set to an explicit path that doesn't exist, the agent fails to start with a clear error. Agents with matching `docs_root` share extraction via `docs_root_hash` (v27 schema).
 
 To customize, edit `~/.mika/identity.toml`:
 

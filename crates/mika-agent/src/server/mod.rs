@@ -17,7 +17,8 @@ pub(crate) mod verdict;
 pub mod verdict_handler;
 pub mod webhook_queue;
 
-use anyhow::{Result, anyhow};
+use crate::kg::config::KgAgentConfig;
+use anyhow::{Context as _, Result, anyhow};
 use axum::{
     Router,
     extract::Request,
@@ -358,6 +359,8 @@ async fn init_agent(
     std::fs::create_dir_all(db_path.parent().unwrap())?;
     let db = Database::open(&db_path)?;
     let identity = crate::prompt::load_identity(agent_home);
+    let kg_config = crate::kg::config::resolve_per_agent_docs_root(&identity, &agent_settings)
+        .with_context(|| format!("failed to resolve [kg] config for agent {agent_name}"))?;
     db.register_agent(
         agent_name,
         &identity.name,
@@ -451,6 +454,7 @@ async fn init_agent(
         llm: agent_llm,
         github_app,
         webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        kg_config,
     };
 
     debug!(agent = agent_name, home = %agent_home.display(), "initialized agent");
@@ -755,69 +759,92 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         }
     }
 
-    // Lexical graph ingestion: chunk docs/solutions/**/*.md per agent, index
-    // into search_content for hybrid search. Runs after domain rebuild so each
+    // Lexical graph ingestion: chunk docs per agent, index into
+    // search_content for hybrid search. Runs after domain rebuild so each
     // KG layer's startup work composes cleanly for #690+.
     //
-    // docs_root resolved via config cascade (#738):
-    //   MIKA_KG_DOCS_ROOT env > kg_docs_root config > <CWD>/docs/solutions
+    // Per-agent docs_root resolved from identity.toml [kg] section (#778).
+    // Agents with matching docs_root share a corpus via docs_root_hash (v27).
+    // Agents with [kg] enabled=false are skipped entirely.
     {
-        let (docs_root, _source) = crate::kg::config::resolve_kg_docs_root(settings);
-        let docs_root_hash = crate::kg::config::hash_docs_root(&docs_root);
-
-        // Empty-path guard (#738): distinguish misconfigured empty value from
-        // genuinely missing directory so operators don't chase misleading logs.
-        if docs_root.as_os_str().is_empty() {
-            warn!(
-                "kg_docs_root is set to empty string — check MIKA_KG_DOCS_ROOT env var or \
-                 kg_docs_root in config.toml; skipping lexical ingestion"
-            );
-        } else if docs_root.exists() {
-            // Fan-out cost advisory (#757 R3). All agents use the same docs_root,
-            // so per-agent extraction/resolution scales N× with agent count.
-            // Only emit when there's actually a multiplier to warn about.
-            if agents.len() >= 2 {
-                let shared_agents: Vec<&str> = agents.keys().map(|s| s.as_str()).collect();
+        for (agent_name, agent_state) in &agents {
+            let KgAgentConfig::Enabled {
+                ref docs_root,
+                ref docs_root_hash,
+            } = agent_state.kg_config
+            else {
                 info!(
-                    event = "kg_shared_docs_root",
-                    docs_root = %docs_root.display(),
-                    agents = ?shared_agents,
-                    agent_count = agents.len(),
-                    "KG extraction and resolution run per agent; sharing docs_root means cost scales N×. \
-                     See MIKA_KG_BATCH_BUDGET (default 500) for the per-batch cap."
+                    agent = agent_name.as_str(),
+                    event = "lexical_ingest_disabled",
+                    reason = "identity.toml [kg].enabled=false",
+                    "KG lexical ingestion disabled — shared-corpus rows remain in DB; \
+                     use `mika kg purge --agent <name>` to clean up (#779)"
                 );
+                continue;
+            };
+
+            // KgAgentConfig::Enabled guarantees a non-empty docs_root (empty paths
+            // are caught by the empty-path guard in resolve_per_agent_docs_root).
+            // CwdDefault paths may not exist on disk — warn-and-skip per #738 policy.
+            if !docs_root.exists() {
+                info!(
+                    agent = agent_name.as_str(),
+                    docs_root = %docs_root.display(),
+                    "docs_root not found — skipping lexical ingestion"
+                );
+                continue;
             }
 
-            for (agent_name, agent_state) in &agents {
-                let ingestor = crate::kg::lexical_ingestor::LexicalIngestor::new(
-                    agent_state.db.clone(),
-                    docs_root.clone(),
-                    None,
-                );
-                match ingestor.ingest_all().await {
-                    Ok(stats) => info!(
-                        event = "lexical_ingest_complete",
-                        agent_id = %agent_name,
-                        docs_scanned = stats.docs_scanned,
-                        docs_ingested = stats.docs_ingested,
-                        docs_skipped = stats.docs_skipped_unchanged,
-                        docs_pruned = stats.docs_pruned,
-                        chunks_added = stats.chunks_added,
-                        duration_ms = stats.duration_ms,
-                        "lexical ingestion ready"
-                    ),
-                    Err(e) => warn!(
+            // Drift WARN: first-run corpus with no prior ingestion (#778 R9).
+            match agent_state
+                .db
+                .count_chunks_for_docs_root_hash(docs_root_hash)
+                .await
+            {
+                Ok(0) => {
+                    warn!(
+                        agent = agent_name.as_str(),
+                        docs_root = %docs_root.display(),
+                        docs_root_hash = docs_root_hash.as_str(),
+                        "agent docs_root_hash has no matching rows in shared corpus \
+                         — first-run ingestion will populate"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        agent = agent_name.as_str(),
                         error = %e,
-                        agent_id = %agent_name,
-                        "lexical ingestion failed; chunks may be stale until next restart"
-                    ),
+                        "failed to check corpus drift; continuing with ingestion"
+                    );
                 }
             }
-        } else {
-            info!(
-                docs_root = %docs_root.display(),
-                "docs/solutions not found — skipping lexical ingestion"
+
+            let ingestor = crate::kg::lexical_ingestor::LexicalIngestor::new(
+                agent_state.db.clone(),
+                docs_root.clone(),
+                None,
             );
+            match ingestor.ingest_all().await {
+                Ok(stats) => info!(
+                    event = "lexical_ingest_complete",
+                    agent_id = %agent_name,
+                    docs_root = %docs_root.display(),
+                    docs_root_hash = docs_root_hash.as_str(),
+                    docs_scanned = stats.docs_scanned,
+                    docs_ingested = stats.docs_ingested,
+                    docs_skipped = stats.docs_skipped_unchanged,
+                    docs_pruned = stats.docs_pruned,
+                    chunks_added = stats.chunks_added,
+                    duration_ms = stats.duration_ms,
+                    "lexical ingestion ready"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    agent_id = %agent_name,
+                    "lexical ingestion failed; chunks may be stale until next restart"
+                ),
+            }
         }
 
         // Subject graph extraction: LLM-based NER + fact triples from
@@ -828,8 +855,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         match settings.make_kg_extraction_provider() {
             Some(Ok(extraction_llm)) => {
                 // #757 R4: advise operators when KG extraction resolves to
-                // Anthropic (expensive for bulk NER). Fires once per startup
-                // by virtue of the surrounding `match` arm running once.
+                // Anthropic (expensive for bulk NER). Fires once per startup.
                 if extraction_llm
                     .provider_name()
                     .eq_ignore_ascii_case("anthropic")
@@ -845,6 +871,20 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     );
                 }
                 for (agent_name, agent_state) in &agents {
+                    let KgAgentConfig::Enabled {
+                        ref docs_root,
+                        docs_root_hash: _,
+                    } = agent_state.kg_config
+                    else {
+                        info!(
+                            agent = agent_name.as_str(),
+                            event = "extraction_disabled",
+                            reason = "identity.toml [kg].enabled=false",
+                            "KG subject extraction disabled"
+                        );
+                        continue;
+                    };
+
                     let db = agent_state.db.clone();
                     let llm = extraction_llm.clone();
                     let docs_root_clone = docs_root.clone();
@@ -939,7 +979,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             let resolution_llm = match settings.make_kg_resolution_provider() {
                 Some(Ok(llm)) => {
                     // #757 R4: advise when resolution resolves to Anthropic.
-                    // Fires at most once per startup.
                     if llm.provider_name().eq_ignore_ascii_case("anthropic") {
                         warn!(
                             event = "kg_anthropic_provider",
@@ -964,6 +1003,20 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             };
 
             for (agent_name, agent_state) in &agents {
+                let KgAgentConfig::Enabled {
+                    docs_root: _,
+                    ref docs_root_hash,
+                } = agent_state.kg_config
+                else {
+                    info!(
+                        agent = agent_name.as_str(),
+                        event = "resolution_disabled",
+                        reason = "identity.toml [kg].enabled=false",
+                        "KG entity resolution disabled"
+                    );
+                    continue;
+                };
+
                 let db = agent_state.db.clone();
                 let llm = resolution_llm.clone();
                 let agent_name_clone = agent_name.clone();
@@ -1233,6 +1286,7 @@ mod tests {
             llm: llm.clone(),
             github_app: None,
             webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            kg_config: crate::kg::config::KgAgentConfig::Disabled,
         };
 
         let mut agents = HashMap::new();

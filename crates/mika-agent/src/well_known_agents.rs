@@ -142,7 +142,10 @@ pub fn provision_well_known_agents(home_dir: &Path, disabled: bool) {
 
                 // Overwrite identity.toml with agent-specific content
                 let identity_content = format!(
-                    "name = \"{}\"\nemoji = \"{}\"\n",
+                    "name = \"{}\"\nemoji = \"{}\"\n\n\
+                     # [kg]\n\
+                     # enabled = true                    # default: true — set false to skip KG for this agent\n\
+                     # docs_root = \"/path/to/docs\"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions\n",
                     spec.display_name, spec.emoji
                 );
                 if let Err(e) = std::fs::write(agent_home.join("identity.toml"), &identity_content)
