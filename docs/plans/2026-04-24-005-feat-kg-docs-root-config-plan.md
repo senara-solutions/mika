@@ -246,7 +246,7 @@ Settings (from config-rs cascade)
 - Integration: `ingestion_orchestrator.rs` reingest path (`reingest_and_reextract` at line 191) continues to use `self.docs_root` — verify by grep that no additional changes are needed in that file.
 
 **Verification:**
-- `cargo test -p mika-agent --test kg_docs_root_resolution` passes the 4 scenarios above.
+- `cargo test -p mika-agent --test kg_docs_root_resolution` passes all scenarios above.
 - Manual verification (mika-dev-executable, post-merge, not in AC): `cargo build --release && cd /tmp && MIKA_KG_DOCS_ROOT=$REPO/docs/solutions ./target/release/mika-server --agent test` logs `lexical_ingest_complete`.
 
 ### Unit 4: Documentation — `.env.example`, CLAUDE.md, configuration.md
@@ -303,6 +303,7 @@ Settings (from config-rs cascade)
 | #778's downstream resolver silently diverges from the signature this plan ships. | Unit 2 makes `resolve_kg_docs_root(&Settings) -> PathBuf` the public contract. #778's grooming will carry this signature forward; if the parameter type needs changing, it's a #778-time decision, not a silent drift. |
 | Test that sets CWD pollutes other tests running in parallel. | Marked `#[serial]` via `serial_test`. Uses `tempdir()` so the directory disappears at test teardown. |
 | OpenRC host operators who already use the `--chdir` workaround miss the new env var and never migrate. | Workaround is explicitly preserved. The env var is additive, not replacing. CLAUDE.md note mentions both paths. |
+| Operator sets `MIKA_KG_DOCS_ROOT=""` or leaves `kg_docs_root` as empty string in config → resolver returns empty `PathBuf` → operator chases a misleading `docs/solutions not found` log for 20 minutes before realizing the config value itself is empty. | Unit 3's consumer branches on `docs_root.as_os_str().is_empty()` and emits a distinct warn (`kg_docs_root is set to empty string — check MIKA_KG_DOCS_ROOT / config.toml`) before the generic existence check. Test scenario in Unit 3 covers it. |
 | CWD-based default lands an empty path if `current_dir()` fails (rare — deleted CWD). | Matches today's behavior via `unwrap_or_default()` → `PathBuf::new().join("docs/solutions")` → existence check fails → warn-and-skip. No regression. |
 
 ## Documentation / Operational Notes
