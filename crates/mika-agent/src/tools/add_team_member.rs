@@ -462,4 +462,69 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("'mandate' is required"));
     }
+
+    #[tokio::test]
+    async fn test_add_team_member_preexisting_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = AddTeamMemberTool {
+            home_dir: tmp.path().to_path_buf(),
+        };
+
+        // Create agents a, b, c — but NOT d
+        create_agent(tmp.path(), "a");
+        create_agent(tmp.path(), "b");
+        create_agent(tmp.path(), "c");
+
+        // Manually write a team.toml with an orphan (d doesn't exist globally)
+        let dir = team::team_dir(tmp.path(), "my-team");
+        fs::create_dir_all(dir.join("workspace")).unwrap();
+        fs::write(
+            dir.join("team.toml"),
+            r#"[team]
+name = "my-team"
+orchestrator = "a"
+
+[[agents]]
+name = "a"
+role = "lead"
+mandate = "Lead"
+
+[[agents]]
+name = "b"
+role = "worker"
+mandate = "Work"
+
+[[agents]]
+name = "d"
+role = "ghost"
+mandate = "Gone"
+
+[flow]
+max_iterations = 3
+"#,
+        )
+        .unwrap();
+
+        // Try to add "c" — should fail because validate_team catches orphan "d"
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "team_name": "my-team",
+                    "agent": {"name": "c", "role": "reviewer", "mandate": "Review code"}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(result.content.contains("invalid roster"));
+        assert!(result.content.contains("update_team"));
+
+        // File unchanged — orphan is surfaced, not silently tolerated
+        let def = team::load_team(tmp.path(), "my-team").unwrap();
+        assert_eq!(def.agents.len(), 3); // Still 3, not 4
+    }
 }
