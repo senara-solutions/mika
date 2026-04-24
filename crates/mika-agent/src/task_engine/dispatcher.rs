@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Timelike;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
@@ -534,55 +534,67 @@ impl TaskDispatcher {
             &self.db,
             self.github_app.clone(),
         )
-        .await?;
+        .await
+        .with_context(|| format!("resuming team_run_id={team_run_id}"))?;
 
         // Consolidated team-run notification (async path).
         // Paired with run_team tool (sync path); see
         // docs/plans/2026-04-24-003-fix-team-callback-consolidation-plan.md
         // for why this lives here and not in TeamEngine::finalize_and_shutdown
         // (keeps the team engine free of a user_message_sender field).
-        if let Some(run) = self.db.load_team_run_by_id(team_run_id).await?
-            && let Some(msg) =
+        if let Some(run) = self.db.load_team_run_by_id(team_run_id).await? {
+            if let Some(msg) =
                 crate::teams::notification::build_run_completion_message_from_row(&run)
-        {
-            if let Some(ref sender) = self.message_sender {
-                match sender.send(&msg.text).await {
-                    Ok(crate::messaging::SendOutcome::Delivered) => {
-                        info!(
-                            team_run_id = %run.id,
-                            team_name = %run.team_name,
-                            status = %run.status,
-                            notification_kind = %msg.notification_kind,
-                            deliverable_chars = msg.deliverable_chars,
-                            truncated = msg.truncated,
-                            path = "async",
-                            "team_run_notified"
-                        );
-                    }
-                    Ok(crate::messaging::SendOutcome::NoChannel) => {
-                        // NoChannel is permanent — silent per dispatcher policy.
-                    }
-                    Ok(crate::messaging::SendOutcome::Failed { reason }) => {
-                        warn!(
-                            team_run_id = %run.id,
-                            error = %reason,
-                            "team_run_notification_delivery_failed"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            team_run_id = %run.id,
-                            error = %e,
-                            "team_run_notification_send_error"
-                        );
+            {
+                if let Some(ref sender) = self.message_sender {
+                    match sender.send(&msg.text).await {
+                        Ok(crate::messaging::SendOutcome::Delivered) => {
+                            info!(
+                                team_run_id = %run.id,
+                                team_name = %run.team_name,
+                                status = %run.status,
+                                notification_kind = %msg.notification_kind,
+                                deliverable_chars = msg.deliverable_chars,
+                                truncated = msg.truncated,
+                                path = "async",
+                                "team_run_notified"
+                            );
+                        }
+                        Ok(crate::messaging::SendOutcome::NoChannel) => {
+                            // NoChannel is permanent — silent per dispatcher policy.
+                        }
+                        Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                            warn!(
+                                team_run_id = %run.id,
+                                error = %reason,
+                                "team_run_notification_delivery_failed"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                team_run_id = %run.id,
+                                error = %e,
+                                "team_run_notification_send_error"
+                            );
+                        }
                     }
                 }
-            }
-            // Log warning for completed-without-deliverable
-            if msg.notification_kind == "fallback" {
-                warn!(
+                // Log warning for completed-without-deliverable
+                if msg.notification_kind == "fallback" {
+                    warn!(
+                        team_run_id = %run.id,
+                        "team run completed without a deliverable"
+                    );
+                }
+            } else {
+                // Non-terminal status (running/suspended) after resume — team run
+                // re-suspended for another delegation cycle. Notification deferred
+                // to the next resume that reaches a terminal state.
+                debug!(
                     team_run_id = %run.id,
-                    "team run completed without a deliverable"
+                    team_name = %run.team_name,
+                    status = %run.status,
+                    "team run non-terminal after resume, deferring notification"
                 );
             }
         }
@@ -944,13 +956,6 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
     }
 }
 
-/// Parse structured fields from callback result text.
-///
-/// Expected format (lines from claude-pilot `run.sh`):
-/// ```text
-/// claude-pilot completed (status: done).
-/// Session: <session_id>
-/// Turns: <N>
 /// Returns `true` if the task is a team-child callback (per-delegation
 /// `resume_agent` created by the team engine). Both `team_run_id` and
 /// `parent_task_id` are set together at child-creation time in
@@ -959,6 +964,13 @@ fn is_team_child_callback(task: &Task) -> bool {
     task.team_run_id.is_some() && task.parent_task_id.is_some()
 }
 
+/// Parse structured fields from callback result text.
+///
+/// Expected format (lines from claude-pilot `run.sh`):
+/// ```text
+/// claude-pilot completed (status: done).
+/// Session: <session_id>
+/// Turns: <N>
 /// Cost: $<amount>
 /// Duration: <N>ms
 /// ```
