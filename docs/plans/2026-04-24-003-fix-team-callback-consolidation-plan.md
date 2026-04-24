@@ -132,6 +132,14 @@ Observed failure: run `fd7ef7ef` (one concrete instance). mika-dev received 2 de
   - `"cancelled"` → `"Team '{name}' was cancelled."`
   - Anything else (`running`, `suspended`) → `None` (hook should not fire in these states; defensive)
 - At both callsites, wrap the send in the existing `MessageSender` outcome handling: `Ok(Delivered)` → info log only; `Ok(NoChannel)` → silent (matches dispatcher policy elsewhere); `Ok(Failed)` → `warn!` and continue; `Err` → `warn!` and continue.
+- **Sync callsite must Option-check `ctx.message_sender`.** Verified: `ToolContext.message_sender: Option<Arc<dyn MessageSender>>` (not every ctx construction site populates it — some test paths and the `toggle_skill` tool construct with `None`). On `None`: `debug!` log and skip the notification. Don't `warn!` — the absence is legitimate for some call paths, not a bug.
+- **Async callsite reads `team_runs` via `self.db.load_team_run_by_id(...)`.** Verified: `resume_team_run` returns `Result<()>`, not `Result<TeamRun>` — the DB roundtrip is necessary. Single indexed PK read; negligible cost. Refactoring `resume_team_run` to return the final `TeamRun` would save the read but touches a larger API surface; out of scope for this fix (follow-up if anyone ever cares).
+- **Anchor both callsites with a short code comment** so a future maintainer doesn't "helpfully" consolidate them into `TeamEngine::finalize_and_shutdown`:
+  ```rust
+  // Paired with <other callsite>; see docs/plans/2026-04-24-003-fix-team-callback-consolidation-plan.md
+  // for why this lives here and not in TeamEngine::finalize_and_shutdown (keeps the team
+  // engine free of a user_message_sender field).
+  ```
 - **Locked log schema** (observability contract — do not change field names without a plan update):
 
 ```rust
@@ -163,6 +171,7 @@ info!(
 - **Helper (completed without deliverable):** `status: "completed"`, `deliverable: None` → `Some("Team 'x' completed (no deliverable produced).")`.
 - **Helper (non-terminal):** `status: "running"` or `"suspended"` → `None`.
 - **Sync hook (tool):** mock `ctx.message_sender`; `teams::run_team()` returns a completed `TeamRun` with deliverable. Assert: exactly one `send` call, text matches helper output, `team_run_notified` log with `path = "sync"`.
+- **Sync hook (no message_sender):** `ctx.message_sender == None`. Assert: no send attempted, one `debug!` log emitted, tool return is unaffected.
 - **Sync hook (non-terminal suspension):** `teams::run_team()` returns `status = "suspended"`. Assert: helper returns `None`, no send call.
 - **Async hook (dispatcher):** `resume_team_run` returns success; `team_runs` table row has `status = "completed"`, `deliverable = Some(...)`. Assert: one send call, `team_run_notified` log with `path = "async"`.
 - **Async hook (failed resume):** resume_team_run completes with `status = "failed"`. Assert: one send call with failure reason.
