@@ -243,9 +243,17 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                 };
                 let last_ext = state.last_extraction.as_deref().unwrap_or("N/A");
 
-                // Truncate docs_root for display
-                let docs_display = if docs_root.len() > 34 {
-                    format!("..{}", &docs_root[docs_root.len() - 32..])
+                // Truncate docs_root for display (char-safe, no byte slicing)
+                let docs_display = if docs_root.chars().count() > 34 {
+                    let suffix: String = docs_root
+                        .chars()
+                        .rev()
+                        .take(32)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!("..{suffix}")
                 } else {
                     docs_root.to_string()
                 };
