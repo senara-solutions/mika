@@ -606,7 +606,13 @@ pub struct TaskSessionRow {
 /// `docs_root_hash` is the 16-hex-char SHA-256 prefix from `kg::config::hash_docs_root`.
 pub fn v27_coalesce_sql(docs_root: &str, docs_root_hash: &str) -> String {
     format!(
-        "-- Step 1: temp lookup tables for id remapping
+        "-- Step 1: temp lookup tables for id remapping.
+         -- DROP IF EXISTS first so the coalesce is retryable on the same
+         -- connection if a prior attempt failed mid-transaction (TEMP tables
+         -- survive ROLLBACK in SQLite — they are session-scoped, not tx-scoped).
+         DROP TABLE IF EXISTS chunk_id_map;
+         DROP TABLE IF EXISTS subject_entity_id_map;
+         DROP TABLE IF EXISTS subject_relationship_id_map;
          CREATE TEMP TABLE chunk_id_map (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL);
          CREATE TEMP TABLE subject_entity_id_map (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL);
          CREATE TEMP TABLE subject_relationship_id_map (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL);
