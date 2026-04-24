@@ -191,6 +191,20 @@ impl MessageSender for GatewayMessageSender {
     }
 }
 
+/// A no-op message sender that silently accepts all messages.
+///
+/// Used to suppress user-facing notifications in contexts where the silent
+/// turn should still run but not produce outbound messages (e.g., team-child
+/// callback turns where the consolidated team notification handles delivery).
+pub struct NoopSender;
+
+#[async_trait]
+impl MessageSender for NoopSender {
+    async fn send(&self, _text: &str) -> Result<SendOutcome> {
+        Ok(SendOutcome::Delivered)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +387,13 @@ mod tests {
             SendOutcome::NoChannel,
             "poisoned chat_id=0 from DB should return NoChannel"
         );
+    }
+
+    #[tokio::test]
+    async fn test_noop_sender_returns_delivered() {
+        let sender = NoopSender;
+        let outcome = sender.send("hello").await.unwrap();
+        assert_eq!(outcome, SendOutcome::Delivered);
     }
 
     /// resolve_chat_id() returning Err (no chat_id configured) still propagates

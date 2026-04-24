@@ -1,4 +1,5 @@
 pub mod engine;
+pub(crate) mod notification;
 pub mod prompt;
 pub mod types;
 
