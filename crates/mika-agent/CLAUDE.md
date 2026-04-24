@@ -276,7 +276,7 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 ## MessageSender Trait
 
-`#[async_trait]` with `Send + Sync` bounds for `Arc<dyn MessageSender>`. Returns `Result<SendOutcome>` where `SendOutcome` is `Delivered` (gateway 2xx), `Failed { reason }` (non-2xx after retry, saved to `failed_sends`), or `NoChannel` (`chat_id == 0` sentinel — no reply channel available, e.g. GitHub webhook sessions). `Err` is reserved for infrastructure failures (chat_id resolution, DB errors). Text-only outbound. CLI prints to stdout. Server uses `GatewayMessageSender` (one retry after 2s, error classification: connection/timeout/HTTP status with body snippet). Team engine agents intentionally have `message_sender: None`.
+`#[async_trait]` with `Send + Sync` bounds for `Arc<dyn MessageSender>`. Returns `Result<SendOutcome>` where `SendOutcome` is `Delivered` (gateway 2xx), `Failed { reason }` (non-2xx after retry, saved to `failed_sends`), or `NoChannel` (`chat_id == 0` sentinel — no reply channel available, e.g. GitHub webhook sessions). `Err` is reserved for infrastructure failures (chat_id resolution, DB errors). Text-only outbound. CLI prints to stdout. Server uses `GatewayMessageSender` (one retry after 2s, error classification: connection/timeout/HTTP status with body snippet). Team engine agents intentionally have `message_sender: None`. `NoopSender` (pub in `messaging.rs`) silently returns `Ok(Delivered)` — used to suppress user-facing notifications in team-child callback turns (#287) where the consolidated team-run notification handles delivery.
 
 **`NoChannel` sentinel (#650):** `GatewayMessageSender::send()` detects `chat_id == 0` after `resolve_chat_id()` and returns `Ok(NoChannel)` before the HTTP POST — no retry, no `failed_sends` entry. `chat_id == 0` is the documented sentinel for sessions without a Telegram reply channel (GitHub webhooks, non-Telegram channels). The agent should use channel-appropriate tools (e.g., `run_gh`) instead of `send_message`.
 
@@ -298,7 +298,7 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 **Engine-level callback metadata extraction (#376):** `try_extract_callback_metadata()` parses structured fields from callback results and persists to parent task.
 
-**Team task tree:** parent `invoke_orchestrator` task + child `resume_agent` tasks per delegation. Suspend/resume on pending grandchild callbacks.
+**Team task tree:** parent `invoke_orchestrator` task + child `resume_agent` tasks per delegation. Suspend/resume on pending grandchild callbacks. **Team-run user notification (#287):** fired once at terminal status from two symmetric callsites (`run_team` tool for sync completion, `dispatch_invoke_orchestrator` for async resume), both routing through `teams::notification::build_run_completion_message`. Per-child `resume_agent` callbacks have their user-facing `send_message` suppressed via `NoopSender`; the silent turn still runs (updates memory, records `llm_calls`) — only the user channel is gated. Deliverable text is UTF-8-safe truncated at 4000 chars (below Telegram's 4096 limit).
 
 ## HTTP Server (mika-server)
 
