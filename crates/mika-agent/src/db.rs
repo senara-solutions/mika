@@ -6,9 +6,9 @@ use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Once;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
 use crate::timestamp;
@@ -595,6 +595,153 @@ pub struct TaskSessionRow {
     pub task_id: Option<String>,
     pub message_count: i64,
     pub task_label: Option<String>,
+}
+
+// ===== v27 coalesce SQL (module-level for integration test access) =====
+
+/// Generate the SQL that coalesces v26 backup table rows into the new v27
+/// shared-corpus tables. Executed inside the existing migration transaction.
+///
+/// `docs_root` must already have single-quotes escaped (`'` → `''`).
+/// `docs_root_hash` is the 16-hex-char SHA-256 prefix from `kg::config::hash_docs_root`.
+pub fn v27_coalesce_sql(docs_root: &str, docs_root_hash: &str) -> String {
+    format!(
+        "-- Step 1: temp lookup tables for id remapping.
+         -- DROP IF EXISTS first so the coalesce is retryable on the same
+         -- connection if a prior attempt failed mid-transaction (TEMP tables
+         -- survive ROLLBACK in SQLite — they are session-scoped, not tx-scoped).
+         DROP TABLE IF EXISTS chunk_id_map;
+         DROP TABLE IF EXISTS subject_entity_id_map;
+         DROP TABLE IF EXISTS subject_relationship_id_map;
+         CREATE TEMP TABLE chunk_id_map (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL);
+         CREATE TEMP TABLE subject_entity_id_map (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL);
+         CREATE TEMP TABLE subject_relationship_id_map (old_id INTEGER PRIMARY KEY, new_id INTEGER NOT NULL);
+
+         -- Step 2: INSERT winning chunks (group by source_doc_path, seq_id; take MIN(id))
+         INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash, created_at, trace_id)
+         SELECT '{docs_root_hash}', '{docs_root}', seq_id, source_doc_path, source_doc_hash, created_at, trace_id
+         FROM kg_chunks_v26_backup
+         WHERE id IN (SELECT MIN(id) FROM kg_chunks_v26_backup GROUP BY source_doc_path, seq_id);
+
+         -- Step 3: populate chunk_id_map
+         INSERT INTO chunk_id_map (old_id, new_id)
+         SELECT b.id, c.id FROM kg_chunks_v26_backup b
+         JOIN kg_chunks c ON c.source_doc_path = b.source_doc_path AND c.seq_id = b.seq_id AND c.docs_root_hash = '{docs_root_hash}';
+
+         -- Step 4: INSERT winning subject entities (majority-vote by normalized entity_key)
+         INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence, properties_json, created_at, trace_id)
+         SELECT '{docs_root_hash}', '{docs_root}', entity_key, type, name, confidence, properties_json, created_at, trace_id
+         FROM (
+             SELECT b.id, b.entity_key, b.type, b.name, b.confidence, b.properties_json, b.created_at, b.trace_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY LOWER(TRIM(b.entity_key))
+                        ORDER BY vote_count DESC, avg_conf DESC, b.id ASC
+                    ) AS rn
+             FROM kg_subject_entities_v26_backup b
+             JOIN (
+                 SELECT LOWER(TRIM(entity_key)) AS norm_key,
+                        COUNT(DISTINCT agent_id) AS vote_count,
+                        AVG(confidence) AS avg_conf
+                 FROM kg_subject_entities_v26_backup
+                 GROUP BY LOWER(TRIM(entity_key))
+             ) agg ON LOWER(TRIM(b.entity_key)) = agg.norm_key
+         )
+         WHERE rn = 1;
+
+         -- Step 5: populate subject_entity_id_map
+         INSERT INTO subject_entity_id_map (old_id, new_id)
+         SELECT b.id, e.id FROM kg_subject_entities_v26_backup b
+         JOIN kg_subject_entities e ON LOWER(TRIM(e.entity_key)) = LOWER(TRIM(b.entity_key)) AND e.docs_root_hash = '{docs_root_hash}';
+
+         -- Step 6: INSERT winning subject relationships (rewire FK ids, then group)
+         INSERT INTO kg_subject_relationships (docs_root_hash, docs_root, from_entity_id, to_entity_id, type, confidence, properties_json, created_at, trace_id)
+         SELECT '{docs_root_hash}', '{docs_root}', new_from, new_to, type, confidence, properties_json, created_at, trace_id
+         FROM (
+             SELECT b.id, fm.new_id AS new_from, tm.new_id AS new_to, b.type, b.confidence,
+                    b.properties_json, b.created_at, b.trace_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY fm.new_id, tm.new_id, LOWER(TRIM(b.type))
+                        ORDER BY vote_count DESC, avg_conf DESC, b.id ASC
+                    ) AS rn
+             FROM kg_subject_relationships_v26_backup b
+             JOIN subject_entity_id_map fm ON fm.old_id = b.from_entity_id
+             JOIN subject_entity_id_map tm ON tm.old_id = b.to_entity_id
+             JOIN (
+                 SELECT fm2.new_id AS nf, tm2.new_id AS nt, LOWER(TRIM(r2.type)) AS norm_type,
+                        COUNT(DISTINCT r2.agent_id) AS vote_count,
+                        AVG(r2.confidence) AS avg_conf
+                 FROM kg_subject_relationships_v26_backup r2
+                 JOIN subject_entity_id_map fm2 ON fm2.old_id = r2.from_entity_id
+                 JOIN subject_entity_id_map tm2 ON tm2.old_id = r2.to_entity_id
+                 GROUP BY fm2.new_id, tm2.new_id, LOWER(TRIM(r2.type))
+             ) agg ON agg.nf = fm.new_id AND agg.nt = tm.new_id AND agg.norm_type = LOWER(TRIM(b.type))
+         )
+         WHERE rn = 1;
+
+         -- Step 7: populate subject_relationship_id_map
+         INSERT INTO subject_relationship_id_map (old_id, new_id)
+         SELECT b.id, r.id
+         FROM kg_subject_relationships_v26_backup b
+         JOIN subject_entity_id_map fm ON fm.old_id = b.from_entity_id
+         JOIN subject_entity_id_map tm ON tm.old_id = b.to_entity_id
+         JOIN kg_subject_relationships r ON r.from_entity_id = fm.new_id
+                                         AND r.to_entity_id = tm.new_id
+                                         AND LOWER(TRIM(r.type)) = LOWER(TRIM(b.type))
+                                         AND r.docs_root_hash = '{docs_root_hash}';
+
+         -- Step 8: INSERT chunk_subjects (rewire both chunk_id and subject_entity_id)
+         INSERT OR IGNORE INTO kg_chunk_subjects (docs_root_hash, docs_root, chunk_id, subject_entity_id, extraction_trace_id, created_at)
+         SELECT '{docs_root_hash}', '{docs_root}', cm.new_id, em.new_id, b.extraction_trace_id, b.created_at
+         FROM kg_chunk_subjects_v26_backup b
+         JOIN chunk_id_map cm ON cm.old_id = b.chunk_id
+         JOIN subject_entity_id_map em ON em.old_id = b.subject_entity_id;
+
+         -- Step 9: INSERT chunk_subject_relationships (rewire chunk_id and subject_relationship_id)
+         INSERT OR IGNORE INTO kg_chunk_subject_relationships (docs_root_hash, docs_root, chunk_id, subject_relationship_id, extraction_trace_id, created_at)
+         SELECT '{docs_root_hash}', '{docs_root}', cm.new_id, rm.new_id, b.extraction_trace_id, b.created_at
+         FROM kg_chunk_subject_relationships_v26_backup b
+         JOIN chunk_id_map cm ON cm.old_id = b.chunk_id
+         JOIN subject_relationship_id_map rm ON rm.old_id = b.subject_relationship_id;
+
+         -- Step 10: INSERT extractions (first-writer-wins by MIN(id) per source_doc_path)
+         INSERT OR IGNORE INTO kg_extractions (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id, created_at)
+         SELECT '{docs_root_hash}', '{docs_root}', source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id, created_at
+         FROM kg_extractions_v26_backup
+         WHERE id IN (SELECT MIN(id) FROM kg_extractions_v26_backup GROUP BY source_doc_path);
+
+         -- Step 11: INSERT per-agent resolutions (rewire subject_entity_id)
+         INSERT OR IGNORE INTO kg_subject_resolutions (agent_id, subject_entity_id, domain_entity_id, confidence, created_at, trace_id)
+         SELECT b.agent_id, em.new_id, b.domain_entity_id, b.confidence, b.created_at, b.trace_id
+         FROM kg_subject_resolutions_v26_backup b
+         JOIN subject_entity_id_map em ON em.old_id = b.subject_entity_id;
+
+         -- Step 12: INSERT per-agent resolutions_log (rewire subject_entity_id)
+         INSERT OR IGNORE INTO kg_resolutions_log (agent_id, subject_entity_id, outcome, resolution_trace_id, source_extraction_trace_id, model, duration_ms, resolved_at)
+         SELECT b.agent_id, em.new_id, b.outcome, b.resolution_trace_id, b.source_extraction_trace_id, b.model, b.duration_ms, b.resolved_at
+         FROM kg_resolutions_log_v26_backup b
+         JOIN subject_entity_id_map em ON em.old_id = b.subject_entity_id;
+
+         -- Step 13: DROP the 8 backup tables
+         DROP TABLE IF EXISTS kg_chunk_subject_relationships_v26_backup;
+         DROP TABLE IF EXISTS kg_chunk_subjects_v26_backup;
+         DROP TABLE IF EXISTS kg_subject_relationships_v26_backup;
+         DROP TABLE IF EXISTS kg_subject_resolutions_v26_backup;
+         DROP TABLE IF EXISTS kg_resolutions_log_v26_backup;
+         DROP TABLE IF EXISTS kg_subject_entities_v26_backup;
+         DROP TABLE IF EXISTS kg_extractions_v26_backup;
+         DROP TABLE IF EXISTS kg_chunks_v26_backup;
+
+         -- Step 14: DROP temp lookup tables
+         DROP TABLE IF EXISTS chunk_id_map;
+         DROP TABLE IF EXISTS subject_entity_id_map;
+         DROP TABLE IF EXISTS subject_relationship_id_map;
+
+         -- Step 15: schema_meta coalesce marker
+         INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('v27_coalesce_complete', '1');
+        ",
+        docs_root_hash = docs_root_hash,
+        docs_root = docs_root,
+    )
 }
 
 // ===== Database =====
@@ -3003,19 +3150,17 @@ impl Database {
         Ok(())
     }
 
-    /// v26 -> v27: Schema v27 — docs_root_hash as shared-corpus primary key.
+    /// v26 -> v27: Schema v27 — docs_root_hash as shared-corpus primary key (#786 + #787).
     ///
-    /// Renames six shared-layer KG tables to `*_v26_backup` and creates fresh
-    /// v27 tables keyed by `docs_root_hash` instead of `agent_id`. Per-agent
-    /// tables (`kg_subject_resolutions`, `kg_resolutions_log`) are unchanged.
-    ///
-    /// The data coalesce from v26 backup tables into v27 is #787's scope.
-    /// This stub is non-destructive — v26 rows are preserved in the backup
-    /// tables until #787 processes them.
-    ///
-    /// Creates a `schema_meta` table with a `v27_coalesce_complete` marker
-    /// that the startup guard (Unit 3) checks. This stub does NOT write the
-    /// marker — that's #787's job after coalesce completes.
+    /// Two-phase migration in a single transaction:
+    /// 1. **DDL** (#786): Renames six shared-layer KG tables to `*_v26_backup`,
+    ///    creates fresh v27 tables keyed by `docs_root_hash` instead of `agent_id`.
+    ///    Rebuilds per-agent tables to fix FK refs.
+    /// 2. **Coalesce** (#787): Reads from backup tables, deduplicates across agents
+    ///    via majority-vote (normalized entity_key, agent-count tiebreak), rewires
+    ///    FKs via temp lookup tables, drops backups, writes `v27_coalesce_complete`
+    ///    marker to `schema_meta`. `docs_root` resolved from `MIKA_KG_DOCS_ROOT`
+    ///    env var or CWD fallback.
     fn migrate_v26_to_v27(&self) -> Result<()> {
         info!("migrating database schema v26 -> v27 (docs_root_hash shared-corpus)");
 
@@ -3027,9 +3172,73 @@ impl Database {
             return Ok(());
         }
 
-        self.conn
-            .execute_batch(
-                "PRAGMA foreign_keys = OFF;
+        // Resolve docs_root for v26 data coalescing.
+        let docs_root_path = std::env::var("MIKA_KG_DOCS_ROOT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join("docs")
+                    .join("solutions")
+            });
+        let docs_root_escaped = docs_root_path.to_string_lossy().replace('\'', "''");
+        let docs_root_hash = crate::kg::config::hash_docs_root(&docs_root_path);
+
+        info!(
+            docs_root = %docs_root_path.display(),
+            docs_root_hash = %docs_root_hash,
+            "v26->v27 coalesce: resolved docs_root for migration"
+        );
+
+        // Log pre-coalesce counts from v26 tables (before DDL renames them).
+        let pre_chunks: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_chunks", [], |r| r.get(0))
+            .unwrap_or(0);
+        let pre_entities: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_subject_entities", [], |r| r.get(0))
+            .unwrap_or(0);
+        let pre_relationships: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_subject_relationships", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        let pre_extractions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_extractions", [], |r| r.get(0))
+            .unwrap_or(0);
+        let pre_resolutions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_subject_resolutions", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        let pre_res_log: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_resolutions_log", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        info!(
+            pre_chunks,
+            pre_entities,
+            pre_relationships,
+            pre_extractions,
+            pre_resolutions,
+            pre_res_log,
+            "v26->v27 coalesce: pre-migration row counts"
+        );
+
+        // Generate the coalesce SQL for the resolved docs_root.
+        let coalesce = v27_coalesce_sql(&docs_root_escaped, &docs_root_hash);
+
+        // Build the full migration: DDL (rename to backup + create v27 tables) +
+        // coalesce (read from backups, dedup, write to v27, drop backups) + finalize.
+        let sql = format!(
+            "PRAGMA foreign_keys = OFF;
 
                  BEGIN IMMEDIATE;
 
@@ -3192,19 +3401,67 @@ impl Database {
                  );
                  CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
 
-                 -- TODO(#787): coalesce rows from *_v26_backup tables into v27 tables
-                 -- via majority-vote by (docs_root_hash, source_doc_path, entity_key).
-                 -- Preserve paid LLM output. Then DROP TABLE *_v26_backup tables.
-                 -- Then INSERT INTO schema_meta (key, value) VALUES ('v27_coalesce_complete', '1').
-                 -- See mika#787 for coalesce SQL.
+                 -- v27 coalesce: read from backup tables, dedup, write to v27 tables.
+                 {coalesce}
 
                  INSERT INTO schema_version (version) VALUES (27);
 
                  COMMIT;
 
-                 PRAGMA foreign_keys = ON;",
-            )
+                 PRAGMA foreign_keys = ON;"
+        );
+
+        self.conn
+            .execute_batch(&sql)
             .context("failed to migrate v26 -> v27 (docs_root_hash shared-corpus)")?;
+
+        // Log post-coalesce counts from the new v27 tables.
+        let post_chunks: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_chunks", [], |r| r.get(0))
+            .unwrap_or(0);
+        let post_entities: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_subject_entities", [], |r| r.get(0))
+            .unwrap_or(0);
+        let post_relationships: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_subject_relationships", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        let post_extractions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_extractions", [], |r| r.get(0))
+            .unwrap_or(0);
+        let post_resolutions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_subject_resolutions", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        let post_res_log: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_resolutions_log", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        info!(
+            post_chunks,
+            post_entities,
+            post_relationships,
+            post_extractions,
+            post_resolutions,
+            post_res_log,
+            chunks_deduped = pre_chunks - post_chunks,
+            entities_deduped = pre_entities - post_entities,
+            relationships_deduped = pre_relationships - post_relationships,
+            extractions_deduped = pre_extractions - post_extractions,
+            "v26->v27 coalesce: migration complete"
+        );
+
+        if pre_chunks > 0 && post_chunks == 0 {
+            warn!("v26->v27 coalesce: all chunks were lost — this may indicate a migration bug");
+        }
 
         Ok(())
     }
