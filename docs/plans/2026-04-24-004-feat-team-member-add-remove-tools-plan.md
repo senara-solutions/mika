@@ -15,9 +15,11 @@ No schema change, no new types, no new shared helpers. Two new tool files, two r
 
 ## Problem Frame
 
-`update_team` (`crates/mika-agent/src/tools/update_team.rs`, 708 lines) requires the caller to supply the full `agents: [...]` array for any composition change. For the common cases — "add Alice to the team", "remove Bob" — the LLM has to first recall or fetch the current roster, construct the complete new array, and call `update_team` with all members listed. That's error-prone (agent names must match exactly) and noisy (verbose tool input for a small logical change).
+`update_team` (`crates/mika-agent/src/tools/update_team.rs`, 708 lines) requires the caller to supply the full `agents: [...]` array for any composition change. For the common cases — "add Alice to the team", "remove Bob" — the LLM has to first recall or fetch the current roster, construct the complete new array, and call `update_team` with all members listed. This is more verbose than individual-verb tool calls would be, and arguably more error-prone (agent names must match exactly).
 
-Individual mutation verbs (`add`, `remove`) are more discoverable for LLMs than "use update_team with a modified array" and make the tool-call output auditable at a glance.
+**Evidence status:** This is a **preemptive ergonomic improvement**, not a fix for an observed failure. The ticket is labeled `p3-nice-to-have`. No telemetry, no cited failing run, no user complaint references `update_team` mis-calls for single-member operations. The justification is a plausible hypothesis that individual mutation verbs (`add`, `remove`) are more discoverable for LLMs than "use update_team with a modified array" — true in general for tool-use ergonomics, but not demonstrated to be an active pain point here.
+
+The zero-cost alternative would be one sentence in `update_team`'s tool description: *"For single-member changes, include the unchanged members plus the addition/removal — no other fields need to change."* That's worth trying first for anyone wanting to avoid adding two new tools without evidence they're needed. This plan proceeds with the dedicated-tools approach because that was the direction chosen during grooming, but the choice is a judgment call, not a forced one.
 
 ## Requirements Trace
 
@@ -61,7 +63,8 @@ Individual mutation verbs (`add`, `remove`) are more discoverable for LLMs than 
 - **Two discrete tools, not a single `update_team` patch extension.** Adding `add_agents`/`remove_agents` params to `update_team` would grow its already-large input schema and blur its "replace the full array" semantics. Individual verbs match LLM tool-use ergonomics and are easier to audit in tool-call history. **Rationale:** LLMs are good at matching verbs; `update_team` already handles full replacements cleanly; don't overload it.
 - **Orchestrator-removal is rejected.** `remove_team_member` returns an error when `agent_name == def.team.orchestrator`. Message points the caller at `update_team` to reassign the orchestrator first. **Rationale:** supporting atomic "remove + reappoint" would require a `new_orchestrator` parameter — that's a compound operation smell. Two-step flow (reassign via `update_team`, then remove old member) is acceptable friction for a rare case. If the rare case becomes common, we add `replace_orchestrator` later (deferred above).
 - **Minimum team size enforced on removal.** `remove_team_member` rejects if `def.agents.len() - 1 < 2`. Matches the existing `update_team` contract at `update_team.rs:127-129`.
-- **Validation reuses `validate_team`.** After each mutation, the tool calls `mika_common::team::validate_team(&home_dir, &def)` before serializing. This is the same downstream guard `update_team` relies on, so the semantic contract stays uniform.
+- **Validation always runs `validate_team` on both add and remove.** After each mutation, the tool calls `mika_common::team::validate_team(&home_dir, &def)` before serializing. This is the same downstream guard `update_team` relies on, so persistence semantics are identical across all three tools — no validation asymmetry, no orthogonality violation. If `validate_team` fails on the remove path because of a pre-existing orphan elsewhere in the roster (an agent listed in `team.toml` whose global definition has since been deleted), the tool returns an actionable error pointing at `update_team`: *"Team 'X' has an invalid roster — agent 'Y' no longer exists globally. Fix this first with `update_team`, then retry."* **Rationale:** silently tolerating orphans on one persistence path would be preserving a bug by making it removable one member at a time. Surfacing the orphan with a clear error preserves the invariant across all team-modifying tools.
+- **What `validate_team` catches in the context of these tools** (per `mika-common/src/team.rs:129-153`): (1) the orchestrator still exists as a global agent, (2) every team member still exists as a global agent, (3) the orchestrator is still listed in the agents array. The relevant failure modes for this plan: on `add` — fails if `agent.name` was deleted globally between the step-4 `agent_exists` check and the save (tiny race window, but possible); on `remove` — fails if a pre-existing orphan is in the roster. Both are legitimate signals; surfacing them is correct.
 - **Persistence mirrors `update_team`.** `toml::to_string_pretty(&def)` then `std::fs::write(team_dir.join("team.toml"), ...)` — same pattern as `update_team.rs:262-273`. No shared helper extracted; the pattern is ~4 lines and duplicating it avoids premature abstraction.
 - **Output shape: text summary of the change.** Success: `"Added agent 'alice' to team 'inner-circle' (role: researcher)."` / `"Removed agent 'alice' from team 'inner-circle' (2 members remaining)."`. Mirrors `update_team`'s changelog-style output.
 - **Concurrency: same guarantees as `update_team` today.** No file locking. Two concurrent calls to these tools (or to `update_team`) on the same `team.toml` can race; that's a pre-existing behavior not introduced by this plan.
@@ -78,13 +81,11 @@ Individual mutation verbs (`add`, `remove`) are more discoverable for LLMs than 
 
 ### Deferred to Implementation
 
-- **Exact wording of the error messages.** Keep them short and actionable (point at `update_team` for orchestrator-replacement, at current roster for "already a member" / "not a member" cases). Low risk.
-- **Whether to include `agent_exists` check on `remove_team_member`.** The member name is checked against the team roster, not the global agent list — if the agent was somehow deleted globally but still listed in the team.toml, `remove_team_member` should still work. Confirm during implementation (no check needed; rely on `validate_team` only where relevant — see below).
-- **Post-remove validation subtlety:** `validate_team` also checks all remaining agents exist globally. If a prior orphan (team member whose agent was globally deleted) is in the team but isn't the one being removed, `validate_team` would fail the save. Decide during implementation: either (a) call `validate_team` and fail cleanly with a pointer to `update_team` to resolve the orphan, or (b) skip `validate_team` on removal and only validate the removal's own invariants (orchestrator-in-list preserved, min-size). Leaning (b) — removing a member shouldn't be blocked by a pre-existing state issue elsewhere in the team. Will finalize when writing the code.
+- **Exact wording of the error messages.** Keep them short and actionable (point at `update_team` for orchestrator-replacement and for pre-existing orphan errors; reference the current roster for "already a member" / "not a member" cases). Low risk.
 
 ## Implementation Units
 
-Both units are independent and can land in either order; sequencing is ticket-number-ordered for commit legibility (add before remove).
+Both units are independent — they share no code and touch no common files beyond the two-line addition to `tools/mod.rs`. Land them in whatever order the implementer prefers.
 
 - [ ] **Unit 1: `add_team_member` tool**
 
@@ -120,13 +121,13 @@ Both units are independent and can land in either order; sequencing is ticket-nu
   ```
 - Steps in `execute`:
   1. Validate + normalize `team_name` (reuse `validate_team_name`, `normalize_team_name`)
-  2. Validate `agent.name`, `agent.role`, `agent.mandate` are non-empty and within `MAX_INPUT_LEN`
+  2. Validate `agent.name`, `agent.role`, `agent.mandate` are non-empty and within `super::MAX_INPUT_LEN` (the same 10,000-char cap `update_team` uses — do not redeclare)
   3. Check `team::team_exists(&self.home_dir, &team_name)` → error if not
   4. Check `agent::agent_exists(&self.home_dir, &agent.name)` → error if not
   5. `let mut def = team::load_team(&self.home_dir, &team_name)?;`
   6. Check `def.agents.iter().any(|a| a.name == agent.name)` → error "'{name}' is already a member of '{team_name}'"
   7. Push new `TeamAgent { name, role, mandate }` into `def.agents`
-  8. `team::validate_team(&self.home_dir, &def)` (defensive; should always pass given step 4 + 6)
+  8. `team::validate_team(&self.home_dir, &def)` — load-bearing, not defensive. Catches: orchestrator-still-in-roster invariant, globally-deleted agents elsewhere in the team (pre-existing orphans), and a race where `agent.name` was deleted globally between step 4 and this step. On failure, return an error that mentions the specific invariant `validate_team` surfaced.
   9. `toml::to_string_pretty(&def)` → `std::fs::write(team_dir(&home_dir, &team_name).join("team.toml"), ...)`
   10. Return `ToolOutput::success(format!("Added agent '{}' to team '{}' (role: {}). Team now has {} members.", ...))`
 - Orchestrator guard is inherited from the registration conditional in `tools/mod.rs` (same guard as `update_team`); no per-tool check needed.
@@ -175,14 +176,14 @@ Both units are independent and can land in either order; sequencing is ticket-nu
   ```
 - Steps in `execute`:
   1. Validate + normalize `team_name`
-  2. Validate `agent_name` is non-empty and within `MAX_INPUT_LEN`
+  2. Validate `agent_name` is non-empty and within `super::MAX_INPUT_LEN`
   3. `team_exists` → error if not
   4. `let mut def = team::load_team(...)?;`
   5. Check `def.agents.iter().any(|a| a.name == agent_name)` → error "'{name}' is not a member of '{team_name}'"
   6. Orchestrator guard: `if def.team.orchestrator == agent_name` → error "'{name}' is the orchestrator of '{team_name}'. Reassign the orchestrator via `update_team` before removing this agent."
   7. Min-size check: `if def.agents.len() - 1 < 2` → error "Removing '{name}' would leave '{team_name}' with fewer than 2 members."
   8. Retain filter: `def.agents.retain(|a| a.name != agent_name);`
-  9. **Skip** full `validate_team` (see Open Questions § Deferred (b)): only verify the local invariant — orchestrator is still in the agents list (already guaranteed by step 6) — and proceed to save. This avoids failing the removal if an unrelated orphan exists elsewhere in the roster.
+  9. `team::validate_team(&self.home_dir, &def)` — same symmetric call as the add path. If it fails because of a pre-existing orphan elsewhere in the roster (a different team member whose global definition has since been deleted), return an actionable error: *"Team '{team_name}' has an invalid roster — agent 'Y' no longer exists globally. Fix this first with `update_team`, then retry the removal."* This preserves the invariant that all three team-modifying tools enforce the same validation contract; orphans are surfaced, not silently tolerated.
   10. `toml::to_string_pretty(&def)` → `std::fs::write(...)`
   11. Return `ToolOutput::success(format!("Removed agent '{}' from team '{}' ({} members remaining).", ...))`
 
@@ -196,7 +197,7 @@ Both units are independent and can land in either order; sequencing is ticket-nu
 - **Edge case (is orchestrator):** `agent_name == team.orchestrator` → error, file unchanged, message references `update_team`.
 - **Edge case (would drop below minimum):** remove from a 2-member team → error, file unchanged.
 - **Edge case (team doesn't exist):** `team_name` doesn't match → error.
-- **Happy path (roster has unrelated orphan):** remove a valid member from a team whose roster includes a globally-deleted agent (orphan) that isn't the target → success. (Tests the "skip full validate_team" decision.)
+- **Edge case (pre-existing orphan in roster):** remove a valid member from a team whose roster includes a globally-deleted agent (orphan) that isn't the target → **error**, file unchanged, message names the orphan and points at `update_team`. (Tests the validation-symmetry decision — orphans are surfaced, not silently tolerated.)
 
 **Verification:**
 - `cargo test -p mika-agent tools::remove_team_member` passes.
@@ -215,14 +216,16 @@ Both units are independent and can land in either order; sequencing is ticket-nu
 | Risk | Mitigation |
 |------|------------|
 | Adding two tools grows the tool registry the LLM sees; marginal context bloat per turn. | Each tool schema is small (~10 lines of JSON). Net growth is < 500 chars in the tool list. Acceptable for the UX improvement. |
-| Orphan-roster behavior differs from `update_team` (remove path skips full `validate_team`). | Documented explicitly in Unit 2's approach; test scenario covers it. Short followup ticket if this divergence turns out to be wrong in practice. |
-| File-write race between these tools and `update_team` on the same `team.toml`. | Pre-existing condition; not introduced here. If it becomes a problem, add a per-team file lock in a separate plan. |
-| Concurrent `add` + `remove` for the same member could leave the file in an unexpected state. | Same pre-existing write-race situation as `update_team`; not a new failure mode. |
+| Tools ship without observed evidence they solve a real problem. | Called out explicitly in Problem Frame. Acceptable for a p3-nice-to-have enhancement; post-merge, watch `tool_calls` telemetry for (a) adoption of the new verbs vs continued use of `update_team` for single-member ops, (b) any increase in tool-call error rate in this family. If adoption is low, the hypothesis was wrong and the tools are carrying their weight only for auditability; that's information, not a regression. |
 
 ## Documentation / Operational Notes
 
 - No deployment, migration, or rollout concerns. Purely additive.
-- CLAUDE.md's `## Management Tools` line currently says "12 tools for multi-agent/team workflows". This will become 14 — update the count and tool list in the same PR.
+- **Doc-update checklist (all in the same PR):**
+  - `crates/mika-agent/CLAUDE.md` § Management Tools: currently lists "12 tools" with an enumerated list; update count to 14 and add `add_team_member` / `remove_team_member` to the list.
+  - `docs/architecture.md:68`: currently says "27 builtin tools + 10 management tools (3 always-on + 7 conditional)" — the `10` and `7 conditional` counts drift here (line 235 says "12" and "remaining 9 tools"). This plan adds two more conditional tools, so the correct post-merge values need both lines updated consistently. Pick one source of truth (suggested: line 235's breakdown) and reconcile the line-68 summary to match.
+  - `docs/architecture.md:235+` management-tools table: add two rows for the new tools.
+  - Grep for any other `"12 tools"` / `"10 management tools"` callsites before merge to catch drift.
 
 ## Sources & References
 
