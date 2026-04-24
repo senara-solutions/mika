@@ -9,19 +9,19 @@ date: 2026-04-24
 
 ## Overview
 
-On team run `fd7ef7ef` (MiniMax-M2.7 orchestrator + MiniMax-M2.7 specialists, 5-member team), the orchestrator assigned work to 1 of 4 non-orchestrator members for a goal that plainly benefited from diverse perspectives. The fix is a minimal two-layer change: a sharper prompt nudge biasing the orchestrator to consider every member, and a structural coverage check that re-prompts once when the response silently omits members — falling through with a `warn!` log on second failure. No new schema, no new public enum variant, no new persisted data structures.
+The team engine has no contract requiring the orchestrator to account for the team's roster. Given a multi-member team and a goal that plausibly benefits from diverse perspectives, the orchestrator can assign to one or two members and silently ignore the rest, and the engine accepts the partial assignment unchanged. The fix adds the missing contract: a minimal prompt instruction that asks the orchestrator to consider every member, and a coverage check that re-prompts once when the response silently omits members — falling through with a `warn!` log on second failure. No new schema, no new public enum variant, no new persisted data structures.
 
 **Defer deliberately:** structured skip reasons, dashboard surfacing, and response-wrapper schema. Add them when the warn-log signal proves the retry isn't enough, or when a concrete consumer materializes.
 
 ## Problem Frame
 
-`build_orchestrator_context` in `crates/mika-agent/src/teams/prompt.rs` lists team members but never tells the orchestrator to account for all of them. `parse_task_assignments` in `crates/mika-agent/src/teams/engine.rs:1437` validates each assignment (agent name, path safety, length) but has no coverage check. On creative/brainstorming goals, weaker-instruction-following models (MiniMax is the observed case) take the path of least resistance and pick the 1–2 most technically-framed members.
+`build_orchestrator_context` in `crates/mika-agent/src/teams/prompt.rs` lists team members but never tells the orchestrator to account for all of them. `parse_task_assignments` in `crates/mika-agent/src/teams/engine.rs:1437` validates each assignment (agent name, path safety, length) but has no coverage check. On creative or brainstorming goals, the path of least resistance is to pick the one or two most technically-framed members and skip the rest.
 
-The cited failure used MiniMax-M2.7 as both orchestrator and specialist engine. This fix needs to hold across all 11 supported providers — the structural layer is defense-in-depth, the prompt is the primary lever.
+The cited failure (run `fd7ef7ef`, inner-circle, 5-agent team) is one observed instance — orchestrator + 1 specialist active, 3 members unused on a username-brainstorming goal that plainly matched their mandates. The fix addresses the engine contract gap, not a model-specific quirk.
 
 ## Requirements Trace
 
-- **R1.** The orchestrator must be prompted to consider every non-orchestrator member before responding.
+- **R1.** The orchestrator must be prompted to consider every non-orchestrator member before responding. This applies across providers — the contract is engine-level.
 - **R2.** If the response silently omits members (neither assigns to them nor explains the omission in free-form reply text), the engine re-prompts once with an explicit list of unaccounted members.
 - **R3.** A coverage-retry event must be observable — minimum a `warn!` log line and a boolean signal on the run — sufficient for post-hoc "did the retry fire?" debugging via log grep or `sqlite3`.
 - **R4.** The fix must not regress single-member teams, focused single-domain goals that legitimately need one agent, or the conversational-reply path.
@@ -41,7 +41,7 @@ The cited failure used MiniMax-M2.7 as both orchestrator and specialist engine. 
 - **Callback consolidation (#287):** different bug class
 - **Structured `skipped` / `SkipEntry` schema:** add if/when the warn-log rate stays non-trivial after this ships, or when a dashboard/analytics consumer exists
 - **Per-member mandate-fit scoring:** larger evaluation feature, out of scope
-- **Model-specific prompt variants:** if MiniMax keeps missing the nudge after this lands, a MiniMax-specific prompt variant is the next escalation (see the provider-variant pattern in `crates/mika-agent/CLAUDE.md` Skills System)
+- **Provider-specific tuning:** if a particular provider's retry rate is an outlier after this lands, a per-provider prompt variant is the established escalation path (see the provider-variant pattern in `crates/mika-agent/CLAUDE.md` Skills System). Not this plan's concern.
 
 ## Context & Research
 
@@ -51,7 +51,6 @@ The cited failure used MiniMax-M2.7 as both orchestrator and specialist engine. 
 - `crates/mika-agent/src/teams/engine.rs:1437-1525` — `parse_task_assignments`
 - `crates/mika-agent/src/teams/engine.rs:674` onward — `decompose()` and its `DecomposeResult` match arms (8 call sites — reason to keep the gap signal internal rather than a new public variant)
 - `src/agent_loop.rs` post-condition retry pattern — structurally similar, one retry then fall through
-- Provider + model for run `fd7ef7ef`: `llm_calls` table shows both `steve-jobs` and `mika-dev` on `minimax/MiniMax-M2.7`
 
 ### Institutional Learnings
 
@@ -60,20 +59,20 @@ The cited failure used MiniMax-M2.7 as both orchestrator and specialist engine. 
 
 ## Key Technical Decisions
 
-- **Prompt first, structural as backstop.** One-sentence addition to the orchestrator prompt is the primary lever. Coverage retry activates only when the prompt fails. **Rationale:** the cited failure is MiniMax-specific; stronger models likely respond to a crisper prompt. We observe the retry rate in the `warn!` logs post-ship; if it converges to ~zero, the structural layer is quiet defense-in-depth. If it stays high, escalate to structured schemas or model-specific variants (deferred above).
+- **Prompt first, structural as backstop.** One-sentence addition to the orchestrator prompt is the primary lever. Coverage retry activates only when the prompt fails. **Rationale:** the prompt is what shapes the output, and a roster-awareness instruction is the missing piece. The structural retry is an engine-level safety net for when the prompt isn't enough — we observe its fire rate via `warn!` logs post-ship. If it's silent, the prompt is doing the work; if it fires often, we have data to escalate to structured schemas (deferred above).
 - **Gap signal stays internal — no new `DecomposeResult` variant.** `parse_task_assignments` keeps its current two-arm signature; the coverage helper is called from `decompose()` against a successful `Tasks` result. **Rationale:** 8 call sites match on `DecomposeResult` today and don't care about coverage. Widening the enum would force churn at every site. SRP.
 - **Re-prompt uses free-form reply, not a new schema.** The nudge says: "You did not assign tasks to: [names]. Either include them or explicitly say why they're not relevant — it's fine to skip members whose mandate doesn't fit the goal." Response is still parsed by the existing logic. **Rationale:** no schema contract to maintain, no wrapper type, no prompt example to keep in sync. If the second response still has missing members, we treat any plausible free-form justification as sufficient — coverage retry is about acknowledgement, not machine-readable reasons.
 - **One-shot retry, then fall through with `warn!`.** Matches `agent_loop.rs` post-condition pattern. Hard cap on cost.
 - **Observability is a single boolean + a `warn!` line.** No persistence schema change. `TeamRun.coverage_retry_fired: bool` gets serialized via the existing `team_runs.checkpoint` JSON column (additive, backward-compatible). Debugging "did this run's orchestrator miss members?" = grep the log for `team_coverage_gap` with run id. **Rationale:** Explicitly YAGNI — structured skip data is not consumed anywhere yet; build it when a consumer needs it.
 - **Prompt tests assert semantics, not wording.** Test checks that the prompt contains a roster-accounting instruction (e.g., searches for "account for" or "every team member"), not a specific literal string. **Rationale:** less brittle, survives wording tweaks.
-- **Validate prompt-only effect before merging structural.** As a Phase-0 sanity check, apply just the prompt addition against the failing scenario (MiniMax orchestrator, 5-agent team, same goal) and record whether coverage improves. Informs whether the structural layer earns its keep right now, or whether it's purely defensive.
+- **Validate prompt-only effect before merging structural.** As a Phase-0 sanity check, apply just the prompt addition against a reproduction of the failing scenario (5-agent team, creative goal) and record whether coverage improves. Informs whether the structural layer earns its keep right now, or whether it's purely defensive.
 
 ## Open Questions
 
 ### Resolved During Planning
 
 - **Is a wrapper schema needed now?** No — defer. Simple missing-name list in the re-prompt is enough; the LLM's free-form response already gets parsed by existing code.
-- **Is this a MiniMax-specific issue?** Likely primary cause. The structural layer is still justified as provider-agnostic defense, but sizing the mechanism to MiniMax's blind spot (not a general engine deficiency) keeps the scope tight.
+- **Is this a provider-specific issue?** Insufficient evidence. The cited failure is one run. The contract gap is real regardless; the fix targets the contract, not any single provider's instruction-following.
 - **Should `CoverageGap` be a new `DecomposeResult` variant?** No. 8 match sites, none care. Keep the gap signal internal to `decompose()`.
 - **Should retry metadata include structured skip reasons?** No (R3). A bool + warn log with run id and missing members is enough until a consumer requests more.
 
@@ -195,9 +194,9 @@ The cited failure used MiniMax-M2.7 as both orchestrator and specialist engine. 
 
 | Risk | Mitigation |
 |------|------------|
-| Prompt change alone fixes the MiniMax case — structural layer is idle defense. | This is the intended outcome; `warn!` frequency tells us if the structural layer ever fires. If it's perpetually silent, no cost; if it fires often, we have data to escalate. |
-| Retry rate stays high (LLMs ignore both prompt and nudge). | Observable via `warn!` log. Next escalation: structured `skipped` schema (deferred) or MiniMax-specific prompt variant. Both explicitly out of scope for this plan. |
-| Prompt wording choice affects retry rate. | Pick the better of two phrasings empirically against `fd7ef7ef`-style scenarios before merging (resolved-during-implementation note). |
+| Prompt change alone fixes the observed cases — structural layer is idle defense. | This is the intended outcome; `warn!` frequency tells us if the structural layer ever fires. If it's perpetually silent, no cost; if it fires often, we have data to escalate. |
+| Retry rate stays high (orchestrator ignores both prompt and nudge). | Observable via `warn!` log. Next escalation: structured `skipped` schema (deferred) or per-provider prompt variant. Both explicitly out of scope for this plan. |
+| Prompt wording choice affects retry rate. | Pick the better of two phrasings empirically against the failing scenario before merging (resolved-during-implementation note). |
 | Unit 3's serde-default field breaks existing deserialization. | `#[serde(default)]` guarantees backward compat; unit test covers pre-existing-row case; fallback is to drop Unit 3 and rely on `warn!` for R3. |
 
 ## Documentation / Operational Notes
@@ -211,4 +210,4 @@ The cited failure used MiniMax-M2.7 as both orchestrator and specialist engine. 
 - Related code: `crates/mika-agent/src/teams/prompt.rs`, `crates/mika-agent/src/teams/engine.rs`
 - Related pattern: `docs/solutions/architecture-patterns/delegation-work-item-guard-enforcement.md`
 - Related memory: `feedback_prompt_enforcement_fragile`
-- Observed failure: team run `fd7ef7ef` — `llm_calls` table confirms MiniMax-M2.7 orchestrator + specialist
+- Observed failure: team run `fd7ef7ef` — one concrete instance of the contract gap, not a provider-specific conclusion
