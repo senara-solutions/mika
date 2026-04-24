@@ -70,7 +70,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `cargo test -p mika-agent --test eval` — Run agent loop integration tests (eval harness)
 - `MIKA_EVAL_REAL_PROVIDERS=anthropic,openai cargo test -p mika-agent --test eval -- --ignored` — Run real-provider eval matrix (requires API keys)
 - `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval` — Run KG provider comparison eval (requires API keys for all selected providers)
-- `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, etc.)
+- `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, `mika kg status`, etc.)
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@senara-solutions/ui` first, requires mika-server on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)

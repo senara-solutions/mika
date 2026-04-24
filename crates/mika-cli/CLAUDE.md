@@ -4,7 +4,7 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 ## Subcommands
 
-`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`.
+`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`.
 
 ### Key Commands
 
@@ -44,7 +44,7 @@ Scoped flags: `--agent <name>` (override active agent, most subcommands), `--tea
 
 ## Other `--format text|json` Commands
 
-`agents validate`, `teams list`, `teams status`, `teams validate`, `skills list`, `skills validate`, `status`, `config list`, `memory search`, `provider`, `model`, `webhook list-dead`, `webhook replay`, `webhook replay-all`.
+`agents validate`, `teams list`, `teams status`, `teams validate`, `skills list`, `skills validate`, `status`, `config list`, `memory search`, `provider`, `model`, `webhook list-dead`, `webhook replay`, `webhook replay-all`, `kg status`, `kg list-agents`, `kg purge`, `kg validate`.
 
 ## Webhook CLI
 
@@ -57,6 +57,20 @@ Requires `MIKA_GATEWAY_URL` (default: `http://localhost:3001`) and `MIKA_INTERNA
 ## Skills CLI
 
 `mika skills install/uninstall/update/list/validate/info` — skill architecture details in `crates/mika-agent/CLAUDE.md`.
+
+## Knowledge Graph CLI
+
+`mika kg status` — show KG state summary across all agents (entity counts, chunk counts, last extraction, enabled flag, corpus grouping by `docs_root_hash`). `--agent X` filters to one agent with extended detail. Supports `--format text|json`.
+
+`mika kg list-agents` — quick enumeration of agents with KG state (agent name, enabled flag, `docs_root_hash`, chunk count). Supports `--agent X` filter and `--format text|json`.
+
+`mika kg purge --agent X` — delete an agent's per-agent KG state (resolutions, resolution log). Interactive typed-ID confirmation (operator types the exact agent ID). `--yes` bypasses confirmation for scripting. `--include-orphaned-corpus` also deletes shared-corpus rows if no other agent references the same `docs_root_hash`. Non-TTY contexts require `--yes`. Supports `--format text|json`.
+
+`mika kg validate` — check for orphan FK rows across KG tables and NULL `source_doc_hash` entries. Each check produces `[OK]`, `[WARN]`, or `[FAIL]` output. Exit 0 when all checks pass (Warn is acceptable), exit 1 on any Fail. Supports `--format text|json`.
+
+Exit codes: `status`, `list-agents` always 0. `purge` returns 0 on success, 1 on cancellation or error. `validate` returns 0 iff no Fail checks, 1 otherwise.
+
+See `crates/mika-agent/CLAUDE.md` for KG architecture and schema details.
 
 ## MCP CLI
 

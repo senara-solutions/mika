@@ -8187,6 +8187,199 @@ fn format_age(timestamp_str: &str, now: chrono::DateTime<Utc>) -> String {
     }
 }
 
+// ===== KG CLI helpers =====
+
+/// Counts of rows deleted by a KG purge operation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KgPurgeCounts {
+    pub resolutions_deleted: u64,
+    pub resolution_log_deleted: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_layer_deleted: Option<Vec<(String, u64)>>,
+}
+
+impl Database {
+    /// Count rows in a KG table matching a key column.
+    pub fn kg_count_rows(&self, table: &str, key_col: &str, key_val: &str) -> Result<u64> {
+        // Allowlist tables and columns to prevent SQL injection
+        let valid_tables = [
+            "kg_chunks",
+            "kg_subject_entities",
+            "kg_subject_relationships",
+            "kg_chunk_subjects",
+            "kg_chunk_subject_relationships",
+            "kg_extractions",
+            "kg_subject_resolutions",
+            "kg_resolutions_log",
+            "kg_entities",
+        ];
+        let valid_cols = ["docs_root_hash", "agent_id"];
+
+        if !valid_tables.contains(&table) {
+            anyhow::bail!("Invalid KG table: {table}");
+        }
+        if !valid_cols.contains(&key_col) {
+            anyhow::bail!("Invalid KG key column: {key_col}");
+        }
+
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE {key_col} = ?1");
+        let count = self
+            .conn
+            .query_row(&sql, params![key_val], |r| r.get::<_, i64>(0))?;
+        Ok(count as u64)
+    }
+
+    /// Get the most recent extraction timestamp for a docs_root_hash.
+    pub fn kg_last_extraction(&self, docs_root_hash: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT MAX(created_at) FROM kg_extractions WHERE docs_root_hash = ?1",
+                params![docs_root_hash],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Detect drift: find distinct docs_root_hash values the agent's
+    /// resolutions point at via the subject->chunk->corpus chain.
+    pub fn kg_observed_hashes(&self, agent_id: &str) -> Result<Vec<String>> {
+        let sql = r#"
+            SELECT DISTINCT c.docs_root_hash
+            FROM kg_subject_resolutions r
+            JOIN kg_subject_entities se ON se.id = r.subject_entity_id
+            JOIN kg_chunk_subjects cs ON cs.subject_entity_id = se.id
+            JOIN kg_chunks c ON c.id = cs.chunk_id
+            WHERE r.agent_id = ?1
+        "#;
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![agent_id], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Transactional purge of an agent's KG state.
+    ///
+    /// **Caller MUST verify no other agent references the `docs_root_hash`
+    /// before passing `force_delete_shared = true`.** The helper does not
+    /// re-verify — this flag is a pre-authorization, not operator intent.
+    pub fn purge_kg_for_agent(
+        &self,
+        agent_id: &str,
+        force_delete_shared: bool,
+        docs_root_hash: Option<&str>,
+    ) -> Result<KgPurgeCounts> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Step 1: Delete per-agent resolutions
+        tx.execute(
+            "DELETE FROM kg_subject_resolutions WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        let resolutions_deleted = tx.changes();
+
+        // Step 2: Delete per-agent resolution log
+        tx.execute(
+            "DELETE FROM kg_resolutions_log WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        let resolution_log_deleted = tx.changes();
+
+        // Step 3: Optionally delete shared-layer rows
+        let shared_layer_deleted = if force_delete_shared {
+            if let Some(hash) = docs_root_hash {
+                // Delete in FK-safe order (children before parents)
+                let tables = [
+                    "kg_chunk_subject_relationships",
+                    "kg_chunk_subjects",
+                    "kg_subject_relationships",
+                    "kg_subject_entities",
+                    "kg_extractions",
+                    "kg_chunks",
+                ];
+                let mut deleted = Vec::new();
+                for table in &tables {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE docs_root_hash = ?1"),
+                        params![hash],
+                    )?;
+                    let count = tx.changes();
+                    if count > 0 {
+                        deleted.push((table.to_string(), count));
+                    }
+                }
+                Some(deleted)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        tx.commit()?;
+
+        Ok(KgPurgeCounts {
+            resolutions_deleted,
+            resolution_log_deleted,
+            shared_layer_deleted,
+        })
+    }
+
+    /// Run orphan FK check for KG validate.
+    /// Returns (count, example_id) of orphan rows.
+    pub fn kg_check_orphan_fk(
+        &self,
+        source_table: &str,
+        fk_col: &str,
+        target_table: &str,
+    ) -> Result<(u64, Option<i64>)> {
+        // Allowlist for safety
+        let valid_tables = [
+            "kg_chunks",
+            "kg_subject_entities",
+            "kg_subject_relationships",
+            "kg_chunk_subjects",
+            "kg_chunk_subject_relationships",
+            "kg_subject_resolutions",
+            "kg_resolutions_log",
+            "kg_entities",
+            "kg_extractions",
+        ];
+        let valid_cols = [
+            "chunk_id",
+            "subject_entity_id",
+            "subject_relationship_id",
+            "domain_entity_id",
+        ];
+
+        if !valid_tables.contains(&source_table) || !valid_tables.contains(&target_table) {
+            anyhow::bail!("Invalid KG table in orphan check");
+        }
+        if !valid_cols.contains(&fk_col) {
+            anyhow::bail!("Invalid KG FK column: {fk_col}");
+        }
+
+        let sql = format!(
+            "SELECT COUNT(*), MIN(id) FROM {source_table} WHERE {fk_col} NOT IN (SELECT id FROM {target_table})"
+        );
+        let (count, example) = self.conn.query_row(&sql, [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+        })?;
+        Ok((count as u64, example))
+    }
+
+    /// Count kg_chunks rows with NULL source_doc_hash.
+    pub fn kg_count_null_hash(&self) -> Result<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM kg_chunks WHERE source_doc_hash IS NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+}
+
 // ===== Tests =====
 
 #[cfg(test)]
