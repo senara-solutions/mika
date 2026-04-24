@@ -138,6 +138,61 @@ impl Tool for RunTeamTool {
         .await;
         team_db.shutdown();
 
+        // Consolidated team-run notification (sync path).
+        // Paired with dispatch_invoke_orchestrator (async path); see
+        // docs/plans/2026-04-24-003-fix-team-callback-consolidation-plan.md
+        // for why this lives here and not in TeamEngine::finalize_and_shutdown
+        // (keeps the team engine free of a user_message_sender field).
+        if let Ok(ref run) = result
+            && let Some(msg) = crate::teams::notification::build_run_completion_message(run)
+        {
+            if let Some(ref sender) = ctx.message_sender {
+                match sender.send(&msg.text).await {
+                    Ok(crate::messaging::SendOutcome::Delivered) => {
+                        tracing::info!(
+                            team_run_id = %run.run_id,
+                            team_name = %run.team_name,
+                            status = %run.status,
+                            notification_kind = %msg.notification_kind,
+                            deliverable_chars = msg.deliverable_chars,
+                            truncated = msg.truncated,
+                            path = "sync",
+                            "team_run_notified"
+                        );
+                    }
+                    Ok(crate::messaging::SendOutcome::NoChannel) => {
+                        // NoChannel is permanent — silent per dispatcher policy.
+                    }
+                    Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                        tracing::warn!(
+                            team_run_id = %run.run_id,
+                            error = %reason,
+                            "team_run_notification_delivery_failed"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            team_run_id = %run.run_id,
+                            error = %e,
+                            "team_run_notification_send_error"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    team_run_id = %run.run_id,
+                    "no message_sender available for team-run notification (sync path)"
+                );
+            }
+            // Log warning for completed-without-deliverable
+            if msg.notification_kind == "fallback" {
+                tracing::warn!(
+                    team_run_id = %run.run_id,
+                    "team run completed without a deliverable"
+                );
+            }
+        }
+
         match result {
             Ok(run) => {
                 if let Some(ref deliverable) = run.deliverable {

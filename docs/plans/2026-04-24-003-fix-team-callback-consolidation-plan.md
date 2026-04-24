@@ -110,7 +110,7 @@ Observed failure: run `fd7ef7ef` (one concrete instance). mika-dev received 2 de
 
 ---
 
-- [ ] **Unit 1: Shared formatter + notification hooks at sync and async terminal states**
+- [x] **Unit 1: Shared formatter + notification hooks at sync and async terminal states**
 
 **Goal:** On every team-run terminal transition, emit exactly one user-facing message containing the deliverable (or failure reason). Both sync completion (via `run_team` tool) and async completion (via `dispatch_invoke_orchestrator`) route through a shared pure formatter.
 
@@ -184,7 +184,7 @@ info!(
 
 ---
 
-- [ ] **Unit 2: Suppress `send_message` in per-child team-callback silent turns**
+- [x] **Unit 2: Suppress `send_message` in per-child team-callback silent turns**
 
 **Goal:** Per-delegation `resume_agent` callbacks run their silent turn with a `NoopSender` instead of the user-facing `message_sender`. With Unit 1 in place, the net result is exactly one user message per team run.
 

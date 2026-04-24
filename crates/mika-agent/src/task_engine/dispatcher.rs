@@ -382,6 +382,24 @@ impl TaskDispatcher {
             try_extract_callback_metadata(&self.db, task).await;
         }
 
+        // Suppress user-facing notifications for team-child callbacks.
+        // The consolidated team-run notification (from run_team tool or
+        // dispatch_invoke_orchestrator) handles user delivery — per-child
+        // silent turns should not independently call send_message on the
+        // user channel. The silent turn still runs for internal state updates.
+        let message_sender = if is_team_child_callback(task) {
+            info!(
+                task_id = %task.id,
+                team_run_id = ?task.team_run_id,
+                parent_task_id = ?task.parent_task_id,
+                agent_id = %task.agent_id,
+                "team_child_callback_notification_suppressed"
+            );
+            Some(Arc::new(crate::messaging::NoopSender) as Arc<dyn crate::messaging::MessageSender>)
+        } else {
+            self.message_sender.clone()
+        };
+
         let params = SilentAgentParams {
             db: &self.db,
             llm: self.llm.as_ref(),
@@ -390,7 +408,7 @@ impl TaskDispatcher {
             trigger,
             home_dir: &self.home_dir,
             session_id: &session_id,
-            message_sender: self.message_sender.clone(),
+            message_sender,
             embedding_client: self.embedding_client.as_ref(),
             brave_api_key: self.brave_api_key.as_deref(),
             github_token: self.github_token.as_deref(),
@@ -516,7 +534,60 @@ impl TaskDispatcher {
             &self.db,
             self.github_app.clone(),
         )
-        .await
+        .await?;
+
+        // Consolidated team-run notification (async path).
+        // Paired with run_team tool (sync path); see
+        // docs/plans/2026-04-24-003-fix-team-callback-consolidation-plan.md
+        // for why this lives here and not in TeamEngine::finalize_and_shutdown
+        // (keeps the team engine free of a user_message_sender field).
+        if let Some(run) = self.db.load_team_run_by_id(team_run_id).await?
+            && let Some(msg) =
+                crate::teams::notification::build_run_completion_message_from_row(&run)
+        {
+            if let Some(ref sender) = self.message_sender {
+                match sender.send(&msg.text).await {
+                    Ok(crate::messaging::SendOutcome::Delivered) => {
+                        info!(
+                            team_run_id = %run.id,
+                            team_name = %run.team_name,
+                            status = %run.status,
+                            notification_kind = %msg.notification_kind,
+                            deliverable_chars = msg.deliverable_chars,
+                            truncated = msg.truncated,
+                            path = "async",
+                            "team_run_notified"
+                        );
+                    }
+                    Ok(crate::messaging::SendOutcome::NoChannel) => {
+                        // NoChannel is permanent — silent per dispatcher policy.
+                    }
+                    Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                        warn!(
+                            team_run_id = %run.id,
+                            error = %reason,
+                            "team_run_notification_delivery_failed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            team_run_id = %run.id,
+                            error = %e,
+                            "team_run_notification_send_error"
+                        );
+                    }
+                }
+            }
+            // Log warning for completed-without-deliverable
+            if msg.notification_kind == "fallback" {
+                warn!(
+                    team_run_id = %run.id,
+                    "team run completed without a deliverable"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Run the heartbeat silent agent with all pre-filter checks.
@@ -880,6 +951,14 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
 /// claude-pilot completed (status: done).
 /// Session: <session_id>
 /// Turns: <N>
+/// Returns `true` if the task is a team-child callback (per-delegation
+/// `resume_agent` created by the team engine). Both `team_run_id` and
+/// `parent_task_id` are set together at child-creation time in
+/// `engine.rs:874-912`.
+fn is_team_child_callback(task: &Task) -> bool {
+    task.team_run_id.is_some() && task.parent_task_id.is_some()
+}
+
 /// Cost: $<amount>
 /// Duration: <N>ms
 /// ```
@@ -1434,5 +1513,68 @@ mod tests {
         let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
         // Should not panic or error — just returns early
         try_extract_callback_metadata(&db, &task).await;
+    }
+
+    // ===== is_team_child_callback predicate tests =====
+
+    fn make_task_with_team_fields(team_run_id: Option<&str>, parent_task_id: Option<&str>) -> Task {
+        Task {
+            id: "test-task-1".to_string(),
+            agent_id: "mika".to_string(),
+            team_run_id: team_run_id.map(String::from),
+            parent_task_id: parent_task_id.map(String::from),
+            depth: 0,
+            label: "test".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            status: "completed".to_string(),
+            process_id: None,
+            input_context: None,
+            result: None,
+            created_by_session: None,
+            created_trace_id: None,
+            execution_trace_id: None,
+            created_at: "2026-04-24T12:00:00Z".to_string(),
+            updated_at: "2026-04-24T12:00:00Z".to_string(),
+            fired_at: None,
+            completed_at: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: "issue".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_is_team_child_callback_both_set() {
+        let task = make_task_with_team_fields(Some("run-1"), Some("parent-1"));
+        assert!(is_team_child_callback(&task));
+    }
+
+    #[test]
+    fn test_is_team_child_callback_no_team_run_id() {
+        // Regular skill callback with a parent but no team_run_id
+        let task = make_task_with_team_fields(None, Some("parent-1"));
+        assert!(!is_team_child_callback(&task));
+    }
+
+    #[test]
+    fn test_is_team_child_callback_no_parent() {
+        // team_run_id set but no parent — team root task (not a child callback)
+        let task = make_task_with_team_fields(Some("run-1"), None);
+        assert!(!is_team_child_callback(&task));
+    }
+
+    #[test]
+    fn test_is_team_child_callback_neither_set() {
+        let task = make_task_with_team_fields(None, None);
+        assert!(!is_team_child_callback(&task));
     }
 }
