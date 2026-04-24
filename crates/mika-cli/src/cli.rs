@@ -73,6 +73,8 @@ pub enum Commands {
     Model(ModelArgs),
     /// Manage gateway webhook dead-letter queue
     Webhook(WebhookArgs),
+    /// Manage Knowledge Graph state
+    Kg(KgArgs),
     /// Git credential helper (used by git, not directly by users)
     #[command(name = "credential-helper")]
     CredentialHelper(CredentialHelperArgs),
@@ -94,6 +96,7 @@ impl Commands {
             Commands::Agents(args) => args.agent_flag.agent.as_deref(),
             Commands::Provider(args) => args.agent_flag.agent.as_deref(),
             Commands::Model(args) => args.agent_flag.agent.as_deref(),
+            Commands::Kg(args) => args.agent_override(),
             // No agent override — listed explicitly so adding a new Commands variant
             // produces a compile error, forcing a conscious scoping decision.
             Commands::Setup { .. }
@@ -128,6 +131,7 @@ impl Commands {
             | Commands::Provider(_)
             | Commands::Model(_)
             | Commands::Webhook(_)
+            | Commands::Kg(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -773,6 +777,84 @@ pub enum McpCommand {
         /// Name of the server to disable
         name: String,
     },
+}
+
+#[derive(clap::Args)]
+pub struct KgArgs {
+    #[command(subcommand)]
+    pub command: KgCommand,
+}
+
+impl KgArgs {
+    /// Extract `--agent` override from whichever KG subcommand carries it.
+    pub fn agent_override(&self) -> Option<&str> {
+        match &self.command {
+            KgCommand::Status(args) => args.agent_flag.agent.as_deref(),
+            KgCommand::ListAgents(args) => args.agent_flag.agent.as_deref(),
+            KgCommand::Purge(args) => Some(args.agent.as_str()),
+            // validate is workspace-wide, no agent filter
+            KgCommand::Validate(_) => None,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum KgCommand {
+    /// Show KG state summary (all agents or one)
+    Status(KgStatusArgs),
+    /// List agents with KG state
+    #[command(name = "list-agents")]
+    ListAgents(KgListAgentsArgs),
+    /// Purge an agent's KG state
+    Purge(KgPurgeArgs),
+    /// Check for orphan rows and FK violations
+    Validate(KgValidateArgs),
+}
+
+#[derive(clap::Args)]
+pub struct KgStatusArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+}
+
+#[derive(clap::Args)]
+pub struct KgListAgentsArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+}
+
+#[derive(clap::Args)]
+pub struct KgPurgeArgs {
+    /// Agent whose KG state to purge (required)
+    #[arg(long)]
+    pub agent: String,
+
+    /// Skip interactive confirmation
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Also delete shared-corpus rows if no other agent references them
+    #[arg(long)]
+    pub include_orphaned_corpus: bool,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+}
+
+#[derive(clap::Args)]
+pub struct KgValidateArgs {
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
 }
 
 /// Known model shorthands: (shorthand, full_model_id, display_name).
