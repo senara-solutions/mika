@@ -65,7 +65,7 @@ from the `mika-agent` crate.
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum for key metadata), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` secrets via dotenvy), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), multi-provider LLM abstraction (`LlmProvider` trait, `AnthropicProvider`, `OpenAiCompatibleProvider`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
 | `mika-a2a` | `crates/mika-a2a/` | A2A (Agent-to-Agent) protocol v0.3 implementation: JSON-RPC request/response types, task state machine, SSE streaming, A2A client |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 27 builtin tools + 10 management tools (3 always-on + 7 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, A2A server endpoints, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 27 builtin tools + 12 management tools (3 always-on + 9 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, A2A server endpoints, HTTP server binary (`mika-server`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`, `doctor`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay with agent identification and reply routing. Env-var-only config. |
 
@@ -232,10 +232,10 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 
 ### Management Tools
 
-12 tools for multi-agent and team workflows, registered via
+14 tools for multi-agent and team workflows, registered via
 `management_tools_if_needed()`. `create_agent`, `list_agents`, and `create_team` are always
 registered (enabling agent and team bootstrapping from a single-agent setup). The
-remaining 9 tools (including task write tools) are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
+remaining 11 tools (including task write tools) are added conditionally when `agents.len() > 1 || !teams.is_empty()`:
 
 | Tool | Description | Timeout | Always registered |
 |------|-------------|---------|-------------------|
@@ -249,6 +249,8 @@ remaining 9 tools (including task write tools) are added conditionally when `age
 | `get_team_history` | List recent runs for a team with IDs, status, goals, and timestamps. | default (30s) | No |
 | `delete_team` | Delete a team definition and all its data (workspace, config). Irreversible. | default (30s) | No |
 | `update_team` | Update an existing team definition. Only provided fields are changed. | default (30s) | No |
+| `add_team_member` | Add a single agent to an existing team. Validates agent exists globally and is not already a member. | default (30s) | No |
+| `remove_team_member` | Remove a single agent from an existing team. Cannot remove the orchestrator or drop below 2-member minimum. | default (30s) | No |
 | `create_task` | Create a trackable task with optional parent, source, and reference_url. Max depth 3, max 25 agent-created per session (configurable via `max_agent_tasks_per_session`, user_request exempt). Cannot be used in callback turns. | default (30s) | No |
 | `update_task_status` | Update task status with validated transitions. Permitted: pending→any, in_progress→blocked/completed/cancelled, blocked→in_progress/completed/cancelled. Terminal states (completed, cancelled) are final. Logs audit event. | default (30s) | No |
 
