@@ -198,6 +198,10 @@ See `tests/eval/grounding_regressions/README.md` for the full vocabulary, capabi
 
 **Cross-cutting conventions:** See `docs/architecture/kg-implementation-conventions.md` (C1–C3) and `docs/architecture/kg-id-convention.md` for the `<type>:<name>` entity key format.
 
+## Knowledge Graph — Docs Root Configuration
+
+`src/kg/config.rs` — Resolution chain for the docs root path the lexical ingestor reads (#738). Resolution order (first hit wins): `MIKA_KG_DOCS_ROOT` env var > `kg_docs_root` config.toml field > `<CWD>/docs/solutions` (container-native default). `resolve_kg_docs_root(&Settings) -> (PathBuf, PathSource)` is the public API. For OpenRC hosts where the service starts with CWD ≠ repo root, set `MIKA_KG_DOCS_ROOT=/path/to/mika-repo/docs/solutions` in the service config, or use the existing `--chdir` init-script workaround.
+
 ## Knowledge Graph — Subject Extractor
 
 `src/kg/subject_extractor.rs` — Per-agent LLM-based extraction of named entities and fact triples from previously-ingested documents (#690). Uses constrained NER with approved entity/relationship types and structural validation (not just prompt-based).

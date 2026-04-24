@@ -759,30 +759,34 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // into search_content for hybrid search. Runs after domain rebuild so each
     // KG layer's startup work composes cleanly for #690+.
     //
-    // docs_root is relative to the server working directory. In containers,
-    // the Dockerfile copies docs/ into the workdir.
+    // docs_root resolved via config cascade (#738):
+    //   MIKA_KG_DOCS_ROOT env > kg_docs_root config > <CWD>/docs/solutions
     {
-        let docs_root = std::env::current_dir()
-            .unwrap_or_default()
-            .join("docs")
-            .join("solutions");
+        let (docs_root, _source) = crate::kg::config::resolve_kg_docs_root(settings);
 
-        // Fan-out cost advisory (#757 R3). All agents use the same docs_root,
-        // so per-agent extraction/resolution scales N× with agent count.
-        // Only emit when there's actually a multiplier to warn about.
-        if docs_root.exists() && agents.len() >= 2 {
-            let shared_agents: Vec<&str> = agents.keys().map(|s| s.as_str()).collect();
-            info!(
-                event = "kg_shared_docs_root",
-                docs_root = %docs_root.display(),
-                agents = ?shared_agents,
-                agent_count = agents.len(),
-                "KG extraction and resolution run per agent; sharing docs_root means cost scales N×. \
-                 See MIKA_KG_BATCH_BUDGET (default 500) for the per-batch cap."
+        // Empty-path guard (#738): distinguish misconfigured empty value from
+        // genuinely missing directory so operators don't chase misleading logs.
+        if docs_root.as_os_str().is_empty() {
+            warn!(
+                "kg_docs_root is set to empty string — check MIKA_KG_DOCS_ROOT env var or \
+                 kg_docs_root in config.toml; skipping lexical ingestion"
             );
-        }
+        } else if docs_root.exists() {
+            // Fan-out cost advisory (#757 R3). All agents use the same docs_root,
+            // so per-agent extraction/resolution scales N× with agent count.
+            // Only emit when there's actually a multiplier to warn about.
+            if agents.len() >= 2 {
+                let shared_agents: Vec<&str> = agents.keys().map(|s| s.as_str()).collect();
+                info!(
+                    event = "kg_shared_docs_root",
+                    docs_root = %docs_root.display(),
+                    agents = ?shared_agents,
+                    agent_count = agents.len(),
+                    "KG extraction and resolution run per agent; sharing docs_root means cost scales N×. \
+                     See MIKA_KG_BATCH_BUDGET (default 500) for the per-batch cap."
+                );
+            }
 
-        if docs_root.exists() {
             for (agent_name, agent_state) in &agents {
                 let ingestor = crate::kg::lexical_ingestor::LexicalIngestor::new(
                     agent_state.db.clone(),

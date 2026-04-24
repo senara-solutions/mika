@@ -23,6 +23,7 @@
 //!   in `kg_subject_resolutions` with confidence scores.
 
 pub mod chunker;
+pub mod config;
 pub mod domain_builder;
 pub mod entity_resolver;
 pub mod ingestion_orchestrator;

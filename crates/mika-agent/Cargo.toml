@@ -60,3 +60,4 @@ tempfile.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
 mika-common = { workspace = true, features = ["test-utils"] }
+serial_test.workspace = true
