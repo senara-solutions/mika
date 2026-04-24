@@ -1,0 +1,375 @@
+//! Schema v27 convergence test (#786 Unit 4).
+//!
+//! Verifies structural properties of the v27 schema produced by clean-slate
+//! `Database::open_in_memory()`. The convergence guarantee between clean-slate
+//! and incremental-upgrade paths is tested via the inline `#[cfg(test)]`
+//! module in `db.rs` (which can access `pub(crate)` internals). This
+//! integration test exercises the public API surface and verifies v27's
+//! key invariants: shared-layer tables use `docs_root_hash`, per-agent
+//! tables keep `agent_id`, and the `schema_meta` marker is set.
+
+use anyhow::Result;
+use rusqlite::Connection;
+use std::collections::BTreeSet;
+
+/// Column info from `PRAGMA table_info`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ColumnInfo {
+    name: String,
+    col_type: String,
+    notnull: bool,
+    dflt_value: Option<String>,
+    pk: i32,
+}
+
+fn get_columns(conn: &Connection, table: &str) -> Result<BTreeSet<ColumnInfo>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table}')"))?;
+    let cols = stmt
+        .query_map([], |row| {
+            Ok(ColumnInfo {
+                name: row.get(1)?,
+                col_type: row.get(2)?,
+                notnull: row.get::<_, i32>(3)? != 0,
+                dflt_value: row.get(4)?,
+                pk: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    Ok(cols)
+}
+
+fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info('{table}')"))
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    column_names(conn, table).iter().any(|c| c == column)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
+fn get_index_names(conn: &Connection, table: &str) -> BTreeSet<String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA index_list('{table}')"))
+        .unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .filter(|name| !name.starts_with("sqlite_autoindex_"))
+        .collect()
+}
+
+/// Build a fresh DB via `Database::open` on a temp file.
+fn build_fresh_db() -> Result<(tempfile::TempDir, Connection)> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("fresh.db");
+    let _db = mika_agent::db::Database::open(&path)?;
+    drop(_db);
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON")?;
+    Ok((dir, conn))
+}
+
+// ===== Shared-layer tables: docs_root_hash, no agent_id =====
+
+#[test]
+fn shared_layer_tables_have_docs_root_hash_and_docs_root() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    let shared_tables = [
+        "kg_chunks",
+        "kg_subject_entities",
+        "kg_subject_relationships",
+        "kg_chunk_subjects",
+        "kg_chunk_subject_relationships",
+        "kg_extractions",
+    ];
+
+    for table in &shared_tables {
+        assert!(
+            has_column(&conn, table, "docs_root_hash"),
+            "v27 shared-layer table {table} must have docs_root_hash column"
+        );
+        assert!(
+            has_column(&conn, table, "docs_root"),
+            "v27 shared-layer table {table} must have docs_root debug column"
+        );
+        assert!(
+            !has_column(&conn, table, "agent_id"),
+            "v27 shared-layer table {table} must NOT have agent_id column"
+        );
+    }
+}
+
+// ===== Per-agent tables: agent_id, no docs_root_hash =====
+
+#[test]
+fn per_agent_tables_keep_agent_id() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    let per_agent_tables = ["kg_subject_resolutions", "kg_resolutions_log"];
+
+    for table in &per_agent_tables {
+        assert!(
+            has_column(&conn, table, "agent_id"),
+            "Per-agent table {table} must retain agent_id in v27"
+        );
+        assert!(
+            !has_column(&conn, table, "docs_root_hash"),
+            "Per-agent table {table} must NOT have docs_root_hash in v27"
+        );
+    }
+}
+
+// ===== Domain tables: unchanged =====
+
+#[test]
+fn domain_tables_unchanged() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    // kg_entities: no agent_id, no docs_root_hash (global)
+    assert!(!has_column(&conn, "kg_entities", "agent_id"));
+    assert!(!has_column(&conn, "kg_entities", "docs_root_hash"));
+    assert!(has_column(&conn, "kg_entities", "entity_key"));
+
+    // kg_relationships: no agent_id, no docs_root_hash (global)
+    assert!(!has_column(&conn, "kg_relationships", "agent_id"));
+    assert!(!has_column(&conn, "kg_relationships", "docs_root_hash"));
+    assert!(has_column(&conn, "kg_relationships", "from_entity_id"));
+}
+
+// ===== schema_meta table and coalesce marker =====
+
+#[test]
+fn fresh_db_has_schema_meta_with_coalesce_marker() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    assert!(
+        table_exists(&conn, "schema_meta"),
+        "Fresh v27 DB must have schema_meta table"
+    );
+
+    let marker: Option<String> = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'v27_coalesce_complete'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    assert_eq!(
+        marker.as_deref(),
+        Some("1"),
+        "Fresh DB must have schema_meta.v27_coalesce_complete = '1'"
+    );
+}
+
+// ===== Schema version =====
+
+#[test]
+fn fresh_db_is_at_v27() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    assert_eq!(version, 27, "Fresh DB must be at schema version 27");
+}
+
+// ===== Index verification =====
+
+#[test]
+fn shared_layer_indexes_use_docs_root_hash() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    // Verify key indexes exist
+    let chunk_indexes = get_index_names(&conn, "kg_chunks");
+    assert!(
+        chunk_indexes.contains("idx_kg_chunks_docs_root_hash_doc"),
+        "kg_chunks must have idx_kg_chunks_docs_root_hash_doc index, got: {chunk_indexes:?}"
+    );
+
+    let se_indexes = get_index_names(&conn, "kg_subject_entities");
+    assert!(
+        se_indexes.contains("idx_kg_subj_entities_drh_type"),
+        "kg_subject_entities must have idx_kg_subj_entities_drh_type index, got: {se_indexes:?}"
+    );
+
+    let sr_indexes = get_index_names(&conn, "kg_subject_relationships");
+    assert!(
+        sr_indexes.contains("idx_kg_subj_rel_from"),
+        "kg_subject_relationships must have idx_kg_subj_rel_from, got: {sr_indexes:?}"
+    );
+    assert!(
+        sr_indexes.contains("idx_kg_subj_rel_to"),
+        "kg_subject_relationships must have idx_kg_subj_rel_to, got: {sr_indexes:?}"
+    );
+    assert!(
+        sr_indexes.contains("idx_kg_subj_rel_type"),
+        "kg_subject_relationships must have idx_kg_subj_rel_type, got: {sr_indexes:?}"
+    );
+
+    let cs_indexes = get_index_names(&conn, "kg_chunk_subjects");
+    assert!(
+        cs_indexes.contains("idx_kg_cs_chunk"),
+        "kg_chunk_subjects must have idx_kg_cs_chunk, got: {cs_indexes:?}"
+    );
+    assert!(
+        cs_indexes.contains("idx_kg_cs_entity"),
+        "kg_chunk_subjects must have idx_kg_cs_entity, got: {cs_indexes:?}"
+    );
+    assert!(
+        cs_indexes.contains("idx_kg_cs_trace"),
+        "kg_chunk_subjects must have idx_kg_cs_trace, got: {cs_indexes:?}"
+    );
+
+    let csr_indexes = get_index_names(&conn, "kg_chunk_subject_relationships");
+    assert!(
+        csr_indexes.contains("idx_kg_csr_chunk"),
+        "kg_chunk_subject_relationships must have idx_kg_csr_chunk, got: {csr_indexes:?}"
+    );
+    assert!(
+        csr_indexes.contains("idx_kg_csr_rel"),
+        "kg_chunk_subject_relationships must have idx_kg_csr_rel, got: {csr_indexes:?}"
+    );
+
+    let ext_indexes = get_index_names(&conn, "kg_extractions");
+    assert!(
+        ext_indexes.contains("idx_kg_extractions_drh"),
+        "kg_extractions must have idx_kg_extractions_drh, got: {ext_indexes:?}"
+    );
+}
+
+// ===== kg_extractions UNIQUE constraint =====
+
+#[test]
+fn kg_extractions_first_writer_wins() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    // Register a test agent and seed one extraction row
+    conn.execute(
+        "INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES ('test-agent', 'Test', '')",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO kg_extractions (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model)
+         VALUES ('0000000000000000', '/test/docs', 'doc1.md', 'hash1', 'test-model')",
+        [],
+    )
+    .unwrap();
+
+    // Second insert with same (docs_root_hash, source_doc_path) should be ignored
+    let changes = conn
+        .execute(
+            "INSERT OR IGNORE INTO kg_extractions (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model)
+             VALUES ('0000000000000000', '/test/docs', 'doc1.md', 'hash2', 'another-model')",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        changes, 0,
+        "Second INSERT OR IGNORE on same (docs_root_hash, source_doc_path) should be no-op"
+    );
+
+    // Verify original row is preserved
+    let model: String = conn
+        .query_row(
+            "SELECT extraction_model FROM kg_extractions WHERE docs_root_hash = '0000000000000000' AND source_doc_path = 'doc1.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(model, "test-model", "First writer's data must be preserved");
+}
+
+// ===== Column-level structural verification for KG tables =====
+
+#[test]
+fn kg_chunks_v27_column_structure() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+    let cols = get_columns(&conn, "kg_chunks").unwrap();
+    let col_names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+
+    assert!(col_names.contains(&"id"), "kg_chunks missing id");
+    assert!(
+        col_names.contains(&"docs_root_hash"),
+        "kg_chunks missing docs_root_hash"
+    );
+    assert!(
+        col_names.contains(&"docs_root"),
+        "kg_chunks missing docs_root"
+    );
+    assert!(col_names.contains(&"seq_id"), "kg_chunks missing seq_id");
+    assert!(
+        col_names.contains(&"source_doc_path"),
+        "kg_chunks missing source_doc_path"
+    );
+    assert!(
+        col_names.contains(&"source_doc_hash"),
+        "kg_chunks missing source_doc_hash"
+    );
+    assert!(
+        col_names.contains(&"created_at"),
+        "kg_chunks missing created_at"
+    );
+    assert!(
+        col_names.contains(&"trace_id"),
+        "kg_chunks missing trace_id"
+    );
+    assert!(
+        !col_names.contains(&"agent_id"),
+        "kg_chunks has forbidden agent_id"
+    );
+}
+
+#[test]
+fn kg_subject_entities_v27_column_structure() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+    let cols = get_columns(&conn, "kg_subject_entities").unwrap();
+    let col_names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+
+    assert!(col_names.contains(&"docs_root_hash"));
+    assert!(col_names.contains(&"docs_root"));
+    assert!(col_names.contains(&"entity_key"));
+    assert!(col_names.contains(&"type"));
+    assert!(col_names.contains(&"name"));
+    assert!(col_names.contains(&"confidence"));
+    assert!(col_names.contains(&"properties_json"));
+    assert!(!col_names.contains(&"agent_id"));
+}
+
+#[test]
+fn kg_extractions_v27_column_structure() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+    let cols = get_columns(&conn, "kg_extractions").unwrap();
+    let col_names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+
+    assert!(col_names.contains(&"docs_root_hash"));
+    assert!(col_names.contains(&"docs_root"));
+    assert!(col_names.contains(&"source_doc_path"));
+    assert!(col_names.contains(&"source_doc_hash"));
+    assert!(col_names.contains(&"extraction_model"));
+    assert!(col_names.contains(&"entities_extracted"));
+    assert!(col_names.contains(&"relationships_extracted"));
+    assert!(col_names.contains(&"extraction_trace_id"));
+    assert!(!col_names.contains(&"agent_id"));
+}

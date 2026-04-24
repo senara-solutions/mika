@@ -52,7 +52,7 @@
 //! - Subject entities/relationships: subject extractor (#690)
 //! - Resolution edges (`kg_subject_resolutions`): entity resolver (#691)
 //!
-//! ## Idempotency key (extraction, #757)
+//! ## Idempotency key (extraction, #757 + #786)
 //!
 //! Extraction is **whole-doc**: one LLM call per source doc, with `[CHUNK N]`
 //! markers in the prompt (see `subject_extractor::extract_document`). The unit
@@ -64,19 +64,23 @@
 //!
 //! The idempotency contract is:
 //!
-//! - **Primary key:** `UNIQUE(agent_id, source_doc_path)` on `kg_extractions`.
-//! - **Staleness check (content hash):** `kg_extractions.source_doc_hash` stores
-//!   the per-doc hash the extractor consumed on its last successful run. A doc
-//!   is "pending" when it either has no `kg_extractions` row OR the row's hash
-//!   disagrees with the current `kg_chunks.source_doc_hash` for that doc:
+//! - **Primary key (v27):** `UNIQUE(docs_root_hash, source_doc_path)` on
+//!   `kg_extractions`. First-writer-wins via `INSERT OR IGNORE` — the first
+//!   agent to extract a doc for a given corpus writes the marker; subsequent
+//!   agents see "already extracted" and skip. Cost N× → 1× for identical
+//!   corpora.
+//! - **Staleness check (content hash):** `kg_extractions.source_doc_hash`
+//!   stores the per-doc hash the extractor consumed on its last successful
+//!   run. A doc is "pending" when it either has no `kg_extractions` row OR
+//!   the row's hash disagrees with the current `kg_chunks.source_doc_hash`:
 //!
 //!   ```sql
 //!   SELECT DISTINCT c.source_doc_path
 //!   FROM kg_chunks c
-//!   WHERE c.agent_id = ?1
+//!   WHERE c.docs_root_hash = ?1
 //!     AND NOT EXISTS (
 //!       SELECT 1 FROM kg_extractions e
-//!       WHERE e.agent_id        = c.agent_id
+//!       WHERE e.docs_root_hash = c.docs_root_hash
 //!         AND e.source_doc_path = c.source_doc_path
 //!         AND e.source_doc_hash = c.source_doc_hash
 //!     )
@@ -91,37 +95,36 @@
 //!   subsequent runs are no-ops. The first-run cost is bounded by
 //!   `MIKA_KG_BATCH_BUDGET` (default 500).
 //!
-//! ## Fan-out cost model (per-agent scaling, #757)
+//! ## Shared-corpus model (v27, #786)
 //!
-//! Subject, chunk, and resolution tables are **agent-scoped by schema design**:
-//! `kg_chunks`, `kg_subject_entities`, `kg_subject_relationships`,
-//! `kg_chunk_subjects`, `kg_chunk_subject_relationships`, `kg_extractions`,
-//! `kg_subject_resolutions`, and `kg_resolutions_log` all carry an `agent_id`.
-//! Only the domain layer (`kg_entities`, `kg_relationships`) is shared.
+//! Six shared-layer tables (`kg_chunks`, `kg_subject_entities`,
+//! `kg_subject_relationships`, `kg_chunk_subjects`,
+//! `kg_chunk_subject_relationships`, `kg_extractions`) are keyed by
+//! `docs_root_hash` — a 16-hex-char SHA-256 prefix of
+//! `fs::canonicalize(docs_root)`. Agents with the same `docs_root` share
+//! a single corpus; extraction runs once, not N× per agent.
 //!
-//! When multiple agents share the same `docs_root`, this intentional isolation
-//! multiplies cost: the same source doc is extracted N times (once per agent)
-//! and every extracted subject entity is resolved N times. With 11 agents and
-//! 283 docs, that is ~3,113 extraction LLM calls per full startup plus a
-//! per-entity resolution multiplier on top.
+//! Per-agent tables (`kg_subject_resolutions`, `kg_resolutions_log`) keep
+//! `agent_id` — resolution bridges subject entities to the agent's domain
+//! graph, which is inherently per-agent.
 //!
-//! Guidance:
+//! Domain tables (`kg_entities`, `kg_relationships`) are unchanged — no
+//! agent_id, no docs_root_hash.
 //!
-//! - **Separate agents** when their subject graphs should diverge (research
-//!   personas, customers with distinct knowledge bases). Accept the N× cost.
-//! - **One agent** when agents should see the same corpus identically
-//!   (workspace tooling, on-call helpers). Extract once; avoid the multiplier.
+//! The `docs_root_hash` is computed by [`crate::kg::config::hash_docs_root`].
+//!
+//! ## Cost model (post-v27)
+//!
+//! - **Extraction:** 1× per distinct `docs_root_hash`, regardless of agent
+//!   count. First-writer-wins on `kg_extractions`.
+//! - **Resolution:** N× per agent (per-agent resolution bridges).
 //! - **Budget guard (`MIKA_KG_BATCH_BUDGET`, default 500).** Hard cap on LLM
 //!   calls per extraction batch and per resolution batch. Worst-case cost per
-//!   startup is `2 × N_agents × budget` (extraction + resolution).
+//!   startup is `N_agents × budget` (resolution only; extraction is 1×).
 //! - **Provider choice matters.** Anthropic is typically ~10× more expensive
 //!   than OpenRouter equivalents for bulk NER. The server emits a
 //!   `kg_anthropic_provider` WARN at startup when KG resolves to Anthropic so
 //!   the cost is visible before it accrues.
-//!
-//! Option (a) from the #757 plan — shared extraction across agents with the
-//! same `docs_root` — is a schema-level redesign (subject/chunk tables would
-//! become per-docs_root with per-agent views) and is out of scope here.
 
 /// Column list for `kg_entities` queries. No `SELECT *`.
 pub const KG_ENTITY_COLUMNS: &str =
