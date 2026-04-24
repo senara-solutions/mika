@@ -11798,4 +11798,39 @@ mod tests {
             "duplicate (docs_root_hash, entity_key) should violate UNIQUE constraint"
         );
     }
+
+    // ── count_chunks_for_docs_root_hash tests (#778) ──────────────────────
+
+    #[test]
+    fn count_chunks_for_docs_root_hash_returns_zero_for_unknown() {
+        let db = db();
+        let count = db
+            .count_chunks_for_docs_root_hash("unknown_hash_0000")
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn count_chunks_for_docs_root_hash_returns_correct_count() {
+        let db = db();
+        let hash = "abc1234567890abc";
+        // Insert 3 chunks with the same docs_root_hash.
+        for seq in 0..3 {
+            db.conn
+                .execute(
+                    "INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash) \
+                     VALUES (?1, '/test', ?2, 'docs/test.md', 'dochash')",
+                    rusqlite::params![hash, seq],
+                )
+                .unwrap();
+        }
+        let count = db.count_chunks_for_docs_root_hash(hash).unwrap();
+        assert_eq!(count, 3);
+
+        // Different hash should still return 0.
+        let other = db
+            .count_chunks_for_docs_root_hash("other_hash_000000")
+            .unwrap();
+        assert_eq!(other, 0);
+    }
 }
