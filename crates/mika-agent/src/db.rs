@@ -2978,6 +2978,159 @@ impl Database {
         Ok(())
     }
 
+    /// v26 -> v27: Schema v27 — docs_root_hash as shared-corpus primary key.
+    ///
+    /// Renames six shared-layer KG tables to `*_v26_backup` and creates fresh
+    /// v27 tables keyed by `docs_root_hash` instead of `agent_id`. Per-agent
+    /// tables (`kg_subject_resolutions`, `kg_resolutions_log`) are unchanged.
+    ///
+    /// The data coalesce from v26 backup tables into v27 is #787's scope.
+    /// This stub is non-destructive — v26 rows are preserved in the backup
+    /// tables until #787 processes them.
+    ///
+    /// Creates a `schema_meta` table with a `v27_coalesce_complete` marker
+    /// that the startup guard (Unit 3) checks. This stub does NOT write the
+    /// marker — that's #787's job after coalesce completes.
+    fn migrate_v26_to_v27(&self) -> Result<()> {
+        info!("migrating database schema v26 -> v27 (docs_root_hash shared-corpus)");
+
+        // Idempotency guard: if kg_chunks already has docs_root_hash, we've run.
+        if self.column_exists("kg_chunks", "docs_root_hash")? {
+            // Already upgraded — just record the version bump.
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (27)", [])?;
+            return Ok(());
+        }
+
+        self.conn
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+
+                 BEGIN IMMEDIATE;
+
+                 -- Create schema_meta table for migration state tracking.
+                 CREATE TABLE IF NOT EXISTS schema_meta (
+                     key TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+
+                 -- 1. kg_chunks: rename to backup, create v27 table.
+                 ALTER TABLE kg_chunks RENAME TO kg_chunks_v26_backup;
+                 CREATE TABLE kg_chunks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     docs_root_hash TEXT NOT NULL,
+                     docs_root TEXT NOT NULL,
+                     seq_id INTEGER NOT NULL,
+                     source_doc_path TEXT NOT NULL,
+                     source_doc_hash TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     trace_id TEXT,
+                     UNIQUE (docs_root_hash, source_doc_path, seq_id)
+                 );
+                 CREATE INDEX idx_kg_chunks_docs_root_hash_doc ON kg_chunks(docs_root_hash, source_doc_path);
+
+                 -- 2. kg_subject_entities: rename to backup, create v27 table.
+                 ALTER TABLE kg_subject_entities RENAME TO kg_subject_entities_v26_backup;
+                 CREATE TABLE kg_subject_entities (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     docs_root_hash TEXT NOT NULL,
+                     docs_root TEXT NOT NULL,
+                     entity_key TEXT NOT NULL,
+                     type TEXT NOT NULL,
+                     name TEXT NOT NULL,
+                     confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                     properties_json TEXT,
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     trace_id TEXT,
+                     CHECK (entity_key = type || ':' || name),
+                     UNIQUE (docs_root_hash, entity_key)
+                 );
+                 CREATE INDEX idx_kg_subj_entities_drh_type ON kg_subject_entities(docs_root_hash, type);
+
+                 -- 3. kg_subject_relationships: rename to backup, create v27 table.
+                 ALTER TABLE kg_subject_relationships RENAME TO kg_subject_relationships_v26_backup;
+                 CREATE TABLE kg_subject_relationships (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     docs_root_hash TEXT NOT NULL,
+                     docs_root TEXT NOT NULL,
+                     from_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                     to_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                     type TEXT NOT NULL,
+                     confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                     properties_json TEXT,
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     trace_id TEXT,
+                     UNIQUE (docs_root_hash, from_entity_id, to_entity_id, type)
+                 );
+                 CREATE INDEX idx_kg_subj_rel_from ON kg_subject_relationships(docs_root_hash, from_entity_id, type);
+                 CREATE INDEX idx_kg_subj_rel_to ON kg_subject_relationships(docs_root_hash, to_entity_id, type);
+                 CREATE INDEX idx_kg_subj_rel_type ON kg_subject_relationships(docs_root_hash, type);
+
+                 -- 4. kg_chunk_subjects: rename to backup, create v27 table.
+                 ALTER TABLE kg_chunk_subjects RENAME TO kg_chunk_subjects_v26_backup;
+                 CREATE TABLE kg_chunk_subjects (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     docs_root_hash TEXT NOT NULL,
+                     docs_root TEXT NOT NULL,
+                     chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                     subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                     extraction_trace_id TEXT,
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     UNIQUE (docs_root_hash, chunk_id, subject_entity_id)
+                 );
+                 CREATE INDEX idx_kg_cs_chunk ON kg_chunk_subjects(docs_root_hash, chunk_id);
+                 CREATE INDEX idx_kg_cs_entity ON kg_chunk_subjects(docs_root_hash, subject_entity_id);
+                 CREATE INDEX idx_kg_cs_trace ON kg_chunk_subjects(docs_root_hash, extraction_trace_id);
+
+                 -- 5. kg_chunk_subject_relationships: rename to backup, create v27 table.
+                 ALTER TABLE kg_chunk_subject_relationships RENAME TO kg_chunk_subject_relationships_v26_backup;
+                 CREATE TABLE kg_chunk_subject_relationships (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     docs_root_hash TEXT NOT NULL,
+                     docs_root TEXT NOT NULL,
+                     chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
+                     subject_relationship_id INTEGER NOT NULL REFERENCES kg_subject_relationships(id) ON DELETE CASCADE,
+                     extraction_trace_id TEXT,
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     UNIQUE (docs_root_hash, chunk_id, subject_relationship_id)
+                 );
+                 CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(docs_root_hash, chunk_id);
+                 CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(docs_root_hash, subject_relationship_id);
+
+                 -- 6. kg_extractions: rename to backup, create v27 table.
+                 ALTER TABLE kg_extractions RENAME TO kg_extractions_v26_backup;
+                 CREATE TABLE kg_extractions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     docs_root_hash TEXT NOT NULL,
+                     docs_root TEXT NOT NULL,
+                     source_doc_path TEXT NOT NULL,
+                     source_doc_hash TEXT,
+                     extraction_model TEXT NOT NULL,
+                     entities_extracted INTEGER NOT NULL DEFAULT 0,
+                     relationships_extracted INTEGER NOT NULL DEFAULT 0,
+                     extraction_trace_id TEXT,
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     UNIQUE (docs_root_hash, source_doc_path)
+                 );
+                 CREATE INDEX idx_kg_extractions_drh ON kg_extractions(docs_root_hash);
+
+                 -- TODO(#787): coalesce rows from *_v26_backup tables into v27 tables
+                 -- via majority-vote by (docs_root_hash, source_doc_path, entity_key).
+                 -- Preserve paid LLM output. Then DROP TABLE *_v26_backup tables.
+                 -- Then INSERT INTO schema_meta (key, value) VALUES ('v27_coalesce_complete', '1').
+                 -- See mika#787 for coalesce SQL.
+
+                 INSERT INTO schema_version (version) VALUES (27);
+
+                 COMMIT;
+
+                 PRAGMA foreign_keys = ON;",
+            )
+            .context("failed to migrate v26 -> v27 (docs_root_hash shared-corpus)")?;
+
+        Ok(())
+    }
+
     /// Check if a column exists on a table (used for idempotent migrations).
     fn column_exists(&self, table: &'static str, column: &'static str) -> Result<bool> {
         let mut stmt = self
