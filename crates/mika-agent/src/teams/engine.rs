@@ -183,6 +183,7 @@ impl TeamEngine {
             started_at: crate::timestamp::now(),
             ended_at: None,
             deliverable: None,
+            coverage_retry_fired: false,
         };
 
         Ok(Self {
@@ -672,7 +673,7 @@ impl TeamEngine {
     /// Pass `None` for first decomposition, `Some(feedback)` for re-decomposition
     /// after critic rejection. (#261: merged decompose + decompose_with_feedback)
     async fn decompose(
-        &self,
+        &mut self,
         feedback: Option<&str>,
         history: &[crate::db::TeamRunRow],
         previous_run: Option<&crate::db::TeamRunSummary>,
@@ -734,6 +735,81 @@ impl TeamEngine {
             DecomposeResult::Tasks(tasks) => tasks,
         };
 
+        // Coverage check: detect silently omitted members and retry once (#286)
+        // Track which response text to persist — the original or the retry's.
+        let mut persist_response = response;
+        let tasks = {
+            let initial_missing = missing_members(&tasks, &self.team);
+            if initial_missing.is_empty() {
+                tasks
+            } else {
+                let missing_names = initial_missing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let nudge = format!(
+                    "You did not assign tasks to: {missing_names}. Either include them or \
+                     add a brief note in a `reply` explaining why they're not relevant to \
+                     this goal. It's fine to skip members whose mandate doesn't fit, but \
+                     the response must reflect that you considered them."
+                );
+                let retry_response = self.run_agent(orchestrator_name, &nudge, &context).await?;
+                let retry_result = parse_task_assignments(&retry_response, &self.team)?;
+                match retry_result {
+                    DecomposeResult::Conversational(reply) => {
+                        // Orchestrator pivoted to a conversational reply on retry —
+                        // respect the decision but log coverage gap.
+                        warn!(
+                            team_run_id = %self.run.run_id,
+                            team_id = %self.team.team.name,
+                            missing_members = ?initial_missing,
+                            retry_recovered = false,
+                            initial_missing_count = initial_missing.len(),
+                            final_missing_count = initial_missing.len(),
+                            "team_coverage_gap"
+                        );
+                        self.run.coverage_retry_fired = true;
+                        // Persist conversational reply and return
+                        if let Some(goal_id) = self.goal_msg_id
+                            && let Err(e) = self
+                                .team_db
+                                .insert_team_workspace_entry(
+                                    &self.run.run_id,
+                                    Some(goal_id),
+                                    Some(orchestrator_name),
+                                    "orchestrator",
+                                    &retry_response,
+                                    iteration,
+                                    Some(&self.trace_id),
+                                )
+                                .await
+                        {
+                            warn!(error = %e, "failed to persist team workspace entry");
+                        }
+                        return Ok(DecomposeResult::Conversational(reply));
+                    }
+                    DecomposeResult::Tasks(retry_tasks) => {
+                        let final_missing = missing_members(&retry_tasks, &self.team);
+                        let retry_recovered = final_missing.is_empty();
+                        warn!(
+                            team_run_id = %self.run.run_id,
+                            team_id = %self.team.team.name,
+                            missing_members = ?final_missing,
+                            retry_recovered = retry_recovered,
+                            initial_missing_count = initial_missing.len(),
+                            final_missing_count = final_missing.len(),
+                            "team_coverage_gap"
+                        );
+                        self.run.coverage_retry_fired = true;
+                        // Persist the retry response (not the original) so DB matches tasks
+                        persist_response = retry_response;
+                        retry_tasks
+                    }
+                }
+            }
+        };
+
         // Persist orchestrator decomposition to DB
         if let Some(goal_id) = self.goal_msg_id {
             let orchestrator_entry_id = self
@@ -743,7 +819,7 @@ impl TeamEngine {
                     Some(goal_id),
                     Some(orchestrator_name),
                     "orchestrator",
-                    &response,
+                    &persist_response,
                     iteration,
                     Some(&self.trace_id),
                 )
@@ -1421,6 +1497,21 @@ impl TeamEngine {
     }
 }
 
+/// Compute non-orchestrator team members who were not assigned any task.
+///
+/// Returns the names of members in `team.agents` (excluding the orchestrator)
+/// that do not appear as an `agent` in any of the provided `tasks`.
+fn missing_members(tasks: &[TaskAssignment], team: &TeamDefinition) -> Vec<String> {
+    let assigned: std::collections::HashSet<&str> =
+        tasks.iter().map(|t| t.agent.as_str()).collect();
+    team.agents
+        .iter()
+        .filter(|a| a.name != team.team.orchestrator)
+        .filter(|a| !assigned.contains(a.name.as_str()))
+        .map(|a| a.name.clone())
+        .collect()
+}
+
 /// Result of parsing the orchestrator's response.
 enum DecomposeResult {
     /// Orchestrator produced valid task assignments.
@@ -1855,5 +1946,122 @@ mod tests {
             extract_json("result: [{\"x\":1}]", '[', ']'),
             Some("[{\"x\":1}]")
         );
+    }
+
+    fn multi_agent_team() -> TeamDefinition {
+        TeamDefinition {
+            team: TeamMeta {
+                name: "test-team".to_string(),
+                orchestrator: "orchestrator".to_string(),
+            },
+            agents: vec![
+                TeamAgent {
+                    name: "orchestrator".to_string(),
+                    role: "orchestrator".to_string(),
+                    mandate: "Plan".to_string(),
+                },
+                TeamAgent {
+                    name: "alice".to_string(),
+                    role: "specialist".to_string(),
+                    mandate: "Research".to_string(),
+                },
+                TeamAgent {
+                    name: "bob".to_string(),
+                    role: "specialist".to_string(),
+                    mandate: "Design".to_string(),
+                },
+                TeamAgent {
+                    name: "carol".to_string(),
+                    role: "specialist".to_string(),
+                    mandate: "Review".to_string(),
+                },
+            ],
+            flow: TeamFlow { max_iterations: 3 },
+        }
+    }
+
+    #[test]
+    fn test_missing_members_full_coverage() {
+        let team = multi_agent_team();
+        let tasks = vec![
+            TaskAssignment {
+                agent: "alice".to_string(),
+                role: "specialist".to_string(),
+                task: "do stuff".to_string(),
+                output_file: "a.md".to_string(),
+                status: TaskStatus::Pending,
+            },
+            TaskAssignment {
+                agent: "bob".to_string(),
+                role: "specialist".to_string(),
+                task: "do stuff".to_string(),
+                output_file: "b.md".to_string(),
+                status: TaskStatus::Pending,
+            },
+            TaskAssignment {
+                agent: "carol".to_string(),
+                role: "specialist".to_string(),
+                task: "do stuff".to_string(),
+                output_file: "c.md".to_string(),
+                status: TaskStatus::Pending,
+            },
+        ];
+        assert!(missing_members(&tasks, &team).is_empty());
+    }
+
+    #[test]
+    fn test_missing_members_partial_coverage() {
+        let team = multi_agent_team();
+        let tasks = vec![TaskAssignment {
+            agent: "alice".to_string(),
+            role: "specialist".to_string(),
+            task: "do stuff".to_string(),
+            output_file: "a.md".to_string(),
+            status: TaskStatus::Pending,
+        }];
+        let missing = missing_members(&tasks, &team);
+        assert_eq!(missing.len(), 2);
+        assert!(missing.contains(&"bob".to_string()));
+        assert!(missing.contains(&"carol".to_string()));
+    }
+
+    #[test]
+    fn test_missing_members_excludes_orchestrator() {
+        let team = multi_agent_team();
+        // No tasks assigned — only non-orchestrator members should be missing
+        let missing = missing_members(&[], &team);
+        assert_eq!(missing.len(), 3);
+        assert!(!missing.contains(&"orchestrator".to_string()));
+    }
+
+    #[test]
+    fn test_missing_members_single_member_team() {
+        let team = TeamDefinition {
+            team: TeamMeta {
+                name: "solo".to_string(),
+                orchestrator: "orchestrator".to_string(),
+            },
+            agents: vec![
+                TeamAgent {
+                    name: "orchestrator".to_string(),
+                    role: "orchestrator".to_string(),
+                    mandate: "Plan".to_string(),
+                },
+                TeamAgent {
+                    name: "only-worker".to_string(),
+                    role: "specialist".to_string(),
+                    mandate: "Work".to_string(),
+                },
+            ],
+            flow: TeamFlow { max_iterations: 3 },
+        };
+        let tasks = vec![TaskAssignment {
+            agent: "only-worker".to_string(),
+            role: "specialist".to_string(),
+            task: "do stuff".to_string(),
+            output_file: "out.md".to_string(),
+            status: TaskStatus::Pending,
+        }];
+        assert!(missing_members(&tasks, &team).is_empty());
     }
 }

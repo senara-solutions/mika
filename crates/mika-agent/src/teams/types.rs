@@ -89,6 +89,11 @@ pub struct TeamRun {
     pub ended_at: Option<String>,
     #[serde(default)]
     pub deliverable: Option<String>,
+    /// Whether the coverage-check retry fired during decomposition (#286).
+    /// Set when the orchestrator silently omitted team members and a nudge
+    /// re-prompt was issued. Observable via `team_coverage_gap` warn log.
+    #[serde(default)]
+    pub coverage_retry_fired: bool,
 }
 
 fn default_timestamp() -> String {
@@ -352,6 +357,35 @@ mod tests {
         assert_eq!(run.started_at, "2026-01-01T00:00:00Z"); // provided
         assert!(run.ended_at.is_none()); // default
         assert!(run.deliverable.is_none()); // default
+        assert!(!run.coverage_retry_fired); // default false
+    }
+
+    #[test]
+    fn test_coverage_retry_fired_backward_compat() {
+        // Pre-existing checkpoint without coverage_retry_fired should deserialize with false
+        let json = r#"{"run_id":"r1","team_name":"t1","goal":"g1","started_at":"2026-01-01T00:00:00Z","status":"Completed"}"#;
+        let run: TeamRun = serde_json::from_str(json).unwrap();
+        assert!(!run.coverage_retry_fired);
+    }
+
+    #[test]
+    fn test_coverage_retry_fired_round_trip() {
+        let run = TeamRun {
+            run_id: "r1".to_string(),
+            team_name: "t1".to_string(),
+            goal: "g1".to_string(),
+            status: RunStatus::Running,
+            iteration: 1,
+            max_iterations: 3,
+            tasks: vec![],
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            ended_at: None,
+            deliverable: None,
+            coverage_retry_fired: true,
+        };
+        let json = serde_json::to_string(&run).unwrap();
+        let restored: TeamRun = serde_json::from_str(&json).unwrap();
+        assert!(restored.coverage_retry_fired);
     }
 
     #[test]
@@ -389,6 +423,7 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             ended_at: None,
             deliverable: None,
+            coverage_retry_fired: false,
         };
         let json = serialize_checkpoint(&run);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -410,6 +445,7 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             ended_at: Some("2026-01-01T01:00:00Z".to_string()),
             deliverable: Some("done".to_string()),
+            coverage_retry_fired: false,
         };
         let checkpoint = serialize_checkpoint(&run);
         let restored = deserialize_checkpoint(&checkpoint).unwrap();
