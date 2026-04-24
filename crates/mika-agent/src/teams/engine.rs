@@ -736,6 +736,8 @@ impl TeamEngine {
         };
 
         // Coverage check: detect silently omitted members and retry once (#286)
+        // Track which response text to persist — the original or the retry's.
+        let mut persist_response = response;
         let tasks = {
             let initial_missing = missing_members(&tasks, &self.team);
             if initial_missing.is_empty() {
@@ -800,6 +802,8 @@ impl TeamEngine {
                             "team_coverage_gap"
                         );
                         self.run.coverage_retry_fired = true;
+                        // Persist the retry response (not the original) so DB matches tasks
+                        persist_response = retry_response;
                         retry_tasks
                     }
                 }
@@ -815,7 +819,7 @@ impl TeamEngine {
                     Some(goal_id),
                     Some(orchestrator_name),
                     "orchestrator",
-                    &response,
+                    &persist_response,
                     iteration,
                     Some(&self.trace_id),
                 )
