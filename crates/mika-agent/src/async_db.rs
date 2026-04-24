@@ -1954,6 +1954,14 @@ impl AsyncDatabase {
         self.with_db(move |db| db.update_session_metadata(&sid, &m))
             .await
     }
+
+    // ── KG corpus queries (#778) ──────────────────────────────────────────
+
+    pub async fn count_chunks_for_docs_root_hash(&self, docs_root_hash: &str) -> Result<u64> {
+        let h = docs_root_hash.to_owned();
+        self.with_db(move |db| db.count_chunks_for_docs_root_hash(&h))
+            .await
+    }
 }
 
 #[cfg(test)]

@@ -8102,6 +8102,27 @@ impl Database {
 
         Ok((data, count))
     }
+
+    // ── KG corpus queries (#778) ──────────────────────────────────────────
+
+    /// Count `kg_chunks` rows for a given `docs_root_hash`.
+    ///
+    /// Used as a "has this corpus been ingested before?" proxy at agent startup.
+    /// Returns 0 for a never-ingested corpus (drift WARN).
+    ///
+    /// **Write-order dependency:** this is a reliable proxy ONLY because the
+    /// lexical ingestor writes `kg_chunks` atomically with (or before)
+    /// `kg_extractions` in the composed-write transaction. If a future edit
+    /// writes `kg_extractions` before `kg_chunks`, this proxy becomes stale.
+    /// See `docs/solutions/best-practices/kg-lexical-ingestion-composed-write-2026-04-22.md`.
+    pub fn count_chunks_for_docs_root_hash(&self, docs_root_hash: &str) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM kg_chunks WHERE docs_root_hash = ?1",
+            params![docs_root_hash],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
 }
 
 // ===== Utility Functions =====
