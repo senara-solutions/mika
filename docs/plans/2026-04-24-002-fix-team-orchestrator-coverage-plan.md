@@ -9,275 +9,206 @@ date: 2026-04-24
 
 ## Overview
 
-Team orchestrators consistently delegate to only one or two team members, leaving the rest idle. This defeats the purpose of assembling a team with distinct roles. The fix adds a **structural roster-awareness guard** in the orchestrator's assignment parse path plus complementary prompt reinforcement — the structural layer is the primary defense because prompt-only constraints have been shown to be fragile here (see `docs/solutions/architecture-patterns/delegation-work-item-guard-enforcement.md`).
+On team run `fd7ef7ef` (MiniMax-M2.7 orchestrator + MiniMax-M2.7 specialists, 5-member team), the orchestrator assigned work to 1 of 4 non-orchestrator members for a goal that plainly benefited from diverse perspectives. The fix is a minimal two-layer change: a sharper prompt nudge biasing the orchestrator to consider every member, and a structural coverage check that re-prompts once when the response silently omits members — falling through with a `warn!` log on second failure. No new schema, no new public enum variant, no new persisted data structures.
+
+**Defer deliberately:** structured skip reasons, dashboard surfacing, and response-wrapper schema. Add them when the warn-log signal proves the retry isn't enough, or when a concrete consumer materializes.
 
 ## Problem Frame
 
-Orchestrators receive a team roster + goal and are told to "decompose into tasks for your team members" (see `crates/mika-agent/src/teams/prompt.rs:110-120`). The prompt never asks the LLM to account for the whole roster. When given a creative/brainstorming goal, the path-of-least-resistance is to pick the one or two most technically competent-sounding members and skip the rest. This happened on team run `fd7ef7ef` (inner-circle, 5 agents): orchestrator (`steve-jobs`) + 1 specialist (`mika-dev`) were active; `elon-musk`, `chase-hughes`, and `mika-qa` were never invoked, even though the goal ("brainstorm GitHub usernames") directly matched their mandates.
+`build_orchestrator_context` in `crates/mika-agent/src/teams/prompt.rs` lists team members but never tells the orchestrator to account for all of them. `parse_task_assignments` in `crates/mika-agent/src/teams/engine.rs:1437` validates each assignment (agent name, path safety, length) but has no coverage check. On creative/brainstorming goals, weaker-instruction-following models (MiniMax is the observed case) take the path of least resistance and pick the 1–2 most technically-framed members.
 
-Downstream: `parse_task_assignments()` in `crates/mika-agent/src/teams/engine.rs:1437` already validates agent names, path safety, and task length. It has no coverage check — an assignment list that names one agent passes through unchanged.
+The cited failure used MiniMax-M2.7 as both orchestrator and specialist engine. This fix needs to hold across all 11 supported providers — the structural layer is defense-in-depth, the prompt is the primary lever.
 
 ## Requirements Trace
 
-- **R1.** Orchestrator must make an explicit decision about every non-orchestrator team member on every actionable turn — either assign a task or record why the member is being skipped.
-- **R2.** A team run must fail the parse and retry (one nudge) if the orchestrator's response silently omits members without recording skip reasons.
-- **R3.** Coverage signal must be observable — team run metadata should expose how many members were assigned vs skipped, with skip reasons available for debugging.
-- **R4.** Fix must not regress legitimate single-member assignments when the team has only one non-orchestrator specialist, or when the goal is a focused single-domain task that truly needs one agent.
+- **R1.** The orchestrator must be prompted to consider every non-orchestrator member before responding.
+- **R2.** If the response silently omits members (neither assigns to them nor explains the omission in free-form reply text), the engine re-prompts once with an explicit list of unaccounted members.
+- **R3.** A coverage-retry event must be observable — minimum a `warn!` log line and a boolean signal on the run — sufficient for post-hoc "did the retry fire?" debugging via log grep or `sqlite3`.
+- **R4.** The fix must not regress single-member teams, focused single-domain goals that legitimately need one agent, or the conversational-reply path.
 
 ## Scope Boundaries
 
 ### In scope
 
-- `parse_task_assignments()` in `crates/mika-agent/src/teams/engine.rs`
-- Orchestrator system prompt in `crates/mika-agent/src/teams/prompt.rs`
-- Assignment schema change: add `skipped: Vec<SkipEntry>` alongside the existing `tasks` array
-- One-retry nudge when coverage check fails (mirrors existing post-condition retry pattern in `src/agent_loop.rs`)
-- Unit tests for the coverage check; integration test via team engine with a mocked LLM
+- `build_orchestrator_context` in `crates/mika-agent/src/teams/prompt.rs` — one-sentence addition
+- A coverage-check helper used inside `parse_task_assignments`'s caller (`decompose`) — returns missing member names, no public enum change
+- One re-prompt pass in `decompose` when the helper returns non-empty missing set
+- A `coverage_retry_fired: bool` signal — ideally on `TeamRun`, else a scoped `warn!` with structured fields
+- Unit tests for the coverage helper; one integration test via `MockLlmProvider` for the retry path
 
 ### Deferred to Separate Tasks
 
-- **Callback consolidation (#287):** different bug class (delivery shape, not assignment) — handled in its own plan on `feat/287/...`
-- **Orchestrator rework for parallel vs sequential execution:** out of scope; orchestrator's execution ordering is unchanged
-- **Per-member role-fit scoring / mandate-matching LLM judge:** would be a larger evaluation feature; this plan uses the simpler structural contract (explicit skip reasons) which catches the observed failure mode
+- **Callback consolidation (#287):** different bug class
+- **Structured `skipped` / `SkipEntry` schema:** add if/when the warn-log rate stays non-trivial after this ships, or when a dashboard/analytics consumer exists
+- **Per-member mandate-fit scoring:** larger evaluation feature, out of scope
+- **Model-specific prompt variants:** if MiniMax keeps missing the nudge after this lands, a MiniMax-specific prompt variant is the next escalation (see the provider-variant pattern in `crates/mika-agent/CLAUDE.md` Skills System)
 
 ## Context & Research
 
 ### Relevant Code and Patterns
 
-- `crates/mika-agent/src/teams/prompt.rs:14-124` — `build_orchestrator_context`, where the roster and assignment instructions are assembled
-- `crates/mika-agent/src/teams/engine.rs:1427-1525` — `DecomposeResult` enum + `parse_task_assignments`, the structural choke point
-- `crates/mika-agent/src/teams/engine.rs:674` — `decompose()` method that calls `parse_task_assignments` and consumes the result
-- `crates/mika-agent/src/teams/types.rs` — `TaskAssignment` struct; add `SkipEntry` alongside
-- `crates/mika-agent/src/agent_loop.rs` — post-condition retry pattern (guards that reject once and re-prompt) used by required-tools gate, completion-claim guard, etc. Team engine does not have an identical retry harness; we'll implement one pass of re-prompt inline in `decompose()`
+- `crates/mika-agent/src/teams/prompt.rs:14-124` — `build_orchestrator_context`
+- `crates/mika-agent/src/teams/engine.rs:1437-1525` — `parse_task_assignments`
+- `crates/mika-agent/src/teams/engine.rs:674` onward — `decompose()` and its `DecomposeResult` match arms (8 call sites — reason to keep the gap signal internal rather than a new public variant)
+- `src/agent_loop.rs` post-condition retry pattern — structurally similar, one retry then fall through
+- Provider + model for run `fd7ef7ef`: `llm_calls` table shows both `steve-jobs` and `mika-dev` on `minimax/MiniMax-M2.7`
 
 ### Institutional Learnings
 
-- `docs/solutions/architecture-patterns/delegation-work-item-guard-enforcement.md` — prior precedent: when prompt-only enforcement of "always track delegated work" failed, the fix was a code-level guard on `delegate_task` that rejects the call if a work item isn't referenced. Same playbook applies here: structural guard beats prompt reminder.
-- `docs/solutions/architecture-patterns/conditional-required-tools-enforcement-via-match-reason.md` — another structural-over-prompt pattern, this one for tool-use constraints keyed on skill match reason.
-
-### External References
-
-Not needed. The bug and fix are entirely internal to the team engine; no external best-practice research materially sharpens the plan.
+- `docs/solutions/architecture-patterns/delegation-work-item-guard-enforcement.md` — prior "prompt-only is fragile, add a code guard" precedent. Partially applies: the guard here doesn't block calls, it nudges and retries.
+- `feedback_prompt_enforcement_fragile` — don't rely on prompt alone for hard constraints. This fix *does* rely on the prompt to produce the right behavior the first time; the structural layer only activates on observed miss. Acceptable because the fallback is a retry, not a silent pass.
 
 ## Key Technical Decisions
 
-- **Primary mechanism is structural, not prompt-only.** Coverage is enforced in `parse_task_assignments`, not only requested in `build_orchestrator_context`. **Rationale:** prompt-level coverage requests have a known failure mode (see `feedback_prompt_enforcement_fragile` — LLMs rationalize skipping members that look less useful). A structural contract forces acknowledgement of every member.
-- **The contract is "record a skip, don't silently omit".** The orchestrator response schema is extended to `{tasks: [...], skipped: [{agent, reason}, ...]}`. The guard verifies `tasks.agents ∪ skipped.agents == team_members`. **Rationale:** we do NOT force 100% team coverage. A focused goal legitimately skips some members; we just require the skip to be explicit. This preserves legitimate single-member assignments (R4).
-- **Failure mode is one-shot retry with feedback, then fall through.** If the response misses members and has no skip entries, the guard re-prompts once with a nudge listing the unaccounted members. On second failure the run proceeds with whatever was parsed (logging a warning) rather than hard-erroring. **Rationale:** matches the existing post-condition guard pattern in the agent loop; hard-erroring would block legitimate runs during a provider hiccup.
-- **Backward-compatible parse.** Responses that emit only `tasks` (array of assignments, no wrapper) still parse as today — the guard triggers only when members are missing from both the assigned and skipped sets. **Rationale:** existing teams, tests, and old call sites keep working; only the failure mode changes.
-- **Skip entries are persisted for observability.** `TeamRun` gains a `skipped_members: Vec<SkipEntry>` field that is surfaced on the dashboard's team-run detail view. **Rationale:** R3 — skip reasons are how we debug "why wasn't agent X used?" in the future.
-- **Prompt reinforcement is additive, not load-bearing.** The orchestrator prompt is updated with roster-matching guidance and a required `skipped` field in the response schema. This makes the schema discoverable but the structural guard is what actually enforces it.
+- **Prompt first, structural as backstop.** One-sentence addition to the orchestrator prompt is the primary lever. Coverage retry activates only when the prompt fails. **Rationale:** the cited failure is MiniMax-specific; stronger models likely respond to a crisper prompt. We observe the retry rate in the `warn!` logs post-ship; if it converges to ~zero, the structural layer is quiet defense-in-depth. If it stays high, escalate to structured schemas or model-specific variants (deferred above).
+- **Gap signal stays internal — no new `DecomposeResult` variant.** `parse_task_assignments` keeps its current two-arm signature; the coverage helper is called from `decompose()` against a successful `Tasks` result. **Rationale:** 8 call sites match on `DecomposeResult` today and don't care about coverage. Widening the enum would force churn at every site. SRP.
+- **Re-prompt uses free-form reply, not a new schema.** The nudge says: "You did not assign tasks to: [names]. Either include them or explicitly say why they're not relevant — it's fine to skip members whose mandate doesn't fit the goal." Response is still parsed by the existing logic. **Rationale:** no schema contract to maintain, no wrapper type, no prompt example to keep in sync. If the second response still has missing members, we treat any plausible free-form justification as sufficient — coverage retry is about acknowledgement, not machine-readable reasons.
+- **One-shot retry, then fall through with `warn!`.** Matches `agent_loop.rs` post-condition pattern. Hard cap on cost.
+- **Observability is a single boolean + a `warn!` line.** No persistence schema change. `TeamRun.coverage_retry_fired: bool` gets serialized via the existing `team_runs.checkpoint` JSON column (additive, backward-compatible). Debugging "did this run's orchestrator miss members?" = grep the log for `team_coverage_gap` with run id. **Rationale:** Explicitly YAGNI — structured skip data is not consumed anywhere yet; build it when a consumer needs it.
+- **Prompt tests assert semantics, not wording.** Test checks that the prompt contains a roster-accounting instruction (e.g., searches for "account for" or "every team member"), not a specific literal string. **Rationale:** less brittle, survives wording tweaks.
+- **Validate prompt-only effect before merging structural.** As a Phase-0 sanity check, apply just the prompt addition against the failing scenario (MiniMax orchestrator, 5-agent team, same goal) and record whether coverage improves. Informs whether the structural layer earns its keep right now, or whether it's purely defensive.
 
 ## Open Questions
 
 ### Resolved During Planning
 
-- **Q: Should the coverage check require a minimum fraction (e.g. ≥50%) of members to be assigned?**
-  Resolution: No. Require explicit accounting (assign or skip-with-reason) instead. Percentage thresholds don't distinguish legitimate focus from lazy under-coverage. The explicit-skip contract catches the observed bug (silent omission) without blocking legitimate focused goals.
-- **Q: Should the guard apply to the orchestrator itself?**
-  Resolution: No. The orchestrator is never a target of its own assignments (current behavior preserved — `build_orchestrator_context` filters the orchestrator from the roster).
-- **Q: Should we retry more than once?**
-  Resolution: No. One re-prompt matches the post-condition guard pattern and bounds cost. Persistent failure falls through with a warning.
+- **Is a wrapper schema needed now?** No — defer. Simple missing-name list in the re-prompt is enough; the LLM's free-form response already gets parsed by existing code.
+- **Is this a MiniMax-specific issue?** Likely primary cause. The structural layer is still justified as provider-agnostic defense, but sizing the mechanism to MiniMax's blind spot (not a general engine deficiency) keeps the scope tight.
+- **Should `CoverageGap` be a new `DecomposeResult` variant?** No. 8 match sites, none care. Keep the gap signal internal to `decompose()`.
+- **Should retry metadata include structured skip reasons?** No (R3). A bool + warn log with run id and missing members is enough until a consumer requests more.
 
 ### Deferred to Implementation
 
-- **Exact wording of the orchestrator prompt addition (roster-awareness hint).** Will be settled when writing prompt.rs — test the two obvious phrasings against the failing run's setup before committing to one.
-- **Whether skip reasons should be capped in length.** Likely yes (same 5000-char cap as task descriptions in `engine.rs:1495`), but will finalize when implementing.
-- **Exact field name on `TeamRun` for surfaced skip metadata.** `skipped_members` is likely fine; will check if `teams/types.rs` already has a naming convention that should be followed.
+- **Exact wording of the prompt addition.** Compare the two obvious phrasings ("Account for every non-orchestrator member" vs "Consider each team member's mandate before assigning") against the failing scenario; pick the one whose retry rate is lower.
+- **Where `coverage_retry_fired` lives on `TeamRun`.** Confirm `team_runs.checkpoint` round-trips new optional fields without migration (it's free-form JSON), else relegate to the `warn!` signal only.
+- **Whether the missing-member list should be truncated.** Practically teams are ≤10 members; probably unnecessary.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Extend response schema with `SkipEntry` and wrapper object**
+- [ ] **Unit 1: Coverage-check helper + `decompose()` retry integration**
 
-**Goal:** Add the data types that represent the new orchestrator response shape, without changing parse behavior yet.
+**Goal:** Detect silent omissions after `parse_task_assignments` returns `Tasks(...)`, re-prompt once with the missing list, fall through with a `warn!` log on second failure. No changes to `DecomposeResult` or `parse_task_assignments` signature.
 
-**Requirements:** R1, R3
+**Requirements:** R2, R3, R4
 
 **Dependencies:** None
 
 **Files:**
-- Modify: `crates/mika-agent/src/teams/types.rs` — add `SkipEntry { agent: String, reason: String }` and optional `OrchestratorResponse { tasks: Vec<TaskAssignment>, skipped: Vec<SkipEntry> }` wrapper types
-- Test: `crates/mika-agent/src/teams/types.rs` — inline `#[cfg(test)] mod tests` for serde round-trips
+- Modify: `crates/mika-agent/src/teams/engine.rs` — add a private `missing_members(tasks: &[TaskAssignment], team: &TeamDefinition) -> Vec<String>` helper; update `decompose()` to call it after `Tasks(...)` parse and branch on non-empty missing set
+- Test: `crates/mika-agent/src/teams/engine.rs` — inline test module covers the helper; integration test in `crates/mika-agent/tests/eval/team_coverage.rs` (new) covers the retry path
 
 **Approach:**
-- Add `SkipEntry` as a simple struct with `#[derive(Debug, Clone, Serialize, Deserialize)]`
-- Keep `TaskAssignment` unchanged — the skip list is a sibling, not a replacement
+- Helper computes `expected = team.agents.filter(name != orchestrator).name` and `assigned = tasks.agent`, returns `expected - assigned` as owned `Vec<String>`
+- In `decompose()`, after parsing to `Tasks(tasks)`: if `missing_members(&tasks, team).is_empty()`, proceed as today. Else run one extra LLM turn with a nudge message listing the missing names, re-parse with the existing `parse_task_assignments`, and on the second result accept whatever comes back (even if still partial), setting `coverage_retry_fired = true` and emitting a structured `warn!("team_coverage_gap", run_id, missing = ?, retry_recovered = bool)` log
+- Conversational-reply path unchanged — helper never runs
+- Single-member teams after the orchestrator filter produce an empty `expected` set; helper returns empty; no retry
+
+**Execution note:** Write the integration test first — the retry shape is easier to anchor to observable behavior than to exact control flow.
 
 **Patterns to follow:**
-- Mirror the existing `TaskAssignment` struct's derive set and naming
+- Existing single-retry pattern in `src/agent_loop.rs` post-condition guards
+- `MockLlmProvider` sequence-based test pattern from `tests/eval/` golden dataset
 
 **Test scenarios:**
-- Happy path: `SkipEntry { agent: "alice", reason: "goal is backend-only" }` round-trips through JSON
-- Happy path: deserializing a `{"tasks": [...], "skipped": [...]}` wrapper preserves both arrays
-- Edge case: deserializing a bare `[...]` array without the wrapper still yields `Vec<TaskAssignment>` (backward compatibility)
+- **Happy path (full coverage):** 3-member team, orchestrator emits tasks for all 3 members. Helper returns empty. Retry never fires. `coverage_retry_fired = false`.
+- **Happy path (single-member team):** Team = orchestrator + 1 specialist. Orchestrator assigns 1 task. `expected` set is the one non-orchestrator member; helper returns empty. No retry.
+- **Edge case (gap → recover):** 3-member team, first response assigns 1 member, nudge turn assigns all 3 (or 2 + reply justifying the skip). Tests: exactly one extra LLM call recorded; final `tasks.len() == 3` (or 2, depending on mock); `coverage_retry_fired = true`; `warn!` emitted with `retry_recovered = true`.
+- **Edge case (gap → gap):** Both turns return the same under-covered response. Tests: two LLM calls recorded; final tasks = first response's tasks (no double-counting); `coverage_retry_fired = true`; `warn!` emitted with `retry_recovered = false` and `missing = [names]`.
+- **Conversational reply path:** Orchestrator returns `{reply: "..."}`. Helper never called. No retry.
+- **Empty tasks:** Existing "no valid assignments" branch still returns `Conversational(...)`. Helper never runs.
 
 **Verification:**
-- `cargo test -p mika-agent teams::types` passes.
+- `cargo test -p mika-agent teams::engine` passes (new helper tests + existing parse tests unchanged)
+- `cargo test -p mika-agent --test eval team_coverage` passes
+- Manual sanity: `grep team_coverage_gap server.log | jq` in staging after a team run; event shape is queryable.
 
 ---
 
-- [ ] **Unit 2: Coverage check in `parse_task_assignments`**
+- [ ] **Unit 2: Prompt reinforcement**
 
-**Goal:** Detect silent omissions — members who appear in the team roster but neither got a task nor were recorded as skipped.
+**Goal:** Bias the orchestrator toward roster-aware responses on the first try so the retry rarely fires.
 
-**Requirements:** R1, R2, R4
+**Requirements:** R1
+
+**Dependencies:** None (prompt and engine changes are independent)
+
+**Files:**
+- Modify: `crates/mika-agent/src/teams/prompt.rs` — add one sentence to the `## Instructions` block in `build_orchestrator_context`
+- Test: `crates/mika-agent/src/teams/prompt.rs#tests` — add a semantic assertion on the new guidance
+
+**Approach:**
+- Insert one sentence after the existing "decompose into tasks for your team members" line, before the response-format block. Tentative: *"Consider each team member's mandate before responding. If a member's expertise doesn't apply to this goal, it's fine to leave them out — but the response should reflect that you thought about the whole roster, not just the first one or two that came to mind."*
+- No schema change. No example change. Existing response format (`[{agent, task, output_file}]` or `{reply: "..."}`) is preserved verbatim.
+
+**Patterns to follow:**
+- Existing `## Instructions` block scaffolding in `build_orchestrator_context`
+- Existing assertion style in `test_orchestrator_context_includes_team_members`
+
+**Test scenarios:**
+- **Happy path:** Prompt contains case-insensitive substring "every" or "each" combined with "member" (semantic check, not literal wording)
+- **Regression guard:** Existing `test_orchestrator_context_includes_team_members` still passes
+- **Regression guard:** Response-format block ("Respond with a JSON array" / "Respond ONLY with compact") still present — ensures we didn't accidentally break the existing contract
+
+**Verification:**
+- `cargo test -p mika-agent teams::prompt` passes including new assertion.
+
+---
+
+- [ ] **Unit 3: `coverage_retry_fired` on `TeamRun` (if trivial) + acceptance test**
+
+**Goal:** Expose the retry signal beyond the log line — a boolean that post-hoc tooling can query without parsing logs.
+
+**Requirements:** R3
 
 **Dependencies:** Unit 1
 
 **Files:**
-- Modify: `crates/mika-agent/src/teams/engine.rs` — teach `parse_task_assignments` to parse the wrapper form and return a new `DecomposeResult::CoverageGap { missing: Vec<String>, partial_tasks: Vec<TaskAssignment>, partial_skips: Vec<SkipEntry> }` variant when members are unaccounted
-- Test: `crates/mika-agent/src/teams/engine.rs` — inline test module `parse_coverage_tests`
+- Modify: `crates/mika-agent/src/teams/types.rs` — add `#[serde(default)] coverage_retry_fired: bool` to `TeamRun`
+- Modify: `crates/mika-agent/src/teams/engine.rs` — populate it when Unit 1's retry fires
+- Test: integration test in `tests/eval/team_coverage.rs` — after a gap-triggered run, `team_run.coverage_retry_fired == true`; after a clean run, `false`
 
 **Approach:**
-- After the existing assignment-collection loop, compute `accounted = tasks.agents ∪ skips.agents`, `expected = team_members_excluding_orchestrator`, `missing = expected - accounted`
-- If `missing` is non-empty AND the response *did* attempt assignments (i.e. we have at least one assignment or skip), return `CoverageGap` with what was parsed; the caller (`decompose`) decides whether to retry
-- If `missing` is empty, return `Tasks(tasks)` as today (no behavior change)
-- Pure conversational-reply path is unchanged — the guard only fires on assignment-shaped responses
+- Only proceed with this unit if `team_runs.checkpoint` already round-trips the `TeamRun` struct as JSON (confirm via quick grep in `db.rs`). If it does, `#[serde(default)]` on the new field keeps existing rows deserializing — no migration.
+- If `TeamRun` persistence uses a different pathway that would require schema change, **drop this unit** — the `warn!` from Unit 1 is the fallback signal and meets R3.
 
 **Patterns to follow:**
-- Existing `DecomposeResult::Conversational` short-circuit for non-actionable replies
-- Existing `agent_names` collection at `engine.rs:1463`
+- Existing `#[serde(default)]` fields on `TeamRun` (if any); `db.rs` checkpoint round-trip path
 
 **Test scenarios:**
-- Happy path: full-coverage response (every member assigned or skipped) → `Tasks` result, no gap
-- Happy path: single-member team assigned one task → `Tasks` result, no gap (no missing members)
-- Edge case: bare array response covering all members → `Tasks` (backward compat)
-- Edge case: bare array response covering 1 of 3 members → `CoverageGap { missing: [2 members], partial_tasks: [1], partial_skips: [] }`
-- Edge case: wrapper with `tasks=[1]`, `skipped=[1]`, team has 3 members → `CoverageGap { missing: [1] }`
-- Error path: empty assignments AND empty skips (existing "no valid assignments" branch) → still returns `Conversational` (unchanged)
+- **Integration (gap-triggered run):** After a `MockLlmProvider` sequence that triggers the retry, `team_run.coverage_retry_fired == true`
+- **Integration (clean run):** After a full-coverage first response, `team_run.coverage_retry_fired == false`
+- **Backward compat:** An old `team_runs` row without the field deserializes with `coverage_retry_fired = false`
 
 **Verification:**
-- New unit tests pass; existing `parse_task_assignments` tests still pass unchanged.
-
----
-
-- [ ] **Unit 3: One-retry nudge in `decompose`**
-
-**Goal:** On `CoverageGap`, re-prompt the orchestrator once with an explicit list of unaccounted members; on second failure, fall through with a warning and proceed with whatever was parsed.
-
-**Requirements:** R2
-
-**Dependencies:** Unit 2
-
-**Files:**
-- Modify: `crates/mika-agent/src/teams/engine.rs` — update `decompose()` (around line 674) to handle `DecomposeResult::CoverageGap` by running one extra LLM call with a nudge prompt, then re-parsing
-- Test: `crates/mika-agent/tests/eval/team_coverage.rs` (new) — integration test using `MockLlmProvider` sequence to simulate gap-then-recover and gap-then-gap-falls-through
-
-**Approach:**
-- Add a small `retry_once_with_coverage_nudge` helper in `engine.rs` that:
-  - Takes the orchestrator context, the `missing` list, and a formatted partial response from the first turn
-  - Builds a short follow-up user message: "Your previous response did not account for these team members: {missing}. For each, either assign a task or add an entry to the `skipped` array with a clear reason."
-  - Calls the LLM once with the extended history
-  - Re-runs `parse_task_assignments` on the new response
-  - On success → `Tasks`
-  - On repeat `CoverageGap` → fold partial results together, log `warn!` with member list and reasons (for observability), and return `Tasks(partial_tasks)` — the run proceeds with what the orchestrator actually produced
-- Counter incremented in audit events for visibility (Unit 5)
-
-**Execution note:** Write the integration test first so the retry shape is anchored to observable behavior, not implementation detail.
-
-**Patterns to follow:**
-- Existing single-retry pattern in `src/agent_loop.rs` post-conditions (e.g. required-tools gate)
-- Existing `execute_inner` control flow in `teams/engine.rs`
-
-**Test scenarios:**
-- Integration (gap → recover): mock LLM returns `{tasks: [a], skipped: []}` with 3-member team, nudge turn returns `{tasks: [a,b], skipped: [{c, reason}]}`. Expect: 2 tasks created, 1 skip recorded, no warning.
-- Integration (gap → gap): mock LLM returns the same under-covered response both times. Expect: 1 task created, partial skips recorded, `warn!` with member list emitted, run proceeds.
-- Integration (pure conversational): mock LLM returns `{reply: "..."}`. Expect: no coverage check, no retry, conversational path unchanged.
-- Edge case (empty team after orchestrator filter): 1-agent team = orchestrator only. No non-orchestrator members to assign. Expect: no coverage check triggered (missing set is empty).
-
-**Verification:**
-- New `team_coverage.rs` integration tests pass
-- Existing team-engine tests in `tests/eval/` still pass
-
----
-
-- [ ] **Unit 4: Update orchestrator prompt with roster-awareness guidance and schema**
-
-**Goal:** Make the new response schema discoverable and bias the LLM toward explicit roster accounting on the first try, so the retry path is a backstop rather than the common case.
-
-**Requirements:** R1 (complementary), R4
-
-**Dependencies:** None (prompt change is independent of parse change)
-
-**Files:**
-- Modify: `crates/mika-agent/src/teams/prompt.rs` — extend `build_orchestrator_context` with roster-matching instructions and the new response schema (both `tasks` and `skipped`)
-- Test: existing prompt tests (`teams/prompt.rs` lines 372+) — update assertions to check the new guidance is present, add a test for the `skipped` schema being mentioned
-
-**Approach:**
-- Add a "Roster awareness" section to the instructions block: "For each team member, decide: assign a task (if their mandate helps with the goal), or skip them (if their mandate is unrelated). Every member must be accounted for in either `tasks` or `skipped`."
-- Update the response schema block: `{"tasks": [{assignment, ...}], "skipped": [{"agent": "<name>", "reason": "<why>"}]}`
-- Update the "Examples" block with one example showing a partial skip
-- Preserve the conversational-reply envelope and existing "list_workspace" instruction verbatim
-
-**Patterns to follow:**
-- Existing prompt scaffolding in `build_orchestrator_context`
-- Existing test harness in `teams/prompt.rs#tests`
-
-**Test scenarios:**
-- Happy path: prompt contains "skipped" schema keyword, team member list is present
-- Happy path: existing `test_orchestrator_context_includes_team_members` still passes
-- Happy path: new `test_orchestrator_context_mentions_skipped_schema` test
-
-**Verification:**
-- `cargo test -p mika-agent teams::prompt::tests` passes, including the new assertion.
-
----
-
-- [ ] **Unit 5: Observability — record coverage metadata on `TeamRun`**
-
-**Goal:** Make coverage gaps visible after the fact so we can tell whether the retry fired, which members were skipped, and why.
-
-**Requirements:** R3
-
-**Dependencies:** Unit 3
-
-**Files:**
-- Modify: `crates/mika-agent/src/teams/types.rs` — add `skipped_members: Vec<SkipEntry>` and `coverage_retry_fired: bool` to `TeamRun`
-- Modify: `crates/mika-agent/src/teams/engine.rs` — populate these fields when coverage retry runs
-- Modify: `crates/mika-agent/src/db.rs` — if `TeamRun` is persisted through this layer, serialize the new fields to the `team_runs.checkpoint` JSON column (no schema migration needed; JSON column is free-form)
-- Test: `crates/mika-agent/src/teams/engine.rs` — assert that after a `CoverageGap` run, `team_run.skipped_members` contains the recorded skips
-
-**Approach:**
-- Inspect `db.rs` to confirm `team_runs.checkpoint` is the JSON blob that round-trips `TeamRun`. If so, serialization is transparent — no schema migration.
-- Dashboard consumption is a future concern; this unit only guarantees the data is captured and visible via `gh` + sqlite query.
-
-**Test scenarios:**
-- Integration: after a team run that fired the retry, the final `TeamRun` has `coverage_retry_fired = true` and `skipped_members.len() > 0`
-- Integration: a clean run has `coverage_retry_fired = false` and empty `skipped_members`
-
-**Verification:**
-- Integration tests pass. Spot-check via `sqlite3 ~/.mika/data/mika.db 'SELECT checkpoint FROM team_runs ORDER BY started_at DESC LIMIT 1'` during manual testing.
+- Integration tests pass. Spot-check via `sqlite3 ~/.mika/data/mika.db "SELECT json_extract(checkpoint, '$.coverage_retry_fired') FROM team_runs ORDER BY started_at DESC LIMIT 5"`.
 
 ## System-Wide Impact
 
-- **Interaction graph:** Orchestrator LLM call path in `decompose()` gains a one-turn-retry branch. Nothing else changes.
-- **Error propagation:** `CoverageGap` is absorbed internally; external callers (`execute_inner`, `run_team` tool, dashboard) only see the existing `Tasks(...)` or `Conversational(...)` outcomes, now potentially supplemented by `team_run.skipped_members`.
-- **State lifecycle risks:** None — the retry is bounded to one extra LLM call; persistence happens only once after the final parse succeeds.
-- **API surface parity:** No external API changes. `run_team` tool schema and A2A task shape are unchanged.
-- **Integration coverage:** New integration tests live next to the existing eval tests and use the same `MockLlmProvider` harness.
-- **Unchanged invariants:** Existing single-assignment team runs still work. Existing tests continue to pass. Prompt still emits conversational replies via `{reply: "..."}` envelope. `TaskAssignment` fields and validation rules (name, path, length) are unchanged.
+- **Interaction graph:** `decompose()` gains one optional extra LLM turn. `DecomposeResult` signature and consumers are unchanged.
+- **Error propagation:** Coverage gap is absorbed inside `decompose()`; external callers see the existing `Tasks(...)` or `Conversational(...)` only.
+- **State lifecycle risks:** One extra LLM call per orchestrator turn in the worst case; single retry bound.
+- **API surface parity:** No external API change — `run_team` tool, A2A task shape, dashboard endpoints unchanged.
+- **Integration coverage:** New tests sit next to existing `tests/eval/` scenarios, use the same `MockLlmProvider` harness.
+- **Unchanged invariants:** `TaskAssignment` fields, `parse_task_assignments` signature, `DecomposeResult` variants, `{reply: "..."}` envelope, and all existing engine tests.
 
 ## Risks & Dependencies
 
 | Risk | Mitigation |
 |------|------------|
-| LLM ignores the new `skipped` schema entirely and keeps emitting bare arrays. | Guard explicitly supports bare-array responses; retries only when the parse actually finds a gap. Prompt reinforcement biases toward the new schema but does not depend on it. |
-| Retry loop becomes expensive for large teams where the LLM struggles to produce full coverage. | Hard cap: one retry. On second failure, run proceeds with whatever was parsed. Cost bound is one extra LLM call per decompose phase. |
-| Legitimate single-agent goals get false-flagged as gaps. | Contract is "account for each member", not "assign to each member". Skipping with a reason is always valid. Prompt explicitly spells this out. |
-| Schema serialization drift on `team_runs.checkpoint`. | The checkpoint column is free-form JSON; adding fields is backward compatible. Old rows deserialize with `#[serde(default)]` yielding empty vec / false. |
-| `MockLlmProvider` sequence-based tests become brittle if the retry path is tweaked later. | Integration tests assert on observable state (`team_run.skipped_members`, log output) rather than exact LLM call counts where possible. |
+| Prompt change alone fixes the MiniMax case — structural layer is idle defense. | This is the intended outcome; `warn!` frequency tells us if the structural layer ever fires. If it's perpetually silent, no cost; if it fires often, we have data to escalate. |
+| Retry rate stays high (LLMs ignore both prompt and nudge). | Observable via `warn!` log. Next escalation: structured `skipped` schema (deferred) or MiniMax-specific prompt variant. Both explicitly out of scope for this plan. |
+| Prompt wording choice affects retry rate. | Pick the better of two phrasings empirically against `fd7ef7ef`-style scenarios before merging (resolved-during-implementation note). |
+| Unit 3's serde-default field breaks existing deserialization. | `#[serde(default)]` guarantees backward compat; unit test covers pre-existing-row case; fallback is to drop Unit 3 and rely on `warn!` for R3. |
 
 ## Documentation / Operational Notes
 
-- Update `crates/mika-agent/CLAUDE.md` under the team-engine section to describe the coverage-check contract (one-sentence mention of the `skipped` field and the retry).
-- No deployment or migration concerns — purely an internal engine change.
-- Dashboard surfacing of `skipped_members` is NOT part of this plan; it's a follow-up tied to milestone #13 team runs work (#652).
+- Add a one-sentence note to `crates/mika-agent/CLAUDE.md` under the team-engine section: "Coverage check in `decompose()` re-prompts once if the orchestrator silently omits members; falls through with `warn!` log on second miss."
+- No deployment, migration, or rollout concerns.
 
 ## Sources & References
 
 - **Origin issue:** [senara-solutions/mika#286](https://github.com/senara-solutions/mika/issues/286)
 - Related code: `crates/mika-agent/src/teams/prompt.rs`, `crates/mika-agent/src/teams/engine.rs`
 - Related pattern: `docs/solutions/architecture-patterns/delegation-work-item-guard-enforcement.md`
-- Related pattern: `docs/solutions/architecture-patterns/conditional-required-tools-enforcement-via-match-reason.md`
-- Related memory: `feedback_prompt_enforcement_fragile` — don't rely on prompt-level enforcement; use structural constraints
-- Observed failure: team run `fd7ef7ef` (inner-circle, 5 agents, 2 active) — described in the issue body
+- Related memory: `feedback_prompt_enforcement_fragile`
+- Observed failure: team run `fd7ef7ef` — `llm_calls` table confirms MiniMax-M2.7 orchestrator + specialist
