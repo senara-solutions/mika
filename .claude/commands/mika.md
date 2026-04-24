@@ -52,6 +52,8 @@ Before running the pipeline, set up an isolated worktree:
 
 **Branch safety (MANDATORY):** You are already on the correct branch. Run `git branch --show-current` to confirm. Do NOT create, rename, or switch branches. All commits and the PR must use the current branch. This applies to every step below — including `/ce:plan`, `/ce:work`, `/ce:review`, and PR creation.
 
+**Git discipline (MANDATORY):** Do NOT run `git pull`, `git pull origin main`, `git merge main`, `git merge origin/main`, or any similar catch-up operation during the pipeline. The Worktree isolation step above already rebased this branch onto `origin/main` via the handler's startup guard. If `origin/main` advances while the pipeline is running, the resulting conflict is resolved **post-pipeline** through the `resolve_pr_conflicts` skill — never by pulling main into the branch mid-session. Mid-session merges create duplicate-hash copies of upstream commits and produce a `mergeable=CONFLICTING` PR on GitHub even though the content is identical. Allowed git commands during the pipeline: `git add`, `git commit`, `git push` (including `--force-with-lease` for amended commits), `git status`, `git log`, `git diff`, `git fetch origin` (read-only). Everything else — especially `pull` and `merge` — is out of scope.
+
 1. `/ce:plan $ARGUMENTS` (if an issue was detected, pass the issue title + body instead of raw arguments)
 2. `/ce:work`
 3. `/ce:review`
