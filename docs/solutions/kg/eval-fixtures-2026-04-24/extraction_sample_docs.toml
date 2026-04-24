@@ -1,0 +1,122 @@
+# KG Provider Evaluation — Extraction Sample Documents
+# Date: 2026-04-24
+# Purpose: Define the sample docs used to evaluate extraction quality across providers.
+# Each entry specifies a doc path (repo-relative) and expected entity count range
+# (min/max) based on manual inspection. These are sanity-check bounds, not exact
+# assertions — a provider that extracts within the range is plausible.
+#
+# Categories:
+#   kg_rich    — Documents about KG itself or heavy in skill/tool/agent references
+#   moderate   — Architecture docs with moderate entity density
+#   low_entity — Simple docs or docs with few extractable KG entities
+
+# --- KG-Rich Documents (5) ---
+
+[[samples]]
+path = "docs/solutions/688-kg-query-tool-graph-traversal.md"
+category = "kg_rich"
+min_entities = 3
+max_entities = 12
+notes = "References query_knowledge_graph tool, graph traversal patterns, cycle detection"
+
+[[samples]]
+path = "docs/solutions/692-self-knowledge-kg-upgrade.md"
+category = "kg_rich"
+min_entities = 3
+max_entities = 10
+notes = "Self-knowledge skill orchestration, references multiple tools and routing patterns"
+
+[[samples]]
+path = "docs/solutions/741-grounding-fabrication-regression-scenarios.md"
+category = "kg_rich"
+min_entities = 3
+max_entities = 10
+notes = "Fabrication problem types, eval harness patterns, regression scenarios"
+
+[[samples]]
+path = "docs/solutions/541-skill-variant-management-tooling.md"
+category = "kg_rich"
+min_entities = 2
+max_entities = 8
+notes = "Skill variant system, prompt management tooling"
+
+[[samples]]
+path = "docs/solutions/best-practices/kg-subject-extraction-constrained-ner-2026-04-22.md"
+category = "kg_rich"
+min_entities = 3
+max_entities = 10
+notes = "Describes the extraction system itself — entity types, validation, partial acceptance"
+
+# --- Moderate Entity Density (5) ---
+
+[[samples]]
+path = "docs/solutions/architecture-patterns/callback-skill-dependency-resolution.md"
+category = "moderate"
+min_entities = 2
+max_entities = 8
+notes = "Skill dependency resolution for callback dispatch"
+
+[[samples]]
+path = "docs/solutions/architecture-patterns/agent-eval-testing-harness-mock-provider.md"
+category = "moderate"
+min_entities = 2
+max_entities = 8
+notes = "Eval harness architecture, MockLlmProvider patterns"
+
+[[samples]]
+path = "docs/solutions/architecture-patterns/multi-provider-llm-trait-abstraction.md"
+category = "moderate"
+min_entities = 2
+max_entities = 8
+notes = "LlmProvider trait, ModelSpec parsing, provider construction"
+
+[[samples]]
+path = "docs/solutions/architecture-patterns/per-skill-llm-override-via-toml-section.md"
+category = "moderate"
+min_entities = 2
+max_entities = 7
+notes = "Per-skill LLM model override via skill.toml configuration"
+
+[[samples]]
+path = "docs/solutions/architecture/callback-resume-agent-lifecycle.md"
+category = "moderate"
+min_entities = 3
+max_entities = 10
+notes = "Callback/resume lifecycle, task engine, SilentTrigger patterns"
+
+# --- Low Entity / Edge Cases (5) ---
+
+[[samples]]
+path = "docs/solutions/677-configurable-task-session-limit.md"
+category = "low_entity"
+min_entities = 1
+max_entities = 5
+notes = "Simple config change — max_agent_tasks_per_session"
+
+[[samples]]
+path = "docs/solutions/architecture-patterns/cli-flag-subcommand-scoping.md"
+category = "low_entity"
+min_entities = 0
+max_entities = 4
+notes = "CLI flag scoping — minimal KG-relevant entities"
+
+[[samples]]
+path = "docs/solutions/architecture-patterns/log-format-selection-tracing-subscriber.md"
+category = "low_entity"
+min_entities = 0
+max_entities = 3
+notes = "Logging configuration — few extractable entities"
+
+[[samples]]
+path = "docs/solutions/security-issues/env-var-leakage-exec-handler-child-processes.md"
+category = "low_entity"
+min_entities = 1
+max_entities = 5
+notes = "Security fix — env var scrubbing, may reference tools/skills tangentially"
+
+[[samples]]
+path = "docs/solutions/602-milestone-project-workflow-implementation.md"
+category = "low_entity"
+min_entities = 1
+max_entities = 5
+notes = "Milestone/project workflow — task types, work item management"

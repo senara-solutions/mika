@@ -26,6 +26,9 @@ mod eval {
     // Grounding + fabrication regression: 5 scenarios from KG retrospective (#741)
     pub mod grounding_regressions;
 
+    // KG provider evaluation matrix: provider comparison for extraction + resolution (#762)
+    pub mod kg_provider_eval;
+
     mod test_basic_conversation;
     mod test_callback_turn;
     mod test_completion_claim_guard;
