@@ -403,6 +403,14 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Claude thinking level (low/medium/high/off)",
     },
+    // -- Knowledge Graph --
+    ConfigKeyInfo {
+        key: "kg_docs_root",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_KG_DOCS_ROOT"),
+        secret: false,
+        description: "Absolute path to docs root for KG lexical ingestion. Defaults to <CWD>/docs/solutions when unset. Needed on hosts where the service CWD != repo root (e.g., OpenRC).",
+    },
     // ReadOnly (runtime-computed)
     ConfigKeyInfo {
         key: "home_dir",
@@ -525,6 +533,11 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "store_llm_calls" => Some(settings.store_llm_calls.to_string()),
         "store_tool_calls" => Some(settings.store_tool_calls.to_string()),
         "log_llm_bodies" => Some(settings.log_llm_bodies.to_string()),
+        // KG
+        "kg_docs_root" => settings
+            .kg_docs_root
+            .as_ref()
+            .map(|p| p.display().to_string()),
         // DB keys (timezone, thinking_level) not available from Settings
         _ => None,
     }
@@ -773,6 +786,14 @@ pub struct Settings {
     /// fan-out cost model.
     #[serde(default)]
     pub kg_batch_budget: Option<u32>,
+
+    /// KG docs root — absolute path to the docs directory the lexical ingestor
+    /// reads (#738). Resolution chain: `MIKA_KG_DOCS_ROOT` env > `kg_docs_root`
+    /// config field > `<CWD>/docs/solutions` (container-native default).
+    /// Needed on hosts where the service CWD ≠ repo root (e.g., OpenRC
+    /// `supervise-daemon` launches with CWD=`/`).
+    #[serde(default)]
+    pub kg_docs_root: Option<PathBuf>,
 
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
@@ -1260,6 +1281,7 @@ impl Settings {
             kg_extraction_model: None,
             kg_resolution_model: None,
             kg_batch_budget: None,
+            kg_docs_root: None,
         }
     }
 }
@@ -1384,6 +1406,7 @@ impl std::fmt::Debug for Settings {
                 "otlp_auth_header",
                 &self.otlp_auth_header.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("kg_docs_root", &self.kg_docs_root)
             .field("home_dir", &self.home_dir)
             .finish()
     }
@@ -1401,6 +1424,7 @@ mod tests {
             std::env::remove_var("MIKA_LLM_PROVIDER");
             std::env::remove_var("MIKA_DB_PATH");
             std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS");
+            std::env::remove_var("MIKA_KG_DOCS_ROOT");
         }
     }
 
@@ -1810,5 +1834,92 @@ mod tests {
         assert_eq!(settings.effective_kg_batch_budget(), 0);
 
         unsafe { std::env::remove_var("MIKA_KG_BATCH_BUDGET") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_root_defaults_to_none() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.kg_docs_root, None);
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_root_env_override() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOT", "/srv/mika/docs/solutions") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(
+            settings.kg_docs_root,
+            Some(PathBuf::from("/srv/mika/docs/solutions"))
+        );
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOT") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_root_config_file() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "kg_docs_root = \"/opt/mika/docs/solutions\"\n",
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(
+            settings.kg_docs_root,
+            Some(PathBuf::from("/opt/mika/docs/solutions"))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_root_env_wins_over_config() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOT", "/env/path") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "kg_docs_root = \"/config/path\"\n").unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        // Env var takes precedence over config file via config-rs cascade.
+        assert_eq!(settings.kg_docs_root, Some(PathBuf::from("/env/path")));
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOT") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_root_get_effective_value() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOT", "/effective/path") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(
+            get_effective_value("kg_docs_root", &settings),
+            Some("/effective/path".to_string())
+        );
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOT") };
     }
 }
