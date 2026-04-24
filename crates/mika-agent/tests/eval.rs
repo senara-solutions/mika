@@ -29,6 +29,9 @@ mod eval {
     // KG provider evaluation matrix: provider comparison for extraction + resolution (#762)
     pub mod kg_provider_eval;
 
+    // v26->v27 KG migration invariant tests: coalesce per-agent data (#787)
+    mod kg_v27_migration;
+
     mod test_basic_conversation;
     mod test_callback_turn;
     mod test_completion_claim_guard;

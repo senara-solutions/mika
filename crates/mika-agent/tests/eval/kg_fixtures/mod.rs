@@ -345,3 +345,641 @@ pub async fn get_resolution(db: &AsyncDatabase, subject_entity_id: i64) -> Optio
     .await
     .unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// v26→v27 Migration Test Infrastructure (#787)
+// ---------------------------------------------------------------------------
+//
+// The helpers below create raw `rusqlite::Connection` databases with a frozen
+// v26 KG schema, seed synthetic data, then leave the database in the exact
+// state that `v27_coalesce_sql` expects: v26 tables renamed to *_v26_backup,
+// v27 tables created empty, schema_meta present but no coalesce marker.
+//
+// These helpers are intentionally separate from the async `test_db()` factory
+// above because:
+//   1. The coalesce SQL is a single `execute_batch` — no async needed.
+//   2. We must NOT call `init_sqlite_vec()` (requires the C extension).
+//   3. We must NOT call `Database::open_in_memory()` (runs full migration).
+
+/// v26 KG table DDL — frozen snapshot from before #786. Used by #787 migration tests.
+/// Do NOT update when the schema version increments.
+pub const V26_KG_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        home_dir TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS schema_version (
+        version INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_entities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_key TEXT NOT NULL UNIQUE,
+        type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        properties_json TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        CHECK (entity_key = type || ':' || name)
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_relationships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_entity_id INTEGER,
+        to_entity_id INTEGER,
+        type TEXT,
+        properties_json TEXT,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        seq_id INTEGER NOT NULL,
+        source_doc_path TEXT NOT NULL,
+        source_doc_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        trace_id TEXT,
+        UNIQUE (agent_id, source_doc_path, seq_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_subject_entities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        entity_key TEXT NOT NULL,
+        type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        properties_json TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        trace_id TEXT,
+        CHECK (entity_key = type || ':' || name),
+        UNIQUE (agent_id, entity_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_subject_relationships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        from_entity_id INTEGER NOT NULL,
+        to_entity_id INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        properties_json TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        trace_id TEXT,
+        UNIQUE (agent_id, from_entity_id, to_entity_id, type)
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_chunk_subjects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        chunk_id INTEGER NOT NULL,
+        subject_entity_id INTEGER NOT NULL,
+        extraction_trace_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (agent_id, chunk_id, subject_entity_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_chunk_subject_relationships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        chunk_id INTEGER NOT NULL,
+        subject_relationship_id INTEGER NOT NULL,
+        extraction_trace_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (agent_id, chunk_id, subject_relationship_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_extractions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        source_doc_path TEXT NOT NULL,
+        source_doc_hash TEXT,
+        extraction_model TEXT NOT NULL,
+        entities_extracted INTEGER NOT NULL DEFAULT 0,
+        relationships_extracted INTEGER NOT NULL DEFAULT 0,
+        extraction_trace_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (agent_id, source_doc_path)
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_subject_resolutions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        subject_entity_id INTEGER NOT NULL,
+        domain_entity_id INTEGER NOT NULL,
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        trace_id TEXT,
+        UNIQUE (agent_id, subject_entity_id, domain_entity_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS kg_resolutions_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        subject_entity_id INTEGER NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN (
+            'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
+        )),
+        resolution_trace_id TEXT NOT NULL,
+        source_extraction_trace_id TEXT,
+        model TEXT,
+        duration_ms INTEGER,
+        resolved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (agent_id, subject_entity_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+";
+
+/// v27 DDL for KG tables — the target tables created by migrate_v26_to_v27.
+/// Matches the exact DDL from db.rs. Used after renaming v26 tables to *_v26_backup.
+const V27_KG_DDL: &str = "
+    CREATE TABLE kg_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        docs_root_hash TEXT NOT NULL,
+        docs_root TEXT NOT NULL,
+        seq_id INTEGER NOT NULL,
+        source_doc_path TEXT NOT NULL,
+        source_doc_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        trace_id TEXT,
+        UNIQUE (docs_root_hash, source_doc_path, seq_id)
+    );
+
+    CREATE TABLE kg_subject_entities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        docs_root_hash TEXT NOT NULL,
+        docs_root TEXT NOT NULL,
+        entity_key TEXT NOT NULL,
+        type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        properties_json TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        trace_id TEXT,
+        CHECK (entity_key = type || ':' || name),
+        UNIQUE (docs_root_hash, entity_key)
+    );
+
+    CREATE TABLE kg_subject_relationships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        docs_root_hash TEXT NOT NULL,
+        docs_root TEXT NOT NULL,
+        from_entity_id INTEGER NOT NULL,
+        to_entity_id INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        properties_json TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        trace_id TEXT,
+        UNIQUE (docs_root_hash, from_entity_id, to_entity_id, type)
+    );
+
+    CREATE TABLE kg_chunk_subjects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        docs_root_hash TEXT NOT NULL,
+        docs_root TEXT NOT NULL,
+        chunk_id INTEGER NOT NULL,
+        subject_entity_id INTEGER NOT NULL,
+        extraction_trace_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (docs_root_hash, chunk_id, subject_entity_id)
+    );
+
+    CREATE TABLE kg_chunk_subject_relationships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        docs_root_hash TEXT NOT NULL,
+        docs_root TEXT NOT NULL,
+        chunk_id INTEGER NOT NULL,
+        subject_relationship_id INTEGER NOT NULL,
+        extraction_trace_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (docs_root_hash, chunk_id, subject_relationship_id)
+    );
+
+    CREATE TABLE kg_extractions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        docs_root_hash TEXT NOT NULL,
+        docs_root TEXT NOT NULL,
+        source_doc_path TEXT NOT NULL,
+        source_doc_hash TEXT,
+        extraction_model TEXT NOT NULL,
+        entities_extracted INTEGER NOT NULL DEFAULT 0,
+        relationships_extracted INTEGER NOT NULL DEFAULT 0,
+        extraction_trace_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (docs_root_hash, source_doc_path)
+    );
+
+    CREATE TABLE kg_subject_resolutions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        subject_entity_id INTEGER NOT NULL,
+        domain_entity_id INTEGER NOT NULL,
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        trace_id TEXT,
+        UNIQUE (agent_id, subject_entity_id, domain_entity_id)
+    );
+
+    CREATE TABLE kg_resolutions_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        subject_entity_id INTEGER NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN (
+            'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
+        )),
+        resolution_trace_id TEXT NOT NULL,
+        source_extraction_trace_id TEXT,
+        model TEXT,
+        duration_ms INTEGER,
+        resolved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        UNIQUE (agent_id, subject_entity_id)
+    );
+";
+
+/// Drift profiles for synthetic v26 data seeding.
+pub enum DriftProfile {
+    /// Every agent extracts the same entities with identical confidence.
+    NoDrift,
+    /// Agents extract overlapping but non-identical entity sets with varied confidence.
+    ObservedDrift,
+}
+
+/// Create an in-memory connection with v26 KG schema + v27 empty tables.
+/// Sets up the exact state after #786's DDL runs but before #787's coalesce:
+/// - v26 tables renamed to *_v26_backup
+/// - v27 tables created (empty)
+/// - schema_meta table exists (no v27_coalesce_complete marker)
+///
+/// Does NOT call `init_sqlite_vec` — the C extension may not be linked in test context.
+pub fn open_v26_for_coalesce() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().expect("open in-memory SQLite");
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")
+        .expect("set pragmas");
+
+    // 1. Create v26 schema tables
+    conn.execute_batch(V26_KG_DDL).expect("create v26 tables");
+
+    // 2. Rename v26 KG tables to *_v26_backup (same as DDL part of migrate_v26_to_v27)
+    conn.execute_batch(
+        "ALTER TABLE kg_chunks RENAME TO kg_chunks_v26_backup;
+         ALTER TABLE kg_subject_entities RENAME TO kg_subject_entities_v26_backup;
+         ALTER TABLE kg_subject_relationships RENAME TO kg_subject_relationships_v26_backup;
+         ALTER TABLE kg_chunk_subjects RENAME TO kg_chunk_subjects_v26_backup;
+         ALTER TABLE kg_chunk_subject_relationships RENAME TO kg_chunk_subject_relationships_v26_backup;
+         ALTER TABLE kg_extractions RENAME TO kg_extractions_v26_backup;
+         ALTER TABLE kg_subject_resolutions RENAME TO kg_subject_resolutions_v26_backup;
+         ALTER TABLE kg_resolutions_log RENAME TO kg_resolutions_log_v26_backup;",
+    )
+    .expect("rename v26 tables to backup");
+
+    // 3. Create v27 empty tables
+    conn.execute_batch(V27_KG_DDL).expect("create v27 tables");
+
+    // 4. Insert schema_version 27
+    conn.execute("INSERT INTO schema_version (version) VALUES (27)", [])
+        .expect("insert schema_version");
+
+    // 5. Turn FK back on
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .expect("enable FK");
+
+    conn
+}
+
+/// Seed a v26 synthetic database with realistic extraction drift.
+/// Returns a Connection with v26 backup tables populated and v27 tables empty.
+///
+/// Parameters:
+/// - agents: number of agents (each gets its own set of extracted entities)
+/// - docs: number of docs in the shared corpus
+/// - drift: controls entity extraction variance across agents
+pub fn build_v26_synthetic_db(agents: u32, docs: u32, drift: DriftProfile) -> rusqlite::Connection {
+    let conn = open_v26_for_coalesce();
+
+    // FK off during bulk inserts to v26 backup tables (which have no FK constraints anyway)
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")
+        .expect("disable FK for seeding");
+
+    // --- Seed agents ---
+    for a in 0..agents {
+        let agent_id = format!("agent-{a}");
+        conn.execute(
+            "INSERT INTO agents (id, name, home_dir) VALUES (?1, ?2, ?3)",
+            rusqlite::params![agent_id, agent_id, format!("/tmp/mika-test/{agent_id}")],
+        )
+        .expect("insert agent");
+    }
+
+    // --- Seed domain entities (for FK from resolutions) ---
+    for i in 0..20 {
+        let etype = match i % 4 {
+            0 => "skill",
+            1 => "tool",
+            2 => "agent",
+            _ => "problem_type",
+        };
+        let name = format!("domain-{i}");
+        let entity_key = format!("{etype}:{name}");
+        conn.execute(
+            "INSERT INTO kg_entities (entity_key, type, name) VALUES (?1, ?2, ?3)",
+            rusqlite::params![entity_key, etype, name],
+        )
+        .expect("insert domain entity");
+    }
+
+    // --- Seed per-agent data ---
+    for a in 0..agents {
+        let agent_id = format!("agent-{a}");
+
+        for d in 0..docs {
+            let doc_path = format!("docs/solutions/test-doc-{d}.md");
+            let doc_hash = format!("{:016x}", (d as u64) * 0x1234_5678_9abc_def0 + 1);
+
+            // Insert 5 chunks per doc
+            let mut chunk_ids = Vec::new();
+            for seq in 0..5 {
+                conn.execute(
+                    "INSERT INTO kg_chunks_v26_backup (agent_id, seq_id, source_doc_path, source_doc_hash) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![agent_id, seq, doc_path, doc_hash],
+                )
+                .expect("insert chunk");
+                let chunk_id = conn.last_insert_rowid();
+                chunk_ids.push(chunk_id);
+            }
+
+            // Generate entities based on drift profile
+            let entities = generate_entities(a, d, &drift);
+
+            let mut entity_ids = Vec::new();
+            for ent in &entities {
+                conn.execute(
+                    "INSERT OR IGNORE INTO kg_subject_entities_v26_backup \
+                     (agent_id, entity_key, type, name, confidence) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        agent_id,
+                        ent.entity_key,
+                        ent.etype,
+                        ent.name,
+                        ent.confidence
+                    ],
+                )
+                .expect("insert subject entity");
+                // Get the ID (may have been ignored if duplicate agent+entity_key)
+                let eid: i64 = conn
+                    .query_row(
+                        "SELECT id FROM kg_subject_entities_v26_backup \
+                         WHERE agent_id = ?1 AND entity_key = ?2",
+                        rusqlite::params![agent_id, ent.entity_key],
+                        |row| row.get(0),
+                    )
+                    .expect("get entity id");
+                entity_ids.push(eid);
+            }
+
+            // Insert 3 relationships per doc (between first 3 entities, if enough exist)
+            let mut rel_ids = Vec::new();
+            if entity_ids.len() >= 3 {
+                for r in 0..3 {
+                    let from_id = entity_ids[r];
+                    let to_id = entity_ids[(r + 1) % 3];
+                    let rel_type = match r {
+                        0 => "SOLVED_BY",
+                        1 => "USES",
+                        _ => "CALLS",
+                    };
+                    let confidence = 0.80 + (r as f64) * 0.05;
+                    conn.execute(
+                        "INSERT OR IGNORE INTO kg_subject_relationships_v26_backup \
+                         (agent_id, from_entity_id, to_entity_id, type, confidence) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![agent_id, from_id, to_id, rel_type, confidence],
+                    )
+                    .expect("insert subject relationship");
+                    let rid: i64 = conn
+                        .query_row(
+                            "SELECT id FROM kg_subject_relationships_v26_backup \
+                             WHERE agent_id = ?1 AND from_entity_id = ?2 AND to_entity_id = ?3 AND type = ?4",
+                            rusqlite::params![agent_id, from_id, to_id, rel_type],
+                            |row| row.get(0),
+                        )
+                        .expect("get relationship id");
+                    rel_ids.push(rid);
+                }
+            }
+
+            // Link chunks to entities via kg_chunk_subjects
+            for (i, &chunk_id) in chunk_ids.iter().enumerate() {
+                // Each chunk links to 2-3 entities
+                let link_count = std::cmp::min(entity_ids.len(), if i < 3 { 3 } else { 2 });
+                for j in 0..link_count {
+                    let eid = entity_ids[j % entity_ids.len()];
+                    conn.execute(
+                        "INSERT OR IGNORE INTO kg_chunk_subjects_v26_backup \
+                         (agent_id, chunk_id, subject_entity_id, extraction_trace_id) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            agent_id,
+                            chunk_id,
+                            eid,
+                            format!("trace-{a}-{d}-{i}-{j}")
+                        ],
+                    )
+                    .expect("insert chunk_subject");
+                }
+            }
+
+            // Link chunks to relationships via kg_chunk_subject_relationships
+            if !rel_ids.is_empty() {
+                for (i, &chunk_id) in chunk_ids.iter().take(3).enumerate() {
+                    let rid = rel_ids[i % rel_ids.len()];
+                    conn.execute(
+                        "INSERT OR IGNORE INTO kg_chunk_subject_relationships_v26_backup \
+                         (agent_id, chunk_id, subject_relationship_id, extraction_trace_id) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            agent_id,
+                            chunk_id,
+                            rid,
+                            format!("trace-rel-{a}-{d}-{i}")
+                        ],
+                    )
+                    .expect("insert chunk_subject_relationship");
+                }
+            }
+
+            // Insert 1 extraction record per (agent, doc)
+            conn.execute(
+                "INSERT OR IGNORE INTO kg_extractions_v26_backup \
+                 (agent_id, source_doc_path, source_doc_hash, extraction_model, \
+                  entities_extracted, relationships_extracted, extraction_trace_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    agent_id,
+                    doc_path,
+                    doc_hash,
+                    "openrouter/deepseek/deepseek-v3",
+                    entities.len() as i64,
+                    std::cmp::min(rel_ids.len(), 3) as i64,
+                    format!("extraction-trace-{a}-{d}")
+                ],
+            )
+            .expect("insert extraction");
+        }
+    }
+
+    // --- Seed resolutions (for ~70% of each agent's entities) ---
+    // Only create resolutions for the FIRST entity per agent per normalized key
+    // to avoid collision when case variants both resolve to the same domain entity.
+    for a in 0..agents {
+        let agent_id = format!("agent-{a}");
+
+        // Collect all entity IDs and their normalized keys for this agent
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, entity_key FROM kg_subject_entities_v26_backup \
+                 WHERE agent_id = ?1 ORDER BY id",
+            )
+            .expect("prepare entity query");
+        let entities: Vec<(i64, String)> = stmt
+            .query_map(rusqlite::params![agent_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query entities")
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Track which normalized keys we've already resolved for this agent
+        let mut resolved_norm_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for (i, (entity_id, entity_key)) in entities.iter().enumerate() {
+            // ~70% resolution rate
+            if (i * 7) % 10 >= 7 {
+                continue;
+            }
+
+            let norm_key = entity_key.trim().to_lowercase();
+            if resolved_norm_keys.contains(&norm_key) {
+                continue; // Skip case variants — avoid collision on INSERT OR IGNORE
+            }
+            resolved_norm_keys.insert(norm_key);
+
+            let domain_entity_id = (i as i64 % 20) + 1; // Map to one of the 20 domain entities
+            let confidence = 0.85;
+            let trace_id = format!("res-trace-{a}-{i}");
+
+            conn.execute(
+                "INSERT OR IGNORE INTO kg_subject_resolutions_v26_backup \
+                 (agent_id, subject_entity_id, domain_entity_id, confidence, trace_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![agent_id, entity_id, domain_entity_id, confidence, trace_id],
+            )
+            .expect("insert resolution");
+
+            conn.execute(
+                "INSERT OR IGNORE INTO kg_resolutions_log_v26_backup \
+                 (agent_id, subject_entity_id, outcome, resolution_trace_id) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![agent_id, entity_id, "matched_exact", trace_id],
+            )
+            .expect("insert resolution log");
+        }
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .expect("re-enable FK");
+
+    conn
+}
+
+/// Internal entity spec for seeding.
+struct EntitySpec {
+    entity_key: String,
+    etype: String,
+    name: String,
+    confidence: f64,
+}
+
+/// Generate entities for a given agent and doc based on drift profile.
+fn generate_entities(agent_idx: u32, doc_idx: u32, drift: &DriftProfile) -> Vec<EntitySpec> {
+    match drift {
+        DriftProfile::NoDrift => {
+            // Every agent extracts the same 10 entities with identical confidence
+            (0..10)
+                .map(|i| {
+                    let name = format!("entity-{doc_idx}-{i}");
+                    EntitySpec {
+                        entity_key: format!("skill:{name}"),
+                        etype: "skill".to_string(),
+                        name,
+                        confidence: 0.85,
+                    }
+                })
+                .collect()
+        }
+        DriftProfile::ObservedDrift => {
+            let mut entities = Vec::new();
+            let seed = (agent_idx as usize) * 1000 + (doc_idx as usize);
+
+            // True set: 30 entities per doc
+            // Each agent draws 8-12 from the true set (deterministic selection)
+            let draw_count = 8 + (seed % 5); // 8..12
+            for i in 0..30 {
+                // Deterministic selection: use a simple hash-like function
+                let selected = ((seed * 31 + i * 17) % 30) < draw_count;
+                if !selected {
+                    continue;
+                }
+                let name = format!("entity-{doc_idx}-{i}");
+                let confidence = 0.70 + ((i % 3) as f64) * 0.10;
+                // Apply per-agent confidence jitter: ±0.10
+                let jitter = ((agent_idx as f64) - 1.0) * 0.05;
+                let confidence = (confidence + jitter).clamp(0.01, 1.0);
+                entities.push(EntitySpec {
+                    entity_key: format!("skill:{name}"),
+                    etype: "skill".to_string(),
+                    name,
+                    confidence,
+                });
+            }
+
+            // Agent-unique entities: 2-4 per (agent, doc)
+            let unique_count = 2 + (seed % 3); // 2..4
+            for i in 0..unique_count {
+                let name = format!("unique-{agent_idx}-{doc_idx}-{i}");
+                entities.push(EntitySpec {
+                    entity_key: format!("skill:{name}"),
+                    etype: "skill".to_string(),
+                    name,
+                    confidence: 0.75,
+                });
+            }
+
+            // Case variants: 1-2 per (agent, doc)
+            let variant_count = 1 + (seed % 2); // 1..2
+            for i in 0..variant_count {
+                // Create case variant of an entity from the true set
+                let target_idx = (seed + i) % 30;
+                let name = format!("Entity-{doc_idx}-{target_idx}"); // uppercase E
+                entities.push(EntitySpec {
+                    entity_key: format!("skill:{name}"),
+                    etype: "skill".to_string(),
+                    name,
+                    confidence: 0.72,
+                });
+            }
+
+            entities
+        }
+    }
+}
