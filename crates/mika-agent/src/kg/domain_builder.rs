@@ -1024,8 +1024,8 @@ mod tests {
                 [],
             )?;
             db.conn.execute(
-                "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence)
-                 VALUES ('test', 'skill:linked-skill', 'skill', 'linked-skill', 1.0)",
+                "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence)
+                 VALUES ('0000000000000000', '/test', 'skill:linked-skill', 'skill', 'linked-skill', 1.0)",
                 [],
             )?;
             let subject_id: i64 = db.conn.last_insert_rowid();

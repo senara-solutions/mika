@@ -132,33 +132,36 @@ pub const KG_RELATIONSHIP_COLUMNS: &str =
     "id, from_entity_id, to_entity_id, type, properties_json, created_at";
 
 /// Column list for `kg_chunks` queries. No `SELECT *`.
+/// v27: `agent_id` replaced by `docs_root_hash, docs_root`.
 pub const KG_CHUNK_COLUMNS: &str =
-    "id, agent_id, seq_id, source_doc_path, source_doc_hash, created_at, trace_id";
+    "id, docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash, created_at, trace_id";
 
 /// Column list for `kg_subject_entities` queries. No `SELECT *`.
-pub const KG_SUBJECT_ENTITY_COLUMNS: &str =
-    "id, agent_id, entity_key, type, name, confidence, properties_json, created_at, trace_id";
+/// v27: `agent_id` replaced by `docs_root_hash, docs_root`.
+pub const KG_SUBJECT_ENTITY_COLUMNS: &str = "id, docs_root_hash, docs_root, entity_key, type, name, confidence, properties_json, created_at, trace_id";
 
 /// Column list for `kg_subject_resolutions` queries. No `SELECT *`.
+/// Per-agent — keeps `agent_id` in v27.
 pub const KG_SUBJECT_RESOLUTION_COLUMNS: &str =
     "id, agent_id, subject_entity_id, domain_entity_id, confidence, created_at, trace_id";
 
 /// Column list for `kg_subject_relationships` queries. No `SELECT *`.
-pub const KG_SUBJECT_RELATIONSHIP_COLUMNS: &str = "id, agent_id, from_entity_id, to_entity_id, type, confidence, properties_json, created_at, trace_id";
+/// v27: `agent_id` replaced by `docs_root_hash, docs_root`.
+pub const KG_SUBJECT_RELATIONSHIP_COLUMNS: &str = "id, docs_root_hash, docs_root, from_entity_id, to_entity_id, type, confidence, properties_json, created_at, trace_id";
 
 /// Column list for `kg_chunk_subjects` queries. No `SELECT *`.
+/// v27: `agent_id` replaced by `docs_root_hash, docs_root`.
 pub const KG_CHUNK_SUBJECT_COLUMNS: &str =
-    "id, agent_id, chunk_id, subject_entity_id, extraction_trace_id, created_at";
+    "id, docs_root_hash, docs_root, chunk_id, subject_entity_id, extraction_trace_id, created_at";
 
 /// Column list for `kg_chunk_subject_relationships` queries. No `SELECT *`.
-pub const KG_CHUNK_SUBJECT_RELATIONSHIP_COLUMNS: &str =
-    "id, agent_id, chunk_id, subject_relationship_id, extraction_trace_id, created_at";
+/// v27: `agent_id` replaced by `docs_root_hash, docs_root`.
+pub const KG_CHUNK_SUBJECT_RELATIONSHIP_COLUMNS: &str = "id, docs_root_hash, docs_root, chunk_id, subject_relationship_id, extraction_trace_id, created_at";
 
 /// Column list for `kg_extractions` queries. No `SELECT *`.
-///
-/// `source_doc_hash` was added in v26 (#757). NULL for pre-v26 rows; populated
-/// on subsequent successful extractions to enable hash-equality idempotency.
-pub const KG_EXTRACTION_COLUMNS: &str = "id, agent_id, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id, created_at";
+/// v27: `agent_id` replaced by `docs_root_hash, docs_root`. First-writer-wins
+/// via `INSERT OR IGNORE` against `UNIQUE(docs_root_hash, source_doc_path)`.
+pub const KG_EXTRACTION_COLUMNS: &str = "id, docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id, created_at";
 
 /// Column list for `kg_resolutions_log` queries. No `SELECT *`.
 pub const KG_RESOLUTION_LOG_COLUMNS: &str = "id, agent_id, subject_entity_id, outcome, resolution_trace_id, source_extraction_trace_id, model, duration_ms, resolved_at";

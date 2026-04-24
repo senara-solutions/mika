@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 26;
+pub const CURRENT_SCHEMA_VERSION: i64 = 27;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -826,6 +826,17 @@ impl Database {
             self.migrate_v25_to_v26()?;
             info!(version = 26, "database migrated to v26");
         }
+        if (3..=26).contains(&version) {
+            self.migrate_v26_to_v27()?;
+            info!(version = 27, "database migrated to v27");
+        }
+
+        // v27 startup guard: refuse to return a Database handle if the
+        // coalesce step from #787 has not run. Fresh installs write the
+        // marker in migrate_v1; existing DBs upgraded via the stub get
+        // the marker only when #787's coalesce SQL runs.
+        self.check_v27_coalesce_guard()?;
+
         Ok(())
     }
 
@@ -882,7 +893,15 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (26);
+            INSERT INTO schema_version (version) VALUES (27);
+
+            -- Schema meta table for migration state tracking (v27+).
+            CREATE TABLE schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            -- Fresh installs are trivially coalesce-complete (no v26 data).
+            INSERT INTO schema_meta (key, value) VALUES ('v27_coalesce_complete', '1');
 
             CREATE TABLE agents (
                 id TEXT PRIMARY KEY,
@@ -1284,23 +1303,25 @@ impl Database {
             CREATE INDEX idx_kg_rel_from ON kg_relationships(from_entity_id, type);
             CREATE INDEX idx_kg_rel_to ON kg_relationships(to_entity_id, type);
 
-            -- KG lexical layer (per-agent)
+            -- KG lexical layer (shared by docs_root_hash — v27)
             CREATE TABLE kg_chunks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                docs_root_hash TEXT NOT NULL,
+                docs_root TEXT NOT NULL,
                 seq_id INTEGER NOT NULL,
                 source_doc_path TEXT NOT NULL,
                 source_doc_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 trace_id TEXT,
-                UNIQUE (agent_id, source_doc_path, seq_id)
+                UNIQUE (docs_root_hash, source_doc_path, seq_id)
             );
-            CREATE INDEX idx_kg_chunks_agent_doc ON kg_chunks(agent_id, source_doc_path);
+            CREATE INDEX idx_kg_chunks_docs_root_hash_doc ON kg_chunks(docs_root_hash, source_doc_path);
 
-            -- KG subject layer (per-agent)
+            -- KG subject layer (shared by docs_root_hash — v27)
             CREATE TABLE kg_subject_entities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                docs_root_hash TEXT NOT NULL,
+                docs_root TEXT NOT NULL,
                 entity_key TEXT NOT NULL,
                 type TEXT NOT NULL,
                 name TEXT NOT NULL,
@@ -1309,9 +1330,9 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 trace_id TEXT,
                 CHECK (entity_key = type || ':' || name),
-                UNIQUE (agent_id, entity_key)
+                UNIQUE (docs_root_hash, entity_key)
             );
-            CREATE INDEX idx_kg_subj_entities_agent_type ON kg_subject_entities(agent_id, type);
+            CREATE INDEX idx_kg_subj_entities_drh_type ON kg_subject_entities(docs_root_hash, type);
 
             CREATE TABLE kg_subject_resolutions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1326,10 +1347,11 @@ impl Database {
             CREATE INDEX idx_kg_resolutions_agent_subj ON kg_subject_resolutions(agent_id, subject_entity_id);
             CREATE INDEX idx_kg_resolutions_agent_dom ON kg_subject_resolutions(agent_id, domain_entity_id);
 
-            -- KG subject-to-subject edges / fact triples (per-agent)
+            -- KG subject-to-subject edges / fact triples (shared by docs_root_hash — v27)
             CREATE TABLE kg_subject_relationships (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                docs_root_hash TEXT NOT NULL,
+                docs_root TEXT NOT NULL,
                 from_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
                 to_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
                 type TEXT NOT NULL,
@@ -1337,43 +1359,46 @@ impl Database {
                 properties_json TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 trace_id TEXT,
-                UNIQUE (agent_id, from_entity_id, to_entity_id, type)
+                UNIQUE (docs_root_hash, from_entity_id, to_entity_id, type)
             );
-            CREATE INDEX idx_kg_subj_rel_from ON kg_subject_relationships(agent_id, from_entity_id, type);
-            CREATE INDEX idx_kg_subj_rel_to ON kg_subject_relationships(agent_id, to_entity_id, type);
-            CREATE INDEX idx_kg_subj_rel_type ON kg_subject_relationships(agent_id, type);
+            CREATE INDEX idx_kg_subj_rel_from ON kg_subject_relationships(docs_root_hash, from_entity_id, type);
+            CREATE INDEX idx_kg_subj_rel_to ON kg_subject_relationships(docs_root_hash, to_entity_id, type);
+            CREATE INDEX idx_kg_subj_rel_type ON kg_subject_relationships(docs_root_hash, type);
 
-            -- KG entity provenance: chunk -> subject entity (many-to-many)
+            -- KG entity provenance: chunk -> subject entity (shared by docs_root_hash — v27)
             CREATE TABLE kg_chunk_subjects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                docs_root_hash TEXT NOT NULL,
+                docs_root TEXT NOT NULL,
                 chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
                 subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
                 extraction_trace_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                UNIQUE (agent_id, chunk_id, subject_entity_id)
+                UNIQUE (docs_root_hash, chunk_id, subject_entity_id)
             );
-            CREATE INDEX idx_kg_cs_chunk ON kg_chunk_subjects(agent_id, chunk_id);
-            CREATE INDEX idx_kg_cs_entity ON kg_chunk_subjects(agent_id, subject_entity_id);
-            CREATE INDEX idx_kg_cs_trace ON kg_chunk_subjects(agent_id, extraction_trace_id);
+            CREATE INDEX idx_kg_cs_chunk ON kg_chunk_subjects(docs_root_hash, chunk_id);
+            CREATE INDEX idx_kg_cs_entity ON kg_chunk_subjects(docs_root_hash, subject_entity_id);
+            CREATE INDEX idx_kg_cs_trace ON kg_chunk_subjects(docs_root_hash, extraction_trace_id);
 
-            -- KG relationship provenance: chunk -> subject relationship (many-to-many)
+            -- KG relationship provenance: chunk -> subject relationship (shared by docs_root_hash — v27)
             CREATE TABLE kg_chunk_subject_relationships (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                docs_root_hash TEXT NOT NULL,
+                docs_root TEXT NOT NULL,
                 chunk_id INTEGER NOT NULL REFERENCES kg_chunks(id) ON DELETE CASCADE,
                 subject_relationship_id INTEGER NOT NULL REFERENCES kg_subject_relationships(id) ON DELETE CASCADE,
                 extraction_trace_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                UNIQUE (agent_id, chunk_id, subject_relationship_id)
+                UNIQUE (docs_root_hash, chunk_id, subject_relationship_id)
             );
-            CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(agent_id, chunk_id);
-            CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(agent_id, subject_relationship_id);
+            CREATE INDEX idx_kg_csr_chunk ON kg_chunk_subject_relationships(docs_root_hash, chunk_id);
+            CREATE INDEX idx_kg_csr_rel ON kg_chunk_subject_relationships(docs_root_hash, subject_relationship_id);
 
-            -- KG extraction tracking (source_doc_hash added in v26 — #757)
+            -- KG extraction tracking (shared by docs_root_hash — v27; first-writer-wins)
             CREATE TABLE kg_extractions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                docs_root_hash TEXT NOT NULL,
+                docs_root TEXT NOT NULL,
                 source_doc_path TEXT NOT NULL,
                 source_doc_hash TEXT,
                 extraction_model TEXT NOT NULL,
@@ -1381,9 +1406,9 @@ impl Database {
                 relationships_extracted INTEGER NOT NULL DEFAULT 0,
                 extraction_trace_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                UNIQUE (agent_id, source_doc_path)
+                UNIQUE (docs_root_hash, source_doc_path)
             );
-            CREATE INDEX idx_kg_extractions_agent ON kg_extractions(agent_id);
+            CREATE INDEX idx_kg_extractions_drh ON kg_extractions(docs_root_hash);
 
             -- KG resolution tracking
             CREATE TABLE kg_resolutions_log (
@@ -3014,6 +3039,23 @@ impl Database {
                      value TEXT NOT NULL
                  );
 
+                 -- Drop v25/v26 indexes that will be recreated (SQLite keeps
+                 -- index names across ALTER TABLE RENAME, so they'd conflict).
+                 DROP INDEX IF EXISTS idx_kg_chunks_agent_doc;
+                 DROP INDEX IF EXISTS idx_kg_subj_entities_agent_type;
+                 DROP INDEX IF EXISTS idx_kg_subj_rel_from;
+                 DROP INDEX IF EXISTS idx_kg_subj_rel_to;
+                 DROP INDEX IF EXISTS idx_kg_subj_rel_type;
+                 DROP INDEX IF EXISTS idx_kg_cs_chunk;
+                 DROP INDEX IF EXISTS idx_kg_cs_entity;
+                 DROP INDEX IF EXISTS idx_kg_cs_trace;
+                 DROP INDEX IF EXISTS idx_kg_csr_chunk;
+                 DROP INDEX IF EXISTS idx_kg_csr_rel;
+                 DROP INDEX IF EXISTS idx_kg_extractions_agent;
+                 DROP INDEX IF EXISTS idx_kg_resolutions_agent_subj;
+                 DROP INDEX IF EXISTS idx_kg_resolutions_agent_dom;
+                 DROP INDEX IF EXISTS idx_kg_res_log_pending;
+
                  -- 1. kg_chunks: rename to backup, create v27 table.
                  ALTER TABLE kg_chunks RENAME TO kg_chunks_v26_backup;
                  CREATE TABLE kg_chunks (
@@ -3114,6 +3156,42 @@ impl Database {
                  );
                  CREATE INDEX idx_kg_extractions_drh ON kg_extractions(docs_root_hash);
 
+                 -- 7. kg_subject_resolutions: rebuild to fix FK refs broken by
+                 -- kg_subject_entities rename (SQLite rewrites FK targets on
+                 -- ALTER TABLE RENAME).
+                 ALTER TABLE kg_subject_resolutions RENAME TO kg_subject_resolutions_v26_backup;
+                 CREATE TABLE kg_subject_resolutions (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                     domain_entity_id INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+                     confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     trace_id TEXT,
+                     UNIQUE (agent_id, subject_entity_id, domain_entity_id)
+                 );
+                 CREATE INDEX idx_kg_resolutions_agent_subj ON kg_subject_resolutions(agent_id, subject_entity_id);
+                 CREATE INDEX idx_kg_resolutions_agent_dom ON kg_subject_resolutions(agent_id, domain_entity_id);
+
+                 -- 8. kg_resolutions_log: rebuild to fix FK refs broken by
+                 -- kg_subject_entities rename.
+                 ALTER TABLE kg_resolutions_log RENAME TO kg_resolutions_log_v26_backup;
+                 CREATE TABLE kg_resolutions_log (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                     outcome TEXT NOT NULL CHECK (outcome IN (
+                         'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
+                     )),
+                     resolution_trace_id TEXT NOT NULL,
+                     source_extraction_trace_id TEXT,
+                     model TEXT,
+                     duration_ms INTEGER,
+                     resolved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     UNIQUE (agent_id, subject_entity_id)
+                 );
+                 CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
+
                  -- TODO(#787): coalesce rows from *_v26_backup tables into v27 tables
                  -- via majority-vote by (docs_root_hash, source_doc_path, entity_key).
                  -- Preserve paid LLM output. Then DROP TABLE *_v26_backup tables.
@@ -3127,6 +3205,53 @@ impl Database {
                  PRAGMA foreign_keys = ON;",
             )
             .context("failed to migrate v26 -> v27 (docs_root_hash shared-corpus)")?;
+
+        Ok(())
+    }
+
+    /// v27 startup guard: refuse to open the database if the coalesce step
+    /// from #787 has not run. Pins to `schema_version == 27` — future v28
+    /// should carry its own guard, not inherit v27's.
+    fn check_v27_coalesce_guard(&self) -> Result<()> {
+        let schema_version = self.schema_version()?;
+        if schema_version != 27 {
+            return Ok(());
+        }
+
+        // Check for schema_meta table existence first (fresh installs have it).
+        let has_meta: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_meta'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !has_meta {
+            anyhow::bail!(
+                "KG v27 migration incomplete — coalesce step from mika#787 has not run. \
+                 Deploy #787 before starting. See mika#786 and mika#787."
+            );
+        }
+
+        let has_marker: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_meta WHERE key = 'v27_coalesce_complete'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !has_marker {
+            anyhow::bail!(
+                "KG v27 migration incomplete — coalesce step from mika#787 has not run. \
+                 Deploy #787 before starting. See mika#786 and mika#787."
+            );
+        }
 
         Ok(())
     }
@@ -10845,10 +10970,12 @@ mod tests {
         let mut snapshots = Vec::new();
         for name in table_names {
             // Skip virtual tables (fts_search, vec_search) — they don't support PRAGMA introspection
+            // Skip v26 backup tables left by migrate_v26_to_v27 (pending #787 coalesce)
             if name == "fts_search"
                 || name == "vec_search"
                 || name.starts_with("fts_search_")
                 || name.starts_with("vec_search_")
+                || name.ends_with("_v26_backup")
             {
                 continue;
             }
@@ -10980,8 +11107,8 @@ mod tests {
             "idx_kg_entities_type",
             "idx_kg_rel_from",
             "idx_kg_rel_to",
-            "idx_kg_chunks_agent_doc",
-            "idx_kg_subj_entities_agent_type",
+            "idx_kg_chunks_docs_root_hash_doc",
+            "idx_kg_subj_entities_drh_type",
             "idx_kg_resolutions_agent_subj",
             "idx_kg_resolutions_agent_dom",
             "idx_kg_subj_rel_from",
@@ -10992,7 +11119,7 @@ mod tests {
             "idx_kg_cs_trace",
             "idx_kg_csr_chunk",
             "idx_kg_csr_rel",
-            "idx_kg_extractions_agent",
+            "idx_kg_extractions_drh",
             "idx_kg_res_log_pending",
         ];
         for idx in expected_indexes {
@@ -11027,16 +11154,16 @@ mod tests {
         let db = db();
         db.conn
             .execute(
-                "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence) \
-                 VALUES ('mika', 'failure_mode:oom', 'failure_mode', 'oom', 0.85)",
+                "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+                 VALUES ('0000000000000000', '/test', 'failure_mode:oom', 'failure_mode', 'oom', 0.85)",
                 [],
             )
             .expect("valid confidence should insert");
 
         // Confidence > 1.0 should fail
         let result = db.conn.execute(
-            "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence) \
-             VALUES ('mika', 'failure_mode:crash', 'failure_mode', 'crash', 1.5)",
+            "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+             VALUES ('0000000000000000', '/test', 'failure_mode:crash', 'failure_mode', 'crash', 1.5)",
             [],
         );
         assert!(
@@ -11046,8 +11173,8 @@ mod tests {
 
         // Confidence < 0.0 should fail
         let result = db.conn.execute(
-            "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence) \
-             VALUES ('mika', 'failure_mode:hang', 'failure_mode', 'hang', -0.1)",
+            "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+             VALUES ('0000000000000000', '/test', 'failure_mode:hang', 'failure_mode', 'hang', -0.1)",
             [],
         );
         assert!(
@@ -11064,8 +11191,8 @@ mod tests {
 
         db.conn
             .execute(
-                "INSERT INTO kg_chunks (agent_id, seq_id, source_doc_path, source_doc_hash) \
-                 VALUES ('mika', 0, 'docs/test.md', 'abc123hash')",
+                "INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash) \
+                 VALUES ('0000000000000000', '/test', 0, 'docs/test.md', 'abc123hash')",
                 [],
             )
             .unwrap();
@@ -11073,14 +11200,14 @@ mod tests {
         let count: i64 = db
             .conn
             .query_row(
-                "SELECT count(*) FROM kg_chunks WHERE agent_id = 'mika'",
+                "SELECT count(*) FROM kg_chunks WHERE docs_root_hash = '0000000000000000'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(count, 1);
 
-        // Delete the agent — chunks should cascade
+        // Delete the agent — v27 shared-layer chunks should NOT cascade
         db.conn
             .execute("DELETE FROM agents WHERE id = 'mika'", [])
             .unwrap();
@@ -11089,7 +11216,10 @@ mod tests {
             .conn
             .query_row("SELECT count(*) FROM kg_chunks", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 0, "kg_chunks should cascade-delete with agent");
+        assert_eq!(
+            count, 1,
+            "kg_chunks should persist after agent deletion (v27 shared-layer)"
+        );
     }
 
     #[test]
@@ -11181,8 +11311,8 @@ mod tests {
         let db1 = Database::open_in_memory().unwrap();
         let snap1 = snapshot_schema(&db1.conn);
 
-        // DB2: simulate a v24 DB, then migrate incrementally through v25 and
-        // v26 (#757). Strategy: create a fresh DB, extract all non-KG DDL from
+        // DB2: simulate a v24 DB, then migrate incrementally through v25,
+        // v26 (#757), and v27 (#786). Strategy: create a fresh DB, extract all non-KG DDL from
         // sqlite_master, replay it on a new connection to get a v24 DB, then
         // run migrate_v24_to_v25 and migrate_v25_to_v26 and compare schemas.
         let fresh = Database::open_in_memory().unwrap();
@@ -11201,7 +11331,7 @@ mod tests {
         let conn2 = rusqlite::Connection::open_in_memory().unwrap();
         conn2.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        // Replay all DDL except KG tables, virtual tables, and views
+        // Replay all DDL except KG tables, virtual tables, views, and schema_meta
         conn2.execute_batch("BEGIN;").unwrap();
         for ddl in &ddl_stmts {
             let lower = ddl.to_lowercase();
@@ -11213,6 +11343,7 @@ mod tests {
                 || lower.contains("kg_extractions")
                 || lower.contains("kg_resolutions_log")
                 || lower.contains("idx_kg_")
+                || lower.contains("schema_meta")
             {
                 continue;
             }
@@ -11264,10 +11395,21 @@ mod tests {
             "kg_entities should not exist at v24"
         );
 
-        // Run incremental migrations: v24 -> v25 -> v26
+        // Run incremental migrations: v24 -> v25 -> v26 -> v27
         let db2 = Database { conn: conn2 };
         db2.migrate_v24_to_v25().unwrap();
         db2.migrate_v25_to_v26().unwrap();
+        db2.migrate_v26_to_v27().unwrap();
+
+        // Insert the v27 coalesce marker so check_v27_coalesce_guard() passes.
+        // In production this is written by the #787 coalesce step; in tests we
+        // short-circuit it so the convergence comparison can proceed.
+        db2.conn
+            .execute(
+                "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('v27_coalesce_complete', '1')",
+                [],
+            )
+            .unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -11278,11 +11420,17 @@ mod tests {
             "DB2 should be at CURRENT_SCHEMA_VERSION after incremental migrations"
         );
 
-        // #757: kg_extractions.source_doc_hash must exist after v26 migration.
+        // #757: kg_extractions.source_doc_hash must exist after v27 migration.
         assert!(
             db2.column_exists("kg_extractions", "source_doc_hash")
                 .unwrap(),
-            "kg_extractions.source_doc_hash should exist after v26 migration"
+            "kg_extractions.source_doc_hash should exist after v27 migration"
+        );
+
+        // #786: kg_chunks.docs_root_hash must exist after v27 migration.
+        assert!(
+            db2.column_exists("kg_chunks", "docs_root_hash").unwrap(),
+            "kg_chunks.docs_root_hash should exist after v27 migration"
         );
 
         let snap2 = snapshot_schema(&db2.conn);
@@ -11323,28 +11471,28 @@ mod tests {
         let db = db();
         db.conn
             .execute(
-                "INSERT INTO kg_chunks (agent_id, seq_id, source_doc_path, source_doc_hash) \
-                 VALUES ('mika', 0, 'docs/test.md', 'hash1')",
+                "INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash) \
+                 VALUES ('0000000000000000', '/test', 0, 'docs/test.md', 'hash1')",
                 [],
             )
             .unwrap();
 
-        // Duplicate (agent_id, source_doc_path, seq_id) should fail
+        // Duplicate (docs_root_hash, source_doc_path, seq_id) should fail
         let result = db.conn.execute(
-            "INSERT INTO kg_chunks (agent_id, seq_id, source_doc_path, source_doc_hash) \
-             VALUES ('mika', 0, 'docs/test.md', 'hash2')",
+            "INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash) \
+             VALUES ('0000000000000000', '/test', 0, 'docs/test.md', 'hash2')",
             [],
         );
         assert!(
             result.is_err(),
-            "duplicate (agent_id, source_doc_path, seq_id) should violate UNIQUE constraint"
+            "duplicate (docs_root_hash, source_doc_path, seq_id) should violate UNIQUE constraint"
         );
 
         // Different seq_id should succeed
         db.conn
             .execute(
-                "INSERT INTO kg_chunks (agent_id, seq_id, source_doc_path, source_doc_hash) \
-                 VALUES ('mika', 1, 'docs/test.md', 'hash1')",
+                "INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash) \
+                 VALUES ('0000000000000000', '/test', 1, 'docs/test.md', 'hash1')",
                 [],
             )
             .expect("different seq_id should be allowed");
@@ -11355,21 +11503,21 @@ mod tests {
         let db = db();
         db.conn
             .execute(
-                "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence) \
-                 VALUES ('mika', 'failure_mode:oom', 'failure_mode', 'oom', 0.9)",
+                "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+                 VALUES ('0000000000000000', '/test', 'failure_mode:oom', 'failure_mode', 'oom', 0.9)",
                 [],
             )
             .unwrap();
 
-        // Duplicate (agent_id, entity_key) should fail
+        // Duplicate (docs_root_hash, entity_key) should fail
         let result = db.conn.execute(
-            "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence) \
-             VALUES ('mika', 'failure_mode:oom', 'failure_mode', 'oom', 0.8)",
+            "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+             VALUES ('0000000000000000', '/test', 'failure_mode:oom', 'failure_mode', 'oom', 0.8)",
             [],
         );
         assert!(
             result.is_err(),
-            "duplicate (agent_id, entity_key) should violate UNIQUE constraint"
+            "duplicate (docs_root_hash, entity_key) should violate UNIQUE constraint"
         );
     }
 }

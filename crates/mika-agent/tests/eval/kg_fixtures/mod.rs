@@ -22,7 +22,14 @@ use mika_agent::db::Database;
 
 /// Current schema version this fixture module is pinned to.
 /// Bump this when updating fixtures for a new schema version.
-const PINNED_SCHEMA_VERSION: i32 = 26;
+const PINNED_SCHEMA_VERSION: i32 = 27;
+
+/// Default docs_root_hash for test fixtures. 16 hex chars matching the
+/// `hash_docs_root` format. Used by seed_* helpers for shared-layer tables.
+pub const TEST_DOCS_ROOT_HASH: &str = "0000000000000000";
+
+/// Default docs_root display string for test fixtures.
+pub const TEST_DOCS_ROOT: &str = "/test/docs/solutions";
 
 // ---------------------------------------------------------------------------
 // Test DB Factory
@@ -135,9 +142,10 @@ pub struct SubjectEntitySpec {
 
 /// Seed a subject entity into `kg_subject_entities`. Returns the inserted row ID.
 ///
-/// Agent ID is taken from `db.agent_id`.
+/// Uses `TEST_DOCS_ROOT_HASH` and `TEST_DOCS_ROOT` for shared-layer scoping (v27).
 pub async fn seed_subject_entity(db: &AsyncDatabase, spec: &SubjectEntitySpec) -> i64 {
-    let agent_id = db.agent_id.clone();
+    let docs_root_hash = TEST_DOCS_ROOT_HASH.to_string();
+    let docs_root = TEST_DOCS_ROOT.to_string();
     let entity_key = format!("{}:{}", spec.entity_type, spec.name);
     let etype = spec.entity_type.to_string();
     let name = spec.name.to_string();
@@ -146,10 +154,11 @@ pub async fn seed_subject_entity(db: &AsyncDatabase, spec: &SubjectEntitySpec) -
 
     db.with_db(move |db| {
         db.execute_sql(
-            "INSERT INTO kg_subject_entities (agent_id, entity_key, type, name, confidence, properties_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence, properties_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &docs_root_hash as &dyn rusqlite::types::ToSql,
+                &docs_root,
                 &entity_key,
                 &etype,
                 &name,
@@ -180,9 +189,12 @@ pub struct ChunkSpec {
 /// depends on `fts_search` being populated; a raw insert into `search_content`
 /// silently breaks Path C tests.
 ///
-/// Agent ID is taken from `db.agent_id`.
+/// Uses `TEST_DOCS_ROOT_HASH` and `TEST_DOCS_ROOT` for shared-layer scoping (v27).
+/// Agent ID from `db.agent_id` is still used for `index_content` (search_content table).
 pub async fn seed_chunk(db: &AsyncDatabase, spec: &ChunkSpec) -> i64 {
     let agent_id = db.agent_id.clone();
+    let docs_root_hash = TEST_DOCS_ROOT_HASH.to_string();
+    let docs_root = TEST_DOCS_ROOT.to_string();
     let seq_id = spec.seq_id;
     let source_doc_path = spec.source_doc_path.to_string();
     let source_doc_hash = spec.source_doc_hash.to_string();
@@ -190,10 +202,11 @@ pub async fn seed_chunk(db: &AsyncDatabase, spec: &ChunkSpec) -> i64 {
 
     db.with_db(move |db| {
         db.execute_sql(
-            "INSERT INTO kg_chunks (agent_id, seq_id, source_doc_path, source_doc_hash) \
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO kg_chunks (docs_root_hash, docs_root, seq_id, source_doc_path, source_doc_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &docs_root_hash as &dyn rusqlite::types::ToSql,
+                &docs_root,
                 &seq_id,
                 &source_doc_path,
                 &source_doc_hash,
@@ -203,6 +216,7 @@ pub async fn seed_chunk(db: &AsyncDatabase, spec: &ChunkSpec) -> i64 {
 
         // Index via the canonical path: updates search_content + fts_search
         // (and vec_search via index_embedding when embeddings are available).
+        // search_content still uses agent_id for its own scoping.
         db.index_content(
             &agent_id,
             mika_agent::db::kg_schema::KG_CHUNK_SOURCE_TYPE,
@@ -218,14 +232,16 @@ pub async fn seed_chunk(db: &AsyncDatabase, spec: &ChunkSpec) -> i64 {
 
 /// Link a chunk to a subject entity via `kg_chunk_subjects`. Returns the row ID.
 pub async fn seed_chunk_subject(db: &AsyncDatabase, chunk_id: i64, subject_entity_id: i64) -> i64 {
-    let agent_id = db.agent_id.clone();
+    let docs_root_hash = TEST_DOCS_ROOT_HASH.to_string();
+    let docs_root = TEST_DOCS_ROOT.to_string();
 
     db.with_db(move |db| {
         db.execute_sql(
-            "INSERT INTO kg_chunk_subjects (agent_id, chunk_id, subject_entity_id) \
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO kg_chunk_subjects (docs_root_hash, docs_root, chunk_id, subject_entity_id) \
+             VALUES (?1, ?2, ?3, ?4)",
             &[
-                &agent_id as &dyn rusqlite::types::ToSql,
+                &docs_root_hash as &dyn rusqlite::types::ToSql,
+                &docs_root,
                 &chunk_id,
                 &subject_entity_id,
             ],

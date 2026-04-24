@@ -40,6 +40,7 @@ async fn test_path_a_direct_domain_entity_match() {
             max_depth: Some(0),
         }),
         agent_id: None,
+        docs_root_hash: None,
         include_context: false,
         result_limit: None,
     };
@@ -105,6 +106,7 @@ async fn test_path_a_name_match_via_question() {
         question: Some("self-dev".to_string()),
         traversal: None,
         agent_id: None,
+        docs_root_hash: None,
         include_context: false,
         result_limit: None,
     };

@@ -763,6 +763,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     //   MIKA_KG_DOCS_ROOT env > kg_docs_root config > <CWD>/docs/solutions
     {
         let (docs_root, _source) = crate::kg::config::resolve_kg_docs_root(settings);
+        let docs_root_hash = crate::kg::config::hash_docs_root(&docs_root);
 
         // Empty-path guard (#738): distinguish misconfigured empty value from
         // genuinely missing directory so operators don't chase misleading logs.
@@ -967,6 +968,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 let llm = resolution_llm.clone();
                 let agent_name_clone = agent_name.clone();
                 let budget = kg_batch_budget;
+                let drh = docs_root_hash.clone();
 
                 let resolution_agent = agent_name_clone.clone();
                 let handle = tokio::spawn(async move {
@@ -974,7 +976,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
                     let resolver =
-                        crate::kg::entity_resolver::SubjectEntityResolver::new(db, llm, None);
+                        crate::kg::entity_resolver::SubjectEntityResolver::new(db, llm, drh, None);
                     match resolver.resolve_pending(budget).await {
                         Ok(stats) => {
                             if stats.matched_exact > 0 || stats.matched_llm > 0 || stats.errors > 0

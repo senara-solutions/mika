@@ -105,6 +105,7 @@ impl Tool for QueryKnowledgeGraphTool {
         };
 
         let agent_id = input["agent_id"].as_str().map(|s| s.to_string());
+        let docs_root_hash = input["docs_root_hash"].as_str().map(|s| s.to_string());
         let include_context = input["include_context"].as_bool().unwrap_or(false);
         let result_limit = input["result_limit"].as_u64().map(|l| l as usize);
 
@@ -112,6 +113,7 @@ impl Tool for QueryKnowledgeGraphTool {
             question,
             traversal,
             agent_id,
+            docs_root_hash,
             include_context,
             result_limit,
         };
