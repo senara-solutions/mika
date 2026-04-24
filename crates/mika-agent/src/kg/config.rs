@@ -123,12 +123,12 @@ mod tests {
         let (path, source) = resolve_kg_docs_root(&settings);
 
         assert_eq!(source, PathSource::CwdDefault);
-        // Path ends with docs/solutions regardless of CWD.
-        assert!(
-            path.ends_with("docs/solutions"),
-            "expected path ending with docs/solutions, got: {}",
-            path.display()
-        );
+        // Verify the full path is CWD-rooted, not just checking the suffix.
+        let expected = std::env::current_dir()
+            .unwrap()
+            .join("docs")
+            .join("solutions");
+        assert_eq!(path, expected);
     }
 
     #[test]
