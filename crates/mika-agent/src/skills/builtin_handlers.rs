@@ -1049,7 +1049,17 @@ fn classify_gh_error(stderr: &str, exit_code: Option<i32>) -> GhReadError {
         || lower.contains("no issues match")
     {
         GhReadError::NotFound(stderr.to_string())
-    } else if lower.contains("authentication") || lower.contains("401") || lower.contains("login") {
+    } else if lower.contains("authentication")
+        || lower.contains("401")
+        // 403/forbidden covers App permission gaps, fine-grained PAT scope
+        // mismatches, and "Resource not accessible by integration". Without
+        // this branch they were silently classified as NetworkError, causing
+        // skills to retry transiently when they should escalate.
+        || lower.contains("403")
+        || lower.contains("forbidden")
+        || lower.contains("resource not accessible")
+        || lower.contains("login")
+    {
         GhReadError::AuthFailed(stderr.to_string())
     } else if lower.contains("rate limit") || lower.contains("429") {
         GhReadError::RateLimited(stderr.to_string())
@@ -1101,6 +1111,18 @@ fn validate_gh_read_input(input: &serde_json::Value) -> Result<GhReadArgs, ToolO
         }
     };
 
+    // Reject flag-shaped repo values. Tokio Command argv passing forecloses
+    // shell injection, but `repo='--token=evil'` would smuggle a flag into
+    // the gh subcommand. Mirrors run_gh's anti-smuggling check.
+    if repo.starts_with('-') {
+        return Err(ToolOutput::error(
+            GhReadError::MalformedRequest(format!(
+                "'repo' value '{repo}' looks like a flag (starts with '-'). Expected format: owner/repo."
+            ))
+            .to_json(),
+        ));
+    }
+
     let target = input
         .get("target")
         .and_then(|v| v.as_str())
@@ -1116,6 +1138,30 @@ fn validate_gh_read_input(input: &serde_json::Value) -> Result<GhReadArgs, ToolO
             ))
             .to_json(),
         ));
+    }
+
+    // For ops that take a numeric target, require all-digit values. Without
+    // this, `target='--web'` would invoke `gh issue view --web` (the issue
+    // view's web flag), bypassing the JSON-output contract.
+    if let Some(ref t) = target {
+        if t.starts_with('-') {
+            return Err(ToolOutput::error(
+                GhReadError::MalformedRequest(format!(
+                    "'target' value '{t}' looks like a flag (starts with '-')."
+                ))
+                .to_json(),
+            ));
+        }
+        if matches!(op.as_str(), "issue_view" | "pr_view" | "pr_diff")
+            && !t.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(ToolOutput::error(
+                GhReadError::MalformedRequest(format!(
+                    "Operation '{op}' requires a numeric 'target' (issue/PR number); got '{t}'."
+                ))
+                .to_json(),
+            ));
+        }
     }
 
     Ok(GhReadArgs { op, target, repo })
@@ -1200,6 +1246,15 @@ async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
     let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
     let latency_ms = start.elapsed().as_millis();
 
+    // Compute is_err FIRST so the audit log reflects the content-prefix
+    // detection (the f6d6a252 fix). Without this, every non-zero exit
+    // logged status=ok because output.is_error stayed false. spawn_and_collect
+    // returns ToolOutput::success even on non-zero exits, formatting content
+    // as "Exit code: N\n{stderr}\n{stdout}".
+    let is_err = output.is_error
+        || output.content.starts_with("Exit code:")
+        || output.content.starts_with("Killed by signal:");
+
     // Audit log
     tracing::info!(
         event = "gh_read_invocation",
@@ -1207,18 +1262,11 @@ async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
         resource = args.target.as_deref().unwrap_or(""),
         repo = %args.repo,
         latency_ms = latency_ms,
-        status = if output.is_error { "error" } else { "ok" },
+        status = if is_err { "error" } else { "ok" },
         "gh_read invocation"
     );
 
-    // spawn_and_collect returns ToolOutput::success even for non-zero exits,
-    // formatting the content as "Exit code: N\n{stderr}\n{stdout}". Detect
-    // non-zero exits via the content prefix (same heuristic used by the agent
-    // loop's non_zero_exit detection).
-    if output.is_error
-        || output.content.starts_with("Exit code:")
-        || output.content.starts_with("Killed by signal:")
-    {
+    if is_err {
         let err = classify_gh_error(&output.content, None);
         ToolOutput::error(err.to_json())
     } else {
@@ -4002,6 +4050,59 @@ mod tests {
     fn test_classify_gh_error_network_error_unknown() {
         let err = classify_gh_error("some unexpected error", Some(1));
         assert!(matches!(err, GhReadError::NetworkError(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_403_forbidden() {
+        // App permission gap or fine-grained PAT scope mismatch.
+        let err = classify_gh_error("HTTP 403: Forbidden", Some(1));
+        assert!(
+            matches!(err, GhReadError::AuthFailed(_)),
+            "403 must classify as AuthFailed (was NetworkError before fix)"
+        );
+    }
+
+    #[test]
+    fn test_classify_gh_error_resource_not_accessible() {
+        // GitHub App installation missing the required permission.
+        let err = classify_gh_error("Resource not accessible by integration", Some(1));
+        assert!(matches!(err, GhReadError::AuthFailed(_)));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_rejects_flag_shaped_target() {
+        let input = serde_json::json!({"op": "issue_view", "target": "--web", "repo": "o/r"});
+        let err = validate_gh_read_input(&input).expect_err("flag-shaped target must reject");
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_rejects_flag_shaped_repo() {
+        let input = serde_json::json!({"op": "issue_view", "target": "42", "repo": "--token=evil"});
+        let err = validate_gh_read_input(&input).expect_err("flag-shaped repo must reject");
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_rejects_non_numeric_target_for_view_ops() {
+        let input = serde_json::json!({"op": "pr_view", "target": "not-a-number", "repo": "o/r"});
+        let err = validate_gh_read_input(&input).expect_err("non-numeric target must reject");
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_allows_non_numeric_target_for_issue_list() {
+        // issue_list accepts label or milestone-name targets — these are not
+        // required to be numeric.
+        let input = serde_json::json!({"op": "issue_list", "target": "bug", "repo": "o/r"});
+        let result = validate_gh_read_input(&input);
+        assert!(
+            result.is_ok(),
+            "issue_list with label target must be allowed"
+        );
     }
 
     #[test]
