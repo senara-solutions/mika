@@ -217,17 +217,15 @@ pub async fn query_knowledge_graph(
         .min(MAX_RESULT_ENTITIES);
 
     let agent_id = input.agent_id.as_deref();
-    // Effective docs_root_hash: prefer multi-corpus list, fall back to singular.
-    // For internal use, we keep the Option<&str> API for back-compat with all
-    // the existing query functions. Multi-corpus IN-list support is the next step.
-    let docs_root_hash = if !input.docs_root_hashes.is_empty() {
-        // For now, the query functions accept Option<&str>. When multi-corpus
-        // is fully wired, they'll accept &[String]. First corpus is used for
-        // back-compat with single-corpus callers while the IN-list migration
-        // proceeds incrementally.
-        input.docs_root_hashes.first().map(|s| s.as_str())
+    // Effective docs_root_hashes: prefer multi-corpus list, fall back to singular,
+    // else empty (no filter). Internal functions accept &[String] — empty slice
+    // means "no corpus filter" (equivalent to the old `None`).
+    let effective_hashes: Vec<String> = if !input.docs_root_hashes.is_empty() {
+        input.docs_root_hashes.clone()
+    } else if let Some(ref h) = input.docs_root_hash {
+        vec![h.clone()]
     } else {
-        input.docs_root_hash.as_deref()
+        vec![]
     };
 
     // Phase 1: Find starting entities
@@ -240,7 +238,7 @@ pub async fn query_knowledge_graph(
             .as_ref()
             .unwrap()
             .trim();
-        let entities = find_by_entity_key(db, start_key, docs_root_hash).await?;
+        let entities = find_by_entity_key(db, start_key, &effective_hashes).await?;
         let method = if entities.is_empty() {
             None
         } else {
@@ -249,7 +247,7 @@ pub async fn query_knowledge_graph(
         (entities, method)
     } else {
         let question = input.question.as_ref().unwrap().trim();
-        resolve_entry_paths(db, question, agent_id, docs_root_hash).await?
+        resolve_entry_paths(db, question, agent_id, &effective_hashes).await?
     };
 
     if starting_entities.is_empty() {
@@ -287,7 +285,7 @@ pub async fn query_knowledge_graph(
         &starting_entities,
         &follow_types,
         max_depth,
-        docs_root_hash,
+        &effective_hashes,
     )
     .await?;
 
@@ -316,7 +314,7 @@ pub async fn query_knowledge_graph(
 
     // Phase 6: Optionally include chunk context
     let chunks = if input.include_context {
-        collect_chunks(db, &ranked, docs_root_hash).await?
+        collect_chunks(db, &ranked, &effective_hashes).await?
     } else {
         vec![]
     };
@@ -335,10 +333,10 @@ pub async fn query_knowledge_graph(
 async fn find_by_entity_key(
     db: &AsyncDatabase,
     entity_key: &str,
-    docs_root_hash: Option<&str>,
+    docs_root_hashes: &[String],
 ) -> anyhow::Result<Vec<EntryEntity>> {
     let key = entity_key.to_owned();
-    let drh = docs_root_hash.map(|s| s.to_owned());
+    let hashes = docs_root_hashes.to_vec();
     let mut results = Vec::new();
 
     // Path A: domain entity exact match
@@ -376,28 +374,38 @@ async fn find_by_entity_key(
         });
     }
 
-    // Path B: subject entity exact match (if docs_root_hash provided)
-    if let Some(ref hash) = drh {
+    // Path B: subject entity exact match (if docs_root_hashes non-empty)
+    if !hashes.is_empty() {
         let key_b = key.clone();
-        let hash_b = hash.clone();
+        let hashes_b = hashes.clone();
         let subject_results: Vec<(i64, String, String, String, f64)> = db
             .with_db(move |db| {
                 let conn = &db.conn;
-                let mut stmt = conn.prepare(
+                let hash_placeholders: Vec<&str> = hashes_b.iter().map(|_| "?").collect();
+                let sql = format!(
                     "SELECT id, entity_key, name, type, confidence FROM kg_subject_entities \
-                     WHERE docs_root_hash = ?1 AND LOWER(entity_key) = LOWER(?2)",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![&hash_b, &key_b], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, f64>(4)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
+                     WHERE docs_root_hash IN ({}) AND LOWER(entity_key) = LOWER(?)",
+                    hash_placeholders.join(","),
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let mut param_idx = 1;
+                for h in &hashes_b {
+                    stmt.raw_bind_parameter(param_idx, h.as_str())?;
+                    param_idx += 1;
+                }
+                stmt.raw_bind_parameter(param_idx, key_b.as_str())?;
+
+                let mut rows = Vec::new();
+                let mut raw_rows = stmt.raw_query();
+                while let Some(row) = raw_rows.next()? {
+                    rows.push((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f64>(4)?,
+                    ));
+                }
                 Ok(rows)
             })
             .await?;
@@ -423,7 +431,7 @@ async fn resolve_entry_paths(
     db: &AsyncDatabase,
     question: &str,
     agent_id: Option<&str>,
-    docs_root_hash: Option<&str>,
+    docs_root_hashes: &[String],
 ) -> anyhow::Result<(Vec<EntryEntity>, Option<&'static str>)> {
     // Run paths A, B, C and merge
     let mut all_entries = Vec::new();
@@ -432,14 +440,14 @@ async fn resolve_entry_paths(
     let path_a = find_domain_entities_by_name(db, question).await?;
     all_entries.extend(path_a);
 
-    // Path B: Subject entity match (if docs_root_hash)
-    if let Some(drh) = docs_root_hash {
-        let path_b = find_subject_entities_by_name(db, question, drh).await?;
+    // Path B: Subject entity match (if docs_root_hashes non-empty)
+    if !docs_root_hashes.is_empty() {
+        let path_b = find_subject_entities_by_name(db, question, docs_root_hashes).await?;
         all_entries.extend(path_b);
     }
 
     // Path C: Semantic search via chunks -> chunk_subjects -> subject entities -> resolve
-    let path_c = find_entities_via_chunks(db, question, docs_root_hash, agent_id).await?;
+    let path_c = find_entities_via_chunks(db, question, docs_root_hashes, agent_id).await?;
     all_entries.extend(path_c);
 
     if all_entries.is_empty() {
@@ -530,32 +538,44 @@ async fn find_domain_entities_by_name(
 async fn find_subject_entities_by_name(
     db: &AsyncDatabase,
     question: &str,
-    docs_root_hash: &str,
+    docs_root_hashes: &[String],
 ) -> anyhow::Result<Vec<EntryEntity>> {
     let q = question.to_lowercase();
     let q_like = format!("%{q}%");
     let q_for_closure = q.clone();
-    let drh = docs_root_hash.to_owned();
+    let hashes = docs_root_hashes.to_vec();
 
     let rows: Vec<(i64, String, String, String, f64)> = db
         .with_db(move |db| {
             let conn = &db.conn;
-            let mut stmt = conn.prepare(
+            let hash_placeholders: Vec<&str> = hashes.iter().map(|_| "?").collect();
+            let sql = format!(
                 "SELECT id, entity_key, name, type, confidence FROM kg_subject_entities \
-                 WHERE docs_root_hash = ?1 AND (LOWER(name) LIKE ?2 OR LOWER(entity_key) = ?3) \
+                 WHERE docs_root_hash IN ({}) AND (LOWER(name) LIKE ? OR LOWER(entity_key) = ?) \
                  LIMIT 20",
-            )?;
-            let rows = stmt
-                .query_map(rusqlite::params![&drh, &q_like, &q_for_closure], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, f64>(4)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
+                hash_placeholders.join(","),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut param_idx = 1;
+            for h in &hashes {
+                stmt.raw_bind_parameter(param_idx, h.as_str())?;
+                param_idx += 1;
+            }
+            stmt.raw_bind_parameter(param_idx, q_like.as_str())?;
+            param_idx += 1;
+            stmt.raw_bind_parameter(param_idx, q_for_closure.as_str())?;
+
+            let mut rows = Vec::new();
+            let mut raw_rows = stmt.raw_query();
+            while let Some(row) = raw_rows.next()? {
+                rows.push((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
+                ));
+            }
             Ok(rows)
         })
         .await?;
@@ -585,7 +605,7 @@ async fn find_subject_entities_by_name(
 async fn find_entities_via_chunks(
     db: &AsyncDatabase,
     question: &str,
-    docs_root_hash: Option<&str>,
+    docs_root_hashes: &[String],
     agent_id: Option<&str>,
 ) -> anyhow::Result<Vec<EntryEntity>> {
     // Use hybrid search scoped to kg_chunk source type
@@ -606,7 +626,7 @@ async fn find_entities_via_chunks(
     }
 
     // Find subject entities linked to these chunks via kg_chunk_subjects
-    let drh = docs_root_hash.map(|s| s.to_owned());
+    let hashes = docs_root_hashes.to_vec();
     let chunk_scores: HashMap<i64, f64> = search_results
         .iter()
         .filter_map(|r| r.source_id.map(|id| (id, r.score)))
@@ -616,16 +636,17 @@ async fn find_entities_via_chunks(
         .with_db(move |db| {
             let conn = &db.conn;
             let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let hash_filter = if !hashes.is_empty() {
+                let hash_placeholders: Vec<&str> = hashes.iter().map(|_| "?").collect();
+                format!(" AND cs.docs_root_hash IN ({})", hash_placeholders.join(","))
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "SELECT DISTINCT se.id, se.entity_key, se.name, se.type, se.confidence, cs.chunk_id \
                  FROM kg_chunk_subjects cs \
                  JOIN kg_subject_entities se ON se.id = cs.subject_entity_id \
                  WHERE cs.chunk_id IN ({placeholders}){hash_filter}",
-                hash_filter = if drh.is_some() {
-                    " AND cs.docs_root_hash = ?"
-                } else {
-                    ""
-                },
             );
             let mut stmt = conn.prepare(&sql)?;
 
@@ -634,8 +655,9 @@ async fn find_entities_via_chunks(
                 stmt.raw_bind_parameter(param_idx, cid)?;
                 param_idx += 1;
             }
-            if let Some(ref h) = drh {
+            for h in &hashes {
                 stmt.raw_bind_parameter(param_idx, h.as_str())?;
+                param_idx += 1;
             }
 
             let mut rows = Vec::new();
@@ -736,7 +758,7 @@ async fn traverse_graph(
     starting: &[EntryEntity],
     follow_types: &[&str],
     max_depth: u32,
-    docs_root_hash: Option<&str>,
+    docs_root_hashes: &[String],
 ) -> anyhow::Result<(Vec<TraversedEntity>, Vec<TraversedEdge>)> {
     let mut all_entities: Vec<TraversedEntity> = Vec::new();
     let mut all_edges: Vec<TraversedEdge> = Vec::new();
@@ -775,8 +797,8 @@ async fn traverse_graph(
         all_edges.extend(edges);
     }
 
-    // Traverse subject layer edges (if docs_root_hash provided)
-    if let Some(drh) = docs_root_hash {
+    // Traverse subject layer edges (if docs_root_hashes non-empty)
+    if !docs_root_hashes.is_empty() {
         let subject_starts: Vec<(i64, f64)> = starting
             .iter()
             .filter(|e| e.layer == Layer::Subject)
@@ -784,8 +806,14 @@ async fn traverse_graph(
             .collect();
 
         if !subject_starts.is_empty() {
-            let (entities, edges) =
-                traverse_subject_layer(db, &subject_starts, follow_types, max_depth, drh).await?;
+            let (entities, edges) = traverse_subject_layer(
+                db,
+                &subject_starts,
+                follow_types,
+                max_depth,
+                docs_root_hashes,
+            )
+            .await?;
             for e in entities {
                 if seen_entity_ids.insert((Layer::Subject, e.entity_id)) {
                     all_entities.push(e);
@@ -929,24 +957,25 @@ async fn traverse_subject_layer(
     starts: &[(i64, f64)],
     follow_types: &[&str],
     max_depth: u32,
-    docs_root_hash: &str,
+    docs_root_hashes: &[String],
 ) -> anyhow::Result<(Vec<TraversedEntity>, Vec<TraversedEdge>)> {
     let start_ids: Vec<i64> = starts.iter().map(|(id, _)| *id).collect();
     let types: Vec<String> = follow_types.iter().map(|s| s.to_string()).collect();
     let depth = max_depth;
-    let drh = docs_root_hash.to_owned();
+    let hashes = docs_root_hashes.to_vec();
 
     db.with_db(move |db| {
         let conn = &db.conn;
 
         let id_placeholders: String = start_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let type_placeholders: String = types.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let hash_placeholders: String = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
-        // All parameters use positional ? — bind order: start_ids..., drh, depth, types..., drh
+        // All parameters use positional ? — bind order: start_ids..., hashes..., depth, types..., hashes...
         let sql = format!(
             "WITH RECURSIVE traverse(entity_id, hop, cumulative_conf, path) AS ( \
                 SELECT id, 0, confidence, CAST(id AS TEXT) \
-                FROM kg_subject_entities WHERE id IN ({id_placeholders}) AND docs_root_hash = ? \
+                FROM kg_subject_entities WHERE id IN ({id_placeholders}) AND docs_root_hash IN ({hash_placeholders}) \
               UNION ALL \
                 SELECT r.to_entity_id, t.hop + 1, t.cumulative_conf * r.confidence, \
                        t.path || ',' || CAST(r.to_entity_id AS TEXT) \
@@ -954,7 +983,7 @@ async fn traverse_subject_layer(
                 JOIN traverse t ON t.entity_id = r.from_entity_id \
                 WHERE t.hop < ? \
                   AND r.type IN ({type_placeholders}) \
-                  AND r.docs_root_hash = ? \
+                  AND r.docs_root_hash IN ({hash_placeholders}) \
                   AND INSTR(',' || t.path || ',', ',' || CAST(r.to_entity_id AS TEXT) || ',') = 0 \
             ) \
             SELECT DISTINCT t.entity_id, t.hop, t.cumulative_conf, \
@@ -972,15 +1001,20 @@ async fn traverse_subject_layer(
             stmt.raw_bind_parameter(param_idx, id)?;
             param_idx += 1;
         }
-        stmt.raw_bind_parameter(param_idx, drh.as_str())?;
-        param_idx += 1;
+        for h in &hashes {
+            stmt.raw_bind_parameter(param_idx, h.as_str())?;
+            param_idx += 1;
+        }
         stmt.raw_bind_parameter(param_idx, depth)?;
         param_idx += 1;
         for t in &types {
             stmt.raw_bind_parameter(param_idx, t.as_str())?;
             param_idx += 1;
         }
-        stmt.raw_bind_parameter(param_idx, drh.as_str())?;
+        for h in &hashes {
+            stmt.raw_bind_parameter(param_idx, h.as_str())?;
+            param_idx += 1;
+        }
 
         let mut entities = Vec::new();
         let mut raw_rows = stmt.raw_query();
@@ -1019,7 +1053,7 @@ async fn traverse_subject_layer(
              WHERE r.from_entity_id IN ({eid_placeholders}) \
                AND r.to_entity_id IN ({eid_placeholders}) \
                AND r.type IN ({type_placeholders}) \
-               AND r.docs_root_hash = ?"
+               AND r.docs_root_hash IN ({hash_placeholders})"
         );
 
         let mut stmt = conn.prepare(&edge_sql)?;
@@ -1036,7 +1070,10 @@ async fn traverse_subject_layer(
             stmt.raw_bind_parameter(param_idx, t.as_str())?;
             param_idx += 1;
         }
-        stmt.raw_bind_parameter(param_idx, drh.as_str())?;
+        for h in &hashes {
+            stmt.raw_bind_parameter(param_idx, h.as_str())?;
+            param_idx += 1;
+        }
 
         let mut edges = Vec::new();
         let mut raw_rows = stmt.raw_query();
@@ -1196,7 +1233,7 @@ async fn build_entries_with_edges(
 async fn collect_chunks(
     db: &AsyncDatabase,
     entities: &[TraversedEntity],
-    docs_root_hash: Option<&str>,
+    docs_root_hashes: &[String],
 ) -> anyhow::Result<Vec<KgChunkResult>> {
     // Find subject entity IDs in the result set
     let subject_entity_ids: Vec<i64> = entities
@@ -1209,7 +1246,7 @@ async fn collect_chunks(
         return Ok(vec![]);
     }
 
-    let drh = docs_root_hash.map(|s| s.to_owned());
+    let hashes = docs_root_hashes.to_vec();
 
     let chunks: Vec<KgChunkResult> = db
         .with_db(move |db| {
@@ -1220,6 +1257,13 @@ async fn collect_chunks(
                 .collect::<Vec<_>>()
                 .join(",");
 
+            let hash_filter = if !hashes.is_empty() {
+                let hash_placeholders: Vec<&str> = hashes.iter().map(|_| "?").collect();
+                format!(" AND cs.docs_root_hash IN ({})", hash_placeholders.join(","))
+            } else {
+                String::new()
+            };
+
             let sql = format!(
                 "SELECT DISTINCT c.id, c.source_doc_path, sc.content \
                  FROM kg_chunk_subjects cs \
@@ -1227,11 +1271,6 @@ async fn collect_chunks(
                  LEFT JOIN search_content sc ON sc.source_type = 'kg_chunk' AND sc.source_id = c.id \
                  WHERE cs.subject_entity_id IN ({placeholders}){hash_filter} \
                  LIMIT ?",
-                hash_filter = if drh.is_some() {
-                    " AND cs.docs_root_hash = ?"
-                } else {
-                    ""
-                },
             );
 
             let mut stmt = conn.prepare(&sql)?;
@@ -1240,7 +1279,7 @@ async fn collect_chunks(
                 stmt.raw_bind_parameter(param_idx, id)?;
                 param_idx += 1;
             }
-            if let Some(ref h) = drh {
+            for h in &hashes {
                 stmt.raw_bind_parameter(param_idx, h.as_str())?;
                 param_idx += 1;
             }

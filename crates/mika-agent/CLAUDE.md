@@ -265,7 +265,7 @@ docs_roots = [
 
 **b. Array order matters under budget pressure.** When `MIKA_KG_BATCH_BUDGET` is constrained, corpora are ingested in array order. If the budget is exhausted mid-array, remaining corpora are deferred to the next restart. Place the most important corpus first.
 
-**c. Resolution chain priority (six tiers, first match wins):**
+**c. Resolution chain priority (seven tiers, first match wins):**
 
 | Priority | Source | Field |
 |----------|--------|-------|
@@ -273,8 +273,9 @@ docs_roots = [
 | 2 | Per-agent identity.toml | `[kg].docs_root` (singular) |
 | 3 | Environment variable | `MIKA_KG_DOCS_ROOTS` (colon-separated) |
 | 4 | Environment variable | `MIKA_KG_DOCS_ROOT` |
-| 5 | Config file | `kg_docs_root` in config.toml |
-| 6 | CWD default | `<CWD>/docs/solutions` |
+| 5 | Config file | `kg_docs_roots` in config.toml (plural) |
+| 6 | Config file | `kg_docs_root` in config.toml |
+| 7 | CWD default | `<CWD>/docs/solutions` |
 
 ## Knowledge Graph — Subject Extractor
 
