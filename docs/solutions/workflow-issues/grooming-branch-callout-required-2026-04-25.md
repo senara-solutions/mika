@@ -101,6 +101,6 @@ This is one instance of a broader pattern: **commands that read issue state to m
 ## Related
 
 - `mika-platform/.claude/commands/mika.md` — the meta-repo /mika command with the branch-derivation priority order.
-- `mika/docs/solutions/workflow-issues/ambient-webhook-mistaken-for-dispatch-2026-04-25.md` — sibling workflow lesson from the same day; both touch /mika dispatch-time correctness.
+- `mika/docs/solutions/workflow-issues/comment-event-fires-autonomous-dispatch-2026-04-25.md` — sibling workflow lesson from the same day documenting how comments on open issues fire autonomous claude-pilot dispatch. Today's autonomous dispatch on mika#814 honored the canonical branch callout established in this doc — the worktree came up on the right branch without re-derivation, validating the pattern under autonomous conditions.
 - `feedback_secondary_pr_plan_doc.md` (memory) — related operational rule about always committing plan docs before pushing secondary cross-repo PRs.
 - senara-solutions/mika-platform#51 — mika-arch v1 parent issue. Follows this convention; provided the test case for verifying the body callout approach lands cleanly.
