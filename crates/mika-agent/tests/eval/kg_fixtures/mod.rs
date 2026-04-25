@@ -22,7 +22,7 @@ use mika_agent::db::Database;
 
 /// Current schema version this fixture module is pinned to.
 /// Bump this when updating fixtures for a new schema version.
-const PINNED_SCHEMA_VERSION: i32 = 27;
+const PINNED_SCHEMA_VERSION: i32 = 28;
 
 /// Default docs_root_hash for test fixtures. 16 hex chars matching the
 /// `hash_docs_root` format. Used by seed_* helpers for shared-layer tables.
@@ -48,6 +48,9 @@ pub fn test_db_with_agent(agent_id: &str) -> AsyncDatabase {
     let db = Database::open_in_memory().unwrap();
     // Register agent first (sessions FK to agents)
     db.register_agent(agent_id, agent_id, &format!("/tmp/mika-test/{agent_id}"))
+        .unwrap();
+    // Seed default corpus mapping so query fan-out finds this agent's KG data.
+    db.register_agent_corpus(agent_id, TEST_DOCS_ROOT_HASH, TEST_DOCS_ROOT)
         .unwrap();
     db.create_session("eval-kg-session", agent_id, "test")
         .unwrap();
@@ -76,6 +79,22 @@ pub async fn assert_schema_version(db: &AsyncDatabase) {
 // ---------------------------------------------------------------------------
 // Seed Helpers
 // ---------------------------------------------------------------------------
+
+/// Seed an agent-corpus mapping into `agent_kg_corpora`. Idempotent.
+pub async fn seed_agent_corpus(
+    db: &AsyncDatabase,
+    agent_id: &str,
+    docs_root_hash: &str,
+    docs_root_path: &str,
+) {
+    let agent_id = agent_id.to_string();
+    let hash = docs_root_hash.to_string();
+    let path = docs_root_path.to_string();
+
+    db.with_db(move |db| db.register_agent_corpus(&agent_id, &hash, &path))
+        .await
+        .unwrap();
+}
 
 /// Specification for a domain entity seed.
 pub struct DomainEntitySpec {

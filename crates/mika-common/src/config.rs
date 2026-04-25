@@ -411,6 +411,13 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Absolute path to docs root for KG lexical ingestion. Defaults to <CWD>/docs/solutions when unset. Needed on hosts where the service CWD != repo root (e.g., OpenRC).",
     },
+    ConfigKeyInfo {
+        key: "kg_docs_roots",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_KG_DOCS_ROOTS"),
+        secret: false,
+        description: "Colon-separated list of absolute paths to docs root directories for multi-corpus agents. Global fallback; per-agent identity.toml [kg].docs_roots takes precedence. Linux/macOS only.",
+    },
     // ReadOnly (runtime-computed)
     ConfigKeyInfo {
         key: "home_dir",
@@ -538,6 +545,13 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
             .kg_docs_root
             .as_ref()
             .map(|p| p.display().to_string()),
+        "kg_docs_roots" => settings.kg_docs_roots.as_ref().map(|paths| {
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":")
+        }),
         // DB keys (timezone, thinking_level) not available from Settings
         _ => None,
     }
@@ -794,6 +808,13 @@ pub struct Settings {
     /// `supervise-daemon` launches with CWD=`/`).
     #[serde(default)]
     pub kg_docs_root: Option<PathBuf>,
+
+    /// KG docs roots — colon-separated list of absolute paths to docs root
+    /// directories for multi-corpus agents (#798). Global fallback; per-agent
+    /// `identity.toml [kg].docs_roots` takes precedence. Linux/macOS only
+    /// (colon separator conflicts with Windows drive letters).
+    #[serde(default)]
+    pub kg_docs_roots: Option<Vec<PathBuf>>,
 
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
@@ -1282,6 +1303,7 @@ impl Settings {
             kg_resolution_model: None,
             kg_batch_budget: None,
             kg_docs_root: None,
+            kg_docs_roots: None,
         }
     }
 }
@@ -1407,6 +1429,7 @@ impl std::fmt::Debug for Settings {
                 &self.otlp_auth_header.as_ref().map(|_| "[REDACTED]"),
             )
             .field("kg_docs_root", &self.kg_docs_root)
+            .field("kg_docs_roots", &self.kg_docs_roots)
             .field("home_dir", &self.home_dir)
             .finish()
     }
@@ -1425,6 +1448,7 @@ mod tests {
             std::env::remove_var("MIKA_DB_PATH");
             std::env::remove_var("MIKA_DISABLE_BUNDLED_SKILLS");
             std::env::remove_var("MIKA_KG_DOCS_ROOT");
+            std::env::remove_var("MIKA_KG_DOCS_ROOTS");
         }
     }
 
