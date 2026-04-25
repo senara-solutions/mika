@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 27;
+pub const CURRENT_SCHEMA_VERSION: i64 = 28;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -984,6 +984,11 @@ impl Database {
         // the marker only when #787's coalesce SQL runs.
         self.check_v27_coalesce_guard()?;
 
+        if (3..=27).contains(&version) {
+            self.migrate_v27_to_v28()?;
+            info!(version = 28, "database migrated to v28");
+        }
+
         Ok(())
     }
 
@@ -1040,7 +1045,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (27);
+            INSERT INTO schema_version (version) VALUES (28);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1058,6 +1063,17 @@ impl Database {
                 last_seen TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
+
+            -- Per-agent KG corpus mapping (#798). Maps agent_id to
+            -- docs_root_hash for multi-corpus query fan-out.
+            CREATE TABLE agent_kg_corpora (
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                docs_root_hash TEXT NOT NULL,
+                docs_root_path TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (agent_id, docs_root_hash)
+            );
+            CREATE INDEX idx_agent_kg_corpora_hash ON agent_kg_corpora(docs_root_hash);
 
             CREATE TABLE teams (
                 id TEXT PRIMARY KEY,
@@ -3466,6 +3482,56 @@ impl Database {
         Ok(())
     }
 
+    /// v27→v28: Add `agent_kg_corpora` table for multi-corpus per-agent KG (#798).
+    /// Maps `agent_id → {docs_root_hash, docs_root_path}` so the query path knows
+    /// which corpora to fan out across without re-deriving from identity.
+    /// Backfills from existing `kg_subject_resolutions → kg_subject_entities` joins.
+    fn migrate_v27_to_v28(&self) -> Result<()> {
+        // Idempotency: skip if table already exists.
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_kg_corpora'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if exists {
+            self.conn.execute(
+                "UPDATE schema_version SET version = 28 WHERE version < 28",
+                [],
+            )?;
+            return Ok(());
+        }
+
+        self.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+
+             CREATE TABLE agent_kg_corpora (
+                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                 docs_root_hash TEXT NOT NULL,
+                 docs_root_path TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                 PRIMARY KEY (agent_id, docs_root_hash)
+             );
+
+             CREATE INDEX idx_agent_kg_corpora_hash ON agent_kg_corpora(docs_root_hash);
+
+             INSERT OR IGNORE INTO agent_kg_corpora (agent_id, docs_root_hash, docs_root_path)
+                 SELECT DISTINCT r.agent_id, e.docs_root_hash, e.docs_root
+                 FROM kg_subject_resolutions r
+                 JOIN kg_subject_entities e ON e.id = r.subject_entity_id
+                 WHERE e.docs_root_hash IS NOT NULL AND e.docs_root IS NOT NULL;
+
+             UPDATE schema_version SET version = 28;
+
+             COMMIT;",
+        )?;
+
+        Ok(())
+    }
+
     /// v27 startup guard: refuse to open the database if the coalesce step
     /// from #787 has not run. Pins to `schema_version == 27` — future v28
     /// should carry its own guard, not inherit v27's.
@@ -3525,6 +3591,36 @@ impl Database {
     }
 
     // ===== Agent CRUD =====
+
+    /// Register an agent-corpus mapping. Idempotent via INSERT OR IGNORE.
+    /// Called per (agent, corpus) pair during startup lexical ingestion (#798).
+    pub fn register_agent_corpus(
+        &self,
+        agent_id: &str,
+        docs_root_hash: &str,
+        docs_root_path: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO agent_kg_corpora (agent_id, docs_root_hash, docs_root_path)
+             VALUES (?1, ?2, ?3)",
+            params![agent_id, docs_root_hash, docs_root_path],
+        )?;
+        Ok(())
+    }
+
+    /// List all corpora registered for an agent.
+    /// Returns `(docs_root_hash, docs_root_path)` pairs.
+    pub fn list_agent_corpora(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT docs_root_hash, docs_root_path FROM agent_kg_corpora WHERE agent_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 
     pub fn register_agent(&self, id: &str, name: &str, home_dir: &str) -> Result<()> {
         self.conn.execute(
@@ -11813,7 +11909,9 @@ mod tests {
                 || lower.contains("kg_chunk_subject")
                 || lower.contains("kg_extractions")
                 || lower.contains("kg_resolutions_log")
+                || lower.contains("agent_kg_corpora")
                 || lower.contains("idx_kg_")
+                || lower.contains("idx_agent_kg_corpora")
                 || lower.contains("schema_meta")
             {
                 continue;
@@ -11866,7 +11964,7 @@ mod tests {
             "kg_entities should not exist at v24"
         );
 
-        // Run incremental migrations: v24 -> v25 -> v26 -> v27
+        // Run incremental migrations: v24 -> v25 -> v26 -> v27 -> v28
         let db2 = Database { conn: conn2 };
         db2.migrate_v24_to_v25().unwrap();
         db2.migrate_v25_to_v26().unwrap();
@@ -11881,6 +11979,8 @@ mod tests {
                 [],
             )
             .unwrap();
+
+        db2.migrate_v27_to_v28().unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -11902,6 +12002,12 @@ mod tests {
         assert!(
             db2.column_exists("kg_chunks", "docs_root_hash").unwrap(),
             "kg_chunks.docs_root_hash should exist after v27 migration"
+        );
+
+        // #798: agent_kg_corpora must exist after v28 migration.
+        assert!(
+            table_exists(&db2.conn, "agent_kg_corpora"),
+            "agent_kg_corpora should exist after v28 migration"
         );
 
         let snap2 = snapshot_schema(&db2.conn);

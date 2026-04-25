@@ -106,14 +106,39 @@ impl Tool for QueryKnowledgeGraphTool {
 
         let agent_id = input["agent_id"].as_str().map(|s| s.to_string());
         let docs_root_hash = input["docs_root_hash"].as_str().map(|s| s.to_string());
+        let docs_root_hashes: Vec<String> = input["docs_root_hashes"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let include_context = input["include_context"].as_bool().unwrap_or(false);
         let result_limit = input["result_limit"].as_u64().map(|l| l as usize);
+
+        // Resolution priority (#798): explicit docs_root_hashes > agent_id lookup
+        // > deprecated singular docs_root_hash > empty (no filter).
+        let effective_hashes = if !docs_root_hashes.is_empty() {
+            docs_root_hashes
+        } else if let Some(ref aid) = agent_id {
+            // Look up from agent_kg_corpora table
+            match ctx.db.list_agent_corpora(aid).await {
+                Ok(corpora) if !corpora.is_empty() => {
+                    corpora.into_iter().map(|(hash, _path)| hash).collect()
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
         let query_input = KgQueryInput {
             question,
             traversal,
             agent_id,
             docs_root_hash,
+            docs_root_hashes: effective_hashes,
             include_context,
             result_limit,
         };

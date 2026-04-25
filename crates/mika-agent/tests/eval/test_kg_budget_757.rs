@@ -324,8 +324,12 @@ async fn resolve_pending_with_zero_budget_still_processes_exact_matches() {
     seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
     seed_exact_match_pair(&db, "tool", "run_gh", 0.92).await;
 
-    let resolver =
-        SubjectEntityResolver::new(db.clone(), None, test_docs_root_hash(), Some("trace-rx1"));
+    let resolver = SubjectEntityResolver::new(
+        db.clone(),
+        None,
+        vec![test_docs_root_hash()],
+        Some("trace-rx1"),
+    );
     let stats = resolver.resolve_pending(0).await.unwrap();
 
     assert_eq!(stats.matched_exact, 2, "two exact matches should resolve");
@@ -367,8 +371,12 @@ async fn resolve_pending_with_no_llm_and_no_exact_match_skips_cleanly() {
     .await
     .unwrap();
 
-    let resolver =
-        SubjectEntityResolver::new(db.clone(), None, test_docs_root_hash(), Some("trace-rx2"));
+    let resolver = SubjectEntityResolver::new(
+        db.clone(),
+        None,
+        vec![test_docs_root_hash()],
+        Some("trace-rx2"),
+    );
     let stats = resolver.resolve_pending(10).await.unwrap();
 
     assert_eq!(stats.skipped_no_llm, 1);
@@ -381,7 +389,8 @@ async fn resolve_pending_empty_set_returns_zero_calls() {
     // No kg_subject_entities → pending query returns empty → early return.
     let db = test_db("agent-rx3");
 
-    let resolver = SubjectEntityResolver::new(db, None, test_docs_root_hash(), Some("trace-rx3"));
+    let resolver =
+        SubjectEntityResolver::new(db, None, vec![test_docs_root_hash()], Some("trace-rx3"));
     let stats = resolver.resolve_pending(10).await.unwrap();
 
     assert_eq!(stats.total, 0);
@@ -431,8 +440,12 @@ async fn resolve_pending_budget_exhaustion_does_not_starve_later_exact_matches()
 
     seed_exact_match_pair(&db, "tool", "run_gh", 0.92).await;
 
-    let resolver =
-        SubjectEntityResolver::new(db.clone(), None, test_docs_root_hash(), Some("trace-rx5"));
+    let resolver = SubjectEntityResolver::new(
+        db.clone(),
+        None,
+        vec![test_docs_root_hash()],
+        Some("trace-rx5"),
+    );
     let stats = resolver.resolve_pending(0).await.unwrap();
 
     // Both exact matches must resolve — the middle SkippedNoLlm entity
@@ -521,7 +534,8 @@ async fn resolve_pending_zero_budget_with_exact_match_mix_still_logs_exact() {
     .await
     .unwrap();
 
-    let resolver = SubjectEntityResolver::new(db, None, test_docs_root_hash(), Some("trace-rx4"));
+    let resolver =
+        SubjectEntityResolver::new(db, None, vec![test_docs_root_hash()], Some("trace-rx4"));
     let stats = resolver.resolve_pending(0).await.unwrap();
 
     assert_eq!(stats.matched_exact, 1);

@@ -2,6 +2,7 @@
 //!
 //! This module provides the docs-root resolution chain consumed by the
 //! lexical ingestor at server startup and by #778's per-agent resolver.
+//! Extended by #798 for multi-corpus per-agent support.
 
 use std::path::{Path, PathBuf};
 
@@ -10,20 +11,43 @@ use sha2::{Digest, Sha256};
 
 use crate::prompt::Identity;
 
+/// A single corpus configuration: a validated docs root path and its
+/// precomputed hash. Used inside `KgAgentConfig::Enabled`.
+#[derive(Debug, Clone)]
+pub struct CorpusConfig {
+    pub docs_root: PathBuf,
+    pub docs_root_hash: String,
+}
+
+/// Reason why KG is disabled for an agent.
+#[derive(Debug, Clone)]
+pub enum DisabledReason {
+    /// `identity.kg.enabled = false` — operator-explicit opt-out.
+    OperatorOptOut,
+    /// CWD-default fell through and `<CWD>/docs/solutions` does not exist.
+    CwdDefaultMissing,
+    /// Plural source listed N paths; every one failed validation.
+    AllPathsUnresolvable {
+        source: PathSource,
+        attempted: usize,
+    },
+}
+
 /// Per-agent KG configuration resolved at `init_agent` time and cached on
-/// `AgentState`. Eliminates partial states: either the agent has a validated
-/// path + hash, or KG is entirely disabled.
+/// `AgentState`. Eliminates partial states: either the agent has validated
+/// corpora, or KG is entirely disabled.
+///
+/// # Pre-1.0 breaking change (#798)
+///
+/// Shape changed from `Enabled { docs_root, docs_root_hash }` to
+/// `Enabled { corpora: Vec<CorpusConfig> }`. Single-corpus agents carry
+/// a one-entry vec — behavior is byte-equivalent to the pre-#798 shape.
 #[derive(Debug, Clone)]
 pub enum KgAgentConfig {
-    /// KG subsystem is disabled for this agent (`[kg] enabled = false`).
-    /// No `LexicalIngestor`, `SubjectExtractor`, or `SubjectEntityResolver`
-    /// is constructed. Existing shared-corpus rows are NOT deleted (#779 CLI).
-    Disabled,
-    /// KG subsystem is enabled with a validated docs root and precomputed hash.
-    Enabled {
-        docs_root: PathBuf,
-        docs_root_hash: String,
-    },
+    /// KG subsystem is disabled for this agent.
+    Disabled { reason: DisabledReason },
+    /// KG subsystem is enabled with one or more validated corpora.
+    Enabled { corpora: Vec<CorpusConfig> },
 }
 
 /// Errors from per-agent KG config validation.
@@ -44,68 +68,273 @@ pub enum KgConfigError {
 }
 
 /// Resolve the per-agent KG configuration from identity.toml `[kg]` section
-/// and the global fallback chain (#738).
+/// and the global fallback chain (#738, #798).
 ///
-/// # Behavior matrix
+/// # Resolution chain (first hit wins, six sources)
 ///
-/// | `enabled` | `docs_root` set | Behavior |
-/// |-----------|-----------------|----------|
-/// | `true`    | set             | Validate path exists as directory; hard-error if not; else return Enabled with hash. |
-/// | `true`    | unset           | Fall back to global resolver (#738). Hard-error on explicit source (env/config) if missing; warn-and-skip passthrough on CWD default. |
-/// | `false`   | any             | Return Disabled. No validation. |
+/// 1. `identity.kg.docs_roots` (plural, TOML array) — `IdentityPathPlural`
+/// 2. `identity.kg.docs_root`  (singular)            — `IdentityPath`
+/// 3. `MIKA_KG_DOCS_ROOTS` env (colon-separated)     — `EnvVarPlural`
+/// 4. `MIKA_KG_DOCS_ROOT` env  (single path)         — `EnvVar`
+/// 5. `settings.kg_docs_roots` (plural, TOML array)   — `ConfigFilePlural`
+/// 6. `settings.kg_docs_root`  (singular)             — `ConfigFile`
+/// 7. `<CWD>/docs/solutions`                          — `CwdDefault`
 ///
-/// # Hard-error policy
+/// # Validation policy (asymmetric by design)
 ///
-/// Explicit paths (per-agent `[kg].docs_root` or global `MIKA_KG_DOCS_ROOT` /
-/// `settings.kg_docs_root`) that don't exist fail loud at agent startup. The
-/// CWD-based default uses warn-and-skip passthrough, matching #738's policy.
+/// - **Singular sources** keep #778's all-or-nothing: path missing → hard error.
+/// - **Plural sources** use per-path validate-and-skip: missing paths emit
+///   `kg_corpus_skipped` warn and are dropped. Agent goes `Disabled` only if
+///   zero paths resolve.
+/// - **CWD default** passes through without validation (downstream warn-and-skip).
+///
+/// # Call-site contract
+///
+/// This function is init-only, called from exactly one site (`server::init_agent`)
+/// per process lifetime per agent. The dual-set warn has no dedup state and
+/// would emit per call. Future hot-reload must re-warn with dedup.
 pub fn resolve_per_agent_docs_root(
     identity: &Identity,
     settings: &Settings,
 ) -> Result<KgAgentConfig, KgConfigError> {
     // Disabled — early return, no validation.
     if !identity.kg.enabled {
-        return Ok(KgAgentConfig::Disabled);
+        return Ok(KgAgentConfig::Disabled {
+            reason: DisabledReason::OperatorOptOut,
+        });
     }
 
-    // Per-agent explicit path — validate and return.
+    // Check for dual-set warnings at each tier.
+    emit_dual_set_warns(identity, settings);
+
+    // Tier 1: identity.kg.docs_roots (plural)
+    if let Some(ref roots) = identity.kg.docs_roots
+        && !roots.is_empty()
+    {
+        return build_corpora(roots, PathSource::IdentityPathPlural);
+    }
+
+    // Tier 2: identity.kg.docs_root (singular)
     if let Some(ref path) = identity.kg.docs_root {
-        return validate_explicit_path(path);
+        return build_corpora(std::slice::from_ref(path), PathSource::IdentityPath);
     }
 
-    // Fall back to global resolver (#738).
-    let (resolved_path, source) = resolve_kg_docs_root(settings);
-
-    // Empty-path guard (#738): an empty string in env/config is a misconfiguration,
-    // not a valid path. Warn-and-skip per CLAUDE.md contract: "If set to an empty
-    // string, lexical ingestion skips with a distinct warn."
-    if resolved_path.as_os_str().is_empty() {
-        tracing::warn!(
-            source = ?source,
-            "kg_docs_root is set to empty string — check MIKA_KG_DOCS_ROOT env var or \
-             kg_docs_root in config.toml; skipping KG for this agent"
-        );
-        return Ok(KgAgentConfig::Disabled);
-    }
-
-    match source {
-        // Explicit global sources — hard-error on missing.
-        PathSource::EnvVar | PathSource::ConfigFile => validate_explicit_path(&resolved_path),
-        // CWD-based default — pass through without validation.
-        // Downstream LexicalIngestor handles warn-and-skip per #738 policy.
-        PathSource::CwdDefault => {
-            let hash = hash_docs_root(&resolved_path);
-            Ok(KgAgentConfig::Enabled {
-                docs_root: resolved_path,
-                docs_root_hash: hash,
-            })
+    // Tier 3: MIKA_KG_DOCS_ROOTS env (colon-separated)
+    if let Ok(s) = std::env::var("MIKA_KG_DOCS_ROOTS") {
+        let paths: Vec<PathBuf> = s
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !paths.is_empty() {
+            return build_corpora(&paths, PathSource::EnvVarPlural);
         }
+    }
+
+    // Tier 4: MIKA_KG_DOCS_ROOT env (singular)
+    if let Ok(env_path) = std::env::var("MIKA_KG_DOCS_ROOT") {
+        // Empty-path guard (#738): an empty string in env is a misconfiguration.
+        if env_path.is_empty() {
+            tracing::warn!(
+                "kg_docs_root is set to empty string — check MIKA_KG_DOCS_ROOT env var; \
+                 skipping KG for this agent"
+            );
+            return Ok(KgAgentConfig::Disabled {
+                reason: DisabledReason::CwdDefaultMissing,
+            });
+        }
+        return build_corpora(&[PathBuf::from(env_path)], PathSource::EnvVar);
+    }
+
+    // Tier 5: settings.kg_docs_roots (plural)
+    if let Some(ref roots) = settings.kg_docs_roots
+        && !roots.is_empty()
+    {
+        return build_corpora(roots, PathSource::ConfigFilePlural);
+    }
+
+    // Tier 6: settings.kg_docs_root (singular)
+    if let Some(ref config_path) = settings.kg_docs_root {
+        if config_path.as_os_str().is_empty() {
+            tracing::warn!(
+                "kg_docs_root is set to empty string in config.toml; \
+                 skipping KG for this agent"
+            );
+            return Ok(KgAgentConfig::Disabled {
+                reason: DisabledReason::CwdDefaultMissing,
+            });
+        }
+        return build_corpora(std::slice::from_ref(config_path), PathSource::ConfigFile);
+    }
+
+    // Tier 7: CWD-based default (container-native).
+    let cwd_default = std::env::current_dir()
+        .unwrap_or_default()
+        .join("docs")
+        .join("solutions");
+    build_corpora(&[cwd_default], PathSource::CwdDefault)
+}
+
+/// Emit dual-set warnings when both plural and singular are set at the same tier.
+fn emit_dual_set_warns(identity: &Identity, settings: &Settings) {
+    // Identity tier
+    if identity
+        .kg
+        .docs_roots
+        .as_ref()
+        .is_some_and(|v| !v.is_empty())
+        && identity.kg.docs_root.is_some()
+    {
+        tracing::warn!(
+            event = "kg_docs_roots_singular_ignored",
+            source = "identity",
+            ignored_path = ?identity.kg.docs_root,
+            "both [kg].docs_roots and [kg].docs_root set in identity.toml — \
+             plural takes precedence, singular ignored"
+        );
+    }
+
+    // Env tier
+    let has_env_plural = std::env::var("MIKA_KG_DOCS_ROOTS")
+        .ok()
+        .is_some_and(|s| !s.is_empty() && s.split(':').any(|p| !p.is_empty()));
+    let has_env_singular = std::env::var("MIKA_KG_DOCS_ROOT").is_ok();
+    if has_env_plural && has_env_singular {
+        tracing::warn!(
+            event = "kg_docs_roots_singular_ignored",
+            source = "env",
+            "both MIKA_KG_DOCS_ROOTS and MIKA_KG_DOCS_ROOT env vars set — \
+             plural takes precedence, singular ignored"
+        );
+    }
+
+    // Config tier
+    if settings
+        .kg_docs_roots
+        .as_ref()
+        .is_some_and(|v| !v.is_empty())
+        && settings.kg_docs_root.is_some()
+    {
+        tracing::warn!(
+            event = "kg_docs_roots_singular_ignored",
+            source = "config",
+            ignored_path = ?settings.kg_docs_root,
+            "both kg_docs_roots and kg_docs_root set in config.toml — \
+             plural takes precedence, singular ignored"
+        );
     }
 }
 
+/// Build corpora from a list of paths, applying validation per source type.
+fn build_corpora(paths: &[PathBuf], source: PathSource) -> Result<KgAgentConfig, KgConfigError> {
+    let is_plural = matches!(
+        source,
+        PathSource::IdentityPathPlural | PathSource::EnvVarPlural | PathSource::ConfigFilePlural
+    );
+
+    // Deduplicate by canonical hash.
+    let deduped = dedupe_paths(paths);
+
+    let mut corpora = Vec::with_capacity(deduped.len());
+
+    for path in &deduped {
+        match source {
+            PathSource::CwdDefault => {
+                // Per #738: CWD missing is warn-and-skip downstream.
+                let hash = hash_docs_root(path);
+                corpora.push(CorpusConfig {
+                    docs_root: path.clone(),
+                    docs_root_hash: hash,
+                });
+            }
+            _ if is_plural => {
+                // Per-path validate-and-skip for plural sources.
+                match validate_explicit_path(path) {
+                    Ok(c) => corpora.push(c),
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "kg_corpus_skipped",
+                            source = ?source,
+                            bad_path = %path.display(),
+                            resolved_count = corpora.len(),
+                            error = %e,
+                            "plural-source path skipped; agent will run with remaining corpora"
+                        );
+                    }
+                }
+            }
+            _ => {
+                // Singular sources: all-or-nothing (#778 policy).
+                corpora.push(validate_explicit_path(path)?);
+            }
+        }
+    }
+
+    if corpora.is_empty() {
+        if is_plural {
+            tracing::warn!(
+                event = "kg_all_corpora_skipped",
+                source = ?source,
+                attempted = deduped.len(),
+                "every plural-source path failed validation; agent KG disabled"
+            );
+            return Ok(KgAgentConfig::Disabled {
+                reason: DisabledReason::AllPathsUnresolvable {
+                    source,
+                    attempted: deduped.len(),
+                },
+            });
+        }
+        Ok(KgAgentConfig::Disabled {
+            reason: DisabledReason::CwdDefaultMissing,
+        })
+    } else {
+        Ok(KgAgentConfig::Enabled { corpora })
+    }
+}
+
+/// Deduplicate paths, emitting info for literal dupes and warn for canonical collisions.
+fn dedupe_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    use std::collections::HashMap;
+
+    let mut seen_literal: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut seen_hash: HashMap<String, PathBuf> = HashMap::new();
+    let mut result = Vec::with_capacity(paths.len());
+
+    for path in paths {
+        // Literal duplicate check
+        if !seen_literal.insert(path.clone()) {
+            tracing::info!(
+                event = "kg_docs_roots_duplicate_literal",
+                path = %path.display(),
+                "duplicate literal path in docs_roots — ignored"
+            );
+            continue;
+        }
+
+        // Canonical collision check
+        let hash = hash_docs_root(path);
+        if let Some(prev) = seen_hash.get(&hash) {
+            tracing::warn!(
+                event = "kg_docs_roots_duplicate_canonical",
+                source_path = %path.display(),
+                prev_path = %prev.display(),
+                canonical_hash = %hash,
+                "distinct paths canonicalize to same hash — only the first is used"
+            );
+            continue;
+        }
+
+        seen_hash.insert(hash, path.clone());
+        result.push(path.clone());
+    }
+
+    result
+}
+
 /// Validate that an explicit path exists and is a directory, returning
-/// `Enabled` with computed hash on success.
-fn validate_explicit_path(path: &Path) -> Result<KgAgentConfig, KgConfigError> {
+/// `CorpusConfig` with computed hash on success.
+fn validate_explicit_path(path: &Path) -> Result<CorpusConfig, KgConfigError> {
     match path.try_exists() {
         Ok(true) => {
             if !path.is_dir() {
@@ -114,7 +343,7 @@ fn validate_explicit_path(path: &Path) -> Result<KgAgentConfig, KgConfigError> {
                 });
             }
             let hash = hash_docs_root(path);
-            Ok(KgAgentConfig::Enabled {
+            Ok(CorpusConfig {
                 docs_root: path.to_path_buf(),
                 docs_root_hash: hash,
             })
@@ -132,17 +361,21 @@ fn validate_explicit_path(path: &Path) -> Result<KgAgentConfig, KgConfigError> {
 
 /// Source of the resolved docs root path.
 ///
-/// Exposed so `resolve_per_agent_docs_root` (in this module) can distinguish
-/// "operator explicitly set this path; hard-error if missing" from "fell
-/// through to container-friendly default; warn-and-skip if missing".
-///
 /// **If you add a new variant**, update `resolve_per_agent_docs_root` in this
-/// module to classify it correctly. The exhaustive match will force a compile
-/// error, but this breadcrumb names the _why_.
+/// module to classify it correctly. The exhaustive match in `path_source_exhaustive`
+/// will force a compile error, but this breadcrumb names the _why_.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathSource {
+    /// Path came from `identity.toml [kg].docs_roots` (plural, #798).
+    IdentityPathPlural,
+    /// Path came from `identity.toml [kg].docs_root` (singular, #778).
+    IdentityPath,
+    /// Path came from `MIKA_KG_DOCS_ROOTS` env var (colon-separated, #798).
+    EnvVarPlural,
     /// Path came from `MIKA_KG_DOCS_ROOT` env var.
     EnvVar,
+    /// Path came from `settings.kg_docs_roots` (config.toml array, #798).
+    ConfigFilePlural,
     /// Path came from `settings.kg_docs_root` (config.toml).
     ConfigFile,
     /// Path fell through to `std::env::current_dir().join("docs/solutions")`.
@@ -156,12 +389,6 @@ pub enum PathSource {
 /// 1. `MIKA_KG_DOCS_ROOT` environment variable (absolute path).
 /// 2. `settings.kg_docs_root` field from config.toml (absolute path).
 /// 3. `<CWD>/docs/solutions` — container-native default.
-///
-/// # Why re-inspect the env var
-///
-/// Config-rs merges `MIKA_KG_DOCS_ROOT` into `settings.kg_docs_root`, so
-/// `Some(...)` could be _either_ env or config file. We re-inspect the env
-/// var directly to distinguish the two sources for `PathSource`.
 ///
 /// # Public contract
 ///
@@ -199,28 +426,13 @@ pub fn resolve_kg_docs_root(settings: &Settings) -> (PathBuf, PathSource) {
 ///
 /// - `sha256(fs::canonicalize(path))[:16]` — 16 hex chars = 64 bits.
 /// - If canonicalization fails (e.g., path does not exist), the raw path
-///   bytes are hashed instead. Consumers that care about path existence
-///   (e.g., #778's per-agent resolver) check separately.
-/// - **Per-host stability only.** `~/.mika/data/mika.db` is machine-local
-///   (same category as `~/.cache`). The hash is stable across restarts on
-///   the same host but NOT portable across hosts with different filesystem
-///   layouts.
-/// - Canonicalization is OS-dependent — on Windows, `fs::canonicalize`
-///   yields UNC-prefixed paths (`\\?\C:\...`). The codebase targets
-///   Linux/macOS; Windows behavior is documented, not tested.
-///
-/// # Public contract
-///
-/// Consumed by #778's per-agent resolver and #779's KG CLI status output.
-/// Signature changes require coordinated update across those tickets. The
-/// `signature_binding` test below catches mechanical drift at compile time.
+///   bytes are hashed instead.
+/// - **Per-host stability only.**
 pub fn hash_docs_root(path: &Path) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_os_str().as_encoded_bytes());
     let digest = hasher.finalize();
-    // First 8 bytes = 16 hex chars = 64 bits.
-    // Use per-byte formatting to guarantee zero-padded 16-char output.
     digest[..8]
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -238,6 +450,7 @@ mod tests {
         // Safety: tests set env vars; no production thread reads these.
         unsafe {
             std::env::remove_var("MIKA_KG_DOCS_ROOT");
+            std::env::remove_var("MIKA_KG_DOCS_ROOTS");
         }
     }
 
@@ -279,7 +492,6 @@ mod tests {
         let (path, source) = resolve_kg_docs_root(&settings);
 
         assert_eq!(source, PathSource::CwdDefault);
-        // Verify the full path is CWD-rooted, not just checking the suffix.
         let expected = std::env::current_dir()
             .unwrap()
             .join("docs")
@@ -315,21 +527,23 @@ mod tests {
         assert_eq!(source, PathSource::ConfigFile);
     }
 
-    /// Signature binding — prevents silent drift from the public contract
-    /// that #778 depends on.
+    /// Signature binding — prevents silent drift from the public contract.
     #[test]
     fn signature_binding() {
         let _: fn(&Settings) -> (PathBuf, PathSource) = resolve_kg_docs_root;
     }
 
     /// Exhaustiveness check — adding a `PathSource` variant without updating
-    /// this match (and by extension, #778's `resolve_per_agent_docs_root`)
-    /// produces a compile error.
+    /// this match produces a compile error.
     #[test]
     fn path_source_exhaustive() {
         let source = PathSource::CwdDefault;
         match source {
+            PathSource::IdentityPathPlural => (),
+            PathSource::IdentityPath => (),
+            PathSource::EnvVarPlural => (),
             PathSource::EnvVar => (),
+            PathSource::ConfigFilePlural => (),
             PathSource::ConfigFile => (),
             PathSource::CwdDefault => (),
         }
@@ -356,8 +570,6 @@ mod tests {
 
     #[test]
     fn hash_docs_root_canonicalization() {
-        // Create real directories so canonicalize resolves both paths identically.
-        // Both `target` AND `aux` must exist for `aux/../target` to canonicalize.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         std::fs::create_dir_all(&target).unwrap();
@@ -380,7 +592,6 @@ mod tests {
             16,
             "non-existent path still returns 16-char hash"
         );
-        // Determinism holds even on non-existent paths.
         let hash2 = hash_docs_root(Path::new("/does/not/exist/xyz"));
         assert_eq!(hash, hash2);
     }
@@ -392,58 +603,69 @@ mod tests {
         assert_ne!(a, b, "different paths should produce different hashes");
     }
 
-    /// Signature binding — prevents silent drift from the public contract
-    /// that #778 and #779 depend on.
     #[test]
     fn hash_docs_root_signature_binding() {
         let _: fn(&Path) -> String = hash_docs_root;
     }
 
-    // ── resolve_per_agent_docs_root tests (#778) ──────────────────────────
+    // ── resolve_per_agent_docs_root tests (#778, #798) ───────────────────
 
     use crate::prompt::{Identity, KgIdentityConfig};
 
-    fn identity_with_kg(enabled: bool, docs_root: Option<PathBuf>) -> Identity {
+    fn identity_with_kg(
+        enabled: bool,
+        docs_root: Option<PathBuf>,
+        docs_roots: Option<Vec<PathBuf>>,
+    ) -> Identity {
         Identity {
-            kg: KgIdentityConfig { enabled, docs_root },
+            kg: KgIdentityConfig {
+                enabled,
+                docs_root,
+                docs_roots,
+            },
             ..Identity::default()
         }
     }
 
     #[test]
     fn resolve_per_agent_disabled_returns_disabled() {
-        let identity = identity_with_kg(false, Some(PathBuf::from("/nonexistent")));
+        let identity = identity_with_kg(false, Some(PathBuf::from("/nonexistent")), None);
         let settings = Settings::test_defaults();
         let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
-        assert!(matches!(result, KgAgentConfig::Disabled));
+        assert!(matches!(
+            result,
+            KgAgentConfig::Disabled {
+                reason: DisabledReason::OperatorOptOut
+            }
+        ));
     }
 
     #[test]
     fn resolve_per_agent_enabled_valid_path() {
         let dir = tempfile::tempdir().unwrap();
-        let identity = identity_with_kg(true, Some(dir.path().to_path_buf()));
+        let identity = identity_with_kg(true, Some(dir.path().to_path_buf()), None);
         let settings = Settings::test_defaults();
         let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
         match result {
-            KgAgentConfig::Enabled {
-                docs_root,
-                docs_root_hash,
-            } => {
-                assert_eq!(docs_root, dir.path());
-                assert_eq!(docs_root_hash, hash_docs_root(dir.path()));
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 1);
+                assert_eq!(corpora[0].docs_root, dir.path());
+                assert_eq!(corpora[0].docs_root_hash, hash_docs_root(dir.path()));
             }
-            KgAgentConfig::Disabled => panic!("expected Enabled"),
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled"),
         }
     }
 
     #[test]
     fn resolve_per_agent_enabled_nonexistent_path_errors() {
-        let identity = identity_with_kg(true, Some(PathBuf::from("/does/not/exist/xyz")));
+        let identity = identity_with_kg(true, Some(PathBuf::from("/does/not/exist/xyz")), None);
         let settings = Settings::test_defaults();
         let result = resolve_per_agent_docs_root(&identity, &settings);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, KgConfigError::PathNotFound { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            KgConfigError::PathNotFound { .. }
+        ));
     }
 
     #[test]
@@ -451,12 +673,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("not_a_dir.txt");
         std::fs::write(&file_path, "hello").unwrap();
-        let identity = identity_with_kg(true, Some(file_path.clone()));
+        let identity = identity_with_kg(true, Some(file_path), None);
         let settings = Settings::test_defaults();
         let result = resolve_per_agent_docs_root(&identity, &settings);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, KgConfigError::NotADirectory { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            KgConfigError::NotADirectory { .. }
+        ));
     }
 
     #[test]
@@ -466,18 +690,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("MIKA_KG_DOCS_ROOT", dir.path().as_os_str()) };
 
-        let identity = identity_with_kg(true, None);
+        let identity = identity_with_kg(true, None, None);
         let settings = Settings::test_defaults();
         let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
         match result {
-            KgAgentConfig::Enabled {
-                docs_root,
-                docs_root_hash,
-            } => {
-                assert_eq!(docs_root, dir.path());
-                assert_eq!(docs_root_hash, hash_docs_root(dir.path()));
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 1);
+                assert_eq!(corpora[0].docs_root, dir.path());
+                assert_eq!(corpora[0].docs_root_hash, hash_docs_root(dir.path()));
             }
-            KgAgentConfig::Disabled => panic!("expected Enabled"),
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled"),
         }
         clean_kg_env();
     }
@@ -488,7 +710,7 @@ mod tests {
         clean_kg_env();
         unsafe { std::env::set_var("MIKA_KG_DOCS_ROOT", "/env/nonexistent/path") };
 
-        let identity = identity_with_kg(true, None);
+        let identity = identity_with_kg(true, None, None);
         let settings = Settings::test_defaults();
         let result = resolve_per_agent_docs_root(&identity, &settings);
         assert!(result.is_err());
@@ -507,17 +729,14 @@ mod tests {
         let mut settings = Settings::test_defaults();
         settings.kg_docs_root = Some(dir.path().to_path_buf());
 
-        let identity = identity_with_kg(true, None);
+        let identity = identity_with_kg(true, None, None);
         let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
         match result {
-            KgAgentConfig::Enabled {
-                docs_root,
-                docs_root_hash,
-            } => {
-                assert_eq!(docs_root, dir.path());
-                assert_eq!(docs_root_hash, hash_docs_root(dir.path()));
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 1);
+                assert_eq!(corpora[0].docs_root, dir.path());
             }
-            KgAgentConfig::Disabled => panic!("expected Enabled"),
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled"),
         }
     }
 
@@ -528,7 +747,7 @@ mod tests {
         let mut settings = Settings::test_defaults();
         settings.kg_docs_root = Some(PathBuf::from("/config/nonexistent/path"));
 
-        let identity = identity_with_kg(true, None);
+        let identity = identity_with_kg(true, None, None);
         let result = resolve_per_agent_docs_root(&identity, &settings);
         assert!(result.is_err());
         assert!(matches!(
@@ -542,22 +761,19 @@ mod tests {
     fn resolve_per_agent_cwd_default_passes_through() {
         clean_kg_env();
         let settings = Settings::test_defaults();
-        let identity = identity_with_kg(true, None);
-        // CWD default — no hard-error even if path doesn't exist.
+        let identity = identity_with_kg(true, None, None);
         let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
         match result {
-            KgAgentConfig::Enabled {
-                docs_root,
-                docs_root_hash,
-            } => {
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 1);
                 let expected = std::env::current_dir()
                     .unwrap()
                     .join("docs")
                     .join("solutions");
-                assert_eq!(docs_root, expected);
-                assert!(!docs_root_hash.is_empty());
+                assert_eq!(corpora[0].docs_root, expected);
+                assert!(!corpora[0].docs_root_hash.is_empty());
             }
-            KgAgentConfig::Disabled => panic!("expected Enabled"),
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled"),
         }
     }
 
@@ -567,11 +783,10 @@ mod tests {
         clean_kg_env();
         unsafe { std::env::set_var("MIKA_KG_DOCS_ROOT", "") };
 
-        let identity = identity_with_kg(true, None);
+        let identity = identity_with_kg(true, None, None);
         let settings = Settings::test_defaults();
-        // Empty string env var should warn-and-skip, not hard-error.
         let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
-        assert!(matches!(result, KgAgentConfig::Disabled));
+        assert!(matches!(result, KgAgentConfig::Disabled { .. }));
         clean_kg_env();
     }
 
@@ -580,5 +795,154 @@ mod tests {
     fn resolve_per_agent_signature_binding() {
         let _: fn(&Identity, &Settings) -> Result<KgAgentConfig, KgConfigError> =
             resolve_per_agent_docs_root;
+    }
+
+    // ── Multi-corpus tests (#798) ────────────────────────────────────────
+
+    #[test]
+    fn resolve_per_agent_plural_identity_wins() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let identity = identity_with_kg(
+            true,
+            Some(dir_a.path().to_path_buf()),
+            Some(vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]),
+        );
+        let settings = Settings::test_defaults();
+        let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
+        match result {
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 2);
+            }
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled with 2 corpora"),
+        }
+    }
+
+    #[test]
+    fn resolve_per_agent_plural_skip_missing() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let identity = identity_with_kg(
+            true,
+            None,
+            Some(vec![
+                dir_a.path().to_path_buf(),
+                PathBuf::from("/does/not/exist/798"),
+            ]),
+        );
+        let settings = Settings::test_defaults();
+        let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
+        match result {
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 1, "missing path should be skipped");
+                assert_eq!(corpora[0].docs_root, dir_a.path());
+            }
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled with 1 corpus"),
+        }
+    }
+
+    #[test]
+    fn resolve_per_agent_plural_all_missing_disabled() {
+        let identity = identity_with_kg(
+            true,
+            None,
+            Some(vec![
+                PathBuf::from("/missing/a"),
+                PathBuf::from("/missing/b"),
+            ]),
+        );
+        let settings = Settings::test_defaults();
+        let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
+        assert!(matches!(
+            result,
+            KgAgentConfig::Disabled {
+                reason: DisabledReason::AllPathsUnresolvable { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_per_agent_empty_plural_falls_through() {
+        // Empty docs_roots should fall through to singular
+        let dir = tempfile::tempdir().unwrap();
+        let identity = identity_with_kg(
+            true,
+            Some(dir.path().to_path_buf()),
+            Some(vec![]), // empty
+        );
+        let settings = Settings::test_defaults();
+        let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
+        match result {
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 1);
+                assert_eq!(corpora[0].docs_root, dir.path());
+            }
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled from singular fallback"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_per_agent_env_plural_wins_over_env_singular() {
+        clean_kg_env();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let dir_c = tempfile::tempdir().unwrap();
+
+        let env_val = format!("{}:{}", dir_a.path().display(), dir_b.path().display());
+        unsafe {
+            std::env::set_var("MIKA_KG_DOCS_ROOTS", &env_val);
+            std::env::set_var("MIKA_KG_DOCS_ROOT", dir_c.path().as_os_str());
+        }
+
+        let identity = identity_with_kg(true, None, None);
+        let settings = Settings::test_defaults();
+        let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
+        match result {
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 2);
+            }
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled from env plural"),
+        }
+        clean_kg_env();
+    }
+
+    #[test]
+    fn resolve_per_agent_literal_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = identity_with_kg(
+            true,
+            None,
+            Some(vec![
+                dir.path().to_path_buf(),
+                dir.path().to_path_buf(), // literal duplicate
+            ]),
+        );
+        let settings = Settings::test_defaults();
+        let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
+        match result {
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 1, "literal duplicate should be deduped");
+            }
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_per_agent_config_plural() {
+        clean_kg_env();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut settings = Settings::test_defaults();
+        settings.kg_docs_roots = Some(vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()]);
+
+        let identity = identity_with_kg(true, None, None);
+        let result = resolve_per_agent_docs_root(&identity, &settings).unwrap();
+        match result {
+            KgAgentConfig::Enabled { corpora } => {
+                assert_eq!(corpora.len(), 2);
+            }
+            KgAgentConfig::Disabled { .. } => panic!("expected Enabled from config plural"),
+        }
     }
 }

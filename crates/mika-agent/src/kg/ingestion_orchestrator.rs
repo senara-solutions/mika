@@ -261,8 +261,12 @@ impl IngestionOrchestrator {
         let docs_root_hash = self.docs_root_hash.clone();
 
         tokio::spawn(async move {
-            let resolver =
-                SubjectEntityResolver::new(db, resolution_llm, docs_root_hash, Some(&trace_id));
+            let resolver = SubjectEntityResolver::new(
+                db,
+                resolution_llm,
+                vec![docs_root_hash],
+                Some(&trace_id),
+            );
 
             match resolver.resolve_pending(budget).await {
                 Ok(stats) => {

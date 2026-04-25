@@ -149,11 +149,11 @@ pub struct SubjectEntityResolver {
     /// `None` when no resolution model configured — exact-match-only mode.
     llm: Option<Arc<dyn LlmProvider>>,
     trace_id: String,
-    /// Shared-corpus key for querying v27 shared-layer tables.
-    /// Reads from `kg_subject_entities` and `kg_chunk_subjects` use this
+    /// Shared-corpus keys for querying v27 shared-layer tables (#798: multi-corpus).
+    /// Reads from `kg_subject_entities` and `kg_chunk_subjects` use these
     /// instead of `agent_id`. Writes to `kg_subject_resolutions` and
     /// `kg_resolutions_log` still use `agent_id` (per-agent).
-    docs_root_hash: String,
+    docs_root_hashes: Vec<String>,
 }
 
 impl SubjectEntityResolver {
@@ -161,12 +161,13 @@ impl SubjectEntityResolver {
     ///
     /// - `db`: async database handle (carries `agent_id` implicitly).
     /// - `llm`: LLM provider for disambiguation. `None` for exact-match-only mode.
-    /// - `docs_root_hash`: shared-corpus key for v27 shared-layer table reads.
+    /// - `docs_root_hashes`: shared-corpus keys for v27 shared-layer table reads (#798).
+    ///   Single-corpus agents pass a one-element vec.
     /// - `trace_id`: optional trace ID for observability.
     pub fn new(
         db: AsyncDatabase,
         llm: Option<Arc<dyn LlmProvider>>,
-        docs_root_hash: String,
+        docs_root_hashes: Vec<String>,
         trace_id: Option<&str>,
     ) -> Self {
         let trace_id = trace_id
@@ -185,7 +186,7 @@ impl SubjectEntityResolver {
             db,
             llm,
             trace_id,
-            docs_root_hash,
+            docs_root_hashes,
         }
     }
 
@@ -699,20 +700,28 @@ impl SubjectEntityResolver {
     /// Fetch subject entities by IDs.
     async fn get_entities_by_ids(&self, ids: &[i64]) -> Result<Vec<PendingEntity>> {
         let ids = ids.to_vec();
-        let docs_root_hash = self.docs_root_hash.clone();
+        let docs_root_hashes = self.docs_root_hashes.clone();
 
         self.db
             .with_db(move |db| {
-                let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+                if docs_root_hashes.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let hash_placeholders: Vec<String> =
+                    docs_root_hashes.iter().map(|_| "?".to_string()).collect();
+                let id_placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
                 let sql = format!(
                     "SELECT id, entity_key, type, name, confidence
                      FROM kg_subject_entities
-                     WHERE docs_root_hash = ? AND id IN ({})",
-                    placeholders.join(",")
+                     WHERE docs_root_hash IN ({}) AND id IN ({})",
+                    hash_placeholders.join(","),
+                    id_placeholders.join(",")
                 );
                 let mut stmt = db.conn.prepare(&sql)?;
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-                    vec![Box::new(docs_root_hash)];
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                for h in &docs_root_hashes {
+                    params.push(Box::new(h.clone()));
+                }
                 for id in &ids {
                     params.push(Box::new(*id));
                 }
@@ -734,18 +743,24 @@ impl SubjectEntityResolver {
     }
 
     /// Get pending entities — never attempted or stale from re-extraction (D4).
+    /// Scoped to all the agent's docs_root_hashes via IN-list (#798).
     async fn get_pending_entities(&self) -> Result<Vec<PendingEntity>> {
         let agent_id = self.db.agent_id.clone();
-        let docs_root_hash = self.docs_root_hash.clone();
+        let docs_root_hashes = self.docs_root_hashes.clone();
 
         self.db
             .with_db(move |db| {
-                let mut stmt = db.conn.prepare(
+                if docs_root_hashes.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let hash_placeholders: Vec<String> =
+                    docs_root_hashes.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
                     "SELECT e.id, e.entity_key, e.type, e.name, e.confidence
                      FROM kg_subject_entities e
                      LEFT JOIN kg_resolutions_log r
-                         ON r.subject_entity_id = e.id AND r.agent_id = ?2
-                     WHERE e.docs_root_hash = ?1
+                         ON r.subject_entity_id = e.id AND r.agent_id = ?
+                     WHERE e.docs_root_hash IN ({})
                        AND e.type IN ('skill', 'tool', 'agent', 'problem_type')
                        AND (
                          r.id IS NULL
@@ -756,9 +771,16 @@ impl SubjectEntityResolver {
                              ORDER BY cs.created_at DESC LIMIT 1
                          )
                        )",
-                )?;
+                    hash_placeholders.join(","),
+                );
+                let mut stmt = db.conn.prepare(&sql)?;
+                // agent_id is first param, then hash params
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(agent_id)];
+                for h in &docs_root_hashes {
+                    params.push(Box::new(h.clone()));
+                }
                 let entities: Vec<PendingEntity> = stmt
-                    .query_map(rusqlite::params![docs_root_hash, agent_id], |row| {
+                    .query_map(rusqlite::params_from_iter(params), |row| {
                         Ok(PendingEntity {
                             id: row.get(0)?,
                             entity_key: row.get(1)?,
@@ -814,27 +836,33 @@ impl SubjectEntityResolver {
 
     /// Get source chunk prose for a subject entity (for disambiguation context).
     async fn get_chunk_context(&self, subject_entity_id: i64) -> Result<String> {
-        let docs_root_hash = self.docs_root_hash.clone();
+        let docs_root_hashes = self.docs_root_hashes.clone();
         let agent_id = self.db.agent_id.clone();
 
         self.db
             .with_db(move |db| {
-                // Get chunk IDs for this entity via kg_chunk_subjects.
-                // kg_chunk_subjects is shared (v27, docs_root_hash); search_content
-                // still has agent_id for its own scoping.
-                let mut stmt = db.conn.prepare(
+                if docs_root_hashes.is_empty() {
+                    return Ok(String::new());
+                }
+                let hash_placeholders: Vec<String> =
+                    docs_root_hashes.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
                     "SELECT sc.content
                      FROM kg_chunk_subjects cs
                      JOIN search_content sc ON sc.source_type = 'kg_chunk'
-                         AND sc.source_id = cs.chunk_id AND sc.agent_id = ?3
-                     WHERE cs.docs_root_hash = ?1 AND cs.subject_entity_id = ?2
+                         AND sc.source_id = cs.chunk_id AND sc.agent_id = ?
+                     WHERE cs.docs_root_hash IN ({}) AND cs.subject_entity_id = ?
                      LIMIT 3",
-                )?;
+                    hash_placeholders.join(","),
+                );
+                let mut stmt = db.conn.prepare(&sql)?;
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(agent_id)];
+                for h in &docs_root_hashes {
+                    params.push(Box::new(h.clone()));
+                }
+                params.push(Box::new(subject_entity_id));
                 let chunks: Vec<String> = stmt
-                    .query_map(
-                        rusqlite::params![docs_root_hash, subject_entity_id, agent_id],
-                        |row| row.get(0),
-                    )?
+                    .query_map(rusqlite::params_from_iter(params), |row| row.get(0))?
                     .filter_map(|r| r.ok())
                     .collect();
 
@@ -852,25 +880,30 @@ impl SubjectEntityResolver {
         entity_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, String>> {
         let ids = entity_ids.to_vec();
-        let docs_root_hash = self.docs_root_hash.clone();
+        let docs_root_hashes = self.docs_root_hashes.clone();
 
         self.db
             .with_db(move |db| {
-                if ids.is_empty() {
+                if ids.is_empty() || docs_root_hashes.is_empty() {
                     return Ok(std::collections::HashMap::new());
                 }
 
-                let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+                let hash_placeholders: Vec<String> =
+                    docs_root_hashes.iter().map(|_| "?".to_string()).collect();
+                let id_placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
                 let sql = format!(
                     "SELECT subject_entity_id, extraction_trace_id
                      FROM kg_chunk_subjects
-                     WHERE docs_root_hash = ? AND subject_entity_id IN ({})
+                     WHERE docs_root_hash IN ({}) AND subject_entity_id IN ({})
                      ORDER BY created_at DESC",
-                    placeholders.join(",")
+                    hash_placeholders.join(","),
+                    id_placeholders.join(","),
                 );
                 let mut stmt = db.conn.prepare(&sql)?;
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-                    vec![Box::new(docs_root_hash)];
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                for h in &docs_root_hashes {
+                    params.push(Box::new(h.clone()));
+                }
                 for id in &ids {
                     params.push(Box::new(*id));
                 }

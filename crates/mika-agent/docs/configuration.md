@@ -353,6 +353,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `kg_resolution_model` | `Option<String>` | None | `MIKA_KG_RESOLUTION_MODEL` | Model for entity resolution disambiguation (#691). Falls back to `kg_ingestion_model` if unset. Mid-tier model recommended for better judgment on ambiguous matches. |
 | `kg_batch_budget` | `Option<u32>` | None (effective default: 500) | `MIKA_KG_BATCH_BUDGET` | Per-batch LLM call cap on KG startup extraction and resolution (#757). Worst-case per-startup cost is `2 × N_agents × budget` (extraction batch + resolution batch). Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next restart. `0` disables the phase entirely (no LLM calls). |
 | `kg_docs_root` | `Option<PathBuf>` | None | `MIKA_KG_DOCS_ROOT` | Absolute path to the docs root the lexical ingestor reads (#738). Resolution chain: env > config > `<CWD>/docs/solutions` (container-native default). Needed on hosts where the service CWD ≠ repo root (e.g., OpenRC `supervise-daemon`). |
+| `kg_docs_roots` | `Option<Vec<PathBuf>>` | None | `MIKA_KG_DOCS_ROOTS` | Colon-separated list of absolute docs-root paths for multi-corpus agents (#798). Per-agent `[kg].docs_roots` in identity.toml takes precedence. Linux/macOS only. |
 | `github_token` | `Option<String>` | None | `MIKA_GITHUB_TOKEN` | GitHub Personal Access Token for agent operations (context injection, work item enrichment, PR merge). Needs Pull requests R/W, Issues R/W, Contents R scopes. |
 | `investigate_github_token` | `Option<String>` | None | `MIKA_INVESTIGATE_GITHUB_TOKEN` | GitHub Personal Access Token for the investigation panel's issue creation tool only. Needs `repo` scope for private repos or `public_repo` for public. Both `investigate_github_token` and `github_repo` must be set to enable the tool. |
 | `github_repo` | `Option<String>` | None | `MIKA_GITHUB_REPO` | Target GitHub repository in `owner/repo` format (e.g. `senara-solutions/mika`). Validated at registration time — must contain exactly one `/`. |
@@ -407,6 +408,7 @@ emoji = "✦"
 # [kg]
 # enabled = true                    # default: true — set false to skip KG for this agent
 # docs_root = "/path/to/docs"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions
+# docs_roots = ["/path/a", "/path/b"]  # optional; multi-corpus (overrides docs_root when set)
 ```
 
 | Field | Description |
@@ -415,6 +417,7 @@ emoji = "✦"
 | `emoji` | A single character or emoji shown alongside the assistant's name in the TUI. |
 | `[kg].enabled` | Whether KG ingestion/extraction/resolution runs for this agent. Default: `true`. |
 | `[kg].docs_root` | Absolute path to the docs root this agent's KG reads from. Optional; falls back to the global resolver chain (`MIKA_KG_DOCS_ROOT` env > `kg_docs_root` config > `<CWD>/docs/solutions`). |
+| `[kg].docs_roots` | Array of absolute paths for multi-corpus agents (#798). Overrides `docs_root` (singular) and `MIKA_KG_DOCS_ROOTS` when set. Each path is validated independently; missing paths are warned and skipped. |
 
 **`[kg]` behavior:** When `enabled = false`, no KG subsystem components are constructed for the agent. Existing shared-corpus rows are preserved (cleanup via `mika kg purge`). When `docs_root` is set to an explicit path that doesn't exist, the agent fails to start with a clear error. Agents with matching `docs_root` share extraction via `docs_root_hash` (v27 schema).
 
@@ -546,6 +549,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_KG_RESOLUTION_MODEL` | No | KG resolution model (falls back to `MIKA_KG_INGESTION_MODEL`) |
 | `MIKA_KG_BATCH_BUDGET` | No | Per-batch LLM call cap on KG extraction/resolution (#757; default: 500; `0` disables) |
 | `MIKA_KG_DOCS_ROOT` | No | Absolute path to docs root for KG lexical ingestion (default: `<CWD>/docs/solutions`; needed on hosts where CWD ≠ repo root) |
+| `MIKA_KG_DOCS_ROOTS` | No | Colon-separated list of docs-root paths for multi-corpus agents (#798; per-agent `[kg].docs_roots` takes precedence; Linux/macOS only) |
 | `MIKA_GITHUB_TOKEN` | No | GitHub token for agent operations |
 | `MIKA_INVESTIGATE_GITHUB_TOKEN` | No | GitHub token for investigation panel issue creation only |
 | `MIKA_GITHUB_REPO` | No | GitHub repo (`owner/repo`) for issue creation |

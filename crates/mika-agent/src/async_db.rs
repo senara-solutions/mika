@@ -1962,6 +1962,26 @@ impl AsyncDatabase {
         self.with_db(move |db| db.count_chunks_for_docs_root_hash(&h))
             .await
     }
+
+    /// Register an agent-corpus mapping (#798). Idempotent.
+    pub async fn register_agent_corpus(
+        &self,
+        agent_id: &str,
+        docs_root_hash: &str,
+        docs_root_path: &str,
+    ) -> Result<()> {
+        let a = agent_id.to_owned();
+        let h = docs_root_hash.to_owned();
+        let p = docs_root_path.to_owned();
+        self.with_db(move |db| db.register_agent_corpus(&a, &h, &p))
+            .await
+    }
+
+    /// List all corpora for an agent (#798).
+    pub async fn list_agent_corpora(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
+        let a = agent_id.to_owned();
+        self.with_db(move |db| db.list_agent_corpora(&a)).await
+    }
 }
 
 #[cfg(test)]

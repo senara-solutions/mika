@@ -37,6 +37,7 @@ async fn test_path_b_subject_match_correct_agent() {
         traversal: None,
         agent_id: Some("mika-dev".to_string()),
         docs_root_hash: Some("0000000000000000".to_string()),
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };
@@ -90,6 +91,7 @@ async fn test_path_b_agent_scoped_isolation() {
         traversal: None,
         agent_id: Some("mika-qa".to_string()),
         docs_root_hash: Some("ffffffffffffffff".to_string()),
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };
@@ -130,6 +132,7 @@ async fn test_path_b_no_agent_id_skips_subject_layer() {
         traversal: None,
         agent_id: None,
         docs_root_hash: None,
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };

@@ -180,7 +180,7 @@ fn fresh_db_has_schema_meta_with_coalesce_marker() {
 // ===== Schema version =====
 
 #[test]
-fn fresh_db_is_at_v27() {
+fn fresh_db_is_at_v28() {
     let (_dir, conn) = build_fresh_db().unwrap();
 
     let version: i64 = conn
@@ -189,7 +189,7 @@ fn fresh_db_is_at_v27() {
         })
         .unwrap();
 
-    assert_eq!(version, 27, "Fresh DB must be at schema version 27");
+    assert_eq!(version, 28, "Fresh DB must be at schema version 28");
 }
 
 // ===== Index verification =====
@@ -372,4 +372,78 @@ fn kg_extractions_v27_column_structure() {
     assert!(col_names.contains(&"relationships_extracted"));
     assert!(col_names.contains(&"extraction_trace_id"));
     assert!(!col_names.contains(&"agent_id"));
+}
+
+// ===== v28: agent_kg_corpora table structure =====
+
+#[test]
+fn agent_kg_corpora_v28_column_structure() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+    let cols = get_columns(&conn, "agent_kg_corpora").unwrap();
+    let col_names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+
+    assert!(
+        col_names.contains(&"agent_id"),
+        "agent_kg_corpora missing agent_id"
+    );
+    assert!(
+        col_names.contains(&"docs_root_hash"),
+        "agent_kg_corpora missing docs_root_hash"
+    );
+    assert!(
+        col_names.contains(&"docs_root_path"),
+        "agent_kg_corpora missing docs_root_path"
+    );
+    assert!(
+        col_names.contains(&"created_at"),
+        "agent_kg_corpora missing created_at"
+    );
+}
+
+#[test]
+fn agent_kg_corpora_v28_index_exists() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+    let indexes = get_index_names(&conn, "agent_kg_corpora");
+    assert!(
+        indexes.contains("idx_agent_kg_corpora_hash"),
+        "agent_kg_corpora must have idx_agent_kg_corpora_hash index, got: {indexes:?}"
+    );
+}
+
+#[test]
+fn agent_kg_corpora_v28_fk_cascade() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    // Enable FK enforcement
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+    // Insert agent
+    conn.execute(
+        "INSERT INTO agents (id, name, home_dir) VALUES ('test-cascade', 'Test', '')",
+        [],
+    )
+    .unwrap();
+
+    // Insert corpus mapping
+    conn.execute(
+        "INSERT INTO agent_kg_corpora (agent_id, docs_root_hash, docs_root_path) VALUES ('test-cascade', 'aaaa', '/test')",
+        [],
+    )
+    .unwrap();
+
+    // Delete agent — corpus row should cascade
+    conn.execute("DELETE FROM agents WHERE id = 'test-cascade'", [])
+        .unwrap();
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_kg_corpora WHERE agent_id = 'test-cascade'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "agent_kg_corpora rows must cascade on agent delete"
+    );
 }

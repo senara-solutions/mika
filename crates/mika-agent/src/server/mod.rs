@@ -768,82 +768,105 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // Agents with [kg] enabled=false are skipped entirely.
     {
         for (agent_name, agent_state) in &agents {
-            let KgAgentConfig::Enabled {
-                ref docs_root,
-                ref docs_root_hash,
-            } = agent_state.kg_config
-            else {
+            let KgAgentConfig::Enabled { ref corpora } = agent_state.kg_config else {
                 info!(
                     agent = agent_name.as_str(),
                     event = "lexical_ingest_disabled",
-                    reason = "identity.toml [kg].enabled=false",
+                    reason = ?agent_state.kg_config,
                     "KG lexical ingestion disabled — shared-corpus rows remain in DB; \
                      use `mika kg purge --agent <name>` to clean up (#779)"
                 );
                 continue;
             };
 
-            // KgAgentConfig::Enabled guarantees a non-empty docs_root (empty paths
-            // are caught by the empty-path guard in resolve_per_agent_docs_root).
-            // CwdDefault paths may not exist on disk — warn-and-skip per #738 policy.
-            if !docs_root.exists() {
-                info!(
-                    agent = agent_name.as_str(),
-                    docs_root = %docs_root.display(),
-                    "docs_root not found — skipping lexical ingestion"
-                );
-                continue;
-            }
+            for (corpus_idx, corpus) in corpora.iter().enumerate() {
+                let docs_root = &corpus.docs_root;
+                let docs_root_hash = &corpus.docs_root_hash;
 
-            // Drift WARN: first-run corpus with no prior ingestion (#778 R9).
-            match agent_state
-                .db
-                .count_chunks_for_docs_root_hash(docs_root_hash)
-                .await
-            {
-                Ok(0) => {
-                    warn!(
+                // CwdDefault paths may not exist on disk — warn-and-skip per #738 policy.
+                if !docs_root.exists() {
+                    info!(
                         agent = agent_name.as_str(),
                         docs_root = %docs_root.display(),
-                        docs_root_hash = docs_root_hash.as_str(),
-                        "agent docs_root_hash has no matching rows in shared corpus \
-                         — first-run ingestion will populate"
+                        corpus_index = corpus_idx,
+                        corpus_count = corpora.len(),
+                        "docs_root not found — skipping lexical ingestion for this corpus"
                     );
+                    continue;
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(
-                        agent = agent_name.as_str(),
-                        error = %e,
-                        "failed to check corpus drift; continuing with ingestion"
-                    );
-                }
-            }
 
-            let ingestor = crate::kg::lexical_ingestor::LexicalIngestor::new(
-                agent_state.db.clone(),
-                docs_root.clone(),
-                None,
-            );
-            match ingestor.ingest_all().await {
-                Ok(stats) => info!(
-                    event = "lexical_ingest_complete",
-                    agent_id = %agent_name,
-                    docs_root = %docs_root.display(),
-                    docs_root_hash = docs_root_hash.as_str(),
-                    docs_scanned = stats.docs_scanned,
-                    docs_ingested = stats.docs_ingested,
-                    docs_skipped = stats.docs_skipped_unchanged,
-                    docs_pruned = stats.docs_pruned,
-                    chunks_added = stats.chunks_added,
-                    duration_ms = stats.duration_ms,
-                    "lexical ingestion ready"
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    agent_id = %agent_name,
-                    "lexical ingestion failed; chunks may be stale until next restart"
-                ),
+                // Register agent-corpus mapping (#798).
+                if let Err(e) = agent_state
+                    .db
+                    .register_agent_corpus(
+                        agent_name,
+                        docs_root_hash,
+                        &docs_root.display().to_string(),
+                    )
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        agent = agent_name.as_str(),
+                        docs_root_hash = docs_root_hash.as_str(),
+                        "failed to register agent corpus mapping"
+                    );
+                }
+
+                // Drift WARN: first-run corpus with no prior ingestion (#778 R9).
+                match agent_state
+                    .db
+                    .count_chunks_for_docs_root_hash(docs_root_hash)
+                    .await
+                {
+                    Ok(0) => {
+                        warn!(
+                            agent = agent_name.as_str(),
+                            docs_root = %docs_root.display(),
+                            docs_root_hash = docs_root_hash.as_str(),
+                            corpus_index = corpus_idx,
+                            corpus_count = corpora.len(),
+                            "agent docs_root_hash has no matching rows in shared corpus \
+                             — first-run ingestion will populate"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            agent = agent_name.as_str(),
+                            error = %e,
+                            "failed to check corpus drift; continuing with ingestion"
+                        );
+                    }
+                }
+
+                let ingestor = crate::kg::lexical_ingestor::LexicalIngestor::new(
+                    agent_state.db.clone(),
+                    docs_root.clone(),
+                    None,
+                );
+                match ingestor.ingest_all().await {
+                    Ok(stats) => info!(
+                        event = "lexical_ingest_complete",
+                        agent_id = %agent_name,
+                        docs_root = %docs_root.display(),
+                        docs_root_hash = docs_root_hash.as_str(),
+                        corpus_index = corpus_idx,
+                        corpus_count = corpora.len(),
+                        docs_scanned = stats.docs_scanned,
+                        docs_ingested = stats.docs_ingested,
+                        docs_skipped = stats.docs_skipped_unchanged,
+                        docs_pruned = stats.docs_pruned,
+                        chunks_added = stats.chunks_added,
+                        duration_ms = stats.duration_ms,
+                        "lexical ingestion ready"
+                    ),
+                    Err(e) => warn!(
+                        error = %e,
+                        agent_id = %agent_name,
+                        "lexical ingestion failed; chunks may be stale until next restart"
+                    ),
+                }
             }
         }
 
@@ -871,54 +894,70 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     );
                 }
                 for (agent_name, agent_state) in &agents {
-                    let KgAgentConfig::Enabled {
-                        ref docs_root,
-                        docs_root_hash: _,
-                    } = agent_state.kg_config
-                    else {
+                    let KgAgentConfig::Enabled { ref corpora } = agent_state.kg_config else {
                         info!(
                             agent = agent_name.as_str(),
                             event = "extraction_disabled",
-                            reason = "identity.toml [kg].enabled=false",
+                            reason = ?agent_state.kg_config,
                             "KG subject extraction disabled"
                         );
                         continue;
                     };
 
+                    // Shared per-agent budget drained left-to-right across corpora (#798).
                     let db = agent_state.db.clone();
                     let llm = extraction_llm.clone();
-                    let docs_root_clone = docs_root.clone();
                     let agent_name_clone = agent_name.clone();
                     let budget = kg_batch_budget;
+                    let corpora_clone: Vec<_> =
+                        corpora.iter().map(|c| c.docs_root.clone()).collect();
+                    let corpus_count = corpora_clone.len();
 
                     let extraction_agent = agent_name_clone.clone();
                     let handle = tokio::spawn(async move {
-                        let extractor = crate::kg::subject_extractor::SubjectExtractor::new(
-                            db,
-                            llm,
-                            docs_root_clone,
-                            None,
-                        );
-                        match extractor.extract_pending(budget).await {
-                            Ok(stats) => {
-                                if stats.docs_extracted > 0 || stats.docs_failed > 0 {
-                                    info!(
-                                        event = "subject_extraction_ready",
-                                        agent_id = %agent_name_clone,
-                                        docs_extracted = stats.docs_extracted,
-                                        docs_failed = stats.docs_failed,
-                                        entities = stats.total_entities,
-                                        relationships = stats.total_relationships,
-                                        duration_ms = stats.duration_ms,
-                                        "subject extraction complete"
-                                    );
-                                }
+                        let mut remaining_budget = budget;
+                        for (corpus_idx, docs_root) in corpora_clone.into_iter().enumerate() {
+                            if remaining_budget == 0 {
+                                warn!(
+                                    event = "kg_budget_exhausted",
+                                    scope = "extraction",
+                                    agent_id = %agent_name_clone,
+                                    roots_remaining = corpus_count - corpus_idx,
+                                    "extraction budget exhausted; remaining corpora skipped this restart"
+                                );
+                                break;
                             }
-                            Err(e) => warn!(
-                                error = %e,
-                                agent_id = %agent_name_clone,
-                                "subject extraction failed; entities may be stale until next restart"
-                            ),
+                            let extractor = crate::kg::subject_extractor::SubjectExtractor::new(
+                                db.clone(),
+                                llm.clone(),
+                                docs_root,
+                                None,
+                            );
+                            match extractor.extract_pending(remaining_budget).await {
+                                Ok(stats) => {
+                                    if stats.docs_extracted > 0 || stats.docs_failed > 0 {
+                                        info!(
+                                            event = "subject_extraction_ready",
+                                            agent_id = %agent_name_clone,
+                                            corpus_index = corpus_idx,
+                                            corpus_count = corpus_count,
+                                            docs_extracted = stats.docs_extracted,
+                                            docs_failed = stats.docs_failed,
+                                            entities = stats.total_entities,
+                                            relationships = stats.total_relationships,
+                                            duration_ms = stats.duration_ms,
+                                            "subject extraction complete"
+                                        );
+                                    }
+                                    remaining_budget =
+                                        remaining_budget.saturating_sub(stats.llm_calls);
+                                }
+                                Err(e) => warn!(
+                                    error = %e,
+                                    agent_id = %agent_name_clone,
+                                    "subject extraction failed; entities may be stale until next restart"
+                                ),
+                            }
                         }
                     });
                     tokio::spawn(async move {
@@ -1003,33 +1042,33 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             };
 
             for (agent_name, agent_state) in &agents {
-                let KgAgentConfig::Enabled {
-                    docs_root: _,
-                    ref docs_root_hash,
-                } = agent_state.kg_config
-                else {
+                let KgAgentConfig::Enabled { ref corpora } = agent_state.kg_config else {
                     info!(
                         agent = agent_name.as_str(),
                         event = "resolution_disabled",
-                        reason = "identity.toml [kg].enabled=false",
+                        reason = ?agent_state.kg_config,
                         "KG entity resolution disabled"
                     );
                     continue;
                 };
 
+                // Gather all docs_root_hash values for this agent's corpora (#798).
+                let hashes: Vec<String> =
+                    corpora.iter().map(|c| c.docs_root_hash.clone()).collect();
+
                 let db = agent_state.db.clone();
                 let llm = resolution_llm.clone();
                 let agent_name_clone = agent_name.clone();
                 let budget = kg_batch_budget;
-                let drh = docs_root_hash.clone();
 
                 let resolution_agent = agent_name_clone.clone();
                 let handle = tokio::spawn(async move {
                     // Small delay to let extraction tasks commit first.
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                    let resolver =
-                        crate::kg::entity_resolver::SubjectEntityResolver::new(db, llm, drh, None);
+                    let resolver = crate::kg::entity_resolver::SubjectEntityResolver::new(
+                        db, llm, hashes, None,
+                    );
                     match resolver.resolve_pending(budget).await {
                         Ok(stats) => {
                             if stats.matched_exact > 0 || stats.matched_llm > 0 || stats.errors > 0
@@ -1286,7 +1325,9 @@ mod tests {
             llm: llm.clone(),
             github_app: None,
             webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            kg_config: crate::kg::config::KgAgentConfig::Disabled,
+            kg_config: crate::kg::config::KgAgentConfig::Disabled {
+                reason: crate::kg::config::DisabledReason::OperatorOptOut,
+            },
         };
 
         let mut agents = HashMap::new();

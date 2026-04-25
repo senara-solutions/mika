@@ -70,6 +70,7 @@ async fn test_path_c_chunk_to_subject_to_domain_bridge() {
         traversal: None,
         agent_id: Some("mika-dev".to_string()),
         docs_root_hash: None,
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };
@@ -141,6 +142,7 @@ async fn test_path_c_no_resolution_yields_subject_only() {
         traversal: None,
         agent_id: Some("mika-dev".to_string()),
         docs_root_hash: Some("0000000000000000".to_string()),
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };

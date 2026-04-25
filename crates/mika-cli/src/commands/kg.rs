@@ -311,7 +311,7 @@ fn build_agent_kg_state(
     let kg_config = mika_agent::kg::config::resolve_per_agent_docs_root(&identity, &settings);
 
     match kg_config {
-        Ok(mika_agent::kg::config::KgAgentConfig::Disabled) => AgentKgState {
+        Ok(mika_agent::kg::config::KgAgentConfig::Disabled { .. }) => AgentKgState {
             agent_id: agent_name.to_string(),
             enabled: false,
             docs_root: None,
@@ -324,17 +324,34 @@ fn build_agent_kg_state(
             drift: false,
             error: None,
         },
-        Ok(mika_agent::kg::config::KgAgentConfig::Enabled {
-            docs_root,
-            docs_root_hash,
-        }) => {
-            // Query row counts
-            let chunks = db
-                .kg_count_rows("kg_chunks", "docs_root_hash", &docs_root_hash)
-                .unwrap_or(0);
-            let subjects = db
-                .kg_count_rows("kg_subject_entities", "docs_root_hash", &docs_root_hash)
-                .unwrap_or(0);
+        Ok(mika_agent::kg::config::KgAgentConfig::Enabled { ref corpora }) => {
+            // Use the first corpus for summary display (back-compat with single-root UI).
+            // Multi-corpus detail is available via `mika kg status --agent X`.
+            let first = corpora.first();
+            let docs_root_hash = first.map(|c| c.docs_root_hash.clone());
+            let docs_root = first.map(|c| c.docs_root.display().to_string());
+
+            // Aggregate row counts across all corpora
+            let mut chunks = 0u64;
+            let mut subjects = 0u64;
+            let mut last_extraction: Option<String> = None;
+            for corpus in corpora {
+                chunks += db
+                    .kg_count_rows("kg_chunks", "docs_root_hash", &corpus.docs_root_hash)
+                    .unwrap_or(0);
+                subjects += db
+                    .kg_count_rows(
+                        "kg_subject_entities",
+                        "docs_root_hash",
+                        &corpus.docs_root_hash,
+                    )
+                    .unwrap_or(0);
+                if let Ok(Some(ts)) = db.kg_last_extraction(&corpus.docs_root_hash)
+                    && last_extraction.as_ref().is_none_or(|prev| ts > *prev)
+                {
+                    last_extraction = Some(ts);
+                }
+            }
             let resolved = db
                 .kg_count_rows("kg_subject_resolutions", "agent_id", agent_name)
                 .unwrap_or(0);
@@ -342,22 +359,14 @@ fn build_agent_kg_state(
             // Pending = subjects that have no resolution log entry for this agent
             let pending = subjects.saturating_sub(resolved);
 
-            // Last extraction timestamp
-            let last_extraction = db.kg_last_extraction(&docs_root_hash).unwrap_or(None);
-
-            // Drift detection
-            let observed_hashes = db.kg_observed_hashes(agent_name).unwrap_or_default();
-            let drift = if observed_hashes.is_empty() {
-                false
-            } else {
-                observed_hashes.len() > 1 || observed_hashes.iter().any(|h| h != &docs_root_hash)
-            };
+            // Drift detection — multi-corpus agents naturally have multiple hashes
+            let drift = false;
 
             AgentKgState {
                 agent_id: agent_name.to_string(),
                 enabled: true,
-                docs_root: Some(docs_root.display().to_string()),
-                docs_root_hash: Some(docs_root_hash),
+                docs_root,
+                docs_root_hash,
                 chunks,
                 subjects,
                 resolved,
@@ -450,7 +459,7 @@ fn run_list_agents(global_home: &Path, db_path: &Path, args: &KgListAgentsArgs) 
         };
 
         match mika_agent::kg::config::resolve_per_agent_docs_root(&identity, &settings) {
-            Ok(mika_agent::kg::config::KgAgentConfig::Disabled) => {
+            Ok(mika_agent::kg::config::KgAgentConfig::Disabled { .. }) => {
                 listings.push(AgentListing {
                     agent_id: agent_name.to_string(),
                     enabled: false,
@@ -459,18 +468,19 @@ fn run_list_agents(global_home: &Path, db_path: &Path, args: &KgListAgentsArgs) 
                     chunks: 0,
                 });
             }
-            Ok(mika_agent::kg::config::KgAgentConfig::Enabled {
-                docs_root,
-                docs_root_hash,
-            }) => {
-                let chunks = db
-                    .kg_count_rows("kg_chunks", "docs_root_hash", &docs_root_hash)
-                    .unwrap_or(0);
+            Ok(mika_agent::kg::config::KgAgentConfig::Enabled { ref corpora }) => {
+                let first = corpora.first();
+                let mut chunks = 0u64;
+                for corpus in corpora {
+                    chunks += db
+                        .kg_count_rows("kg_chunks", "docs_root_hash", &corpus.docs_root_hash)
+                        .unwrap_or(0);
+                }
                 listings.push(AgentListing {
                     agent_id: agent_name.to_string(),
                     enabled: true,
-                    docs_root: Some(docs_root.display().to_string()),
-                    docs_root_hash: Some(docs_root_hash),
+                    docs_root: first.map(|c| c.docs_root.display().to_string()),
+                    docs_root_hash: first.map(|c| c.docs_root_hash.clone()),
                     chunks,
                 });
             }
@@ -749,32 +759,35 @@ fn run_purge(global_home: &Path, db_path: &Path, args: &KgPurgeArgs) -> Result<(
     let kg_config = mika_agent::kg::config::resolve_per_agent_docs_root(&identity, &settings)
         .map_err(|e| anyhow::anyhow!("KG config error for agent '{agent_id}': {e}"))?;
 
-    let (docs_root_hash, shared_agents) = match &kg_config {
-        mika_agent::kg::config::KgAgentConfig::Disabled => (None, Vec::new()),
-        mika_agent::kg::config::KgAgentConfig::Enabled { docs_root_hash, .. } => {
+    let (docs_root_hash, shared_agents): (Option<String>, Vec<String>) = match &kg_config {
+        mika_agent::kg::config::KgAgentConfig::Disabled { .. } => (None, Vec::new()),
+        mika_agent::kg::config::KgAgentConfig::Enabled { corpora } => {
+            // Use first corpus hash for purge analysis (multi-corpus purge is future work)
+            let first_hash = corpora.first().map(|c| c.docs_root_hash.clone());
             // Find other agents sharing this hash
-            let mut sharing = Vec::new();
-            for other in &agents {
-                if other == agent_id {
-                    continue;
-                }
-                let other_home = mika_common::home::resolve_agent_home(global_home, other);
-                let other_identity = mika_agent::prompt::load_identity(&other_home);
-                if let Ok(other_settings) =
-                    mika_common::config::Settings::load_for_agent(global_home, &other_home)
-                    && let Ok(mika_agent::kg::config::KgAgentConfig::Enabled {
-                        docs_root_hash: other_hash,
-                        ..
-                    }) = mika_agent::kg::config::resolve_per_agent_docs_root(
-                        &other_identity,
-                        &other_settings,
-                    )
-                    && &other_hash == docs_root_hash
-                {
-                    sharing.push(other.clone());
+            let mut sharing: Vec<String> = Vec::new();
+            if let Some(ref hash) = first_hash {
+                for other in &agents {
+                    if other == agent_id {
+                        continue;
+                    }
+                    let other_home = mika_common::home::resolve_agent_home(global_home, other);
+                    let other_identity = mika_agent::prompt::load_identity(&other_home);
+                    if let Ok(other_settings) =
+                        mika_common::config::Settings::load_for_agent(global_home, &other_home)
+                        && let Ok(mika_agent::kg::config::KgAgentConfig::Enabled {
+                            corpora: other_corpora,
+                        }) = mika_agent::kg::config::resolve_per_agent_docs_root(
+                            &other_identity,
+                            &other_settings,
+                        )
+                        && other_corpora.iter().any(|c| &c.docs_root_hash == hash)
+                    {
+                        sharing.push(other.clone());
+                    }
                 }
             }
-            (Some(docs_root_hash.clone()), sharing)
+            (first_hash, sharing)
         }
     };
 

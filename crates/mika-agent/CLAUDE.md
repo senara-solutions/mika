@@ -230,6 +230,53 @@ docs_root = "/absolute/path"      # optional; falls back to global chain above
 
 For OpenRC hosts where the service starts with CWD ≠ repo root, set `MIKA_KG_DOCS_ROOT=/path/to/mika-repo/docs/solutions` in the service config, or use the existing `--chdir` init-script workaround.
 
+### Multi-Corpus Support (#798)
+
+Agents that need to reason across multiple repositories can specify an array of docs roots. The `mika-arch` agent is the canonical example — it indexes all six platform repos' `docs/solutions/` directories.
+
+**Per-agent identity.toml recipe (mika-arch):**
+
+```toml
+name = "mika-arch"
+emoji = "A"
+
+[kg]
+enabled = true
+docs_roots = [
+  "/data/workspace/mika-platform/mika/docs/solutions",
+  "/data/workspace/mika-platform/mika-cloud/docs/solutions",
+  "/data/workspace/mika-platform/mika-skills/docs/solutions",
+  "/data/workspace/mika-platform/claude-pilot-py/docs/solutions",
+  "/data/workspace/mika-platform/openclaw/docs/solutions",
+  "/data/workspace/mika-platform/lettabot/docs/solutions",
+]
+```
+
+**Precedence:** Per-agent `[kg].docs_roots` overrides the global `MIKA_KG_DOCS_ROOTS` env var, which overrides the singular `MIKA_KG_DOCS_ROOT` / `kg_docs_root` chain. If both `docs_root` (singular) and `docs_roots` (plural) are set in the same `[kg]` section, the plural form wins.
+
+**Policy callouts:**
+
+**a. Singular vs plural validation asymmetry:**
+
+| Field | Missing path | Empty value |
+|-------|-------------|-------------|
+| `docs_root` (singular) | Hard-error if explicit; warn-and-skip if CWD default | Skips ingestion with distinct warn |
+| `docs_roots` (plural) | Each path validated independently; missing paths logged as WARN and skipped; agent starts if at least one path is valid | Empty array treated as "not set" (falls back to singular chain) |
+
+**b. Array order matters under budget pressure.** When `MIKA_KG_BATCH_BUDGET` is constrained, corpora are ingested in array order. If the budget is exhausted mid-array, remaining corpora are deferred to the next restart. Place the most important corpus first.
+
+**c. Resolution chain priority (seven tiers, first match wins):**
+
+| Priority | Source | Field |
+|----------|--------|-------|
+| 1 | Per-agent identity.toml | `[kg].docs_roots` (plural) |
+| 2 | Per-agent identity.toml | `[kg].docs_root` (singular) |
+| 3 | Environment variable | `MIKA_KG_DOCS_ROOTS` (colon-separated) |
+| 4 | Environment variable | `MIKA_KG_DOCS_ROOT` |
+| 5 | Config file | `kg_docs_roots` in config.toml (plural) |
+| 6 | Config file | `kg_docs_root` in config.toml |
+| 7 | CWD default | `<CWD>/docs/solutions` |
+
 ## Knowledge Graph — Subject Extractor
 
 `src/kg/subject_extractor.rs` — Per-agent LLM-based extraction of named entities and fact triples from previously-ingested documents (#690). Uses constrained NER with approved entity/relationship types and structural validation (not just prompt-based).
@@ -364,7 +411,7 @@ All SQLite timestamp columns use ISO 8601 TEXT format (`%Y-%m-%dT%H:%M:%SZ`). Th
 
 ## Schema Version
 
-**Current: v27.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls, tool_calls, team_runs, schema_meta (migration state tracking), kg_entities, kg_relationships. **Shared-corpus KG tables (keyed by `docs_root_hash`):** kg_chunks, kg_subject_entities, kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions (first-writer-wins via INSERT OR IGNORE). **Per-agent KG tables:** kg_subject_resolutions, kg_resolutions_log. `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
+**Current: v28.** Tables: sessions, messages (with `internal` flag for agent-to-agent visibility), team_workspace, audit_events, skill_overrides (with `enabled` column for DB-backed disable state), tasks (with manual/callback/a2a trigger types and a `type` column distinguishing `issue`/`milestone`/`project`), a2a_task_map, a2a_artifacts, a2a_push_notification_configs, llm_calls, tool_calls, team_runs, schema_meta (migration state tracking), kg_entities, kg_relationships. **Shared-corpus KG tables (keyed by `docs_root_hash`):** kg_chunks, kg_subject_entities, kg_subject_relationships, kg_chunk_subjects, kg_chunk_subject_relationships, kg_extractions (first-writer-wins via INSERT OR IGNORE). **Per-agent KG tables:** kg_subject_resolutions, kg_resolutions_log, agent_kg_corpora (agent_id to docs_root_hash mapping for multi-corpus fan-out). `unified_timeline` VIEW for cross-subsystem queries. Session-based message storage with FK. System sessions (`system-{agent_id}`) for compaction.
 
 Recent migrations:
 - v18->v19: `sessions.task_id` column for reverse session->task lookups. `get_sessions_for_task_tree()`.
@@ -375,6 +422,7 @@ Recent migrations:
 - v23->v24: `skill_overrides.enabled` column (`INTEGER`, nullable tri-state). `NULL` = default (enabled), `0` = disabled, `1` = explicitly enabled. Replaces `.disabled` marker files (#629). `SkillOverride.enabled: Option<bool>`. `set_skill_enabled()` with default-equals-delete (row deleted when all columns are NULL). `apply_overrides()` evicts disabled skills from `SkillRegistry.entries` into `disabled: Vec<DisabledSkill>`. One-shot `migrate_disabled_markers()` converts legacy `.disabled` marker files to DB rows at startup (fail-open on marker removal).
 - v24->v25: Knowledge graph tables. Domain layer: `kg_entities`, `kg_relationships`. Lexical layer: `kg_chunks` + `search_content` integration. Subject layer: `kg_subject_entities`, `kg_subject_relationships`, provenance tables (`kg_chunk_subjects`, `kg_chunk_subject_relationships`), `kg_extractions` tracking. Resolution layer (#691): `kg_subject_resolutions` (subject → domain edges with confidence, UNIQUE on agent_id+subject_entity_id+domain_entity_id), `kg_resolutions_log` (resolution tracking with outcome CHECK constraint, UNIQUE on agent_id+subject_entity_id).
 - v25->v26: `kg_extractions.source_doc_hash TEXT` (nullable) for #757 extraction idempotency. Pending-doc query now compares the stored hash against `kg_chunks.source_doc_hash` directly; pre-v26 rows get NULL and re-extract once under the budget before populating. Additive-nullable; no backfill needed. See `src/db/kg_schema.rs` → **Idempotency key** for the full contract.
+- v27->v28: `agent_kg_corpora` table (#798) — maps `agent_id` to `docs_root_hash` for multi-corpus query fan-out. Populated by startup lexical ingest. Enables agents with `[kg].docs_roots` (plural) to query across multiple corpora.
 - v26->v27: **Shared-corpus primary key** (#786 + #787). Six shared-layer KG tables (`kg_chunks`, `kg_subject_entities`, `kg_subject_relationships`, `kg_chunk_subjects`, `kg_chunk_subject_relationships`, `kg_extractions`) change primary-key scope from `agent_id` to `docs_root_hash` — a 16-hex-char SHA-256 prefix of `fs::canonicalize(docs_root)` computed by `kg::config::hash_docs_root`. Agents with the same `docs_root` now share a single corpus; extraction cost drops from N× to 1×. Per-agent tables (`kg_subject_resolutions`, `kg_resolutions_log`) FK-rewired but row-count preserved. `schema_meta` table added for migration state tracking. Two-phase migration: (1) DDL renames v26 tables to `*_v26_backup`, creates empty v27 tables (#786); (2) coalesce reads from backups, deduplicates via majority-vote (normalized `entity_key`, agent-count + mean-confidence + `MIN(id)` tiebreak), rewires FKs via temp lookup tables, drops backups, writes `v27_coalesce_complete` marker (#787). `v27_coalesce_sql()` is public for integration test access. `docs_root` resolved from `MIKA_KG_DOCS_ROOT` env var or CWD fallback at migration time. Startup guard refuses `Database::open()` when `schema_version == 27` and marker is absent. Recovery runbook: `docs/solutions/database-issues/kg-v27-stuck-migration-recovery-2026-04-24.md`.
 
 Full migration history: see `docs/runtime-structure.md`.
