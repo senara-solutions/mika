@@ -2154,6 +2154,39 @@ mod tests {
 
     #[test]
     #[serial]
+    fn kg_docs_roots_get_effective_value() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOTS", "/x:/y:/z") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(
+            get_effective_value("kg_docs_roots", &settings),
+            Some("/x:/y:/z".to_string())
+        );
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_toml_empty_array_is_none() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "kg_docs_roots = []\n").unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(
+            settings.kg_docs_roots.is_none(),
+            "empty TOML array should yield None"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn kg_docs_roots_four_element_env_var() {
         clean_env();
         // Safety: test-only env var.
