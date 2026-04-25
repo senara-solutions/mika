@@ -573,6 +573,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     if settings.dev_mode {
         crate::well_known_agents::provision_well_known_agents(
             global_home,
+            settings,
             settings.disable_agent_provisioning,
         );
     }

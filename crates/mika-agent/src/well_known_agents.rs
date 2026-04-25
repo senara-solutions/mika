@@ -6,11 +6,13 @@
 
 use std::path::Path;
 
-use tracing::{info, warn};
+use mika_common::config::Settings;
+use tracing::{error, info, warn};
 
 use crate::db::Database;
 
 /// Per-skill LLM override to seed on first creation.
+#[non_exhaustive]
 pub struct LlmOverrideSpec {
     /// Skill name to override.
     pub skill_name: &'static str,
@@ -20,7 +22,29 @@ pub struct LlmOverrideSpec {
     pub model: &'static str,
 }
 
+/// Builder for an agent's identity.toml content.
+///
+/// Static variant: a `&'static str` template baked into the binary (used by
+/// agents whose identity is fully known at compile time).
+///
+/// Computed variant: a function that receives `&Settings` and returns the
+/// rendered identity.toml content. Used by agents whose identity depends on
+/// runtime configuration (e.g., mika-arch's `[kg].docs_roots` which must be
+/// absolute paths derived from `MIKA_KG_DOCS_ROOTS` at provision time).
+///
+/// Failure semantics: a `Computed` builder may return `Err(String)` to signal
+/// "this agent cannot be provisioned on this host" (e.g., required env not
+/// set). The provisioner logs `error!` with the agent name and the message,
+/// then SKIPS this agent so other well-known agents can still come up.
+pub enum IdentitySource {
+    /// Static template — content is the same across all hosts.
+    Static(&'static str),
+    /// Computed at provision time from `Settings`.
+    Computed(fn(&Settings) -> Result<String, String>),
+}
+
 /// Specification for a well-known development agent.
+#[non_exhaustive]
 pub struct WellKnownAgent {
     /// Agent name (lowercase, hyphenated).
     pub name: &'static str,
@@ -36,11 +60,11 @@ pub struct WellKnownAgent {
     /// When `Some`, overwrites the default config.toml with agent-specific
     /// LLM provider/model settings.
     pub config_toml: Option<&'static str>,
-    /// Optional custom identity.toml content. When `Some`, overrides the
+    /// Optional custom identity.toml builder. When `Some`, overrides the
     /// default template (which only sets name + emoji + commented KG block).
-    /// Used by agents like mika-arch that need `[skills].allowlist` and
-    /// custom `[kg].docs_roots` in identity.toml.
-    pub identity_toml: Option<&'static str>,
+    /// Used by agents like mika-arch that need `[skills].allowlist`,
+    /// `[tools].disabled`, and runtime-resolved `[kg].docs_roots`.
+    pub identity_source: Option<IdentitySource>,
     /// Per-skill LLM overrides to seed in `skill_overrides` DB table.
     /// Only applied on first creation (same guard as `disabled_skills`).
     pub llm_overrides: &'static [LlmOverrideSpec],
@@ -52,9 +76,18 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
     display_name: "Dev",
     emoji: "🛠",
     soul: MIKA_DEV_SOUL,
-    disabled_skills: &["qa-review", "qa-review-build-callback", "skill-review"],
+    // mika-arch-* skills are review-class for the architect agent only;
+    // exclude them from mika-dev to prevent context pollution and arch-style
+    // keyword triggers firing on dev work.
+    disabled_skills: &[
+        "qa-review",
+        "qa-review-build-callback",
+        "skill-review",
+        "mika-arch-groom-ticket",
+        "mika-arch-second-review",
+    ],
     config_toml: None,
-    identity_toml: None,
+    identity_source: None,
     llm_overrides: &[],
 };
 
@@ -74,9 +107,13 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
         "agents-teams",
         "address-pr-comments",
         "resolve-pr-conflicts",
+        // mika-arch-* skills are for the architect agent only — keep mika-qa
+        // focused on PR review without arch-style triggers.
+        "mika-arch-groom-ticket",
+        "mika-arch-second-review",
     ],
     config_toml: None,
-    identity_toml: None,
+    identity_source: None,
     llm_overrides: &[],
 };
 
@@ -122,7 +159,7 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
         "browser-control",
     ],
     config_toml: Some(MIKA_RELAY_CONFIG),
-    identity_toml: None,
+    identity_source: None,
     llm_overrides: &[],
 };
 
@@ -132,6 +169,10 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
 /// skill allowlist (only `mika-arch-groom-ticket` and `mika-arch-second-review`
 /// are enabled). Base model is Kimi; per-skill LLM overrides route to
 /// Opus 4.7 (groom-ticket) and Sonnet 4.6 (second-review).
+///
+/// Identity is computed at provision time from `Settings.kg_docs_roots` so
+/// `[kg].docs_roots` contains absolute paths. Without `MIKA_KG_DOCS_ROOTS`
+/// set, mika-arch is skipped at provision with an explicit `error!` log.
 pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
     name: "mika-arch",
     display_name: "Architect",
@@ -140,7 +181,7 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
     // Empty: mika-arch uses identity allowlist, not denylist.
     disabled_skills: &[],
     config_toml: Some(MIKA_ARCH_CONFIG),
-    identity_toml: Some(MIKA_ARCH_IDENTITY),
+    identity_source: Some(IdentitySource::Computed(build_mika_arch_identity)),
     llm_overrides: &[
         LlmOverrideSpec {
             skill_name: "mika-arch-groom-ticket",
@@ -155,12 +196,146 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
     ],
 };
 
+/// Tools mika-arch must NOT receive in its LLM tool array.
+///
+/// These names are baked into mika-arch's identity.toml `[tools].disabled`
+/// at provision time. The filter is applied in
+/// `agent::apply_agent_tool_visibility()` at LLM-tool-array assembly — the
+/// model never sees these tools, cannot call them, cannot be prompt-injected
+/// into trying. Defense-in-depth for the read-only-architect invariant.
+///
+/// Categories:
+/// - Memory mutations: writes to platform memory tables
+/// - Skill mutations: writes to skills on disk or `skill_overrides` rows
+/// - Config / files: writes to settings or agent files
+/// - Reminders / scheduled tasks: writes to scheduled_tasks rows
+/// - Tasks: mutates task state
+/// - PR mutations: merges PRs
+/// - Cross-agent invocation: mika-arch is advisory; it does not initiate
+///   activity in other agents' lanes (target-agent boundary leak)
+/// - Agent / team mutations: provisions/edits other agents and teams
+///
+/// Notably allowed:
+/// - `send_message`: writes to mika-arch's own session history. Constitutive
+///   of being an agent — denying it leaves mika-arch unable to deliver
+///   verdicts in non-skill-output contexts. Not a platform side-effect.
+pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
+    // Memory mutations
+    "update_core_memory",
+    "store_fact",
+    "update_fact",
+    // Skill mutations
+    "create_skill",
+    "delete_skill",
+    "toggle_skill",
+    "update_skill",
+    // Config / files
+    "set_config",
+    "write_agent_file",
+    // Reminders
+    "create_reminder",
+    "cancel_reminder",
+    // Tasks
+    "cancel_task",
+    "complete_task",
+    "create_task",
+    "update_task_status",
+    // PR mutations
+    "pr_merge_with_gate",
+    // Cross-agent invocation: mika-arch is advisory, does not orchestrate
+    "a2a_call",
+    "delegate_task",
+    "run_team",
+    // Agent / team mutations
+    "create_agent",
+    "create_team",
+    "delete_team",
+    "update_team",
+    "add_team_member",
+    "remove_team_member",
+];
+
+/// Build mika-arch's identity.toml with absolute `[kg].docs_roots` paths
+/// derived from `Settings.kg_docs_roots`.
+///
+/// Returns `Err` when `MIKA_KG_DOCS_ROOTS` (or `kg_docs_roots` in config.toml)
+/// is unset or empty. The provisioner logs the error and skips mika-arch so
+/// other well-known agents still come up.
+fn build_mika_arch_identity(settings: &Settings) -> Result<String, String> {
+    let docs_roots = settings
+        .kg_docs_roots
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            "MIKA_KG_DOCS_ROOTS (or kg_docs_roots in config.toml) not set; \
+         mika-arch requires absolute paths to docs corpora and cannot be \
+         provisioned without them"
+                .to_string()
+        })?;
+
+    let mut roots_block = String::new();
+    for path in docs_roots {
+        let s = path.to_string_lossy();
+        if !path.is_absolute() {
+            return Err(format!(
+                "MIKA_KG_DOCS_ROOTS contains a relative path '{s}'; mika-arch \
+                 requires absolute paths because mika-server runs with CWD=/ \
+                 in production"
+            ));
+        }
+        roots_block.push_str(&format!("  \"{s}\",\n"));
+    }
+
+    let mut tools_block = String::from("disabled = [\n");
+    for tool in MIKA_ARCH_DISABLED_TOOLS {
+        tools_block.push_str(&format!("  \"{tool}\",\n"));
+    }
+    tools_block.push(']');
+
+    Ok(format!(
+        r#"name = "Architect"
+emoji = "🏛"
+
+[kg]
+enabled = true
+docs_roots = [
+{roots_block}]
+
+[skills]
+allowlist = ["mika-arch-groom-ticket", "mika-arch-second-review"]
+
+[tools]
+{tools_block}
+"#
+    ))
+}
+
 /// All well-known agents.
 pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] = &[&MIKA_DEV, &MIKA_QA, &MIKA_RELAY, &MIKA_ARCH];
 
 /// Look up a well-known agent by name.
 pub fn find_well_known_agent(name: &str) -> Option<&'static WellKnownAgent> {
     WELL_KNOWN_AGENTS.iter().find(|a| a.name == name).copied()
+}
+
+/// Render the identity.toml content for a well-known agent.
+///
+/// Resolves the spec's `identity_source`:
+/// - `None` → default template (name + emoji + commented KG block).
+/// - `Some(Static(s))` → returns `s`.
+/// - `Some(Computed(f))` → calls `f(settings)`; propagates `Err`.
+fn render_identity_content(spec: &WellKnownAgent, settings: &Settings) -> Result<String, String> {
+    match &spec.identity_source {
+        None => Ok(format!(
+            "name = \"{}\"\nemoji = \"{}\"\n\n\
+             # [kg]\n\
+             # enabled = true                    # default: true — set false to skip KG for this agent\n\
+             # docs_root = \"/path/to/docs\"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions\n",
+            spec.display_name, spec.emoji
+        )),
+        Some(IdentitySource::Static(s)) => Ok((*s).to_string()),
+        Some(IdentitySource::Computed(f)) => f(settings),
+    }
 }
 
 /// Provision well-known development agents on the filesystem.
@@ -172,7 +347,11 @@ pub fn find_well_known_agent(name: &str) -> Option<&'static WellKnownAgent> {
 /// When `disabled` is true, logs a warning and returns without changes.
 /// This is the filesystem phase — DB skill overrides are set separately
 /// in [`seed_well_known_skill_overrides`] during agent init.
-pub fn provision_well_known_agents(home_dir: &Path, disabled: bool) {
+///
+/// Computed-identity failures (e.g., mika-arch when `MIKA_KG_DOCS_ROOTS` is
+/// unset) emit `error!` and skip THAT agent — other well-known agents still
+/// come up. Operator sees the error in logs and fixes the env config.
+pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disabled: bool) {
     if disabled {
         warn!(
             "agent provisioning disabled by config \
@@ -191,24 +370,25 @@ pub fn provision_well_known_agents(home_dir: &Path, disabled: bool) {
             continue;
         }
 
+        // Render identity.toml content first — bail before bootstrap if
+        // computed-identity returned Err so we don't leave a half-provisioned
+        // directory tree behind.
+        let identity_content = match render_identity_content(spec, settings) {
+            Ok(content) => content,
+            Err(e) => {
+                error!(
+                    agent = spec.name,
+                    error = %e,
+                    "well-known agent identity could not be rendered — skipping provisioning"
+                );
+                continue;
+            }
+        };
+
         match mika_common::home::bootstrap_agent(home_dir, spec.name) {
             Ok(()) => {
                 let agent_home = mika_common::agent::agent_dir(home_dir, spec.name);
 
-                // Overwrite identity.toml with agent-specific content.
-                // If the spec provides custom identity_toml, use it directly;
-                // otherwise fall back to the default template (name + emoji + commented KG).
-                let identity_content = if let Some(custom) = spec.identity_toml {
-                    custom.to_string()
-                } else {
-                    format!(
-                        "name = \"{}\"\nemoji = \"{}\"\n\n\
-                         # [kg]\n\
-                         # enabled = true                    # default: true — set false to skip KG for this agent\n\
-                         # docs_root = \"/path/to/docs\"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions\n",
-                        spec.display_name, spec.emoji
-                    )
-                };
                 if let Err(e) = std::fs::write(agent_home.join("identity.toml"), &identity_content)
                 {
                     warn!(
@@ -427,26 +607,27 @@ llm_max_tokens = 8192
 log_level = "info"
 "#;
 
-const MIKA_ARCH_IDENTITY: &str = r#"name = "Architect"
-emoji = "🏛"
-
-[kg]
-enabled = true
-docs_roots = [
-  "mika/docs/solutions",
-  "mika-platform/docs/solutions",
-  "mika-skills/docs/solutions",
-  "mika-cloud/docs/solutions",
-]
-
-[skills]
-allowlist = ["mika-arch-groom-ticket", "mika-arch-second-review"]
-"#;
+// MIKA_ARCH_IDENTITY is no longer a static const — see build_mika_arch_identity()
+// above. Identity is rendered at provision time from `Settings.kg_docs_roots` so
+// `[kg].docs_roots` always contains absolute paths.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
+
+    /// Test settings with kg_docs_roots populated so mika-arch identity computation succeeds.
+    /// Uses fake-but-absolute paths — mika-arch identity rendering only validates absoluteness,
+    /// not existence. The KG ingest pipeline does its own existence validation downstream.
+    fn test_settings_with_kg_roots() -> Settings {
+        let mut s = Settings::test_defaults();
+        s.kg_docs_roots = Some(vec![
+            PathBuf::from("/tmp/test-kg-corpus-a"),
+            PathBuf::from("/tmp/test-kg-corpus-b"),
+        ]);
+        s
+    }
 
     #[test]
     fn test_find_well_known_agent_found() {
@@ -475,12 +656,152 @@ mod tests {
         // Create the agents directory
         fs::create_dir_all(home.join("agents")).unwrap();
 
-        provision_well_known_agents(home, false);
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
 
-        // All well-known agents should exist
+        // Iterate WELL_KNOWN_AGENTS rather than hard-coding names so adding a
+        // future well-known agent automatically extends this test.
+        for spec in WELL_KNOWN_AGENTS {
+            assert!(
+                mika_common::agent::agent_exists(home, spec.name),
+                "well-known agent {} was not provisioned",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_provision_skips_mika_arch_when_kg_docs_roots_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("agents")).unwrap();
+
+        // Settings without kg_docs_roots — mika-arch must be skipped, others must come up.
+        let mut settings = Settings::test_defaults();
+        settings.kg_docs_roots = None;
+        provision_well_known_agents(home, &settings, false);
+
         assert!(mika_common::agent::agent_exists(home, "mika-dev"));
         assert!(mika_common::agent::agent_exists(home, "mika-qa"));
         assert!(mika_common::agent::agent_exists(home, "mika-relay"));
+        assert!(
+            !mika_common::agent::agent_exists(home, "mika-arch"),
+            "mika-arch must NOT be provisioned without absolute docs_roots"
+        );
+    }
+
+    #[test]
+    fn test_mika_arch_identity_has_absolute_docs_roots() {
+        let settings = test_settings_with_kg_roots();
+        let toml = build_mika_arch_identity(&settings).expect("identity should render");
+        assert!(toml.contains("/tmp/test-kg-corpus-a"));
+        assert!(toml.contains("/tmp/test-kg-corpus-b"));
+        // No relative paths leaked through
+        assert!(!toml.contains("\"mika/docs/solutions\""));
+    }
+
+    #[test]
+    fn test_mika_arch_identity_rejects_relative_paths() {
+        let mut settings = Settings::test_defaults();
+        settings.kg_docs_roots = Some(vec![PathBuf::from("relative/path")]);
+        let err = build_mika_arch_identity(&settings).expect_err("must reject relative");
+        assert!(err.contains("relative path"));
+    }
+
+    #[test]
+    fn test_mika_arch_identity_has_tools_disabled_block() {
+        let toml = build_mika_arch_identity(&test_settings_with_kg_roots()).unwrap();
+        assert!(toml.contains("[tools]"));
+        assert!(toml.contains("\"pr_merge_with_gate\""));
+        assert!(toml.contains("\"a2a_call\""));
+        assert!(toml.contains("\"update_core_memory\""));
+        // send_message must NOT be in the disabled list (constitutive of being an agent)
+        assert!(!toml.contains("\"send_message\""));
+    }
+
+    #[test]
+    fn test_mika_arch_disabled_tools_does_not_include_send_message() {
+        assert!(
+            !MIKA_ARCH_DISABLED_TOOLS.contains(&"send_message"),
+            "send_message must remain visible to mika-arch — it writes to the agent's own \
+             session history (constitutive), not platform state"
+        );
+    }
+
+    /// Skills that front a write-capable tool (i.e., one in any well-known
+    /// agent's `disabled_tools` denylist or otherwise mutational).
+    ///
+    /// **Keep in sync with skills that front any tool in
+    /// `MIKA_ARCH_DISABLED_TOOLS` or any other well-known agent's denylist.**
+    /// Adding a write-capable bundled skill without updating this list will
+    /// allow `test_well_known_allowlist_excludes_write_capable_skills` to
+    /// silently pass.
+    ///
+    /// Future migration: when the maintainability cluster lands and
+    /// `SkillRegistry::load_for_agent` is extracted, this constant should be
+    /// replaced by a derived predicate (`skills_with_write_tools()`) that
+    /// inspects each skill's `tools.json` against the active denylist.
+    /// Until then: hardcoded list, explicit naming for greppability.
+    const WRITE_CAPABLE_SKILLS_FOR_INVARIANT_TEST: &[&str] = &[
+        // Skills that front exec/write tools
+        "self-dev",
+        "self-dev-iterate",
+        "self-dev-webhook-qa",
+        "self-dev-webhook-ci",
+        "self-dev-sprint",
+        "claude-pilot",
+        "build-mika",
+        "deploy-mika",
+        "agents-teams",
+        "address-pr-comments",
+        "resolve-pr-conflicts",
+        "self-check",
+        // QA skills that front pr_merge/run_gh-write
+        "qa-review",
+        "qa-review-build-callback",
+        // Skill management
+        "skill-review",
+        // Permission policy executes side-effects
+        "permission-policy",
+    ];
+
+    /// Invariant: well-known agents that declare a `[skills].allowlist` (i.e.
+    /// they're advertised as scoped/read-only) must not have any write-capable
+    /// bundled skill in their active set after the allowlist is applied.
+    ///
+    /// This protects against the silent-reorder regression flagged by the
+    /// testing reviewer: if a future refactor reorders `apply_identity_allowlist`
+    /// vs `apply_overrides`, or if a new write-capable skill ships and isn't
+    /// added to the denylist tracker above, this test fails loud.
+    #[test]
+    fn test_well_known_allowlist_excludes_write_capable_skills() {
+        for spec in WELL_KNOWN_AGENTS {
+            // Render identity for this agent. Static-no-identity agents skip;
+            // computed agents use test settings.
+            let identity_toml = match render_identity_content(spec, &test_settings_with_kg_roots())
+            {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let identity: crate::prompt::Identity = match toml::from_str(&identity_toml) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let allowlist = match identity.skills.allowlist {
+                Some(a) if !a.is_empty() => a,
+                _ => continue, // Agents without an allowlist aren't gated by this invariant.
+            };
+
+            for entry in &allowlist {
+                assert!(
+                    !WRITE_CAPABLE_SKILLS_FOR_INVARIANT_TEST.contains(&entry.as_str()),
+                    "well-known agent '{}' has write-capable skill '{}' in its [skills].allowlist. \
+                     Either remove it from the allowlist or remove it from \
+                     WRITE_CAPABLE_SKILLS_FOR_INVARIANT_TEST (with justification).",
+                    spec.name,
+                    entry,
+                );
+            }
+        }
     }
 
     #[test]
@@ -489,7 +810,7 @@ mod tests {
         let home = tmp.path();
         fs::create_dir_all(home.join("agents")).unwrap();
 
-        provision_well_known_agents(home, false);
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
 
         let dev_identity = fs::read_to_string(
             mika_common::agent::agent_dir(home, "mika-dev").join("identity.toml"),
@@ -519,7 +840,7 @@ mod tests {
         let home = tmp.path();
         fs::create_dir_all(home.join("agents")).unwrap();
 
-        provision_well_known_agents(home, false);
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
 
         let dev_soul =
             fs::read_to_string(mika_common::agent::agent_dir(home, "mika-dev").join("soul.md"))
@@ -546,7 +867,7 @@ mod tests {
         let home = tmp.path();
         fs::create_dir_all(home.join("agents")).unwrap();
 
-        provision_well_known_agents(home, false);
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
 
         let relay_config = fs::read_to_string(
             mika_common::agent::agent_dir(home, "mika-relay").join("config.toml"),
@@ -573,7 +894,7 @@ mod tests {
         let dev_home = mika_common::agent::agent_dir(home, "mika-dev");
         fs::write(dev_home.join("soul.md"), "custom soul content").unwrap();
 
-        provision_well_known_agents(home, false);
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
 
         // mika-dev should keep custom soul
         let dev_soul = fs::read_to_string(dev_home.join("soul.md")).unwrap();
@@ -593,7 +914,7 @@ mod tests {
         mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
         assert!(!mika_common::agent::agent_exists(home, "mika-qa"));
 
-        provision_well_known_agents(home, false);
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
 
         // mika-qa should now exist
         assert!(mika_common::agent::agent_exists(home, "mika-qa"));
@@ -605,7 +926,7 @@ mod tests {
         let home = tmp.path();
         fs::create_dir_all(home.join("agents")).unwrap();
 
-        provision_well_known_agents(home, true);
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), true);
 
         // No agents should be created
         assert!(!mika_common::agent::agent_exists(home, "mika-dev"));
@@ -766,12 +1087,19 @@ mod tests {
 
     #[test]
     fn test_well_known_agent_specs_dev_qa_no_overlap() {
-        // Verify the dev and qa skill lists don't overlap (they have
-        // complementary roles — one builds, the other reviews)
+        // Dev and QA have complementary roles — dev builds, qa reviews. Their
+        // disabled lists should not overlap EXCEPT for skills that are owned
+        // by a third agent (mika-arch). Both dev and qa correctly exclude
+        // mika-arch's review skills to prevent context pollution.
+        let allowed_overlap: &[&str] = &["mika-arch-groom-ticket", "mika-arch-second-review"];
         for dev_skill in MIKA_DEV.disabled_skills {
+            if allowed_overlap.contains(dev_skill) {
+                continue;
+            }
             assert!(
                 !MIKA_QA.disabled_skills.contains(dev_skill),
-                "skill '{}' is disabled for both mika-dev and mika-qa",
+                "skill '{}' is disabled for both mika-dev and mika-qa (and is not \
+                 in the allowed overlap set for third-agent-owned skills)",
                 dev_skill
             );
         }
@@ -849,24 +1177,38 @@ mod tests {
     }
 
     #[test]
-    fn test_mika_arch_identity_toml_has_allowlist() {
+    fn test_mika_arch_identity_toml_has_allowlist_and_disabled_tools() {
+        let rendered = build_mika_arch_identity(&test_settings_with_kg_roots())
+            .expect("MIKA_ARCH identity should render with valid settings");
         let identity: crate::prompt::Identity =
-            toml::from_str(MIKA_ARCH_IDENTITY).expect("MIKA_ARCH_IDENTITY should parse");
+            toml::from_str(&rendered).expect("rendered identity should parse");
         assert_eq!(identity.name, "Architect");
         assert_eq!(identity.emoji, "🏛");
         assert!(identity.kg.enabled);
         let docs_roots = identity.kg.docs_roots.expect("should have docs_roots");
-        assert_eq!(docs_roots.len(), 4);
+        assert_eq!(docs_roots.len(), 2);
         let allowlist = identity.skills.allowlist.expect("should have allowlist");
         assert_eq!(allowlist.len(), 2);
         assert!(allowlist.contains(&"mika-arch-groom-ticket".to_string()));
         assert!(allowlist.contains(&"mika-arch-second-review".to_string()));
+        // Tool denylist must be present and contain the load-bearing items.
+        assert_eq!(
+            identity.tools.disabled.len(),
+            MIKA_ARCH_DISABLED_TOOLS.len()
+        );
+        assert!(
+            identity
+                .tools
+                .disabled
+                .contains(&"pr_merge_with_gate".to_string())
+        );
+        assert!(identity.tools.disabled.contains(&"a2a_call".to_string()));
     }
 
     #[test]
     fn test_provision_mika_arch() {
         let home = tempfile::tempdir().unwrap();
-        provision_well_known_agents(home.path(), false);
+        provision_well_known_agents(home.path(), &test_settings_with_kg_roots(), false);
 
         let arch_home = mika_common::agent::agent_dir(home.path(), "mika-arch");
         assert!(arch_home.exists(), "mika-arch agent directory should exist");

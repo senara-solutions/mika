@@ -105,6 +105,27 @@ pub struct SkillsIdentityConfig {
     pub allowlist: Option<Vec<String>>,
 }
 
+/// Tool visibility config from the `[tools]` block in identity.toml.
+///
+/// Used by well-known agents (mika-arch, etc.) to deny specific built-in tools
+/// at the LLM-presentation layer. Listed tool names are filtered out of the tool
+/// array sent to the model — the model never sees them, cannot call them, and
+/// cannot be prompt-injected into trying. Defense-in-depth for read-only agents.
+///
+/// Filter is applied in `agent::apply_agent_tool_visibility()` after the registry
+/// is materialized for the API call. The shared `Arc<ToolRegistry>` is unchanged.
+///
+/// Future migration: when well-known agents move from denylist to allowlist for
+/// tools (mirroring the skill allowlist), add a sibling `allowlist` field here
+/// and update `apply_agent_tool_visibility` to handle both.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ToolsIdentityConfig {
+    /// Tool names that must not appear in this agent's LLM tool array.
+    /// Empty = all registry tools visible (current default).
+    #[serde(default)]
+    pub disabled: Vec<String>,
+}
+
 /// Agent identity loaded from ~/.mika/identity.toml.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Identity {
@@ -118,6 +139,8 @@ pub struct Identity {
     pub kg: KgIdentityConfig,
     #[serde(default)]
     pub skills: SkillsIdentityConfig,
+    #[serde(default)]
+    pub tools: ToolsIdentityConfig,
 }
 
 fn default_name() -> String {
@@ -136,16 +159,32 @@ impl Default for Identity {
             reflection: None,
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
+            tools: ToolsIdentityConfig::default(),
         }
     }
 }
 
 /// Load identity from ~/.mika/identity.toml.
-/// Returns defaults if file is missing or invalid.
+///
+/// Returns defaults if the file is missing.
+///
+/// On parse error: emits `error!` and applies fail-closed semantics for
+/// well-known agents (e.g., mika-arch). Specifically:
+/// - For well-known agents, returns an `Identity` with `skills.allowlist =
+///   Some(vec!["__fail_closed__"])` (a sentinel that matches no real skill,
+///   evicting all bundled skills) and `tools.disabled` = full mutational set.
+///   The agent is effectively neutered until the operator fixes the file.
+/// - For user-defined agents, falls back to `Identity::default()` (current
+///   behavior — they have no security contract to preserve).
+///
+/// The well-known check uses the home_dir's last component matched against
+/// `find_well_known_agent`. This keeps the discrimination at the load layer
+/// where it belongs, without requiring every caller to know the agent's
+/// well-known status.
 pub fn load_identity(home_dir: &Path) -> Identity {
     let path = home_dir.join("identity.toml");
     match std::fs::read_to_string(&path) {
-        Ok(content) => toml::from_str(&content).unwrap_or_default(),
+        Ok(content) => parse_identity_or_fail_closed(&content, home_dir, &path),
         Err(_) => Identity::default(),
     }
 }
@@ -155,8 +194,66 @@ pub fn load_identity(home_dir: &Path) -> Identity {
 pub async fn load_identity_async(home_dir: &Path) -> Identity {
     let path = home_dir.join("identity.toml");
     match tokio::fs::read_to_string(&path).await {
-        Ok(content) => toml::from_str(&content).unwrap_or_default(),
+        Ok(content) => parse_identity_or_fail_closed(&content, home_dir, &path),
         Err(_) => Identity::default(),
+    }
+}
+
+fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) -> Identity {
+    match toml::from_str::<Identity>(content) {
+        Ok(identity) => identity,
+        Err(parse_err) => {
+            let agent_name = home_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>");
+
+            // Well-known agents fail closed; user agents fall back to defaults.
+            let is_well_known =
+                crate::well_known_agents::find_well_known_agent(agent_name).is_some();
+
+            if is_well_known {
+                tracing::error!(
+                    agent = %agent_name,
+                    path = %path.display(),
+                    error = %parse_err,
+                    "well-known agent identity.toml is malformed — failing CLOSED \
+                     (all skills evicted, all mutational tools denied) until the \
+                     operator fixes it"
+                );
+                fail_closed_identity()
+            } else {
+                tracing::error!(
+                    agent = %agent_name,
+                    path = %path.display(),
+                    error = %parse_err,
+                    "agent identity.toml is malformed — falling back to defaults"
+                );
+                Identity::default()
+            }
+        }
+    }
+}
+
+/// Fail-closed `Identity` for well-known agents whose `identity.toml` failed
+/// to parse. Sentinel allowlist matches no real skill (evicts all bundled
+/// skills); denylist contains every mutational built-in tool to prevent
+/// the agent from acting until the operator fixes the file.
+fn fail_closed_identity() -> Identity {
+    Identity {
+        name: default_name(),
+        emoji: default_emoji(),
+        reflection: None,
+        kg: KgIdentityConfig::default(),
+        skills: SkillsIdentityConfig {
+            allowlist: Some(vec!["__fail_closed_no_skills__".to_string()]),
+        },
+        tools: ToolsIdentityConfig {
+            disabled: crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        },
     }
 }
 
@@ -806,6 +903,7 @@ mod tests {
             reflection: None,
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
+            tools: ToolsIdentityConfig::default(),
         }
     }
 
@@ -885,6 +983,7 @@ mod tests {
             reflection: None,
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
+            tools: ToolsIdentityConfig::default(),
         };
         let ctx = PromptContext {
             soul_content: "",

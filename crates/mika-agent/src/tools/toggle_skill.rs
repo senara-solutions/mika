@@ -61,6 +61,25 @@ impl Tool for ToggleSkillTool {
             return Ok(ToolOutput::error(e));
         }
 
+        // Identity-allowlist guard: if this agent's identity.toml declares an
+        // allowlist and the target skill isn't in it, the toggle would be a
+        // silent no-op (Phase -1 evicts the skill from the registry before
+        // Phase 0 reads DB overrides). Return a structured error so the agent
+        // sees the failure mode instead of getting a deceptive "enabled" reply.
+        let identity = crate::prompt::load_identity(ctx.home_dir);
+        if let Some(ref allowlist) = identity.skills.allowlist {
+            let in_allowlist = allowlist.iter().any(|a| a.eq_ignore_ascii_case(name));
+            if !in_allowlist {
+                return Ok(ToolOutput::error(format!(
+                    "Skill '{name}' is not in this agent's identity allowlist. \
+                     Editing the DB override has no effect — Phase -1 evicts the \
+                     skill from the registry before DB overrides apply. To use \
+                     this skill, add it to `[skills].allowlist` in identity.toml \
+                     (operator-only)."
+                )));
+            }
+        }
+
         // Check current enabled state from DB overrides.
         let agent_id = ctx.db.agent_id();
         let overrides = ctx.db.get_skill_overrides(agent_id).await?;

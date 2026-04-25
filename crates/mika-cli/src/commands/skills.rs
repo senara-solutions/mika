@@ -743,6 +743,23 @@ fn toggle_skill(
         bail!("Skill '{name}' not found at {}", skill_dir.display());
     }
 
+    // Identity-allowlist guard: agents declaring `[skills].allowlist` (e.g.
+    // mika-arch) evict non-allowlisted skills at Phase -1, before DB overrides
+    // apply. Setting an override on an evicted skill silently no-ops on next
+    // load. Surface this loudly instead. Mirrors the toggle_skill agent tool.
+    let agent_home = mika_common::home::resolve_agent_home(global_home, agent_id);
+    let identity = mika_agent::prompt::load_identity(&agent_home);
+    if let Some(ref allowlist) = identity.skills.allowlist
+        && !allowlist.iter().any(|a| a.eq_ignore_ascii_case(name))
+    {
+        bail!(
+            "Skill '{name}' is not in agent '{agent_id}'s identity allowlist. \
+             Editing the DB override has no effect — Phase -1 evicts the skill \
+             from the registry before DB overrides apply. To use this skill, \
+             add it to `[skills].allowlist` in the agent's identity.toml."
+        );
+    }
+
     let db_path = mika_common::home::container_db_path(global_home);
     if !db_path.exists() {
         bail!(
