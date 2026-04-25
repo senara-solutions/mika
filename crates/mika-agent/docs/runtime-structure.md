@@ -143,7 +143,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **skill_overrides** — `(agent_id NOCASE, skill_name NOCASE) PK`, `always_on INTEGER`, `llm_provider TEXT`, `llm_model TEXT` (v20), `enabled INTEGER` (v24). Per-agent overrides: LLM overrides resolve as DB > manifest `[llm]` > agent default (`mika skills llm <name> set <provider>/<model>`). Enabled state is tri-state: `NULL`=default (enabled), `0`=disabled, `1`=explicitly enabled. `enabled=false` evicts the skill from `SkillRegistry.entries` during `apply_overrides()`. Replaces `.disabled` marker files (#629). Default-equals-delete: rows where all columns are NULL are pruned.
 
-### Knowledge Graph Tables (v25; v26 added `source_doc_hash`; v27 shared-corpus `docs_root_hash`)
+### Knowledge Graph Tables (v25; v26 added `source_doc_hash`; v27 shared-corpus `docs_root_hash`; v28 `agent_kg_corpora`)
 
 **Domain layer (global, no agent_id or docs_root_hash):**
 
@@ -172,6 +172,8 @@ Agents with the same `docs_root` share these tables. `docs_root_hash` is a 16-he
 **kg_subject_resolutions** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `subject_entity_id FK→kg_subject_entities`, `domain_entity_id FK→kg_entities`, `confidence REAL NOT NULL CHECK(0.0..1.0)`, `trace_id TEXT`, `created_at TEXT`. Resolution edges bridging subject→domain. UNIQUE on `(agent_id, subject_entity_id, domain_entity_id)`. CASCADE on both FKs. Sole writer: `SubjectEntityResolver` (#691).
 
 **kg_resolutions_log** — `id INTEGER PK AUTO`, `agent_id FK→agents`, `subject_entity_id FK→kg_subject_entities`, `outcome TEXT NOT NULL CHECK(matched_exact|matched_llm|no_match|skipped_discovered_type|skipped_no_llm|error)`, `resolution_trace_id TEXT NOT NULL`, `source_extraction_trace_id TEXT`, `model TEXT`, `duration_ms INTEGER`, `resolved_at TEXT`. Resolution tracking. UNIQUE on `(agent_id, subject_entity_id)`. Sole writer: `SubjectEntityResolver` (#691).
+
+**agent_kg_corpora** — `(agent_id FK→agents, docs_root_hash TEXT) PK`, `docs_root_path TEXT NOT NULL`, `created_at TEXT`. Maps agents to their configured KG corpora for multi-corpus query fan-out (#798, v28). Populated by startup lexical ingest via `register_agent_corpus()` (`INSERT OR IGNORE`). Query tool reads via `list_agent_corpora(agent_id)` to resolve the agent's hash set for IN-list filtering. CASCADE on `agents(id)`. Index: `idx_agent_kg_corpora_hash` on `docs_root_hash` (supports inverse "which agents share this corpus" lookups).
 
 **Migration state tracking (v27+):**
 
