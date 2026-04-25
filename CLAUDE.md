@@ -34,6 +34,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `dashboard/` — React observability dashboard. See `dashboard/CLAUDE.md`.
 - `docs/` — Public documentation (architecture, configuration, deployment, runtime-structure, skills, slash-commands, getting-started) — **single source of truth** for all docs. See [docs/runtime-structure.md](docs/runtime-structure.md) for full `~/.mika` directory layout, DB schema, and log paths.
 - `docs/adr/` — Architecture Decision Records (numbered)
+- `docs/architecture/` — Architecture references including `review-guide.md` (SOLID/DRY/YAGNI/KISS/Orthogonality with citations to mika code; primary consumer is `mika-arch`'s plan-review skills, but applies to any code authored or reviewed in this repo).
 - `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
 - `docs/solutions/` — Documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when debugging or implementing in documented areas.
 - `skills/bundled/` — Source tree for engine-coupled bundled skills discovered at build time via `crates/mika-agent/build.rs`. See `crates/mika-agent/CLAUDE.md` Skills System for details.
