@@ -2,6 +2,17 @@
 
 React 19 + TypeScript + Vite + Tailwind CSS v4 + TanStack React Query observability dashboard SPA.
 
+## Design system
+
+The Dashboard is one of three surfaces in the Mika ecosystem (alongside Cloud Console and Landing Page) that share a single design system. Before designing or implementing any visual change here, read:
+
+- [`mika/docs/design/north-star.md`](../docs/design/north-star.md) — the WHY (intuitive, new-gen, uniform across the ecosystem, the system is the law).
+- [`mika/docs/design/luminescent-core.md`](../docs/design/luminescent-core.md) — the rulebook (colors, typography, surfaces, components, do/don'ts).
+
+The rulebook is owned by Vincent and updated via direct commits to main. Implementation PRs apply the rulebook but do not relitigate it. PRs that "feel different" must propose a rulebook extension first. See `north-star.md` § "What gets reviewed in PRs (and what doesn't)".
+
+This Dashboard is currently undergoing the first of three ecosystem-wide design reconciliations (mika#669 / milestone #13 Dashboard improvements).
+
 ## Architecture
 
 - **Production:** Embedded into the mika-server binary via `rust-embed` and served at `/dashboard/*` (controlled by `MIKA_DASHBOARD_ENABLED`, default `false`)
