@@ -41,6 +41,7 @@ async fn test_path_a_direct_domain_entity_match() {
         }),
         agent_id: None,
         docs_root_hash: None,
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };
@@ -107,6 +108,7 @@ async fn test_path_a_name_match_via_question() {
         traversal: None,
         agent_id: None,
         docs_root_hash: None,
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };

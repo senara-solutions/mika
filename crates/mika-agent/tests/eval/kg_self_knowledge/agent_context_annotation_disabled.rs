@@ -44,6 +44,7 @@ async fn test_disabled_skill_annotated_not_filtered() {
         }),
         agent_id: Some("mika-dev".to_string()),
         docs_root_hash: None,
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };
@@ -94,6 +95,7 @@ async fn test_enabled_skill_annotated_true() {
         }),
         agent_id: Some("mika-dev".to_string()),
         docs_root_hash: None,
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };
@@ -132,6 +134,7 @@ async fn test_non_skill_entity_no_agent_context() {
         }),
         agent_id: Some("mika-dev".to_string()),
         docs_root_hash: None,
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };
@@ -169,6 +172,7 @@ async fn test_no_agent_id_no_agent_context() {
         }),
         agent_id: None, // No agent_id
         docs_root_hash: None,
+        docs_root_hashes: vec![],
         include_context: false,
         result_limit: None,
     };

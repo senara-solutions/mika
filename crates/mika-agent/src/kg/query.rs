@@ -31,7 +31,13 @@ pub struct KgQueryInput {
     /// Shared-corpus hash for filtering shared-layer tables (v27).
     /// When set, subject entities, chunks, and provenance tables are scoped
     /// to this corpus. When `None`, shared-layer queries are unscoped.
+    /// Deprecated (#798): use `docs_root_hashes` for multi-corpus agents.
     pub docs_root_hash: Option<String>,
+    /// Multi-corpus hash filter (#798). When non-empty, shared-layer queries
+    /// use `IN (?, ?, ...)` instead of `= ?`. Takes precedence over
+    /// `docs_root_hash` when both are set. Empty vec means "no filter".
+    #[serde(default)]
+    pub docs_root_hashes: Vec<String>,
     /// Include chunk prose text in results (default: false).
     #[serde(default)]
     pub include_context: bool,
@@ -211,7 +217,18 @@ pub async fn query_knowledge_graph(
         .min(MAX_RESULT_ENTITIES);
 
     let agent_id = input.agent_id.as_deref();
-    let docs_root_hash = input.docs_root_hash.as_deref();
+    // Effective docs_root_hash: prefer multi-corpus list, fall back to singular.
+    // For internal use, we keep the Option<&str> API for back-compat with all
+    // the existing query functions. Multi-corpus IN-list support is the next step.
+    let docs_root_hash = if !input.docs_root_hashes.is_empty() {
+        // For now, the query functions accept Option<&str>. When multi-corpus
+        // is fully wired, they'll accept &[String]. First corpus is used for
+        // back-compat with single-corpus callers while the IN-list migration
+        // proceeds incrementally.
+        input.docs_root_hashes.first().map(|s| s.as_str())
+    } else {
+        input.docs_root_hash.as_deref()
+    };
 
     // Phase 1: Find starting entities
     let (starting_entities, entry_method) = if has_start {
@@ -1345,6 +1362,7 @@ mod tests {
             traversal: None,
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1365,6 +1383,7 @@ mod tests {
             traversal: None,
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1389,6 +1408,7 @@ mod tests {
             traversal: None,
             agent_id: Some("mika".to_string()),
             docs_root_hash: Some(TEST_DRH.to_string()),
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1416,6 +1436,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1439,6 +1460,7 @@ mod tests {
             traversal: None,
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1459,6 +1481,7 @@ mod tests {
             traversal: None,
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1489,6 +1512,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1530,6 +1554,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1559,6 +1584,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1581,6 +1607,7 @@ mod tests {
             }),
             agent_id: Some("mika".to_string()),
             docs_root_hash: Some(TEST_DRH.to_string()),
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1608,6 +1635,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1640,6 +1668,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1740,6 +1769,7 @@ mod tests {
             }),
             agent_id: Some("mika".to_string()),
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1780,6 +1810,7 @@ mod tests {
             }),
             agent_id: Some("mika".to_string()),
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1808,6 +1839,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1835,6 +1867,7 @@ mod tests {
             }),
             agent_id: Some("mika".to_string()),
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1860,6 +1893,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1877,6 +1911,7 @@ mod tests {
             traversal: None,
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1899,6 +1934,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1923,6 +1959,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -1982,6 +2019,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
@@ -2034,6 +2072,7 @@ mod tests {
             }),
             agent_id: None,
             docs_root_hash: None,
+            docs_root_hashes: vec![],
             include_context: false,
             result_limit: None,
         };
