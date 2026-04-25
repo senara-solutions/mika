@@ -239,6 +239,10 @@ pub async fn run(
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
     let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
+    let identity = mika_agent::prompt::load_identity(&ctx.home_dir);
+    if let Some(ref allowlist) = identity.skills.allowlist {
+        skill_registry.apply_identity_allowlist(allowlist);
+    }
     if let Ok(overrides) = ctx
         .async_db
         .get_skill_overrides(&ctx.async_db.agent_id)

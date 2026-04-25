@@ -87,6 +87,24 @@ impl Default for KgIdentityConfig {
     }
 }
 
+/// Skill provisioning config from the `[skills]` block in identity.toml.
+///
+/// Used by well-known agents (mika-arch, etc.) to declare their active skill set
+/// in identity.toml rather than via `skill_overrides` DB rows. When `allowlist`
+/// is `Some` and non-empty, only the listed skills are kept active; all others
+/// are evicted from the registry at startup.
+///
+/// User-defined agents should omit this section entirely — their skill set is
+/// managed via the `mika skills enable/disable` CLI and DB-backed `skill_overrides`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SkillsIdentityConfig {
+    /// When `Some` and non-empty, only these skill names are kept active.
+    /// All other bundled skills are evicted from the registry at startup.
+    /// `None` or empty = all bundled skills enabled (current default).
+    #[serde(default)]
+    pub allowlist: Option<Vec<String>>,
+}
+
 /// Agent identity loaded from ~/.mika/identity.toml.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Identity {
@@ -98,6 +116,8 @@ pub struct Identity {
     pub reflection: Option<ReflectionConfig>,
     #[serde(default)]
     pub kg: KgIdentityConfig,
+    #[serde(default)]
+    pub skills: SkillsIdentityConfig,
 }
 
 fn default_name() -> String {
@@ -115,6 +135,7 @@ impl Default for Identity {
             emoji: default_emoji(),
             reflection: None,
             kg: KgIdentityConfig::default(),
+            skills: SkillsIdentityConfig::default(),
         }
     }
 }
@@ -784,6 +805,7 @@ mod tests {
             emoji: "✦".to_string(),
             reflection: None,
             kg: KgIdentityConfig::default(),
+            skills: SkillsIdentityConfig::default(),
         }
     }
 
@@ -862,6 +884,7 @@ mod tests {
             emoji: "🤖".to_string(),
             reflection: None,
             kg: KgIdentityConfig::default(),
+            skills: SkillsIdentityConfig::default(),
         };
         let ctx = PromptContext {
             soul_content: "",
@@ -2139,5 +2162,50 @@ docs_root = 42
         let identity = result.unwrap_or_default();
         assert!(identity.kg.enabled);
         assert!(identity.kg.docs_root.is_none());
+    }
+
+    #[test]
+    fn test_identity_with_skills_allowlist() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Architect"
+emoji = "🏛"
+
+[skills]
+allowlist = ["mika-arch-groom-ticket", "mika-arch-second-review"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(identity.name, "Architect");
+        let allowlist = identity.skills.allowlist.unwrap();
+        assert_eq!(allowlist.len(), 2);
+        assert_eq!(allowlist[0], "mika-arch-groom-ticket");
+        assert_eq!(allowlist[1], "mika-arch-second-review");
+    }
+
+    #[test]
+    fn test_identity_without_skills_section() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Dev"
+emoji = "🛠"
+"#,
+        )
+        .unwrap();
+        assert!(identity.skills.allowlist.is_none());
+    }
+
+    #[test]
+    fn test_identity_with_empty_skills_allowlist() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Dev"
+
+[skills]
+allowlist = []
+"#,
+        )
+        .unwrap();
+        assert_eq!(identity.skills.allowlist.unwrap().len(), 0);
     }
 }

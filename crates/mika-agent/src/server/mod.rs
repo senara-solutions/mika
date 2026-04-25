@@ -381,6 +381,11 @@ async fn init_agent(
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
     let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
+    // Phase -1: identity-driven skill allowlist (well-known agents like mika-arch)
+    if let Some(ref allowlist) = identity.skills.allowlist {
+        skill_registry.apply_identity_allowlist(allowlist);
+    }
+    // Phase 0+1: DB-backed overrides (disabled state, always_on, LLM provider/model)
     if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
         skill_registry.apply_overrides(&overrides);
     }

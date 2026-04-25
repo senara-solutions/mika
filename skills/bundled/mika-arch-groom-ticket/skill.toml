@@ -1,0 +1,20 @@
+[skill]
+name = "mika-arch-groom-ticket"
+description = "First-pass principle-grounded plan review — produces READY / ITERATE / ESCALATE disposition with annotated plan content."
+version = "0.1.0"
+always_on = false
+timeout_secs = 120
+
+[triggers]
+keywords = [
+    "groom-ticket",
+    "review-plan",
+    "architect-review",
+    "arch-review",
+    "first-review",
+    "plan review",
+    "architecture review",
+]
+
+[constraints]
+required_tools = ["gh_read"]

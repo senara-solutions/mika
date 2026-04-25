@@ -45,7 +45,11 @@ impl Tool for ListSkillsTool {
         let skills_dir = ctx.home_dir.join("skills");
         let mut registry = SkillRegistry::from_dir(&skills_dir);
 
-        // Apply DB overrides so the listing reflects effective values
+        // Apply identity allowlist then DB overrides so the listing reflects effective values
+        let identity = crate::prompt::load_identity(ctx.home_dir);
+        if let Some(ref allowlist) = identity.skills.allowlist {
+            registry.apply_identity_allowlist(allowlist);
+        }
         if let Ok(overrides) = ctx.db.get_skill_overrides(ctx.db.agent_id()).await {
             registry.apply_overrides(&overrides);
         }

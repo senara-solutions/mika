@@ -37,6 +37,7 @@ static DOC_TASK_SYSTEM: &str = include_str!(concat!(env!("OUT_DIR"), "/docs/task
 /// Known builtin function names, used for startup validation.
 pub const KNOWN_BUILTINS: &[&str] = &[
     "get_documentation",
+    "gh_read",
     "git_ops",
     "review_skill",
     "run_gh",
@@ -69,6 +70,7 @@ pub async fn execute(
 ) -> ToolOutput {
     let mut output = match function {
         "get_documentation" => get_documentation(&input, ctx).await,
+        "gh_read" => gh_read(&input, ctx).await,
         "git_ops" => git_ops(&input, ctx).await,
         "review_skill" => review_skill(&input, ctx).await,
         "run_gh" => run_gh(&input, ctx).await,
@@ -969,6 +971,252 @@ async fn git_ops_worktree_prune(repo_path: &str) -> ToolOutput {
         ToolOutput::success(msg)
     } else {
         ToolOutput::error(format!("Failed to prune worktrees.\n{}", result.content))
+    }
+}
+
+// -- GitHub read-only handler --
+
+/// Allowed read-only operations for `gh_read`.
+const GH_READ_ALLOWED_OPS: &[&str] = &["issue_view", "pr_view", "pr_diff", "issue_list"];
+
+/// Validated `gh_read` input — operation, optional target, and repo.
+#[derive(Debug)]
+struct GhReadArgs {
+    op: String,
+    target: Option<String>,
+    repo: String,
+}
+
+/// Structured error types for `gh_read` responses.
+#[derive(Debug)]
+enum GhReadError {
+    NotFound(String),
+    AuthFailed(String),
+    RateLimited(String),
+    NetworkError(String),
+    MalformedRequest(String),
+}
+
+impl GhReadError {
+    fn to_json(&self) -> String {
+        match self {
+            Self::NotFound(msg) => {
+                format!(
+                    "{{\"error\": \"not_found\", \"message\": {}}}",
+                    serde_json::json!(msg)
+                )
+            }
+            Self::AuthFailed(msg) => {
+                format!(
+                    "{{\"error\": \"auth_failed\", \"message\": {}}}",
+                    serde_json::json!(msg)
+                )
+            }
+            Self::RateLimited(msg) => {
+                format!(
+                    "{{\"error\": \"rate_limited\", \"message\": {}}}",
+                    serde_json::json!(msg)
+                )
+            }
+            Self::NetworkError(msg) => {
+                format!(
+                    "{{\"error\": \"network_error\", \"message\": {}}}",
+                    serde_json::json!(msg)
+                )
+            }
+            Self::MalformedRequest(msg) => {
+                format!(
+                    "{{\"error\": \"malformed_request\", \"message\": {}}}",
+                    serde_json::json!(msg)
+                )
+            }
+        }
+    }
+}
+
+/// Classify `gh` stderr/exit-code into structured error variants.
+fn classify_gh_error(stderr: &str, exit_code: Option<i32>) -> GhReadError {
+    let lower = stderr.to_lowercase();
+
+    // Check for CLI-not-found first (before generic "not found" which would false-positive)
+    if exit_code == Some(127) || lower.contains("command not found") {
+        return GhReadError::NetworkError(format!("gh CLI not found or not installed: {stderr}"));
+    }
+
+    if lower.contains("not found")
+        || lower.contains("could not resolve")
+        || lower.contains("no pull requests found")
+        || lower.contains("no issues match")
+    {
+        GhReadError::NotFound(stderr.to_string())
+    } else if lower.contains("authentication") || lower.contains("401") || lower.contains("login") {
+        GhReadError::AuthFailed(stderr.to_string())
+    } else if lower.contains("rate limit") || lower.contains("429") {
+        GhReadError::RateLimited(stderr.to_string())
+    } else {
+        GhReadError::NetworkError(stderr.to_string())
+    }
+}
+
+/// Validate and parse `gh_read` input.
+///
+/// Input schema: `{"op": "issue_view", "target": "123", "repo": "owner/repo"}`
+fn validate_gh_read_input(input: &serde_json::Value) -> Result<GhReadArgs, ToolOutput> {
+    let op = input
+        .get("op")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if op.is_empty() {
+        return Err(ToolOutput::error(
+            GhReadError::MalformedRequest("Missing required 'op' parameter.".to_string()).to_json(),
+        ));
+    }
+
+    if !GH_READ_ALLOWED_OPS.contains(&op.as_str()) {
+        return Err(ToolOutput::error(
+            GhReadError::MalformedRequest(format!(
+                "Operation '{}' is not allowed. Permitted: {}.",
+                op,
+                GH_READ_ALLOWED_OPS.join(", ")
+            ))
+            .to_json(),
+        ));
+    }
+
+    let repo = input
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let repo = match repo {
+        Some(r) => r,
+        None => {
+            return Err(ToolOutput::error(
+                GhReadError::MalformedRequest("Missing required 'repo' parameter.".to_string())
+                    .to_json(),
+            ));
+        }
+    };
+
+    let target = input
+        .get("target")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    // issue_view, pr_view, pr_diff require a target (number)
+    if matches!(op.as_str(), "issue_view" | "pr_view" | "pr_diff") && target.is_none() {
+        return Err(ToolOutput::error(
+            GhReadError::MalformedRequest(format!(
+                "Operation '{}' requires a 'target' parameter (issue/PR number).",
+                op
+            ))
+            .to_json(),
+        ));
+    }
+
+    Ok(GhReadArgs { op, target, repo })
+}
+
+/// Build the `gh` CLI command for a `gh_read` operation.
+fn build_gh_read_command(args: &GhReadArgs) -> Vec<String> {
+    match args.op.as_str() {
+        "issue_view" => {
+            vec![
+                "issue".to_string(),
+                "view".to_string(),
+                args.target.clone().unwrap(),
+                "--json".to_string(),
+                "number,title,body,labels,milestone,comments,state,assignees".to_string(),
+            ]
+        }
+        "pr_view" => {
+            vec![
+                "pr".to_string(),
+                "view".to_string(),
+                args.target.clone().unwrap(),
+                "--json".to_string(),
+                "number,title,body,labels,headRefName,state,reviewDecision,reviews,commits"
+                    .to_string(),
+            ]
+        }
+        "pr_diff" => {
+            vec![
+                "pr".to_string(),
+                "diff".to_string(),
+                args.target.clone().unwrap(),
+            ]
+        }
+        "issue_list" => {
+            let mut cmd = vec!["issue".to_string(), "list".to_string()];
+            if let Some(ref target) = args.target {
+                // If target looks like a milestone number or name, use --milestone;
+                // otherwise treat as label filter.
+                if target.chars().all(|c| c.is_ascii_digit()) {
+                    cmd.push("--milestone".to_string());
+                    cmd.push(target.clone());
+                } else {
+                    cmd.push("--label".to_string());
+                    cmd.push(target.clone());
+                }
+            }
+            cmd.push("--json".to_string());
+            cmd.push("number,title,state,labels,milestone,assignees".to_string());
+            cmd
+        }
+        _ => unreachable!("validate_gh_read_input checks op against allowlist"),
+    }
+}
+
+/// Read-only GitHub CLI handler with structured errors.
+///
+/// Input: `{"op": "issue_view", "target": "123", "repo": "owner/repo"}`
+///
+/// Unlike `run_gh`, this handler uses an operation-level allowlist (not raw
+/// subcommands) and only supports read-only operations. Structured error
+/// variants enable skill prompts to branch on failure type.
+async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
+    let args = match validate_gh_read_input(input) {
+        Ok(a) => a,
+        Err(err) => return err,
+    };
+
+    let start = std::time::Instant::now();
+    let gh_cmd = build_gh_read_command(&args);
+
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(&gh_cmd);
+    cmd.arg("--repo").arg(&args.repo);
+    cmd.env("GH_PROMPT_DISABLED", "1");
+    super::executor::scrub_mika_env_vars(&mut cmd);
+
+    if let Some(token) = ctx.github_token {
+        cmd.env("GH_TOKEN", token);
+    }
+
+    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+    let latency_ms = start.elapsed().as_millis();
+
+    // Audit log
+    tracing::info!(
+        event = "gh_read_invocation",
+        op = %args.op,
+        resource = args.target.as_deref().unwrap_or(""),
+        repo = %args.repo,
+        latency_ms = latency_ms,
+        status = if output.is_error { "error" } else { "ok" },
+        "gh_read invocation"
+    );
+
+    if output.is_error {
+        // Classify the error into structured variants
+        let err = classify_gh_error(&output.content, None);
+        ToolOutput::error(err.to_json())
+    } else {
+        output
     }
 }
 
@@ -3646,5 +3894,186 @@ mod tests {
             "issue".to_string(),
             "review".to_string(),
         ]));
+    }
+
+    // -- gh_read tests --
+
+    #[test]
+    fn test_validate_gh_read_input_valid_issue_view() {
+        let input = serde_json::json!({"op": "issue_view", "target": "123", "repo": "owner/repo"});
+        let args = validate_gh_read_input(&input).unwrap();
+        assert_eq!(args.op, "issue_view");
+        assert_eq!(args.target.as_deref(), Some("123"));
+        assert_eq!(args.repo, "owner/repo");
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_valid_pr_diff() {
+        let input = serde_json::json!({"op": "pr_diff", "target": "456", "repo": "owner/repo"});
+        let args = validate_gh_read_input(&input).unwrap();
+        assert_eq!(args.op, "pr_diff");
+        assert_eq!(args.target.as_deref(), Some("456"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_issue_list_no_target() {
+        let input = serde_json::json!({"op": "issue_list", "repo": "owner/repo"});
+        let args = validate_gh_read_input(&input).unwrap();
+        assert_eq!(args.op, "issue_list");
+        assert!(args.target.is_none());
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_issue_list_with_milestone() {
+        let input = serde_json::json!({"op": "issue_list", "target": "17", "repo": "owner/repo"});
+        let args = validate_gh_read_input(&input).unwrap();
+        assert_eq!(args.op, "issue_list");
+        assert_eq!(args.target.as_deref(), Some("17"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_disallowed_op() {
+        let input =
+            serde_json::json!({"op": "issue_create", "target": "test", "repo": "owner/repo"});
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("issue_create"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_missing_op() {
+        let input = serde_json::json!({"repo": "owner/repo"});
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("op"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_missing_repo() {
+        let input = serde_json::json!({"op": "issue_view", "target": "123"});
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("repo"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_missing_target_for_issue_view() {
+        let input = serde_json::json!({"op": "issue_view", "repo": "owner/repo"});
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("target"));
+    }
+
+    #[test]
+    fn test_classify_gh_error_not_found() {
+        let err = classify_gh_error("GraphQL: Could not resolve to an Issue", Some(1));
+        assert!(matches!(err, GhReadError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_auth_failed() {
+        let err = classify_gh_error("authentication required", Some(1));
+        assert!(matches!(err, GhReadError::AuthFailed(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_rate_limited() {
+        let err = classify_gh_error("API rate limit exceeded", Some(1));
+        assert!(matches!(err, GhReadError::RateLimited(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_network_error_command_not_found() {
+        let err = classify_gh_error("command not found", Some(127));
+        assert!(matches!(err, GhReadError::NetworkError(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_network_error_unknown() {
+        let err = classify_gh_error("some unexpected error", Some(1));
+        assert!(matches!(err, GhReadError::NetworkError(_)));
+    }
+
+    #[test]
+    fn test_build_gh_read_command_issue_view() {
+        let args = GhReadArgs {
+            op: "issue_view".to_string(),
+            target: Some("42".to_string()),
+            repo: "owner/repo".to_string(),
+        };
+        let cmd = build_gh_read_command(&args);
+        assert_eq!(cmd[0], "issue");
+        assert_eq!(cmd[1], "view");
+        assert_eq!(cmd[2], "42");
+        assert_eq!(cmd[3], "--json");
+    }
+
+    #[test]
+    fn test_build_gh_read_command_pr_diff() {
+        let args = GhReadArgs {
+            op: "pr_diff".to_string(),
+            target: Some("99".to_string()),
+            repo: "owner/repo".to_string(),
+        };
+        let cmd = build_gh_read_command(&args);
+        assert_eq!(cmd, vec!["pr", "diff", "99"]);
+    }
+
+    #[test]
+    fn test_build_gh_read_command_issue_list_no_target() {
+        let args = GhReadArgs {
+            op: "issue_list".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+        };
+        let cmd = build_gh_read_command(&args);
+        assert_eq!(cmd[0], "issue");
+        assert_eq!(cmd[1], "list");
+        assert_eq!(cmd[2], "--json");
+    }
+
+    #[test]
+    fn test_build_gh_read_command_issue_list_milestone_filter() {
+        let args = GhReadArgs {
+            op: "issue_list".to_string(),
+            target: Some("17".to_string()),
+            repo: "owner/repo".to_string(),
+        };
+        let cmd = build_gh_read_command(&args);
+        assert!(cmd.contains(&"--milestone".to_string()));
+        assert!(cmd.contains(&"17".to_string()));
+    }
+
+    #[test]
+    fn test_build_gh_read_command_issue_list_label_filter() {
+        let args = GhReadArgs {
+            op: "issue_list".to_string(),
+            target: Some("bug".to_string()),
+            repo: "owner/repo".to_string(),
+        };
+        let cmd = build_gh_read_command(&args);
+        assert!(cmd.contains(&"--label".to_string()));
+        assert!(cmd.contains(&"bug".to_string()));
+    }
+
+    #[test]
+    fn test_gh_read_in_known_builtins() {
+        assert!(
+            KNOWN_BUILTINS.contains(&"gh_read"),
+            "gh_read must be registered in KNOWN_BUILTINS"
+        );
+    }
+
+    #[test]
+    fn test_gh_read_error_json_format() {
+        let err = GhReadError::NotFound("issue 999 not found".to_string());
+        let json_str = err.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["error"], "not_found");
+        assert_eq!(parsed["message"], "issue 999 not found");
     }
 }

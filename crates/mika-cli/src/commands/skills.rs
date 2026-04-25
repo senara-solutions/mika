@@ -23,13 +23,13 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     match args.command {
         None => {
             let mut registry = SkillRegistry::from_dir(&skills_dir);
-            apply_db_overrides_if_available(&global_home, agent_name, &mut registry);
+            apply_db_overrides_if_available(&global_home, agent_name, &agent_home, &mut registry);
             registry.log_summary();
             list_skills(&registry, &agent_home, &crate::cli::OutputFormat::Text)?;
         }
         Some(SkillsCommand::List { format }) => {
             let mut registry = SkillRegistry::from_dir(&skills_dir);
-            apply_db_overrides_if_available(&global_home, agent_name, &mut registry);
+            apply_db_overrides_if_available(&global_home, agent_name, &agent_home, &mut registry);
             registry.log_summary();
             list_skills(&registry, &agent_home, &format)?;
         }
@@ -256,8 +256,15 @@ async fn resolve_github_token_for_git(global_home: &Path, agent_home: &Path) -> 
 fn apply_db_overrides_if_available(
     global_home: &Path,
     agent_id: &str,
+    agent_home: &Path,
     registry: &mut SkillRegistry,
 ) {
+    // Apply identity allowlist if present
+    let identity = mika_agent::prompt::load_identity(agent_home);
+    if let Some(ref allowlist) = identity.skills.allowlist {
+        registry.apply_identity_allowlist(allowlist);
+    }
+
     let db_path = mika_common::home::container_db_path(global_home);
     if !db_path.exists() {
         return;

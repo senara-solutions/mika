@@ -377,6 +377,53 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// Apply identity-driven skill allowlist (Phase -1 of the override chain).
+    ///
+    /// When an agent's `identity.toml` declares a `[skills].allowlist`, only
+    /// the listed skills remain active. All other skills are evicted from the
+    /// registry. This runs **before** `apply_overrides()` so DB-backed overrides
+    /// (always_on, LLM provider/model) still apply to surviving skills.
+    ///
+    /// Call with a non-empty allowlist for well-known agents that own their skill
+    /// set via identity.toml. For user-defined agents (no allowlist), skip this call.
+    pub fn apply_identity_allowlist(&mut self, allowlist: &[String]) {
+        if allowlist.is_empty() {
+            return;
+        }
+
+        let mut evicted = Vec::new();
+        self.skills.retain(|entry| {
+            let is_allowed = allowlist
+                .iter()
+                .any(|a| entry.manifest.skill.name.eq_ignore_ascii_case(a));
+            if !is_allowed {
+                tracing::info!(
+                    skill = %entry.manifest.skill.name,
+                    "skill not in identity allowlist — evicted from registry"
+                );
+                evicted.push(DisabledSkill {
+                    name: entry.manifest.skill.name.clone(),
+                });
+            }
+            is_allowed
+        });
+        self.disabled.extend(evicted);
+
+        // Warn about allowlisted skills that don't exist in the registry
+        for name in allowlist {
+            if !self
+                .skills
+                .iter()
+                .any(|e| e.manifest.skill.name.eq_ignore_ascii_case(name))
+            {
+                tracing::warn!(
+                    skill = %name,
+                    "identity allowlist references unknown skill — not in bundled manifests"
+                );
+            }
+        }
+    }
+
     /// Apply database-backed overrides to skill entries and validate dependencies.
     ///
     /// For each override, finds the matching skill by name (case-insensitive)
@@ -2566,5 +2613,119 @@ keywords = ["big-test"]
         let always_on = registry.always_on_skills();
         assert_eq!(always_on.len(), 1);
         assert_eq!(always_on[0].manifest.skill.name, "qa-review");
+    }
+
+    // -- apply_identity_allowlist tests --
+
+    #[test]
+    fn test_identity_allowlist_keeps_only_listed_skills() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("skill-a", false, true),
+                make_entry("skill-b", false, true),
+                make_entry("skill-c", false, true),
+            ],
+        };
+
+        registry.apply_identity_allowlist(&["skill-a".to_string(), "skill-c".to_string()]);
+
+        assert_eq!(registry.skills.len(), 2);
+        assert_eq!(registry.skills[0].manifest.skill.name, "skill-a");
+        assert_eq!(registry.skills[1].manifest.skill.name, "skill-c");
+        assert_eq!(registry.disabled.len(), 1);
+        assert_eq!(registry.disabled[0].name, "skill-b");
+    }
+
+    #[test]
+    fn test_identity_allowlist_empty_is_noop() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("skill-a", false, true),
+                make_entry("skill-b", false, true),
+            ],
+        };
+
+        registry.apply_identity_allowlist(&[]);
+
+        assert_eq!(registry.skills.len(), 2);
+        assert!(registry.disabled.is_empty());
+    }
+
+    #[test]
+    fn test_identity_allowlist_case_insensitive() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("Skill-A", false, true),
+                make_entry("skill-b", false, true),
+            ],
+        };
+
+        registry.apply_identity_allowlist(&["skill-a".to_string()]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "Skill-A");
+    }
+
+    #[test]
+    fn test_identity_allowlist_unknown_skill_name() {
+        // Allowlist references a skill that doesn't exist — no crash, just a warn
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("skill-a", false, true)],
+        };
+
+        registry.apply_identity_allowlist(&["skill-a".to_string(), "nonexistent".to_string()]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "skill-a");
+    }
+
+    #[test]
+    fn test_identity_allowlist_composes_with_db_overrides() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("skill-a", false, true),
+                make_entry("skill-b", false, true),
+                make_entry("skill-c", false, true),
+            ],
+        };
+
+        // Phase -1: identity allowlist keeps only a and b
+        registry.apply_identity_allowlist(&["skill-a".to_string(), "skill-b".to_string()]);
+        assert_eq!(registry.skills.len(), 2);
+
+        // Phase 0+1: DB overrides apply to survivors
+        let overrides = vec![SkillOverride {
+            skill_name: "skill-a".to_string(),
+            always_on: Some(true),
+            enabled: None,
+            llm_provider: Some("anthropic".to_string()),
+            llm_model: Some("claude-opus-4-7".to_string()),
+        }];
+        registry.apply_overrides(&overrides);
+
+        // skill-a should have the LLM override applied
+        let entry = registry
+            .skills
+            .iter()
+            .find(|e| e.manifest.skill.name == "skill-a")
+            .unwrap();
+        assert!(entry.manifest.skill.always_on);
+        assert_eq!(entry.manifest.llm.provider.as_deref(), Some("anthropic"));
+        assert_eq!(entry.manifest.llm.model.as_deref(), Some("claude-opus-4-7"));
     }
 }

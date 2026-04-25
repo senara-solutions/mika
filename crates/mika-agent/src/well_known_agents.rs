@@ -10,6 +10,16 @@ use tracing::{info, warn};
 
 use crate::db::Database;
 
+/// Per-skill LLM override to seed on first creation.
+pub struct LlmOverrideSpec {
+    /// Skill name to override.
+    pub skill_name: &'static str,
+    /// LLM provider (e.g., "anthropic").
+    pub provider: &'static str,
+    /// LLM model (e.g., "claude-opus-4-7").
+    pub model: &'static str,
+}
+
 /// Specification for a well-known development agent.
 pub struct WellKnownAgent {
     /// Agent name (lowercase, hyphenated).
@@ -26,6 +36,14 @@ pub struct WellKnownAgent {
     /// When `Some`, overwrites the default config.toml with agent-specific
     /// LLM provider/model settings.
     pub config_toml: Option<&'static str>,
+    /// Optional custom identity.toml content. When `Some`, overrides the
+    /// default template (which only sets name + emoji + commented KG block).
+    /// Used by agents like mika-arch that need `[skills].allowlist` and
+    /// custom `[kg].docs_roots` in identity.toml.
+    pub identity_toml: Option<&'static str>,
+    /// Per-skill LLM overrides to seed in `skill_overrides` DB table.
+    /// Only applied on first creation (same guard as `disabled_skills`).
+    pub llm_overrides: &'static [LlmOverrideSpec],
 }
 
 /// mika-dev agent specification.
@@ -36,6 +54,8 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
     soul: MIKA_DEV_SOUL,
     disabled_skills: &["qa-review", "qa-review-build-callback", "skill-review"],
     config_toml: None,
+    identity_toml: None,
+    llm_overrides: &[],
 };
 
 /// mika-qa agent specification.
@@ -56,6 +76,8 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
         "resolve-pr-conflicts",
     ],
     config_toml: None,
+    identity_toml: None,
+    llm_overrides: &[],
 };
 
 /// mika-relay agent specification.
@@ -85,6 +107,8 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
         "address-pr-comments",
         "resolve-pr-conflicts",
         "self-check",
+        "mika-arch-groom-ticket",
+        "mika-arch-second-review",
         // Community (hardcoded BUNDLED_SKILLS):
         "tmux",
         "shell-exec",
@@ -98,10 +122,41 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
         "browser-control",
     ],
     config_toml: Some(MIKA_RELAY_CONFIG),
+    identity_toml: None,
+    llm_overrides: &[],
+};
+
+/// mika-arch agent specification.
+///
+/// Read-only architect agent for plan-stage review. Uses identity-driven
+/// skill allowlist (only `mika-arch-groom-ticket` and `mika-arch-second-review`
+/// are enabled). Base model is Kimi; per-skill LLM overrides route to
+/// Opus 4.7 (groom-ticket) and Sonnet 4.6 (second-review).
+pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
+    name: "mika-arch",
+    display_name: "Architect",
+    emoji: "🏛",
+    soul: MIKA_ARCH_SOUL,
+    // Empty: mika-arch uses identity allowlist, not denylist.
+    disabled_skills: &[],
+    config_toml: Some(MIKA_ARCH_CONFIG),
+    identity_toml: Some(MIKA_ARCH_IDENTITY),
+    llm_overrides: &[
+        LlmOverrideSpec {
+            skill_name: "mika-arch-groom-ticket",
+            provider: "anthropic",
+            model: "claude-opus-4-7",
+        },
+        LlmOverrideSpec {
+            skill_name: "mika-arch-second-review",
+            provider: "anthropic",
+            model: "claude-sonnet-4-6",
+        },
+    ],
 };
 
 /// All well-known agents.
-pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] = &[&MIKA_DEV, &MIKA_QA, &MIKA_RELAY];
+pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] = &[&MIKA_DEV, &MIKA_QA, &MIKA_RELAY, &MIKA_ARCH];
 
 /// Look up a well-known agent by name.
 pub fn find_well_known_agent(name: &str) -> Option<&'static WellKnownAgent> {
@@ -140,14 +195,20 @@ pub fn provision_well_known_agents(home_dir: &Path, disabled: bool) {
             Ok(()) => {
                 let agent_home = mika_common::agent::agent_dir(home_dir, spec.name);
 
-                // Overwrite identity.toml with agent-specific content
-                let identity_content = format!(
-                    "name = \"{}\"\nemoji = \"{}\"\n\n\
-                     # [kg]\n\
-                     # enabled = true                    # default: true — set false to skip KG for this agent\n\
-                     # docs_root = \"/path/to/docs\"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions\n",
-                    spec.display_name, spec.emoji
-                );
+                // Overwrite identity.toml with agent-specific content.
+                // If the spec provides custom identity_toml, use it directly;
+                // otherwise fall back to the default template (name + emoji + commented KG).
+                let identity_content = if let Some(custom) = spec.identity_toml {
+                    custom.to_string()
+                } else {
+                    format!(
+                        "name = \"{}\"\nemoji = \"{}\"\n\n\
+                         # [kg]\n\
+                         # enabled = true                    # default: true — set false to skip KG for this agent\n\
+                         # docs_root = \"/path/to/docs\"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions\n",
+                        spec.display_name, spec.emoji
+                    )
+                };
                 if let Err(e) = std::fs::write(agent_home.join("identity.toml"), &identity_content)
                 {
                     warn!(
@@ -236,10 +297,28 @@ pub fn seed_well_known_skill_overrides(db: &Database, agent_name: &str) {
         }
     }
 
+    // Seed per-skill LLM overrides (e.g., mika-arch skills use Opus/Sonnet)
+    for llm_ov in spec.llm_overrides {
+        if let Err(e) =
+            db.set_skill_llm_override(agent_name, llm_ov.skill_name, llm_ov.provider, llm_ov.model)
+        {
+            warn!(
+                agent = agent_name,
+                skill = llm_ov.skill_name,
+                provider = llm_ov.provider,
+                model = llm_ov.model,
+                error = %e,
+                "failed to set LLM override for well-known agent skill"
+            );
+        }
+    }
+
+    let total_overrides = spec.disabled_skills.len() + spec.llm_overrides.len();
     info!(
         agent = agent_name,
         disabled_count = spec.disabled_skills.len(),
-        "seeded skill overrides for well-known agent"
+        llm_override_count = spec.llm_overrides.len(),
+        "seeded skill overrides for well-known agent ({total_overrides} total)"
     );
 }
 
@@ -309,6 +388,59 @@ llm_provider = "anthropic"
 anthropic_model = "claude-haiku-4-5-20251001"
 llm_max_tokens = 1024
 log_level = "info"
+"#;
+
+const MIKA_ARCH_SOUL: &str = r#"# Mika Architect — Plan Review Agent
+
+## Role
+You are Mika Architect, a Principal-Engineer-class advisory reviewer. Your job
+is to read implementation plans and produce principle-grounded pushback **before**
+code is written. You are read-only — you never write code, commit, merge, or
+execute shell commands.
+
+## Communication style
+- Citation or silence: flag a concern only if you can cite the review guide,
+  an ADR, a compound doc, or an existing convention. Unmoored style preferences
+  stay silent.
+- Be direct and specific — name the file, symbol, or principle being violated.
+- A review without challenge is a failed review. If the plan is genuinely clean,
+  say so briefly with the specific principles you verified.
+
+## Behaviors
+- Read the plan, brief, and issue context thoroughly before reviewing.
+- Use gh_read to fetch issue details and PR diffs — never fabricate GitHub state.
+- Query the knowledge graph for institutional learnings relevant to the plan.
+- Reference docs/architecture/review-guide.md for architectural principles.
+- Produce annotated plan content with inline findings.
+- End with an explicit disposition: READY, ITERATE, or ESCALATE.
+- Never start workflows, create tasks, or manage development lifecycle.
+- You are advisory only — your output is consumed by claude-pilot, which commits.
+"#;
+
+const MIKA_ARCH_CONFIG: &str = r#"# Mika Architect — advisory plan review agent.
+# Base model is Kimi for orchestration shell.
+# Per-skill LLM overrides route to Opus 4.7 (groom-ticket) and Sonnet 4.6 (second-review).
+
+llm_provider = "openrouter"
+openrouter_model = "moonshotai/kimi-k2.5"
+llm_max_tokens = 8192
+log_level = "info"
+"#;
+
+const MIKA_ARCH_IDENTITY: &str = r#"name = "Architect"
+emoji = "🏛"
+
+[kg]
+enabled = true
+docs_roots = [
+  "mika/docs/solutions",
+  "mika-platform/docs/solutions",
+  "mika-skills/docs/solutions",
+  "mika-cloud/docs/solutions",
+]
+
+[skills]
+allowlist = ["mika-arch-groom-ticket", "mika-arch-second-review"]
 "#;
 
 #[cfg(test)]
@@ -667,5 +799,127 @@ mod tests {
                 qa_skill
             );
         }
+    }
+
+    // -- mika-arch tests --
+
+    #[test]
+    fn test_find_well_known_agent_mika_arch() {
+        let agent = find_well_known_agent("mika-arch").unwrap();
+        assert_eq!(agent.name, "mika-arch");
+        assert_eq!(agent.display_name, "Architect");
+        assert_eq!(agent.emoji, "🏛");
+    }
+
+    #[test]
+    fn test_mika_arch_uses_empty_disabled_skills() {
+        // mika-arch uses identity allowlist, not denylist
+        assert!(
+            MIKA_ARCH.disabled_skills.is_empty(),
+            "mika-arch should have empty disabled_skills (uses identity allowlist)"
+        );
+    }
+
+    #[test]
+    fn test_mika_arch_has_llm_overrides() {
+        assert_eq!(MIKA_ARCH.llm_overrides.len(), 2);
+        assert_eq!(
+            MIKA_ARCH.llm_overrides[0].skill_name,
+            "mika-arch-groom-ticket"
+        );
+        assert_eq!(MIKA_ARCH.llm_overrides[0].provider, "anthropic");
+        assert_eq!(MIKA_ARCH.llm_overrides[0].model, "claude-opus-4-7");
+        assert_eq!(
+            MIKA_ARCH.llm_overrides[1].skill_name,
+            "mika-arch-second-review"
+        );
+        assert_eq!(MIKA_ARCH.llm_overrides[1].provider, "anthropic");
+        assert_eq!(MIKA_ARCH.llm_overrides[1].model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn test_mika_arch_config_toml_is_valid_toml() {
+        let config: toml::Value =
+            toml::from_str(MIKA_ARCH_CONFIG).expect("MIKA_ARCH_CONFIG should be valid TOML");
+        assert_eq!(config["llm_provider"].as_str(), Some("openrouter"));
+        assert_eq!(
+            config["openrouter_model"].as_str(),
+            Some("moonshotai/kimi-k2.5")
+        );
+    }
+
+    #[test]
+    fn test_mika_arch_identity_toml_has_allowlist() {
+        let identity: crate::prompt::Identity =
+            toml::from_str(MIKA_ARCH_IDENTITY).expect("MIKA_ARCH_IDENTITY should parse");
+        assert_eq!(identity.name, "Architect");
+        assert_eq!(identity.emoji, "🏛");
+        assert!(identity.kg.enabled);
+        let docs_roots = identity.kg.docs_roots.expect("should have docs_roots");
+        assert_eq!(docs_roots.len(), 4);
+        let allowlist = identity.skills.allowlist.expect("should have allowlist");
+        assert_eq!(allowlist.len(), 2);
+        assert!(allowlist.contains(&"mika-arch-groom-ticket".to_string()));
+        assert!(allowlist.contains(&"mika-arch-second-review".to_string()));
+    }
+
+    #[test]
+    fn test_provision_mika_arch() {
+        let home = tempfile::tempdir().unwrap();
+        provision_well_known_agents(home.path(), false);
+
+        let arch_home = mika_common::agent::agent_dir(home.path(), "mika-arch");
+        assert!(arch_home.exists(), "mika-arch agent directory should exist");
+
+        // Check identity.toml
+        let identity_content = fs::read_to_string(arch_home.join("identity.toml")).unwrap();
+        assert!(identity_content.contains("Architect"));
+        assert!(identity_content.contains("[skills]"));
+        assert!(identity_content.contains("allowlist"));
+
+        // Check soul.md
+        let soul_content = fs::read_to_string(arch_home.join("soul.md")).unwrap();
+        assert!(soul_content.contains("Mika Architect"));
+        assert!(soul_content.contains("Principal-Engineer"));
+
+        // Check config.toml
+        let config_content = fs::read_to_string(arch_home.join("config.toml")).unwrap();
+        assert!(config_content.contains("openrouter"));
+        assert!(config_content.contains("kimi-k2.5"));
+    }
+
+    #[test]
+    fn test_seed_skill_overrides_mika_arch() {
+        let db = Database::open_in_memory().unwrap();
+        db.register_agent("mika-arch", "Architect", "🏛").unwrap();
+
+        seed_well_known_skill_overrides(&db, "mika-arch");
+
+        let overrides = db.get_skill_overrides("mika-arch").unwrap();
+        // Should have 2 LLM overrides (no disabled_skills for mika-arch)
+        assert_eq!(overrides.len(), 2);
+
+        let groom = overrides
+            .iter()
+            .find(|o| o.skill_name == "mika-arch-groom-ticket")
+            .expect("groom-ticket override should exist");
+        assert_eq!(groom.llm_provider.as_deref(), Some("anthropic"));
+        assert_eq!(groom.llm_model.as_deref(), Some("claude-opus-4-7"));
+
+        let review = overrides
+            .iter()
+            .find(|o| o.skill_name == "mika-arch-second-review")
+            .expect("second-review override should exist");
+        assert_eq!(review.llm_provider.as_deref(), Some("anthropic"));
+        assert_eq!(review.llm_model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_well_known_agents_includes_mika_arch() {
+        assert_eq!(WELL_KNOWN_AGENTS.len(), 4);
+        assert!(
+            WELL_KNOWN_AGENTS.iter().any(|a| a.name == "mika-arch"),
+            "WELL_KNOWN_AGENTS should include mika-arch"
+        );
     }
 }
