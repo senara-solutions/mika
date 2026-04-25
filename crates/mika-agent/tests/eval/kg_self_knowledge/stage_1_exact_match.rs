@@ -48,7 +48,7 @@ async fn test_stage_1_exact_match_case_insensitive() {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         None,
-        "0000000000000000".to_string(),
+        vec!["0000000000000000".to_string()],
         Some("test-stage-1"),
     );
     let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
@@ -121,7 +121,7 @@ async fn test_stage_1_low_confidence_escalates_to_stage_2() {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         None,
-        "0000000000000000".to_string(),
+        vec!["0000000000000000".to_string()],
         Some("test-stage-1-low"),
     );
     let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
@@ -163,7 +163,7 @@ async fn test_stage_1_discovered_type_skipped() {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         None,
-        "0000000000000000".to_string(),
+        vec!["0000000000000000".to_string()],
         Some("test-discovered"),
     );
     // Use resolve_doc_entities which takes explicit IDs (no SQL type filter)

@@ -48,9 +48,15 @@ impl ReflectionConfig {
 /// Controls whether the KG subsystem runs for this agent and which docs root
 /// it reads from. When `enabled` is `false`, no KG subsystem components
 /// (`LexicalIngestor`, `SubjectExtractor`, `SubjectEntityResolver`) are
-/// constructed for the agent. When `docs_root` is `None`, the global fallback
-/// chain applies (#738): `MIKA_KG_DOCS_ROOT` env > `kg_docs_root` config >
-/// `<CWD>/docs/solutions`.
+/// constructed for the agent. When both `docs_roots` and `docs_root` are `None`,
+/// the global fallback chain applies (#738): `MIKA_KG_DOCS_ROOT` env >
+/// `kg_docs_root` config > `<CWD>/docs/solutions`.
+///
+/// ## Plural vs singular
+///
+/// `docs_roots` (plural, #798) takes precedence over `docs_root` (singular, #778)
+/// when both are set on the same agent. Setting both emits a
+/// `kg_docs_roots_singular_ignored` warn at resolver time.
 #[derive(Debug, Deserialize, Clone)]
 pub struct KgIdentityConfig {
     /// Whether KG ingestion/extraction/resolution runs for this agent.
@@ -60,6 +66,11 @@ pub struct KgIdentityConfig {
     /// Absolute path to the docs root this agent's KG reads from.
     /// When `None`, falls back to the global resolver (#738).
     pub docs_root: Option<PathBuf>,
+    /// Multiple docs root paths for multi-corpus agents (#798).
+    /// When `Some` and non-empty, takes precedence over `docs_root`.
+    /// TOML format: `docs_roots = ["/path/a", "/path/b"]`.
+    #[serde(default)]
+    pub docs_roots: Option<Vec<PathBuf>>,
 }
 
 fn default_kg_enabled() -> bool {
@@ -71,6 +82,7 @@ impl Default for KgIdentityConfig {
         Self {
             enabled: default_kg_enabled(),
             docs_root: None,
+            docs_roots: None,
         }
     }
 }

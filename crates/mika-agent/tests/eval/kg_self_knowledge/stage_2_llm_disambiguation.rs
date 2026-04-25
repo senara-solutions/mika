@@ -88,7 +88,7 @@ async fn test_stage_2_synonyms_disambiguation() {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         Some(llm),
-        "0000000000000000".to_string(),
+        vec!["0000000000000000".to_string()],
         Some("test-synonyms"),
     );
     let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
@@ -169,7 +169,7 @@ async fn test_stage_2_case_variant_low_confidence() {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         Some(llm),
-        "0000000000000000".to_string(),
+        vec!["0000000000000000".to_string()],
         Some("test-case-variants"),
     );
     let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
@@ -236,7 +236,7 @@ async fn test_stage_2_skipped_no_llm() {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         None,
-        "0000000000000000".to_string(),
+        vec!["0000000000000000".to_string()],
         Some("test-no-llm"),
     );
     let stats = resolver.resolve_pending(u32::MAX).await.unwrap();
