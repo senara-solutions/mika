@@ -2728,4 +2728,39 @@ keywords = ["big-test"]
         assert_eq!(entry.manifest.llm.provider.as_deref(), Some("anthropic"));
         assert_eq!(entry.manifest.llm.model.as_deref(), Some("claude-opus-4-7"));
     }
+
+    #[test]
+    fn test_identity_allowlist_db_disable_wins() {
+        // A skill that survives the identity allowlist can still be evicted
+        // by a DB-backed enabled=false override (operator customization).
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("skill-a", false, true),
+                make_entry("skill-b", false, true),
+            ],
+        };
+
+        // Phase -1: allowlist keeps both
+        registry.apply_identity_allowlist(&["skill-a".to_string(), "skill-b".to_string()]);
+        assert_eq!(registry.skills.len(), 2);
+
+        // Phase 0: DB override disables skill-a
+        let overrides = vec![SkillOverride {
+            skill_name: "skill-a".to_string(),
+            always_on: None,
+            enabled: Some(false),
+            llm_provider: None,
+            llm_model: None,
+        }];
+        registry.apply_overrides(&overrides);
+
+        // skill-a should be evicted by DB override
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "skill-b");
+        // skill-a in disabled list (twice — once identity didn't evict it, then DB did)
+        assert!(registry.disabled.iter().any(|d| d.name == "skill-a"));
+    }
 }

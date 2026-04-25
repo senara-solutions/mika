@@ -1211,8 +1211,14 @@ async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
         "gh_read invocation"
     );
 
-    if output.is_error {
-        // Classify the error into structured variants
+    // spawn_and_collect returns ToolOutput::success even for non-zero exits,
+    // formatting the content as "Exit code: N\n{stderr}\n{stdout}". Detect
+    // non-zero exits via the content prefix (same heuristic used by the agent
+    // loop's non_zero_exit detection).
+    if output.is_error
+        || output.content.starts_with("Exit code:")
+        || output.content.starts_with("Killed by signal:")
+    {
         let err = classify_gh_error(&output.content, None);
         ToolOutput::error(err.to_json())
     } else {
@@ -4075,5 +4081,76 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["error"], "not_found");
         assert_eq!(parsed["message"], "issue 999 not found");
+    }
+
+    // Additional coverage tests for gh_read
+
+    #[test]
+    fn test_validate_gh_read_input_missing_target_for_pr_view() {
+        let input = serde_json::json!({"op": "pr_view", "repo": "owner/repo"});
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("target"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_missing_target_for_pr_diff() {
+        let input = serde_json::json!({"op": "pr_diff", "repo": "owner/repo"});
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("target"));
+    }
+
+    #[test]
+    fn test_build_gh_read_command_pr_view() {
+        let args = GhReadArgs {
+            op: "pr_view".to_string(),
+            target: Some("7".to_string()),
+            repo: "owner/repo".to_string(),
+        };
+        let cmd = build_gh_read_command(&args);
+        assert_eq!(cmd[0], "pr");
+        assert_eq!(cmd[1], "view");
+        assert_eq!(cmd[2], "7");
+        assert_eq!(cmd[3], "--json");
+        // Verify key fields are present
+        let fields = &cmd[4];
+        assert!(fields.contains("reviewDecision"));
+        assert!(fields.contains("reviews"));
+        assert!(fields.contains("commits"));
+    }
+
+    #[test]
+    fn test_classify_gh_error_no_prs_found() {
+        let err = classify_gh_error("no pull requests found in owner/repo", Some(1));
+        assert!(matches!(err, GhReadError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_401_in_stderr() {
+        let err = classify_gh_error("HTTP 401 Unauthorized", Some(1));
+        assert!(matches!(err, GhReadError::AuthFailed(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_429_in_stderr() {
+        let err = classify_gh_error("HTTP 429 Too Many Requests", Some(1));
+        assert!(matches!(err, GhReadError::RateLimited(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_command_not_found_no_exit_code() {
+        // Production path: exit_code is always None from spawn_and_collect
+        let err = classify_gh_error("command not found", None);
+        assert!(matches!(err, GhReadError::NetworkError(_)));
+    }
+
+    #[test]
+    fn test_classify_gh_error_exit_code_prefix() {
+        // spawn_and_collect formats non-zero exits as "Exit code: N\n..."
+        let err = classify_gh_error("Exit code: 1\nGraphQL: Could not resolve to an Issue", None);
+        assert!(matches!(err, GhReadError::NotFound(_)));
     }
 }
