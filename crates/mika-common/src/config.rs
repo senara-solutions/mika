@@ -3,6 +3,7 @@ use std::sync::Arc;
 use config::{Config, Environment, File, FileFormat};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use serde::de;
 use std::path::{Path, PathBuf};
 
 use crate::llm::ProviderKind;
@@ -813,7 +814,7 @@ pub struct Settings {
     /// directories for multi-corpus agents (#798). Global fallback; per-agent
     /// `identity.toml [kg].docs_roots` takes precedence. Linux/macOS only
     /// (colon separator conflicts with Windows drive letters).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_colon_paths")]
     pub kg_docs_roots: Option<Vec<PathBuf>>,
 
     /// Resolved home directory path (populated after load, not from config file)
@@ -826,6 +827,61 @@ pub const DEFAULT_KG_BATCH_BUDGET: u32 = 500;
 
 fn default_true() -> bool {
     true
+}
+
+/// Deserialize `kg_docs_roots` from either a colon-separated string (env var /
+/// dotenv path) or a native TOML/JSON array.  Aligns with the manual
+/// `split(':').filter(|p| !p.is_empty())` in `kg/config.rs` Tier 3.
+fn deserialize_colon_paths<'de, D>(deserializer: D) -> Result<Option<Vec<PathBuf>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ColonPathsVisitor;
+
+    impl<'de> de::Visitor<'de> for ColonPathsVisitor {
+        type Value = Option<Vec<PathBuf>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a colon-separated string or array of paths")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let paths: Vec<PathBuf> = v
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if paths.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(paths))
+            }
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut paths = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                if !s.is_empty() {
+                    paths.push(PathBuf::from(s));
+                }
+            }
+            if paths.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(paths))
+            }
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(ColonPathsVisitor)
 }
 
 fn default_llm_provider() -> ProviderKind {
@@ -1945,5 +2001,174 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOT") };
+    }
+
+    // -- kg_docs_roots colon-separated env var parsing (#814) --
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_env_var_colon_separated() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOTS", "/a:/b:/c") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        let roots = settings
+            .kg_docs_roots
+            .expect("should parse colon-separated env var");
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c")
+            ]
+        );
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_env_var_single_path() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOTS", "/single") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        let roots = settings.kg_docs_roots.expect("should parse single path");
+        assert_eq!(roots, vec![PathBuf::from("/single")]);
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_env_var_empty_string_is_none() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOTS", "") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(
+            settings.kg_docs_roots.is_none(),
+            "empty string should yield None"
+        );
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_env_var_consecutive_colons_filtered() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOTS", "/a::/b") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        let roots = settings
+            .kg_docs_roots
+            .expect("should filter empty segments");
+        assert_eq!(roots, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_env_var_trailing_colon_filtered() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOTS", "/a:/b:") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        let roots = settings
+            .kg_docs_roots
+            .expect("should filter trailing colon");
+        assert_eq!(roots, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_toml_array() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "kg_docs_roots = [\"/x\", \"/y\"]\n",
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        let roots = settings.kg_docs_roots.expect("TOML array should parse");
+        assert_eq!(roots, vec![PathBuf::from("/x"), PathBuf::from("/y")]);
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_env_overrides_toml() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOTS", "/env/a:/env/b") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "kg_docs_roots = [\"/toml/x\", \"/toml/y\"]\n",
+        )
+        .unwrap();
+
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        let roots = settings.kg_docs_roots.expect("env should override TOML");
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/env/a"), PathBuf::from("/env/b")]
+        );
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_unset_is_none() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(settings.kg_docs_roots.is_none(), "unset should yield None");
+    }
+
+    #[test]
+    #[serial]
+    fn kg_docs_roots_four_element_env_var() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_KG_DOCS_ROOTS", "/a:/b:/c:/d") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        let roots = settings
+            .kg_docs_roots
+            .expect("4-element env var should parse");
+        assert_eq!(roots.len(), 4);
+        assert_eq!(roots[0], PathBuf::from("/a"));
+        assert_eq!(roots[3], PathBuf::from("/d"));
+
+        unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
     }
 }
