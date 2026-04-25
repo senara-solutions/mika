@@ -118,6 +118,10 @@ async fn run_a2a_agent(
         agent_state.skills_dirty.store(false, Ordering::Release);
         let mut registry =
             crate::skills::SkillRegistry::from_dir(&agent_state.home_dir.join("skills"));
+        let identity = crate::prompt::load_identity(&agent_state.home_dir);
+        if let Some(ref allowlist) = identity.skills.allowlist {
+            registry.apply_identity_allowlist(allowlist);
+        }
         if let Ok(overrides) = agent_state
             .db
             .get_skill_overrides(agent_state.db.agent_id())

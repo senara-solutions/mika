@@ -1525,6 +1525,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         provider,
         model,
         &resolved_context,
+        &ctx.identity.tools.disabled,
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
@@ -2394,8 +2395,15 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
     let provider = llm.provider_name();
     let model = llm.model_name();
     let no_context = HashMap::new();
-    let (skill_tool_defs, prompt_variant) =
-        inject_skills_and_resolve_tools(&matched, tools, &mut system, provider, model, &no_context);
+    let (skill_tool_defs, prompt_variant) = inject_skills_and_resolve_tools(
+        &matched,
+        tools,
+        &mut system,
+        provider,
+        model,
+        &no_context,
+        &ctx.identity.tools.disabled,
+    );
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
 
@@ -2735,6 +2743,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         provider,
         model,
         &resolved_context,
+        &ctx.identity.tools.disabled,
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
@@ -3163,6 +3172,50 @@ fn has_successful_pr_review(summaries: &[ToolCallSummary]) -> bool {
 /// `provider_name` and `model_name` select variant-specific prompts when available.
 /// Two-level fallback for prompts: model-specific > root.
 /// Three-level fallback for timeouts: model > provider > root.
+/// Filter built-in tool definitions against an agent's identity-driven denylist.
+///
+/// Applied at the LLM-presentation layer (this function is called inside
+/// `inject_skills_and_resolve_tools`), before the tool array reaches the
+/// LLM API call. Disabled tools are *not* presented to the model — the
+/// model never sees them, cannot call them, cannot be prompt-injected into
+/// trying. The shared `Arc<ToolRegistry>` is unchanged.
+///
+/// `disabled` is the agent's `Identity.tools.disabled` list, sourced from
+/// `identity.toml` `[tools].disabled` at agent context load time.
+///
+/// Future migration (when well-known agents move from denylist to allowlist
+/// for tools): extend this hook to handle both shapes — same call site,
+/// different predicate, no caller changes.
+pub(crate) fn apply_agent_tool_visibility(
+    tool_defs: &mut Vec<mika_common::claude::ToolDefinition>,
+    disabled: &[String],
+) {
+    if disabled.is_empty() {
+        return;
+    }
+    let removed_count = tool_defs.len();
+    tool_defs.retain(|d| {
+        let blocked = disabled
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&d.name));
+        if blocked {
+            tracing::debug!(
+                tool = %d.name,
+                "tool hidden from agent's LLM tool array (identity [tools].disabled)"
+            );
+        }
+        !blocked
+    });
+    let removed = removed_count - tool_defs.len();
+    if removed > 0 {
+        tracing::info!(
+            hidden_count = removed,
+            disabled_size = disabled.len(),
+            "applied identity tool-visibility filter"
+        );
+    }
+}
+
 fn inject_skills_and_resolve_tools(
     matched: &[&SkillEntry],
     tools: &ToolRegistry,
@@ -3170,9 +3223,13 @@ fn inject_skills_and_resolve_tools(
     provider_name: &str,
     model_name: &str,
     resolved_context: &HashMap<String, context::ContextBlock>,
+    disabled_tools: &[String],
 ) -> (Vec<mika_common::claude::ToolDefinition>, Option<String>) {
     // Always include ALL builtin tools
     let mut tool_defs = tools.definitions().to_vec();
+    // Apply per-agent visibility filter BEFORE skill tools are added — this
+    // is the named hook that future allowlist migration will reuse.
+    apply_agent_tool_visibility(&mut tool_defs, disabled_tools);
     let mut seen: std::collections::HashSet<String> =
         tool_defs.iter().map(|d| d.name.clone()).collect();
 
@@ -3821,6 +3878,7 @@ mod tests {
         let mut system = "Base prompt.".to_string();
 
         let no_ctx = HashMap::new();
+        let no_disabled: Vec<String> = vec![];
         let (defs, variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
@@ -3828,6 +3886,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            &no_disabled,
         );
 
         // Should append skill snippet to system prompt
@@ -3876,6 +3935,7 @@ mod tests {
         let mut system = String::new();
 
         let no_ctx = HashMap::new();
+        let no_disabled: Vec<String> = vec![];
         let (defs, _variant) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
@@ -3883,11 +3943,68 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            &no_disabled,
         );
 
         // "overlap" should appear exactly once (builtin wins)
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].description, "builtin overlap");
+    }
+
+    #[test]
+    fn test_apply_agent_tool_visibility_evicts_listed_names() {
+        let mut defs = vec![
+            ToolDefinition {
+                name: "pr_merge_with_gate".to_string(),
+                description: "merges PRs".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "search_memory".to_string(),
+                description: "reads memory".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "update_core_memory".to_string(),
+                description: "writes memory".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let disabled = vec![
+            "pr_merge_with_gate".to_string(),
+            "update_core_memory".to_string(),
+        ];
+        apply_agent_tool_visibility(&mut defs, &disabled);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "search_memory");
+    }
+
+    #[test]
+    fn test_apply_agent_tool_visibility_no_op_when_disabled_empty() {
+        let mut defs = vec![ToolDefinition {
+            name: "pr_merge_with_gate".to_string(),
+            description: "merges PRs".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let disabled: Vec<String> = vec![];
+        apply_agent_tool_visibility(&mut defs, &disabled);
+        assert_eq!(
+            defs.len(),
+            1,
+            "empty denylist should leave tool defs unchanged"
+        );
+    }
+
+    #[test]
+    fn test_apply_agent_tool_visibility_case_insensitive() {
+        let mut defs = vec![ToolDefinition {
+            name: "Pr_Merge_With_Gate".to_string(),
+            description: "case-mixed".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let disabled = vec!["pr_merge_with_gate".to_string()];
+        apply_agent_tool_visibility(&mut defs, &disabled);
+        assert!(defs.is_empty(), "filter must match case-insensitively");
     }
 
     #[test]
@@ -3906,6 +4023,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            &[],
         );
 
         // Should NOT add skill context section when snippet is empty
@@ -3932,6 +4050,7 @@ mod tests {
             "groq",
             "llama-3.3-70b-versatile",
             &no_ctx,
+            &[],
         );
 
         assert!(system.contains("Root prompt for search."));
@@ -3953,6 +4072,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            &[],
         );
 
         // Should NOT add any skill context section
@@ -3980,6 +4100,7 @@ mod tests {
             "anthropic",
             "claude-sonnet-4-6",
             &no_ctx,
+            &[],
         );
 
         assert!(system.contains("Sonnet-specific prompt."));
@@ -4014,6 +4135,7 @@ mod tests {
             "anthropic",
             "claude-opus-4",
             &no_ctx,
+            &[],
         );
 
         assert!(system.contains("Root prompt."));
@@ -4040,6 +4162,7 @@ mod tests {
             "groq",
             "llama-3.3-70b-versatile",
             &no_ctx,
+            &[],
         );
 
         assert!(system.contains("Root prompt."));
@@ -4066,6 +4189,7 @@ mod tests {
             "openrouter",
             "anthropic/claude-sonnet-4",
             &no_ctx,
+            &[],
         );
 
         assert!(system.contains("OpenRouter model prompt."));

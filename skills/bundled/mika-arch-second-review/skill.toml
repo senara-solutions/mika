@@ -1,0 +1,18 @@
+[skill]
+name = "mika-arch-second-review"
+description = "Iteration-pass plan review after a first-pass ITERATE verdict — produces GROOMED or ESCALATE. Never ITERATE again."
+version = "0.1.0"
+always_on = false
+timeout_secs = 120
+
+[triggers]
+keywords = [
+    "second-review",
+    "groom-iteration",
+    "iterate-review",
+    "second pass",
+    "follow-up review",
+]
+
+[constraints]
+required_tools = ["gh_read"]

@@ -23,13 +23,13 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
     match args.command {
         None => {
             let mut registry = SkillRegistry::from_dir(&skills_dir);
-            apply_db_overrides_if_available(&global_home, agent_name, &mut registry);
+            apply_db_overrides_if_available(&global_home, agent_name, &agent_home, &mut registry);
             registry.log_summary();
             list_skills(&registry, &agent_home, &crate::cli::OutputFormat::Text)?;
         }
         Some(SkillsCommand::List { format }) => {
             let mut registry = SkillRegistry::from_dir(&skills_dir);
-            apply_db_overrides_if_available(&global_home, agent_name, &mut registry);
+            apply_db_overrides_if_available(&global_home, agent_name, &agent_home, &mut registry);
             registry.log_summary();
             list_skills(&registry, &agent_home, &format)?;
         }
@@ -256,8 +256,15 @@ async fn resolve_github_token_for_git(global_home: &Path, agent_home: &Path) -> 
 fn apply_db_overrides_if_available(
     global_home: &Path,
     agent_id: &str,
+    agent_home: &Path,
     registry: &mut SkillRegistry,
 ) {
+    // Apply identity allowlist if present
+    let identity = mika_agent::prompt::load_identity(agent_home);
+    if let Some(ref allowlist) = identity.skills.allowlist {
+        registry.apply_identity_allowlist(allowlist);
+    }
+
     let db_path = mika_common::home::container_db_path(global_home);
     if !db_path.exists() {
         return;
@@ -734,6 +741,23 @@ fn toggle_skill(
     let skill_dir = skills_dir.join(name);
     if !skill_dir.is_dir() {
         bail!("Skill '{name}' not found at {}", skill_dir.display());
+    }
+
+    // Identity-allowlist guard: agents declaring `[skills].allowlist` (e.g.
+    // mika-arch) evict non-allowlisted skills at Phase -1, before DB overrides
+    // apply. Setting an override on an evicted skill silently no-ops on next
+    // load. Surface this loudly instead. Mirrors the toggle_skill agent tool.
+    let agent_home = mika_common::home::resolve_agent_home(global_home, agent_id);
+    let identity = mika_agent::prompt::load_identity(&agent_home);
+    if let Some(ref allowlist) = identity.skills.allowlist
+        && !allowlist.iter().any(|a| a.eq_ignore_ascii_case(name))
+    {
+        bail!(
+            "Skill '{name}' is not in agent '{agent_id}'s identity allowlist. \
+             Editing the DB override has no effect — Phase -1 evicts the skill \
+             from the registry before DB overrides apply. To use this skill, \
+             add it to `[skills].allowlist` in the agent's identity.toml."
+        );
     }
 
     let db_path = mika_common::home::container_db_path(global_home);

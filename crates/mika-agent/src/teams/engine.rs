@@ -106,6 +106,9 @@ impl TeamEngine {
                 tracing::warn!(agent = %ta.name, error = %e, "failed to migrate .disabled markers");
             }
             let mut skills = SkillRegistry::from_dir(&skills_dir);
+            if let Some(ref allowlist) = identity.skills.allowlist {
+                skills.apply_identity_allowlist(allowlist);
+            }
             if let Ok(overrides) = db.get_skill_overrides(&ta.name) {
                 skills.apply_overrides(&overrides);
             }

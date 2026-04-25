@@ -69,7 +69,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~3159 tests)
+- `cargo test` — Run all tests (~3204 tests)
 - `cargo test -p mika-agent --test eval` — Run agent loop integration tests (eval harness)
 - `MIKA_EVAL_REAL_PROVIDERS=anthropic,openai cargo test -p mika-agent --test eval -- --ignored` — Run real-provider eval matrix (requires API keys)
 - `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval` — Run KG provider comparison eval (requires API keys for all selected providers)
@@ -121,7 +121,7 @@ Optional (Knowledge Graph LLM):
 - `MIKA_KG_RESOLUTION_MODEL` — Model for entity resolution disambiguation (#691). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Mid-tier model recommended for better judgment on ambiguous matches.
 - `MIKA_KG_BATCH_BUDGET` — Per-batch LLM call cap on KG startup extraction and resolution (#757). Default `500`. Worst-case per-startup cost is `2 × N_agents × budget` (extraction batch + resolution batch, one of each per agent). Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next restart. `0` disables the phase entirely. Extraction idempotency (see `crates/mika-agent/src/db/kg_schema.rs` → **Idempotency key**) keeps the second and subsequent restarts free of extraction calls once marker rows are populated.
 - `MIKA_KG_DOCS_ROOT` — Absolute path to the docs root the `LexicalIngestor` reads (#738). Defaults to `<CWD>/docs/solutions` when unset — works in containers where the Dockerfile copies `docs/` into the workdir. Needed on hosts where the service starts with CWD ≠ repo root (e.g., OpenRC `supervise-daemon` launches with CWD=`/`). Also settable as `kg_docs_root` in config.toml. If set to an empty string, lexical ingestion skips with a distinct warn.
-- `MIKA_KG_DOCS_ROOTS` — Optional colon-separated list of docs-root paths for multi-corpus agents (e.g., mika-arch reasoning across multiple repos). Global fallback; per-agent `[kg].docs_roots` in identity.toml takes precedence. Linux/macOS only.
+- `MIKA_KG_DOCS_ROOTS` — Optional colon-separated list of docs-root paths for multi-corpus agents (e.g., mika-arch reasoning across multiple repos). Global fallback; per-agent `[kg].docs_roots` in identity.toml takes precedence. Linux/macOS only. **Required for mika-arch in dev mode** — at provision time, `MIKA_ARCH_IDENTITY` is computed from this env so `[kg].docs_roots` always contains absolute paths (mika-server runs with CWD=`/` under OpenRC/systemd). When unset, mika-arch is skipped at provision with an explicit `error!` log; other well-known agents (mika-dev/qa/relay) come up normally.
 
 ### Post-restart safety check (#757)
 
@@ -153,7 +153,7 @@ Server mode additionally requires:
 - `MIKA_INTERNAL_TOKEN` — Shared secret for Bearer auth between gateway and agent
 
 Optional (startup behavior):
-- `MIKA_DEV_MODE` — Enable dev mode (default: false). When true, auto-provisions well-known development agents (`mika-dev`, `mika-qa`, `mika-relay`) on startup with role-specific identity, soul, and skill assignments. mika-dev gets self-dev family skills; mika-qa gets qa-review family skills; mika-relay gets only permission-policy (haiku model for cheap permission classification). Idempotent — existing agents are never overwritten.
+- `MIKA_DEV_MODE` — Enable dev mode (default: false). When true, auto-provisions well-known development agents (`mika-dev`, `mika-qa`, `mika-relay`, `mika-arch`) on startup with role-specific identity, soul, and skill assignments. mika-dev gets self-dev family skills; mika-qa gets qa-review family skills; mika-relay gets only permission-policy (haiku model for cheap permission classification); mika-arch gets groom-ticket and second-review skills (read-only architect, Kimi base with Opus/Sonnet skill overrides). Idempotent — existing agents are never overwritten.
 - `MIKA_DISABLE_BUNDLED_SKILLS` — Skip bundled skill re-sync on startup (default: false). WARNING: do not enable in production — prevents security updates to handler scripts.
 - `MIKA_DISABLE_AGENT_PROVISIONING` — Skip well-known agent auto-creation on startup (default: false). When true, prevents `dev_mode` from creating or updating agent identity files, allowing manual edits to persist across restarts/deploys. Same pattern as `MIKA_DISABLE_BUNDLED_SKILLS`.
 
@@ -238,7 +238,9 @@ skills/bundled/
 ├── build-mika/            # Build verification
 ├── deploy-mika/           # Deployment
 ├── agents-teams/          # Agent/team management
-└── skill-review/          # Skill review handler
+├── skill-review/          # Skill review handler
+├── mika-arch-groom-ticket/  # First-pass plan review (Opus 4.7) — produces READY/ITERATE/ESCALATE
+└── mika-arch-second-review/ # Second-pass plan review (Sonnet 4.6) — produces GROOMED/ESCALATE
 ```
 
 ### Build-Time Discovery

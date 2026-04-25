@@ -108,6 +108,9 @@ async fn spawn_agent_worker(
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
     let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
+    if let Some(ref allowlist) = identity.skills.allowlist {
+        skill_registry.apply_identity_allowlist(allowlist);
+    }
     if let Ok(overrides) = ctx
         .async_db
         .get_skill_overrides(&ctx.async_db.agent_id)
@@ -230,6 +233,10 @@ async fn spawn_agent_worker(
                     if worker_dirty.load(Ordering::Acquire) {
                         worker_dirty.store(false, Ordering::Release);
                         let mut registry = SkillRegistry::from_dir(&worker_home.join("skills"));
+                        let reload_identity = mika_agent::prompt::load_identity(&worker_home);
+                        if let Some(ref allowlist) = reload_identity.skills.allowlist {
+                            registry.apply_identity_allowlist(allowlist);
+                        }
                         if let Ok(overrides) =
                             worker_db.get_skill_overrides(&worker_db.agent_id).await
                         {
@@ -288,6 +295,10 @@ async fn spawn_agent_worker(
                     if worker_dirty.load(Ordering::Acquire) {
                         worker_dirty.store(false, Ordering::Release);
                         let mut registry = SkillRegistry::from_dir(&worker_home.join("skills"));
+                        let reload_identity2 = mika_agent::prompt::load_identity(&worker_home);
+                        if let Some(ref allowlist) = reload_identity2.skills.allowlist {
+                            registry.apply_identity_allowlist(allowlist);
+                        }
                         if let Ok(overrides) =
                             worker_db.get_skill_overrides(&worker_db.agent_id).await
                         {

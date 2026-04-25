@@ -122,8 +122,12 @@ impl Tool for DelegateTaskTool {
         };
         let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, agent_name);
 
-        // Load delegate agent's skills (with DB overrides)
+        // Load delegate agent identity and skills (with identity allowlist + DB overrides)
+        let identity = crate::prompt::load_identity(&agent_home);
         let mut skills = crate::skills::SkillRegistry::from_dir(&agent_home.join("skills"));
+        if let Some(ref allowlist) = identity.skills.allowlist {
+            skills.apply_identity_allowlist(allowlist);
+        }
         if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
             skills.apply_overrides(&overrides);
         }
@@ -131,7 +135,6 @@ impl Tool for DelegateTaskTool {
 
         // Register delegate agent so sessions FK constraint is satisfied.
         // Follows the team engine pattern (engine.rs line 95).
-        let identity = crate::prompt::load_identity(&agent_home);
         if let Err(e) = async_db
             .register_agent(
                 agent_name,

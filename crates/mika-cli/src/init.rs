@@ -148,6 +148,7 @@ fn ensure_initialized_for_agent(
             {
                 mika_agent::well_known_agents::provision_well_known_agents(
                     global_home,
+                    &global_settings,
                     global_settings.disable_agent_provisioning,
                 );
             }
