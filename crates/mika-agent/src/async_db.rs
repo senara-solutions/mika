@@ -1458,12 +1458,15 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_agent_with_stats(&aid)).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_sessions_paginated(
         &self,
         agent_id: Option<String>,
         channel_type: Option<String>,
         session_id: Option<String>,
         task_id: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SessionWithStats>> {
@@ -1473,6 +1476,8 @@ impl AsyncDatabase {
                 channel_type.as_deref(),
                 session_id.as_deref(),
                 task_id.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
                 limit,
                 offset,
             )
@@ -1486,6 +1491,8 @@ impl AsyncDatabase {
         channel_type: Option<String>,
         session_id: Option<String>,
         task_id: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
     ) -> Result<u64> {
         self.with_db(move |db| {
             db.count_sessions(
@@ -1493,6 +1500,8 @@ impl AsyncDatabase {
                 channel_type.as_deref(),
                 session_id.as_deref(),
                 task_id.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
             )
         })
         .await
@@ -1575,12 +1584,15 @@ impl AsyncDatabase {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_sessions_paginated_with_count(
         &self,
         agent_id: Option<String>,
         channel_type: Option<String>,
         session_id: Option<String>,
         task_id: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<SessionWithStats>, u64)> {
@@ -1590,6 +1602,8 @@ impl AsyncDatabase {
                 channel_type.as_deref(),
                 session_id.as_deref(),
                 task_id.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
                 limit,
                 offset,
             )
@@ -1664,11 +1678,19 @@ impl AsyncDatabase {
     pub async fn list_dev_runs_paginated_with_count(
         &self,
         status: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<Task>, u64)> {
         self.with_db(move |db| {
-            db.list_dev_runs_paginated_with_count(status.as_deref(), limit, offset)
+            db.list_dev_runs_paginated_with_count(
+                status.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                limit,
+                offset,
+            )
         })
         .await
     }
