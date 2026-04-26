@@ -75,7 +75,7 @@ Post your verdict as a GitHub pull request review using `run_gh`. The review typ
 | `block[ac]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 | `block` (other sub-types) | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 
-The `<verdict_body>` is your full verdict output: DIFF ANALYSIS + FINDINGS (if any) + VERDICT + REASON.
+The `<verdict_body>` is your full verdict output: DIFF ANALYSIS + PLAN-AC VERIFICATION (always — carried forward from the prior turn or composed now from the AC list extracted before `build_mika`) + BUILD VERIFICATION (always when this callback ran) + FINDINGS (if any) + VERDICT + REASON + (when verdict is `block[ac]`) `Plan amendment required:` section per qa-review Step 2.5.8.
 
 **Tool call format:** `run_gh` takes a JSON object with `command` (array of strings) and `repo` (string). Example for a pass verdict:
 ```json
@@ -91,7 +91,7 @@ If `run_gh pr review` fails, record the error in `FINDINGS`, then retry the call
 
 After completing all checks — **including the successful `run_gh pr review` call from Step 5** — output your verdict. Your response MUST end with the verdict block below. The verdict block is a **mirror** of the body you passed to `run_gh pr review`; the posted GitHub review is the source of truth, and the text in your response exists only for logging and debugging. If they ever differ, the posted review wins. You may include analysis notes before the block, but the verdict block must be the last thing in your response.
 
-**Format — follow exactly. Every verdict MUST include DIFF ANALYSIS (Step 3d) and BUILD VERIFICATION (Step 3e, when applicable) echo-backs:**
+**Format — follow exactly. Every verdict MUST include DIFF ANALYSIS (qa-review Step 3d), PLAN-AC VERIFICATION (qa-review Step 2.5.6, always — carried forward or recomposed), and BUILD VERIFICATION (Step 3e.5, when this callback ran) echo-backs. When verdict is `block[ac]`, also include the `Plan amendment required:` section (qa-review Step 2.5.8).**
 
 ```
 DIFF ANALYSIS:
@@ -101,6 +101,15 @@ Key changes:
 - Refactored LangfuseExporter to use batch flush with 5-second interval
 - Updated integration tests to assert trace_id presence in exported spans
 
+PLAN-AC VERIFICATION:
+Plan: docs/plans/<plan>.md
+ACs evaluated: 4
+- [✅] satisfied: trace_id propagated through gRPC handlers: confirmed in src/agent.rs hunk
+- [✅] satisfied: LangfuseExporter batch interval = 5s: src/exporter.rs:42
+- [✅] satisfied: integration tests assert trace_id presence: tests/eval/trace_id.rs added
+- [⏭️] CI-deferred: no test regressions
+- [✅] implicit structural: no parallel plan files in docs/plans/
+
 BUILD VERIFICATION:
 Build: pass
 ACs tested: 2
@@ -108,15 +117,46 @@ ACs tested: 2
 - `mika agents list`: pass — human-friendly text output preserved
 
 VERDICT: pass
-REASON: Pipeline artifacts present, diff review clean, build verification passed
+REASON: Pipeline artifacts present, diff review clean, all plan ACs satisfied, build verification passed
 ```
 
-When build verification was skipped (no executable ACs, wrong repo, no worktree):
+When build verification was skipped (no Behavioral ACs in plan, wrong repo, no worktree):
 ```
-BUILD VERIFICATION: skipped (no executable ACs)
+BUILD VERIFICATION: skipped (no Behavioral ACs in plan)
 ```
 
-Or with findings (severity determines the verdict line):
+For a `block[ac]` verdict (one or more plan ACs unsatisfied):
+```
+DIFF ANALYSIS:
+Files reviewed: 4
+Key changes:
+- Added --verbose flag to `mika ask` subcommand
+- Emits trailer with session_id only in text mode
+
+PLAN-AC VERIFICATION:
+Plan: docs/plans/<plan>.md
+ACs evaluated: 9
+- [❌] unsatisfied: `mika ask --verbose` emits the v1 metadata block in JSON and prose formats per the field list and rendering rules above
+  expected: 11 fields, alphabetical in JSON, importance-ordered in text, token fields gated on MIKA_STORE_LLM_CALLS=true
+  actual: text mode emits session_id only (1 of 11 fields); JSON --verbose ignored entirely (zero metadata)
+- [✅] satisfied: --verbose flag added to clap config
+- ... (remaining ACs)
+- [✅] implicit structural: no parallel plan files in docs/plans/
+
+BUILD VERIFICATION:
+Build: pass
+ACs tested: 1
+- `mika ask --verbose --format json "ping"`: fail — output contains no metadata object
+
+VERDICT: block[ac]
+REASON: Plan AC for v1 metadata block unsatisfied — 10 of 11 fields missing; JSON --verbose silently ignored.
+
+Plan amendment required:
+- AC: `mika ask --verbose` emits the v1 metadata block in JSON and prose formats per the field list and rendering rules above
+  Conflict reason (inferred): JSON-nested-metadata shape conflicts with `/mika-groom-ticket`'s parser, which scans for `session_id: <uuid>` lines on stdout. Resolution requires either: (a) amend plan rendering to match parser shape, or (b) amend `/mika-groom-ticket` parser to handle nested JSON. Operator decision required — auto-retry inappropriate.
+```
+
+Or with security findings (severity determines the verdict line):
 
 ```
 DIFF ANALYSIS:
@@ -125,11 +165,16 @@ Key changes:
 - Hardcoded API key string literal assigned to AUTH_TOKEN in src/config.rs:42
 - New SQL query in src/db.rs using format!() with user input
 
+PLAN-AC VERIFICATION:
+Plan: docs/plans/<plan>.md
+ACs evaluated: <n>
+- [✅] / [❌] per bullet ...
+
 FINDINGS:
 - Hardcoded API key found in src/config.rs line 42
 - SQL injection vector in src/db.rs line 87
 
-VERDICT: block
+VERDICT: block[security]
 REASON: Security issues — hardcoded credentials and SQL injection vector
 ```
 

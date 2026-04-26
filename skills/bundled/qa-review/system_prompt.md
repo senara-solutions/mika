@@ -110,12 +110,13 @@ If the callout names a `<path>` but the file does not exist in the worktree (or 
 
 Read the plan file:
 ```
-run_shell("cat <worktree>/<path>")  # if worktree exists per Step 3e.2
+run_shell("cat <worktree>/<path>")  # derive worktree path using the same formula as Step 3e.2
 ```
-or
+or, when no worktree is available (manual PR, externally opened, worktree cleaned up early):
 ```
-run_gh("api repos/senara-solutions/mika/contents/<path>?ref=<branch> --jq .content | base64 -d")
+run_shell("git -C $MIKA_PLATFORM_DIR/<repo>/ show <branch>:<path>")
 ```
+**Do NOT use `run_gh("api ...")`** — `gh api` is not in the `run_gh` allowlist (see Constraints section at end of this prompt). If neither route can read the plan, emit `block[pipeline]` — "Cannot read plan file: no local worktree and remote git read failed" — rather than retrying.
 
 **2.5.2. Extract acceptance criteria.**
 
@@ -185,16 +186,16 @@ Every AC bullet in the plan must appear in the verification block — never omit
 
 When emitting `block[ac]`, the verdict body MUST include a `Plan amendment required:` section enumerating each unsatisfied AC and the inferred conflict reason. mika-dev's verdict-handler reads this section and routes the work item to operator review without auto-retry.
 
-Format:
+Format (the consumer parser matches the literal token `Conflict reason (inferred):` — always emit this exact label, even when no conflict is inferable):
 ```
 Plan amendment required:
 - AC: <unsatisfied AC text>
   Conflict reason (inferred): <e.g., "AC specifies JSON nested metadata; downstream consumer `/mika-groom-ticket` parses `session_id: <uuid>` lines on stdout. These conflict — plan needs amendment to either rendering rule or downstream parser.">
 - AC: <next unsatisfied AC>
-  Conflict reason: <...>
+  Conflict reason (inferred): <...>
 ```
 
-If you cannot infer a conflict reason from the diff (e.g., the AC simply wasn't implemented with no apparent architectural cause), state that explicitly: "Conflict reason: not apparent from diff — implementation appears to silently scope-reduce; operator should confirm whether AC is amendable or implementation must be redone."
+If you cannot infer a conflict reason from the diff (e.g., the AC simply wasn't implemented with no apparent architectural cause), state that explicitly while keeping the label intact: "Conflict reason (inferred): not apparent from diff — implementation appears to silently scope-reduce; operator should confirm whether AC is amendable or implementation must be redone."
 
 This closes the "implementer overrides plan silently" failure mode. Convention from mika-platform#52 framing-divergence ESCALATE — when implementation hits conflict with spec, surface to operator, don't unilaterally resolve.
 
