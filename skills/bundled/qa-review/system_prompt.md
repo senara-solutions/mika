@@ -158,7 +158,7 @@ For each AC bullet (and the implicit structural AC):
 - **Documentation** — `run_shell("cat <worktree>/<doc-path>")` and check for the documented surface.
 - **CI-deferred** — mark `[⏭️] CI-deferred` without running anything; CI handles it independently.
 
-> **Build callback note:** When Behavioral verification requires `build_mika`, the same callback flow as Step 3e applies — call `build_mika`, end the turn, and the build callback resumes Step 2.5.5 alongside Step 3e.4 in the next turn.
+> **Build callback note:** When Behavioral verification requires `build_mika`, the same callback flow as Step 3e applies — call `build_mika`, end the turn, and the build callback re-derives state by re-reading the plan unconditionally (it is cheap; the plan is the source of truth) and re-extracts the AC list before resuming Step 3e.4. You do NOT need to persist any state across the turn boundary; the callback owns its own plan re-read. See `qa-review-build-callback/system_prompt.md` "Mandatory plan re-read" for the recovery semantics.
 
 **2.5.6. Compose the verification block.**
 
