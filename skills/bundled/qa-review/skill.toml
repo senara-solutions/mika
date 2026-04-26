@@ -10,7 +10,7 @@ dependencies = ["github", "build-mika"]
 keywords = ["review", "pr", "qa", "pull request"]
 
 [constraints]
-required_tools = ["qa_pr_view", "run_gh"]
+required_tools = ["qa_pr_view", "run_gh", "run_shell"]
 
 [context.pr_diff]
 type = "gh_pr_diff"
