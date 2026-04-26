@@ -1274,6 +1274,21 @@ fn validate_gh_read_input(input: &serde_json::Value) -> Result<GhReadArgs, ToolO
                     .to_json(),
                 ));
             }
+            // Charset enforcement: prevent URL injection via query-string
+            // metacharacters. The ref is interpolated into `?ref={ref}` in the
+            // gh api URL — chars like `?`, `&`, `#`, `%` would corrupt the URL.
+            // Allow git-ref-safe characters: alphanumeric, `.`, `_`, `/`, `-`.
+            if !r
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+            {
+                return Err(ToolOutput::error(
+                    GhReadError::MalformedRequest(format!(
+                        "'ref' contains disallowed characters. Only [A-Za-z0-9._/-] are permitted: '{r}'."
+                    ))
+                    .to_json(),
+                ));
+            }
         }
 
         (Some(path), r#ref)
@@ -4824,5 +4839,173 @@ mod tests {
         assert_eq!(parsed["error"], "file_too_large");
         assert_eq!(parsed["size_bytes"], 2_000_000);
         assert_eq!(parsed["max_bytes"], 1_048_576);
+    }
+
+    // -- Review-driven tests (code review findings) --
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_ref_charset_rejection() {
+        // Query-string injection via metacharacters in ref (P1 security finding)
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/main.rs",
+            "ref": "main&foo=bar"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("disallowed"));
+
+        // Fragment injection
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/main.rs",
+            "ref": "main#fragment"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.content.contains("disallowed"));
+
+        // Percent-encoded ref
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/main.rs",
+            "ref": "main%00evil"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.content.contains("disallowed"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_ref_at_boundary() {
+        // Ref exactly 256 chars — should be accepted
+        let ref_256 = "a".repeat(256);
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/main.rs",
+            "ref": ref_256
+        });
+        assert!(
+            validate_gh_read_input(&input).is_ok(),
+            "ref of exactly 256 chars must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_parse_file_view_malformed_json() {
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("test.rs".to_string()),
+            r#ref: None,
+        };
+        let err = parse_file_view_response("not valid json at all", &args).unwrap_err();
+        assert!(
+            matches!(err, GhReadError::MalformedRequest(ref m) if m.contains("parse")),
+            "Expected MalformedRequest with parse error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_file_view_unexpected_encoding() {
+        let body = serde_json::json!({
+            "name": "test.txt",
+            "path": "test.txt",
+            "sha": "abc123",
+            "size": 10,
+            "content": "some content",
+            "encoding": "none",
+            "type": "file"
+        });
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("test.txt".to_string()),
+            r#ref: None,
+        };
+        let err = parse_file_view_response(&body.to_string(), &args).unwrap_err();
+        assert!(
+            matches!(err, GhReadError::MalformedRequest(ref m) if m.contains("encoding")),
+            "Expected MalformedRequest about encoding, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_file_view_empty_file() {
+        // GitHub returns size=0, content="" for empty files
+        let body = serde_json::json!({
+            "name": "empty.txt",
+            "path": "empty.txt",
+            "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            "size": 0,
+            "content": "",
+            "encoding": "base64",
+            "type": "file"
+        });
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("empty.txt".to_string()),
+            r#ref: None,
+        };
+        let result = parse_file_view_response(&body.to_string(), &args).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], "");
+        assert_eq!(parsed["size_bytes"], 0);
+    }
+
+    #[test]
+    fn test_parse_file_view_base64_with_newlines() {
+        use base64::Engine;
+        // GitHub returns base64 with embedded \n every 60 chars
+        let content = "This is a test file with enough content to span multiple base64 lines when encoded.\nLine two.\nLine three.\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(content);
+        // Insert newlines every 60 chars like GitHub does
+        let with_newlines: String = encoded
+            .as_bytes()
+            .chunks(60)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = serde_json::json!({
+            "name": "test.txt",
+            "path": "test.txt",
+            "sha": "sha123",
+            "size": content.len(),
+            "content": with_newlines,
+            "encoding": "base64",
+            "type": "file"
+        });
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("test.txt".to_string()),
+            r#ref: None,
+        };
+        let result = parse_file_view_response(&body.to_string(), &args).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], content);
+    }
+
+    #[test]
+    fn test_build_gh_read_command_file_view_exact_url() {
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("src/main.rs".to_string()),
+            r#ref: Some("v1.0".to_string()),
+        };
+        let cmd = build_gh_read_command(&args);
+        assert_eq!(
+            cmd[1], "/repos/owner/repo/contents/src/main.rs?ref=v1.0",
+            "Full URL must match exactly"
+        );
     }
 }
