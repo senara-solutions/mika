@@ -815,6 +815,7 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
                         worker_team_db.clone(),
                         worker_run_id.as_deref(),
                         github_app.clone(),
+                        None, // CLI: no AppState for session-scoped dedup (#821)
                     )
                     .await
                     {

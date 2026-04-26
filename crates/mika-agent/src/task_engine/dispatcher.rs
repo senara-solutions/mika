@@ -542,6 +542,7 @@ impl TaskDispatcher {
             &self.home_dir,
             &self.db,
             self.github_app.clone(),
+            self.pr_reviews_posted.clone(),
         )
         .await
         .with_context(|| format!("resuming team_run_id={team_run_id}"))?;

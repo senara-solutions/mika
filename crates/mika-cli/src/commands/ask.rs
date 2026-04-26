@@ -518,6 +518,7 @@ pub async fn run_team_ask(
         team_db.clone(),
         run_id,
         github_app,
+        None, // CLI: no AppState for session-scoped dedup (#821)
     )
     .await?;
     team_db.shutdown();

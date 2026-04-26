@@ -134,6 +134,7 @@ impl Tool for RunTeamTool {
             team_db.clone(),
             None,
             self.github_app.clone(),
+            None, // run_team tool: no AppState access for session-scoped dedup (#821)
         )
         .await;
         team_db.shutdown();

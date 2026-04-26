@@ -34,6 +34,7 @@ pub async fn run_team(
     team_db: AsyncDatabase,
     reference_run_id: Option<&str>,
     github_app: Option<Arc<GitHubApp>>,
+    pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
 ) -> Result<TeamRun> {
     let def = team::load_team(global_home, team_name)?;
     team::validate_team(global_home, &def)?;
@@ -47,6 +48,7 @@ pub async fn run_team(
         team_db,
         reference_run_id,
         github_app,
+        pr_reviews_posted,
     )?;
     engine.execute().await
 }
@@ -67,6 +69,7 @@ pub async fn resume_team_run(
     global_home: &Path,
     db: &AsyncDatabase,
     github_app: Option<Arc<GitHubApp>>,
+    pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
 ) -> Result<()> {
     tracing::info!(
         team_name = team_name,
@@ -89,8 +92,16 @@ pub async fn resume_team_run(
     let resume_db = crate::db::Database::open(&db_path)?;
     let team_db = AsyncDatabase::new_with_agent(resume_db, &db.agent_id);
 
-    let engine =
-        TeamEngine::new_for_resume(def, run, global_home, &settings, team_db, github_app).await?;
+    let engine = TeamEngine::new_for_resume(
+        def,
+        run,
+        global_home,
+        &settings,
+        team_db,
+        github_app,
+        pr_reviews_posted,
+    )
+    .await?;
     let _run = engine.execute_from_phase(next_phase, child_results).await?;
 
     Ok(())

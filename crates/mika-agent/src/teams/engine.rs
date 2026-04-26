@@ -67,6 +67,9 @@ pub struct TeamEngine {
     trace_id: String,
     /// If set, use this specific run's summary instead of auto-detecting the last completed run.
     reference_run_id: Option<String>,
+    /// Session-scoped PR review dedup map (#821). Shared with `AppState`.
+    /// Entries evicted at each `end_session()` callsite.
+    pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
 }
 
 impl TeamEngine {
@@ -160,6 +163,7 @@ impl TeamEngine {
         team_db: AsyncDatabase,
         reference_run_id: Option<&str>,
         github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
+        pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
     ) -> Result<Self> {
         let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -206,6 +210,7 @@ impl TeamEngine {
             goal_msg_id: None,
             trace_id: mika_common::trace::generate_trace_id(),
             reference_run_id: reference_run_id.map(|s| s.to_string()),
+            pr_reviews_posted,
         })
     }
 
@@ -217,6 +222,7 @@ impl TeamEngine {
         settings: &Settings,
         team_db: AsyncDatabase,
         github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
+        pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
     ) -> Result<Self> {
         let res = Self::init_resources(&team, global_home, settings, &run.run_id, None)?;
 
@@ -251,6 +257,7 @@ impl TeamEngine {
             goal_msg_id: None,
             trace_id,
             reference_run_id: None,
+            pr_reviews_posted,
         })
     }
 
@@ -1014,6 +1021,7 @@ impl TeamEngine {
             let github_app = github_app.clone();
             let team_db = team_db.clone();
             let trace_id = self.trace_id.clone();
+            let pr_reviews_posted = self.pr_reviews_posted.clone();
 
             let agent_span = info_span!("team_agent_task", agent = %input.agent_name);
             join_set.spawn(
@@ -1154,6 +1162,9 @@ impl TeamEngine {
                     let end_session_id = format!("team-{}-{}", run_id, &input.agent_name);
                     if let Err(e) = team_db.end_session(&end_session_id).await {
                         warn!(agent = %input.agent_name, error = %e, "failed to end per-agent team session");
+                    }
+                    if let Some(ref map) = pr_reviews_posted {
+                        map.remove(&end_session_id);
                     }
 
                     (input.index, input.agent_name, result)
