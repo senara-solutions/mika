@@ -205,7 +205,6 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
 /// into trying. Defense-in-depth for the read-only-architect invariant.
 ///
 /// Categories:
-/// - Memory mutations: writes to platform memory tables
 /// - Skill mutations: writes to skills on disk or `skill_overrides` rows
 /// - Config / files: writes to settings or agent files
 /// - Reminders / scheduled tasks: writes to scheduled_tasks rows
@@ -219,11 +218,12 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
 /// - `send_message`: writes to mika-arch's own session history. Constitutive
 ///   of being an agent — denying it leaves mika-arch unable to deliver
 ///   verdicts in non-skill-output contexts. Not a platform side-effect.
+/// - `update_core_memory`, `store_fact`, `update_fact`: memory writes are
+///   agent-scoped self-state (5 core memory blocks + 4 facts categories,
+///   scoped to `agent_id = 'mika-arch'`). Constitutive of being an agent —
+///   persistence, not platform side-effect. See
+///   `docs/architecture/review-guide.md` § Orthogonality.
 pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
-    // Memory mutations
-    "update_core_memory",
-    "store_fact",
-    "update_fact",
     // Skill mutations
     "create_skill",
     "delete_skill",
@@ -713,7 +713,9 @@ mod tests {
         assert!(toml.contains("[tools]"));
         assert!(toml.contains("\"pr_merge_with_gate\""));
         assert!(toml.contains("\"a2a_call\""));
-        assert!(toml.contains("\"update_core_memory\""));
+        // Memory writes are NOT denied — agent-scoped self-state, not platform side-effect.
+        // See review-guide.md § Orthogonality (commit 2bba6223).
+        assert!(!toml.contains("\"update_core_memory\""));
         // send_message must NOT be in the disabled list (constitutive of being an agent)
         assert!(!toml.contains("\"send_message\""));
     }
@@ -725,6 +727,21 @@ mod tests {
             "send_message must remain visible to mika-arch — it writes to the agent's own \
              session history (constitutive), not platform state"
         );
+    }
+
+    #[test]
+    fn test_mika_arch_disabled_tools_excludes_agent_self_state() {
+        // Memory writes mutate the agent's own self-state (5 core memory blocks
+        // + 4 facts categories, scoped to agent_id='mika-arch'). They are
+        // constitutive of being an agent, not platform side-effects.
+        // See mika/docs/architecture/review-guide.md § Orthogonality.
+        let agent_self_state_tools = ["update_core_memory", "store_fact", "update_fact"];
+        for tool in &agent_self_state_tools {
+            assert!(
+                !MIKA_ARCH_DISABLED_TOOLS.contains(tool),
+                "{tool} must remain visible to mika-arch (agent self-state, not platform side-effect)"
+            );
+        }
     }
 
     /// Skills that front a write-capable tool (i.e., one in any well-known
