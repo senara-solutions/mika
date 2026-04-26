@@ -192,6 +192,39 @@ Dashboard list surfaces use one of two filter primitives. `<SelectFilter />` fro
 
 For AI platforms, we introduce the **Console Component**: A `surface_container_highest` block using **JetBrains Mono** text. It features no borders but utilizes a "Purple Glow" (a `primary` radial gradient at 5% opacity) in the top-right corner to suggest the agent is "thinking."
 
+### 5.4 Time-range filter affordance grammar
+
+Time-range filtering is the canonical observability filter. `<TimeRangeFilter />` from `@senara-solutions/ui` is the canonical primitive; hand-rolling `<input type="datetime-local">` or relative-time presets outside this primitive is forbidden on filter rows.
+
+**Affordance shape:**
+- Quick presets row: `15m / 1h / 24h / 7d / 30d / Custom`. Selected preset highlights with the focus ring + token color (`text-accent`).
+- Custom picker: native `<input type="datetime-local">` for absolute start and end timestamps. Surfaces the timezone of the running system; users entering values in their local time get filtered to that window.
+- Empty state: no preset selected = no time filter applied.
+
+**Visual reference:** Stitch screen `c5b6feddb5444f3d83a7f9b94e140bcd` (Unified Event Timeline Dashboard) is the canonical template.
+
+**Format contract:**
+- Component emits ISO 8601 strings (e.g., `"2026-04-26T22:00:00Z"`) via the `onChange` callback.
+- URL state (via `useSearchParamsFilter`) stores ISO 8601 strings as `?from=...&to=...`.
+- Backend SQLite queries compare TEXT columns lexicographically; ISO 8601 ordering matches chronological ordering, so string comparison is correct.
+- Frontend types declare `from?: string` and `to?: string` (not `number`). Plan corrects the latent type-mismatch bug across 4 existing API filter types as part of migration.
+
+**Timezone conversion (named assumption):**
+
+`<TimeRangeFilter />` emits ISO 8601 UTC strings via `new Date(localInputValue).toISOString()`. This conversion interprets the user's `<input type="datetime-local">` input as the **browser's local timezone** and converts to UTC for backend transmission.
+
+**Known limitation:** users whose browser timezone differs from their intended operational timezone (common for ops engineers working across regions) will see results offset by the difference. The custom-picker shows the value the user typed; the emitted UTC string is offset from it. Result rows are filtered against UTC-stored timestamps.
+
+**Follow-up trigger:** if multi-timezone support is needed (explicit timezone selector in the picker, or preset re-evaluation on timezone switch), add `date-fns-tz` or equivalent. Native `<input type="datetime-local">` does not provide timezone metadata.
+
+The component's inline JSDoc must name this assumption so it's discoverable without reading this rulebook section.
+
+**Server-side enforcement:** filtering happens at the SQL `WHERE` clause level, not by client-side row slicing. List endpoints accept `from`/`to` query params and add `created_at >= ? AND created_at <= ?` (or equivalent timestamp column). Plan adds this support to the 3 endpoints currently missing it (sessions, tasks, dev-runs).
+
+**Keyboard:** preset buttons are focusable (`<button>` semantics — Tab/Enter/Space). Native `<input type="datetime-local">` provides keyboard date entry.
+
+**ARIA:** `role="group"` on the preset row with `aria-label="Time range presets"`. Each preset button has `aria-pressed={isSelected}`. Custom inputs have `aria-label="Start time"` and `aria-label="End time"`.
+
 ### 5.5 State catalog grammar (loading / empty / error)
 
 Every list and detail surface in the dashboard renders one of three lifecycle states before the happy-path content: **loading** (fetch in progress), **empty** (request succeeded, zero results), **error** (fetch failed). The canonical primitives are `<LoadingState />`, `<EmptyState />`, `<ErrorState />` from `@senara-solutions/ui`. Hand-rolling these states (raw `Loading...` text, `text-red-400` error banners, untreated `null` returns) is a review fail.
