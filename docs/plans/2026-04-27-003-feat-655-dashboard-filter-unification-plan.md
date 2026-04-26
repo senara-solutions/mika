@@ -350,8 +350,8 @@ grep -rn 'placeholder="Search agent\.\.\."' mika/dashboard/src/pages/*.tsx  # �
 grep -rn "<select" mika/dashboard/src/pages/*.tsx  # → 0 matches
 # 2. Filter-shaped <input> for agent (was Sessions free-text) — expected 0 matches
 grep -rn 'placeholder="Search agent\.\.\."' mika/dashboard/src/pages/*.tsx  # → 0 matches
-# 3. useAgents callsites — expected exactly 5 (one per page using <AgentFilter />: Sessions, Timeline, LlmCalls, ToolCalls, plus any new consumer); confirms no stray calls added/dropped during migration
-grep -rn "useAgents" mika/dashboard/src/pages/*.tsx  # → exactly 5 matches (Sessions + Timeline + LlmCalls + ToolCalls + the page seeding the agents prop in any other migrated callsite)
+# 3. useAgents callsites — expected exactly 4 (one per page using <AgentFilter />: Sessions, Timeline, LlmCalls, ToolCalls); confirms cache-shared invocation
+grep -rn "useAgents" mika/dashboard/src/pages/*.tsx  # → exactly 4 matches (Sessions + Timeline + LlmCalls + ToolCalls)
 
 # Confirm packages/ui/CLAUDE.md lists primitives as audited clean
 grep -E "SelectFilter.*Audited clean.*mika#655|AgentFilter.*Audited clean.*mika#655" mika/packages/ui/CLAUDE.md  # → 2 matches
