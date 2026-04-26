@@ -232,6 +232,10 @@ Labels render UPPERCASE with `tracking-wide` (`0.05em` letter-spacing) per §3 t
 
 This addition is the design-system contract for the grammar Change 2 introduces. It declares variants, semantic meaning, canonical rendering surface, and the hand-rolled-forbidden rule. Future variants extend the table here, not in the codebase first.
 
+**Layering discipline (per architect second-pass sharpening):** the rulebook references tokens *by name* (`--color-blocked`, `--color-success`, etc.); concrete hex values live in `theme.css` (Change 1). Avoiding hex literals in `luminescent-core.md` keeps the layering clean — rulebook declares grammar, theme defines values, component consumes both. Single definition point per token.
+
+**Follow-up trigger named:** `recurring_active → info` is a semantic generalization. If operational context requires visual distinction between `in_progress` and `recurring_active` (e.g., "agent doing something right now" vs "task scheduled to run on cadence"), add `--color-recurring` token + extend §5.1's table in a follow-up. Not a blocker for #657.
+
 Net diff: ~25 lines added to `luminescent-core.md`.
 
 ### Change 5 — Document canonical-primitive enforcement in `packages/ui/CLAUDE.md`
