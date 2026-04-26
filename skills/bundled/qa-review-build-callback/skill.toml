@@ -3,6 +3,7 @@ name = "qa-review-build-callback"
 description = "Build callback resumption for qa-review — continues QA verdict after build_mika completes"
 version = "0.1.0"
 always_on = false
+max_prompt_size = 32768
 dependencies = ["qa-review"]
 
 [triggers]
