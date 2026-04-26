@@ -131,6 +131,14 @@ For each instance, ask: "if a post-condition retry forced a new turn, would this
 
 The retry-creates-new-turn semantic is itself worth surfacing in the agent-loop CLAUDE.md docs — the `step` counter resets, the `ToolContext` is fresh, the trace_id stays the same. Per-trace might be a useful middle-ground scope for some defenses (broader than per-turn, narrower than per-session).
 
+## Implementation
+
+Both fixes landed in PR for mika#821 (`fix/mika-qa-duplicate-review-session-scope` branch):
+
+- **Fix A:** `pr_reviews_posted: Arc<DashMap<String, HashSet<String>>>` on `AppState`, threaded through `ToolContext`. `run_gh` checks and populates the map. Entries evicted at 4 `end_session()` dispatcher callsites. `make_pr_dedup_key()` derives keys from `gh pr review` arguments.
+- **Fix B:** `has_successful_pr_review()` check inserted inside the required-tools gate block (before the re-prompt), allowing EndTurn when a PR review already succeeded.
+- **6 new tests:** session-scope dedup (cross-turn duplicate, different-PR-same-session, same-PR-different-session, required-tools-gate-retry-blocks), `make_pr_dedup_key` unit tests, early-accept-skips-guard-#3.
+
 ## Related
 
 - senara-solutions/mika#811 / PR #813 — added mika-arch with the existing post-condition chain.

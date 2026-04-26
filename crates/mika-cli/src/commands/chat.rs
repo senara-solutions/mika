@@ -163,6 +163,7 @@ async fn spawn_agent_worker(
         // the engine from stealing callbacks. See #264.
         cli_mode: true,
         settings: ctx.settings.clone(),
+        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
     });
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
         ctx.async_db.clone(),
@@ -287,6 +288,7 @@ async fn spawn_agent_worker(
                         trace_id: None,
                         correlated_task_id: None,
                         internal: false,
+                        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
                     })
                     .await;
 
@@ -398,6 +400,7 @@ async fn spawn_agent_worker(
                         trace_id: trace_id.clone(),
                         correlated_task_id: None,
                         internal: false,
+                        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
                     })
                     .await;
 

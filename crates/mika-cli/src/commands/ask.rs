@@ -330,6 +330,7 @@ pub async fn run(
         trace_id: None,
         correlated_task_id: task_id.map(|s| s.to_string()),
         internal: task_id.is_some() && !task_complete,
+        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
     })
     .await;
 

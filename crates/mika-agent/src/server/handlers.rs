@@ -865,6 +865,7 @@ async fn run_agent_for_message(
         trace_id: Some(req.request_id.clone()),
         correlated_task_id: None,
         internal: false,
+        pr_reviews_posted: Some(&state.pr_reviews_posted),
     };
 
     match agent::run_agent(&params).await {

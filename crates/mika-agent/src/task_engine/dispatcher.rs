@@ -57,6 +57,9 @@ pub struct TaskDispatcher {
     /// Passed as `settings: Some(&self.settings)` to all `SilentAgentParams` constructions.
     /// See #323.
     pub settings: Settings,
+    /// Session-scoped PR review dedup map (#821). Shared with `AppState`.
+    /// Entries evicted at each `end_session()` callsite.
+    pub pr_reviews_posted: Option<Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
 }
 
 impl TaskDispatcher {
@@ -275,6 +278,9 @@ impl TaskDispatcher {
         if let Err(e) = self.db.end_session(&session_id).await {
             warn!(session_id = %session_id, error = %e, "failed to end skill session");
         }
+        if let Some(ref map) = self.pr_reviews_posted {
+            map.remove(&session_id);
+        }
 
         self.write_execution_trace(&task.id, &trace_id).await;
 
@@ -430,6 +436,9 @@ impl TaskDispatcher {
 
         if let Err(e) = self.db.end_session(&session_id).await {
             warn!(session_id = %session_id, error = %e, "failed to end {} session", session_prefix);
+        }
+        if let Some(ref map) = self.pr_reviews_posted {
+            map.remove(&session_id);
         }
 
         self.write_execution_trace(&task.id, &trace_id).await;
@@ -674,6 +683,9 @@ impl TaskDispatcher {
         if let Err(e) = self.db.end_session(&session_id).await {
             warn!(session_id = %session_id, error = %e, "failed to end heartbeat session");
         }
+        if let Some(ref map) = self.pr_reviews_posted {
+            map.remove(&session_id);
+        }
 
         self.write_execution_trace(&task.id, &trace_id).await;
 
@@ -829,6 +841,9 @@ impl TaskDispatcher {
 
         if let Err(e) = self.db.end_session(&session_id).await {
             warn!(session_id = %session_id, error = %e, "failed to end reflection session");
+        }
+        if let Some(ref map) = self.pr_reviews_posted {
+            map.remove(&session_id);
         }
 
         self.write_execution_trace(&task.id, &trace_id).await;
@@ -1063,6 +1078,7 @@ mod tests {
             agent_lock: None,
             cli_mode: false,
             settings,
+            pr_reviews_posted: None,
         }
     }
 

@@ -55,6 +55,7 @@ use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use mika_common::config::Settings;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -62,6 +63,7 @@ use uuid::Uuid;
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use dashmap::DashMap;
 use mika_common::agent::DEFAULT_AGENT;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::team;
@@ -131,6 +133,12 @@ pub struct ToolContext<'a> {
     /// Used by `run_gh` to reject duplicate PR review submissions within the
     /// same turn — prevents duplicate webhooks. See #695.
     pub pr_review_posted: &'a AtomicBool,
+    /// Session-scoped PR review dedup map (#821). Outer key: session_id,
+    /// inner set: PR dedup keys (repo|positional). Prevents duplicate reviews
+    /// across turns within the same session (e.g., when a required-tools gate
+    /// forces a retry into a new turn). `None` in CLI/test contexts where
+    /// session-scoped dedup is not needed — falls back to per-turn AtomicBool.
+    pub pr_reviews_posted: Option<&'a Arc<DashMap<String, HashSet<String>>>>,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

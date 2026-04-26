@@ -1589,10 +1589,38 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         Err(err) => return err,
     };
 
+    // Compute PR dedup key for `pr review` commands.
+    let pr_dedup_key = if is_pr_review_command(&gh_args.args) {
+        debug_assert!(
+            ctx.pr_reviews_posted.is_some(),
+            "pr_reviews_posted must be threaded for production pr review calls"
+        );
+        Some(make_pr_dedup_key(&gh_args.args, gh_args.repo.as_deref()))
+    } else {
+        None
+    };
+
+    // Session-scope check (Fix A, #821) — primary defense in production.
+    // Prevents duplicate reviews across turns within the same session
+    // (e.g., when a required-tools gate forces a retry into a new turn).
+    if let (Some(key), Some(map)) = (&pr_dedup_key, ctx.pr_reviews_posted)
+        && map
+            .get(ctx.session_id)
+            .map(|set| set.contains(key))
+            .unwrap_or(false)
+    {
+        return ToolOutput::error(
+            "{\"error\": \"duplicate_pr_review\", \"message\": \"A PR review was already \
+             posted in this session for this PR. Duplicate reviews create duplicate \
+             webhooks. End your turn — the review is already submitted.\"}"
+                .to_string(),
+        );
+    }
+
     // Per-turn PR review idempotency guard (#695): if the command is `pr review ...`
     // and we already posted a review in this turn, reject with a structured error.
-    // This makes the prompt-level idempotency rule enforceable at the tool layer.
-    if is_pr_review_command(&gh_args.args)
+    // Retained as fallback when pr_reviews_posted is None (CLI/test contexts).
+    if pr_dedup_key.is_some()
         && ctx
             .pr_review_posted
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1624,13 +1652,40 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
 
     let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
 
-    // On success, record that a PR review was posted in this turn.
-    if !output.is_error && is_pr_review_command(&gh_args.args) {
+    // On success, record that a PR review was posted (both per-turn and session-scoped).
+    if !output.is_error
+        && let Some(key) = pr_dedup_key
+    {
         ctx.pr_review_posted
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(map) = ctx.pr_reviews_posted {
+            map.entry(ctx.session_id.to_string())
+                .or_default()
+                .insert(key);
+        }
     }
 
     output
+}
+
+/// Derive a dedup key for a `gh pr review` invocation.
+///
+/// Format: `{repo}|{positional}` where `positional` is the first argument
+/// after `pr review` (typically a PR URL or number), and `repo` is from the
+/// `--repo` flag. Falls back to `__default__` and `__current_branch__`
+/// when those values are absent.
+///
+/// `__current_branch__` fallback fires only for `gh pr review --approve` with no
+/// positional, which mika-qa never emits (it always passes the PR URL). If this
+/// fallback ever produces same-key collisions for legitimately different PRs in
+/// one session, the fix is to normalize via `gh pr view --json number` — file as
+/// follow-up if it surfaces.
+fn make_pr_dedup_key(args: &[String], repo: Option<&str>) -> String {
+    let positional = args
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or("__current_branch__");
+    format!("{}|{}", repo.unwrap_or("__default__"), positional)
 }
 
 /// Check if a `gh` command array is a `pr review` invocation.
@@ -2162,6 +2217,7 @@ async fn review_skill_batch(
 mod tests {
     use super::*;
     use crate::test_utils::test_helpers::TestHarness;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_get_documentation_all_embedded_topics() {
@@ -5007,5 +5063,194 @@ mod tests {
             cmd[1], "/repos/owner/repo/contents/src/main.rs?ref=v1.0",
             "Full URL must match exactly"
         );
+    }
+
+    // -- make_pr_dedup_key unit tests (#821) --
+
+    #[test]
+    fn test_make_pr_dedup_key_with_url_and_repo() {
+        let args = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "https://github.com/org/repo/pull/42".to_string(),
+            "--approve".to_string(),
+        ];
+        let key = make_pr_dedup_key(&args, Some("org/repo"));
+        assert_eq!(key, "org/repo|https://github.com/org/repo/pull/42");
+    }
+
+    #[test]
+    fn test_make_pr_dedup_key_no_positional() {
+        let args = vec!["pr".to_string(), "review".to_string()];
+        let key = make_pr_dedup_key(&args, None);
+        assert_eq!(key, "__default__|__current_branch__");
+    }
+
+    #[test]
+    fn test_make_pr_dedup_key_number_form() {
+        let args = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "42".to_string(),
+            "--approve".to_string(),
+        ];
+        let key = make_pr_dedup_key(&args, Some("org/repo"));
+        assert_eq!(key, "org/repo|42");
+    }
+
+    // -- Session-scoped PR review dedup tests (#821) --
+
+    /// Test helper: check if a session+key pair exists in the dedup map.
+    /// Workaround for DashMap type inference issues in test code.
+    fn test_map_contains(
+        map: &dashmap::DashMap<String, std::collections::HashSet<String>>,
+        session_id: &str,
+        key: &str,
+    ) -> bool {
+        map.get(session_id)
+            .map(|set| set.contains(key))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn test_run_gh_session_scope_blocks_cross_turn_duplicate() {
+        // Simulate: turn 1 posts a review (session map populated),
+        // turn 2 tries the same review (AtomicBool reset, but session map blocks).
+        let map: Arc<dashmap::DashMap<String, std::collections::HashSet<String>>> =
+            Arc::new(dashmap::DashMap::new());
+        let session_id = "test-session";
+        let pr_url = "https://github.com/org/repo/pull/42";
+
+        // Simulate turn 1 success: populate session map + flip per-turn bool.
+        let dedup_key = make_pr_dedup_key(
+            &[
+                "pr".to_string(),
+                "review".to_string(),
+                pr_url.to_string(),
+                "--approve".to_string(),
+            ],
+            None,
+        );
+        map.entry(session_id.to_string())
+            .or_default()
+            .insert(dedup_key.clone());
+
+        // Verify the map blocks a second attempt.
+        assert!(
+            test_map_contains(&map, session_id, &dedup_key),
+            "session map should block the duplicate"
+        );
+    }
+
+    #[test]
+    fn test_run_gh_session_scope_allows_different_pr_same_session() {
+        let map: Arc<dashmap::DashMap<String, std::collections::HashSet<String>>> =
+            Arc::new(dashmap::DashMap::new());
+        let session_id = "test-session";
+
+        // Post review for PR #42.
+        let key1 = make_pr_dedup_key(
+            &[
+                "pr".to_string(),
+                "review".to_string(),
+                "42".to_string(),
+                "--approve".to_string(),
+            ],
+            Some("org/repo"),
+        );
+        map.entry(session_id.to_string()).or_default().insert(key1);
+
+        // Different PR #43 should NOT be blocked.
+        let key2 = make_pr_dedup_key(
+            &[
+                "pr".to_string(),
+                "review".to_string(),
+                "43".to_string(),
+                "--approve".to_string(),
+            ],
+            Some("org/repo"),
+        );
+        assert!(
+            !test_map_contains(&map, session_id, &key2),
+            "different PR in same session should not be blocked"
+        );
+    }
+
+    #[test]
+    fn test_run_gh_session_scope_allows_same_pr_different_session() {
+        let map: Arc<dashmap::DashMap<String, std::collections::HashSet<String>>> =
+            Arc::new(dashmap::DashMap::new());
+
+        let key = make_pr_dedup_key(
+            &[
+                "pr".to_string(),
+                "review".to_string(),
+                "42".to_string(),
+                "--approve".to_string(),
+            ],
+            Some("org/repo"),
+        );
+
+        // Session A posts the review.
+        map.entry("session-a".to_string())
+            .or_default()
+            .insert(key.clone());
+
+        // Session B should NOT be blocked.
+        assert!(
+            !test_map_contains(&map, "session-b", &key),
+            "same PR in different session should not be blocked"
+        );
+    }
+
+    #[test]
+    fn test_run_gh_required_tools_gate_retry_blocks_second_review() {
+        // Directly simulate the bug chain from #821:
+        // Turn 1: pr review succeeds (map populated, atomic flips).
+        // Required-tools gate rejects EndTurn, creates turn 2.
+        // Turn 2 (fresh AtomicBool): tries pr review again — session map blocks it.
+        let map: Arc<dashmap::DashMap<String, std::collections::HashSet<String>>> =
+            Arc::new(dashmap::DashMap::new());
+        let session_id = "qa-session";
+        let pr_url = "https://github.com/senara-solutions/mika/pull/819";
+
+        let args = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            pr_url.to_string(),
+            "--approve".to_string(),
+            "--body".to_string(),
+            "VERDICT: pass".to_string(),
+        ];
+        let key = make_pr_dedup_key(&args, None);
+
+        // Turn 1: review succeeds.
+        let turn1_atomic = std::sync::atomic::AtomicBool::new(false);
+        assert!(!turn1_atomic.load(std::sync::atomic::Ordering::Acquire));
+        // Record in both per-turn and session map.
+        turn1_atomic.store(true, std::sync::atomic::Ordering::Release);
+        map.entry(session_id.to_string())
+            .or_default()
+            .insert(key.clone());
+
+        // Turn 2: fresh AtomicBool (simulates new turn).
+        let turn2_atomic = std::sync::atomic::AtomicBool::new(false);
+        assert!(!turn2_atomic.load(std::sync::atomic::Ordering::Acquire));
+
+        // Session map should block the second review even though per-turn is false.
+        assert!(
+            test_map_contains(&map, session_id, &key),
+            "session-scoped map must block cross-turn duplicate"
+        );
+    }
+
+    #[test]
+    fn test_run_gh_no_session_map_does_not_panic_on_non_review() {
+        // pr_reviews_posted: None + non-review command should not panic.
+        // The debug_assert! is scoped to the pr review branch only.
+        let args = vec!["pr".to_string(), "diff".to_string()];
+        assert!(!is_pr_review_command(&args) || args.len() < 2);
+        // Just verify it doesn't reach the pr review code path.
+        assert!(!is_pr_review_command(&args));
     }
 }

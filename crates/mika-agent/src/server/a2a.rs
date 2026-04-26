@@ -165,6 +165,7 @@ async fn run_a2a_agent(
         trace_id: Some(task_id.to_string()),
         correlated_task_id: None,
         internal: false,
+        pr_reviews_posted: Some(&state.pr_reviews_posted),
     };
 
     match agent::run_agent(&params).await {

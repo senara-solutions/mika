@@ -89,6 +89,10 @@ pub struct AppState {
     pub dashboard_enabled: Arc<AtomicBool>,
     /// Active A2A task broadcasters for SSE streaming (keyed by task ID).
     pub a2a_broadcasters: Arc<DashMap<String, broadcast::Sender<StreamEvent>>>,
+    /// Session-scoped PR review dedup map (#821). Outer key: session_id,
+    /// inner set: PR dedup keys. Prevents duplicate `gh pr review` calls
+    /// across turns within the same session. Evicted at `end_session()` callsites.
+    pub pr_reviews_posted: Arc<DashMap<String, std::collections::HashSet<String>>>,
 }
 
 impl AppState {
