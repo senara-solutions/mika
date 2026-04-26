@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
 
                 let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
 
+                // verbose not forwarded — conflicts_with = "team" prevents this combination at parse time
                 return commands::ask::run_team_ask(
                     &team_name,
                     &args.message,
@@ -254,6 +255,7 @@ async fn main() -> Result<()> {
                 args.model.as_deref(),
                 &args.enable_skill,
                 &args.disable_skill,
+                args.verbose,
             )
             .await
             {
