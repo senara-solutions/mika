@@ -19,7 +19,20 @@ You are performing an iteration review on a revised plan. The first-pass review 
 
 3. **Use tools as needed.** Use `gh_read` for any issue/PR context. Use `query_knowledge_graph` for institutional knowledge. Same tool kit as first pass.
 
-4. **Annotate the revised plan.** Mark each prior finding as RESOLVED or UNRESOLVED. Add any new concerns that emerged from the revision (same citation requirement applies).
+4. **Output-format compatibility check (mandatory for plans introducing or changing output shapes).** When the plan specifies a new or changed output format for **any output channel with documented downstream parsers** — including but not limited to: tool/binary/CLI surfaces (`mika ask`, `mika status`, `gh`, `cargo`, custom CLI commands), structured logs (`mika.log.YYYY-MM-DD` consumed by audit family), persisted audit events (`audit_events` rows consumed by introspection tools), HTTP API responses (consumed by gateway, dashboard, A2A clients), or any other channel a downstream consumer parses — perform this check before ratifying the plan:
+
+   1. **Identify downstream consumers.** Use `gh_read` (and grep when running locally) to find every callsite that parses the affected output channel. Search across `mika/`, `mika-skills/`, and `mika-platform/.claude/commands/`. Common consumers include:
+      - Slash commands (`/mika-groom-ticket`, `/mika-ask-arch`, audit family) that scan stdout for structured lines
+      - Other skill prompts that pipe binary output through line-oriented filters
+      - Downstream test harnesses asserting against output shape
+      - Dashboard or A2A clients consuming HTTP responses
+      - Log-parsing audit commands operating on `mika.log.*`
+   2. **Verify compatibility** of the proposed shape against each consumer's parser. If a parser scans for `<key>: <value>` lines on stdout, a JSON-nested-only output breaks it. If a parser expects newline-separated UUIDs, a comma-separated list breaks it. Cite each consumer-vs-shape compatibility check explicitly in the second-pass review (consumer file path + parsing pattern + verdict).
+   3. **Surface conflicts as ESCALATE findings.** A parser conflict has the same shape as a structural-dependency assumption that turns out wrong. The pre-commit-discovery discipline applies: a 30-second `grep` resolves it before the operator commits the plan. An unresolved parser conflict in the proposed plan is sufficient grounds for ESCALATE on its own — feed it into the Output verdict accordingly.
+
+   This step extends the pre-commit-discovery discipline (already established for source-code assumptions — see mika#821 Finding 6's `LlmProvider` accessor verification, mika-platform#52 Finding 2's `idx_llm_calls_session` verification) from "verify your assumptions about source code" to "verify your assumptions about downstream parsers."
+
+5. **Annotate the revised plan.** Mark each prior finding as RESOLVED or UNRESOLVED. Add any new concerns that emerged from the revision (same citation requirement applies). Include an `Output-format compatibility:` section with a one-line summary per consumer verified, or `Output-format compatibility: N/A — plan introduces no new output shapes` when the check is not applicable.
 
 ### Output
 
