@@ -117,9 +117,17 @@ These tests verify the canonical primitive's contract; downstream consumers don'
 - `<TraceIdWidget />` migration. The widget doesn't exist yet — built later by mika#652 / mika#653 work per dashboard-stitch-map. The forward-looking acceptance criterion "`<TraceIdWidget />` uses `<CopyButton />` internally" is preserved as a constraint for the implementer of those tickets, not for this one.
 - Migrating CopyButton's caller convention (e.g., adding new props like `onCopySuccess` callback) — YAGNI; current API is sufficient for the dashboard's needs.
 
-## Forward constraint for #652/#653 (per architect Finding 2)
+## Forward constraint for #652/#653 (per architect Finding 2 + second-pass clarification)
 
-Post-grooming, add a comment to mika#665's issue body or a follow-up note that surfaces the forward constraint to mika#652 and mika#653 implementers: **"`<TraceIdWidget />` (built by mika#652/#653) MUST use `<CopyButton />` internally."** The constraint lives in the issue body where milestone tooling (and future implementers) will surface it. Cite: issue-as-versioned-contract pattern (mika-platform#52 body-edit convention).
+Post-grooming, add the forward constraint via **body-edit (not comment)** to **all three issue bodies** (#665, #652, #653) — defense-in-depth on cross-ticket constraint mirroring per architect second-pass review. Body-edits are versioned-contract surface (what `/mika-groom-ticket`'s parser scans + milestone-tooling renders on the primary view); comments are audit-trail-only.
+
+| Issue | Body callout to add |
+|---|---|
+| #665 | `> - **Forward constraint:** This primitive's API is consumed by \`<TraceIdWidget />\` from mika#652/#653 — when those tickets build the widget, it MUST use \`<CopyButton />\` internally per AC3.` |
+| #652 | `> - **Constraint from mika#665 AC3:** When building \`<TraceIdWidget />\`, use \`<CopyButton />\` from \`@senara-solutions/ui\` internally — do not author a parallel copy-on-click implementation.` |
+| #653 | (same as #652 — both build the widget per dashboard-stitch-map.md) |
+
+Cite: issue-as-versioned-contract pattern (mika-platform#52/#53 conventions) + cross-ticket constraint mirroring (analogous to cross-repo-awareness discipline).
 
 ## Risks
 
