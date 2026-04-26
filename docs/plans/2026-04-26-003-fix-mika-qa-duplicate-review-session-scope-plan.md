@@ -18,13 +18,15 @@ Two existing defenses both bypassed:
 - `ToolContext.pr_review_posted` AtomicBool — per-turn-scoped, reset on new turn.
 - PR review early-accept (#695, post-condition #3b) — skips guards #4–#7 only, NOT #3 (required-tools). Doesn't help when the trigger IS guard #3.
 
-## Fix framing (post-architect-review reframe)
+## Fix framing
 
-**Fix B (extend early-accept to short-circuit guard #3) is the root-cause fix.** It directly closes the reproduced failure path: the early-accept guard's intent (#695) was "primary action completed; further continuation risks duplicate submissions," but its scope was incomplete — it only skipped guards #4-#7 while the trigger was guard #3. Making the scope match the intent eliminates the gate-retry mechanism that produces the duplicate.
+**Fix A (session-scoped dedup map at the tool-call layer) is the primary defense.** Defense placed where the side-effect emits — `gh pr review` invocation in `run_gh` — catches every trigger that reaches that point, regardless of whether the trigger is the reproduced retry, max-steps continuation, webhook re-delivery, or any future post-condition gate. This is the orthogonality argument from `docs/architecture/review-guide.md` § 6: defense lives at the boundary closest to the side-effect, not at the gating layer that happens to trigger it today. Surviving refactors of the gating layers above is a structural property; closing the empirically-reproduced trigger is a symptomatic property.
 
-**Fix A (session-scoped dedup map) is defense-in-depth for distinct retry sources** that don't go through the required-tools gate at all: max-steps continuation, manual re-prompt, webhook re-delivery, future post-condition additions. These paths are structurally valid but unverified in production. Fix A guards them prophylactically.
+**Fix B (extend early-accept to short-circuit guard #3) is the post-condition-layer defense-in-depth.** It aligns the early-accept guard's reach (#695) with its semantic intent — "primary action completed; further continuation risks duplicate submissions" — by extending the scope from guards #4-#7 to also include guard #3. Closes the specific reproduced failure path. Smaller surface than Fix A; ships at the gating layer, not the side-effect layer.
 
-Both ship together (per ticket). Sequencing in implementation: Fix B first (smaller, ships defense-in-depth on its own and closes the reproduced bug), Fix A second.
+Both ship together (per ticket). Sequencing in implementation: Fix B first (smaller, lower-risk, closes the reproduced bug standalone), Fix A second (larger surface, additive).
+
+**Note on framing history.** First-pass architect review proposed inverting this framing (Fix B as root-cause, Fix A as defense-in-depth) on reproducibility-of-trigger grounds. Second-pass architect surfaced the inversion as plan-vs-issue divergence — same shape as mika#817's audit-trail discipline. The issue body's framing (Fix A primary, depth-of-defense) is preserved here because depth-of-defense at the tool-call layer is the stronger criterion: it's structural rather than symptomatic. The architectural reframe was sensible-sounding but replaced the chosen criterion (orthogonality) with a different one (reproducibility) without operator sign-off.
 
 ## Current code shape (verified against worktree main @ 0beb5645)
 
@@ -187,7 +189,7 @@ Net diff estimate: ~85-110 lines of source change + ~150 lines of test code.
 2. `end_session()` server-side callsites enumerated above (6 sites). DB-only call from `AsyncDatabase` at `async_db.rs:584` and `Database` at `db.rs:4974` — both unchanged; eviction lives at the callsite, not in the DB.
 3. Required-tools-gate `continue;` at `agent.rs:887`. Fix B's early-accept hook lands before the `request.messages.push(...)` calls (lines 868-887).
 
-Implementer should verify the dispatcher already has `AppState` (or equivalent) access at the 4 dispatcher callsites — if not, threading it adds modest churn but no design change.
+**Dispatcher access shape (committed):** if `TaskDispatcher` does not already hold an `AppState` reference, thread `Arc<DashMap<String, HashSet<String>>>` directly into `TaskDispatcher` rather than threading the full `AppState`. Minimal-coupling argument: only this one piece of `AppState` is needed at the dispatcher callsites; passing `AppState` through `TaskDispatcher` solely for one field expands the dispatcher's coupling surface unnecessarily. The Arc clone is mechanically the same cost either way.
 
 ## Tests
 
@@ -197,7 +199,7 @@ Inline in `crates/mika-agent/src/skills/builtin_handlers.rs` mod tests (extend e
 2. **`test_run_gh_session_scope_allows_different_pr_same_session`** — call `run_gh pr review <url1> --approve` then `run_gh pr review <url2> --approve` in the same session — both succeed, both recorded.
 3. **`test_run_gh_session_scope_allows_same_pr_different_session`** — call `run_gh pr review <url> --approve` for session A, then for session B (separate session_ids) — both succeed.
 4. **`test_run_gh_required_tools_gate_retry_blocks_second_review`** — directly simulate the bug chain. Mock turn 1: post review (session map populated, atomic flips, EndTurn). Reset atomic only (mimics turn 2 fresh ToolContext). Call review again — assert blocked.
-5. **`test_run_gh_no_session_map_falls_back_to_atomic`** — pass `pr_reviews_posted: None`. First call succeeds, atomic flips. Second call in same turn (atomic still true) — assert `duplicate_pr_review`. Confirms the per-turn defense remains functional in test contexts. (`debug_assert!` disabled for this test via release-mode-style guard, OR the test runs `pr diff` instead of `pr review` to skip the assert path — implementer's call.)
+5. **`test_run_gh_no_session_map_does_not_assert_on_non_review`** — pass `pr_reviews_posted: None` and call `gh pr diff` (or another non-`pr review` subcommand). Assert that the call proceeds without panicking. Confirms the `debug_assert!(pr_reviews_posted.is_some())` is correctly scoped to the `pr review` branch only — non-review commands never reach the assertion regardless of map presence. **Rationale for using `pr diff` over `pr review`:** the assert exists to catch production misuse on `pr review`; release-mode-bypass tests would undermine its protective value. Assert-scoping and per-turn-fallback are orthogonal concerns — test them separately. The per-turn AtomicBool fallback for `pr review` (the original purpose of this test slot) is implicitly covered by the existing #695 tests that pre-date this change. (Per architect orthogonality argument, `review-guide.md` § 6.)
 
 Inline in `crates/mika-agent/src/agent.rs` mod tests:
 
@@ -214,9 +216,9 @@ Existing tests must continue to pass: `has_successful_pr_review` tests at `agent
 - [ ] `cargo fmt --check` clean.
 - [ ] Post-deploy, the next 3 PRs reviewed by mika-qa receive exactly one APPROVED review each (regression check on real traffic).
 
-## PR description framing (per architect Finding 1)
+## PR description framing
 
-The PR description must lead with: **Fix B is the root-cause fix; Fix A is defense-in-depth for distinct retry sources.** Reviewers should not apply equal scrutiny to both — Fix A's surface is larger but its risk profile is "guards a hypothetical class," whereas Fix B's surface is small and directly closes the N=2 reproduced bug.
+The PR description leads with: **Fix A (session-scoped dedup at the tool-call layer) is the primary defense; Fix B (early-accept extension) is the post-condition-layer defense-in-depth.** Reviewers should weight Fix A's surface accordingly — it's the structural fix, the one that survives refactors of the gating layers. Fix B is the smaller, gate-specific complement that closes the reproduced trigger.
 
 ## Out of scope (from ticket)
 
@@ -236,9 +238,11 @@ The PR description must lead with: **Fix B is the root-cause fix; Fix A is defen
 
 ## Sequencing
 
-1. **Fix B first** (smaller, lower-risk, ships defense-in-depth on its own — closes the reproduced bug). One file (`agent.rs`), ~12 lines + 1 test.
-2. **Fix A second** (ToolContext field, AppState field, run_gh algorithm change, threading through 14+ sites, eviction at 6 callsites). Larger surface but additive.
+Note: implementation order (Fix B first) and architectural framing (Fix A primary) are intentionally orthogonal. Fix B ships first because it's smaller and closes the reproduced bug on its own — that's an implementation-risk argument. Fix A is the primary defense because it lives at the tool-call layer — that's an orthogonality argument. Both are true simultaneously.
+
+1. **Fix B first** (smaller, lower-risk, closes the reproduced bug standalone). One file (`agent.rs`), ~12 lines + 1 test.
+2. **Fix A second** (ToolContext field, AppState field, run_gh algorithm change, threading through 14+ sites, eviction at 6 callsites). Larger surface but additive; this is the structural primary defense.
 3. Add tests inline.
 4. Run `cargo test -p mika-agent`, `cargo clippy --all-targets`, `cargo fmt --check`.
-5. Open PR cross-referencing #821, #695, #818. PR description leads with Fix B = root-cause, Fix A = defense-in-depth (per architect Finding 1).
+5. Open PR cross-referencing #821, #695, #818. PR description leads with Fix A = primary tool-call-layer defense, Fix B = post-condition-layer defense-in-depth (matches issue body framing).
 6. Post-merge: monitor next 3 mika-qa runs for AC verification.
