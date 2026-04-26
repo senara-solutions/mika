@@ -119,6 +119,20 @@ Two concerns are orthogonal when changing one cannot break the other. Mika gets 
 - **A module that depends on another module's public API.** Dependencies are not coupling; they are the design. Flag implementation coupling (knowing about internals), not interface coupling (using a stable surface).
 - **A workflow that is sequential by design.** The mika-arch v1 plan gates Unit 6 (second-review) on Unit 5 (dogfood). That sequencing is not an orthogonality violation — it is a deliberate dependency captured in the plan.
 
+### Agent self-state vs platform side-effects (a special orthogonality concern)
+
+When auditing what an agent "should be allowed to do," distinguish **mutations of the agent's own self-state** from **mutations of platform state, other agents' state, or external systems**. These are different surfaces with different blast radii and shouldn't be conflated in a single allow/deny decision.
+
+- **Agent self-state:** the agent's own core memory blocks, structured facts (people / preferences / commitments / events scoped to its own `agent_id`), conversation memory. Writes here are *persistence* — the substrate that makes an agent capable of cross-session pattern recognition. Blast radius: this agent's own future context. Recoverable. Not a platform side-effect.
+- **Platform side-effects:** code commits, PR merges, shell exec, infra changes, configs touching shared state. Blast radius: outside the agent. Often irreversible.
+- **Cross-agent state:** other agents' files, shared task state, skill definitions. Blast radius: the broader agent fleet. Should follow the orchestrator-only enforcement pattern (`global_home_dir`, `read_agent_file` with `agent` parameter, etc.).
+
+The principle: **deny by what gets mutated, not by whether something is mutated.** A read-only role definition (e.g., mika-arch's "advisory architect, no code generation, no commits") prohibits the second and third categories. It should not prohibit the first — agent persistence is constitutive of being an agent at all, not a side-effect.
+
+**What to flag:** a denylist or allowlist that bundles agent self-state with platform mutations under a single "no mutations" rule. That's the bundling mistake — it conflates persistence with platform side-effects and starves the agent of the substrate its role assumes. Cite this section + name the specific tools being mis-bundled.
+
+**What not to flag:** a denylist that explicitly distinguishes the two surfaces and denies platform side-effects while permitting self-state writes. That's the rule working as designed.
+
 ---
 
 ## 6. Citation-or-silence — what NOT to flag
