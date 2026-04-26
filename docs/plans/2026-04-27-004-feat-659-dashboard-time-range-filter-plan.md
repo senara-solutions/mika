@@ -403,14 +403,19 @@ grep -rn "from?: number\|to?: number" mika/dashboard/src/api/*.ts  # → 0 match
 grep -l "import.*TimeRangeFilter" mika/dashboard/src/pages/  # → exactly 7 files (Sessions, Timeline, LlmCalls, ToolCalls, Tasks, DevRuns, TeamRuns)
 # 3. URL state for from/to is wired
 grep -rn "updateFilter('from'" mika/dashboard/src/pages/*.tsx  # → ≥ 7 matches (one per migrated page)
-# 4. Backend has WHERE created_at >= clauses across all 6 list endpoints (timeline + llm_calls + tool_calls + sessions + tasks + dev-runs); team-runs uses started_at
-grep -c "created_at >= " mika/crates/mika-agent/src/db.rs  # → ≥ 5 occurrences (3 pre-existing + 2 added by Change 3 for sessions/tasks; dev-runs also adds one for tasks-table query)
-grep -c "started_at >= " mika/crates/mika-agent/src/db.rs  # → ≥ 1 (team-runs, pre-existing)
+# 4. Backend has WHERE created_at >= clauses across the relevant endpoints. All SQL lives in db.rs (verified — Change 3 SQL additions are in db.rs only; server/dashboard.rs and server/dashboard_dev_runs.rs only modify query structs).
+#    Expected exact count: 6 occurrences after Change 3 lands (3 pre-existing — timeline, llm_calls, tool_calls + 3 new — sessions, tasks, dev-runs).
+#    "Exactly 6" rather than "≥ 5" forces the verification to fail if any of the 3 new endpoints is skipped (per architect second-pass observation).
+grep -c "created_at >= " mika/crates/mika-agent/src/db.rs  # → exactly 6
+grep -c "started_at >= " mika/crates/mika-agent/src/db.rs  # → exactly 1 (team-runs, pre-existing on r.started_at column)
 
-# Manual timezone correctness test (per architect Finding 1)
-# Set browser timezone to UTC+5; enter custom range 2026-04-26T00:00 to 2026-04-26T23:59;
-# confirm emitted ISO strings are 2026-04-25T19:00:00Z and 2026-04-26T18:59:00Z (offset by -5h, since +5h browser local converts to -5h UTC offset).
-# This proves the conversion is working, not silently truncating timezone data.
+# Manual timezone correctness test (per architect Finding 1, sharpened with concrete assertion)
+# Setup: set browser timezone to UTC+5 (e.g., Asia/Karachi).
+# Action: enter custom range start = 2026-04-26T00:00 (local), end = 2026-04-26T23:59 (local).
+# Concrete assertion: emitted ISO strings MUST be:
+#   from = "2026-04-25T19:00:00.000Z" (NOT "2026-04-26T00:00:00.000Z" — that would mean timezone was silently truncated)
+#   to   = "2026-04-26T18:59:00.000Z" (NOT "2026-04-26T23:59:00.000Z")
+# The -5h shift is what proves the conversion is working — local 00:00 in UTC+5 is 19:00 UTC the previous day.
 
 # Confirm CLAUDE.md enforcement
 grep "TimeRangeFilter.*Audited clean.*mika#659" mika/packages/ui/CLAUDE.md  # → match
