@@ -41,6 +41,8 @@ These run after server startup and can leak transactions during normal operation
 | 3737 | `set_skill_enabled` (skill_overrides toggle) | `BEGIN IMMEDIATE` + result-collection IIFE + conditional `COMMIT` | `Connection::transaction_with_behavior(Immediate)` + writes + `tx.commit()?` |
 | 3777 | `delete_skill_llm_override` (atomic UPDATE+DELETE on skill_overrides) | `BEGIN IMMEDIATE` + IIFE + conditional `COMMIT` | `Connection::transaction_with_behavior(Immediate)` + writes + `tx.commit()?` |
 
+**Pre-edit discovery for callsites 3737 and 3777** (per architect second-pass review): classify the existing IIFE pattern as either (a) error-collection-only or (b) post-commit cleanup. If (a), `Transaction` RAII replaces directly. If (b), cleanup logic must be preserved explicitly post-commit / per-error-arm. Same discovery discipline as Finding 2 — read the function bodies, classify, refactor accordingly. 5-minute step before the mechanical edit.
+
 **Critical: line 5619 is `BEGIN` (DEFERRED), not IMMEDIATE.** Replacing it with `transaction_with_behavior(Immediate)` would change the locking semantics and could introduce contention. Use `Connection::transaction()` (default DEFERRED) for that callsite specifically. Lines 3737 and 3777 use `BEGIN IMMEDIATE` — those map to `transaction_with_behavior(Immediate)`.
 
 #### A2 — Migration callsites (hygiene only, NOT load-bearing for #636)
@@ -118,7 +120,7 @@ Inline in `crates/mika-agent/src/db.rs` mod tests:
 Inline in new `crates/mika-agent/src/server/checkpoint.rs` mod tests:
 
 4. **`test_checkpoint_pragma_returns_pages`** — open a test DB with WAL writes pending, call `PRAGMA wal_checkpoint(PASSIVE)`, verify the return value parses as `(busy_or_log_size, checkpointed_frames)` and at least one page checkpointed.
-5. **`test_checkpoint_concurrent_with_reader`** — spawn a reader holding a transaction, run PASSIVE checkpoint, verify the checkpoint completes (possibly with non-zero `busy` count, which is expected) and reader query still succeeds.
+5. **`test_checkpoint_passive_does_not_error_under_concurrent_reader`** — spawn a reader holding a transaction, run PASSIVE checkpoint, verify the checkpoint completes (possibly with non-zero `busy` count, which is expected) and reader query still succeeds. Renamed (per architect second-pass) to clarify scope: this tests concurrent-runner sanity, NOT staleness-fix. Test 6 is the staleness regression check.
 
 End-to-end staleness regression test (per Finding 6):
 
@@ -146,7 +148,7 @@ End-to-end staleness regression test (per Finding 6):
 - `MIKA_DASHBOARD_CHECKPOINT_INTERVAL_SECS` env-var configurability — deferred per Finding 5 (YAGNI). Comment in code names the future tunable.
 - Tuning `PRAGMA wal_autocheckpoint` (the global SQLite-level checkpoint threshold) — Fix B's explicit periodic checkpoint achieves the same effect with predictable timing and observable logs.
 - Refactoring AsyncDatabase architecture (e.g., adding a connection pool) — broader change with much larger blast radius; not needed for this bug.
-- Restoring `dashboard_db` as an independent connection (decoupling from default-agent-db) — would prevent the shared-Connection pin entirely, but is a structural change. Documented as a follow-up trigger if A+B prove insufficient.
+- Restoring `dashboard_db` as an independent connection (decoupling from default-agent-db) — would prevent the shared-Connection pin entirely, but is a structural change. Documented as a follow-up trigger if A+B prove insufficient. **Shared-Connection design also provides snapshot consistency between agent state and dashboard view of that agent** (per architect Finding 1 second-pass); decoupling would surface this cross-consistency as a separate property to manage. The shared-Connection design isn't purely accidental — it has architectural value worth preserving until the bug definitively requires breaking it.
 
 ## Risks
 
