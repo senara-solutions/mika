@@ -11,6 +11,22 @@ Run these steps in order. Do not do anything else. Do not stop between steps —
 
 **Issue linking:** If `$ARGUMENTS` (after stripping any `branch:` prefix) starts with `#` followed by a number (e.g. `#42`) or is just a number, treat it as a GitHub issue reference. Run `gh issue view <number> --json number,title,body,labels` to fetch the issue details, then use the issue title and body as the feature description for the planning step. Remember the issue number for the PR step.
 
+**Plan-on-branch detection:** After fetching an issue body (or when a plan path is supplied directly in `$ARGUMENTS`), check whether a groomed plan-on-branch already exists. The grooming pipeline (`/mika-groom-ticket`) writes a callout into the issue body of this exact shape:
+
+```
+> - **Plan:** `docs/plans/<filename>.md` (committed on branch @ `<sha>`)
+```
+
+Parse the issue body for that callout. Extract the `<path>` (the value inside the first backtick-wrapped argument).
+
+- **If the callout is present AND `<path>` exists in the worktree** (verify with `test -f <path>`): set `PLAN_PATH=<path>` and **skip Step 1 (`/ce:plan`)** in the Pipeline below. Run `/ce:work <PLAN_PATH>` directly (Step 2). Frame the prompt explicitly so claude-pilot consumes the plan as the contract:
+
+  > This plan was groomed and committed by the architect. It is the contract for this implementation. If any acceptance criterion is unclear or unsatisfiable (e.g., conflicts with an existing parser, breaks a downstream consumer, depends on something that doesn't exist), **send_message** to mika-dev surfacing the ambiguity — do not silently scope-reduce. Do not write a new plan file in `docs/plans/`. The existing plan-on-branch is the single source of truth.
+
+- **If the callout is absent OR `<path>` does not exist in the worktree:** fall back to the current flow — run `/ce:plan $ARGUMENTS` (Step 1) followed by `/ce:work` (Step 2).
+
+This branch is also valid when `$ARGUMENTS` directly contains a `docs/plans/...md` path (e.g., `/mika implement the langfuse fix plan` where the operator names the path): treat it the same as a callout match.
+
 ## Worktree isolation
 
 Before running the pipeline, set up an isolated worktree:
@@ -54,8 +70,8 @@ Before running the pipeline, set up an isolated worktree:
 
 **Git discipline (MANDATORY):** Do NOT run `git pull`, `git pull origin main`, `git merge main`, `git merge origin/main`, or any similar catch-up operation during the pipeline. The Worktree isolation step above already rebased this branch onto `origin/main` via the handler's startup guard. If `origin/main` advances while the pipeline is running, the resulting conflict is resolved **post-pipeline** through the `resolve_pr_conflicts` skill — never by pulling main into the branch mid-session. Mid-session merges create duplicate-hash copies of upstream commits and produce a `mergeable=CONFLICTING` PR on GitHub even though the content is identical. Allowed git commands during the pipeline: `git add`, `git commit`, `git push` (including `--force-with-lease` for amended commits), `git status`, `git log`, `git diff`, `git fetch origin` (read-only). Everything else — especially `pull` and `merge` — is out of scope.
 
-1. `/ce:plan $ARGUMENTS` (if an issue was detected, pass the issue title + body instead of raw arguments)
-2. `/ce:work`
+1. `/ce:plan $ARGUMENTS` (if an issue was detected, pass the issue title + body instead of raw arguments) — **skip when a plan-on-branch was detected above; jump straight to Step 2 with `/ce:work <PLAN_PATH>`**
+2. `/ce:work` — when a plan-on-branch was detected, invoke as `/ce:work <PLAN_PATH>` with the contract framing from the Issue linking section above
 3. `/ce:review`
 4. `/compound-engineering:resolve_todo_parallel`
 5. `/mika-doc-audit`

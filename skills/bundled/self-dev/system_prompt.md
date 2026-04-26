@@ -380,10 +380,10 @@ Remember the returned `task_id` as `milestone_wi`.
 
 ### Step M2 — Fetch milestone issues and labels (MANDATORY — do NOT skip)
 
-Fetch milestone title (for grouping metadata):
+Fetch milestone title (for grouping metadata). `gh` has no `milestone` subcommand; fetch via the existing `issue list --milestone --json milestone` shape:
 ```json
 run_gh({
-  "command": ["milestone", "list", "--json", "number,title", "--jq", ".[] | select(.number==<n>) | .title"],
+  "command": ["issue", "list", "--milestone", "<n>", "--state", "all", "--json", "milestone", "--jq", ".[0].milestone.title"],
   "repo": "senara-solutions/<repo>"
 })
 ```

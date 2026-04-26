@@ -13,7 +13,8 @@ When you receive a GitHub webhook event for `pull_request_review.submitted`:
 The message contains the review body, PR URL, repo, and reviewer. mika-qa posts structured verdicts as PR reviews.
 
 1. **Parse the verdict** from the review body:
-   - Find the line starting with `VERDICT:` — extract the token (e.g., `pass`, `hold[review]`, `block[ci]`)
+   - Find the line starting with `VERDICT:` — extract the token (e.g., `pass`, `hold[review]`, `block[ci]`, `block[ac]`, `block[security]`, `block[pipeline]`).
+   - `block[ac]` is a distinct, non-auto-retryable verdict class introduced when plan-AC verification is gating. Route it through the dedicated `block[ac]` branch in Step 3 — do NOT collapse it into `block[ci]` (auto-retry, semantically wrong) or treat it as `hold[review]` (advisory, semantically wrong).
    - If no `VERDICT:` line found: treat as informational comment, no action needed
 2. **Extract PR coordinates** from the PR URL in the message:
    - `pr_number` (integer) and `repo` (owner/repo format)
@@ -68,6 +69,41 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
    4. Extract `FINDINGS:` and `REASON:` from the review body. Notify Vincent: "{repo}#{number} blocked by CI — attempting fix ({n}/2). {PR URL}"
    5. Launch claude-pilot with a free-text prompt to fix CI failures. Wait for callback.
    6. After callback: update `ci_fix_count` in metadata. Clear `ci_fix_dispatched_from` from metadata (prevents stale flags on future rounds). Proceed to Step 5 with `in_progress`.
+
+   **block[ac]** — Plan-vs-implementation conflict, NOT auto-retryable:
+
+   `block[ac]` is distinct from `block[ci]`. AC mismatches are not transient — they reflect a real conflict between the plan-on-branch (the contract) and what was implementable, or a silent scope-reduction. Auto-retry is semantically wrong; resolution requires plan amendment OR AC rewording, both of which are operator decisions.
+
+   1. Correlate to task (Step 4).
+   2. **Parse the "Plan amendment required:" section** from the review body. Extract every `- AC: <text>` bullet with its accompanying `Conflict reason (inferred): <text>` line. If the section is absent (qa-review violated its Step 2.5.8 contract), fall through using a generic note: "block[ac] received but Plan amendment required: section missing — operator must inspect the review manually."
+   3. **Update task to blocked first** (state mutation before notification — so the operator notification, when sent, accurately reflects persisted state). If Step 1 found NO correlated task (out-of-band PR), skip directly to sub-step 5 and notify the operator that no task was correlated. Otherwise:
+      ```
+      update_task_status({"task_id": <task_id>, "status": "blocked", "note": "Plan amendment required (block[ac])"})
+      ```
+      Do NOT increment any retry counter; do NOT dispatch claude-pilot. If `update_task_status` returns an error, hold that error in scope so sub-step 5's notification can surface it ("Failed to record block[ac] for {repo}#{number}: {error}. Manual update required.") instead of falsely confirming the block.
+   4. **Pause milestone if applicable.** If the task has a `parent_task_id` and that parent task is type=`milestone`, pause the milestone:
+      ```
+      update_task_status({"task_id": <parent_task_id>, "status": "blocked", "note": "Child {repo}#{number} block[ac] — milestone paused pending plan amendment"})
+      ```
+      Then **verify the pause took effect** — terminal states (`completed`, `cancelled`) silently no-op state transitions but accept metadata writes:
+      ```
+      check_task({"task_id": <parent_task_id>})
+      ```
+      If the returned `status` is not `blocked`, append a warning to the operator notification in sub-step 5: "Warning: parent milestone {parent_task_id} did not transition to blocked (current status: {status}). Manual review required."
+   5. **Notify Vincent via `send_message`** with the conflict summary (now reflects the persisted state from sub-step 3 and any milestone-pause warning from sub-step 4):
+      ```
+      {repo}#{number} BLOCKED [block[ac]]: plan-vs-implementation conflict — {N} unsatisfied AC(s).
+
+      Plan amendment required:
+      - AC: {first AC text}
+        Conflict reason (inferred): {first conflict reason}
+      - AC: {next AC text}
+        Conflict reason (inferred): {next conflict reason}
+      ...
+
+      Auto-retry inappropriate — this is a plan-vs-implementation conflict, not a transient failure. Resolution requires plan amendment OR AC rewording. {PR URL}
+      ```
+   6. Proceed to Step 5 with `blocked`. Do NOT call `run_claude_pilot`. Do NOT increment `qa_retry_count` or `ci_fix_count`.
 
    **block[security]**, **block[pipeline]**, **block** (bare) — Non-fixable:
    - Correlate to task (Step 4).
