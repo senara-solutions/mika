@@ -126,6 +126,14 @@ Total dollar cost on Kimi: pennies. Same workload on Opus 4.7 first-pass + Sonne
 4. **Architect-class prompts carry the discipline even on a smaller model.** Kimi K2.5 produced structured tables, principle checklists, and citation-style reviewing without any handholding. The skill prompts (mika-arch-groom-ticket, mika-arch-second-review) plus the review-guide reference were sufficient to deliver the operating shape. The model-override question is about *quality of judgment*, not *output structure*.
 5. **First-deploy gotchas were config, not code.** The PR shipped clean. The two issues that bit on smoke-test (`MIKA_DEV_MODE` not set, `MIKA_KG_DOCS_ROOTS` env-var parsing) were both runtime configuration gaps, not implementation bugs. The fix in both cases was operator-side (`~/.mika/.env` and `~/.mika/config.toml`).
 
+## Operator-proxy memory-seeding pattern (added 2026-04-26)
+
+When mika-arch surfaces facts she'd want to persist but lacks the tool path to do so (today: `update_core_memory`/`store_fact`/`update_fact` denied via `MIKA_ARCH_DISABLED_TOOLS` — see mika#818 for the durable fix), the operator can act as proxy: ask mika-arch to return the writes in structured JSON form (5 core memory blocks + 4 fact categories with the contract shapes the tools would have used), then apply them directly to the `core_memory` / `people` / `preferences` / `commitments` / `events` tables scoped to `agent_id='mika-arch'`. UPSERT semantics mirror the tools: core_memory is `INSERT … ON CONFLICT(agent_id, key) DO UPDATE` (replace, not append); preferences is the same on `(agent_id, category)`; people uses canonical_name as the conflict key; events and commitments are append-with-IGNORE on the partial-unique constraints.
+
+Validated 2026-04-26 on mika-arch session `83519e10-…`: 5 core memory blocks populated (~1122 tokens / 2500 budget), 1 person, 4 preferences, 3 events, 1 commitment seeded. Persists across mika-server restarts (data is in DB, not memory), so when the denylist fix lands and mika-arch resumes direct write capability, the seeded state stays as the baseline — future writes append rather than replace.
+
+The pattern is **temporary scaffolding for a tool gap**, not steady-state. Once mika#818 lands and mika-arch can write directly, retire this pattern. Document it here because: (a) the pattern *worked* and may be reused for similar future gaps where an agent needs to persist state but the tool path is closed by design or by accident, and (b) the seeded JSON-shape contract (the structured response we asked mika-arch to return) is reusable as a "convert your useful state into DB-applicable form" pattern for any agent.
+
 ## Recommended follow-ups
 
 - **Already filed:** mika#814 (env-var parse bug), mika#815 (D2 cross-cutting migration for mika-dev/mika-qa/mika-relay).

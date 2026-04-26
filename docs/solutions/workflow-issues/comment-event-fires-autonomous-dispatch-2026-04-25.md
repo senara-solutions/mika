@@ -147,6 +147,25 @@ End-to-end from architect's GROOMED verdict to claude-pilot running: ~5 minutes 
 
 This is what mika-arch v1 was building toward — a **fully autonomous architect-validated implementation pipeline** where human time is spent on architectural disagreement (escalations, rulebook updates), not on dispatch ceremony. Today the loop closed for the first time. The discipline questions above ("when is this correct" / "when does it go wrong") become the steering wheel for the next iteration.
 
+## Update 2026-04-26 — QA-approval event is also a trigger
+
+Confirmed second instance of the same broader pattern with a *different trigger event*. mika-dev session `9cc0a1d3-9dd1-49a0-8594-0cc10b3cd234` (channel: `github`) fired on a `pull_request_review.submitted (APPROVED)` webhook for PR #819 (mika#817's implementation). Within ~45 seconds mika-dev had:
+
+1. Run `list_tasks(in_progress)` → `list_tasks(pending)` → `list_tasks()` — backlog scan.
+2. Picked mika#818 (the next groomed-but-not-dispatched ticket, with a Branch + Plan callout + GROOMED architect verdict on its body).
+3. `create_task` → `update_task_status(in_progress)` → `run_claude_pilot(prompt: "mika#818")`.
+
+Crucially: this happened **40 seconds before PR #819 actually merged.** The QA-approval event was sufficient signal for mika-dev to "make progress on the next thing" — the merge itself wasn't required. The operator's intent ("wait for #817 to land before dispatching #818") existed only in conversation context with CC and as the text "but gated on mika#817 ... landing first" in #818's GROOMED summary comment. **Neither was parseable by the classifier as a hold signal.**
+
+Generalization: the trigger event isn't just `issue_comment.created` (yesterday's compound). Any GitHub event mika-dev's classifier reads as "actionable progress" — comment, QA approval, CI success, possibly merge — can fire backlog-scan + autodispatch on the next groomed ticket. The operator-side gate must be encoded in something the classifier reads, not in conversation prose.
+
+**Encoding options for explicit gating** (none implemented today; pick one when ready to ship the discipline):
+- A label like `gated-on:mika#NNN` that the classifier checks before dispatching.
+- A canonical body callout like `> - **Status:** gated-on-mika#NNN` parallel to the existing `> - **Branch:**` callout.
+- A working-note in mika-dev's core memory recording open gates (similar to the operator-proxy memory-seeding pattern established for mika-arch on 2026-04-26).
+
+Operationally for mika#818: no harm — #818 and #817 touch different files (`well_known_agents.rs` vs `builtin_handlers.rs`), no code dependency. The 40-second window didn't matter. But the pattern is now confirmed: this is how the autonomous loop closes by default; if you want to gate it, gate it explicitly.
+
 ## Related
 
 - [`grooming-branch-callout-required-2026-04-25.md`](./grooming-branch-callout-required-2026-04-25.md) — the canonical issue-body callout pattern. Honored cleanly by the autonomous dispatch today; the worktree came up on the right branch without re-derivation.
