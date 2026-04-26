@@ -836,13 +836,31 @@ async fn run_loop(
                             .filter(|t| !tools_called.contains(t.as_str()))
                             .collect();
                         if !missing.is_empty() {
-                            // Check if a required tool failed with a terminal error.
-                            // If so, the workflow is broken and retrying won't help —
-                            // allow EndTurn so the agent can report the failure. See #516.
-                            if has_terminal_required_tool_failure(
+                            // PR review early-accept extension (#821): if the turn
+                            // already contains a successful `gh pr review`, skip the
+                            // required-tools gate. The primary side-effect completed;
+                            // forcing a retry risks duplicate review submissions.
+                            // Extends the #695 early-accept to also cover guard #3.
+                            if has_successful_pr_review(&all_tool_summaries) {
+                                let missing_names: Vec<&str> =
+                                    missing.iter().map(|s| s.as_str()).collect();
+                                info!(
+                                    step,
+                                    ?missing_names,
+                                    label = mode.label(),
+                                    "PR review already posted — accepting EndTurn \
+                                     (skipping required-tools gate #3)"
+                                );
+                                required_tools_retry_done = true;
+                                // Fall through — let the response proceed to the
+                                // next guard (early-accept #3b will skip #4-#7).
+                            } else if has_terminal_required_tool_failure(
                                 &effective_required_tools,
                                 &all_tool_summaries,
                             ) {
+                                // Check if a required tool failed with a terminal error.
+                                // If so, the workflow is broken and retrying won't help —
+                                // allow EndTurn so the agent can report the failure. See #516.
                                 let missing_names: Vec<&str> =
                                     missing.iter().map(|s| s.as_str()).collect();
                                 warn!(
@@ -1335,6 +1353,10 @@ pub struct AgentParams<'a> {
     /// hiding them from the TUI inbox mode. Set by `mika ask --task-id` (relay sessions)
     /// where `task_complete` is false. See #557.
     pub internal: bool,
+    /// Session-scoped PR review dedup map (#821). Passed from `AppState` in server mode.
+    /// `None` in CLI/test contexts — falls back to per-turn AtomicBool defense.
+    pub pr_reviews_posted:
+        Option<&'a Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -1644,6 +1666,7 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             .settings
             .map_or(25, |s| s.max_agent_tasks_per_session),
         pr_review_posted: &pr_review_posted,
+        pr_reviews_posted: params.pr_reviews_posted,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -2464,6 +2487,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
             .settings
             .map_or(25, |s| s.max_agent_tasks_per_session),
         pr_review_posted: &pr_review_posted,
+        pr_reviews_posted: None, // Silent mode: no session-scoped dedup needed
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
@@ -2790,6 +2814,7 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
             .settings
             .map_or(25, |s| s.max_agent_tasks_per_session),
         pr_review_posted: &pr_review_posted,
+        pr_reviews_posted: None, // Team mode: no session-scoped dedup needed
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
@@ -6251,6 +6276,49 @@ mod tests {
     #[test]
     fn pr_review_not_detected_when_empty() {
         assert!(!has_successful_pr_review(&[]));
+    }
+
+    // -- required-tools gate skipped after PR review success (#821, Fix B) --
+
+    #[test]
+    fn required_tools_gate_skipped_after_pr_review_success() {
+        // Simulate: successful `run_gh pr review` in tool summaries.
+        // Required tools include a tool not called (e.g., qa_pr_view).
+        // has_successful_pr_review should return true, which means the
+        // required-tools gate should skip instead of re-prompting.
+        let summaries = vec![
+            ToolCallSummary {
+                step: 1,
+                name: "run_gh".to_string(),
+                input_summary:
+                    r#"{"command":["pr","review","https://github.com/org/repo/pull/42","--approve","--body","VERDICT: pass"]}"#
+                        .to_string(),
+                output_summary: "Review submitted".to_string(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+
+        // This is the condition checked in the required-tools gate (Fix B).
+        // When true, the gate skips re-prompting.
+        assert!(
+            has_successful_pr_review(&summaries),
+            "should detect successful PR review in tool summaries"
+        );
+
+        // Verify it returns false for the negative case (failed review).
+        let failed_summaries = vec![ToolCallSummary {
+            step: 1,
+            name: "run_gh".to_string(),
+            input_summary: r#"{"command":["pr","review","42","--approve"]}"#.to_string(),
+            output_summary: "Exit code: 1".to_string(),
+            success: false,
+            non_zero_exit: true,
+        }];
+        assert!(
+            !has_successful_pr_review(&failed_summaries),
+            "failed review should not trigger early-accept"
+        );
     }
 
     // -- detect_resume_intent tests --

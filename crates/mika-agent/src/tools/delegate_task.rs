@@ -341,6 +341,9 @@ impl Tool for DelegateTaskTool {
         if let Err(e) = async_db.end_session(&session_id).await {
             tracing::warn!(session = %session_id, error = %e, "failed to end delegate session");
         }
+        if let Some(map) = ctx.pr_reviews_posted {
+            map.remove(&session_id);
+        }
 
         // Critical: shut down the async DB thread to prevent leaks
         async_db.shutdown();

@@ -768,6 +768,7 @@ async fn run_investigation(
         active_skill_paths: &[],
         max_tasks_per_session: 25,
         pr_review_posted: &pr_review_posted,
+        pr_reviews_posted: None, // Investigation: no session-scoped dedup needed
     };
 
     let mut text_sent = false;

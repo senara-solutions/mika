@@ -347,6 +347,7 @@ async fn init_agent(
     embedding_client: Option<EmbeddingClient>,
     brave_api_key: Option<String>,
     disable_bundled_skills: bool,
+    pr_reviews_posted: Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>,
 ) -> Result<AgentState> {
     // Load per-agent settings (global config.toml → agent config.toml → agent .env → env vars).
     // Settings::load_for_agent injects per-agent .env as a config source (#430),
@@ -425,6 +426,7 @@ async fn init_agent(
         // The agent_lock serializes concurrent dispatch attempts.
         cli_mode: false,
         settings: agent_settings.clone(),
+        pr_reviews_posted: Some(pr_reviews_posted),
     });
 
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
@@ -635,6 +637,11 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // Discover and initialize all agents
     let mut agents = HashMap::new();
 
+    // Session-scoped PR review dedup map (#821). Created once, shared across
+    // all agents via their TaskDispatchers and AppState.
+    let pr_reviews_posted: Arc<dashmap::DashMap<String, std::collections::HashSet<String>>> =
+        Arc::new(dashmap::DashMap::new());
+
     let agent_names = agent::list_agents(global_home);
 
     if agent_names.is_empty() {
@@ -655,6 +662,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     .as_ref()
                     .map(|s| s.expose_secret().to_string()),
                 settings.disable_bundled_skills,
+                pr_reviews_posted.clone(),
             )
             .await?;
             agents.insert(agent::DEFAULT_AGENT.to_string(), Arc::new(agent_state));
@@ -676,6 +684,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     .as_ref()
                     .map(|s| s.expose_secret().to_string()),
                 settings.disable_bundled_skills,
+                pr_reviews_posted.clone(),
             )
             .await
             {
@@ -1159,6 +1168,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
         dashboard_enabled: Arc::new(AtomicBool::new(settings.dashboard_enabled)),
         a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
+        pr_reviews_posted,
     };
 
     let app = build_router(state.clone());
@@ -1299,6 +1309,7 @@ mod tests {
             agent_lock: None,
             cli_mode: false,
             settings: test_settings(),
+            pr_reviews_posted: None,
         });
         let engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
             db,
@@ -1359,6 +1370,7 @@ mod tests {
             investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
             dashboard_enabled: Arc::new(AtomicBool::new(false)),
             a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
+            pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
         }
     }
 

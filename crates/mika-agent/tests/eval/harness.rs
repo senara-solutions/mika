@@ -92,6 +92,7 @@ impl EvalHarness {
             trace_id: Some(self.trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
+            pr_reviews_posted: None,
         };
 
         let output = run_agent(&params).await?;
@@ -148,6 +149,7 @@ impl EvalHarness {
             trace_id: Some(turn_trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
+            pr_reviews_posted: None,
         };
 
         let output = run_agent(&params).await?;

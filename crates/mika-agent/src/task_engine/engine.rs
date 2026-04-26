@@ -657,6 +657,7 @@ mod tests {
             agent_lock: None,
             cli_mode: false,
             settings,
+            pr_reviews_posted: None,
         })
     }
 
@@ -1064,6 +1065,7 @@ mod tests {
             agent_lock: None,
             cli_mode: true,
             settings,
+            pr_reviews_posted: None,
         });
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 

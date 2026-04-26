@@ -54,6 +54,7 @@ pub mod test_helpers {
             active_skill_paths: &[],
             max_tasks_per_session: 25,
             pr_review_posted: &PR_REVIEW_POSTED,
+            pr_reviews_posted: None,
         }
     }
 
@@ -128,6 +129,7 @@ pub mod test_helpers {
                 active_skill_paths: &[],
                 max_tasks_per_session: 25,
                 pr_review_posted: &PR_REVIEW_POSTED,
+                pr_reviews_posted: None,
             }
         }
 
@@ -156,6 +158,7 @@ pub mod test_helpers {
                 active_skill_paths: &[],
                 max_tasks_per_session: 25,
                 pr_review_posted: &PR_REVIEW_POSTED,
+                pr_reviews_posted: None,
             }
         }
         /// Create a ToolContext with custom home and global home directories.
@@ -188,6 +191,7 @@ pub mod test_helpers {
                 active_skill_paths: &[],
                 max_tasks_per_session: 25,
                 pr_review_posted: &PR_REVIEW_POSTED,
+                pr_reviews_posted: None,
             }
         }
     }
