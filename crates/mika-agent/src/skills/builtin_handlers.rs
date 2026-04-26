@@ -976,8 +976,17 @@ async fn git_ops_worktree_prune(repo_path: &str) -> ToolOutput {
 
 // -- GitHub read-only handler --
 
+/// Maximum file size for `file_view` op (matches GitHub contents API cap).
+const FILE_VIEW_MAX_BYTES: u64 = 1_048_576;
+
 /// Allowed read-only operations for `gh_read`.
-const GH_READ_ALLOWED_OPS: &[&str] = &["issue_view", "pr_view", "pr_diff", "issue_list"];
+const GH_READ_ALLOWED_OPS: &[&str] = &[
+    "issue_view",
+    "pr_view",
+    "pr_diff",
+    "issue_list",
+    "file_view",
+];
 
 /// Validated `gh_read` input — operation, optional target, and repo.
 #[derive(Debug)]
@@ -985,6 +994,10 @@ struct GhReadArgs {
     op: String,
     target: Option<String>,
     repo: String,
+    /// File path for `file_view` op (repo-root-relative).
+    path: Option<String>,
+    /// Git ref for `file_view` op (branch/tag/sha). Defaults to `"main"`.
+    r#ref: Option<String>,
 }
 
 /// Structured error types for `gh_read` responses.
@@ -995,6 +1008,7 @@ enum GhReadError {
     RateLimited(String),
     NetworkError(String),
     MalformedRequest(String),
+    FileTooLarge { size_bytes: u64, max_bytes: u64 },
 }
 
 impl GhReadError {
@@ -1028,6 +1042,14 @@ impl GhReadError {
                 format!(
                     "{{\"error\": \"malformed_request\", \"message\": {}}}",
                     serde_json::json!(msg)
+                )
+            }
+            Self::FileTooLarge {
+                size_bytes,
+                max_bytes,
+            } => {
+                format!(
+                    "{{\"error\": \"file_too_large\", \"message\": \"File size ({size_bytes} bytes) exceeds maximum ({max_bytes} bytes).\", \"size_bytes\": {size_bytes}, \"max_bytes\": {max_bytes}}}"
                 )
             }
         }
@@ -1164,10 +1186,114 @@ fn validate_gh_read_input(input: &serde_json::Value) -> Result<GhReadArgs, ToolO
         }
     }
 
-    Ok(GhReadArgs { op, target, repo })
+    // file_view-specific validation: path and ref
+    let (path, r#ref) = if op == "file_view" {
+        let path = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        let path = match path {
+            Some(p) => p,
+            None => {
+                return Err(ToolOutput::error(
+                    GhReadError::MalformedRequest(
+                        "Operation 'file_view' requires a 'path' parameter.".to_string(),
+                    )
+                    .to_json(),
+                ));
+            }
+        };
+
+        // Anti-flag-smuggling on path
+        if path.starts_with('-') {
+            return Err(ToolOutput::error(
+                GhReadError::MalformedRequest(format!(
+                    "'path' value '{path}' looks like a flag (starts with '-')."
+                ))
+                .to_json(),
+            ));
+        }
+
+        // No absolute paths
+        if path.starts_with('/') {
+            return Err(ToolOutput::error(
+                GhReadError::MalformedRequest(format!(
+                    "'path' must be repo-root-relative, not absolute: '{path}'."
+                ))
+                .to_json(),
+            ));
+        }
+
+        // No directory traversal
+        if path.contains("..") {
+            return Err(ToolOutput::error(
+                GhReadError::MalformedRequest(format!("'path' must not contain '..': '{path}'."))
+                    .to_json(),
+            ));
+        }
+
+        // Charset enforcement: only [A-Za-z0-9._/\-] allowed.
+        // This prevents URL-encoding attacks (e.g., foo%2F..%2Fbaz bypassing
+        // the literal '..' check after GitHub's server-side URL decoding).
+        if !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        {
+            return Err(ToolOutput::error(
+                GhReadError::MalformedRequest(format!(
+                    "'path' contains disallowed characters. Only [A-Za-z0-9._/-] are permitted: '{path}'."
+                ))
+                .to_json(),
+            ));
+        }
+
+        // Ref validation
+        let r#ref = input
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        if let Some(ref r) = r#ref {
+            if r.starts_with('-') {
+                return Err(ToolOutput::error(
+                    GhReadError::MalformedRequest(format!(
+                        "'ref' value '{r}' looks like a flag (starts with '-')."
+                    ))
+                    .to_json(),
+                ));
+            }
+            if r.len() > 256 {
+                return Err(ToolOutput::error(
+                    GhReadError::MalformedRequest(format!(
+                        "'ref' value is too long ({} chars, max 256).",
+                        r.len()
+                    ))
+                    .to_json(),
+                ));
+            }
+        }
+
+        (Some(path), r#ref)
+    } else {
+        (None, None)
+    };
+
+    Ok(GhReadArgs {
+        op,
+        target,
+        repo,
+        path,
+        r#ref,
+    })
 }
 
 /// Build the `gh` CLI command for a `gh_read` operation.
+///
+/// Each op arm appends `--repo` where needed. `file_view` uses `gh api`
+/// which takes the repo in the URL path, so it omits `--repo`.
 fn build_gh_read_command(args: &GhReadArgs) -> Vec<String> {
     match args.op.as_str() {
         "issue_view" => {
@@ -1177,6 +1303,8 @@ fn build_gh_read_command(args: &GhReadArgs) -> Vec<String> {
                 args.target.clone().unwrap(),
                 "--json".to_string(),
                 "number,title,body,labels,milestone,comments,state,assignees".to_string(),
+                "--repo".to_string(),
+                args.repo.clone(),
             ]
         }
         "pr_view" => {
@@ -1187,6 +1315,8 @@ fn build_gh_read_command(args: &GhReadArgs) -> Vec<String> {
                 "--json".to_string(),
                 "number,title,body,labels,headRefName,state,reviewDecision,reviews,commits"
                     .to_string(),
+                "--repo".to_string(),
+                args.repo.clone(),
             ]
         }
         "pr_diff" => {
@@ -1194,6 +1324,8 @@ fn build_gh_read_command(args: &GhReadArgs) -> Vec<String> {
                 "pr".to_string(),
                 "diff".to_string(),
                 args.target.clone().unwrap(),
+                "--repo".to_string(),
+                args.repo.clone(),
             ]
         }
         "issue_list" => {
@@ -1211,7 +1343,21 @@ fn build_gh_read_command(args: &GhReadArgs) -> Vec<String> {
             }
             cmd.push("--json".to_string());
             cmd.push("number,title,state,labels,milestone,assignees".to_string());
+            cmd.push("--repo".to_string());
+            cmd.push(args.repo.clone());
             cmd
+        }
+        "file_view" => {
+            let path = args.path.as_deref().unwrap();
+            let r#ref = args.r#ref.as_deref().unwrap_or("main");
+            vec![
+                "api".to_string(),
+                format!("/repos/{}/contents/{}?ref={}", args.repo, path, r#ref),
+                "--method".to_string(),
+                "GET".to_string(),
+                "-H".to_string(),
+                "Accept: application/vnd.github+json".to_string(),
+            ]
         }
         _ => unreachable!("validate_gh_read_input checks op against allowlist"),
     }
@@ -1235,7 +1381,8 @@ async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
 
     let mut cmd = tokio::process::Command::new("gh");
     cmd.args(&gh_cmd);
-    cmd.arg("--repo").arg(&args.repo);
+    // --repo is now per-op inside build_gh_read_command (file_view uses gh api
+    // which takes repo in the URL path, not as a --repo flag).
     cmd.env("GH_PROMPT_DISABLED", "1");
     super::executor::scrub_mika_env_vars(&mut cmd);
 
@@ -1255,23 +1402,105 @@ async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
         || output.content.starts_with("Exit code:")
         || output.content.starts_with("Killed by signal:");
 
+    // Compute audit resource field — target for issue/pr ops, <ref>:<path> for file_view
+    let audit_resource = if args.op == "file_view" {
+        let r = args.r#ref.as_deref().unwrap_or("main");
+        let p = args.path.as_deref().unwrap_or("");
+        format!("{r}:{p}")
+    } else {
+        args.target.as_deref().unwrap_or("").to_string()
+    };
+
+    // For file_view, extract blob_sha from the response on success
+    let blob_sha: Option<String> = if args.op == "file_view" && !is_err {
+        serde_json::from_str::<serde_json::Value>(&output.content)
+            .ok()
+            .and_then(|v| v.get("sha").and_then(|s| s.as_str()).map(String::from))
+    } else {
+        None
+    };
+
     // Audit log
     tracing::info!(
         event = "gh_read_invocation",
         op = %args.op,
-        resource = args.target.as_deref().unwrap_or(""),
+        resource = %audit_resource,
         repo = %args.repo,
         latency_ms = latency_ms,
         status = if is_err { "error" } else { "ok" },
+        blob_sha = blob_sha.as_deref().unwrap_or(""),
         "gh_read invocation"
     );
 
     if is_err {
         let err = classify_gh_error(&output.content, None);
-        ToolOutput::error(err.to_json())
-    } else {
-        output
+        return ToolOutput::error(err.to_json());
     }
+
+    // file_view post-processing: parse GitHub contents API response,
+    // detect FileTooLarge, base64 decode, return normalized response.
+    if args.op == "file_view" {
+        return match parse_file_view_response(&output.content, &args) {
+            Ok(json) => ToolOutput::success(json),
+            Err(err) => ToolOutput::error(err.to_json()),
+        };
+    }
+
+    output
+}
+
+/// Parse GitHub contents API response for `file_view` op.
+///
+/// Returns normalized JSON: `{"content": "<text>", "ref": "<blob-sha>", "path": "<path>", "size_bytes": <n>}`
+fn parse_file_view_response(body: &str, args: &GhReadArgs) -> Result<String, GhReadError> {
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        GhReadError::MalformedRequest(format!("Failed to parse GitHub API response: {e}"))
+    })?;
+
+    let size = json.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let content_raw = json.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let sha = json.get("sha").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Detect FileTooLarge: GitHub returns 200 with empty content + non-zero size
+    // for files > 1 MiB.
+    if size > FILE_VIEW_MAX_BYTES && content_raw.is_empty() {
+        return Err(GhReadError::FileTooLarge {
+            size_bytes: size,
+            max_bytes: FILE_VIEW_MAX_BYTES,
+        });
+    }
+
+    // Verify encoding is base64 (GitHub's documented encoding for contents API)
+    let encoding = json.get("encoding").and_then(|v| v.as_str()).unwrap_or("");
+    if encoding != "base64" && !content_raw.is_empty() {
+        return Err(GhReadError::MalformedRequest(format!(
+            "Unexpected encoding '{encoding}'; expected 'base64'."
+        )));
+    }
+
+    // Base64 decode — GitHub's base64 content has line breaks
+    use base64::Engine;
+    let cleaned = content_raw.replace('\n', "");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&cleaned)
+        .map_err(|e| {
+            GhReadError::MalformedRequest(format!("Failed to base64-decode file content: {e}"))
+        })?;
+
+    // UTF-8 validation
+    let text = String::from_utf8(bytes).map_err(|_| {
+        GhReadError::MalformedRequest("File content is not valid UTF-8.".to_string())
+    })?;
+
+    let path = args.path.as_deref().unwrap_or("");
+    let response = serde_json::json!({
+        "content": text,
+        "ref": sha,
+        "path": path,
+        "size_bytes": size,
+    });
+
+    Ok(response.to_string())
 }
 
 // -- GitHub CLI handler --
@@ -4111,12 +4340,17 @@ mod tests {
             op: "issue_view".to_string(),
             target: Some("42".to_string()),
             repo: "owner/repo".to_string(),
+            path: None,
+            r#ref: None,
         };
         let cmd = build_gh_read_command(&args);
         assert_eq!(cmd[0], "issue");
         assert_eq!(cmd[1], "view");
         assert_eq!(cmd[2], "42");
         assert_eq!(cmd[3], "--json");
+        // Verify --repo is in the argv (moved into per-op arms)
+        assert!(cmd.contains(&"--repo".to_string()));
+        assert!(cmd.contains(&"owner/repo".to_string()));
     }
 
     #[test]
@@ -4125,9 +4359,11 @@ mod tests {
             op: "pr_diff".to_string(),
             target: Some("99".to_string()),
             repo: "owner/repo".to_string(),
+            path: None,
+            r#ref: None,
         };
         let cmd = build_gh_read_command(&args);
-        assert_eq!(cmd, vec!["pr", "diff", "99"]);
+        assert_eq!(cmd, vec!["pr", "diff", "99", "--repo", "owner/repo"]);
     }
 
     #[test]
@@ -4136,11 +4372,15 @@ mod tests {
             op: "issue_list".to_string(),
             target: None,
             repo: "owner/repo".to_string(),
+            path: None,
+            r#ref: None,
         };
         let cmd = build_gh_read_command(&args);
         assert_eq!(cmd[0], "issue");
         assert_eq!(cmd[1], "list");
         assert_eq!(cmd[2], "--json");
+        // Verify --repo is in the argv
+        assert!(cmd.contains(&"--repo".to_string()));
     }
 
     #[test]
@@ -4149,10 +4389,13 @@ mod tests {
             op: "issue_list".to_string(),
             target: Some("17".to_string()),
             repo: "owner/repo".to_string(),
+            path: None,
+            r#ref: None,
         };
         let cmd = build_gh_read_command(&args);
         assert!(cmd.contains(&"--milestone".to_string()));
         assert!(cmd.contains(&"17".to_string()));
+        assert!(cmd.contains(&"--repo".to_string()));
     }
 
     #[test]
@@ -4161,10 +4404,13 @@ mod tests {
             op: "issue_list".to_string(),
             target: Some("bug".to_string()),
             repo: "owner/repo".to_string(),
+            path: None,
+            r#ref: None,
         };
         let cmd = build_gh_read_command(&args);
         assert!(cmd.contains(&"--label".to_string()));
         assert!(cmd.contains(&"bug".to_string()));
+        assert!(cmd.contains(&"--repo".to_string()));
     }
 
     #[test]
@@ -4210,6 +4456,8 @@ mod tests {
             op: "pr_view".to_string(),
             target: Some("7".to_string()),
             repo: "owner/repo".to_string(),
+            path: None,
+            r#ref: None,
         };
         let cmd = build_gh_read_command(&args);
         assert_eq!(cmd[0], "pr");
@@ -4221,6 +4469,9 @@ mod tests {
         assert!(fields.contains("reviewDecision"));
         assert!(fields.contains("reviews"));
         assert!(fields.contains("commits"));
+        // Verify --repo is in the argv
+        assert!(cmd.contains(&"--repo".to_string()));
+        assert!(cmd.contains(&"owner/repo".to_string()));
     }
 
     #[test]
@@ -4253,5 +4504,325 @@ mod tests {
         // spawn_and_collect formats non-zero exits as "Exit code: N\n..."
         let err = classify_gh_error("Exit code: 1\nGraphQL: Could not resolve to an Issue", None);
         assert!(matches!(err, GhReadError::NotFound(_)));
+    }
+
+    // -- file_view validation tests --
+
+    #[test]
+    fn test_validate_gh_read_input_valid_file_view() {
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/main.rs",
+            "ref": "feat/branch"
+        });
+        let args = validate_gh_read_input(&input).unwrap();
+        assert_eq!(args.op, "file_view");
+        assert_eq!(args.path.as_deref(), Some("src/main.rs"));
+        assert_eq!(args.r#ref.as_deref(), Some("feat/branch"));
+        assert!(args.target.is_none());
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_default_ref() {
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "README.md"
+        });
+        let args = validate_gh_read_input(&input).unwrap();
+        assert_eq!(args.path.as_deref(), Some("README.md"));
+        assert!(args.r#ref.is_none()); // defaults applied in build_gh_read_command
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_missing_path() {
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("path"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_path_starts_with_dash() {
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "--evil"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("flag"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_path_starts_with_slash() {
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "/etc/passwd"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("absolute"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_path_with_traversal() {
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/../../../etc/passwd"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains(".."));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_path_charset_rejection() {
+        // URL-encoded path component — the load-bearing case (architect finding 1).
+        // `%2F` decodes to `/` server-side; charset enforcement rejects `%` before
+        // it reaches GitHub's URL decoder.
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "foo%2Fbar%2Fbaz"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("disallowed"));
+
+        // Whitespace
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/my file.rs"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.content.contains("disallowed"));
+
+        // Semicolons (shell metacharacter)
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src;echo/evil"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.content.contains("disallowed"));
+
+        // Non-ASCII
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/caf\u{00e9}.rs"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.content.contains("disallowed"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_ref_starts_with_dash() {
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/main.rs",
+            "ref": "--evil-ref"
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("flag"));
+    }
+
+    #[test]
+    fn test_validate_gh_read_input_file_view_ref_too_long() {
+        let long_ref = "a".repeat(257);
+        let input = serde_json::json!({
+            "op": "file_view",
+            "repo": "owner/repo",
+            "path": "src/main.rs",
+            "ref": long_ref
+        });
+        let err = validate_gh_read_input(&input).unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("malformed_request"));
+        assert!(err.content.contains("too long"));
+    }
+
+    // -- file_view build-command tests --
+
+    #[test]
+    fn test_build_gh_read_command_file_view() {
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "senara-solutions/mika".to_string(),
+            path: Some("crates/mika-agent/src/main.rs".to_string()),
+            r#ref: Some("feat/test-branch".to_string()),
+        };
+        let cmd = build_gh_read_command(&args);
+        assert_eq!(cmd[0], "api");
+        assert!(cmd[1].starts_with("/repos/senara-solutions/mika/contents/"));
+        assert!(cmd[1].contains("crates/mika-agent/src/main.rs"));
+        assert!(cmd[1].contains("?ref=feat/test-branch"));
+        assert!(cmd.contains(&"--method".to_string()));
+        assert!(cmd.contains(&"GET".to_string()));
+        // file_view must NOT have --repo (gh api doesn't accept it)
+        assert!(!cmd.contains(&"--repo".to_string()));
+    }
+
+    #[test]
+    fn test_build_gh_read_command_file_view_default_ref() {
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("README.md".to_string()),
+            r#ref: None,
+        };
+        let cmd = build_gh_read_command(&args);
+        assert!(cmd[1].contains("?ref=main"), "default ref should be 'main'");
+    }
+
+    #[test]
+    fn test_build_gh_read_command_existing_ops_have_repo() {
+        // Regression: confirm the four existing ops still emit --repo after
+        // the refactor moved the append into their per-op arms.
+        for op in &["issue_view", "pr_view", "pr_diff", "issue_list"] {
+            let args = GhReadArgs {
+                op: op.to_string(),
+                target: if *op == "issue_list" {
+                    None
+                } else {
+                    Some("1".to_string())
+                },
+                repo: "o/r".to_string(),
+                path: None,
+                r#ref: None,
+            };
+            let cmd = build_gh_read_command(&args);
+            assert!(
+                cmd.contains(&"--repo".to_string()),
+                "op '{op}' must include --repo in argv"
+            );
+            assert!(
+                cmd.contains(&"o/r".to_string()),
+                "op '{op}' must include repo value in argv"
+            );
+        }
+    }
+
+    // -- file_view response parsing tests --
+
+    #[test]
+    fn test_parse_file_view_happy_path() {
+        use base64::Engine;
+        let content = "Hello, world!\nLine 2\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(content);
+        let body = serde_json::json!({
+            "name": "test.txt",
+            "path": "src/test.txt",
+            "sha": "abc123def456",
+            "size": content.len(),
+            "content": encoded,
+            "encoding": "base64",
+            "type": "file"
+        });
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("src/test.txt".to_string()),
+            r#ref: Some("main".to_string()),
+        };
+        let result = parse_file_view_response(&body.to_string(), &args).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"], content);
+        assert_eq!(parsed["ref"], "abc123def456");
+        assert_eq!(parsed["path"], "src/test.txt");
+        assert_eq!(parsed["size_bytes"], content.len());
+    }
+
+    #[test]
+    fn test_parse_file_view_file_too_large() {
+        // GitHub returns empty content + non-zero size for files > 1 MiB
+        let body = serde_json::json!({
+            "name": "big.bin",
+            "path": "big.bin",
+            "sha": "deadbeef",
+            "size": 2_000_000,
+            "content": "",
+            "encoding": "base64",
+            "type": "file"
+        });
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("big.bin".to_string()),
+            r#ref: None,
+        };
+        let err = parse_file_view_response(&body.to_string(), &args).unwrap_err();
+        match err {
+            GhReadError::FileTooLarge {
+                size_bytes,
+                max_bytes,
+            } => {
+                assert_eq!(size_bytes, 2_000_000);
+                assert_eq!(max_bytes, FILE_VIEW_MAX_BYTES);
+            }
+            other => panic!("Expected FileTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_file_view_non_utf8_content() {
+        use base64::Engine;
+        // Invalid UTF-8 sequence
+        let bytes: &[u8] = &[0xFF, 0xFE, 0x00, 0x01];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let body = serde_json::json!({
+            "name": "binary.dat",
+            "path": "binary.dat",
+            "sha": "binarysha",
+            "size": bytes.len(),
+            "content": encoded,
+            "encoding": "base64",
+            "type": "file"
+        });
+        let args = GhReadArgs {
+            op: "file_view".to_string(),
+            target: None,
+            repo: "owner/repo".to_string(),
+            path: Some("binary.dat".to_string()),
+            r#ref: None,
+        };
+        let err = parse_file_view_response(&body.to_string(), &args).unwrap_err();
+        assert!(
+            matches!(err, GhReadError::MalformedRequest(ref msg) if msg.contains("UTF-8")),
+            "Expected MalformedRequest with UTF-8 message, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_file_too_large_error_json_format() {
+        let err = GhReadError::FileTooLarge {
+            size_bytes: 2_000_000,
+            max_bytes: 1_048_576,
+        };
+        let json_str = err.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["error"], "file_too_large");
+        assert_eq!(parsed["size_bytes"], 2_000_000);
+        assert_eq!(parsed["max_bytes"], 1_048_576);
     }
 }
