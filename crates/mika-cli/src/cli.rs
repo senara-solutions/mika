@@ -213,6 +213,11 @@ pub struct AskArgs {
     /// Not supported in team mode (use DB overrides instead).
     #[arg(long, conflicts_with = "team")]
     pub disable_skill: Vec<String>,
+
+    /// Emit metadata trailer after response (e.g., session_id).
+    /// Useful for cross-command integration where downstream consumers need session context.
+    #[arg(long, conflicts_with = "team")]
+    pub verbose: bool,
 }
 
 #[derive(clap::Args)]

@@ -34,6 +34,7 @@ pub async fn run(
     model_override: Option<&str>,
     enable_skill: &[String],
     disable_skill: &[String],
+    verbose: bool,
 ) -> Result<()> {
     let mut ctx = init::init_for_agent(agent_name)?;
 
@@ -369,6 +370,9 @@ pub async fn run(
                     pending_callbacks.len()
                 );
             }
+            if verbose {
+                println!("session_id: {session_id}");
+            }
         }
         OutputFormat::Json => {
             let response = AskJsonResponse {
@@ -638,6 +642,21 @@ mod tests {
         assert_eq!(parsed["task_id"], "abc-123-def");
         // pending_tasks should be omitted when empty
         assert!(parsed.get("pending_tasks").is_none());
+    }
+
+    #[test]
+    fn test_verbose_trailer_format() {
+        // The verbose trailer must be a standalone `session_id: <uuid>` line
+        // that downstream parsers can match by key name.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let trailer = format!("session_id: {session_id}");
+
+        // Must start with the key name
+        assert!(trailer.starts_with("session_id: "));
+
+        // The value after "session_id: " must be a valid UUID
+        let value = trailer.strip_prefix("session_id: ").unwrap();
+        assert!(uuid::Uuid::parse_str(value).is_ok());
     }
 
     #[test]
