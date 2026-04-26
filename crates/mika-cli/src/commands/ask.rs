@@ -371,6 +371,10 @@ pub async fn run(
                 );
             }
             if verbose {
+                // Blank line separates response body from metadata trailer,
+                // making `grep ^session_id:` reliable even when LLM prose
+                // contains "session_id:" text.
+                println!();
                 println!("session_id: {session_id}");
             }
         }
