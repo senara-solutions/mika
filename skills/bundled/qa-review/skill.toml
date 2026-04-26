@@ -3,7 +3,7 @@ name = "qa-review"
 description = "Quality gate for PR review — produces structured pass/hold/block verdicts for mika-dev"
 version = "0.8.0"
 always_on = true
-max_prompt_size = 32768
+max_prompt_size = 49152
 dependencies = ["github", "build-mika"]
 
 [triggers]
