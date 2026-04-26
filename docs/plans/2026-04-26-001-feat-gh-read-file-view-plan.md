@@ -1,10 +1,34 @@
 ---
 title: "feat(gh_read): add file_view op — read repo working-tree files by path"
 type: feat
-status: active
+status: groomed
 date: 2026-04-26
 origin: senara-solutions/mika#817
 depth: medium
+architect_session: 83519e10-7970-4b4a-b0fc-272762b15e26
+architect_model: anthropic/claude-opus-4-7
+architect_verdict: GROOMED (post spec correction; see Architect grooming closure below)
+---
+
+## Architect grooming closure (2026-04-26)
+
+Two-pass review on session `83519e10-7970-4b4a-b0fc-272762b15e26` (mika-arch on Opus 4.7 via `skill_overrides`).
+
+**First-pass: `Disposition: ITERATE`** — 7 findings:
+1. Path charset enforcement (load-bearing — URL-decoding attack surface)
+2. Pin `--method GET` explicitly in argv
+3. Push `--repo` flag into per-op arms of `build_gh_read_command`
+4. Reframe repo allowlist deferral as "uniform across all five ops if introduced"
+5. Add `blob_sha` to audit log (cost-free)
+6. Document GitHub's >100 MiB → 403 → AuthFailed boundary
+7. Audit `resource` shape: `<ref>:<path>` not `<repo>:<ref>:<path>`
+
+All 7 applied (this commit + finding 1 in Unit 2; finding 2 in Unit 3 argv; finding 3 in Unit 3 refactor; finding 4 in Out-of-scope; finding 5 in Unit 5 audit; finding 6 in D4; finding 7 in Unit 5 resource).
+
+**Second-pass: `Verdict: ESCALATE`** — six of seven first-pass findings cleanly RESOLVED. Seventh (repo allowlist) flagged as plan-vs-issue-spec divergence: the issue body had specified an allowlist that the plan deferred. Architect refused to ratify unilateral spec divergence per the issue-as-contract discipline.
+
+**Resolution: issue body corrected to match plan reasoning.** The architect's substantive review of plan content is unchanged; the six-of-seven RESOLVED verdict applies to the corrected spec. **No third architect pass** — R11 holds, plan content unchanged, spec changed to match reviewed plan. Audit trail: this annotation, the issue body edit-notice comment on mika#817, and the architect session record at `83519e10-…`. Effective verdict on corrected spec: GROOMED.
+
 ---
 
 # feat(gh_read): add file_view op
