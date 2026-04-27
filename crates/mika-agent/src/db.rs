@@ -10571,6 +10571,97 @@ mod tests {
     }
 
     #[test]
+    fn test_sessions_time_range_filter() {
+        let db = db();
+        // Create sessions with known timestamps
+        db.create_session("s1", "mika", "cli").unwrap();
+        db.create_session("s2", "mika", "cli").unwrap();
+
+        // Query with from/to set to a window that includes all sessions (now-1h to now+1h)
+        let from_ts = crate::timestamp::now_minus(chrono::Duration::seconds(3600));
+        let to_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
+        let sessions = db
+            .list_sessions_paginated(None, None, None, None, Some(&from_ts), Some(&to_ts), 50, 0)
+            .unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // Query with from set to the far future — should return no sessions
+        let future_ts = "2099-01-01T00:00:00Z";
+        let sessions = db
+            .list_sessions_paginated(None, None, None, None, Some(future_ts), None, 50, 0)
+            .unwrap();
+        assert!(sessions.is_empty());
+
+        // Count should also respect the filter
+        let count = db
+            .count_sessions(None, None, None, None, Some(&from_ts), Some(&to_ts))
+            .unwrap();
+        assert_eq!(count, 2);
+        let count = db
+            .count_sessions(None, None, None, None, Some(future_ts), None)
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_tasks_time_range_filter() {
+        let db = db();
+        db.create_task(&new_task("mika", "task-a", "manual", "none"))
+            .unwrap();
+        db.create_task(&new_task("mika", "task-b", "manual", "none"))
+            .unwrap();
+
+        // Build filters with a wide time range
+        let from_ts = crate::timestamp::now_minus(chrono::Duration::seconds(3600));
+        let to_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
+        let filters = TaskFilters {
+            from: Some(from_ts),
+            to: Some(to_ts),
+            ..Default::default()
+        };
+        let (tasks, count) = db.list_tasks_paginated_with_count(&filters, 50, 0).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(count, 2);
+
+        // Narrow to the far future — no matches
+        let filters = TaskFilters {
+            from: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let (tasks, count) = db.list_tasks_paginated_with_count(&filters, 50, 0).unwrap();
+        assert!(tasks.is_empty());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_dev_runs_time_range_filter() {
+        let db = db();
+        // Create dev-run-shaped tasks (trigger_type=manual, source=self_dev)
+        let mut t = new_task("mika", "dev-run-1", "manual", "none");
+        t.source = Some("self_dev".to_string());
+        db.create_task(&t).unwrap();
+        let mut t2 = new_task("mika", "dev-run-2", "manual", "none");
+        t2.source = Some("self_dev".to_string());
+        db.create_task(&t2).unwrap();
+
+        // Wide time range — should get both
+        let from_ts = crate::timestamp::now_minus(chrono::Duration::seconds(3600));
+        let to_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
+        let (runs, count) = db
+            .list_dev_runs_paginated_with_count(None, Some(&from_ts), Some(&to_ts), 50, 0)
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(count, 2);
+
+        // Far future — no matches
+        let (runs, count) = db
+            .list_dev_runs_paginated_with_count(None, Some("2099-01-01T00:00:00Z"), None, 50, 0)
+            .unwrap();
+        assert!(runs.is_empty());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn test_unified_timeline_uses_execution_trace_id() {
         let db = db();
         let task = NewTask {
