@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
-import { Pagination, EmptyState, TaskStatusBadge, ListRow, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, formatRelativeTime } from '@senara-solutions/ui'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 function TaskRow({ task, indent = 0 }: { task: TaskItem; indent?: number }) {
@@ -71,8 +71,8 @@ function ChildTaskRows({ parentTaskId, indent }: { parentTaskId: string; indent:
   if (isLoading) {
     return (
       <tr>
-        <td colSpan={8} className="px-4 py-2 text-xs text-muted/40" style={{ paddingLeft: `${indent * 1.5 + 1}rem` }}>
-          Loading...
+        <td colSpan={8} className="px-4 py-2" style={{ paddingLeft: `${indent * 1.5 + 1}rem` }}>
+          <div className="h-4 w-48 animate-pulse rounded bg-white/[0.06]" />
         </td>
       </tr>
     )
@@ -259,7 +259,7 @@ function WorkItemsSection() {
   const [page, setPage] = useState(1)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = { trigger_type: 'manual', page, per_page: 20 }
-  const { data, isLoading, error } = useTasks(filters)
+  const { data, isLoading, error, refetch } = useTasks(filters)
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -273,11 +273,9 @@ function WorkItemsSection() {
   return (
     <Section title="Work Items" count={data?.total} defaultOpen={true}>
       {isLoading ? (
-        <div className="text-muted/60 py-4 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-4 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
         <EmptyState message="No active work items" />
       ) : (
@@ -310,7 +308,7 @@ function TeamRunTasksSection() {
     page,
     per_page: 20,
   }
-  const { data, isLoading, error } = useTasks(filters)
+  const { data, isLoading, error, refetch } = useTasks(filters)
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -324,11 +322,9 @@ function TeamRunTasksSection() {
   return (
     <Section title="Team Run Tasks" count={data?.total} defaultOpen={true}>
       {isLoading ? (
-        <div className="text-muted/60 py-4 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-4 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
         <EmptyState message="No team run tasks" />
       ) : (
@@ -362,16 +358,14 @@ function StandaloneCallbacksSection() {
     page,
     per_page: 20,
   }
-  const { data, isLoading, error } = useTasks(filters)
+  const { data, isLoading, error, refetch } = useTasks(filters)
 
   return (
     <Section title="Standalone Callbacks" count={data?.total} defaultOpen={true}>
       {isLoading ? (
-        <div className="text-muted/60 py-4 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-4 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
         <EmptyState message="No standalone callbacks" />
       ) : (
@@ -397,16 +391,14 @@ function ScheduledSection() {
     page,
     per_page: 20,
   }
-  const { data, isLoading, error } = useTasks(filters)
+  const { data, isLoading, error, refetch } = useTasks(filters)
 
   return (
     <Section title="Scheduled Tasks" count={data?.total} defaultOpen={false}>
       {isLoading ? (
-        <div className="text-muted/60 py-4 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-4 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
         <EmptyState message="No scheduled tasks" />
       ) : (

@@ -1,6 +1,6 @@
 import { Link } from 'react-router'
 import { useDevRuns, type DevRunsFilters } from '../api/devRuns.ts'
-import { Pagination, EmptyState, TaskStatusBadge, ListRow, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
 const STATUS_OPTIONS = [
@@ -36,7 +36,7 @@ export default function DevRuns() {
     per_page: 50,
   }
 
-  const { data, isLoading, error } = useDevRuns(filters)
+  const { data, isLoading, error, refetch } = useDevRuns(filters)
 
   return (
     <div>
@@ -72,13 +72,16 @@ export default function DevRuns() {
       </div>
 
       {isLoading ? (
-        <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-8 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
-        <EmptyState message="No dev runs match your filters" />
+        <EmptyState
+          message="No dev runs match your filters"
+          action={filters.status
+            ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
+            : undefined}
+        />
       ) : (
         <>
           <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">

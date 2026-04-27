@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams, Link } from 'react-router'
 import { useAgentDetail, useAgentSessions, useAgentAudit, type CoreMemory } from '../api/agents.ts'
-import { StatusBadge, Pagination, EmptyState, MarkdownContent, formatRelativeTime } from '@senara-solutions/ui'
+import { StatusBadge, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime } from '@senara-solutions/ui'
 import { ArrowLeft, User, Brain, Target, Users, GitBranch, Pencil } from 'lucide-react'
 
 const BLOCK_TOKEN_CAP = 500
@@ -54,19 +54,18 @@ export default function AgentDetail() {
   const [sessionsPage, setSessionsPage] = useState(1)
   const [auditPage] = useState(1)
 
-  const { data: agent, isLoading, error } = useAgentDetail(agentId ?? '')
+  const { data: agent, isLoading, error, refetch } = useAgentDetail(agentId ?? '')
   const { data: sessions } = useAgentSessions(agentId ?? '', sessionsPage)
   const { data: audit } = useAgentAudit(agentId ?? '', auditPage)
 
   if (isLoading) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+    return <LoadingState variant="detail" />
   }
-  if (error || !agent) {
-    return (
-      <div className="text-red-400 py-8 text-center text-sm">
-        {error instanceof Error ? error.message : 'Agent not found'}
-      </div>
-    )
+  if (error) {
+    return <ErrorState message={formatApiError(error)} retry={() => refetch()} />
+  }
+  if (!agent) {
+    return <EmptyState message="Agent not found" />
   }
 
   const editsUsed = agent.core_memory_edits_this_session

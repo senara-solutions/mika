@@ -9,6 +9,9 @@ import {
   CopyButton,
   MarkdownContent,
   EmptyState,
+  LoadingState,
+  ErrorState,
+  formatApiError,
   formatRelativeTime,
 } from '@senara-solutions/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
@@ -252,7 +255,7 @@ function SessionMessages({ sessionId }: { sessionId: string }) {
 
 export default function DevRunDetail() {
   const { taskId } = useParams<{ taskId: string }>()
-  const { data: run, isLoading, error } = useDevRun(taskId)
+  const { data: run, isLoading, error, refetch } = useDevRun(taskId)
 
   // Parse GitHub references from the run data
   const issueRef = run?.reference_url ? parseGitHubUrl(run.reference_url) : null
@@ -263,12 +266,12 @@ export default function DevRunDetail() {
       : null
 
   // Fetch GitHub data (conditional on refs existing)
-  const { data: issue, error: issueError, isLoading: issueLoading } = useGitHubIssue(
+  const { data: issue, error: issueError, isLoading: issueLoading, refetch: refetchIssue } = useGitHubIssue(
     issueRef?.owner ?? null,
     issueRef?.repo ?? null,
     issueRef?.number ?? null,
   )
-  const { data: pull, error: pullError, isLoading: pullLoading } = useGitHubPull(
+  const { data: pull, error: pullError, isLoading: pullLoading, refetch: refetchPull } = useGitHubPull(
     prRef?.owner ?? null,
     prRef?.repo ?? null,
     prRef?.number ?? null,
@@ -279,17 +282,13 @@ export default function DevRunDetail() {
   const { data: children } = useTaskChildren(taskId)
 
   if (isLoading) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+    return <LoadingState variant="detail" />
   }
   if (error) {
-    return (
-      <div className="text-red-400 py-8 text-center text-sm">
-        Error: {error instanceof Error ? error.message : 'Unknown error'}
-      </div>
-    )
+    return <ErrorState message={formatApiError(error)} retry={() => refetch()} />
   }
   if (!run) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Dev run not found</div>
+    return <EmptyState message="Dev run not found" />
   }
 
   const hasReviews = (pull?.reviews?.length ?? 0) > 0
@@ -372,14 +371,14 @@ export default function DevRunDetail() {
             }
           >
             {issueLoading && (
-              <div className="text-muted/40 text-xs">Loading issue...</div>
+              <div className="text-muted/40 text-xs animate-pulse">Loading issue...</div>
             )}
             {issueError && (
-              <div className="text-muted/40 text-xs">
-                {(issueError as Error).message?.includes('503')
-                  ? 'GitHub integration not available'
-                  : 'Failed to load issue'}
-              </div>
+              <ErrorState
+                variant="detail-section"
+                message={formatApiError(issueError)}
+                retry={() => refetchIssue()}
+              />
             )}
             {issue && (
               <div>
@@ -442,14 +441,14 @@ export default function DevRunDetail() {
             }
           >
             {pullLoading && (
-              <div className="text-muted/40 text-xs">Loading PR...</div>
+              <div className="text-muted/40 text-xs animate-pulse">Loading PR...</div>
             )}
             {pullError && (
-              <div className="text-muted/40 text-xs">
-                {(pullError as Error).message?.includes('503')
-                  ? 'GitHub integration not available'
-                  : 'Failed to load PR'}
-              </div>
+              <ErrorState
+                variant="detail-section"
+                message={formatApiError(pullError)}
+                retry={() => refetchPull()}
+              />
             )}
             {pull && (
               <div>

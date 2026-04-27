@@ -6,6 +6,7 @@ export interface EmptyStateProps {
   title?: string
   icon?: ReactNode
   variant?: 'minimal' | 'card'
+  action?: { label: string; onClick: () => void }
 }
 
 export default function EmptyState({
@@ -13,6 +14,7 @@ export default function EmptyState({
   title,
   icon,
   variant = 'minimal',
+  action,
 }: EmptyStateProps) {
   // undefined = default Inbox icon, null = no icon, ReactNode = custom icon
   const resolvedIcon = icon === null ? null : (icon ?? <Inbox size={32} />)
@@ -26,6 +28,15 @@ export default function EmptyState({
         <p className="text-sm font-medium text-heading mb-1">{title}</p>
       )}
       <p className="text-sm">{message}</p>
+      {action && (
+        <button
+          type="button"
+          onClick={action.onClick}
+          className="mt-3 text-sm text-accent hover:text-accent-light transition-colors"
+        >
+          {action.label}
+        </button>
+      )}
     </>
   )
 
