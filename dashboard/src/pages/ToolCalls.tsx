@@ -2,7 +2,7 @@ import { useState, Fragment } from 'react'
 import { Link } from 'react-router'
 import { useToolCalls, type ToolCallsFilters } from '../api/toolCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { CopyButton, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, SelectFilter, formatTimestamp } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatTimestamp } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
@@ -38,6 +38,8 @@ export default function ToolCalls() {
     agent_id: searchParams.get('agent_id') ?? undefined,
     tool_name: searchParams.get('tool_name') ?? undefined,
     success: searchParams.get('success') ?? undefined,
+    from: searchParams.get('from') ?? undefined,
+    to: searchParams.get('to') ?? undefined,
     page: Number(searchParams.get('page')) || 1,
     per_page: 50,
   }
@@ -90,7 +92,14 @@ export default function ToolCalls() {
             onChange={(v) => updateFilter('success', v)}
             options={SUCCESS_OPTIONS}
           />
-          {(filters.agent_id || filters.tool_name || filters.success) && (
+          <TimeRangeFilter
+            value={{ from: filters.from, to: filters.to }}
+            onChange={(range) => {
+              updateFilter('from', range.from ?? '')
+              updateFilter('to', range.to ?? '')
+            }}
+          />
+          {(filters.agent_id || filters.tool_name || filters.success || filters.from || filters.to) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}
               className="text-xs text-muted/60 hover:text-muted transition-colors"
@@ -109,7 +118,7 @@ export default function ToolCalls() {
       ) : !data || data.data.length === 0 ? (
         <EmptyState
           message="No tool calls match your filters"
-          action={(filters.agent_id || filters.tool_name || filters.success)
+          action={(filters.agent_id || filters.tool_name || filters.success || filters.from || filters.to)
             ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
             : undefined}
         />

@@ -1,6 +1,6 @@
 import { Link } from 'react-router'
 import { useDevRuns, type DevRunsFilters } from '../api/devRuns.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, TimeRangeFilter, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
 const STATUS_OPTIONS = [
@@ -32,6 +32,8 @@ export default function DevRuns() {
 
   const filters: DevRunsFilters = {
     status: searchParams.get('status') ?? undefined,
+    from: searchParams.get('from') ?? undefined,
+    to: searchParams.get('to') ?? undefined,
     page: Number(searchParams.get('page')) || 1,
     per_page: 50,
   }
@@ -60,7 +62,14 @@ export default function DevRuns() {
             onChange={(v) => updateFilter('status', v)}
             options={STATUS_OPTIONS}
           />
-          {filters.status && (
+          <TimeRangeFilter
+            value={{ from: filters.from, to: filters.to }}
+            onChange={(range) => {
+              updateFilter('from', range.from ?? '')
+              updateFilter('to', range.to ?? '')
+            }}
+          />
+          {(filters.status || filters.from || filters.to) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}
               className="text-xs text-muted/60 hover:text-muted transition-colors"
@@ -78,7 +87,7 @@ export default function DevRuns() {
       ) : !data || data.data.length === 0 ? (
         <EmptyState
           message="No dev runs match your filters"
-          action={filters.status
+          action={(filters.status || filters.from || filters.to)
             ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
             : undefined}
         />

@@ -1,6 +1,6 @@
 import { Link } from 'react-router'
 import { useTeamRuns, type TeamRunsFilters } from '../api/teams.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, SelectFilter, TimeRangeFilter, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
 const STATUS_OPTIONS = [
@@ -18,6 +18,8 @@ export default function TeamRuns() {
   const filters: TeamRunsFilters = {
     team_name: searchParams.get('team_name') ?? undefined,
     status: searchParams.get('status') ?? undefined,
+    from: searchParams.get('from') ?? undefined,
+    to: searchParams.get('to') ?? undefined,
     page: Number(searchParams.get('page')) || 1,
     per_page: 50,
   }
@@ -53,7 +55,14 @@ export default function TeamRuns() {
             onChange={(v) => updateFilter('status', v)}
             options={STATUS_OPTIONS}
           />
-          {(filters.team_name || filters.status) && (
+          <TimeRangeFilter
+            value={{ from: filters.from, to: filters.to }}
+            onChange={(range) => {
+              updateFilter('from', range.from ?? '')
+              updateFilter('to', range.to ?? '')
+            }}
+          />
+          {(filters.team_name || filters.status || filters.from || filters.to) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}
               className="text-xs text-muted/60 hover:text-muted transition-colors"
@@ -71,7 +80,7 @@ export default function TeamRuns() {
       ) : !data || data.data.length === 0 ? (
         <EmptyState
           message="No team runs match your filters"
-          action={(filters.team_name || filters.status)
+          action={(filters.team_name || filters.status || filters.from || filters.to)
             ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
             : undefined}
         />
