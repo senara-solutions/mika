@@ -122,6 +122,57 @@ When you receive a callback result from a completed background task (`run_claude
 >
 > **When no milestone/project context:** Proceed with normal callback handling below.
 
+**Pipeline result classification (MANDATORY — run before generic failure handling):**
+
+Before applying the generic pipeline-failure path, classify the callback result to detect recoverable work:
+
+> **Primary trigger (marker-match):** When the callback's `tasks.result` field contains the literal substring `error_max_turns` (claude-pilot's max-turns guardrail produces `[guardrail] error_max_turns: SDK limit reached after N turns`), run the grounding check below.
+>
+> **Secondary trigger (conservative heuristic, time-bounded):** When ALL of the following hold simultaneously:
+> - `tasks.result` is NULL or empty (subprocess output not captured)
+> - No PR exists on origin for the task's branch (`run_gh("pr list --head <branch>")` returns empty)
+> - Task status is currently `in_progress`
+> - Task `created_at` is more than **2 hours** ago
+> - Task `updated_at` is more than 30 minutes ago (recently-updated tasks are still making progress)
+>
+> Run the grounding check below. Active pipelines are NOT triggered because their `updated_at` will be recent.
+>
+> **Grounding check (the load-bearing logic):**
+>
+> ```bash
+> git -C <repo-path> log --oneline origin/main..<branch>
+> ```
+>
+> Branch resolution: from the task's `metadata.claude_pilot.branch` (set when claude-pilot dispatch succeeds) or, if absent, from the issue body's `> - **Branch:**` callout (per the plan-on-branch convention).
+>
+> **Decision tree:**
+> - **`git log` returns ≥ 1 commit:** verdict is `recover_unpushed_work`. Apply the handler below. Do NOT redispatch claude-pilot. Do NOT apply the generic pipeline-failure path.
+> - **`git log` returns 0 commits:** verdict is genuine no-progress failure. Fall through to the generic pipeline-failure path below.
+>
+> **Handler when verdict is `recover_unpushed_work` (atomicity: write metadata BEFORE send_message):**
+>
+> 1. **First**, write `unpushed_recovery_pending: true` to `tasks.metadata` JSON via `update_task_status` (status stays `in_progress` — the work is recoverable, not failed).
+> 2. **Then**, emit `send_message` to operator with the structured payload:
+>
+>    ```json
+>    {
+>      "verdict": "recover_unpushed_work",
+>      "task_id": "<uuid>",
+>      "branch": "<branch-name>",
+>      "tip_sha": "<commit-sha from git log output>",
+>      "commit_count": <int>,
+>      "turn_count_at_exhaustion": <int from metadata>,
+>      "claude_pilot_log_path": "/var/log/claude-pilot/<subprocess-task-id>.log",
+>      "suggested_recovery_command": "WT=$(git -C /data/workspace/mika-platform/<repo> worktree list --porcelain | awk -v b=<branch> '/^worktree /{p=$2} /^branch refs\\/heads\\/'b'$/{print p}'); [ -z \"$WT\" ] && { WT=/data/workspace/mika-platform/.claude/worktrees/<sanitized-branch>/<repo>; git -C /data/workspace/mika-platform/<repo> worktree add \"$WT\" <branch>; }; cd \"$WT\" && git rebase origin/main && git push origin <branch> && gh pr create --repo senara-solutions/<repo>"
+>    }
+>    ```
+>
+>    The metadata-first ordering ensures: if `send_message` fails after metadata is written, the operator can be re-notified on the next heartbeat (the `unpushed_recovery_pending` flag is durable). If the order were reversed, a `send_message` failure would leave no durable record that the recovery verdict was reached.
+>
+> 3. Do NOT increment `pipeline_retry_count`. The pipeline didn't fail — it ran out of turns mid-closeout. Retry is the wrong frame.
+> 4. Do NOT call `run_claude_pilot` again for this task.
+> 5. Proceed to Step 6 with `in_progress` and note "recover_unpushed_work: {commit_count} commits on local branch, awaiting operator recovery. Branch: {branch}".
+
 **On pipeline failure (callback contains "PIPELINE FAILURE:"):**
 
 1. Extract metadata (Session, Cost, Turns, Duration) from the lines after the PIPELINE FAILURE prefix.
