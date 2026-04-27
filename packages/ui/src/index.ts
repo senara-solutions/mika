@@ -17,6 +17,8 @@ export { default as SelectFilter } from './components/SelectFilter.tsx'
 export type { SelectFilterOption, SelectFilterProps } from './components/SelectFilter.tsx'
 export { default as AgentFilter } from './components/AgentFilter.tsx'
 export type { AgentSummary, AgentFilterProps } from './components/AgentFilter.tsx'
+export { default as TimeRangeFilter } from './components/TimeRangeFilter.tsx'
+export type { TimeRange, TimeRangePreset, TimeRangeFilterProps } from './components/TimeRangeFilter.tsx'
 
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'
