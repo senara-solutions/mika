@@ -66,7 +66,7 @@ export default function Agents() {
                     </p>
                   </div>
                 </div>
-                <StatusBadge active={agent.active} />
+                <StatusBadge variant={agent.active ? 'success' : 'neutral'} label={agent.active ? 'Active' : 'Inactive'} />
               </div>
               <div className="flex items-center justify-between text-xs text-muted pt-3 border-t border-white/[0.04]">
                 <div className="flex items-center gap-4">

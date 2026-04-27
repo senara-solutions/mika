@@ -2,7 +2,7 @@ import { useState, Fragment } from 'react'
 import { Link } from 'react-router'
 import { useToolCalls, type ToolCallsFilters } from '../api/toolCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { CopyButton, Pagination, EmptyState, formatTimestamp } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, StatusBadge, formatTimestamp } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search, ChevronRight, ChevronDown } from 'lucide-react'
 
@@ -167,17 +167,7 @@ export default function ToolCalls() {
                           {row.skill_name ?? <span className="text-muted/30">-</span>}
                         </td>
                         <td className="px-4 py-3">
-                          {row.success ? (
-                            <span className="inline-flex items-center gap-1 text-emerald-400">
-                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                              <span className="text-[10px]">ok</span>
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 text-red-400">
-                              <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-                              <span className="text-[10px]">fail</span>
-                            </span>
-                          )}
+                          <StatusBadge variant={row.success ? 'success' : 'error'} label={row.success ? 'Ok' : 'Fail'} />
                         </td>
                         <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
                           {formatLatency(row.latency_ms)}

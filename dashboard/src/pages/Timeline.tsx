@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
+import { Pagination, EmptyState, StatusBadge, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
@@ -36,10 +36,7 @@ export default function Timeline() {
           <div className="flex items-center gap-3">
             <h2 className="text-heading text-xl font-semibold">Unified Event Timeline</h2>
             {autoRefresh && (
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-emerald-500/15 text-emerald-400">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                Live
-              </span>
+              <StatusBadge variant="success" label="Live" dotPulse />
             )}
           </div>
           <p className="text-sm text-muted/60 mt-1">

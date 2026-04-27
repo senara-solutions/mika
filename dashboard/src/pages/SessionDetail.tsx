@@ -4,7 +4,8 @@ import { useSessionDetail, useSessionMessages, type Message } from '../api/sessi
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import { useSessionLlmCalls } from '../api/llmCalls.ts'
 import { useSessionToolCalls, useSessionSkills, useTraceToolCalls } from '../api/toolCalls.ts'
-import { CopyButton, Pagination, EmptyState, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, StatusBadge, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
+import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
@@ -175,17 +176,7 @@ function ToolCallsTable({
                     </td>
                     {/* Status */}
                     <td className="px-2 py-2">
-                      {tc.success ? (
-                        <span className="inline-flex items-center gap-1 text-emerald-400">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                          <span className="text-[10px]">ok</span>
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 text-red-400">
-                          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-                          <span className="text-[10px]">fail</span>
-                        </span>
-                      )}
+                      <StatusBadge variant={tc.success ? 'success' : 'error'} label={tc.success ? 'Ok' : 'Fail'} />
                     </td>
                     {/* Tool name */}
                     <td className="px-2 py-2 font-mono text-heading font-medium max-w-[160px] truncate">
@@ -298,29 +289,11 @@ function formatLatency(ms: number): string {
   return `${ms}ms`
 }
 
-function llmStatusBadge(status: string) {
+function llmStatusVariant(status: string): { variant: StatusBadgeVariant; label: string } {
   switch (status) {
-    case 'success':
-      return (
-        <span className="inline-flex items-center gap-1 text-emerald-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-          <span className="text-[10px]">success</span>
-        </span>
-      )
-    case 'error':
-      return (
-        <span className="inline-flex items-center gap-1 text-red-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-          <span className="text-[10px]">error</span>
-        </span>
-      )
-    default:
-      return (
-        <span className="inline-flex items-center gap-1 text-muted/60">
-          <span className="w-1.5 h-1.5 rounded-full bg-muted/40" />
-          <span className="text-[10px]">{status}</span>
-        </span>
-      )
+    case 'success': return { variant: 'success', label: 'Success' }
+    case 'error': return { variant: 'error', label: 'Error' }
+    default: return { variant: 'neutral', label: status }
   }
 }
 
@@ -351,19 +324,15 @@ function AgentAvatar({ name }: { name: string }) {
   )
 }
 
-function statusBadge(status: string) {
-  const styles: Record<string, string> = {
-    running: 'bg-blue-500/15 text-blue-400',
-    completed: 'bg-emerald-500/15 text-emerald-400',
-    failed: 'bg-red-500/15 text-red-400',
-    suspended: 'bg-amber-500/15 text-amber-400',
-    cancelled: 'bg-white/[0.06] text-muted/60',
+function sessionStatusVariant(status: string): { variant: StatusBadgeVariant; label: string } {
+  switch (status) {
+    case 'running': return { variant: 'info', label: 'Running' }
+    case 'completed': return { variant: 'success', label: 'Completed' }
+    case 'failed': return { variant: 'error', label: 'Failed' }
+    case 'suspended': return { variant: 'warning', label: 'Suspended' }
+    case 'cancelled': return { variant: 'neutral', label: 'Cancelled' }
+    default: return { variant: 'neutral', label: status }
   }
-  return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase ${styles[status] ?? styles.cancelled}`}>
-      {status}
-    </span>
-  )
 }
 
 function roleConfig(role: string) {
@@ -730,21 +699,17 @@ export default function SessionDetail() {
               <h2 className="text-heading text-lg font-semibold font-mono">{sessionId}</h2>
               <CopyButton text={sessionId ?? ''} className="ml-1" />
               {session && !session.ended_at && (
-                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-emerald-500/15 text-emerald-400">
-                  Active
-                </span>
+                <StatusBadge variant="success" label="Active" />
               )}
               {session && session.ended_at && (
-                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-white/[0.06] text-muted/60">
-                  Ended
-                </span>
+                <StatusBadge variant="neutral" label="Ended" />
               )}
               {isTeamSession && (
                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase bg-purple-500/15 text-purple-400">
                   <Users size={10} /> Team
                 </span>
               )}
-              {teamRun && statusBadge(teamRun.status)}
+              {teamRun && <StatusBadge {...sessionStatusVariant(teamRun.status)} />}
             </div>
             {session && (
               <div className="flex items-center gap-3 mt-1">
@@ -936,7 +901,7 @@ export default function SessionDetail() {
                       <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.output_tokens)}</td>
                       <td className="px-4 py-3 text-xs text-muted/40 font-mono text-right">{formatTokens(row.cache_read_tokens)}</td>
                       <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">{formatLatency(row.latency_ms)}</td>
-                      <td className="px-4 py-3">{llmStatusBadge(row.status)}</td>
+                      <td className="px-4 py-3"><StatusBadge {...llmStatusVariant(row.status)} /></td>
                       <td className="px-4 py-3">
                         {row.trace_id ? (
                           <Link
@@ -1023,17 +988,7 @@ export default function SessionDetail() {
                             {row.skill_name ?? <span className="text-muted/30">-</span>}
                           </td>
                           <td className="px-4 py-3">
-                            {row.success ? (
-                              <span className="inline-flex items-center gap-1 text-emerald-400">
-                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                                <span className="text-[10px]">ok</span>
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center gap-1 text-red-400">
-                                <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-                                <span className="text-[10px]">fail</span>
-                              </span>
-                            )}
+                            <StatusBadge variant={row.success ? 'success' : 'error'} label={row.success ? 'Ok' : 'Fail'} />
                           </td>
                           <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
                             {formatLatency(row.latency_ms)}
