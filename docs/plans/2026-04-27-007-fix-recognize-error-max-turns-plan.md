@@ -69,9 +69,10 @@ In the post-callback section, add the pipeline-result-classification step:
 > - `tasks.result` is NULL or empty (subprocess output not captured)
 > - No PR exists on origin for the task's branch (`gh pr list --head <branch>` returns `[]`)
 > - Task status is currently `in_progress`
-> - Task `created_at` is more than 30 minutes ago (prevents false positives on actively-running pipelines)
+> - Task `created_at` is more than **2 hours** ago (per architect second-pass: 30 minutes can produce false positives on legitimate long-running pipelines doing complex compound or large migrations; 2 hours is beyond any reasonable pipeline run, so the bound is unambiguously stale)
+> - Task `updated_at` is more than 30 minutes ago (recently-updated `updated_at` on an `in_progress` task means the pipeline is still making progress; only stale-progress rows trigger)
 >
-> Run the grounding check below. **The secondary trigger is conservative and treats only stale-in-progress-with-no-result-and-no-PR cases.** Active pipelines under 30 minutes are NOT triggered.
+> Run the grounding check below. **The secondary trigger is conservative and treats only stale-in-progress-with-no-result-and-no-PR cases.** Active pipelines (including ones that legitimately run > 30 minutes) are NOT triggered because their `updated_at` will be recent.
 >
 > **Grounding check (the load-bearing logic):**
 >
@@ -99,7 +100,7 @@ In the post-callback section, add the pipeline-result-classification step:
 >      "commit_count": <int>,
 >      "turn_count_at_exhaustion": <int>,
 >      "claude_pilot_log_path": "/var/log/claude-pilot/<subprocess-task-id>.log",
->      "suggested_recovery_command": "git -C /data/workspace/mika-platform/mika worktree add ../.claude/worktrees/<sanitized-branch>/mika <branch> && cd <worktree> && git rebase origin/main && git push origin <branch> && gh pr create"
+>      "suggested_recovery_command": "WT=$(git -C /data/workspace/mika-platform/mika worktree list --porcelain | awk -v b=<branch> '/^worktree /{p=$2} /^branch refs\\/heads\\/'b'$/{print p}'); [ -z \"$WT\" ] && { WT=/data/workspace/mika-platform/.claude/worktrees/<sanitized-branch>/mika; git -C /data/workspace/mika-platform/mika worktree add \"$WT\" <branch>; }; cd \"$WT\" && git rebase origin/main && git push origin <branch> && gh pr create --repo senara-solutions/mika"
 >    }
 >    ```
 >
