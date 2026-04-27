@@ -227,11 +227,17 @@ export function formatApiError(error: unknown): string {
   if (typeof error === 'object' && error !== null && 'detail' in error && typeof (error as { detail: unknown }).detail === 'string') {
     return (error as { detail: string }).detail
   }
+  // React Query v4 types error as Error | null; v5 types it as unknown.
+  // Guarding with instanceof keeps the utility correct across both versions
+  // without pinning the library (per architect second-pass observation).
+  if (error instanceof Error) {
+    return error.message
+  }
   return 'An unexpected error occurred.'
 }
 ```
 
-Three cases (per Finding 2): network error / server-error-envelope / fallback. ~20 lines. Exported alongside the components.
+Four cases now (per architect second-pass): network error / server-error-envelope / Error-instance fallback / unknown fallback. The `instanceof Error` guard prevents a silent v4→v5 regression where `error.message` becomes inaccessible without a type guard. ~25 lines. Exported alongside the components.
 
 Net diff: ~160 lines for new components + ~10 lines for EmptyState extension + 2 export lines.
 
