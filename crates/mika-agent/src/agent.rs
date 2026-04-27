@@ -3556,15 +3556,25 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     // so it is evaluated FIRST.  Without this guard, the LLM successfully removes
     // the `ready` label via run_gh and EndTurns — webhook_zero_tools is satisfied
     // by the run_gh call but the dispatch never happens.
+    //
+    // The satisfied predicate counts run_claude_pilot ATTEMPTS (success or
+    // failure), not just successes.  Terminal failures (global_dispatch_active,
+    // task_not_dispatchable, dispatch_blocked_by, dispatch_limit_exceeded) are
+    // structural and not recoverable by re-prompt — the LLM should handle them
+    // by notifying the operator (the prompt's Step 4 covers this).  Forcing a
+    // retry on those failures would only produce misleading "never called"
+    // operator notifications when the dispatch was in fact attempted (#846
+    // adversarial review).
     IntentPrecondition {
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
         satisfied: ready_label_dispatch_satisfied,
         correction_message: "[Your response was rejected. The `ready` label has been \
-             removed but you did NOT call run_claude_pilot. The Ready-Label Dispatch \
-             handler requires you to dispatch claude-pilot for this issue: \
-             call create_task with the issue reference, then call run_claude_pilot \
-             with prompt=\"<repo>#<n>\" and task_id=<UUID from create_task>. \
+             removed but you did NOT attempt run_claude_pilot. The Ready-Label \
+             Dispatch handler requires the full sequence: (1) run_gh \
+             `issue view <n> --json title,body --repo <repo>` to fetch the issue, \
+             (2) create_task with the issue reference, (3) run_claude_pilot with \
+             prompt=\"<repo>#<n>\" and task_id=<UUID from create_task>. \
              Do not end this turn until run_claude_pilot has been called.]",
     },
     // #696 — webhook events require at least one successful tool call.
@@ -3605,13 +3615,16 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
     msg.starts_with(READY_LABEL_DISPATCH_MARKER)
 }
 
-/// Returns `true` when `run_claude_pilot` was called successfully during this
-/// turn.  Mirrors the existing guard patterns (success-only — a failed
-/// dispatch is a real problem the LLM should handle, not silently EndTurn on).
+/// Returns `true` when `run_claude_pilot` was attempted during this turn,
+/// regardless of success.  Counting attempts (not just successes) avoids
+/// misleading "never called" operator notifications on terminal-failure paths
+/// like `global_dispatch_active` (concurrent webhook), `task_not_dispatchable`,
+/// `dispatch_blocked_by`, and `dispatch_limit_exceeded`.  Those failures are
+/// structural and not recoverable by re-prompt — the LLM handles them via
+/// `send_message` per the prompt's Step 4.  See `INTENT_GUARDS` comment for
+/// the rationale and #846 adversarial review for the failure scenarios.
 fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries
-        .iter()
-        .any(|s| s.success && s.name == "run_claude_pilot")
+    summaries.iter().any(|s| s.name == "run_claude_pilot")
 }
 
 /// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
@@ -6602,7 +6615,12 @@ mod tests {
     }
 
     #[test]
-    fn ready_label_not_satisfied_when_run_claude_pilot_failed() {
+    fn ready_label_satisfied_when_run_claude_pilot_attempted_terminally() {
+        // Attempt with terminal failure (e.g., global_dispatch_active when a
+        // concurrent dispatch is active) still satisfies the guard. Forcing
+        // a retry on terminal failures would produce misleading "never called"
+        // operator notifications.  The LLM handles the failure via send_message
+        // per the prompt's Step 4 (#846 adversarial review).
         let summaries = vec![ToolCallSummary {
             step: 0,
             name: "run_claude_pilot".to_string(),
@@ -6611,7 +6629,7 @@ mod tests {
             success: false,
             non_zero_exit: true,
         }];
-        assert!(!ready_label_dispatch_satisfied(&summaries));
+        assert!(ready_label_dispatch_satisfied(&summaries));
     }
 
     #[test]
