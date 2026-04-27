@@ -1,14 +1,9 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, formatRelativeTime, type TimeRange } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { ChevronDown, ChevronRight } from 'lucide-react'
-
-interface TimeRangeProps {
-  from?: string
-  to?: string
-}
 
 function TaskRow({ task, indent = 0 }: { task: TaskItem; indent?: number }) {
   return (
@@ -261,7 +256,7 @@ function Section({
   )
 }
 
-function WorkItemsSection({ timeRange }: { timeRange: TimeRangeProps }) {
+function WorkItemsSection({ timeRange }: { timeRange: TimeRange }) {
   const [page, setPage] = useState(1)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = { trigger_type: 'manual', from: timeRange.from, to: timeRange.to, page, per_page: 20 }
@@ -306,7 +301,7 @@ function WorkItemsSection({ timeRange }: { timeRange: TimeRangeProps }) {
   )
 }
 
-function TeamRunTasksSection({ timeRange }: { timeRange: TimeRangeProps }) {
+function TeamRunTasksSection({ timeRange }: { timeRange: TimeRange }) {
   const [page, setPage] = useState(1)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = {
@@ -357,7 +352,7 @@ function TeamRunTasksSection({ timeRange }: { timeRange: TimeRangeProps }) {
   )
 }
 
-function StandaloneCallbacksSection({ timeRange }: { timeRange: TimeRangeProps }) {
+function StandaloneCallbacksSection({ timeRange }: { timeRange: TimeRange }) {
   const [page, setPage] = useState(1)
   const filters: TasksFilters = {
     action_type: 'resume_agent,run_skill',
@@ -394,7 +389,7 @@ function StandaloneCallbacksSection({ timeRange }: { timeRange: TimeRangeProps }
   )
 }
 
-function ScheduledSection({ timeRange }: { timeRange: TimeRangeProps }) {
+function ScheduledSection({ timeRange }: { timeRange: TimeRange }) {
   const [page, setPage] = useState(1)
   const filters: TasksFilters = {
     trigger_type: 'cron,one_shot',
@@ -464,7 +459,7 @@ function ScheduledSection({ timeRange }: { timeRange: TimeRangeProps }) {
 export default function Tasks() {
   const { searchParams, setSearchParams, updateFilter } = useSearchParamsFilter()
 
-  const timeRange: TimeRangeProps = {
+  const timeRange: TimeRange = {
     from: searchParams.get('from') ?? undefined,
     to: searchParams.get('to') ?? undefined,
   }
@@ -499,10 +494,10 @@ export default function Tasks() {
         </div>
       </div>
 
-      <WorkItemsSection timeRange={timeRange} />
-      <TeamRunTasksSection timeRange={timeRange} />
-      <StandaloneCallbacksSection timeRange={timeRange} />
-      <ScheduledSection timeRange={timeRange} />
+      <WorkItemsSection key={`work-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
+      <TeamRunTasksSection key={`team-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
+      <StandaloneCallbacksSection key={`cb-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
+      <ScheduledSection key={`sched-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
     </div>
   )
 }

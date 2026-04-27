@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from 'react'
+import { useState, useCallback, useMemo, useEffect } from 'react'
 
 /**
  * Time range for filtering observability data.
@@ -47,6 +47,14 @@ export default function TimeRangeFilter({
   const [showCustom, setShowCustom] = useState(false)
   const [activePreset, setActivePreset] = useState<string | null>(null)
 
+  // Reset visual state when the filter is cleared externally (e.g., "Clear All" button)
+  useEffect(() => {
+    if (!value.from && !value.to) {
+      setActivePreset(null)
+      setShowCustom(false)
+    }
+  }, [value.from, value.to])
+
   const handlePresetClick = useCallback(
     (preset: TimeRangePreset) => {
       if (activePreset === preset.label) {
@@ -57,7 +65,7 @@ export default function TimeRangeFilter({
       }
       setActivePreset(preset.label)
       setShowCustom(false)
-      const from = new Date(Date.now() - preset.durationMs).toISOString()
+      const from = stripMilliseconds(new Date(Date.now() - preset.durationMs).toISOString())
       onChange({ from, to: undefined })
     },
     [activePreset, onChange],
@@ -77,7 +85,7 @@ export default function TimeRangeFilter({
   const handleCustomFrom = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const localValue = e.target.value
-      const from = localValue ? new Date(localValue).toISOString() : undefined
+      const from = safeToIsoString(localValue)
       onChange({ from, to: value.to })
     },
     [onChange, value.to],
@@ -86,7 +94,7 @@ export default function TimeRangeFilter({
   const handleCustomTo = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const localValue = e.target.value
-      const to = localValue ? new Date(localValue).toISOString() : undefined
+      const to = safeToIsoString(localValue)
       onChange({ from: value.from, to })
     },
     [onChange, value.from],
@@ -174,4 +182,21 @@ function toDatetimeLocalString(d: Date): string {
   const hours = String(d.getHours()).padStart(2, '0')
   const minutes = String(d.getMinutes()).padStart(2, '0')
   return `${year}-${month}-${day}T${hours}:${minutes}`
+}
+
+/**
+ * Parse a datetime-local string to ISO 8601 UTC, returning undefined on invalid input.
+ * Strips milliseconds to match backend TEXT timestamp format (%Y-%m-%dT%H:%M:%SZ)
+ * and ensure correct lexicographic comparison at the `to` boundary.
+ */
+function safeToIsoString(localValue: string): string | undefined {
+  if (!localValue) return undefined
+  const d = new Date(localValue)
+  if (isNaN(d.getTime())) return undefined
+  return stripMilliseconds(d.toISOString())
+}
+
+/** Strip `.000Z` suffix, replacing with `Z` to match backend timestamp precision. */
+function stripMilliseconds(iso: string): string {
+  return iso.replace(/\.\d{3}Z$/, 'Z')
 }
