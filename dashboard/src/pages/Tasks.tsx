@@ -71,7 +71,7 @@ function ChildTaskRows({ parentTaskId, indent }: { parentTaskId: string; indent:
   if (isLoading) {
     return (
       <tr>
-        <td colSpan={7} className="px-4 py-2 text-xs text-muted/40" style={{ paddingLeft: `${indent * 1.5 + 1}rem` }}>
+        <td colSpan={8} className="px-4 py-2 text-xs text-muted/40" style={{ paddingLeft: `${indent * 1.5 + 1}rem` }}>
           Loading...
         </td>
       </tr>

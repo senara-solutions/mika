@@ -30,7 +30,8 @@ type ListRowProps = StaticProps | NavigableProps | ExpandableProps
 function isTargetRow(e: MouseEvent | KeyboardEvent, rowRef: React.RefObject<HTMLTableRowElement | null>): boolean {
   const target = e.target as HTMLElement
   // Don't trigger row action if the click/key originated from a nested interactive element
-  if (target.closest('a, button, [role="button"], [role="link"]') && target.closest('a, button, [role="button"], [role="link"]') !== rowRef.current) {
+  const closestInteractive = target.closest('a, button, [role="button"], [role="link"]')
+  if (closestInteractive && closestInteractive !== rowRef.current) {
     return false
   }
   return true
