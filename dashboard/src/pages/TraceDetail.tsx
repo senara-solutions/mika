@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router'
 import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/timeline.ts'
 import { useTraceLlmCalls } from '../api/llmCalls.ts'
 import { useTraceToolCalls } from '../api/toolCalls.ts'
-import { CopyButton as UiCopyButton, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
+import { CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
@@ -14,8 +14,6 @@ import {
   Bot,
   Settings,
   Wrench,
-  Copy,
-  Check,
   ChevronRight,
   ChevronDown,
   Search,
@@ -116,39 +114,6 @@ function toolSourceBadge(source: string) {
     default:
       return 'bg-white/[0.06] text-muted/60'
   }
-}
-
-function CopyButton({
-  text,
-  className,
-  title = 'Copy to clipboard',
-}: {
-  text: string
-  className?: string
-  title?: string
-}) {
-  const [copied, setCopied] = useState(false)
-
-  const handleCopy = async (e: React.MouseEvent) => {
-    e.stopPropagation()
-    try {
-      await navigator.clipboard.writeText(text)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Silently fail
-    }
-  }
-
-  return (
-    <button
-      onClick={handleCopy}
-      className={`opacity-40 hover:opacity-100 transition-opacity shrink-0 ${className ?? ''}`}
-      title={title}
-    >
-      {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-    </button>
-  )
 }
 
 function ToolCallsTable({
@@ -710,7 +675,7 @@ export default function TraceDetail() {
                                 <div>
                                   <div className="flex items-center gap-2">
                                     <span className="text-[10px] text-muted/40 uppercase tracking-wider">Input</span>
-                                    <UiCopyButton text={row.input} title="Copy input" />
+                                    <CopyButton text={row.input} title="Copy input" />
                                   </div>
                                   <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06] mt-1 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
                                     {row.input}
@@ -721,7 +686,7 @@ export default function TraceDetail() {
                                 <div>
                                   <div className="flex items-center gap-2">
                                     <span className="text-[10px] text-muted/40 uppercase tracking-wider">Output</span>
-                                    <UiCopyButton text={row.output} title="Copy output" />
+                                    <CopyButton text={row.output} title="Copy output" />
                                   </div>
                                   <div className="font-mono text-xs text-muted/70 pl-2 border-l border-white/[0.06] mt-1 whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
                                     {row.output}
