@@ -1,9 +1,17 @@
 import { Link } from 'react-router'
 import { useDevRuns, type DevRunsFilters } from '../api/devRuns.ts'
-import { Pagination, EmptyState, TaskStatusBadge, ListRow, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, TaskStatusBadge, ListRow, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
-const STATUSES = ['', 'pending', 'in_progress', 'blocked', 'completed', 'cancelled', 'failed']
+const STATUS_OPTIONS = [
+  { label: 'All Statuses', value: '' },
+  { label: 'Pending', value: 'pending' },
+  { label: 'In Progress', value: 'in_progress' },
+  { label: 'Blocked', value: 'blocked' },
+  { label: 'Completed', value: 'completed' },
+  { label: 'Cancelled', value: 'cancelled' },
+  { label: 'Failed', value: 'failed' },
+]
 
 function formatDuration(ms: number | null): string {
   if (ms === null || ms === undefined) return '—'
@@ -46,17 +54,12 @@ export default function DevRuns() {
       {/* Filters */}
       <div className="bg-bg-card border border-white/[0.05] rounded-xl p-3 mb-4">
         <div className="flex flex-wrap items-center gap-3">
-          <select
+          <SelectFilter
+            ariaLabel="Filter by status"
             value={filters.status ?? ''}
-            onChange={(e) => updateFilter('status', e.target.value)}
-            className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
-          >
-            {STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {s ? s.replace('_', ' ').replace(/\b\w/g, (c) => c.toUpperCase()) : 'All Statuses'}
-              </option>
-            ))}
-          </select>
+            onChange={(v) => updateFilter('status', v)}
+            options={STATUS_OPTIONS}
+          />
           {filters.status && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}

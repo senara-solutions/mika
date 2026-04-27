@@ -1,9 +1,16 @@
 import { Link } from 'react-router'
 import { useTeamRuns, type TeamRunsFilters } from '../api/teams.ts'
-import { Pagination, EmptyState, TaskStatusBadge, ListRow, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, TaskStatusBadge, ListRow, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
-const STATUSES = ['', 'running', 'completed', 'failed', 'suspended', 'cancelled']
+const STATUS_OPTIONS = [
+  { label: 'All Statuses', value: '' },
+  { label: 'Running', value: 'running' },
+  { label: 'Completed', value: 'completed' },
+  { label: 'Failed', value: 'failed' },
+  { label: 'Suspended', value: 'suspended' },
+  { label: 'Cancelled', value: 'cancelled' },
+]
 
 export default function TeamRuns() {
   const { searchParams, setSearchParams, updateFilter, setPage } = useSearchParamsFilter()
@@ -40,17 +47,12 @@ export default function TeamRuns() {
             onChange={(e) => updateFilter('team_name', e.target.value)}
             className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted placeholder:text-muted/30 focus:outline-none focus:border-accent/40 min-w-[180px]"
           />
-          <select
+          <SelectFilter
+            ariaLabel="Filter by status"
             value={filters.status ?? ''}
-            onChange={(e) => updateFilter('status', e.target.value)}
-            className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
-          >
-            {STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {s ? s.charAt(0).toUpperCase() + s.slice(1) : 'All Statuses'}
-              </option>
-            ))}
-          </select>
+            onChange={(v) => updateFilter('status', v)}
+            options={STATUS_OPTIONS}
+          />
           {(filters.team_name || filters.status) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}

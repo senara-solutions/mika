@@ -1,11 +1,19 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
-import { Pagination, EmptyState, ListRow, formatRelativeTime } from '@senara-solutions/ui'
+import { useAgents } from '../api/agents.ts'
+import { Pagination, EmptyState, ListRow, AgentFilter, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search, Terminal, MessageSquare, Users, Settings, ArrowRightLeft } from 'lucide-react'
 
-const CHANNEL_TYPES = ['', 'cli', 'telegram', 'team', 'system', 'delegate']
+const CHANNEL_OPTIONS = [
+  { label: 'All Channels', value: '' },
+  { label: 'CLI', value: 'cli' },
+  { label: 'Telegram', value: 'telegram' },
+  { label: 'Team', value: 'team' },
+  { label: 'System', value: 'system' },
+  { label: 'Delegate', value: 'delegate' },
+]
 
 function channelIcon(type: string) {
   switch (type) {
@@ -35,10 +43,10 @@ export default function Sessions() {
     per_page: 50,
   }
 
-  const [agentSearch, setAgentSearch] = useState(filters.agent_id ?? '')
   const [sessionSearch, setSessionSearch] = useState(filters.session_id ?? '')
 
   const { data, isLoading, error } = useSessions(filters)
+  const { data: agents } = useAgents()
 
   return (
     <div>
@@ -54,18 +62,11 @@ export default function Sessions() {
       {/* Filters */}
       <div className="bg-bg-card border border-white/[0.05] rounded-xl p-3 mb-4">
         <div className="flex flex-wrap items-center gap-3">
-          <div className="relative flex-1 min-w-[180px]">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted/40" />
-            <input
-              type="text"
-              aria-label="Search sessions by agent"
-              placeholder="Search agent..."
-              value={agentSearch}
-              onChange={(e) => setAgentSearch(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && updateFilter('agent_id', agentSearch.trim())}
-              className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm text-muted placeholder:text-muted/30 focus:outline-none focus:border-accent/40"
-            />
-          </div>
+          <AgentFilter
+            agents={agents}
+            value={filters.agent_id ?? ''}
+            onChange={(v) => updateFilter('agent_id', v)}
+          />
           <div className="relative flex-1 min-w-[180px]">
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted/40" />
             <input
@@ -78,17 +79,12 @@ export default function Sessions() {
               className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm font-mono text-muted placeholder:text-muted/30 placeholder:font-sans focus:outline-none focus:border-accent/40"
             />
           </div>
-          <select
+          <SelectFilter
+            ariaLabel="Filter by channel"
             value={filters.channel_type ?? ''}
-            onChange={(e) => updateFilter('channel_type', e.target.value)}
-            className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
-          >
-            {CHANNEL_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t ? t.charAt(0).toUpperCase() + t.slice(1) : 'All Channels'}
-              </option>
-            ))}
-          </select>
+            onChange={(v) => updateFilter('channel_type', v)}
+            options={CHANNEL_OPTIONS}
+          />
           {(filters.agent_id || filters.channel_type || filters.session_id) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}

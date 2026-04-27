@@ -2,7 +2,7 @@ import { useState, Fragment } from 'react'
 import { Link } from 'react-router'
 import { useToolCalls, type ToolCallsFilters } from '../api/toolCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { CopyButton, Pagination, EmptyState, StatusBadge, ListRow, formatTimestamp } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, StatusBadge, ListRow, AgentFilter, SelectFilter, formatTimestamp } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
@@ -24,7 +24,11 @@ function sourceBadge(source: string) {
   }
 }
 
-const SUCCESS_OPTIONS = ['', 'true', 'false']
+const SUCCESS_OPTIONS = [
+  { label: 'All Results', value: '' },
+  { label: 'Success', value: 'true' },
+  { label: 'Failed', value: 'false' },
+]
 
 export default function ToolCalls() {
   const { searchParams, setSearchParams, updateFilter, setPage } = useSearchParamsFilter()
@@ -75,29 +79,17 @@ export default function ToolCalls() {
               className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm text-muted placeholder:text-muted/30 focus:outline-none focus:border-accent/40 font-mono"
             />
           </div>
-          <select
+          <AgentFilter
+            agents={agents}
             value={filters.agent_id ?? ''}
-            onChange={(e) => updateFilter('agent_id', e.target.value)}
-            className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
-          >
-            <option value="">All Agents</option>
-            {agents?.map((a) => (
-              <option key={a.name} value={a.id}>
-                {a.name}
-              </option>
-            ))}
-          </select>
-          <select
+            onChange={(v) => updateFilter('agent_id', v)}
+          />
+          <SelectFilter
+            ariaLabel="Filter by result"
             value={filters.success ?? ''}
-            onChange={(e) => updateFilter('success', e.target.value)}
-            className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
-          >
-            {SUCCESS_OPTIONS.map((v) => (
-              <option key={v} value={v}>
-                {v === '' ? 'All Results' : v === 'true' ? 'Success' : 'Failed'}
-              </option>
-            ))}
-          </select>
+            onChange={(v) => updateFilter('success', v)}
+            options={SUCCESS_OPTIONS}
+          />
           {(filters.agent_id || filters.tool_name || filters.success) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}

@@ -160,6 +160,28 @@ Tabular and list surfaces use one of three row affordances. `<ListRow />` from `
 - `expandable`: `role="button"` with `aria-expanded={true|false}` and `aria-label` describing the expansion target.
 - `static`: no role attribute; row is purely structural.
 
+### 5.3 Filter affordance grammar
+
+Dashboard list surfaces use one of two filter primitives. `<SelectFilter />` from `@senara-solutions/ui` is the canonical primitive for categorical selection (one-of-N from a fixed or fetched option set). `<AgentFilter />` is a specialization that fetches agents via consumer-injected `agents` prop internally. Hand-rolling `<select>` or filter-shaped `<input>` with categorical options outside these primitives is forbidden.
+
+| Primitive | Use for | Options | Example surfaces |
+|---|---|---|---|
+| `<SelectFilter />` | Categorical filter (one-of-N) where the option set is known | Static array (`{ label, value }`) or fetched array | channel_type, event_type, success, status |
+| `<AgentFilter />` | Specialized agent selection (one agent from the active set) | Consumer-injected `agents` prop | Sessions, Timeline, LlmCalls, ToolCalls |
+
+**Free-text filters** (e.g., session ID lookup, trace ID lookup, free-text search over content) remain native `<input type="text">` with consistent styling. They are not categorical and do not migrate to `<SelectFilter />`. A `<TextFilter />` primitive may emerge if free-text styling drift surfaces.
+
+**Agent selection: exact `agent_id` match is the canonical pattern (named design decision).** Three of four pages with agent filters already render a dropdown; `<AgentFilter />` canonicalizes that pattern. Substring or partial match on agent name is not a supported filter affordance **in v1**. If agent set size grows beyond ~20, or if user feedback reveals search need, the designated follow-up path is `<AutocompleteFilter />` — not extending `<AgentFilter />` with a substring-match prop, and not re-introducing free-text on a single page.
+
+**Visual contract:**
+- Both primitives render a single dropdown with the canonical filter styling (border, rounded-lg, focus ring per design tokens).
+- An empty / "all" option is always the first item, labeled to the consumer's preference (`All Channels`, `All Agents`, `All Statuses`).
+- Selected value reflects URL state via `useSearchParamsFilter`'s `updateFilter`.
+
+**Keyboard:** native `<select>` keyboard semantics (Tab focuses, Up/Down navigates options, prefix typing jumps to matching option, Esc closes). v1 does not implement custom combobox / type-ahead; if option-set growth or search-required UX surfaces, that's the trigger for an `<AutocompleteFilter />` follow-up.
+
+**ARIA:** `aria-label` describing the filter dimension (e.g., `aria-label="Filter by agent"`). Native `<select>` provides the rest.
+
 ### Input Fields
 
 - Background: `surface_container_lowest`.
