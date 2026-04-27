@@ -148,7 +148,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add `webhook_ready_label_dispatch` to `INTENT_GUARDS` registry**
+- [x] **Unit 1: Add `webhook_ready_label_dispatch` to `INTENT_GUARDS` registry**
 
 **Goal:** Add a third entry to `INTENT_GUARDS` that triggers on the ready-label marker and is satisfied only when `run_claude_pilot` is called. Make the dispatch contract structural.
 
@@ -187,7 +187,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
 ---
 
-- [ ] **Unit 2: Strengthen Ready-Label Dispatch handler with structural compulsion**
+- [x] **Unit 2: Strengthen Ready-Label Dispatch handler with structural compulsion**
 
 **Goal:** Defense in depth — restructure the prompt handler to inline the full dispatch sequence with `MANDATORY` framing, `IMMEDIATELY` imperative, and `GATE` pattern. Engine guard catches violations; prompt prevents them.
 
@@ -221,7 +221,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
 ---
 
-- [ ] **Unit 3: Operator notification on `webhook_ready_label_dispatch` exhaustion**
+- [x] **Unit 3: Operator notification on `webhook_ready_label_dispatch` exhaustion**
 
 **Goal:** Eliminate the silent failure mode. When the new guard fires, re-prompts, and the LLM still doesn't call `run_claude_pilot`, emit `send_message` to the operator before returning `LoopResult`.
 
@@ -301,7 +301,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
 ---
 
-- [ ] **Unit 5: Solution doc — pattern citation**
+- [x] **Unit 5: Solution doc — pattern citation**
 
 **Goal:** Document the pattern: "prose-routed handler steps in self-dev fail under cognitive load; the architectural fix is an INTENT_GUARDS entry, not more prose." Future architect reviews check for this.
 

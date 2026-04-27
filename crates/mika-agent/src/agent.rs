@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
@@ -1123,6 +1123,34 @@ async fn run_loop(
                                 )),
                             });
                             continue;
+                        }
+                    }
+
+                    // #846 — operator notification when the ready-label dispatch
+                    // guard fired but run_claude_pilot still wasn't called after
+                    // the retry.  Without this the failure is silent past
+                    // label-removal: the ready label disappears but no dispatch
+                    // happens and no PR is created.
+                    if intent_guard_retries.contains("webhook_ready_label_dispatch")
+                        && !ready_label_dispatch_satisfied(&all_tool_summaries)
+                    {
+                        let location = parse_ready_label_location(&user_input_text)
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        error!(
+                            trace_id = %tool_ctx.trace_id,
+                            location = %location,
+                            label = mode.label(),
+                            "ready_label_dispatch_stalled — operator notification fired"
+                        );
+                        if let Some(ref sender) = tool_ctx.message_sender {
+                            let notification = format!(
+                                "Ready-label dispatch stalled on {location}: the `ready` \
+                                 label was removed but run_claude_pilot was never called. \
+                                 Investigate trace_id {} in /var/log/mika/server.log. \
+                                 To retry, re-add the `ready` label.",
+                                tool_ctx.trace_id
+                            );
+                            let _ = sender.send(&notification).await;
                         }
                     }
 
@@ -3523,6 +3551,22 @@ struct IntentPrecondition {
 /// "trigger + tool-signature" pattern (e.g. persistence nudge, completion
 /// claim) remain as inline code outside this registry.
 const INTENT_GUARDS: &[IntentPrecondition] = &[
+    // #846 — ready-label webhook events require run_claude_pilot dispatch.
+    // More specific than webhook_zero_tools (which any successful tool satisfies),
+    // so it is evaluated FIRST.  Without this guard, the LLM successfully removes
+    // the `ready` label via run_gh and EndTurns — webhook_zero_tools is satisfied
+    // by the run_gh call but the dispatch never happens.
+    IntentPrecondition {
+        label: "webhook_ready_label_dispatch",
+        trigger: ready_label_dispatch_trigger,
+        satisfied: ready_label_dispatch_satisfied,
+        correction_message: "[Your response was rejected. The `ready` label has been \
+             removed but you did NOT call run_claude_pilot. The Ready-Label Dispatch \
+             handler requires you to dispatch claude-pilot for this issue: \
+             call create_task with the issue reference, then call run_claude_pilot \
+             with prompt=\"<repo>#<n>\" and task_id=<UUID from create_task>. \
+             Do not end this turn until run_claude_pilot has been called.]",
+    },
     // #696 — webhook events require at least one successful tool call.
     IntentPrecondition {
         label: "webhook_zero_tools",
@@ -3549,6 +3593,47 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
              next child, and resume execution.]",
     },
 ];
+
+/// Marker prefix emitted by `mika_gateway::github::format_event_text` for
+/// `issues.labeled` events where the label name is `ready`.  See
+/// `crates/mika-gateway/src/github.rs` `format_event_text` and #842.
+const READY_LABEL_DISPATCH_MARKER: &str = "[GitHub] Issue labeled ready on ";
+
+/// Triggers when a webhook turn was initiated by the ready-label dispatch
+/// marker.  Matches the gateway's exact format prefix (#842).
+fn ready_label_dispatch_trigger(msg: &str) -> bool {
+    msg.starts_with(READY_LABEL_DISPATCH_MARKER)
+}
+
+/// Returns `true` when `run_claude_pilot` was called successfully during this
+/// turn.  Mirrors the existing guard patterns (success-only — a failed
+/// dispatch is a real problem the LLM should handle, not silently EndTurn on).
+fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
+    summaries
+        .iter()
+        .any(|s| s.success && s.name == "run_claude_pilot")
+}
+
+/// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
+/// the affected ticket in the operator notification fired when the guard is
+/// exhausted (#846).  Returns `None` when the input doesn't match the marker
+/// shape.
+fn parse_ready_label_location(msg: &str) -> Option<String> {
+    let rest = msg.strip_prefix(READY_LABEL_DISPATCH_MARKER)?;
+    // Take everything up to first whitespace or em-dash separator. The gateway
+    // formatter (mika-gateway::github::format_event_text) emits
+    // `[GitHub] Issue labeled ready on <repo>#<n>` followed optionally by
+    // " — <title>" or a newline + body.
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '\u{2014}')
+        .unwrap_or(rest.len());
+    let location = rest[..end].trim();
+    if location.is_empty() {
+        None
+    } else {
+        Some(location.to_string())
+    }
+}
 
 /// Regex matching resume/continue intent combined with a process reference.
 ///
@@ -6413,5 +6498,185 @@ mod tests {
     #[test]
     fn resume_not_satisfied_when_empty() {
         assert!(!resume_reconcile_satisfied(&[]));
+    }
+
+    // -- ready_label_dispatch trigger tests (#846) --
+
+    #[test]
+    fn ready_label_trigger_matches_canonical_marker() {
+        assert!(ready_label_dispatch_trigger(
+            "[GitHub] Issue labeled ready on mika#999"
+        ));
+        assert!(ready_label_dispatch_trigger(
+            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 — title with — em-dashes"
+        ));
+        // Body containing additional text after the marker still matches.
+        assert!(ready_label_dispatch_trigger(
+            "[GitHub] Issue labeled ready on mika#42\n\nIssue body follows."
+        ));
+    }
+
+    #[test]
+    fn ready_label_trigger_rejects_other_labels() {
+        assert!(!ready_label_dispatch_trigger(
+            "[GitHub] Issue labeled bug on mika#999"
+        ));
+        assert!(!ready_label_dispatch_trigger(
+            "[GitHub] Issue labeled p1-important on mika#999"
+        ));
+        assert!(!ready_label_dispatch_trigger(
+            "[GitHub] Issue labeled enhancement on mika#999"
+        ));
+    }
+
+    #[test]
+    fn ready_label_trigger_rejects_other_event_types() {
+        // Other GitHub events that share the `[GitHub]` prefix must not trigger.
+        assert!(!ready_label_dispatch_trigger(
+            "[GitHub] PR comment on mika#999 by samidarko"
+        ));
+        assert!(!ready_label_dispatch_trigger(
+            "[GitHub] Issue comment on mika#999 by samidarko"
+        ));
+        assert!(!ready_label_dispatch_trigger(
+            "[GitHub] Check suite failure on branch fix/foo"
+        ));
+    }
+
+    #[test]
+    fn ready_label_trigger_rejects_direct_prompts() {
+        // Direct `mika ask` prompts with no source-prefix must not trigger.
+        assert!(!ready_label_dispatch_trigger("implement mika issue#999"));
+        assert!(!ready_label_dispatch_trigger(
+            "ready label on mika#999 please"
+        ));
+        assert!(!ready_label_dispatch_trigger(""));
+    }
+
+    // -- ready_label_dispatch_satisfied tests --
+
+    #[test]
+    fn ready_label_satisfied_when_run_claude_pilot_succeeded() {
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "run_gh".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "create_task".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 2,
+                name: "run_claude_pilot".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(ready_label_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn ready_label_not_satisfied_when_only_run_gh_succeeded() {
+        // Reproduces the #846 regression: label removal succeeded but
+        // run_claude_pilot was never called.
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(!ready_label_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn ready_label_not_satisfied_when_run_claude_pilot_failed() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_claude_pilot".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: false,
+            non_zero_exit: true,
+        }];
+        assert!(!ready_label_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn ready_label_not_satisfied_when_empty() {
+        assert!(!ready_label_dispatch_satisfied(&[]));
+    }
+
+    // -- parse_ready_label_location tests (#846 operator notification) --
+
+    #[test]
+    fn parse_location_from_simple_marker() {
+        let out = parse_ready_label_location("[GitHub] Issue labeled ready on mika#999");
+        assert_eq!(out, Some("mika#999".to_string()));
+    }
+
+    #[test]
+    fn parse_location_from_marker_with_em_dash_title() {
+        let out = parse_ready_label_location(
+            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 \u{2014} title with \u{2014} more dashes",
+        );
+        assert_eq!(out, Some("senara-solutions/mika#1234".to_string()));
+    }
+
+    #[test]
+    fn parse_location_from_marker_with_newline_body() {
+        let out = parse_ready_label_location(
+            "[GitHub] Issue labeled ready on mika#42\n\nIssue body follows.",
+        );
+        assert_eq!(out, Some("mika#42".to_string()));
+    }
+
+    #[test]
+    fn parse_location_returns_none_for_other_markers() {
+        assert!(parse_ready_label_location("[GitHub] Issue labeled bug on mika#999").is_none());
+        assert!(parse_ready_label_location("implement mika issue#999").is_none());
+        assert!(parse_ready_label_location("").is_none());
+    }
+
+    #[test]
+    fn parse_location_returns_none_for_empty_location() {
+        // Marker present but no location text after it.
+        assert!(parse_ready_label_location("[GitHub] Issue labeled ready on ").is_none());
+        assert!(parse_ready_label_location("[GitHub] Issue labeled ready on \n").is_none());
+    }
+
+    #[test]
+    fn ready_label_guard_runs_before_webhook_zero_tools() {
+        // Registry-order invariant: the more specific ready-label guard must
+        // be evaluated before the generic webhook_zero_tools guard. Otherwise
+        // a successful run_gh on the ready-label turn satisfies
+        // webhook_zero_tools and the missing run_claude_pilot is never caught.
+        let labels: Vec<&str> = INTENT_GUARDS.iter().map(|g| g.label).collect();
+        let ready_idx = labels
+            .iter()
+            .position(|l| *l == "webhook_ready_label_dispatch")
+            .expect("webhook_ready_label_dispatch must be registered");
+        let zero_idx = labels
+            .iter()
+            .position(|l| *l == "webhook_zero_tools")
+            .expect("webhook_zero_tools must be registered");
+        assert!(
+            ready_idx < zero_idx,
+            "webhook_ready_label_dispatch (idx={ready_idx}) must precede \
+             webhook_zero_tools (idx={zero_idx}) so the more specific trigger \
+             fires first"
+        );
     }
 }

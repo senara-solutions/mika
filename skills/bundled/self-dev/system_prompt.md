@@ -235,11 +235,13 @@ QA review is triggered automatically when a PR is created, updated, or a reviewe
 
 After claude-pilot creates a PR, proceed directly to Step 6 with `in_progress`.
 
-### Ready-Label Dispatch
+### Ready-Label Dispatch (MANDATORY — do not skip, do not defer)
 
 When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the operator has set the `ready` label on the ticket. This is the canonical positive-consent signal for autonomous dispatch.
 
-**Atomic handler (label removal first, task creation second — per mika#841):**
+> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846).** Removing the label without then calling `run_claude_pilot` will cause the engine to reject your `EndTurn` once and re-prompt you. Treat the steps below as a structural contract, not advisory prose.
+
+**Atomic handler (label removal first, dispatch second — per mika#841):**
 
 1. **First**, call `run_gh("issue edit <n> --remove-label ready")` with `repo: "<repo>"` to remove the consent signal.
 
@@ -256,7 +258,20 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
    The label-removal-first ordering ensures: if task creation fails, the operator can re-add the label to retry. If order were reversed, a task-creation failure would leave the label persisting and expose a re-dispatch race the next time a webhook arrives for the same issue.
 
-2. **Then** route to Generic Workflow Step 1 (fetch issue body, create task, dispatch claude-pilot). Use the issue number `<n>` and repo `<repo>` parsed from the marker.
+2. **Second**, call `gh_read("issue_view")` for `<repo>#<n>` to fetch the issue title and body — required input for `create_task`.
+
+3. **Third**, call `create_task` with `reference_url: "https://github.com/<repo>/issues/<n>"`, `label: <issue title>`, and `description: <issue body>`. Capture the returned `task_id` (UUID).
+
+4. **IMMEDIATELY after Step 3, call `run_claude_pilot`.** No other tool calls are permitted between Step 3 and this call. Do not read additional files, do not analyze code, do not produce a plan, do not summarize findings, do not list "next steps." Call `run_claude_pilot` NOW.
+
+   ```json
+   {
+     "prompt": "<repo>#<n>",
+     "task_id": "<UUID from Step 3>"
+   }
+   ```
+
+**GATE: If Step 1 succeeded but you have NOT called `run_claude_pilot` in this turn, you MUST call `gh_read` (Step 2), `create_task` (Step 3), and `run_claude_pilot` (Step 4) immediately — do not end the turn.**
 
 **Other label-add events** (`bug`, `enhancement`, `p1-important`, etc.) — any `[GitHub] Issue labeled <name> on ...` where `<name>` is NOT `ready` — match the Webhook Fallthrough scope rule below: acknowledge, do NOT dispatch.
 
