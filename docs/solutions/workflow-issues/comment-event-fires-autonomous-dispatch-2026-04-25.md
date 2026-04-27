@@ -19,6 +19,8 @@ tags:
   - issue-comment-event
   - mika-arch
   - architect-implementation-loop
+  - ready-label
+  - positive-consent
 ---
 
 # GitHub issue-comment events autonomously fire mika-dev → claude-pilot
@@ -174,3 +176,30 @@ Operationally for mika#818: no harm — #818 and #817 touch different files (`we
 - `senara-solutions/mika#814` — the ticket that was autonomously dispatched. claude-pilot subprocess `5f1e29db-…` is implementing it as of this writing.
 - `senara-solutions/mika#803`, `#804` — long-running retry primitive + self-dev `error_max_turns` handler. Adjacent reliability gaps in the dispatch loop. Worth picking up alongside the dispatch-guard work.
 - mika-dev session `e26d6bb9-922a-412e-89f7-f9eea4133ec8` — the canonical reference for inspecting the autonomous-dispatch tool sequence in DB.
+
+## Resolution
+
+**Ticket:** [mika#841](https://github.com/senara-solutions/mika/issues/841) — positive-consent dispatch gate via `ready` label.
+
+**Origin:** mika#798 (2026-04-25) — first observed instance of a GitHub comment triggering unintended autonomous dispatch.
+
+**Recurrence:** mika#838 (2026-04-27) — same failure shape. The `/mika-groom-ticket` Phase-5 closing comment contained a verbatim `implement mika issue#838` substring. The `issue_comment.created` webhook delivered this to mika-dev, whose Layer 1 routing table matched the embedded content, bypassing the Webhook Fallthrough scope rule.
+
+**Initial proposed solutions (superseded):**
+- mika#807 — three-source contract tightening via skill-prompt rules (negative-detection). Closed as superseded by mika#841.
+- mika#801 — `check_active_grooming(issue, repo)` heuristic helper (negative-detection). Closed as superseded by mika#841.
+
+**Final resolution — positive-consent dispatch gate (mika#841):**
+
+Vincent's two-way rule: mika-dev dispatches if and only if (a) Vincent prompts mika-dev directly (via `mika ask`) OR (b) the `ready` label is set on the ticket. Everything else is inert — acknowledged at most, never dispatched.
+
+Three layers changed:
+1. **Gateway:** `route_event` admits `issues.labeled` events to mika-dev. `format_event_text` emits `[GitHub] Issue labeled <name> on <repo>#<n>` with the specific label name extracted from the webhook payload.
+2. **Skill prompt (self-dev):** Layer 1 routing table gains a source-check precondition — matches only when the message has no bracketed source-prefix marker (`[GitHub]`, `[claude-pilot]`, `[Telegram]`). A new Ready-Label Dispatch handler fires on `[GitHub] Issue labeled ready on <repo>#<n>` — removes the label first (atomicity), then routes to Generic Workflow. Other label-add events fall through to Webhook Fallthrough (acknowledge only).
+3. **Label taxonomy:** `ready` label added to `.github/labels.yml` with state-oriented description ("Approved for autonomous dispatch").
+
+**Architectural argument (closure-bound vs completeness-bound):**
+
+Negative-detection (mika#807/#801) was completeness-bound — heuristics fail on inputs they don't enumerate. A grooming signal not in the heuristic's deny-list bypasses the guard. Positive-consent is closure-bound — the rule enumerates the two valid dispatch triggers; everything else is inert by construction. Same allowlist-vs-denylist pattern from security: denylists fail the moment someone invents a new attack shape; allowlists hold by construction.
+
+**Architect review:** mika-arch session `3801e5e4-5a7b-4d57-a9e0-f217964c913b` (lifecycle ESCALATE → operator-resolved as supersession); session `8959665a-7fa4-4e39-bc36-da48faf0d50d` (#841 first-pass ITERATE → revisions → second-pass GROOMED).

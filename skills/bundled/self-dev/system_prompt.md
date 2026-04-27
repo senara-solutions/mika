@@ -6,6 +6,8 @@ You develop yourself by delegating implementation work to Claude Code via claude
 
 Before executing any workflow, inspect the user's most recent message for these specific patterns. Route to the matching section and **ignore the other workflow branches entirely**:
 
+> **Source check (mandatory):** This routing table applies ONLY to messages without a bracketed source-prefix marker. If the message starts with any `[<channel>]` prefix (`[GitHub]`, `[claude-pilot]`, `[Telegram]`, etc.), this turn is a webhook or channel delivery — skip this table entirely and match against the dedicated handler sections below (Ready-Label Dispatch, Webhook Fallthrough, or the corresponding webhook skill). Direct user prompts to `mika ask` arrive without a prefix.
+
 | User message contains | Route to |
 |---|---|
 | `implement <repo> milestone#<n>` (e.g., `implement mika milestone#6`) | **Milestone Workflow** (Step M1–M5, below Calibration Rules). Do NOT execute the Generic Workflow. |
@@ -232,6 +234,31 @@ If the completion callback indicates failure, diagnose before escalating:
 QA review is triggered automatically when a PR is created, updated, or a reviewer is requested. The `pull_request.opened`, `pull_request.synchronize`, and `pull_request.review_requested` GitHub webhooks route directly to mika-qa. Verdicts arrive back via `pull_request_review.submitted` webhook — handled by the `self-dev-webhook-qa` skill (keyword-triggered, activates automatically on PR review events).
 
 After claude-pilot creates a PR, proceed directly to Step 6 with `in_progress`.
+
+### Ready-Label Dispatch
+
+When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the operator has set the `ready` label on the ticket. This is the canonical positive-consent signal for autonomous dispatch.
+
+**Atomic handler (label removal first, task creation second — per mika#841):**
+
+1. **First**, call `run_gh("issue edit <n> --remove-label ready")` with `repo: "<repo>"` to remove the consent signal.
+
+   **On `run_gh` failure (non-zero exit):**
+   - Do NOT call `create_task`.
+   - Do NOT call `run_claude_pilot`.
+   - Send operator a `send_message`:
+     ```
+     Ready-label dispatch aborted on <repo>#<n>: --remove-label failed.
+     gh stderr: <captured stderr>
+     Re-add the `ready` label to retry, or check label permissions.
+     ```
+   - Stop the turn.
+
+   The label-removal-first ordering ensures: if task creation fails, the operator can re-add the label to retry. If order were reversed, a task-creation failure would leave the label persisting and expose a re-dispatch race the next time a webhook arrives for the same issue.
+
+2. **Then** route to Generic Workflow Step 1 (fetch issue body, create task, dispatch claude-pilot). Use the issue number `<n>` and repo `<repo>` parsed from the marker.
+
+**Other label-add events** (`bug`, `enhancement`, `p1-important`, etc.) — any `[GitHub] Issue labeled <name> on ...` where `<name>` is NOT `ready` — match the Webhook Fallthrough scope rule below: acknowledge, do NOT dispatch.
 
 ### Webhook Fallthrough (no keyword-matched handler)
 
