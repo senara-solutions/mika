@@ -117,6 +117,23 @@ Forbid 1px divider lines. Separate list items using the **Spacing Scale**:
 
 - Use `surface_bright` as the background with a 2px inner "glow" dot using the `primary` token to signify an active agent.
 
+### 5.1 Multi-state status grammar
+
+The active-agent chip above is the canonical surface form. For surfaces requiring multi-state status indication (success/failed operations, pending/blocked task states, info/neutral classifications), the design system declares six variants. `<StatusBadge />` from `@senara-solutions/ui` is the canonical rendering primitive for this grammar.
+
+| Variant | Token | Semantic meaning |
+|---|---|---|
+| `success` | `--color-success` | Operation completed successfully; agent active; positive terminal state |
+| `warning` | `--color-warning` | Degraded, paused, pending — caution but not failure; can resume |
+| `error` | `--color-error` | Operation failed; intervention required |
+| `info` | `--color-accent` | Active operation in progress; informational/in-motion state |
+| `neutral` | `--color-muted` | Cancelled, archived, or stateless; no active signal |
+| `blocked` | `--color-blocked` | External-dependency wait; visually distinct from `warning` to preserve at-a-glance signal when paired with pending/suspended states in tabular contexts |
+
+Labels render UPPERCASE with `tracking-wide` (`0.05em` letter-spacing) per §3 typography. The active-agent chip above is a specialized form of `success` with the `dotPulse` modifier.
+
+**Hand-rolled status pills are forbidden.** Any new surface code rendering its own status pill (success/error inline indicators, custom colored dots with text) is a review fail. Use `<StatusBadge variant="..." label="..." />` from `@senara-solutions/ui`. For task-domain status (`pending`, `in_progress`, `completed`, etc.), use `<TaskStatusBadge status={...} />` which delegates to `<StatusBadge />` with the canonical task→variant mapping.
+
 ### Input Fields
 
 - Background: `surface_container_lowest`.
