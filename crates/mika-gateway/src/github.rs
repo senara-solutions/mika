@@ -202,21 +202,26 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
             let url = issue.and_then(|i| i.html_url.as_deref()).unwrap_or("");
             let body = truncate_body(issue.and_then(|i| i.body.as_deref()).unwrap_or(""), 2000);
 
+            // For label-add events, emit a structured marker with the specific
+            // label name so mika-dev's prompt can pattern-match unambiguously.
+            // Checked first to avoid allocating body/text that would be discarded.
+            if action == "labeled"
+                && let Some(label_name) = event
+                    .label
+                    .as_ref()
+                    .and_then(|l| l.name.as_deref())
+                    .filter(|n| !n.is_empty())
+            {
+                return format!(
+                    "[GitHub] Issue labeled {label_name} on {repo_name}#{number} — {title}\n{url}"
+                );
+            }
+            // Fallback for labeled without label name: uses generic format below.
+
             let mut text =
                 format!("[GitHub] Issue {action}: {repo_name}#{number} — {title}\n{url}");
             if !body.is_empty() {
                 text.push_str(&format!("\n\n{body}"));
-            }
-            if action == "labeled" {
-                // For label-add events, emit a structured marker with the specific
-                // label name so mika-dev's prompt can pattern-match unambiguously.
-                if let Some(label_name) = event.label.as_ref().and_then(|l| l.name.as_deref()) {
-                    return format!(
-                        "[GitHub] Issue labeled {label_name} on {repo_name}#{number} — {title}\n{url}"
-                    );
-                }
-                // Fallback: label name unavailable — use generic format.
-                // mika-dev's prompt will refuse to match the unstructured fallback.
             }
             if action == "assigned"
                 && let Some(assignee) = issue.and_then(|i| i.assignee.as_ref())
@@ -1291,6 +1296,40 @@ mod tests {
             text,
             "[GitHub] Issue labeled ready on senara-solutions/mika#841 — Gate dispatch on ready label\nhttps://github.com/senara-solutions/mika/issues/841"
         );
+    }
+
+    #[test]
+    fn test_format_event_text_issue_labeled_empty_label_name() {
+        // Empty label name should fall back to generic format, not produce
+        // a malformed structured marker with a blank name.
+        let event = GitHubWebhookEvent {
+            action: Some("labeled".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: Some(GitHubIssue {
+                number: Some(100),
+                title: Some("Test issue".to_string()),
+                html_url: Some("https://github.com/org/repo/issues/100".to_string()),
+                body: None,
+                assignee: None,
+            }),
+            pull_request: None,
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            label: Some(GitHubLabel {
+                name: Some(String::new()),
+            }),
+            repository: Some(GitHubRepository {
+                full_name: Some("org/repo".to_string()),
+                html_url: None,
+            }),
+        };
+        let text = format_event_text("issues", &event);
+        // Must fall back to generic format, not the structured "labeled <name> on" marker
+        assert!(text.starts_with("[GitHub] Issue labeled:"));
+        assert!(!text.contains("Issue labeled  on")); // no blank-name marker
     }
 
     #[test]

@@ -20,7 +20,7 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 ## GitHub Webhook Integration
 
 HMAC-SHA256 signature validation via `X-Hub-Signature-256`. Event routing:
-- `issues.assigned` and `issue_comment.created` and `pull_request_review.submitted` and `pull_request.closed` and `check_suite.completed(failure/timed_out/success)` -> mika-dev
+- `issues.assigned` and `issues.labeled` and `issue_comment.created` and `pull_request_review.submitted` and `pull_request.closed` and `check_suite.completed(failure/timed_out/success)` -> mika-dev
 - `pull_request.opened/synchronize/review_requested` -> mika-qa
 - Delivery UUID dedup via 10k-entry LRU cache
 - 256KB body limit

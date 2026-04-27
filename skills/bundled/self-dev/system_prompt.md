@@ -250,7 +250,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
      ```
      Ready-label dispatch aborted on <repo>#<n>: --remove-label failed.
      gh stderr: <captured stderr>
-     Re-add the `ready` label to retry, or check label permissions.
+     The `ready` label is still on the issue. Fix the permission issue, then remove and re-add the label to generate a new webhook.
      ```
    - Stop the turn.
 
