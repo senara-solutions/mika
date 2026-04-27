@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, StatusBadge, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
+import { Pagination, EmptyState, StatusBadge, ListRow, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
@@ -149,7 +149,7 @@ export default function Timeline() {
                 {data.data.map((row, i) => {
                   const badge = eventTypeBadge(row.event_type)
                   return (
-                    <tr key={i} className="hover:bg-white/[0.02] transition-colors">
+                    <ListRow key={i} variant="static">
                       <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
                         {formatTimestamp(row.created_at)}
                       </td>
@@ -182,7 +182,7 @@ export default function Timeline() {
                           <span className="text-muted/30 text-xs">-</span>
                         )}
                       </td>
-                    </tr>
+                    </ListRow>
                   )
                 })}
               </tbody>

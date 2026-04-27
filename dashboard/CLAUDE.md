@@ -26,7 +26,7 @@ Event Timeline, Agents, Sessions, Traces, Tasks (+ detail), Team Runs, LLM Calls
 
 ## `packages/ui/`
 
-`@senara-solutions/ui` shared React component library (Vite library mode, published to GitHub Packages). Components: StatusBadge (six-variant: success/warning/error/info/neutral/blocked), TaskStatusBadge (thin adapter delegating to StatusBadge), Pagination, EmptyState, CopyButton, MarkdownContent. Utils: formatTime, badges, agentColors. Theme CSS with design tokens (colors, spacing scale). Peer deps: React 19, Tailwind CSS v4, lucide-react. See `packages/ui/CLAUDE.md` for the enforcement rules and canonical primitives table.
+`@senara-solutions/ui` shared React component library (Vite library mode, published to GitHub Packages). Components: StatusBadge (six-variant: success/warning/error/info/neutral/blocked), TaskStatusBadge (thin adapter delegating to StatusBadge), Pagination, EmptyState, CopyButton, MarkdownContent, ListRow (three-variant: static/navigable/expandable — canonical row primitive for list/table surfaces with keyboard a11y and ARIA). Utils: formatTime, badges, agentColors. Theme CSS with design tokens (colors, spacing scale). Peer deps: React 19, Tailwind CSS v4, lucide-react. See `packages/ui/CLAUDE.md` for the enforcement rules and canonical primitives table.
 
 ## Commands
 

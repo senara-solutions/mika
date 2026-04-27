@@ -30,7 +30,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, skills, task engine, HTTP server (mika-server). See `crates/mika-agent/CLAUDE.md`.
 - `crates/mika-gateway/` — Telegram and GitHub webhook router: Postgres customer registry, message routing, A2A proxy. See `crates/mika-gateway/CLAUDE.md`.
 - `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands. See `crates/mika-cli/CLAUDE.md`.
-- `packages/ui/` — `@senara-solutions/ui` shared React component library (Vite library mode, published to GitHub Packages). Components: StatusBadge (six-variant: success/warning/error/info/neutral/blocked), Pagination, EmptyState, CopyButton, MarkdownContent, TaskStatusBadge (thin adapter delegating to StatusBadge). See `packages/ui/CLAUDE.md`.
+- `packages/ui/` — `@senara-solutions/ui` shared React component library (Vite library mode, published to GitHub Packages). Components: StatusBadge (six-variant: success/warning/error/info/neutral/blocked), Pagination, EmptyState, CopyButton, MarkdownContent, TaskStatusBadge (thin adapter delegating to StatusBadge), ListRow (three-variant: static/navigable/expandable — canonical row primitive for all list/table surfaces). See `packages/ui/CLAUDE.md`.
 - `dashboard/` — React observability dashboard. See `dashboard/CLAUDE.md`.
 - `docs/` — Public documentation (architecture, configuration, deployment, runtime-structure, skills, slash-commands, getting-started) — **single source of truth** for all docs. See [docs/runtime-structure.md](docs/runtime-structure.md) for full `~/.mika` directory layout, DB schema, and log paths.
 - `docs/adr/` — Architecture Decision Records (numbered)

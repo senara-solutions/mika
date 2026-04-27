@@ -7,6 +7,8 @@ export type { EmptyStateProps } from './components/EmptyState.tsx'
 export { default as CopyButton } from './components/CopyButton.tsx'
 export { default as MarkdownContent } from './components/MarkdownContent.tsx'
 export { default as TaskStatusBadge } from './components/TaskStatusBadge.tsx'
+export { default as ListRow } from './components/ListRow.tsx'
+export type { ListRowVariant, ListRowProps } from './components/ListRow.tsx'
 
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'

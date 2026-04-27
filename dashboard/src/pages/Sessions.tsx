@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
-import { Pagination, EmptyState, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, ListRow, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search, Terminal, MessageSquare, Users, Settings, ArrowRightLeft } from 'lucide-react'
 
@@ -123,7 +123,7 @@ export default function Sessions() {
               </thead>
               <tbody className="divide-y divide-white/[0.03]">
                 {data.data.map((s) => (
-                  <tr key={s.id} className="hover:bg-white/[0.02] transition-colors">
+                  <ListRow key={s.id} variant="static">
                     <td className="px-4 py-3">
                       <Link
                         to={`/sessions/${s.id}`}
@@ -143,7 +143,7 @@ export default function Sessions() {
                       {formatRelativeTime(s.started_at)}
                     </td>
                     <td className="px-4 py-3 text-xs text-heading font-medium">{s.message_count}</td>
-                  </tr>
+                  </ListRow>
                 ))}
               </tbody>
             </table>

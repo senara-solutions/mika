@@ -19,12 +19,14 @@ All components implement the [luminescent-core](../../docs/design/luminescent-co
 | `<EmptyState>` | Empty data placeholder | `{ message }` | — |
 | `<CopyButton>` | Click-to-copy with visual confirm | `{ text, className?, title? }` | — |
 | `<MarkdownContent>` | Render markdown content | `{ content }` | — |
+| `<ListRow>` | All `<tr>` row rendering in list/table surfaces (static, navigable, expandable) | `{ variant, onClick?, isExpanded?, onToggle?, ariaLabel? }` | Audited clean (mika#654) |
 
 ## Enforcement Rules
 
 - **Hand-rolled status pills are forbidden.** Any dashboard or consumer code rendering its own colored dot + text status indicator is a review fail. Use `<StatusBadge variant="..." label="..." />`. For task statuses, use `<TaskStatusBadge status={...} />`.
 - **Design tokens over hardcoded colors.** Status colors must reference design tokens (`--color-success`, `--color-warning`, `--color-error`, `--color-accent`, `--color-muted`, `--color-blocked`), not Tailwind color utilities (`bg-emerald-400`, `text-red-400`, etc.).
 - **Escape hatch:** If a surface genuinely needs a pill shape not covered by `<StatusBadge />` (e.g., channel pills, source badges), document the justification in the PR description and name the gap. Do not silently hand-roll.
+- **Hand-rolled list rows are forbidden.** Any dashboard list page rendering `<tr>` with row-level `onClick` or inline hover styling outside `<ListRow />` is a review fail. Use `<ListRow variant="static|navigable|expandable" />`. See `luminescent-core.md` §5.2 for the affordance grammar.
 
 ## Commands
 

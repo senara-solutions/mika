@@ -1,6 +1,6 @@
 import { Link } from 'react-router'
 import { useTeamRuns, type TeamRunsFilters } from '../api/teams.ts'
-import { Pagination, EmptyState, TaskStatusBadge, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, TaskStatusBadge, ListRow, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 
 const STATUSES = ['', 'running', 'completed', 'failed', 'suspended', 'cancelled']
@@ -86,7 +86,7 @@ export default function TeamRuns() {
               </thead>
               <tbody className="divide-y divide-white/[0.03]">
                 {data.data.map((run) => (
-                  <tr key={run.id} className="hover:bg-white/[0.02] transition-colors">
+                  <ListRow key={run.id} variant="static">
                     <td className="px-4 py-3 text-xs text-heading font-medium">
                       {run.team_name}
                     </td>
@@ -117,7 +117,7 @@ export default function TeamRuns() {
                         </Link>
                       )}
                     </td>
-                  </tr>
+                  </ListRow>
                 ))}
               </tbody>
             </table>
