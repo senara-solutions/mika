@@ -162,7 +162,7 @@ grep -rn "fn ask\|run_ask\|format_prompt\|prompt_for_agent" crates/mika-cli/src/
 
 - **Path A** (no bracketed prefix added by `mika ask`): plan as written — inverted rule applies.
 - **Path B** (prefix added, e.g., `[CLI]` or `[user]`):
-  - **B1** — remove the prefix from the direct-prompt formatter (small CLI change in same PR; ~5 LOC).
+  - **B1** — remove the prefix from the direct-prompt formatter (small CLI change in same PR; ~5 LOC). **Constraint per architect second-pass:** if the direct-prompt formatter is shared with automated callers (scheduled heartbeats, delegation calls, relay agent — all of which may rely on the bracketed prefix for source identification), do NOT remove the prefix unconditionally. Instead add a `--no-prefix` flag or pass a `source: DirectHuman` variant that suppresses the prefix only on the interactive path. Verify scope: `grep -rn "format_prompt\|prepare_message\|<formatter-fn-name>" crates/` — if multiple callers, take the variant approach.
   - **B2** — fall back to whitelist-against-known-channels: rule changes to "match `implement <repo> issue#<n>` ONLY when message starts with one of `[Direct]` / `[CLI]` / `[<known direct prefix>]` OR has no prefix at all." Maintenance burden: every new channel must be reviewed.
 
 The implementer commits to one path before writing Change 3a. Architect's pre-stated preference: B1 over B2 (B2 reintroduces completeness-bound risk this plan exists to remove).
@@ -226,7 +226,7 @@ Add a new `## Resolution` section at the end. Per architect Finding 9, the secti
   - mika#801 — `check_active_grooming(issue, repo)` heuristic helper (negative-detection).
 - **Final resolution:** positive-consent dispatch gate via `ready` label (mika#841).
 - **Architectural argument (Vincent's two-way rule):** dispatch fires iff (a) Vincent prompts mika-dev directly OR (b) `ready` label is set on the ticket. Closure-bound: the rule enumerates the two valid triggers; everything else is inert by default. Negative-detection (mika#807/#801) was completeness-bound — heuristics fail on inputs they don't enumerate. Same allowlist-vs-denylist pattern from security: denylists lose the moment someone invents a new attack shape.
-- **Architect review:** mika-arch session `3801e5e4-5a7b-4d57-a9e0-f217964c913b` (lifecycle ESCALATE → operator-resolved as supersession), session `8959665a-7fa4-4e39-bc36-da48faf0d50d` (#841 grooming).
+- **Architect review:** mika-arch session `3801e5e4-5a7b-4d57-a9e0-f217964c913b` (lifecycle ESCALATE → operator-resolved as supersession); session `8959665a-7fa4-4e39-bc36-da48faf0d50d` (#841 first-pass ITERATE → revisions → second-pass GROOMED).
 
 The doc records the failure class (unchanged); the new section records the chosen resolution and the reasoning chain that got us there. **Doc lifecycle is decoupled from ticket lifecycle** (per peer review recommendation): tickets get superseded; docs get extended.
 
