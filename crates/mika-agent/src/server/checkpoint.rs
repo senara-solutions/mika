@@ -65,8 +65,12 @@ pub fn spawn_dashboard_checkpoint_task(db: AsyncDatabase) {
                         error = %e,
                     );
                     // If the database is shut down, exit the loop.
+                    // Covers all three AsyncDatabase error variants:
+                    // "database has been shut down", "database thread has stopped",
+                    // "database thread dropped reply" (closure panic via catch_unwind).
                     if e.to_string().contains("has been shut down")
                         || e.to_string().contains("has stopped")
+                        || e.to_string().contains("dropped reply")
                     {
                         info!(
                             target: "mika::checkpoint",
