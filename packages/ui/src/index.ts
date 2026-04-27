@@ -9,6 +9,10 @@ export { default as MarkdownContent } from './components/MarkdownContent.tsx'
 export { default as TaskStatusBadge } from './components/TaskStatusBadge.tsx'
 export { default as ListRow } from './components/ListRow.tsx'
 export type { ListRowVariant, ListRowProps } from './components/ListRow.tsx'
+export { default as SelectFilter } from './components/SelectFilter.tsx'
+export type { SelectFilterOption, SelectFilterProps } from './components/SelectFilter.tsx'
+export { default as AgentFilter } from './components/AgentFilter.tsx'
+export type { AgentSummary, AgentFilterProps } from './components/AgentFilter.tsx'
 
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'

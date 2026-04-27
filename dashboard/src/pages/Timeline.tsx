@@ -2,11 +2,16 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, StatusBadge, ListRow, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
+import { Pagination, EmptyState, StatusBadge, ListRow, AgentFilter, SelectFilter, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
-const EVENT_TYPES = ['', 'message', 'audit', 'task']
+const EVENT_TYPE_OPTIONS = [
+  { label: 'All Event Types', value: '' },
+  { label: 'Message', value: 'message' },
+  { label: 'Audit', value: 'audit' },
+  { label: 'Task', value: 'task' },
+]
 
 export default function Timeline() {
   const { searchParams, setSearchParams, updateFilter, setPage } = useSearchParamsFilter()
@@ -79,29 +84,17 @@ export default function Timeline() {
               className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm text-muted placeholder:text-muted/30 focus:outline-none focus:border-accent/40 font-mono"
             />
           </div>
-          <select
+          <AgentFilter
+            agents={agents}
             value={filters.agent_id ?? ''}
-            onChange={(e) => updateFilter('agent_id', e.target.value)}
-            className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
-          >
-            <option value="">All Agents</option>
-            {agents?.map((a) => (
-              <option key={a.name} value={a.id}>
-                {a.name}
-              </option>
-            ))}
-          </select>
-          <select
+            onChange={(v) => updateFilter('agent_id', v)}
+          />
+          <SelectFilter
+            ariaLabel="Filter by event type"
             value={filters.event_type ?? ''}
-            onChange={(e) => updateFilter('event_type', e.target.value)}
-            className="bg-bg border border-white/[0.06] rounded-lg px-3 py-2 text-sm text-muted focus:outline-none focus:border-accent/40"
-          >
-            {EVENT_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t ? t.charAt(0).toUpperCase() + t.slice(1) : 'All Event Types'}
-              </option>
-            ))}
-          </select>
+            onChange={(v) => updateFilter('event_type', v)}
+            options={EVENT_TYPE_OPTIONS}
+          />
           <button
             onClick={handleTraceSearch}
             className="flex items-center gap-2 px-3 py-2 rounded-lg bg-accent text-white text-sm font-medium hover:bg-accent-light transition-colors"
