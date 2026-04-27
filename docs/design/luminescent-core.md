@@ -134,6 +134,32 @@ Labels render UPPERCASE with `tracking-wide` (`0.05em` letter-spacing) per §3 t
 
 **Hand-rolled status pills are forbidden.** Any new surface code rendering its own status pill (success/error inline indicators, custom colored dots with text) is a review fail. Use `<StatusBadge variant="..." label="..." />` from `@senara-solutions/ui`. For task-domain status (`pending`, `in_progress`, `completed`, etc.), use `<TaskStatusBadge status={...} />` which delegates to `<StatusBadge />` with the canonical task→variant mapping.
 
+### 5.2 List row affordance grammar
+
+Tabular and list surfaces use one of three row affordances. `<ListRow />` from `@senara-solutions/ui` is the canonical rendering primitive; hand-rolling `<tr>` with row-level `onClick` outside this primitive is forbidden.
+
+| Variant | Visual | Behavior | When to use |
+|---|---|---|---|
+| `static` | Cell-level links navigate; row itself not interactive | Row click is a no-op | Tabular data where individual cells (IDs, names, links) navigate to context-specific destinations |
+| `navigable` | Whole row is clickable, `→` glyph in first cell | Row click navigates to detail page | List pages where every row maps 1:1 to a detail page |
+| `expandable` | Whole row is clickable, left-side chevron indicates state | Row click toggles inline expansion (more details, child rows) | Hierarchical or detail-rich rows where inline expansion is more useful than navigation |
+
+**Glyph conventions:**
+- `navigable`: `→` arrow on the left, indicates "click to enter."
+- `expandable`: `chevron-right` collapsed → `chevron-down` expanded, on the left.
+- `static`: no glyph; row is not advertising click affordance.
+
+**Keyboard interaction model:**
+- **Navigable:** Enter triggers navigation (same as click). Tab moves focus on/off the row.
+- **Expandable:** Enter or Space toggles expansion. Escape collapses if currently expanded. Tab moves focus on/off the row. Focused state must be visually distinct (`focus-visible` ring per design tokens).
+- **Static:** not focusable; not keyboard-interactive. Only nested links are keyboard-navigable via Tab.
+- **Nested-element guard:** for navigable/expandable rows, the row's keyboard handler triggers only when the focus target is the row itself (not a child link/button).
+
+**ARIA:**
+- `navigable`: `role="link"` with `aria-label` describing destination.
+- `expandable`: `role="button"` with `aria-expanded={true|false}` and `aria-label` describing the expansion target.
+- `static`: no role attribute; row is purely structural.
+
 ### Input Fields
 
 - Background: `surface_container_lowest`.

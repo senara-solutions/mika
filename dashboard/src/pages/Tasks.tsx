@@ -1,12 +1,12 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
-import { Pagination, EmptyState, TaskStatusBadge, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, TaskStatusBadge, ListRow, formatRelativeTime } from '@senara-solutions/ui'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 function TaskRow({ task, indent = 0 }: { task: TaskItem; indent?: number }) {
   return (
-    <tr className="hover:bg-white/[0.02] transition-colors">
+    <ListRow variant="static">
       <td className="px-4 py-3">
         <TaskStatusBadge status={task.status} />
       </td>
@@ -61,7 +61,7 @@ function TaskRow({ task, indent = 0 }: { task: TaskItem; indent?: number }) {
       <td className="px-4 py-3 text-xs text-muted/70 font-mono">
         {formatRelativeTime(task.updated_at)}
       </td>
-    </tr>
+    </ListRow>
   )
 }
 
@@ -110,78 +110,82 @@ function ExpandableTaskRow({
 
   const isRoot = task.depth === 0
 
+  const cells = (
+    <>
+      <td className="px-4 py-3">
+        <TaskStatusBadge status={task.status} />
+      </td>
+      <td className="px-4 py-3 text-xs text-heading max-w-[300px] truncate">
+        {indent > 0 && (
+          <span style={{ paddingLeft: `${indent * 1.5}rem` }} className="inline-block" />
+        )}
+        <Link
+          to={`/tasks/${task.id}`}
+          className="text-accent hover:text-accent-light transition-colors"
+        >
+          {task.label}
+        </Link>
+      </td>
+      <td className="px-4 py-3">
+        <Link
+          to={`/agents/${task.agent_id}`}
+          className="text-accent text-xs hover:text-accent-light transition-colors"
+        >
+          {task.agent_id}
+        </Link>
+      </td>
+      <td className="px-4 py-3">
+        {task.source && (
+          <span className="text-xs text-muted bg-white/[0.04] px-2 py-0.5 rounded-full">
+            {task.source}
+          </span>
+        )}
+      </td>
+      <td className="px-4 py-3">
+        {task.team_run_id ? (
+          <Link
+            to={`/team-runs/${task.team_run_id}`}
+            className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
+          >
+            Team Run &rarr;
+          </Link>
+        ) : (
+          <span className="text-xs text-muted/40">&mdash;</span>
+        )}
+      </td>
+      <td className="px-4 py-3 text-xs text-muted/70">
+        {task.created_trace_id && (
+          <Link
+            to={`/traces/${task.created_trace_id}`}
+            className="text-accent font-mono hover:text-accent-light transition-colors"
+          >
+            {task.created_trace_id.slice(0, 12)}...
+          </Link>
+        )}
+      </td>
+      <td className="px-4 py-3 text-xs text-muted/70 font-mono">
+        {formatRelativeTime(task.updated_at)}
+      </td>
+    </>
+  )
+
   return (
     <>
-      <tr
-        className={`hover:bg-white/[0.02] transition-colors ${isRoot ? 'cursor-pointer' : ''}`}
-        onClick={isRoot ? toggle : undefined}
-      >
-        <td className="px-4 py-3">
-          <div className="flex items-center gap-1">
-            {isRoot && (
-              isExpanded
-                ? <ChevronDown size={12} className="text-muted/40 shrink-0" />
-                : <ChevronRight size={12} className="text-muted/40 shrink-0" />
-            )}
-            <TaskStatusBadge status={task.status} />
-          </div>
-        </td>
-        <td className="px-4 py-3 text-xs text-heading max-w-[300px] truncate">
-          {indent > 0 && (
-            <span style={{ paddingLeft: `${indent * 1.5}rem` }} className="inline-block" />
-          )}
-          <Link
-            to={`/tasks/${task.id}`}
-            className="text-accent hover:text-accent-light transition-colors"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {task.label}
-          </Link>
-        </td>
-        <td className="px-4 py-3">
-          <Link
-            to={`/agents/${task.agent_id}`}
-            className="text-accent text-xs hover:text-accent-light transition-colors"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {task.agent_id}
-          </Link>
-        </td>
-        <td className="px-4 py-3">
-          {task.source && (
-            <span className="text-xs text-muted bg-white/[0.04] px-2 py-0.5 rounded-full">
-              {task.source}
-            </span>
-          )}
-        </td>
-        <td className="px-4 py-3">
-          {task.team_run_id ? (
-            <Link
-              to={`/team-runs/${task.team_run_id}`}
-              className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
-              onClick={(e) => e.stopPropagation()}
-            >
-              Team Run &rarr;
-            </Link>
-          ) : (
-            <span className="text-xs text-muted/40">&mdash;</span>
-          )}
-        </td>
-        <td className="px-4 py-3 text-xs text-muted/70">
-          {task.created_trace_id && (
-            <Link
-              to={`/traces/${task.created_trace_id}`}
-              className="text-accent font-mono hover:text-accent-light transition-colors"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {task.created_trace_id.slice(0, 12)}...
-            </Link>
-          )}
-        </td>
-        <td className="px-4 py-3 text-xs text-muted/70 font-mono">
-          {formatRelativeTime(task.updated_at)}
-        </td>
-      </tr>
+      {isRoot ? (
+        <ListRow
+          variant="expandable"
+          isExpanded={isExpanded}
+          onToggle={toggle}
+          ariaLabel={`Toggle subtasks of ${task.label}`}
+        >
+          {cells}
+        </ListRow>
+      ) : (
+        <ListRow variant="static">
+          <td className="w-8" />{/* spacer to align with expandable rows' chevron column */}
+          {cells}
+        </ListRow>
+      )}
       {isExpanded && <ChildTaskRows parentTaskId={task.id} indent={indent + 1} />}
     </>
   )
@@ -189,9 +193,11 @@ function ExpandableTaskRow({
 
 function TaskTable({
   headers,
+  hasExpandableRows = false,
   children,
 }: {
   headers: string[]
+  hasExpandableRows?: boolean
   children: React.ReactNode
 }) {
   return (
@@ -199,6 +205,7 @@ function TaskTable({
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-white/[0.05] text-muted/60 text-xs uppercase tracking-wider">
+            {hasExpandableRows && <th className="w-8 px-2 py-3" />}
             {headers.map((h) => (
               <th key={h} className="text-left px-4 py-3 font-medium">
                 {h}
@@ -277,6 +284,7 @@ function WorkItemsSection() {
         <>
           <TaskTable
             headers={['Status', 'Title', 'Agent', 'Source', 'Team Run', 'Trace', 'Updated']}
+            hasExpandableRows
           >
             {data.data.map((t) => (
               <ExpandableTaskRow
@@ -327,6 +335,7 @@ function TeamRunTasksSection() {
         <>
           <TaskTable
             headers={['Status', 'Title', 'Agent', 'Action', 'Team Run', 'Trace', 'Updated']}
+            hasExpandableRows
           >
             {data.data.map((t) => (
               <ExpandableTaskRow
@@ -406,7 +415,7 @@ function ScheduledSection() {
             headers={['Status', 'Title', 'Agent', 'Schedule', 'Next Run', 'Last Run', 'Updated']}
           >
             {data.data.map((t) => (
-              <tr key={t.id} className="hover:bg-white/[0.02] transition-colors">
+              <ListRow key={t.id} variant="static">
                 <td className="px-4 py-3">
                   <TaskStatusBadge status={t.status} />
                 </td>
@@ -438,7 +447,7 @@ function ScheduledSection() {
                 <td className="px-4 py-3 text-xs text-muted/70 font-mono">
                   {formatRelativeTime(t.updated_at)}
                 </td>
-              </tr>
+              </ListRow>
             ))}
           </TaskTable>
           <Pagination page={page} perPage={20} total={data.total} onPageChange={setPage} />
