@@ -226,8 +226,10 @@ The same pattern applies to all D2-scoped files in Unit 4. This Unit 1 instance 
 
 **mika#845 (dev-groom) cross-ticket dependency (per architect Finding 8) — pre-stated branches, not implementer-discretion:**
 
-- **Path A — mika#845 already merged at implementation time of this Unit:** Unit 2 enum is `["dev-pilot", "dev-groom"]`. Unit 3's inline assertions cover both routings: "implement <ticket-ref>" → `skill: "dev-pilot"`, "groom <ticket-ref>" → `skill: "dev-groom"`.
-- **Path B — mika#845 not yet merged:** Unit 2 enum is `["dev-pilot"]` only. mika#845's plan **must** include a step to extend the enum to include `"dev-groom"` as part of its own implementation. mika#845's ticket body and plan should reference mika#844's tool-schema as a hard dependency. Unit 3's inline assertion in this PR covers only the `"dev-pilot"` routing; the `"dev-groom"` assertion lands with mika#845.
+**Amended 2026-04-27 post mika#845 first-pass architect review:** the Path A/B branching below was speculative; mika#845's D7 (skill-not-tool, operator-only enforcement) supersedes. Under mika#845's structural enforcement (D2 Layers 1+3 — agent allowlist + gateway guard), no caller ever passes `skill: "dev-groom"` to `run_claude_pilot` — operators activate dev-groom via skill keyword match, not via the dispatch tool. Adding `"dev-groom"` to the enum produces a structurally-unreachable code path (YAGNI violation). Both branches reduce to **enum is `["dev-pilot"]` permanently; mika#845 registers the skill but adds NO entry to this enum.**
+
+- **Path A — mika#845 already merged at implementation time of this Unit:** enum is `["dev-pilot"]`. Unit 3's inline assertions cover the dispatch routing: "implement <ticket-ref>" → `skill: "dev-pilot"`. dev-groom routing is verified separately via skill-activation eval fixture in mika#845's Unit 4 (not via this enum).
+- **Path B — mika#845 not yet merged:** enum is `["dev-pilot"]`. Same as Path A. No coordination required between tickets on this enum's value.
 
 The implementer **must** check mika#845's merge status at the start of Unit 2 and select the path. Do not silently default to one branch.
 
