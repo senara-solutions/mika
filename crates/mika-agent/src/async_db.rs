@@ -14,7 +14,7 @@ use crate::db::{
     TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 
-type DbClosure = Box<dyn FnOnce(&Database) + Send>;
+type DbClosure = Box<dyn FnOnce(&mut Database) + Send>;
 
 /// Async wrapper around [`Database`] using a dedicated OS thread.
 ///
@@ -43,7 +43,7 @@ impl AsyncDatabase {
     }
 
     /// Spawn with a specific agent_id.
-    pub fn new_with_agent(db: Database, agent_id: &str) -> Self {
+    pub fn new_with_agent(mut db: Database, agent_id: &str) -> Self {
         // Bounded channel: backpressure when DB thread falls behind
         let (tx, rx) = mpsc::sync_channel::<DbClosure>(512);
         let handle = std::thread::Builder::new()
@@ -52,7 +52,7 @@ impl AsyncDatabase {
                 while let Ok(f) = rx.recv() {
                     if let Err(_panic) =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            f(&db);
+                            f(&mut db);
                         }))
                     {
                         tracing::error!("database closure panicked — thread continues");
@@ -107,7 +107,7 @@ impl AsyncDatabase {
 
     pub async fn with_db<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&Database) -> Result<T> + Send + 'static,
+        f: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
         // Clone the sender while holding the lock, then release the lock before

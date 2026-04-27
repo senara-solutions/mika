@@ -1,5 +1,6 @@
 mod a2a;
 mod auth;
+pub mod checkpoint;
 pub mod ci_failure_handler;
 pub mod ci_success_handler;
 pub mod dashboard;
@@ -358,7 +359,7 @@ async fn init_agent(
     let agent_llm = agent_settings.make_llm_provider()?;
     let db_path = home::container_db_path(global_home);
     std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let db = Database::open(&db_path)?;
+    let mut db = Database::open(&db_path)?;
     let identity = crate::prompt::load_identity(agent_home);
     let kg_config = crate::kg::config::resolve_per_agent_docs_root(&identity, &agent_settings)
         .with_context(|| format!("failed to resolve [kg] config for agent {agent_name}"))?;
@@ -370,7 +371,7 @@ async fn init_agent(
     startup::seed_core_memory_if_empty(&db, agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
     if agent_settings.dev_mode {
-        crate::well_known_agents::seed_well_known_skill_overrides(&db, agent_name);
+        crate::well_known_agents::seed_well_known_skill_overrides(&mut db, agent_name);
     }
     let async_db = AsyncDatabase::new_with_agent(db, agent_name);
 
@@ -729,6 +730,11 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         .expect("default agent must exist")
         .db
         .clone();
+
+    // Defense-in-depth for mika#636: periodic WAL checkpoint forces the
+    // dashboard connection to advance past any held WAL snapshot, ensuring
+    // writes from other processes (e.g. `mika ask`) become visible.
+    checkpoint::spawn_dashboard_checkpoint_task(dashboard_db.clone());
 
     // Domain graph rebuild: populate kg_entities and kg_relationships from
     // authoritative sources (skill manifests, tool registry, MCP, agent configs).

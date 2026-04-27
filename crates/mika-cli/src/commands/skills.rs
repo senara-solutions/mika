@@ -134,7 +134,7 @@ fn run_skill_llm(
             db_path.display()
         );
     }
-    let db = mika_agent::db::Database::open(&db_path)
+    let mut db = mika_agent::db::Database::open(&db_path)
         .with_context(|| format!("failed to open database at {}", db_path.display()))?;
 
     match action {
@@ -767,14 +767,14 @@ fn toggle_skill(
             db_path.display()
         );
     }
-    let db = mika_agent::db::Database::open(&db_path)
+    let mut db = mika_agent::db::Database::open(&db_path)
         .with_context(|| format!("failed to open database at {}", db_path.display()))?;
 
     // Migrate legacy .disabled markers to DB before reading state.
     // Without this, `mika skills enable foo` on a skill with a .disabled marker
     // would no-op (DB shows enabled=NULL=true), then the next server startup
     // migration would re-disable the skill (#629).
-    if let Err(e) = mika_agent::skills::migrate_disabled_markers(skills_dir, &db, agent_id) {
+    if let Err(e) = mika_agent::skills::migrate_disabled_markers(skills_dir, &mut db, agent_id) {
         eprintln!("  [WARN] failed to migrate .disabled markers: {e}");
     }
 

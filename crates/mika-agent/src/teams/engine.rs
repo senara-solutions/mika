@@ -98,14 +98,15 @@ impl TeamEngine {
         // concurrent readers correctly, and busy_timeout covers write contention.
         for ta in &team.agents {
             let home_dir = agent::agent_dir(global_home, &ta.name);
-            let db = Database::open(&db_path)
+            let mut db = Database::open(&db_path)
                 .with_context(|| format!("failed to open container DB for agent '{}'", ta.name))?;
             let identity = crate::prompt::load_identity(&home_dir);
             db.register_agent(&ta.name, &identity.name, home_dir.to_str().unwrap_or(""))?;
             startup::seed_core_memory_if_empty(&db, &home_dir, &ta.name)?;
             let skills_dir = home_dir.join("skills");
             // Migrate legacy .disabled marker files to DB (one-shot, idempotent).
-            if let Err(e) = crate::skills::migrate_disabled_markers(&skills_dir, &db, &ta.name) {
+            if let Err(e) = crate::skills::migrate_disabled_markers(&skills_dir, &mut db, &ta.name)
+            {
                 tracing::warn!(agent = %ta.name, error = %e, "failed to migrate .disabled markers");
             }
             let mut skills = SkillRegistry::from_dir(&skills_dir);
