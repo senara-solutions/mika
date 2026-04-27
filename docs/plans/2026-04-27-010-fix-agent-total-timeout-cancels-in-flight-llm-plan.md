@@ -89,7 +89,7 @@ if Instant::now() >= deadline {
 }
 ```
 
-`LoopResult` gains a `DeadlineExceeded` variant. Callers map it to mode-appropriate fallback (see step 3).
+`LoopResult` gains a `DeadlineExceeded` variant. Callers map it to mode-appropriate fallback (see step 3). **`LoopResult` must NOT carry `#[non_exhaustive]`** — the compiler's match-exhaustiveness check is the machine-enforcement surface that ensures all three outer handlers (conversation, silent, team) handle every variant. A `_ => { /* default */ }` arm could silently route a future variant into the wrong fallback.
 
 **3. Caller-side fallback handling.**
 
@@ -107,7 +107,11 @@ a. **Before `attempt_continuation_turn` (line 437).** When `MAX_TOOL_STEPS = 20`
 
 b. **Before prelude work in `run_agent_inner` (and team/silent equivalents).** Prelude work — system-prompt assembly (`prompt::build_system_prompt`), context resolution (`resolve_contexts`), skill matching (`match_skills`), conversation-summary load — runs *before* the loop. A pathological prelude (huge KG query, slow context fetch) could itself blow the budget and leave the loop never reached. Add a deadline check immediately after prelude completes and before entering `run_loop`. If the prelude already exceeded the deadline, emit the fallback without entering the loop.
 
+   **Granularity scope:** prelude is empirically fast (10–100ms for current `.await` sites). Threading `deadline` into every async helper (`resolve_contexts`, `match_skills`, etc.) is YAGNI scope creep. As an implementation pre-commit step, run `grep -n "\.await" crates/mika-agent/src/agent.rs` filtered to the prelude region of each outer-fn body — verify all calls hit known-fast paths. If a future prelude step has a documented slow path (e.g., a KG query that could block on a cold cache), thread `deadline` into it then. Tracked under § Out of scope.
+
 c. **Replace continuation's own `tokio::time::timeout` (line 437) with deadline-aware wrapper.** The 60s timeout there has the same in-flight-cancel bug as the outer 300s — at smaller scale, but architecturally identical. Architect explicitly pulls this into scope. Replace with `tokio::time::timeout(min(60s, deadline - now), continuation_call)` so in-flight LLM calls during continuation also persist their `llm_calls` row before being cut off. The 60s ceiling stays — what changes is the deadline-clamp on top of it.
+
+   At the clamp callsite, add `debug_assert!(deadline > Instant::now(), "deadline already passed at continuation entry — gate 4a should have prevented this")`. Stripped in release; fires in tests (including the new eval scenario's `tokio::time::pause()` path) if gate 4a's logic ever drifts. Makes the gate-fires-first invariant machine-verifiable.
 
 **5. In-flight LLM call protection.**
 
@@ -170,6 +174,7 @@ Add `mika/docs/solutions/runtime-errors/agent-deadline-graceful-exit-2026-04-27.
 - Adding a runtime-configurable deadline for production (the new `AgentParams.total_timeout: Option<Duration>` field is test-utils-gated; production paths pass `None`).
 - Auditing other `tokio::time::timeout` callsites (lines 437, 2047, 2070, 2097 — those are short-scoped continuation/utility timeouts, not the turn-level 300s budget).
 - Per-step deadline checks within `dispatch_tool` — tools self-cap at 30s and the tool timeout is a different mechanism. (Note: `attempt_continuation_turn` *is* now in scope per F3, contrary to the original plan.)
+- Threading `deadline` into prelude async helpers (`resolve_contexts`, `match_skills`, etc.) — current prelude `.await` sites are sub-100ms. Re-open this scope item if any future prelude step has a documented slow path.
 
 ## Risks and mitigations
 
