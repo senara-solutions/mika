@@ -107,6 +107,8 @@ The skill MUST be unreachable from autonomous flows. Structural enforcement at t
 
 The two layers compose against different regression modes. Layer 1 is the load-bearing primary check; Layer 3 is the safety net for routing-path additions that might bypass Layer 1.
 
+**Layer 2 re-evaluation trigger (per architect second-pass):** Layer 2 (`operator_only` skill.toml flag) is deferred until either (a) a second `operator_only` skill exists, OR (b) a new dispatch entry point is added that bypasses Layer 1 + Layer 3 (e.g., a new tool, a new gateway routing seam, an internal RPC). When (a) or (b) becomes true, re-evaluate Layer 2 before the new dispatch path ships. This converts the YAGNI deferral into a visible decision with a re-evaluation trigger, not a forgotten hole.
+
 ### D3 — Session capture follows mika-platform#56 JSON-metadata pattern; additive-contract on mika#843
 
 The skill's first-pass and second-pass mika-arch invocations use:
