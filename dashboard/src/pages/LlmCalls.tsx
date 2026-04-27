@@ -1,7 +1,7 @@
 import { Link, useNavigate } from 'react-router'
 import { useLlmCalls, type LlmCallsFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, StatusBadge, ListRow, AgentFilter, formatTimestamp } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, formatTimestamp } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
@@ -36,7 +36,7 @@ export default function LlmCalls() {
     per_page: 50,
   }
 
-  const { data, isLoading, error } = useLlmCalls(filters)
+  const { data, isLoading, error, refetch } = useLlmCalls(filters)
   const { data: agents } = useAgents()
 
   return (
@@ -83,13 +83,16 @@ export default function LlmCalls() {
 
       {/* Table */}
       {isLoading ? (
-        <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-8 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
-        <EmptyState message="No LLM calls match your filters" />
+        <EmptyState
+          message="No LLM calls match your filters"
+          action={(filters.agent_id || filters.model)
+            ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
+            : undefined}
+        />
       ) : (
         <>
           <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">

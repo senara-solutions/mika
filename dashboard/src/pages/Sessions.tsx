@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, ListRow, AgentFilter, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, ListRow, AgentFilter, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search, Terminal, MessageSquare, Users, Settings, ArrowRightLeft } from 'lucide-react'
 
@@ -45,7 +45,7 @@ export default function Sessions() {
 
   const [sessionSearch, setSessionSearch] = useState(filters.session_id ?? '')
 
-  const { data, isLoading, error } = useSessions(filters)
+  const { data, isLoading, error, refetch } = useSessions(filters)
   const { data: agents } = useAgents()
 
   return (
@@ -97,13 +97,16 @@ export default function Sessions() {
       </div>
 
       {isLoading ? (
-        <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-8 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
-        <EmptyState message="No sessions match your filters" />
+        <EmptyState
+          message="No sessions match your filters"
+          action={(filters.agent_id || filters.channel_type || filters.session_id)
+            ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
+            : undefined}
+        />
       ) : (
         <>
           <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">

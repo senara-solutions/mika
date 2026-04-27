@@ -2,7 +2,7 @@ import { useState, Fragment } from 'react'
 import { Link } from 'react-router'
 import { useToolCalls, type ToolCallsFilters } from '../api/toolCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { CopyButton, Pagination, EmptyState, StatusBadge, ListRow, AgentFilter, SelectFilter, formatTimestamp } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, SelectFilter, formatTimestamp } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
@@ -42,7 +42,7 @@ export default function ToolCalls() {
     per_page: 50,
   }
 
-  const { data, isLoading, error } = useToolCalls(filters)
+  const { data, isLoading, error, refetch } = useToolCalls(filters)
   const { data: agents } = useAgents()
 
   const toggleExpand = (id: string) => {
@@ -103,13 +103,16 @@ export default function ToolCalls() {
 
       {/* Table */}
       {isLoading ? (
-        <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-8 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
-        <EmptyState message="No tool calls match your filters" />
+        <EmptyState
+          message="No tool calls match your filters"
+          action={(filters.agent_id || filters.tool_name || filters.success)
+            ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
+            : undefined}
+        />
       ) : (
         <>
           <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">

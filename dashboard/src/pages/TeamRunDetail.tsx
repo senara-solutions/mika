@@ -6,7 +6,7 @@ import {
   useTeamWorkspace,
   type TeamWorkspaceEntry,
 } from '../api/teams.ts'
-import { TaskStatusBadge, CopyButton, EmptyState, MarkdownContent, formatRelativeTime } from '@senara-solutions/ui'
+import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime } from '@senara-solutions/ui'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 function DarkContainer({ children, className = '' }: { children: React.ReactNode; className?: string }) {
@@ -137,20 +137,16 @@ function IterationSection({
 
 export default function TeamRunDetail() {
   const { runId } = useParams()
-  const { data: run, isLoading: runLoading, error: runError } = useTeamRun(runId)
+  const { data: run, isLoading: runLoading, error: runError, refetch } = useTeamRun(runId)
   const { data: summary } = useTeamRunSummary(runId)
   const { data: workspace } = useTeamWorkspace(runId)
 
   if (runLoading) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+    return <LoadingState variant="detail" />
   }
 
   if (runError) {
-    return (
-      <div className="text-red-400 py-8 text-center text-sm">
-        Error: {runError instanceof Error ? runError.message : 'Unknown error'}
-      </div>
-    )
+    return <ErrorState message={formatApiError(runError)} retry={() => refetch()} />
   }
 
   if (!run) {

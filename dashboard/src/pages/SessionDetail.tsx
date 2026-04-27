@@ -4,13 +4,12 @@ import { useSessionDetail, useSessionMessages, type Message } from '../api/sessi
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import { useSessionLlmCalls } from '../api/llmCalls.ts'
 import { useSessionToolCalls, useSessionSkills, useTraceToolCalls } from '../api/toolCalls.ts'
-import { CopyButton, Pagination, EmptyState, StatusBadge, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, formatTimestamp, getAgentColor } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
 import {
-  AlertTriangle,
   ArrowLeft,
   User,
   Bot,
@@ -395,7 +394,7 @@ export default function SessionDetail() {
   const [expandedToolCallIds, setExpandedToolCallIds] = useState<Set<string>>(new Set())
   const [investigationScope, setInvestigationScope] = useState<InvestigationScope | null>(null)
 
-  const { data: session, isLoading: sessionLoading, isError: sessionError, error: sessionErr } = useSessionDetail(sessionId ?? '')
+  const { data: session, isLoading: sessionLoading, isError: sessionError, error: sessionErr, refetch } = useSessionDetail(sessionId ?? '')
   const { data: messages, isLoading: messagesLoading, isError: messagesError, error: messagesErr } = useSessionMessages(
     sessionId ?? '',
     page,
@@ -455,8 +454,6 @@ export default function SessionDetail() {
 
   const isLoading = sessionLoading || messagesLoading
   const isError = sessionError || messagesError
-  const errorMessage = sessionErr?.message ?? messagesErr?.message ?? 'Failed to load session'
-
   const openInvestigation = (
     messageId: number,
     toolCallIndex?: number,
@@ -816,13 +813,9 @@ export default function SessionDetail() {
 
       {/* Tab content */}
       {isLoading ? (
-        <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        <LoadingState variant="detail" />
       ) : isError ? (
-        <div className="flex flex-col items-center justify-center py-16 text-center">
-          <AlertTriangle size={32} className="text-red-400 mb-3" />
-          <p className="text-heading text-sm font-medium mb-1">Failed to load session</p>
-          <p className="text-muted/60 text-xs">{errorMessage}</p>
-        </div>
+        <ErrorState message={formatApiError(sessionErr ?? messagesErr)} retry={() => refetch()} />
       ) : activeTab === 'messages' ? (
         /* Messages tab */
         isTeamSession ? (
@@ -865,7 +858,7 @@ export default function SessionDetail() {
       ) : activeTab === 'llm-calls' ? (
         /* LLM Calls tab */
         llmCallsLoading ? (
-          <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+          <LoadingState variant="list" rows={3} />
         ) : !llmCallsData || llmCallsData.data.length === 0 ? (
           <EmptyState message="No LLM calls recorded for this session" />
         ) : (
@@ -930,7 +923,7 @@ export default function SessionDetail() {
       ) : activeTab === 'tool-calls' ? (
         /* Tool Calls tab */
         toolCallsLoading ? (
-          <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+          <LoadingState variant="list" rows={3} />
         ) : !toolCallsData || toolCallsData.data.length === 0 ? (
           <EmptyState message="No tool calls recorded for this session" />
         ) : (

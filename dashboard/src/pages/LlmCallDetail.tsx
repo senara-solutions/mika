@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router'
 import { useLlmCall } from '../api/llmCalls.ts'
-import { CopyButton, StatusBadge, formatRelativeTime } from '@senara-solutions/ui'
+import { CopyButton, StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
@@ -25,20 +25,16 @@ function llmStatusVariant(status: string): { variant: StatusBadgeVariant; label:
 
 export default function LlmCallDetail() {
   const { id } = useParams<{ id: string }>()
-  const { data: call, isLoading, error } = useLlmCall(id)
+  const { data: call, isLoading, error, refetch } = useLlmCall(id)
 
   if (isLoading) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+    return <LoadingState variant="detail" />
   }
   if (error) {
-    return (
-      <div className="text-red-400 py-8 text-center text-sm">
-        Error: {error instanceof Error ? error.message : 'Unknown error'}
-      </div>
-    )
+    return <ErrorState message={formatApiError(error)} retry={() => refetch()} />
   }
   if (!call) {
-    return <div className="text-muted/60 py-8 text-center text-sm">LLM call not found</div>
+    return <EmptyState message="LLM call not found" />
   }
 
   return (
