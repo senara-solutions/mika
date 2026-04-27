@@ -11,6 +11,7 @@
   --color-warning: #f59e0b;
   --color-error: #ef4444;
   --color-blocked: #f97316;
+  --color-surface-container-high: #1e2130;
 
   /* Spacing scale per luminescent-core §6 (8px base, doubled rhythm) */
   --spacing-1: 0.25rem;   /*  4px */

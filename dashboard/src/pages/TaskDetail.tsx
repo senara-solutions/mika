@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router'
 import { useTask, useTaskChildren, useTaskSessions } from '../api/tasks.ts'
-import { TaskStatusBadge, CopyButton, formatRelativeTime } from '@senara-solutions/ui'
+import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
 function formatDuration(start: string, end: string): string {
@@ -18,22 +18,18 @@ function formatDuration(start: string, end: string): string {
 
 export default function TaskDetail() {
   const { taskId } = useParams<{ taskId: string }>()
-  const { data: task, isLoading, error } = useTask(taskId)
+  const { data: task, isLoading, error, refetch } = useTask(taskId)
   const { data: children } = useTaskChildren(taskId)
   const { data: taskSessions } = useTaskSessions(taskId)
 
   if (isLoading) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+    return <LoadingState variant="detail" />
   }
   if (error) {
-    return (
-      <div className="text-red-400 py-8 text-center text-sm">
-        Error: {error instanceof Error ? error.message : 'Unknown error'}
-      </div>
-    )
+    return <ErrorState message={formatApiError(error)} retry={() => refetch()} />
   }
   if (!task) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Task not found</div>
+    return <EmptyState message="Task not found" />
   }
 
   return (

@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router'
 import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/timeline.ts'
 import { useTraceLlmCalls } from '../api/llmCalls.ts'
 import { useTraceToolCalls } from '../api/toolCalls.ts'
-import { CopyButton as UiCopyButton, EmptyState, StatusBadge, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
+import { CopyButton as UiCopyButton, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
@@ -474,8 +474,8 @@ function EventCard({ event }: { event: { event_type: string; event_subtype: stri
 
 export default function TraceDetail() {
   const { traceId } = useParams<{ traceId: string }>()
-  const { data: events, isLoading: eventsLoading, error: eventsError } = useTraceDetail(traceId ?? '')
-  const { data: messages, isLoading: messagesLoading, error: messagesError } = useTraceMessages(traceId ?? '')
+  const { data: events, isLoading: eventsLoading, error: eventsError, refetch: refetchEvents } = useTraceDetail(traceId ?? '')
+  const { data: messages, isLoading: messagesLoading, error: messagesError, refetch: refetchMessages } = useTraceMessages(traceId ?? '')
   const { data: llmCalls } = useTraceLlmCalls(traceId ?? '')
   const { data: toolCalls } = useTraceToolCalls(traceId ?? '')
   const [investigationScope, setInvestigationScope] = useState<InvestigationScope | null>(null)
@@ -570,11 +570,9 @@ export default function TraceDetail() {
       )}
 
       {isLoading ? (
-        <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        <LoadingState variant="detail" />
       ) : error ? (
-        <div className="text-red-400 py-8 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => { refetchEvents(); refetchMessages() }} />
       ) : timeline.length === 0 ? (
         <EmptyState message="No events found for this trace" />
       ) : (

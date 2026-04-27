@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, StatusBadge, ListRow, AgentFilter, SelectFilter, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, SelectFilter, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
@@ -26,7 +26,7 @@ export default function Timeline() {
     per_page: 50,
   }
 
-  const { data, isLoading, error } = useTimeline(filters, true, autoRefresh)
+  const { data, isLoading, error, refetch } = useTimeline(filters, true, autoRefresh)
   const { data: agents } = useAgents()
 
   function handleTraceSearch() {
@@ -118,13 +118,16 @@ export default function Timeline() {
 
       {/* Table */}
       {isLoading ? (
-        <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-8 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !data || data.data.length === 0 ? (
-        <EmptyState message="No events match your filters" />
+        <EmptyState
+          message="No events match your filters"
+          action={(filters.agent_id || filters.event_type || filters.trace_id)
+            ? { label: 'Clear filters', onClick: () => { setTraceSearch(''); setSearchParams(new URLSearchParams()) } }
+            : undefined}
+        />
       ) : (
         <>
           <div className="bg-bg-card border border-white/[0.05] rounded-2xl overflow-hidden">

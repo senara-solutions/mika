@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router'
 import { useToolCall } from '../api/toolCalls.ts'
-import { CopyButton, StatusBadge, formatRelativeTime } from '@senara-solutions/ui'
+import { CopyButton, StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
 function formatLatency(ms: number): string {
@@ -23,20 +23,16 @@ function sourceBadge(source: string) {
 
 export default function ToolCallDetail() {
   const { id } = useParams<{ id: string }>()
-  const { data: call, isLoading, error } = useToolCall(id)
+  const { data: call, isLoading, error, refetch } = useToolCall(id)
 
   if (isLoading) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+    return <LoadingState variant="detail" />
   }
   if (error) {
-    return (
-      <div className="text-red-400 py-8 text-center text-sm">
-        Error: {error instanceof Error ? error.message : 'Unknown error'}
-      </div>
-    )
+    return <ErrorState message={formatApiError(error)} retry={() => refetch()} />
   }
   if (!call) {
-    return <div className="text-muted/60 py-8 text-center text-sm">Tool call not found</div>
+    return <EmptyState message="Tool call not found" />
   }
 
   return (

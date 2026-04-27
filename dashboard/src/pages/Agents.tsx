@@ -1,11 +1,11 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useAgents } from '../api/agents.ts'
-import { StatusBadge, EmptyState, formatRelativeTime } from '@senara-solutions/ui'
+import { StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
 import { MessageSquare, Search } from 'lucide-react'
 
 export default function Agents() {
-  const { data: agents, isLoading, error } = useAgents()
+  const { data: agents, isLoading, error, refetch } = useAgents()
   const [search, setSearch] = useState('')
 
   const filtered = agents?.filter(
@@ -35,13 +35,11 @@ export default function Agents() {
       </div>
 
       {isLoading ? (
-        <div className="text-muted/60 py-8 text-center text-sm">Loading...</div>
+        <LoadingState variant="list" />
       ) : error ? (
-        <div className="text-red-400 py-8 text-center text-sm">
-          Error: {error instanceof Error ? error.message : 'Unknown error'}
-        </div>
+        <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !filtered || filtered.length === 0 ? (
-        <EmptyState message="No agents found" />
+        <EmptyState message="No agents found" action={search ? { label: 'Clear search', onClick: () => setSearch('') } : undefined} />
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filtered.map((agent) => (

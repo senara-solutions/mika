@@ -16,7 +16,9 @@ All components implement the [luminescent-core](../../docs/design/luminescent-co
 | `<StatusBadge>` | Multi-state status indicator (6 variants: success/warning/error/info/neutral/blocked) | `{ variant, label, dotPulse? }` | Audited clean (mika#657) |
 | `<TaskStatusBadge>` | Task-domain status — thin adapter delegating to `<StatusBadge />` via typed task→variant mapping | `{ status: string }` | Audited clean (mika#657) |
 | `<Pagination>` | Table/list pagination | `{ page, totalPages, total, onPageChange }` | Audited clean (mika#663) |
-| `<EmptyState>` | Empty data placeholder | `{ message }` | — |
+| `<LoadingState>` | All loading states — skeleton placeholders for list and detail pages | `{ variant: 'list' \| 'detail', rows?, ariaLabel? }` | Audited clean (mika#658) |
+| `<EmptyState>` | All zero-result states — extended with optional action affordance | `{ message?, title?, icon?, variant?, action?: { label, onClick } }` | Audited clean (mika#658) |
+| `<ErrorState>` | All fetch-failure states — retry + details affordances, no raw stack traces | `{ message?, retry?, detailsHref?, variant?: 'list' \| 'detail-section' }` | Audited clean (mika#658) |
 | `<CopyButton>` | Click-to-copy with visual confirm | `{ text, className?, title? }` | — |
 | `<MarkdownContent>` | Render markdown content | `{ content }` | — |
 | `<ListRow>` | All `<tr>` row rendering in list/table surfaces (static, navigable, expandable) | `{ variant, onClick?, isExpanded?, onToggle?, ariaLabel? }` | Audited clean (mika#654) |
@@ -30,6 +32,7 @@ All components implement the [luminescent-core](../../docs/design/luminescent-co
 - **Escape hatch:** If a surface genuinely needs a pill shape not covered by `<StatusBadge />` (e.g., channel pills, source badges), document the justification in the PR description and name the gap. Do not silently hand-roll.
 - **Hand-rolled list rows are forbidden.** Any dashboard list page rendering `<tr>` with row-level `onClick` or inline hover styling outside `<ListRow />` is a review fail. Use `<ListRow variant="static|navigable|expandable" />`. See `luminescent-core.md` §5.2 for the affordance grammar.
 - **Hand-rolled categorical filters are forbidden.** Any dashboard list page rendering `<select>` for categorical filtering (agent, channel, status, event type, etc.) outside `<SelectFilter />` or `<AgentFilter />` is a review fail. See `luminescent-core.md` §5.3 for the filter affordance grammar.
+- **Hand-rolled lifecycle states are forbidden.** Any dashboard page rendering raw `Loading...` text, `text-red-400` error divs, or inline loading/error ternaries outside `<LoadingState />`, `<ErrorState />`, and `<EmptyState />` is a review fail. Error messages must use `formatApiError(error)` — never raw `error.message`. See `luminescent-core.md` §5.5 for the state catalog grammar.
 
 ### `<AgentFilter />` callsite pattern
 
@@ -39,6 +42,28 @@ Consumer is responsible for fetching agents. `<AgentFilter />` does NOT call `us
 const { data: agents } = useAgents()  // query key: ['agents'] — verify cache shape if duplicating
 return <AgentFilter agents={agents} value={filters.agent_id ?? ''} onChange={(v) => updateFilter('agent_id', v)} />
 ```
+
+### Lifecycle state callsite pattern
+
+Every `useQuery` consumer renders three states before the happy path. The canonical ternary:
+
+```tsx
+import { LoadingState, ErrorState, EmptyState, formatApiError } from '@senara-solutions/ui'
+
+const { data, isLoading, error, refetch } = useMyQuery(filters)
+
+{isLoading ? (
+  <LoadingState variant="list" />
+) : error ? (
+  <ErrorState message={formatApiError(error)} retry={() => refetch()} />
+) : !data || data.data.length === 0 ? (
+  <EmptyState message="No items match your filters" action={hasFilters ? { label: 'Clear filters', onClick: clearFilters } : undefined} />
+) : (
+  /* happy-path content */
+)}
+```
+
+Detail pages use `variant="detail"` for `<LoadingState />` and early returns instead of ternaries. Sub-section errors use `variant="detail-section"` for compact inline display.
 
 ## Commands
 
