@@ -16,8 +16,8 @@ export interface TimelineFilters {
   event_type?: string
   trace_id?: string
   session_id?: string
-  from?: number
-  to?: number
+  from?: string
+  to?: string
   page?: number
   per_page?: number
 }
