@@ -422,8 +422,16 @@ struct ContinuationResult {
 ///
 /// `deadline` clamps the inner LLM-call timeout to `min(CONTINUATION_TIMEOUT_SECS,
 /// deadline - now)`. The caller is expected to gate entry on `deadline > now +
-/// CONTINUATION_TIMEOUT_SECS` (see mika#848 F3a) — the `debug_assert!` here is
-/// the test-time enforcement that this gate fires first.
+/// CONTINUATION_TIMEOUT_SECS` (see mika#848 F3a). If the gate ever drifts and we
+/// land here with the deadline already passed, the runtime fast-path below
+/// returns the structured fallback without firing a zero-timeout LLM call —
+/// otherwise we would re-introduce the in-flight-cancel bug at smaller scale.
+///
+/// **mika#848 F3c**: persists an `llm_calls` row for the continuation LLM call
+/// in all three outcomes (success, API error, deadline-clamped timeout) so the
+/// continuation turn is never the silent-drop variant of the in-flight-cancel
+/// bug at smaller scale.
+#[allow(clippy::too_many_arguments)]
 async fn attempt_continuation_turn(
     request: &mut LlmRequest,
     llm: &dyn LlmProvider,
@@ -431,6 +439,11 @@ async fn attempt_continuation_turn(
     system_prompt_original_len: usize,
     label: &str,
     deadline: Instant,
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    store_llm_calls: bool,
+    prompt_variant: Option<&str>,
 ) -> ContinuationResult {
     // Strip the step-awareness nudge from the system prompt so the continuation
     // turn does not see stale "2 steps remaining" text.
@@ -446,32 +459,63 @@ async fn attempt_continuation_turn(
         ),
     });
 
-    // Clamp the continuation timeout to the remaining deadline budget so an
-    // in-flight LLM call here can never push the turn past the agent total
-    // timeout. The caller's gate (mika#848 F3a) should have already prevented
-    // entry when remaining < CONTINUATION_TIMEOUT_SECS.
+    // Runtime invariant guard (release-mode safe — replaces a release-stripped
+    // debug_assert!): if the F3a gate ever drifts and lets us through with no
+    // remaining budget, do NOT fire a zero-timeout LLM call (which would drop
+    // the in-flight reqwest mid-flight, re-introducing mika#848 at smaller
+    // scale). Emit the structured fallback and return.
     let now = Instant::now();
-    debug_assert!(
-        deadline > now,
-        "deadline already passed at continuation entry — gate (F3a) should have prevented this"
-    );
+    if deadline <= now {
+        warn!(
+            target: "mika::otel",
+            label,
+            tool_calls = tool_call_summaries.len(),
+            "continuation entered with deadline already passed — F3a gate drift; emitting fallback without LLM call"
+        );
+        return ContinuationResult {
+            text: format_step_exceeded_fallback(tool_call_summaries),
+            usage: None,
+        };
+    }
     let remaining = deadline.saturating_duration_since(now);
     let continuation_timeout =
         std::cmp::min(Duration::from_secs(CONTINUATION_TIMEOUT_SECS), remaining);
 
+    let llm_call_start = std::time::Instant::now();
     let continuation = tokio::time::timeout(continuation_timeout, llm.send_message(request)).await;
+    let latency_ms = llm_call_start.elapsed().as_millis() as u64;
 
     match continuation {
         Ok(Ok(resp)) => {
             let t = mika_common::llm::strip_internal_tags(&resp.text());
-            let u = Some(resp.usage);
+            let stop = format!("{:?}", resp.stop_reason);
+            let usage = resp.usage;
+            if store_llm_calls {
+                save_continuation_llm_call(
+                    db,
+                    session_id,
+                    trace_id,
+                    llm.provider_name(),
+                    llm.model_name(),
+                    Some(&usage),
+                    Some(&stop),
+                    "success",
+                    None,
+                    latency_ms,
+                    prompt_variant,
+                )
+                .await;
+            }
             if t.is_empty() {
                 ContinuationResult {
                     text: format_step_exceeded_fallback(tool_call_summaries),
-                    usage: u,
+                    usage: Some(usage),
                 }
             } else {
-                ContinuationResult { text: t, usage: u }
+                ContinuationResult {
+                    text: t,
+                    usage: Some(usage),
+                }
             }
         }
         Ok(Err(e)) => {
@@ -481,6 +525,22 @@ async fn attempt_continuation_turn(
                 label,
                 "continuation turn API error after max steps"
             );
+            if store_llm_calls {
+                save_continuation_llm_call(
+                    db,
+                    session_id,
+                    trace_id,
+                    llm.provider_name(),
+                    llm.model_name(),
+                    None,
+                    None,
+                    "error",
+                    Some(&e.to_string()),
+                    latency_ms,
+                    prompt_variant,
+                )
+                .await;
+            }
             ContinuationResult {
                 text: format_step_exceeded_fallback(tool_call_summaries),
                 usage: None,
@@ -493,11 +553,82 @@ async fn attempt_continuation_turn(
                 label,
                 "continuation turn timed out after max steps"
             );
+            if store_llm_calls {
+                save_continuation_llm_call(
+                    db,
+                    session_id,
+                    trace_id,
+                    llm.provider_name(),
+                    llm.model_name(),
+                    None,
+                    None,
+                    "timeout",
+                    Some(&format!(
+                        "continuation deadline-clamp timeout ({}s)",
+                        continuation_timeout.as_secs()
+                    )),
+                    latency_ms,
+                    prompt_variant,
+                )
+                .await;
+            }
             ContinuationResult {
                 text: format_step_exceeded_fallback(tool_call_summaries),
                 usage: None,
             }
         }
+    }
+}
+
+/// Persist an `llm_calls` row for a continuation-turn LLM call. Used in all three
+/// outcome arms (success, API error, deadline-clamped timeout) so the continuation
+/// turn is never the silent-drop variant of mika#848. Step is encoded as
+/// `u32::MAX` to distinguish continuation calls from in-loop step indices.
+#[allow(clippy::too_many_arguments)]
+async fn save_continuation_llm_call(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    provider: &str,
+    model: &str,
+    usage: Option<&LlmUsage>,
+    stop_reason: Option<&str>,
+    status: &str,
+    error: Option<&str>,
+    latency_ms: u64,
+    prompt_variant: Option<&str>,
+) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (input, output, cache_read, cache_write) = match usage {
+        Some(u) => (
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+        ),
+        None => (0, 0, None, None),
+    };
+    if let Err(e) = db
+        .save_llm_call(
+            &id,
+            session_id,
+            Some(trace_id),
+            provider,
+            model,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            latency_ms,
+            stop_reason,
+            status,
+            error,
+            u32::MAX,
+            prompt_variant,
+        )
+        .await
+    {
+        warn!(error = %e, "failed to save continuation llm_call record");
     }
 }
 
@@ -1966,6 +2097,11 @@ async fn run_agent_inner(
                 system_prompt_original_len,
                 "agent",
                 deadline,
+                db,
+                session_id,
+                trace_id,
+                store_llm,
+                prompt_variant.as_deref(),
             )
             .await;
 
@@ -2804,6 +2940,11 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                 system_prompt_original_len,
                 trigger_label,
                 deadline,
+                db,
+                params.session_id,
+                &trace_id,
+                store_llm,
+                prompt_variant.as_deref(),
             )
             .await;
 
@@ -3187,6 +3328,11 @@ async fn run_team_agent_inner_impl(
                 system_prompt_original_len,
                 "team agent",
                 deadline,
+                params.db,
+                params.session_id,
+                &trace_id,
+                store_llm,
+                prompt_variant.as_deref(),
             )
             .await;
 

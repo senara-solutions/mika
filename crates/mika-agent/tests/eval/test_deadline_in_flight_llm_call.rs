@@ -99,6 +99,83 @@ async fn deadline_during_llm_call_persists_llm_calls_row() {
     );
 }
 
+/// **Plan AC F3c contract:** an LLM call inside `attempt_continuation_turn`
+/// must persist its `llm_calls` row in every outcome (success, API error,
+/// deadline-clamped timeout). Pre-fix, the continuation path called
+/// `llm.send_message` directly with no DB write — the silent-drop variant of
+/// the in-flight-cancel bug at smaller scale.
+///
+/// We test the API-error arm to lock in the persistence contract without the
+/// virtual-time complications of the deadline-clamp arm (which would require
+/// driving 20+ tool dispatches under `tokio::time::pause()`, where each tool's
+/// 30s `tokio::time::timeout` interacts non-trivially with auto-advance).
+///
+/// The key invariant: `attempt_continuation_turn` writes a row before
+/// returning, regardless of which arm fires. The success/error arms exercise
+/// the same `save_continuation_llm_call` helper as the timeout arm, so
+/// covering one structurally proves the others.
+#[tokio::test]
+async fn continuation_llm_call_persists_row_on_api_error() {
+    use mika_common::llm::LlmError;
+    use mika_common::llm::mock::tool_call_response;
+
+    let mut responses: Vec<MockResponse> = (0..20)
+        .map(|i| tool_call_response("search_memory", json!({"query": format!("q{i}")})))
+        .collect();
+    // 21st response is the continuation turn — fails with an HTTP 500.
+    // Pre-F3c, the continuation made the LLM call and discarded the error
+    // without persisting anything. Post-F3c, the error arm calls
+    // `save_continuation_llm_call` with status='error'.
+    responses.push(MockResponse::Error(LlmError::HttpError {
+        status: 500,
+        message: "Internal server error during continuation".into(),
+        retryable: false,
+    }));
+
+    let harness = EvalHarness::builder()
+        .responses(responses)
+        .build()
+        .await
+        .expect("harness build");
+
+    let trace = harness
+        .run("Drive max-steps then continuation.")
+        .await
+        .expect("agent run");
+
+    // 20 in-loop calls + 1 continuation error = 21 rows. Pre-F3c this would
+    // have been 20 — the continuation error was never persisted.
+    assert_eq!(
+        trace.llm_call_count, 21,
+        "F3c: continuation LLM call must persist its row even on API error (got {})",
+        trace.llm_call_count
+    );
+
+    // The 21st row should be status='error' with a non-empty error message
+    // pointing at the continuation, not at the in-loop steps.
+    let last_call = trace.llm_calls.last().expect("expected continuation row");
+    assert_eq!(
+        last_call.status, "error",
+        "continuation row should be status='error' on API failure; got '{}'",
+        last_call.status
+    );
+    assert!(
+        last_call
+            .error_message
+            .as_ref()
+            .is_some_and(|e| e.contains("Internal server error")),
+        "continuation error_message should propagate the API error; got {:?}",
+        last_call.error_message
+    );
+
+    // Output should be the structured fallback (not a panic, not silence).
+    let text = trace.output.text.expect("output text");
+    assert!(
+        text.contains("search_memory"),
+        "fallback should mention attempted tools; got: {text}"
+    );
+}
+
 /// Sanity: when the deadline is generous, the same setup runs to completion
 /// (the slow response resolves, the agent loop exits with `Done`, no fallback
 /// is emitted). Confirms that the deadline-exceeded path is what's being

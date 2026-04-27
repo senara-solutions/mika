@@ -38,12 +38,47 @@ if [ -z "${start:-}" ]; then
 fi
 
 # awk: starting at $start, track brace depth from the first `{` on the signature
-# line forward; emit the line range from start to the matching `}`.
+# line forward; emit the line range from start to the matching `}`. Skips braces
+# inside string literals (double-quoted, with backslash-escape support) and
+# inside line comments (`//`) so a stray `}` in a comment or string doesn't
+# terminate the function body prematurely. Block comments (`/* */`) are not
+# handled — the function body should not contain them; if a future addition does,
+# this script needs updating.
 end=$(awk -v s="$start" '
     NR < s { next }
     {
-        for (i = 1; i <= length($0); i++) {
+        in_str = 0
+        in_comment = 0
+        i = 1
+        n = length($0)
+        while (i <= n) {
             c = substr($0, i, 1)
+            if (in_comment) {
+                # rest of line is comment; skip to end
+                break
+            }
+            if (in_str) {
+                if (c == "\\") {
+                    # escape sequence — skip next char
+                    i += 2
+                    continue
+                }
+                if (c == "\"") {
+                    in_str = 0
+                }
+                i++
+                continue
+            }
+            # not in string or comment
+            if (c == "\"") {
+                in_str = 1
+                i++
+                continue
+            }
+            if (c == "/" && i < n && substr($0, i + 1, 1) == "/") {
+                in_comment = 1
+                break
+            }
             if (c == "{") {
                 depth++
                 seen = 1
@@ -54,6 +89,7 @@ end=$(awk -v s="$start" '
                     exit
                 }
             }
+            i++
         }
     }
 ' "$AGENT_FILE")
@@ -64,6 +100,10 @@ if [ -z "${end:-}" ]; then
 fi
 
 # Search for tokio::select! within the body. Reject any match.
+# Note: this is a substring grep, so aliasing (e.g., `use tokio::select as foo;
+# foo!`) would not be caught. The substring check is a guardrail for the common
+# case, not a fully precise static analysis. If aliasing becomes a real concern,
+# upgrade to a Rust-aware syntactic check.
 hits=$(sed -n "${start},${end}p" "$AGENT_FILE" | grep -n 'tokio::select!' || true)
 
 if [ -n "$hits" ]; then

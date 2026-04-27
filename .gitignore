@@ -36,3 +36,4 @@ node_modules
 
 # Lefthook
 lefthook-local.yml
+.context/compound-engineering/
