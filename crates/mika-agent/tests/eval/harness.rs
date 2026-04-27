@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 use tempfile::TempDir;
 
-use mika_agent::agent::{AgentParams, run_agent};
+use mika_agent::agent::{AgentParams, run_agent, run_agent_with_deadline};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
 use mika_agent::mcp::McpManager;
@@ -17,6 +17,7 @@ use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::LlmProvider;
 use mika_common::llm::mock::{MockLlmProvider, MockResponse};
+use tokio::time::Instant;
 
 use super::trace::AgentTrace;
 
@@ -96,6 +97,52 @@ impl EvalHarness {
         };
 
         let output = run_agent(&params).await?;
+        AgentTrace::from_run(
+            &self.db,
+            &self.trace_id,
+            self.mock_provider.as_deref(),
+            output,
+        )
+        .await
+    }
+
+    /// Run the agent with an explicit deadline, exercising the deadline-exceeded
+    /// code path without waiting for the production 5-minute budget.
+    ///
+    /// Pair with `tokio::time::pause()` and `delayed_response` mock entries to
+    /// simulate slow provider calls under virtual time. See mika#848 and the
+    /// `deadline_in_flight_llm_call` eval scenario for the canonical pattern.
+    pub async fn run_with_deadline(&self, message: &str, deadline: Instant) -> Result<AgentTrace> {
+        let params = AgentParams {
+            db: &self.db,
+            llm: self.llm.as_ref(),
+            tools: &self.tools,
+            skills: &self.skills,
+            user_message: message,
+            channel_type: "test",
+            session_id: &self.session_id,
+            home_dir: self.home_dir.path(),
+            is_onboarding: self.is_onboarding,
+            message_sender: self.message_sender.clone(),
+            skip_compaction: self.skip_compaction,
+            embedding_client: self.embedding_client.as_ref(),
+            thinking: None,
+            user_images: &[],
+            brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
+            github_app: None,
+            skills_dirty: &self.skills_dirty,
+            mcp_manager: self.mcp_manager.as_ref(),
+            global_home_dir: None,
+            is_callback_turn: self.is_callback_turn,
+            settings: Some(&self.settings),
+            trace_id: Some(self.trace_id.clone()),
+            correlated_task_id: None,
+            internal: self.internal,
+            pr_reviews_posted: None,
+        };
+
+        let output = run_agent_with_deadline(&params, deadline).await?;
         AgentTrace::from_run(
             &self.db,
             &self.trace_id,

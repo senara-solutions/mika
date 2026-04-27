@@ -107,6 +107,14 @@ jobs:
       - name: Check for unsafe byte-slice patterns
         run: bash scripts/check-byte-slices.sh
 
+  loop-select-lint:
+    name: Loop Select Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Reject tokio::select! inside run_loop (mika#848)
+        run: bash scripts/check-loop-select.sh
+
   pipeline-artifacts:
     name: Pipeline Artifacts
     runs-on: ubuntu-22.04

@@ -35,6 +35,7 @@ mod eval {
     mod test_basic_conversation;
     mod test_callback_turn;
     mod test_completion_claim_guard;
+    mod test_deadline_in_flight_llm_call;
     mod test_di_builders;
     mod test_error_handling;
     mod test_intent_precondition_guard;
