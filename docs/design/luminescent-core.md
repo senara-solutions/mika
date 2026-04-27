@@ -192,6 +192,58 @@ Dashboard list surfaces use one of two filter primitives. `<SelectFilter />` fro
 
 For AI platforms, we introduce the **Console Component**: A `surface_container_highest` block using **JetBrains Mono** text. It features no borders but utilizes a "Purple Glow" (a `primary` radial gradient at 5% opacity) in the top-right corner to suggest the agent is "thinking."
 
+### 5.5 State catalog grammar (loading / empty / error)
+
+Every list and detail surface in the dashboard renders one of three lifecycle states before the happy-path content: **loading** (fetch in progress), **empty** (request succeeded, zero results), **error** (fetch failed). The canonical primitives are `<LoadingState />`, `<EmptyState />`, `<ErrorState />` from `@senara-solutions/ui`. Hand-rolling these states (raw `Loading...` text, `text-red-400` error banners, untreated `null` returns) is a review fail.
+
+**Visual reference:** Stitch screen `be408326efc949e49b8ab6d7c524b5f9` ("Mika State Catalog Reference") — 6 panels showing list-context and detail-context patterns.
+
+| Primitive | Use for | Variant API |
+|---|---|---|
+| `<LoadingState variant="list" \| "detail" />` | Skeleton placeholder. List variant renders a header row + N skeleton rows preserving column widths. Detail variant renders metadata-strip skeleton + paragraph blocks + sub-section skeletons. | `variant` selects layout; `rows?` overrides default row count for list. |
+| `<EmptyState message title? icon? action? variant? />` | Successful fetch, zero results. List context: contained within the table chrome (filter row + breadcrumbs stay visible). Detail sub-section context: compact inline message, no chrome. | `variant: 'minimal' \| 'card'` (existing); `action: { label, onClick }` (new) for "Clear filters" affordances. |
+| `<ErrorState message? retry? detailsHref? variant? />` | Fetch failed. List: contained, primary "Retry" button + secondary "View error details ↗" link. Detail sub-section: compact inline, "Retry" link only. **Never expose raw stack traces — error wording must be human-shaped.** | `variant: 'list' \| 'detail-section'`; `retry: () => void` triggers refetch; `detailsHref?: string` opens log viewer or null if no detail surface available. |
+
+**Loading skeleton contract:**
+- Skeleton rectangles use `surface_container_high` (per rulebook §2 surface hierarchy) with the `animate-pulse` Tailwind utility for subtle motion. Pulse speed must be slow (~2s) — the rulebook prohibits attention-stealing animation.
+- List skeleton preserves column widths from the actual table — the user sees structure forming, not a spinner-shaped void. This matches Stitch screen row-1 panel 1.
+- Detail skeleton preserves the page's metadata strip + main panel + sub-section table layout.
+- v1 ships uniform skeleton row heights. If post-ship UX feedback identifies specific pages where skeleton→content column-width jitter is unacceptable, follow-up trigger is to add a `columns?: { widths: string[] }` prop to `<LoadingState />`.
+
+**Wrapper-component constraint:**
+
+The three primitives are consumed directly. **No `<QueryStates />` or similar wrapper component that reads query-library state (e.g., `query.isLoading`) is canonical.** A wrapper would couple `packages/ui/` to the query library's shape, breaking the library's backend-agnostic posture. If a consumer wants a convenience layer, it lives in `dashboard/src/components/`, not in `packages/ui/`.
+
+**Error-message conversion:**
+
+Consumers MUST convert raw error objects to human-shaped strings before passing to `<ErrorState message={...} />`. The canonical conversion path is `formatApiError(error: unknown): string` exported from `@senara-solutions/ui`. Three cases handled:
+- Network error (`TypeError: Failed to fetch` etc.) → "Network unreachable. Check your connection."
+- Server error with `detail` field (typical FastAPI/Axum error envelope) → use the detail text
+- Error instance → use the error message
+- Fallback (unknown shape) → "An unexpected error occurred."
+
+`<ErrorState message={formatApiError(error)} />` is the canonical callsite pattern. Do not pass `error.message` directly — that exposes raw internals to users. Do not invent per-page prose conventions — use the utility so all pages produce uniform error grammar.
+
+**`detailsHref` constraint:**
+
+`detailsHref` is provided for future log-viewer linkage. v1 consumers pass `undefined`. Do not invent a destination — wait for the log-viewer surface (separate ticket) to define its URL shape and mapping convention.
+
+**Empty state contract:**
+- Surrounding chrome (filter row, breadcrumbs, page title) MUST remain visible. The empty state is contained inside the table/panel container, not a full-page takeover. This matches Stitch row-1 panel 2.
+- Sub-section empty (detail context, e.g., "Tool Calls (0)") is a compact inline message in `on_surface_variant` color — no icon, no button. Matches Stitch row-2 panel 5.
+- `action?: { label, onClick }` renders a primary-colored tertiary text button (e.g., "Clear filters", "Try a wider time range").
+
+**Error state contract:**
+- Error icon uses `--color-error` (#ef4444) at low opacity — never raw red Tailwind classes (`text-red-400`).
+- Error wording is human-shaped: "Failed to load sessions. The dashboard server returned 500." NOT raw error.message dumps. The component accepts a `message?: string` override; if absent, renders a generic-but-context-appropriate fallback.
+- `retry: () => void` wires to the consumer's `useQuery` `refetch` function — primary gradient button per rulebook §5.
+- `detailsHref?: string` opens an error-details surface (initially: log viewer URL or trace ID search). Optional; if absent, no secondary link rendered.
+- **No raw stack traces, no `error.message` ternaries.** Consumers convert their error object to a human message before passing.
+
+**Keyboard:** all action elements (`<button>` for retry, `<a>` for details) are keyboard-accessible by default. Loading skeletons are not focusable (purely structural). Empty/error icons are decorative (`aria-hidden="true"`).
+
+**ARIA:** `<LoadingState />` includes `role="status"` and `aria-live="polite"` so screen readers announce loading. `<ErrorState />` includes `role="alert"` so screen readers escalate errors.
+
 ---
 
 ## 6. Roundness & Spacing
