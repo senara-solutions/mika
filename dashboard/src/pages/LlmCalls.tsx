@@ -1,7 +1,7 @@
 import { Link, useNavigate } from 'react-router'
 import { useLlmCalls, type LlmCallsFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, formatTimestamp } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, TimeRangeFilter, formatTimestamp } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
@@ -32,6 +32,8 @@ export default function LlmCalls() {
   const filters: LlmCallsFilters = {
     agent_id: searchParams.get('agent_id') ?? undefined,
     model: searchParams.get('model') ?? undefined,
+    from: searchParams.get('from') ?? undefined,
+    to: searchParams.get('to') ?? undefined,
     page: Number(searchParams.get('page')) || 1,
     per_page: 50,
   }
@@ -70,7 +72,14 @@ export default function LlmCalls() {
             value={filters.agent_id ?? ''}
             onChange={(v) => updateFilter('agent_id', v)}
           />
-          {(filters.agent_id || filters.model) && (
+          <TimeRangeFilter
+            value={{ from: filters.from, to: filters.to }}
+            onChange={(range) => {
+              updateFilter('from', range.from ?? '')
+              updateFilter('to', range.to ?? '')
+            }}
+          />
+          {(filters.agent_id || filters.model || filters.from || filters.to) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}
               className="text-xs text-muted/60 hover:text-muted transition-colors"
@@ -89,7 +98,7 @@ export default function LlmCalls() {
       ) : !data || data.data.length === 0 ? (
         <EmptyState
           message="No LLM calls match your filters"
-          action={(filters.agent_id || filters.model)
+          action={(filters.agent_id || filters.model || filters.from || filters.to)
             ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
             : undefined}
         />

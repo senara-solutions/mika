@@ -25,8 +25,8 @@ export interface LlmCallsFilters {
   agent_id?: string
   trace_id?: string
   model?: string
-  from?: number
-  to?: number
+  from?: string
+  to?: string
   page?: number
   per_page?: number
 }

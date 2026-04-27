@@ -25,8 +25,8 @@ export interface ToolCallsFilters {
   trace_id?: string
   tool_name?: string
   success?: string
-  from?: number
-  to?: number
+  from?: string
+  to?: string
   page?: number
   per_page?: number
 }

@@ -352,6 +352,8 @@ pub struct TaskFilters {
     pub agent_id: Option<String>,
     pub team_run_id_filter: Option<TeamRunIdFilter>,
     pub source: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 /// How to filter tasks by team_run_id.
@@ -7496,12 +7498,15 @@ impl Database {
     }
 
     /// List sessions with optional filters and pagination.
+    #[allow(clippy::too_many_arguments)]
     pub fn list_sessions_paginated(
         &self,
         agent_id: Option<&str>,
         channel_type: Option<&str>,
         session_id: Option<&str>,
         task_id: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SessionWithStats>> {
@@ -7529,6 +7534,14 @@ impl Database {
                 "COALESCE(s.task_id, json_extract(s.metadata, '$.task_id')) = ?{}",
                 param_values.len()
             ));
+        }
+        if let Some(f) = from {
+            param_values.push(f.to_string());
+            conditions.push(format!("s.started_at >= ?{}", param_values.len()));
+        }
+        if let Some(t) = to {
+            param_values.push(t.to_string());
+            conditions.push(format!("s.started_at <= ?{}", param_values.len()));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -7578,6 +7591,8 @@ impl Database {
         channel_type: Option<&str>,
         session_id: Option<&str>,
         task_id: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
     ) -> Result<u64> {
         let mut conditions = Vec::new();
         let mut param_values: Vec<String> = Vec::new();
@@ -7603,6 +7618,14 @@ impl Database {
                 "COALESCE(task_id, json_extract(metadata, '$.task_id')) = ?{}",
                 param_values.len()
             ));
+        }
+        if let Some(f) = from {
+            param_values.push(f.to_string());
+            conditions.push(format!("started_at >= ?{}", param_values.len()));
+        }
+        if let Some(t) = to {
+            param_values.push(t.to_string());
+            conditions.push(format!("started_at <= ?{}", param_values.len()));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -7886,6 +7909,16 @@ impl Database {
             conditions.push(format!("source = ?{}", params.len()));
         }
 
+        if let Some(ref from) = filters.from {
+            params.push(from.clone());
+            conditions.push(format!("created_at >= ?{}", params.len()));
+        }
+
+        if let Some(ref to) = filters.to {
+            params.push(to.clone());
+            conditions.push(format!("created_at <= ?{}", params.len()));
+        }
+
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
@@ -7996,21 +8029,26 @@ impl Database {
     }
 
     /// List sessions and count in a single closure.
+    #[allow(clippy::too_many_arguments)]
     pub fn list_sessions_paginated_with_count(
         &self,
         agent_id: Option<&str>,
         channel_type: Option<&str>,
         session_id: Option<&str>,
         task_id: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<SessionWithStats>, u64)> {
-        let count = self.count_sessions(agent_id, channel_type, session_id, task_id)?;
+        let count = self.count_sessions(agent_id, channel_type, session_id, task_id, from, to)?;
         let data = self.list_sessions_paginated(
             agent_id,
             channel_type,
             session_id,
             task_id,
+            from,
+            to,
             limit,
             offset,
         )?;
@@ -8094,43 +8132,60 @@ impl Database {
     pub fn list_dev_runs_paginated_with_count(
         &self,
         status: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<Task>, u64)> {
-        let (count_sql, data_sql, status_param);
+        let mut conditions = vec![
+            "trigger_type = 'manual'".to_string(),
+            "source IN ('self_dev', 'github_issue')".to_string(),
+        ];
+        let mut param_values: Vec<String> = Vec::new();
 
         if let Some(s) = status {
-            status_param = Some(s.to_string());
-            count_sql = "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue') AND status = ?1";
-            data_sql = format!(
-                "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue') AND status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
-                Self::TASK_COLUMNS
-            );
-        } else {
-            status_param = None;
-            count_sql = "SELECT COUNT(*) FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue')";
-            data_sql = format!(
-                "SELECT {} FROM tasks WHERE trigger_type = 'manual' AND source IN ('self_dev', 'github_issue') ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
-                Self::TASK_COLUMNS
-            );
+            param_values.push(s.to_string());
+            conditions.push(format!("status = ?{}", param_values.len()));
+        }
+        if let Some(f) = from {
+            param_values.push(f.to_string());
+            conditions.push(format!("created_at >= ?{}", param_values.len()));
+        }
+        if let Some(t) = to {
+            param_values.push(t.to_string());
+            conditions.push(format!("created_at <= ?{}", param_values.len()));
         }
 
-        let count: u64 = if let Some(ref s) = status_param {
-            self.conn
-                .query_row(count_sql, params![s], |r| r.get::<_, i64>(0))? as u64
-        } else {
-            self.conn.query_row(count_sql, [], |r| r.get::<_, i64>(0))? as u64
-        };
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
 
-        let data: Vec<Task> = if let Some(ref s) = status_param {
-            let mut stmt = self.conn.prepare(&data_sql)?;
-            stmt.query_map(params![s, limit as i64, offset as i64], Self::row_to_task)?
-                .collect::<rusqlite::Result<_>>()?
-        } else {
-            let mut stmt = self.conn.prepare(&data_sql)?;
-            stmt.query_map(params![limit as i64, offset as i64], Self::row_to_task)?
-                .collect::<rusqlite::Result<_>>()?
-        };
+        let count_sql = format!("SELECT COUNT(*) FROM tasks {}", where_clause);
+        let data_sql = format!(
+            "SELECT {} FROM tasks {} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+            Self::TASK_COLUMNS,
+            where_clause,
+            param_values.len() + 1,
+            param_values.len() + 2,
+        );
+
+        let mut count_stmt = self.conn.prepare(&count_sql)?;
+        let boxed_count: Vec<Box<dyn rusqlite::types::ToSql>> = param_values
+            .iter()
+            .map(|s| Box::new(s.clone()) as _)
+            .collect();
+        let count_refs: Vec<&dyn rusqlite::types::ToSql> =
+            boxed_count.iter().map(|p| &**p).collect();
+        let count: u64 = count_stmt.query_row(&*count_refs, |r| r.get::<_, i64>(0))? as u64;
+
+        let mut data_stmt = self.conn.prepare(&data_sql)?;
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            param_values.into_iter().map(|s| Box::new(s) as _).collect();
+        all_params.push(Box::new(limit as i64));
+        all_params.push(Box::new(offset as i64));
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| &**p).collect();
+        let data: Vec<Task> = data_stmt
+            .query_map(&*param_refs, Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
 
         Ok((data, count))
     }
@@ -10507,12 +10562,103 @@ mod tests {
         db.create_session("other-sess", "mika", "cli").unwrap();
 
         let sessions = db
-            .list_sessions_paginated(None, None, None, Some(&task_id), 50, 0)
+            .list_sessions_paginated(None, None, None, Some(&task_id), None, None, 50, 0)
             .unwrap();
         assert_eq!(sessions.len(), 2);
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"col-sess"));
         assert!(ids.contains(&"meta-sess-2"));
+    }
+
+    #[test]
+    fn test_sessions_time_range_filter() {
+        let db = db();
+        // Create sessions with known timestamps
+        db.create_session("s1", "mika", "cli").unwrap();
+        db.create_session("s2", "mika", "cli").unwrap();
+
+        // Query with from/to set to a window that includes all sessions (now-1h to now+1h)
+        let from_ts = crate::timestamp::now_minus(chrono::Duration::seconds(3600));
+        let to_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
+        let sessions = db
+            .list_sessions_paginated(None, None, None, None, Some(&from_ts), Some(&to_ts), 50, 0)
+            .unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // Query with from set to the far future — should return no sessions
+        let future_ts = "2099-01-01T00:00:00Z";
+        let sessions = db
+            .list_sessions_paginated(None, None, None, None, Some(future_ts), None, 50, 0)
+            .unwrap();
+        assert!(sessions.is_empty());
+
+        // Count should also respect the filter
+        let count = db
+            .count_sessions(None, None, None, None, Some(&from_ts), Some(&to_ts))
+            .unwrap();
+        assert_eq!(count, 2);
+        let count = db
+            .count_sessions(None, None, None, None, Some(future_ts), None)
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_tasks_time_range_filter() {
+        let db = db();
+        db.create_task(&new_task("mika", "task-a", "manual", "none"))
+            .unwrap();
+        db.create_task(&new_task("mika", "task-b", "manual", "none"))
+            .unwrap();
+
+        // Build filters with a wide time range
+        let from_ts = crate::timestamp::now_minus(chrono::Duration::seconds(3600));
+        let to_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
+        let filters = TaskFilters {
+            from: Some(from_ts),
+            to: Some(to_ts),
+            ..Default::default()
+        };
+        let (tasks, count) = db.list_tasks_paginated_with_count(&filters, 50, 0).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(count, 2);
+
+        // Narrow to the far future — no matches
+        let filters = TaskFilters {
+            from: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let (tasks, count) = db.list_tasks_paginated_with_count(&filters, 50, 0).unwrap();
+        assert!(tasks.is_empty());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_dev_runs_time_range_filter() {
+        let db = db();
+        // Create dev-run-shaped tasks (trigger_type=manual, source=self_dev)
+        let mut t = new_task("mika", "dev-run-1", "manual", "none");
+        t.source = Some("self_dev".to_string());
+        db.create_task(&t).unwrap();
+        let mut t2 = new_task("mika", "dev-run-2", "manual", "none");
+        t2.source = Some("self_dev".to_string());
+        db.create_task(&t2).unwrap();
+
+        // Wide time range — should get both
+        let from_ts = crate::timestamp::now_minus(chrono::Duration::seconds(3600));
+        let to_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
+        let (runs, count) = db
+            .list_dev_runs_paginated_with_count(None, Some(&from_ts), Some(&to_ts), 50, 0)
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(count, 2);
+
+        // Far future — no matches
+        let (runs, count) = db
+            .list_dev_runs_paginated_with_count(None, Some("2099-01-01T00:00:00Z"), None, 50, 0)
+            .unwrap();
+        assert!(runs.is_empty());
+        assert_eq!(count, 0);
     }
 
     #[test]

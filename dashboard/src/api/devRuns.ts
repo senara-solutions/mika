@@ -24,6 +24,8 @@ export interface DevRun {
 
 export interface DevRunsFilters {
   status?: string
+  from?: string
+  to?: string
   page?: number
   per_page?: number
 }

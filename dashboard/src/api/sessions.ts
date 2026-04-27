@@ -27,6 +27,8 @@ export interface SessionsFilters {
   agent_id?: string
   channel_type?: string
   session_id?: string
+  from?: string
+  to?: string
   page?: number
   per_page?: number
 }

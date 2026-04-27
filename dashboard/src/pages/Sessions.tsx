@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, ListRow, AgentFilter, SelectFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search, Terminal, MessageSquare, Users, Settings, ArrowRightLeft } from 'lucide-react'
 
@@ -39,6 +39,8 @@ export default function Sessions() {
     agent_id: searchParams.get('agent_id') ?? undefined,
     channel_type: searchParams.get('channel_type') ?? undefined,
     session_id: searchParams.get('session_id') ?? undefined,
+    from: searchParams.get('from') ?? undefined,
+    to: searchParams.get('to') ?? undefined,
     page: Number(searchParams.get('page')) || 1,
     per_page: 50,
   }
@@ -85,7 +87,14 @@ export default function Sessions() {
             onChange={(v) => updateFilter('channel_type', v)}
             options={CHANNEL_OPTIONS}
           />
-          {(filters.agent_id || filters.channel_type || filters.session_id) && (
+          <TimeRangeFilter
+            value={{ from: filters.from, to: filters.to }}
+            onChange={(range) => {
+              updateFilter('from', range.from ?? '')
+              updateFilter('to', range.to ?? '')
+            }}
+          />
+          {(filters.agent_id || filters.channel_type || filters.session_id || filters.from || filters.to) && (
             <button
               onClick={() => setSearchParams(new URLSearchParams())}
               className="text-xs text-muted/60 hover:text-muted transition-colors"
@@ -103,7 +112,7 @@ export default function Sessions() {
       ) : !data || data.data.length === 0 ? (
         <EmptyState
           message="No sessions match your filters"
-          action={(filters.agent_id || filters.channel_type || filters.session_id)
+          action={(filters.agent_id || filters.channel_type || filters.session_id || filters.from || filters.to)
             ? { label: 'Clear filters', onClick: () => setSearchParams(new URLSearchParams()) }
             : undefined}
         />

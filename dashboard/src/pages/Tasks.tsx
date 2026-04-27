@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, formatRelativeTime, type TimeRange } from '@senara-solutions/ui'
+import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 function TaskRow({ task, indent = 0 }: { task: TaskItem; indent?: number }) {
@@ -255,10 +256,10 @@ function Section({
   )
 }
 
-function WorkItemsSection() {
+function WorkItemsSection({ timeRange }: { timeRange: TimeRange }) {
   const [page, setPage] = useState(1)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
-  const filters: TasksFilters = { trigger_type: 'manual', page, per_page: 20 }
+  const filters: TasksFilters = { trigger_type: 'manual', from: timeRange.from, to: timeRange.to, page, per_page: 20 }
   const { data, isLoading, error, refetch } = useTasks(filters)
 
   const toggleExpanded = (id: string) => {
@@ -300,11 +301,13 @@ function WorkItemsSection() {
   )
 }
 
-function TeamRunTasksSection() {
+function TeamRunTasksSection({ timeRange }: { timeRange: TimeRange }) {
   const [page, setPage] = useState(1)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = {
     team_run_id: 'notnull',
+    from: timeRange.from,
+    to: timeRange.to,
     page,
     per_page: 20,
   }
@@ -349,12 +352,14 @@ function TeamRunTasksSection() {
   )
 }
 
-function StandaloneCallbacksSection() {
+function StandaloneCallbacksSection({ timeRange }: { timeRange: TimeRange }) {
   const [page, setPage] = useState(1)
   const filters: TasksFilters = {
     action_type: 'resume_agent,run_skill',
     team_run_id: 'null',
     trigger_type: 'callback',
+    from: timeRange.from,
+    to: timeRange.to,
     page,
     per_page: 20,
   }
@@ -384,10 +389,12 @@ function StandaloneCallbacksSection() {
   )
 }
 
-function ScheduledSection() {
+function ScheduledSection({ timeRange }: { timeRange: TimeRange }) {
   const [page, setPage] = useState(1)
   const filters: TasksFilters = {
     trigger_type: 'cron,one_shot',
+    from: timeRange.from,
+    to: timeRange.to,
     page,
     per_page: 20,
   }
@@ -450,6 +457,13 @@ function ScheduledSection() {
 }
 
 export default function Tasks() {
+  const { searchParams, setSearchParams, updateFilter } = useSearchParamsFilter()
+
+  const timeRange: TimeRange = {
+    from: searchParams.get('from') ?? undefined,
+    to: searchParams.get('to') ?? undefined,
+  }
+
   return (
     <div>
       <div className="mb-5">
@@ -459,10 +473,31 @@ export default function Tasks() {
         </p>
       </div>
 
-      <WorkItemsSection />
-      <TeamRunTasksSection />
-      <StandaloneCallbacksSection />
-      <ScheduledSection />
+      {/* Time range filter bar */}
+      <div className="bg-bg-card border border-white/[0.05] rounded-xl p-3 mb-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <TimeRangeFilter
+            value={{ from: timeRange.from, to: timeRange.to }}
+            onChange={(range) => {
+              updateFilter('from', range.from ?? '')
+              updateFilter('to', range.to ?? '')
+            }}
+          />
+          {(timeRange.from || timeRange.to) && (
+            <button
+              onClick={() => setSearchParams(new URLSearchParams())}
+              className="text-xs text-muted/60 hover:text-muted transition-colors"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      </div>
+
+      <WorkItemsSection key={`work-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
+      <TeamRunTasksSection key={`team-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
+      <StandaloneCallbacksSection key={`cb-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
+      <ScheduledSection key={`sched-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
     </div>
   )
 }

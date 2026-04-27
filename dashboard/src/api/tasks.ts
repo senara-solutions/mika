@@ -59,6 +59,8 @@ export interface TasksFilters {
   agent_id?: string
   team_run_id?: string
   source?: string
+  from?: string
+  to?: string
   page?: number
   per_page?: number
 }

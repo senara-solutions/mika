@@ -98,6 +98,8 @@ impl From<Task> for DevRunResponse {
 #[derive(Debug, Deserialize)]
 pub struct DevRunsQuery {
     pub status: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -113,7 +115,7 @@ pub async fn handle_dev_runs_list(
 
     let (data, total) = match state
         .dashboard_db
-        .list_dev_runs_paginated_with_count(q.status, per_page, offset)
+        .list_dev_runs_paginated_with_count(q.status, q.from, q.to, per_page, offset)
         .await
     {
         Ok(result) => result,

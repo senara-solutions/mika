@@ -235,6 +235,8 @@ pub async fn handle_agent_sessions(
             None,
             None,
             None,
+            None,
+            None,
             per_page,
             offset,
         )
@@ -288,6 +290,8 @@ pub struct SessionsQuery {
     pub session_id: Option<String>,
     /// Filter sessions by correlated task_id (stored in session metadata JSON).
     pub task_id: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -306,6 +310,8 @@ pub async fn handle_sessions_list(
             q.channel_type,
             q.session_id,
             q.task_id,
+            q.from,
+            q.to,
             per_page,
             offset,
         )
@@ -543,6 +549,8 @@ pub struct TasksQuery {
     pub agent_id: Option<String>,
     pub team_run_id: Option<String>,
     pub source: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -567,6 +575,8 @@ pub async fn handle_tasks_list(
         agent_id: q.agent_id,
         team_run_id_filter,
         source: q.source,
+        from: q.from,
+        to: q.to,
     };
 
     let (data, total) = match state

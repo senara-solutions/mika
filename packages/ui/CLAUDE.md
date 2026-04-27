@@ -24,6 +24,7 @@ All components implement the [luminescent-core](../../docs/design/luminescent-co
 | `<ListRow>` | All `<tr>` row rendering in list/table surfaces (static, navigable, expandable) | `{ variant, onClick?, isExpanded?, onToggle?, ariaLabel? }` | Audited clean (mika#654) |
 | `<SelectFilter>` | All categorical filters in dashboard list pages (channel, event type, status, success, etc.) | `{ ariaLabel, value, onChange, options }` | Audited clean (mika#655) |
 | `<AgentFilter>` | All agent-selection filters — thin adapter delegating to `<SelectFilter />` via consumer-injected `agents` prop | `{ agents, value, onChange, emptyLabel? }` | Audited clean (mika#655) |
+| `<TimeRangeFilter>` | All time-range filtering on dashboard list surfaces (presets + custom picker, ISO 8601 emission, server-side enforcement) | `{ value: { from?, to? }, onChange: (range) => void }` | Audited clean (mika#659) |
 
 ## Enforcement Rules
 
@@ -33,6 +34,7 @@ All components implement the [luminescent-core](../../docs/design/luminescent-co
 - **Hand-rolled list rows are forbidden.** Any dashboard list page rendering `<tr>` with row-level `onClick` or inline hover styling outside `<ListRow />` is a review fail. Use `<ListRow variant="static|navigable|expandable" />`. See `luminescent-core.md` §5.2 for the affordance grammar.
 - **Hand-rolled categorical filters are forbidden.** Any dashboard list page rendering `<select>` for categorical filtering (agent, channel, status, event type, etc.) outside `<SelectFilter />` or `<AgentFilter />` is a review fail. See `luminescent-core.md` §5.3 for the filter affordance grammar.
 - **Hand-rolled lifecycle states are forbidden.** Any dashboard page rendering raw `Loading...` text, `text-red-400` error divs, or inline loading/error ternaries outside `<LoadingState />`, `<ErrorState />`, and `<EmptyState />` is a review fail. Error messages must use `formatApiError(error)` — never raw `error.message`. See `luminescent-core.md` §5.5 for the state catalog grammar.
+- **Hand-rolled time-range filters are forbidden.** Any dashboard list page rendering relative-time presets or `<input type="datetime-local">` for time filtering outside `<TimeRangeFilter />` is a review fail. See `luminescent-core.md` §5.4 for the time-range affordance grammar.
 
 ### `<AgentFilter />` callsite pattern
 
@@ -64,6 +66,33 @@ const { data, isLoading, error, refetch } = useMyQuery(filters)
 ```
 
 Detail pages use `variant="detail"` for `<LoadingState />` and early returns instead of ternaries. Sub-section errors use `variant="detail-section"` for compact inline display.
+
+### `<TimeRangeFilter />` callsite pattern
+
+`<TimeRangeFilter />` is URL-state friendly — read `from`/`to` from `searchParams`, pass back via `updateFilter`:
+
+```tsx
+import { TimeRangeFilter } from '@senara-solutions/ui'
+import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
+
+const { searchParams, updateFilter } = useSearchParamsFilter()
+const value = {
+  from: searchParams.get('from') ?? undefined,
+  to: searchParams.get('to') ?? undefined,
+}
+
+return (
+  <TimeRangeFilter
+    value={value}
+    onChange={(range) => {
+      updateFilter('from', range.from ?? '')
+      updateFilter('to', range.to ?? '')
+    }}
+  />
+)
+```
+
+The component emits ISO 8601 UTC strings; backends compare TEXT columns lexicographically (chronological-equivalent for ISO 8601). Filter typings declare `from?: string; to?: string` — never `number`.
 
 ## Commands
 
