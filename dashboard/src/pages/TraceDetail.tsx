@@ -570,7 +570,7 @@ export default function TraceDetail() {
       )}
 
       {isLoading ? (
-        <LoadingState variant="list" />
+        <LoadingState variant="detail" />
       ) : error ? (
         <ErrorState message={formatApiError(error)} retry={() => { refetchEvents(); refetchMessages() }} />
       ) : timeline.length === 0 ? (

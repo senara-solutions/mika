@@ -371,14 +371,12 @@ export default function DevRunDetail() {
             }
           >
             {issueLoading && (
-              <div className="text-muted/40 text-xs">Loading issue...</div>
+              <div className="text-muted/40 text-xs animate-pulse">Loading issue...</div>
             )}
             {issueError && (
               <ErrorState
                 variant="detail-section"
-                message={(issueError as Error).message?.includes('503')
-                  ? 'GitHub integration not available'
-                  : 'Failed to load issue'}
+                message={formatApiError(issueError)}
                 retry={() => refetchIssue()}
               />
             )}
@@ -443,14 +441,12 @@ export default function DevRunDetail() {
             }
           >
             {pullLoading && (
-              <div className="text-muted/40 text-xs">Loading PR...</div>
+              <div className="text-muted/40 text-xs animate-pulse">Loading PR...</div>
             )}
             {pullError && (
               <ErrorState
                 variant="detail-section"
-                message={(pullError as Error).message?.includes('503')
-                  ? 'GitHub integration not available'
-                  : 'Failed to load PR'}
+                message={formatApiError(pullError)}
                 retry={() => refetchPull()}
               />
             )}

@@ -395,7 +395,7 @@ export default function SessionDetail() {
   const [investigationScope, setInvestigationScope] = useState<InvestigationScope | null>(null)
 
   const { data: session, isLoading: sessionLoading, isError: sessionError, error: sessionErr, refetch } = useSessionDetail(sessionId ?? '')
-  const { data: messages, isLoading: messagesLoading, isError: messagesError, error: messagesErr } = useSessionMessages(
+  const { data: messages, isLoading: messagesLoading, isError: messagesError, error: messagesErr, refetch: refetchMessages } = useSessionMessages(
     sessionId ?? '',
     page,
   )
@@ -815,7 +815,7 @@ export default function SessionDetail() {
       {isLoading ? (
         <LoadingState variant="detail" />
       ) : isError ? (
-        <ErrorState message={formatApiError(sessionErr ?? messagesErr)} retry={() => refetch()} />
+        <ErrorState message={formatApiError(sessionErr ?? messagesErr)} retry={() => { refetch(); refetchMessages() }} />
       ) : activeTab === 'messages' ? (
         /* Messages tab */
         isTeamSession ? (
