@@ -133,6 +133,21 @@ When you receive a GitHub webhook event for `pull_request.closed`:
 
 ---
 
+## Verdict Class: `recover_unpushed_work` (callback-originated, NOT webhook-originated)
+
+**Verdict class `recover_unpushed_work`** is handled in `self-dev/system_prompt.md`, not here. It fires when claude-pilot returns the `error_max_turns` marker (or the conservative stale-in-progress heuristic triggers) AND the task's branch has unpushed local commits verified via `git log origin/main..<branch>`.
+
+**Webhook handler interaction (all event types — including `pull_request_review.submitted`):** Before routing any verdict in Step 3, check if the correlated task (Step 4) has `unpushed_recovery_pending: true` in its metadata. If set, skip ALL verdict processing regardless of verdict type (`pass`, `hold`, `block[ci]`, `block[ac]`, etc.) and stale event type (`check_suite`, `pull_request_review`):
+- Do NOT call `pr_merge_with_gate`
+- Do NOT auto-retry via `run_claude_pilot`
+- Do NOT increment `pipeline_retry_count`, `qa_retry_count`, or `ci_fix_count`
+- Do NOT transition the task to `blocked` or `failed`
+- Acknowledge the event, notify Vincent "Stale webhook for recovery-pending task — skipping verdict processing", and stop — the operator recovery path owns this task
+
+**Cross-reference:** mika#838, mika#825 (`block[ac]` precedent for operator-routed verdicts).
+
+---
+
 ## Calibration Rules
 
 These rules encode specific failure modes observed in live dev runs. Each rule cites the incident that motivated it.
