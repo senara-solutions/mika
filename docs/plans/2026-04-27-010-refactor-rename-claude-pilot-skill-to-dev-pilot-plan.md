@@ -68,15 +68,23 @@ This plan implements the rename. It keeps the app identity (`claude-pilot` binar
 - `mika/docs/solutions/architecture-patterns/cli-skill-always-on-transient-override.md` — skill registry semantics.
 - `mika-platform/docs/solutions/best-practices/pre-filing-scope-verification-2026-04-27.md` — same discipline at meta-repo level.
 
-### Architect Verdict (Pre-Filing Consult)
+### Architect Verdict (Pre-Filing Consult + First-Pass Groom Review)
 
-- **Session:** `46084b1a-d873-4e8a-92ae-4e76b0396348` (2026-04-27, mika-arch).
-- **Disposition:** ITERATE.
-- **Iterations folded:**
+- **Pre-filing session:** `46084b1a-d873-4e8a-92ae-4e76b0396348` (2026-04-27, mika-arch). Disposition: ITERATE. Iterations folded into ticket body before filing:
   1. mika#806 cited as parent debt for broader skill-routing eval coverage; this plan adds two minimal inline `skill:`-arg assertions.
   2. Open-issue body sweep added to D2 audit policy (mika#784 is the named example: title says "claude-pilot handler" in skill-meaning context).
   3. Pre-deploy SQL probe codified in D3 (against `~/.mika/data/mika.db`, 30-minute threshold).
   4. mika#843 sequencing coupling noted in companion ticket (mika#845, not this plan).
+
+- **First-pass groom-ticket session:** `d20ac2fb-bb61-4822-ba0a-4c07d73014a3` (2026-04-27, mika-arch). Disposition: ITERATE with 8 findings + 1 conditional dispatch-blocker. Iterations folded into this plan revision:
+  1. F1 — Unit 1 names KG seed discovery command + expected output shape.
+  2. F2 — D2 adds explicit three-category classification rubric (app/skill/ambiguous).
+  3. F3 — Unit 2 specifies the schema-validation error message format for missing/invalid `skill:` arg.
+  4. F4 (conditional dispatch-blocker, **resolved**) — Unit 6 simplified to reference the auto-rebuild mechanism in `kg/domain_builder.rs`. Verified Path A applies (sole-writer + idempotent + per-boot rebuild). No "file follow-up" workaround needed.
+  5. F5 — branch renamed to `refactor/844/...` to align with plan filename + work shape; D4 documents the deviation.
+  6. F6 — D3 names the rationale for the 1800-second threshold (pragmatic + empirical bounds on typical claude-pilot dispatch length).
+  7. F7 — Unit 5 adds edit-vs-comment criteria for issue body sweep (active-spec → edit; historical-record → comment).
+  8. F8 — Unit 2 pre-states mika#845 Path A/B branches with cross-ticket dependency note.
 
 ## Key Technical Decisions
 
@@ -96,9 +104,15 @@ For every file in the in-scope list (sibling skills, live docs, mika-platform re
 grep -n "claude-pilot\|claude_pilot\|ClaudePilot" <file>
 ```
 
-Each match is annotated as **app-meaning** (binary, log channel, log path, upstream repo, tool name → keep) or **skill-meaning** (dispatch role, skill registry lookup, skill prompt invocation → rename to `dev-pilot`). The annotated grep output is the auditable artifact in the PR description.
+Each match is annotated against the classification rubric below. The annotated grep output is the auditable artifact in the PR description.
 
-**Open-issue body sweep** (architect concern 2): before deploy, run `gh issue list --repo senara-solutions/mika --state open --search "claude-pilot"` and triage each open ticket body. Skill-meaning bodies (e.g. mika#784: "pre-push duplicate-commit guard in claude-pilot handler") get either a body edit or an addendum comment.
+**Classification rubric — three categories, named explicitly so per-line judgment is bounded by criteria, not implementer-discretion:**
+
+- **App-meaning (KEEP):** the match references the binary, the log channel `[claude-pilot]`, the log path `/var/log/claude-pilot/`, the metadata namespace `metadata.claude_pilot.*`, the upstream repo (`claude-pilot-py`, `senara-solutions/claude-pilot`), the source-prefix detection from mika#841, or the tool-label `run_claude_pilot`.
+- **Skill-meaning (RENAME to `dev-pilot`):** the match references the dispatch role, the bundled skill directory `mika/skills/bundled/claude-pilot/`, the `skill_id` value `"claude-pilot"`, or the skill-descriptor in KG seeds.
+- **Ambiguous (FLAG for second-pass review):** the match could plausibly read as either category; resolution requires reading surrounding prose context. Ambiguous matches are NOT renamed during Unit 4's mechanical pass — they're surfaced as a "needs review" subset in the PR description, and the reviewer (or architect at second-pass) settles each one. Without an explicit ambiguous bucket, a low-confidence implementer collapses to one category-or-the-other and silently misclassifies.
+
+**Open-issue body sweep** (architect concern 2): before deploy, run `gh issue list --repo senara-solutions/mika --state open --search "claude-pilot"` and triage each open ticket body. Skill-meaning bodies (e.g. mika#784: "pre-push duplicate-commit guard in claude-pilot handler") get either a body edit or an addendum comment per Unit 5's edit-vs-comment criteria.
 
 ### D3 — Clean cutover, gated by SQL pre-commit probe
 
@@ -108,11 +122,13 @@ Each match is annotated as **app-meaning** (binary, log channel, log path, upstr
 
 **Pre-deploy gate (mandatory):** the implementer runs the SQL probe documented in Unit 6 against `~/.mika/data/mika.db` immediately before deploy. `max_age_seconds < 1800` → proceed. `max_age_seconds >= 1800` → halt and escalate.
 
-### D4 — Plan filename type prefix is `refactor`; branch type stays `feat`
+**Rationale for the 1800-second (30-minute) threshold:** pragmatic — an in-flight `tasks` row older than 30 minutes is most likely either (a) a milestone-scope dispatch with hours of work that would lose progress to a fail-fast rejection on unknown skill name, or (b) already stalled/hung and worth operator attention regardless of the cutover. 30 minutes is also approximately the upper bound of a typical claude-pilot dispatch (well-formed runs complete in 20-25 minutes). Future operators tightening or loosening the threshold should anchor on this rationale, not pick a different round number.
 
-**Position:** plan filename uses `refactor` (semantic — this is a refactor, not new functionality). Branch stays `feat/844/...` per the spec default for `enhancement`-labeled issues (already created; renaming mid-flight is unnecessary churn).
+### D4 — Plan filename and branch both use `refactor` prefix
 
-**Rationale:** the `/mika-groom-ticket` spec says "Default `<type>` is `feat` for `enhancement`-labeled issues" — that drives the branch slug. Plan filename type is independent and can match the work's actual nature.
+**Position:** plan filename and branch both use `refactor` (semantic — this is a refactor, not new functionality). The spec default (`enhancement` label → `feat`) is overridden because the work shape (rename + registry update + no new behavior) is genuinely refactor.
+
+**Rationale:** the branch is the contract; the plan file is the artifact. Both should reflect the work's nature. Per the architect first-pass review (Finding 5), label-derived branch prefixes are a `/mika-groom-ticket` default convention that can deviate when the work shape doesn't match the label. The branch was originally created as `feat/844/...` per spec default and renamed to `refactor/844/rename-claude-pilot-skill-to-dev-pilot` after first-pass review (cheap — no remote tracking established at that point). The worktree directory path on disk stays `feat-844-...` (cosmetic; `git worktree move` would be unnecessary churn).
 
 ## Open Questions
 
@@ -150,6 +166,19 @@ Each match is annotated as **app-meaning** (binary, log channel, log path, upstr
 - Modify: `crates/mika-agent/src/skills/mod.rs` (~10 test fixture sites at lines 934, 974, 1049-1050, 1053, 1078, 1191, 1193 — rename)
 - Audit: `crates/mika-agent/src/db/kg_schema.rs` for any skill-descriptor entries (separate from the `tool:run_claude_pilot` entry at line 209-210); rename skill-meaning entries
 - Test: existing `cargo test --package mika-agent` suite (no new test files for this unit; existing tests verify registry integrity)
+
+**KG seed discovery command (per architect Finding 1 — converts "implementer audits the file" from ritual into mechanical assertion):**
+
+```
+grep -n '"claude-pilot"\|claude_pilot' crates/mika-agent/src/db/kg_schema.rs
+```
+
+Expected output: a non-empty list of `(line, kind)` pairs. The implementer classifies each per the D2 rubric:
+- **Tool-label entries** (e.g., `format_entity_key("tool", "run_claude_pilot")` at line 209-210): app-meaning. KEEP.
+- **Skill-descriptor entries** (e.g., `format_entity_key("skill", "claude-pilot")`, if any): skill-meaning. RENAME to `"dev-pilot"`.
+- **Ambiguous entries:** flag for D2's second-pass review.
+
+The same pattern applies to all D2-scoped files in Unit 4. This Unit 1 instance is named here because the KG seed is structurally different (Rust source code with `format_entity_key(...)` call sites, not prose) and the discovery command reflects that shape.
 
 **Approach:**
 - The skill directory rename + `skill.toml` `name=` field + Rust skill-ID lookups must move together as one atomic commit. Splitting them creates an interim broken-build state where the registry references a directory that no longer exists.
@@ -192,7 +221,15 @@ Each match is annotated as **app-meaning** (binary, log channel, log path, upstr
 **Approach:**
 - The tool's argument schema is the contract surface. Adding a required field is a breaking change for callers — but in this codebase the only callers are mika-dev's prompts (updated in Unit 4) and the skill executor itself (this unit). No external API consumers.
 - The `skill` arg propagates to `handlers/run.sh` as an env var or positional argument. The handler script uses it to load the right system prompt. (Today the handler is implicitly dispatch-only because there's only one skill on this app.)
-- For Unit 2 alone, the enum is `["dev-pilot"]` (single-value). When mika#845 ships, the enum extends. The implementer must check mika#845's status at implementation time to decide the enum.
+
+**Schema-validation error message (per architect Finding 3):** when a caller invokes `run_claude_pilot` without `skill:`, the schema-validation failure must produce an explicit, named error — not a generic schema-mismatch. Required form: `"missing required argument 'skill'; valid values: [<enum-values>]"`. When a caller provides an invalid enum value (e.g., `skill: "claude-pilot"` post-rename), the error must list the valid values. Operators reading logs and prompt authors debugging routing both depend on the named affordance.
+
+**mika#845 (dev-groom) cross-ticket dependency (per architect Finding 8) — pre-stated branches, not implementer-discretion:**
+
+- **Path A — mika#845 already merged at implementation time of this Unit:** Unit 2 enum is `["dev-pilot", "dev-groom"]`. Unit 3's inline assertions cover both routings: "implement <ticket-ref>" → `skill: "dev-pilot"`, "groom <ticket-ref>" → `skill: "dev-groom"`.
+- **Path B — mika#845 not yet merged:** Unit 2 enum is `["dev-pilot"]` only. mika#845's plan **must** include a step to extend the enum to include `"dev-groom"` as part of its own implementation. mika#845's ticket body and plan should reference mika#844's tool-schema as a hard dependency. Unit 3's inline assertion in this PR covers only the `"dev-pilot"` routing; the `"dev-groom"` assertion lands with mika#845.
+
+The implementer **must** check mika#845's merge status at the start of Unit 2 and select the path. Do not silently default to one branch.
 
 **Patterns to follow:**
 - Existing tool schema declarations in `crates/mika-agent/src/skills/mod.rs` for required-field patterns.
@@ -311,11 +348,17 @@ Each match is annotated as **app-meaning** (binary, log channel, log path, upstr
 
 **Approach:**
 - Run `gh issue list --repo senara-solutions/mika --state open --search "claude-pilot" --json number,title,body --limit 100`
-- For each result, classify the body's references:
+- For each result, classify the body's references per the D2 rubric:
   - **App-meaning only** (binary, log path, channel marker): skip; no change.
-  - **Skill-meaning** (the dispatch role, "claude-pilot handler", "claude-pilot skill", etc.): edit body OR add an addendum comment clarifying the rename.
-- For tickets with mixed references, prefer addendum comment (preserves original phrasing while disambiguating).
+  - **Skill-meaning** (the dispatch role, "claude-pilot handler", "claude-pilot skill", etc.): apply the edit-vs-comment criteria below.
+  - **Ambiguous:** flag for second-pass review; surface in the issue-sweep audit log.
 - Mika#784 is the named example from the architect verdict ("pre-push duplicate-commit guard in claude-pilot handler" — skill-meaning). Confirm the example during execution; treat the architect's classification as a hint, not absolute truth.
+
+**Edit-vs-comment criteria (per architect Finding 7) — distinction is contract-vs-history, not preference:**
+
+- **Body edit** (with edit-notice comment): the body's skill-meaning reference is in the **active-spec sections** — proposed solution, acceptance criteria, decisions, scope, requirements. Active spec is reviewed by future implementers and must reflect current naming, not 2026-04-27's pre-rename naming. Edit in place; post a brief edit-notice comment naming the rename and timestamp. Same shape as the issue-as-versioned-contract pattern previously used in mika#654.
+- **Addendum comment** (no body edit): the body's skill-meaning reference is in **historical-record sections** — problem statement, root-cause analysis, context, prior-art references, repro steps. Historical record stays accurate to time-of-filing; rewriting falsifies the lineage. Post a comment noting "naming update: post-mika#844, 'claude-pilot' here refers to the dispatch skill, now named `dev-pilot`."
+- **Mixed bodies:** apply per-section. Edit active-spec sections; comment on historical-record sections. Reasonably interpret section boundaries when the body lacks explicit headers.
 
 **Patterns to follow:**
 - `gh issue comment <n> --body-file <tmpfile>` for addendum comments.
@@ -360,8 +403,9 @@ WHERE status IN ('in_progress','pending');
 **Step 2 — Deploy sequence:**
 
 1. `make deploy` (per `mika-platform/CLAUDE.md` § Local Dev Environment) — builds binaries, installs, restarts the agent service.
-2. KG re-index: the seed entry change in `kg_schema.rs` lands automatically with the binary rebuild, but the live KG corpus may have stale `claude-pilot`-tagged chunks. Run the KG re-index command (per `mika/CLAUDE.md` deploy notes for KG-touching changes; if no documented command exists, file a follow-up sub-issue and accept the stale chunks as a known limitation for one cycle).
-3. Confirm the agent service is up: `mika ask "ping"` returns.
+2. **KG domain graph auto-rebuilds on next server boot — no explicit command needed.** Per `crates/mika-agent/src/kg/domain_builder.rs` (verified during architect Finding 4 resolution): the domain builder is the **sole writer** of `skill:*`, `tool:*`, `agent:*`, and `problem_type:*` entity_keys; runs once per server boot after `SkillRegistry::apply_overrides()`; idempotent — re-running produces the same graph state. The `make deploy` → restart cycle auto-rebuilds from the in-memory `SkillRegistry`/`ToolRegistry` (which read from `kg_schema.rs` constants and the loaded skill manifests). Stale `claude-pilot` skill-descriptor entries in the live `kg_entities` table are overwritten on next boot.
+3. **Lexical and subject KG layers are out of scope.** `docs/solutions/**/*.md` chunks are only re-ingested when content hashes change. Historical mentions of `claude-pilot` in solutions docs stay (per Scope Boundaries — historical records are not retroactively renamed).
+4. Confirm the agent service is up: `mika ask "ping"` returns.
 
 **Step 3 — End-to-end smoke (mandatory before declaring deploy done):**
 
@@ -399,7 +443,7 @@ WHERE status IN ('in_progress','pending');
 | Risk | Mitigation |
 |------|------------|
 | In-flight tasks at deploy time reference old skill ID and fail to resume | SQL probe gate (D3) — halt deploy if max age ≥ 30 min |
-| KG corpus has stale `claude-pilot`-tagged chunks post-deploy that bias mika-dev's tool selection | Unit 6 deploy step explicitly includes KG re-index; if no command exists, file follow-up sub-issue and accept stale chunks for one cycle |
+| KG domain graph has stale `skill:claude-pilot` entries post-deploy | Auto-resolved: domain builder is sole writer + idempotent + runs on every boot. Verified in architect Finding 4 resolution. The lexical/subject layers (which contain historical `claude-pilot` mentions in `docs/solutions/`) are intentionally out of scope per the historical-records exclusion |
 | Per-line audit (D2) misclassifies a match (e.g., reads "claude-pilot finishes" as skill-meaning, renames it, breaks app-meaning prose) | Grep-and-annotate verification block in PR description is the auditable artifact; reviewer cross-checks each annotation against the diff |
 | Open-issue body sweep (Unit 5) misses tickets filed during the implementation window | Re-run sweep at deploy time (Unit 6 verification) so the sweep is current as of the cutover, not as of when the PR was opened |
 | Tool-schema breaking change (Unit 2) propagates to a call site we didn't audit | Inline assertion (Unit 3) catches mika-dev routing; integration smoke (Unit 6) catches end-to-end. Surfaces from any external caller would manifest as schema-validation errors at runtime, surfaceable via logs |
