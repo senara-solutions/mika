@@ -20,6 +20,25 @@ struct AskJsonResponse {
     task_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pending_tasks: Vec<String>,
+    /// Runtime metadata envelope. Populated when `--verbose` is set; omitted
+    /// otherwise (preserves byte-identical output for existing JSON consumers).
+    /// Per-field gating: not every future field needs to be `--verbose`-gated;
+    /// the envelope shape supports unconditional fields landing alongside
+    /// gated ones without semantics churn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<MetadataEnvelope>,
+}
+
+/// Runtime metadata for `mika ask` invocations under `--format json`.
+///
+/// Mirrors the text-mode trailer's role: separates the assistant message
+/// (`role`/`content`) from CLI/runtime concerns. Fields here may be
+/// individually gated by `--verbose` (e.g., `session_id`) or unconditional
+/// (future ops fields like `trace_id` could ship without the flag).
+#[derive(serde::Serialize)]
+struct MetadataEnvelope {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,11 +398,22 @@ pub async fn run(
             }
         }
         OutputFormat::Json => {
+            // `--verbose` populates the metadata envelope; without it,
+            // metadata stays None and the field is skipped on serialization,
+            // keeping the output byte-identical for existing consumers.
+            let metadata = if verbose {
+                Some(MetadataEnvelope {
+                    session_id: Some(session_id.clone()),
+                })
+            } else {
+                None
+            };
             let response = AskJsonResponse {
                 role: "assistant",
                 content: output.text,
                 task_id: task_id.map(|s| s.to_string()),
                 pending_tasks: pending_callbacks,
+                metadata,
             };
             println!("{}", serde_json::to_string(&response)?);
         }
@@ -573,6 +603,7 @@ mod tests {
             content: Some("Hello, world!".to_string()),
             task_id: None,
             pending_tasks: vec![],
+            metadata: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(json, r#"{"role":"assistant","content":"Hello, world!"}"#);
@@ -585,6 +616,7 @@ mod tests {
             content: None,
             task_id: None,
             pending_tasks: vec![],
+            metadata: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(json, r#"{"role":"assistant","content":null}"#);
@@ -597,6 +629,7 @@ mod tests {
             content: Some("Line 1\nLine 2\t\"quoted\"".to_string()),
             task_id: None,
             pending_tasks: vec![],
+            metadata: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -611,6 +644,7 @@ mod tests {
             content: Some("I've started the implementation.".to_string()),
             task_id: None,
             pending_tasks: vec!["task-abc-123".to_string(), "task-def-456".to_string()],
+            metadata: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -626,6 +660,7 @@ mod tests {
             content: Some("Done.".to_string()),
             task_id: None,
             pending_tasks: vec![],
+            metadata: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         // pending_tasks should be omitted entirely when empty
@@ -639,6 +674,7 @@ mod tests {
             content: Some("Permission granted.".to_string()),
             task_id: Some("abc-123-def".to_string()),
             pending_tasks: vec![],
+            metadata: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -670,9 +706,69 @@ mod tests {
             content: Some("Hello.".to_string()),
             task_id: None,
             pending_tasks: vec![],
+            metadata: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         // task_id should be omitted when None
         assert!(!json.contains("task_id"));
+    }
+
+    #[test]
+    fn test_json_response_omits_metadata_when_none() {
+        // Existing JSON consumers (no --verbose) must see byte-identical
+        // output to pre-#829: the `metadata` key is skipped entirely when
+        // None, not emitted as `"metadata":null`.
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: Some("Hello, world!".to_string()),
+            task_id: None,
+            pending_tasks: vec![],
+            metadata: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"role":"assistant","content":"Hello, world!"}"#);
+        assert!(!json.contains("metadata"));
+    }
+
+    #[test]
+    fn test_json_response_includes_metadata_session_id_when_verbose() {
+        // When --verbose is set, the JSON envelope must carry session_id
+        // inside a nested `metadata` object — separating runtime metadata
+        // from the assistant message shape (mirrors the text-mode trailer's
+        // conceptual separation).
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let response = AskJsonResponse {
+            role: "assistant",
+            content: Some("Here.".to_string()),
+            task_id: None,
+            pending_tasks: vec![],
+            metadata: Some(MetadataEnvelope {
+                session_id: Some(session_id.clone()),
+            }),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Metadata must be a nested object, not a top-level field.
+        assert!(parsed["metadata"].is_object());
+        assert_eq!(parsed["metadata"]["session_id"], session_id);
+
+        // The session_id value must round-trip as a valid UUID.
+        let value = parsed["metadata"]["session_id"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(value).is_ok());
+
+        // session_id must NOT appear at the top level — that would entangle
+        // the message shape with runtime metadata.
+        assert!(parsed.get("session_id").is_none());
+    }
+
+    #[test]
+    fn test_metadata_envelope_omits_none_session_id() {
+        // Per-field gating inside the envelope: if a future field is
+        // unconditional (e.g., trace_id) it can land alongside an absent
+        // session_id without forcing `"session_id":null` into the output.
+        let envelope = MetadataEnvelope { session_id: None };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(json, "{}");
     }
 }
