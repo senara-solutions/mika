@@ -82,6 +82,11 @@
   color: "7057ff"
   description: Observability dashboard (React SPA)
 
+# ── State ─────────────────────────────────────────────────────────────────────
+- name: ready
+  color: "2ea44f"
+  description: Approved for autonomous dispatch
+
 # ── Sprint Hooks ───────────────────────────────────────��─────────────────────
 - name: needs-build
   color: "d97706"

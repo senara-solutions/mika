@@ -68,6 +68,8 @@ pub struct GitHubWebhookEvent {
     pub review: Option<GitHubReview>,
     /// Requested reviewer (present in pull_request.review_requested events).
     pub requested_reviewer: Option<GitHubUser>,
+    /// Label data (present in issues.labeled events — the specific label just added).
+    pub label: Option<GitHubLabel>,
     /// Repository data.
     pub repository: Option<GitHubRepository>,
 }
@@ -131,6 +133,11 @@ pub struct GitHubReview {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct GitHubLabel {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct GitHubRepository {
     pub full_name: Option<String>,
     pub html_url: Option<String>,
@@ -149,6 +156,7 @@ pub fn route_event(
 ) -> Option<&'static str> {
     match (event_type, action) {
         ("issues", Some("assigned")) => Some("mika-dev"),
+        ("issues", Some("labeled")) => Some("mika-dev"),
         ("issue_comment", Some("created")) => Some("mika-dev"),
         ("pull_request", Some("opened" | "synchronize" | "review_requested")) => Some("mika-qa"),
         ("pull_request", Some("closed")) => Some("mika-dev"),
@@ -193,6 +201,22 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .unwrap_or("(no title)");
             let url = issue.and_then(|i| i.html_url.as_deref()).unwrap_or("");
             let body = truncate_body(issue.and_then(|i| i.body.as_deref()).unwrap_or(""), 2000);
+
+            // For label-add events, emit a structured marker with the specific
+            // label name so mika-dev's prompt can pattern-match unambiguously.
+            // Checked first to avoid allocating body/text that would be discarded.
+            if action == "labeled"
+                && let Some(label_name) = event
+                    .label
+                    .as_ref()
+                    .and_then(|l| l.name.as_deref())
+                    .filter(|n| !n.is_empty())
+            {
+                return format!(
+                    "[GitHub] Issue labeled {label_name} on {repo_name}#{number} — {title}\n{url}"
+                );
+            }
+            // Fallback for labeled without label name: uses generic format below.
 
             let mut text =
                 format!("[GitHub] Issue {action}: {repo_name}#{number} — {title}\n{url}");
@@ -1007,6 +1031,14 @@ mod tests {
     }
 
     #[test]
+    fn test_route_event_issues_labeled() {
+        assert_eq!(
+            route_event("issues", Some("labeled"), None),
+            Some("mika-dev")
+        );
+    }
+
+    #[test]
     fn test_route_event_issues_closed() {
         assert_eq!(route_event("issues", Some("closed"), None), None);
     }
@@ -1124,6 +1156,7 @@ mod tests {
             comment: None,
             review: None,
             requested_reviewer: None,
+            label: None,
             repository: Some(GitHubRepository {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
@@ -1157,6 +1190,7 @@ mod tests {
             comment: None,
             review: None,
             requested_reviewer: None,
+            label: None,
             repository: Some(GitHubRepository {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
@@ -1183,6 +1217,7 @@ mod tests {
             comment: None,
             review: None,
             requested_reviewer: None,
+            label: None,
             repository: Some(GitHubRepository {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
@@ -1218,6 +1253,7 @@ mod tests {
                 login: "mika-platform-qa".to_string(),
                 user_type: Some("User".to_string()),
             }),
+            label: None,
             repository: Some(GitHubRepository {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
@@ -1227,6 +1263,103 @@ mod tests {
         assert!(text.contains("[GitHub] PR review_requested"));
         assert!(text.contains("org/repo#15"));
         assert!(text.contains("Requested reviewer: @mika-platform-qa"));
+    }
+
+    #[test]
+    fn test_format_event_text_issue_labeled_extracts_label_name() {
+        let event = GitHubWebhookEvent {
+            action: Some("labeled".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: Some(GitHubIssue {
+                number: Some(841),
+                title: Some("Gate dispatch on ready label".to_string()),
+                html_url: Some("https://github.com/senara-solutions/mika/issues/841".to_string()),
+                body: None,
+                assignee: None,
+            }),
+            pull_request: None,
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            label: Some(GitHubLabel {
+                name: Some("ready".to_string()),
+            }),
+            repository: Some(GitHubRepository {
+                full_name: Some("senara-solutions/mika".to_string()),
+                html_url: None,
+            }),
+        };
+        let text = format_event_text("issues", &event);
+        assert_eq!(
+            text,
+            "[GitHub] Issue labeled ready on senara-solutions/mika#841 — Gate dispatch on ready label\nhttps://github.com/senara-solutions/mika/issues/841"
+        );
+    }
+
+    #[test]
+    fn test_format_event_text_issue_labeled_empty_label_name() {
+        // Empty label name should fall back to generic format, not produce
+        // a malformed structured marker with a blank name.
+        let event = GitHubWebhookEvent {
+            action: Some("labeled".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: Some(GitHubIssue {
+                number: Some(100),
+                title: Some("Test issue".to_string()),
+                html_url: Some("https://github.com/org/repo/issues/100".to_string()),
+                body: None,
+                assignee: None,
+            }),
+            pull_request: None,
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            label: Some(GitHubLabel {
+                name: Some(String::new()),
+            }),
+            repository: Some(GitHubRepository {
+                full_name: Some("org/repo".to_string()),
+                html_url: None,
+            }),
+        };
+        let text = format_event_text("issues", &event);
+        // Must fall back to generic format, not the structured "labeled <name> on" marker
+        assert!(text.starts_with("[GitHub] Issue labeled:"));
+        assert!(!text.contains("Issue labeled  on")); // no blank-name marker
+    }
+
+    #[test]
+    fn test_format_event_text_issue_labeled_missing_label_name() {
+        let event = GitHubWebhookEvent {
+            action: Some("labeled".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: Some(GitHubIssue {
+                number: Some(100),
+                title: Some("Test issue".to_string()),
+                html_url: Some("https://github.com/org/repo/issues/100".to_string()),
+                body: None,
+                assignee: None,
+            }),
+            pull_request: None,
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            label: None,
+            repository: Some(GitHubRepository {
+                full_name: Some("org/repo".to_string()),
+                html_url: None,
+            }),
+        };
+        let text = format_event_text("issues", &event);
+        // Falls back to generic format when label name is unavailable
+        assert!(text.starts_with("[GitHub] Issue labeled:"));
+        assert!(text.contains("org/repo#100"));
     }
 
     #[test]
@@ -1250,6 +1383,7 @@ mod tests {
             comment: None,
             review: None,
             requested_reviewer: None,
+            label: None,
             repository: Some(GitHubRepository {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
