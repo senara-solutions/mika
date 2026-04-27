@@ -28,8 +28,20 @@ export default function CopyButton({
       onClick={handleCopy}
       className={`opacity-40 hover:opacity-100 transition-opacity shrink-0 ${className ?? ''}`}
       title={title}
+      data-testid="copy-button"
     >
-      {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+      <span className="relative inline-flex items-center justify-center w-3 h-3">
+        <Copy
+          size={12}
+          data-testid="copy-icon"
+          className={`transition-opacity duration-150 ${copied ? 'opacity-0' : 'opacity-100'}`}
+        />
+        <Check
+          size={12}
+          data-testid="check-icon"
+          className={`absolute transition-opacity duration-150 text-emerald-400 ${copied ? 'opacity-100' : 'opacity-0'}`}
+        />
+      </span>
     </button>
   )
 }
