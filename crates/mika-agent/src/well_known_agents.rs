@@ -444,7 +444,7 @@ pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disable
 /// `disabled_skills` list. Only runs on first creation — if any
 /// `skill_overrides` rows already exist for this agent, the function
 /// returns early to preserve user customizations.
-pub fn seed_well_known_skill_overrides(db: &Database, agent_name: &str) {
+pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
     let spec = match find_well_known_agent(agent_name) {
         Some(s) => s,
         None => return,
@@ -954,11 +954,11 @@ mod tests {
     fn test_seed_skill_overrides_mika_dev() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let mut db = Database::open(&db_path).unwrap();
         db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
             .unwrap();
 
-        seed_well_known_skill_overrides(&db, "mika-dev");
+        seed_well_known_skill_overrides(&mut db, "mika-dev");
 
         let overrides = db.get_skill_overrides("mika-dev").unwrap();
         assert_eq!(overrides.len(), MIKA_DEV.disabled_skills.len());
@@ -976,10 +976,10 @@ mod tests {
     fn test_seed_skill_overrides_mika_qa() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let mut db = Database::open(&db_path).unwrap();
         db.register_agent("mika-qa", "QA", "/tmp/mika-qa").unwrap();
 
-        seed_well_known_skill_overrides(&db, "mika-qa");
+        seed_well_known_skill_overrides(&mut db, "mika-qa");
 
         let overrides = db.get_skill_overrides("mika-qa").unwrap();
         assert_eq!(overrides.len(), MIKA_QA.disabled_skills.len());
@@ -997,7 +997,7 @@ mod tests {
     fn test_seed_skill_overrides_skips_existing() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let mut db = Database::open(&db_path).unwrap();
         db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
             .unwrap();
 
@@ -1006,7 +1006,7 @@ mod tests {
             .unwrap();
 
         // Now seed — should not add anything since overrides exist
-        seed_well_known_skill_overrides(&db, "mika-dev");
+        seed_well_known_skill_overrides(&mut db, "mika-dev");
 
         let overrides = db.get_skill_overrides("mika-dev").unwrap();
         // Should only have the one custom override, not the well-known ones
@@ -1018,11 +1018,11 @@ mod tests {
     fn test_seed_skill_overrides_mika_relay() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let mut db = Database::open(&db_path).unwrap();
         db.register_agent("mika-relay", "Relay", "/tmp/mika-relay")
             .unwrap();
 
-        seed_well_known_skill_overrides(&db, "mika-relay");
+        seed_well_known_skill_overrides(&mut db, "mika-relay");
 
         let overrides = db.get_skill_overrides("mika-relay").unwrap();
         assert_eq!(overrides.len(), MIKA_RELAY.disabled_skills.len());
@@ -1092,11 +1092,11 @@ mod tests {
     fn test_seed_skill_overrides_non_well_known() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
+        let mut db = Database::open(&db_path).unwrap();
         db.register_agent("custom-agent", "Custom", "/tmp/custom")
             .unwrap();
 
-        seed_well_known_skill_overrides(&db, "custom-agent");
+        seed_well_known_skill_overrides(&mut db, "custom-agent");
 
         let overrides = db.get_skill_overrides("custom-agent").unwrap();
         assert!(overrides.is_empty());
@@ -1249,10 +1249,10 @@ mod tests {
 
     #[test]
     fn test_seed_skill_overrides_mika_arch() {
-        let db = Database::open_in_memory().unwrap();
+        let mut db = Database::open_in_memory().unwrap();
         db.register_agent("mika-arch", "Architect", "🏛").unwrap();
 
-        seed_well_known_skill_overrides(&db, "mika-arch");
+        seed_well_known_skill_overrides(&mut db, "mika-arch");
 
         let overrides = db.get_skill_overrides("mika-arch").unwrap();
         // Should have 2 LLM overrides (no disabled_skills for mika-arch)

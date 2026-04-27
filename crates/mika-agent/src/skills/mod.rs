@@ -27,7 +27,7 @@ use crate::db::{Database, SkillOverride};
 /// read-only FS and the DB already has the override).
 pub fn migrate_disabled_markers(
     skills_dir: &Path,
-    db: &Database,
+    db: &mut Database,
     agent_id: &str,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(skills_dir) {
@@ -1699,8 +1699,8 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join(".disabled"), "").unwrap();
 
-        let db = crate::db::Database::open_in_memory().unwrap();
-        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+        let mut db = crate::db::Database::open_in_memory().unwrap();
+        migrate_disabled_markers(skills_dir, &mut db, "mika").unwrap();
 
         let overrides = db.get_skill_overrides("mika").unwrap();
         assert_eq!(overrides.len(), 1);
@@ -1718,8 +1718,8 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         // No .disabled marker
 
-        let db = crate::db::Database::open_in_memory().unwrap();
-        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+        let mut db = crate::db::Database::open_in_memory().unwrap();
+        migrate_disabled_markers(skills_dir, &mut db, "mika").unwrap();
 
         assert!(db.get_skill_overrides("mika").unwrap().is_empty());
     }
@@ -1732,11 +1732,11 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join(".disabled"), "").unwrap();
 
-        let db = crate::db::Database::open_in_memory().unwrap();
+        let mut db = crate::db::Database::open_in_memory().unwrap();
         // First run: writes override, removes marker
-        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+        migrate_disabled_markers(skills_dir, &mut db, "mika").unwrap();
         // Second run: no markers, no-op
-        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+        migrate_disabled_markers(skills_dir, &mut db, "mika").unwrap();
 
         let overrides = db.get_skill_overrides("mika").unwrap();
         assert_eq!(overrides.len(), 1);
@@ -1757,8 +1757,8 @@ mod tests {
         std::fs::write(bar.join(".disabled"), "").unwrap();
         // baz has no marker
 
-        let db = crate::db::Database::open_in_memory().unwrap();
-        migrate_disabled_markers(skills_dir, &db, "mika").unwrap();
+        let mut db = crate::db::Database::open_in_memory().unwrap();
+        migrate_disabled_markers(skills_dir, &mut db, "mika").unwrap();
 
         let overrides = db.get_skill_overrides("mika").unwrap();
         assert_eq!(overrides.len(), 2);
@@ -1793,9 +1793,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let skills_dir = tmp.path().join("nonexistent");
 
-        let db = crate::db::Database::open_in_memory().unwrap();
+        let mut db = crate::db::Database::open_in_memory().unwrap();
         // Should not error on missing directory
-        migrate_disabled_markers(&skills_dir, &db, "mika").unwrap();
+        migrate_disabled_markers(&skills_dir, &mut db, "mika").unwrap();
     }
 
     // -- validate_markdown_content tests (#511) --

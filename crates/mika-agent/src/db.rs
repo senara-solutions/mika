@@ -3,7 +3,7 @@ pub mod kg_schema;
 use anyhow::{Context, Result};
 use chrono::{Duration, TimeZone, Utc};
 use chrono_tz::Tz;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -763,7 +763,7 @@ impl Database {
              PRAGMA auto_vacuum = INCREMENTAL;",
         )
         .context("failed to set SQLite pragmas")?;
-        let db = Self { conn };
+        let mut db = Self { conn };
         // Auto-backup DB file before any destructive schema migration
         let current_ver = db.current_version().unwrap_or(0);
         if current_ver > 0 && current_ver < CURRENT_SCHEMA_VERSION {
@@ -793,7 +793,7 @@ impl Database {
         let conn = Connection::open_in_memory().context("failed to open in-memory SQLite")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .context("failed to set pragmas")?;
-        let db = Self { conn };
+        let mut db = Self { conn };
         db.migrate()?;
         Ok(db)
     }
@@ -860,7 +860,7 @@ impl Database {
         Ok(version)
     }
 
-    fn migrate(&self) -> Result<()> {
+    fn migrate(&mut self) -> Result<()> {
         let version = self.current_version()?;
         debug!(
             current_version = version,
@@ -992,7 +992,7 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v1(&self) -> Result<()> {
+    fn migrate_v1(&mut self) -> Result<()> {
         info!("applying migration v1: unified task engine schema (clean slate)");
 
         // Drop all existing tables (clean slate — no backward compat constraint)
@@ -1036,11 +1036,9 @@ impl Database {
             self.conn.execute_batch(drop)?;
         }
 
-        self.conn
-            .execute_batch(
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(
                 "
-            BEGIN;
-
             CREATE TABLE schema_version (
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
@@ -1592,11 +1590,10 @@ impl Database {
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
-
-            COMMIT;
             ",
             )
             .context("failed to create v1 schema")?;
+        tx.commit()?;
 
         // Unified timeline VIEW (uses shared constant)
         self.conn
@@ -1617,7 +1614,7 @@ impl Database {
     /// Migration v3: Sessions + Messages schema redesign (clean-slate).
     ///
     /// Single user, no data to preserve. Drop and recreate via migrate_v1.
-    fn migrate_v3(&self) -> Result<()> {
+    fn migrate_v3(&mut self) -> Result<()> {
         info!("applying migration v3: sessions + messages schema redesign (clean slate)");
         self.migrate_v1()
     }
@@ -1785,7 +1782,7 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v7_to_v8(&self) -> Result<()> {
+    fn migrate_v7_to_v8(&mut self) -> Result<()> {
         info!(
             "migrating database schema v7 → v8 (tasks: manual trigger_type, blocked status, none action_type, reference_url, source)"
         );
@@ -1797,16 +1794,16 @@ impl Database {
         // copies self-referencing parent_task_id rows, and ALTER TABLE RENAME validates
         // FK references. Also disable FK checks to avoid issues with the temporary table.
         self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let result = (|| -> Result<()> {
-            // Drop the unified_timeline VIEW first — it references the `tasks` table.
-            // SQLite 3.25+ validates all views/triggers during ALTER TABLE RENAME,
-            // so the view must not exist when we rename tasks_new → tasks.
-            self.conn
-                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        // Drop the unified_timeline VIEW first — it references the `tasks` table.
+        // SQLite 3.25+ validates all views/triggers during ALTER TABLE RENAME,
+        // so the view must not exist when we rename tasks_new → tasks.
+        tx.execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
 
-            self.conn.execute_batch(
+        tx.execute_batch(
             "CREATE TABLE tasks_new (
                 id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -1868,8 +1865,8 @@ impl Database {
             ALTER TABLE tasks_new RENAME TO tasks;",
         )?;
 
-            // Recreate all indexes (still within the transaction)
-            self.conn.execute_batch(
+        // Recreate all indexes (still within the transaction)
+        tx.execute_batch(
             "CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
              CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
                 WHERE status IN ('pending','recurring_active');
@@ -1897,30 +1894,17 @@ impl Database {
                 AND status IN ('pending', 'in_progress', 'blocked');",
         )?;
 
-            // Recreate unified_timeline VIEW (was dropped before table rebuild)
-            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+        // Recreate unified_timeline VIEW (was dropped before table rebuild)
+        tx.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
 
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (8)", [])?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (8)", [])?;
 
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
-                Err(e)
-            }
-        }
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(())
     }
 
-    fn migrate_v8_to_v9(&self) -> Result<()> {
+    fn migrate_v8_to_v9(&mut self) -> Result<()> {
         info!(
             "migrating database schema v8 → v9 (rewind: nullable after_value, rewound_by_trace_id)"
         );
@@ -1928,773 +1912,714 @@ impl Database {
         // Rebuild audit_events to make after_value nullable and add rewound_by_trace_id.
         // SQLite cannot ALTER a NOT NULL constraint, so we must rebuild the table.
         self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let result = (|| -> Result<()> {
-            // Drop the unified_timeline VIEW — it references audit_events.
-            self.conn
-                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        // Drop the unified_timeline VIEW — it references audit_events.
+        tx.execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
 
-            self.conn.execute_batch(
-                "CREATE TABLE audit_events_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    session_id TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    target_key TEXT NOT NULL,
-                    before_value TEXT,
-                    after_value TEXT,
-                    reasoning TEXT,
-                    trace_id TEXT,
-                    rewound_by_trace_id TEXT,
-                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
-                );
+        tx.execute_batch(
+            "CREATE TABLE audit_events_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                before_value TEXT,
+                after_value TEXT,
+                reasoning TEXT,
+                trace_id TEXT,
+                rewound_by_trace_id TEXT,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );
 
-                INSERT INTO audit_events_new (id, agent_id, session_id, tool_name, target_key,
-                    before_value, after_value, reasoning, trace_id, created_at)
-                SELECT id, agent_id, session_id, tool_name, target_key,
-                    before_value, after_value, reasoning, trace_id, created_at
-                FROM audit_events;
+            INSERT INTO audit_events_new (id, agent_id, session_id, tool_name, target_key,
+                before_value, after_value, reasoning, trace_id, created_at)
+            SELECT id, agent_id, session_id, tool_name, target_key,
+                before_value, after_value, reasoning, trace_id, created_at
+            FROM audit_events;
 
-                DROP TABLE audit_events;
-                ALTER TABLE audit_events_new RENAME TO audit_events;",
-            )?;
+            DROP TABLE audit_events;
+            ALTER TABLE audit_events_new RENAME TO audit_events;",
+        )?;
 
-            // Recreate existing indexes + new rewound index
-            self.conn.execute_batch(
-                "CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at);
-                 CREATE INDEX idx_audit_session ON audit_events(session_id);
-                 CREATE INDEX idx_audit_trace ON audit_events(trace_id)
-                     WHERE trace_id IS NOT NULL;
-                 CREATE INDEX idx_audit_rewound ON audit_events(rewound_by_trace_id)
-                     WHERE rewound_by_trace_id IS NOT NULL;",
-            )?;
+        // Recreate existing indexes + new rewound index
+        tx.execute_batch(
+            "CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at);
+             CREATE INDEX idx_audit_session ON audit_events(session_id);
+             CREATE INDEX idx_audit_trace ON audit_events(trace_id)
+                 WHERE trace_id IS NOT NULL;
+             CREATE INDEX idx_audit_rewound ON audit_events(rewound_by_trace_id)
+                 WHERE rewound_by_trace_id IS NOT NULL;",
+        )?;
 
-            // Recreate unified_timeline VIEW
-            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+        // Recreate unified_timeline VIEW
+        tx.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
 
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (9)", [])?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (9)", [])?;
 
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
-                Err(e)
-            }
-        }
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(())
     }
 
-    fn migrate_v9_to_v10(&self) -> Result<()> {
+    fn migrate_v9_to_v10(&mut self) -> Result<()> {
         info!(
             "migrating database schema v9 → v10 (team_runs.trace_id, unified_timeline + team_workspace)"
         );
 
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        // Hoist column_exists check before creating the transaction (borrow checker constraint).
+        let has_trace_id = self.column_exists("team_runs", "trace_id")?;
 
-        let result = (|| -> Result<()> {
-            // Add trace_id column to team_runs (idempotent guard for crash recovery)
-            if !self.column_exists("team_runs", "trace_id")? {
-                self.conn
-                    .execute_batch("ALTER TABLE team_runs ADD COLUMN trace_id TEXT;")?;
-            }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-            // Recreate unified_timeline VIEW with team_workspace union
-            self.conn
-                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
-            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
-
-            // Add partial index on team_workspace.trace_id (matches other timeline tables)
-            self.conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_team_ws_trace ON team_workspace(trace_id)
-                     WHERE trace_id IS NOT NULL;",
-            )?;
-
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (10)", [])?;
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
+        // Add trace_id column to team_runs (idempotent guard for crash recovery)
+        if !has_trace_id {
+            tx.execute_batch("ALTER TABLE team_runs ADD COLUMN trace_id TEXT;")?;
         }
+
+        // Recreate unified_timeline VIEW with team_workspace union
+        tx.execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        tx.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+        // Add partial index on team_workspace.trace_id (matches other timeline tables)
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_team_ws_trace ON team_workspace(trace_id)
+                 WHERE trace_id IS NOT NULL;",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (10)", [])?;
+
+        tx.commit()?;
+        Ok(())
     }
 
-    fn migrate_v10_to_v11(&self) -> Result<()> {
+    fn migrate_v10_to_v11(&mut self) -> Result<()> {
         info!(
             "migrating database schema v10 → v11 (tasks.execution_trace_id, sessions.parent_session_id)"
         );
 
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        // Hoist column_exists checks before creating the transaction (borrow checker constraint).
+        let has_exec_trace = self.column_exists("tasks", "execution_trace_id")?;
+        let has_parent_session = self.column_exists("sessions", "parent_session_id")?;
 
-        let result = (|| -> Result<()> {
-            // Add execution_trace_id column to tasks (idempotent guard)
-            if !self.column_exists("tasks", "execution_trace_id")? {
-                self.conn
-                    .execute_batch("ALTER TABLE tasks ADD COLUMN execution_trace_id TEXT;")?;
-            }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-            // Add parent_session_id column to sessions (idempotent guard)
-            if !self.column_exists("sessions", "parent_session_id")? {
-                self.conn
-                    .execute_batch("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;")?;
-            }
-
-            // Partial indexes for new columns
-            self.conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;",
-            )?;
-            self.conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id) WHERE parent_session_id IS NOT NULL;",
-            )?;
-
-            // Recreate unified_timeline VIEW with COALESCE for execution_trace_id
-            self.conn
-                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
-            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
-
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (11)", [])?;
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
+        // Add execution_trace_id column to tasks (idempotent guard)
+        if !has_exec_trace {
+            tx.execute_batch("ALTER TABLE tasks ADD COLUMN execution_trace_id TEXT;")?;
         }
+
+        // Add parent_session_id column to sessions (idempotent guard)
+        if !has_parent_session {
+            tx.execute_batch("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;")?;
+        }
+
+        // Partial indexes for new columns
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;",
+        )?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id) WHERE parent_session_id IS NOT NULL;",
+        )?;
+
+        // Recreate unified_timeline VIEW with COALESCE for execution_trace_id
+        tx.execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        tx.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (11)", [])?;
+
+        tx.commit()?;
+        Ok(())
     }
 
-    fn migrate_v11_to_v12(&self) -> Result<()> {
+    fn migrate_v11_to_v12(&mut self) -> Result<()> {
         info!("migrating database schema v11 → v12 (INTEGER timestamps → ISO 8601 TEXT)");
 
         self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let result = (|| -> Result<()> {
-            // Drop views that reference tables we're rebuilding
-            self.conn
-                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        // Drop views that reference tables we're rebuilding
+        tx.execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
 
-            // --- agents ---
-            self.conn.execute_batch(
-                "CREATE TABLE agents_new (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL COLLATE NOCASE,
-                    home_dir TEXT NOT NULL DEFAULT '',
-                    active BOOLEAN NOT NULL DEFAULT 1,
-                    last_seen TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO agents_new SELECT id, name, home_dir, active,
-                    CASE WHEN last_seen IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', last_seen, 'unixepoch') ELSE NULL END,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM agents;
-                DROP TABLE agents;
-                ALTER TABLE agents_new RENAME TO agents;")?;
+        // --- agents ---
+        tx.execute_batch(
+            "CREATE TABLE agents_new (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE,
+                home_dir TEXT NOT NULL DEFAULT '',
+                active BOOLEAN NOT NULL DEFAULT 1,
+                last_seen TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO agents_new SELECT id, name, home_dir, active,
+                CASE WHEN last_seen IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', last_seen, 'unixepoch') ELSE NULL END,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM agents;
+            DROP TABLE agents;
+            ALTER TABLE agents_new RENAME TO agents;")?;
 
-            // --- teams ---
-            self.conn.execute_batch(
-                "CREATE TABLE teams_new (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL COLLATE NOCASE,
-                    config_path TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO teams_new SELECT id, name, config_path,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM teams;
-                DROP TABLE teams;
-                ALTER TABLE teams_new RENAME TO teams;",
-            )?;
+        // --- teams ---
+        tx.execute_batch(
+            "CREATE TABLE teams_new (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE,
+                config_path TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO teams_new SELECT id, name, config_path,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM teams;
+            DROP TABLE teams;
+            ALTER TABLE teams_new RENAME TO teams;",
+        )?;
 
-            // --- team_runs ---
-            self.conn.execute_batch(
-                "CREATE TABLE team_runs_new (
-                    id TEXT PRIMARY KEY,
-                    team_id TEXT NOT NULL REFERENCES teams(id),
-                    goal TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'running'
-                        CHECK (status IN ('running','completed','failed','cancelled','suspended')),
-                    failure_reason TEXT,
-                    iteration INTEGER NOT NULL DEFAULT 1,
-                    max_iterations INTEGER NOT NULL DEFAULT 3,
-                    deliverable TEXT,
-                    checkpoint TEXT,
-                    trace_id TEXT,
-                    started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    ended_at TEXT
-                );
-                INSERT INTO team_runs_new SELECT id, team_id, goal, status, failure_reason,
-                    iteration, max_iterations, deliverable, checkpoint, trace_id,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', started_at, 'unixepoch'),
-                    CASE WHEN ended_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', ended_at, 'unixepoch') ELSE NULL END
-                FROM team_runs;
-                DROP TABLE team_runs;
-                ALTER TABLE team_runs_new RENAME TO team_runs;
-                CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);")?;
+        // --- team_runs ---
+        tx.execute_batch(
+            "CREATE TABLE team_runs_new (
+                id TEXT PRIMARY KEY,
+                team_id TEXT NOT NULL REFERENCES teams(id),
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running'
+                    CHECK (status IN ('running','completed','failed','cancelled','suspended')),
+                failure_reason TEXT,
+                iteration INTEGER NOT NULL DEFAULT 1,
+                max_iterations INTEGER NOT NULL DEFAULT 3,
+                deliverable TEXT,
+                checkpoint TEXT,
+                trace_id TEXT,
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                ended_at TEXT
+            );
+            INSERT INTO team_runs_new SELECT id, team_id, goal, status, failure_reason,
+                iteration, max_iterations, deliverable, checkpoint, trace_id,
+                strftime('%Y-%m-%dT%H:%M:%SZ', started_at, 'unixepoch'),
+                CASE WHEN ended_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', ended_at, 'unixepoch') ELSE NULL END
+            FROM team_runs;
+            DROP TABLE team_runs;
+            ALTER TABLE team_runs_new RENAME TO team_runs;
+            CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);")?;
 
-            // --- sessions (must be before messages due to FK) ---
-            self.conn.execute_batch(
-                "CREATE TABLE sessions_new (
-                    id TEXT PRIMARY KEY,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    channel_type TEXT NOT NULL DEFAULT 'cli',
-                    started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    ended_at TEXT,
-                    metadata TEXT,
-                    parent_session_id TEXT
-                );
-                INSERT INTO sessions_new SELECT id, agent_id, channel_type,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', started_at, 'unixepoch'),
-                    CASE WHEN ended_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', ended_at, 'unixepoch') ELSE NULL END,
-                    metadata, parent_session_id
-                FROM sessions;
-                DROP TABLE sessions;
-                ALTER TABLE sessions_new RENAME TO sessions;
-                CREATE INDEX idx_sessions_agent ON sessions(agent_id, started_at DESC);
-                CREATE INDEX idx_sessions_parent ON sessions(parent_session_id) WHERE parent_session_id IS NOT NULL;")?;
+        // --- sessions (must be before messages due to FK) ---
+        tx.execute_batch(
+            "CREATE TABLE sessions_new (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                channel_type TEXT NOT NULL DEFAULT 'cli',
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                ended_at TEXT,
+                metadata TEXT,
+                parent_session_id TEXT
+            );
+            INSERT INTO sessions_new SELECT id, agent_id, channel_type,
+                strftime('%Y-%m-%dT%H:%M:%SZ', started_at, 'unixepoch'),
+                CASE WHEN ended_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', ended_at, 'unixepoch') ELSE NULL END,
+                metadata, parent_session_id
+            FROM sessions;
+            DROP TABLE sessions;
+            ALTER TABLE sessions_new RENAME TO sessions;
+            CREATE INDEX idx_sessions_agent ON sessions(agent_id, started_at DESC);
+            CREATE INDEX idx_sessions_parent ON sessions(parent_session_id) WHERE parent_session_id IS NOT NULL;")?;
 
-            // --- tasks ---
-            self.conn.execute_batch(
-                "CREATE TABLE tasks_new (
-                    id TEXT PRIMARY KEY,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
-                    parent_task_id TEXT REFERENCES tasks_new(id) ON DELETE SET NULL,
-                    depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
-                    label TEXT NOT NULL,
-                    trigger_type TEXT NOT NULL CHECK (
-                        trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual')
-                    ),
-                    cron_expr TEXT,
-                    event_source TEXT,
-                    event_offset_secs INTEGER,
-                    condition_expr TEXT,
-                    next_fire_at TEXT,
-                    timeout_at TEXT,
-                    action_type TEXT NOT NULL CHECK (
-                        action_type IN (
-                            'send_message','resume_agent','inject_context',
-                            'run_skill','invoke_orchestrator','none'
-                        )
-                    ),
-                    action_config TEXT NOT NULL DEFAULT '{}',
-                    status TEXT NOT NULL DEFAULT 'pending' CHECK (
-                        status IN ('pending','in_progress','completed','failed',
-                                   'cancelled','expired','recurring_active','delivered','blocked')
-                    ),
-                    process_id INTEGER,
-                    input_context TEXT,
-                    result TEXT,
-                    reference_url TEXT,
-                    source TEXT,
-                    created_by_session TEXT,
-                    created_trace_id TEXT,
-                    execution_trace_id TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    fired_at TEXT,
-                    completed_at TEXT
-                );
-                INSERT INTO tasks_new SELECT id, agent_id, team_run_id, parent_task_id, depth, label,
-                    trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
-                    CASE WHEN next_fire_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', next_fire_at, 'unixepoch') ELSE NULL END,
-                    CASE WHEN timeout_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', timeout_at, 'unixepoch') ELSE NULL END,
-                    action_type, action_config, status, process_id, input_context, result,
-                    reference_url, source, created_by_session, created_trace_id, execution_trace_id,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
-                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch'),
-                    CASE WHEN fired_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', fired_at, 'unixepoch') ELSE NULL END,
-                    CASE WHEN completed_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', completed_at, 'unixepoch') ELSE NULL END
-                FROM tasks;
-                DROP TABLE tasks;
-                ALTER TABLE tasks_new RENAME TO tasks;")?;
+        // --- tasks ---
+        tx.execute_batch(
+            "CREATE TABLE tasks_new (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+                parent_task_id TEXT REFERENCES tasks_new(id) ON DELETE SET NULL,
+                depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
+                label TEXT NOT NULL,
+                trigger_type TEXT NOT NULL CHECK (
+                    trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual')
+                ),
+                cron_expr TEXT,
+                event_source TEXT,
+                event_offset_secs INTEGER,
+                condition_expr TEXT,
+                next_fire_at TEXT,
+                timeout_at TEXT,
+                action_type TEXT NOT NULL CHECK (
+                    action_type IN (
+                        'send_message','resume_agent','inject_context',
+                        'run_skill','invoke_orchestrator','none'
+                    )
+                ),
+                action_config TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    status IN ('pending','in_progress','completed','failed',
+                               'cancelled','expired','recurring_active','delivered','blocked')
+                ),
+                process_id INTEGER,
+                input_context TEXT,
+                result TEXT,
+                reference_url TEXT,
+                source TEXT,
+                created_by_session TEXT,
+                created_trace_id TEXT,
+                execution_trace_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                fired_at TEXT,
+                completed_at TEXT
+            );
+            INSERT INTO tasks_new SELECT id, agent_id, team_run_id, parent_task_id, depth, label,
+                trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
+                CASE WHEN next_fire_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', next_fire_at, 'unixepoch') ELSE NULL END,
+                CASE WHEN timeout_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', timeout_at, 'unixepoch') ELSE NULL END,
+                action_type, action_config, status, process_id, input_context, result,
+                reference_url, source, created_by_session, created_trace_id, execution_trace_id,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
+                strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch'),
+                CASE WHEN fired_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', fired_at, 'unixepoch') ELSE NULL END,
+                CASE WHEN completed_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', completed_at, 'unixepoch') ELSE NULL END
+            FROM tasks;
+            DROP TABLE tasks;
+            ALTER TABLE tasks_new RENAME TO tasks;")?;
 
-            // Recreate task indexes
-            self.conn.execute_batch(
-                "CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
-                 CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at) WHERE status IN ('pending','recurring_active');
-                 CREATE INDEX idx_tasks_schedulable ON tasks(agent_id, next_fire_at ASC) WHERE status IN ('pending','recurring_active');
-                 CREATE INDEX idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
-                 CREATE INDEX idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
-                 CREATE INDEX idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
-                 CREATE INDEX idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;
-                 CREATE INDEX idx_tasks_manual_active ON tasks(agent_id, created_at DESC) WHERE trigger_type = 'manual' AND status IN ('pending', 'in_progress', 'blocked');
-                 CREATE UNIQUE INDEX idx_tasks_unique_recurring ON tasks(agent_id, label COLLATE NOCASE) WHERE trigger_type = 'recurring' AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
-                 CREATE UNIQUE INDEX idx_tasks_unique_reminder ON tasks(agent_id, label COLLATE NOCASE) WHERE status IN ('pending', 'in_progress', 'recurring_active') AND (action_type = 'send_message' OR action_type = 'resume_agent') AND trigger_type NOT IN ('callback');
-                 CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at) WHERE trigger_type='callback' AND action_type='resume_agent' AND status IN ('completed','failed');")?;
+        // Recreate task indexes
+        tx.execute_batch(
+            "CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
+             CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at) WHERE status IN ('pending','recurring_active');
+             CREATE INDEX idx_tasks_schedulable ON tasks(agent_id, next_fire_at ASC) WHERE status IN ('pending','recurring_active');
+             CREATE INDEX idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
+             CREATE INDEX idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
+             CREATE INDEX idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
+             CREATE INDEX idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;
+             CREATE INDEX idx_tasks_manual_active ON tasks(agent_id, created_at DESC) WHERE trigger_type = 'manual' AND status IN ('pending', 'in_progress', 'blocked');
+             CREATE UNIQUE INDEX idx_tasks_unique_recurring ON tasks(agent_id, label COLLATE NOCASE) WHERE trigger_type = 'recurring' AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
+             CREATE UNIQUE INDEX idx_tasks_unique_reminder ON tasks(agent_id, label COLLATE NOCASE) WHERE status IN ('pending', 'in_progress', 'recurring_active') AND (action_type = 'send_message' OR action_type = 'resume_agent') AND trigger_type NOT IN ('callback');
+             CREATE INDEX idx_tasks_callback_delivery ON tasks(agent_id, completed_at) WHERE trigger_type='callback' AND action_type='resume_agent' AND status IN ('completed','failed');")?;
 
-            // --- messages ---
-            self.conn.execute_batch(
-                "CREATE TABLE messages_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary','tool_result')),
-                    content TEXT NOT NULL,
-                    metadata TEXT,
-                    trace_id TEXT,
-                    compacted_through_id INTEGER,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO messages_new SELECT id, session_id, agent_id, role, content, metadata,
-                    trace_id, compacted_through_id,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM messages;
-                DROP TABLE messages;
-                ALTER TABLE messages_new RENAME TO messages;
-                CREATE INDEX idx_msg_session ON messages(session_id, created_at ASC);
-                CREATE INDEX idx_msg_agent_created ON messages(agent_id, created_at DESC);
-                CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;")?;
+        // --- messages ---
+        tx.execute_batch(
+            "CREATE TABLE messages_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                role TEXT NOT NULL CHECK (role IN ('user','assistant','system','summary','tool_result')),
+                content TEXT NOT NULL,
+                metadata TEXT,
+                trace_id TEXT,
+                compacted_through_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO messages_new SELECT id, session_id, agent_id, role, content, metadata,
+                trace_id, compacted_through_id,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM messages;
+            DROP TABLE messages;
+            ALTER TABLE messages_new RENAME TO messages;
+            CREATE INDEX idx_msg_session ON messages(session_id, created_at ASC);
+            CREATE INDEX idx_msg_agent_created ON messages(agent_id, created_at DESC);
+            CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;")?;
 
-            // --- core_memory ---
-            self.conn.execute_batch(
-                "CREATE TABLE core_memory_new (
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    key TEXT NOT NULL COLLATE NOCASE,
-                    value TEXT NOT NULL,
-                    token_count INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    PRIMARY KEY (agent_id, key)
-                );
-                INSERT INTO core_memory_new SELECT agent_id, key, value, token_count,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
-                FROM core_memory;
-                DROP TABLE core_memory;
-                ALTER TABLE core_memory_new RENAME TO core_memory;",
-            )?;
+        // --- core_memory ---
+        tx.execute_batch(
+            "CREATE TABLE core_memory_new (
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                key TEXT NOT NULL COLLATE NOCASE,
+                value TEXT NOT NULL,
+                token_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (agent_id, key)
+            );
+            INSERT INTO core_memory_new SELECT agent_id, key, value, token_count,
+                strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
+            FROM core_memory;
+            DROP TABLE core_memory;
+            ALTER TABLE core_memory_new RENAME TO core_memory;",
+        )?;
 
-            // --- people ---
-            self.conn.execute_batch(
-                "CREATE TABLE people_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    canonical_name TEXT NOT NULL COLLATE NOCASE,
-                    relationship TEXT,
-                    notes TEXT,
-                    first_mentioned TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    last_mentioned TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    mention_count INTEGER NOT NULL DEFAULT 1,
-                    UNIQUE (agent_id, canonical_name)
-                );
-                INSERT INTO people_new SELECT id, agent_id, canonical_name, relationship, notes,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', first_mentioned, 'unixepoch'),
-                    strftime('%Y-%m-%dT%H:%M:%SZ', last_mentioned, 'unixepoch'),
-                    mention_count
-                FROM people;
-                DROP TABLE people;
-                ALTER TABLE people_new RENAME TO people;",
-            )?;
+        // --- people ---
+        tx.execute_batch(
+            "CREATE TABLE people_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                canonical_name TEXT NOT NULL COLLATE NOCASE,
+                relationship TEXT,
+                notes TEXT,
+                first_mentioned TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                last_mentioned TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                mention_count INTEGER NOT NULL DEFAULT 1,
+                UNIQUE (agent_id, canonical_name)
+            );
+            INSERT INTO people_new SELECT id, agent_id, canonical_name, relationship, notes,
+                strftime('%Y-%m-%dT%H:%M:%SZ', first_mentioned, 'unixepoch'),
+                strftime('%Y-%m-%dT%H:%M:%SZ', last_mentioned, 'unixepoch'),
+                mention_count
+            FROM people;
+            DROP TABLE people;
+            ALTER TABLE people_new RENAME TO people;",
+        )?;
 
-            // --- commitments ---
-            self.conn.execute_batch(
-                "CREATE TABLE commitments_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    description TEXT NOT NULL COLLATE NOCASE,
-                    status TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending','completed','cancelled')),
-                    due_date TEXT,
-                    person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    completed_at TEXT
-                );
-                INSERT INTO commitments_new SELECT id, agent_id, description, status, due_date, person_id,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
-                    CASE WHEN completed_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', completed_at, 'unixepoch') ELSE NULL END
-                FROM commitments;
-                DROP TABLE commitments;
-                ALTER TABLE commitments_new RENAME TO commitments;
-                CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
-                CREATE UNIQUE INDEX idx_commitments_unique_pending ON commitments(agent_id, description COLLATE NOCASE, due_date) WHERE status = 'pending';")?;
+        // --- commitments ---
+        tx.execute_batch(
+            "CREATE TABLE commitments_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                description TEXT NOT NULL COLLATE NOCASE,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','completed','cancelled')),
+                due_date TEXT,
+                person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                completed_at TEXT
+            );
+            INSERT INTO commitments_new SELECT id, agent_id, description, status, due_date, person_id,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
+                CASE WHEN completed_at IS NOT NULL THEN strftime('%Y-%m-%dT%H:%M:%SZ', completed_at, 'unixepoch') ELSE NULL END
+            FROM commitments;
+            DROP TABLE commitments;
+            ALTER TABLE commitments_new RENAME TO commitments;
+            CREATE INDEX idx_commit_agent_status ON commitments(agent_id, status);
+            CREATE UNIQUE INDEX idx_commitments_unique_pending ON commitments(agent_id, description COLLATE NOCASE, due_date) WHERE status = 'pending';")?;
 
-            // --- preferences ---
-            self.conn.execute_batch(
-                "CREATE TABLE preferences_new (
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    category TEXT NOT NULL COLLATE NOCASE,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    PRIMARY KEY (agent_id, category)
-                );
-                INSERT INTO preferences_new SELECT agent_id, category, value,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
-                FROM preferences;
-                DROP TABLE preferences;
-                ALTER TABLE preferences_new RENAME TO preferences;",
-            )?;
+        // --- preferences ---
+        tx.execute_batch(
+            "CREATE TABLE preferences_new (
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                category TEXT NOT NULL COLLATE NOCASE,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (agent_id, category)
+            );
+            INSERT INTO preferences_new SELECT agent_id, category, value,
+                strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
+            FROM preferences;
+            DROP TABLE preferences;
+            ALTER TABLE preferences_new RENAME TO preferences;",
+        )?;
 
-            // --- events ---
-            self.conn.execute_batch(
-                "CREATE TABLE events_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    description TEXT NOT NULL,
-                    event_date TEXT,
-                    context TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO events_new SELECT id, agent_id, description, event_date, context,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM events;
-                DROP TABLE events;
-                ALTER TABLE events_new RENAME TO events;
-                CREATE UNIQUE INDEX idx_events_unique_description ON events(agent_id, description COLLATE NOCASE, event_date) WHERE event_date IS NOT NULL;")?;
+        // --- events ---
+        tx.execute_batch(
+            "CREATE TABLE events_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                description TEXT NOT NULL,
+                event_date TEXT,
+                context TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO events_new SELECT id, agent_id, description, event_date, context,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM events;
+            DROP TABLE events;
+            ALTER TABLE events_new RENAME TO events;
+            CREATE UNIQUE INDEX idx_events_unique_description ON events(agent_id, description COLLATE NOCASE, event_date) WHERE event_date IS NOT NULL;")?;
 
-            // --- audit_events ---
-            self.conn.execute_batch(
-                "CREATE TABLE audit_events_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    session_id TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    target_key TEXT NOT NULL,
-                    before_value TEXT,
-                    after_value TEXT,
-                    reasoning TEXT,
-                    trace_id TEXT,
-                    rewound_by_trace_id TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO audit_events_new SELECT id, agent_id, session_id, tool_name,
-                    target_key, before_value, after_value, reasoning, trace_id, rewound_by_trace_id,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM audit_events;
-                DROP TABLE audit_events;
-                ALTER TABLE audit_events_new RENAME TO audit_events;
-                CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at DESC);
-                CREATE INDEX idx_audit_session ON audit_events(session_id);
-                CREATE INDEX idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;
-                CREATE INDEX idx_audit_rewound ON audit_events(rewound_by_trace_id) WHERE rewound_by_trace_id IS NOT NULL;")?;
+        // --- audit_events ---
+        tx.execute_batch(
+            "CREATE TABLE audit_events_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                before_value TEXT,
+                after_value TEXT,
+                reasoning TEXT,
+                trace_id TEXT,
+                rewound_by_trace_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO audit_events_new SELECT id, agent_id, session_id, tool_name,
+                target_key, before_value, after_value, reasoning, trace_id, rewound_by_trace_id,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM audit_events;
+            DROP TABLE audit_events;
+            ALTER TABLE audit_events_new RENAME TO audit_events;
+            CREATE INDEX idx_audit_agent_created ON audit_events(agent_id, created_at DESC);
+            CREATE INDEX idx_audit_session ON audit_events(session_id);
+            CREATE INDEX idx_audit_trace ON audit_events(trace_id) WHERE trace_id IS NOT NULL;
+            CREATE INDEX idx_audit_rewound ON audit_events(rewound_by_trace_id) WHERE rewound_by_trace_id IS NOT NULL;")?;
 
-            // --- audit_event_summaries ---
-            self.conn.execute_batch(
-                "CREATE TABLE audit_event_summaries_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    year INTEGER NOT NULL,
-                    month INTEGER NOT NULL,
-                    summary TEXT NOT NULL,
-                    event_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    UNIQUE (agent_id, year, month)
-                );
-                INSERT INTO audit_event_summaries_new SELECT id, agent_id, year, month,
-                    summary, event_count,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM audit_event_summaries;
-                DROP TABLE audit_event_summaries;
-                ALTER TABLE audit_event_summaries_new RENAME TO audit_event_summaries;",
-            )?;
+        // --- audit_event_summaries ---
+        tx.execute_batch(
+            "CREATE TABLE audit_event_summaries_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE (agent_id, year, month)
+            );
+            INSERT INTO audit_event_summaries_new SELECT id, agent_id, year, month,
+                summary, event_count,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM audit_event_summaries;
+            DROP TABLE audit_event_summaries;
+            ALTER TABLE audit_event_summaries_new RENAME TO audit_event_summaries;",
+        )?;
 
-            // --- search_content ---
-            self.conn.execute_batch(
-                "CREATE TABLE search_content_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    source_type TEXT NOT NULL,
-                    source_id INTEGER,
-                    content TEXT NOT NULL,
-                    embedding_json TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO search_content_new SELECT id, agent_id, source_type, source_id, content,
-                    embedding_json,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
-                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
-                FROM search_content;
-                DROP TABLE search_content;
-                ALTER TABLE search_content_new RENAME TO search_content;
-                CREATE INDEX idx_search_agent ON search_content(agent_id, source_type);",
-            )?;
+        // --- search_content ---
+        tx.execute_batch(
+            "CREATE TABLE search_content_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                source_type TEXT NOT NULL,
+                source_id INTEGER,
+                content TEXT NOT NULL,
+                embedding_json TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO search_content_new SELECT id, agent_id, source_type, source_id, content,
+                embedding_json,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),
+                strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
+            FROM search_content;
+            DROP TABLE search_content;
+            ALTER TABLE search_content_new RENAME TO search_content;
+            CREATE INDEX idx_search_agent ON search_content(agent_id, source_type);",
+        )?;
 
-            // --- team_workspace ---
-            self.conn.execute_batch(
-                "CREATE TABLE team_workspace_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
-                    parent_id INTEGER REFERENCES team_workspace_new(id),
-                    agent_name TEXT,
-                    entry_type TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    trace_id TEXT,
-                    iteration INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO team_workspace_new SELECT id, run_id, parent_id, agent_name,
-                    entry_type, content, trace_id, iteration,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM team_workspace;
-                DROP TABLE team_workspace;
-                ALTER TABLE team_workspace_new RENAME TO team_workspace;
-                CREATE INDEX idx_team_ws_run ON team_workspace(run_id, created_at);
-                CREATE INDEX idx_team_ws_trace ON team_workspace(trace_id) WHERE trace_id IS NOT NULL;")?;
+        // --- team_workspace ---
+        tx.execute_batch(
+            "CREATE TABLE team_workspace_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+                parent_id INTEGER REFERENCES team_workspace_new(id),
+                agent_name TEXT,
+                entry_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                trace_id TEXT,
+                iteration INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO team_workspace_new SELECT id, run_id, parent_id, agent_name,
+                entry_type, content, trace_id, iteration,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM team_workspace;
+            DROP TABLE team_workspace;
+            ALTER TABLE team_workspace_new RENAME TO team_workspace;
+            CREATE INDEX idx_team_ws_run ON team_workspace(run_id, created_at);
+            CREATE INDEX idx_team_ws_trace ON team_workspace(trace_id) WHERE trace_id IS NOT NULL;",
+        )?;
 
-            // --- heartbeat_sends ---
-            self.conn.execute_batch(
-                "CREATE TABLE heartbeat_sends_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO heartbeat_sends_new SELECT id, agent_id,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', sent_at, 'unixepoch')
-                FROM heartbeat_sends;
-                DROP TABLE heartbeat_sends;
-                ALTER TABLE heartbeat_sends_new RENAME TO heartbeat_sends;
-                CREATE INDEX idx_heartbeat_agent ON heartbeat_sends(agent_id, sent_at DESC);",
-            )?;
+        // --- heartbeat_sends ---
+        tx.execute_batch(
+            "CREATE TABLE heartbeat_sends_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO heartbeat_sends_new SELECT id, agent_id,
+                strftime('%Y-%m-%dT%H:%M:%SZ', sent_at, 'unixepoch')
+            FROM heartbeat_sends;
+            DROP TABLE heartbeat_sends;
+            ALTER TABLE heartbeat_sends_new RENAME TO heartbeat_sends;
+            CREATE INDEX idx_heartbeat_agent ON heartbeat_sends(agent_id, sent_at DESC);",
+        )?;
 
-            // --- reflection_runs ---
-            self.conn.execute_batch(
-                "CREATE TABLE reflection_runs_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    status TEXT NOT NULL,
-                    changes_made INTEGER NOT NULL DEFAULT 0,
-                    summary TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO reflection_runs_new SELECT id, agent_id, status, changes_made, summary,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM reflection_runs;
-                DROP TABLE reflection_runs;
-                ALTER TABLE reflection_runs_new RENAME TO reflection_runs;
-                CREATE INDEX idx_reflect_agent ON reflection_runs(agent_id, created_at DESC);",
-            )?;
+        // --- reflection_runs ---
+        tx.execute_batch(
+            "CREATE TABLE reflection_runs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                changes_made INTEGER NOT NULL DEFAULT 0,
+                summary TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO reflection_runs_new SELECT id, agent_id, status, changes_made, summary,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM reflection_runs;
+            DROP TABLE reflection_runs;
+            ALTER TABLE reflection_runs_new RENAME TO reflection_runs;
+            CREATE INDEX idx_reflect_agent ON reflection_runs(agent_id, created_at DESC);",
+        )?;
 
-            // --- customer_config ---
-            self.conn.execute_batch(
-                "CREATE TABLE customer_config_new (
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    key TEXT NOT NULL COLLATE NOCASE,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    PRIMARY KEY (agent_id, key)
-                );
-                INSERT INTO customer_config_new SELECT agent_id, key, value,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
-                FROM customer_config;
-                DROP TABLE customer_config;
-                ALTER TABLE customer_config_new RENAME TO customer_config;",
-            )?;
+        // --- customer_config ---
+        tx.execute_batch(
+            "CREATE TABLE customer_config_new (
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                key TEXT NOT NULL COLLATE NOCASE,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (agent_id, key)
+            );
+            INSERT INTO customer_config_new SELECT agent_id, key, value,
+                strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch')
+            FROM customer_config;
+            DROP TABLE customer_config;
+            ALTER TABLE customer_config_new RENAME TO customer_config;",
+        )?;
 
-            // --- failed_sends ---
-            self.conn.execute_batch(
-                "CREATE TABLE failed_sends_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    text TEXT NOT NULL,
-                    request_id TEXT,
-                    retry_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO failed_sends_new SELECT id, agent_id, text, request_id, retry_count,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
-                FROM failed_sends;
-                DROP TABLE failed_sends;
-                ALTER TABLE failed_sends_new RENAME TO failed_sends;",
-            )?;
+        // --- failed_sends ---
+        tx.execute_batch(
+            "CREATE TABLE failed_sends_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                request_id TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO failed_sends_new SELECT id, agent_id, text, request_id, retry_count,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch')
+            FROM failed_sends;
+            DROP TABLE failed_sends;
+            ALTER TABLE failed_sends_new RENAME TO failed_sends;",
+        )?;
 
-            // --- schema_version ---
-            self.conn.execute_batch(
-                "CREATE TABLE schema_version_new (
-                    version INTEGER NOT NULL,
-                    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                INSERT INTO schema_version_new SELECT version,
-                    strftime('%Y-%m-%dT%H:%M:%SZ', applied_at, 'unixepoch')
-                FROM schema_version;
-                DROP TABLE schema_version;
-                ALTER TABLE schema_version_new RENAME TO schema_version;",
-            )?;
+        // --- schema_version ---
+        tx.execute_batch(
+            "CREATE TABLE schema_version_new (
+                version INTEGER NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO schema_version_new SELECT version,
+                strftime('%Y-%m-%dT%H:%M:%SZ', applied_at, 'unixepoch')
+            FROM schema_version;
+            DROP TABLE schema_version;
+            ALTER TABLE schema_version_new RENAME TO schema_version;",
+        )?;
 
-            // Recreate unified_timeline VIEW
-            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+        // Recreate unified_timeline VIEW
+        tx.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
 
-            // Record migration
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (12)", [])?;
+        // Record migration
+        tx.execute("INSERT INTO schema_version (version) VALUES (12)", [])?;
 
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
-                Err(e)
-            }
-        }
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(())
     }
 
-    fn migrate_v12_to_v13(&self) -> Result<()> {
+    fn migrate_v12_to_v13(&mut self) -> Result<()> {
         info!("migrating database schema v12 → v13 (A2A orthogonal persistence)");
 
         self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let result = (|| -> Result<()> {
-            // Drop view first — it references the tasks table we're about to rebuild
-            self.conn
-                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        // Drop view first — it references the tasks table we're about to rebuild
+        tx.execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
 
-            // Rebuild tasks table to add 'a2a' to trigger_type CHECK constraint
-            self.conn.execute_batch(
-                "CREATE TABLE tasks_new (
-                    id TEXT PRIMARY KEY,
-                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-                    team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
-                    parent_task_id TEXT REFERENCES tasks_new(id) ON DELETE SET NULL,
-                    depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
-                    label TEXT NOT NULL,
-                    trigger_type TEXT NOT NULL CHECK (
-                        trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual','a2a')
-                    ),
-                    cron_expr TEXT,
-                    event_source TEXT,
-                    event_offset_secs INTEGER,
-                    condition_expr TEXT,
-                    next_fire_at TEXT,
-                    timeout_at TEXT,
-                    action_type TEXT NOT NULL CHECK (
-                        action_type IN (
-                            'send_message','resume_agent','inject_context',
-                            'run_skill','invoke_orchestrator','none'
-                        )
-                    ),
-                    action_config TEXT NOT NULL DEFAULT '{}',
-                    status TEXT NOT NULL DEFAULT 'pending' CHECK (
-                        status IN ('pending','in_progress','completed','failed',
-                                   'cancelled','expired','recurring_active','delivered','blocked')
-                    ),
-                    process_id INTEGER,
-                    input_context TEXT,
-                    result TEXT,
-                    reference_url TEXT,
-                    source TEXT,
-                    created_by_session TEXT,
-                    created_trace_id TEXT,
-                    execution_trace_id TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                    fired_at TEXT,
-                    completed_at TEXT
-                );
-                INSERT INTO tasks_new SELECT * FROM tasks;
-                DROP TABLE tasks;
-                ALTER TABLE tasks_new RENAME TO tasks;
-                CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
-                CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
-                    WHERE status IN ('pending','recurring_active');
-                CREATE INDEX idx_tasks_schedulable
-                    ON tasks(agent_id, next_fire_at ASC)
-                    WHERE status IN ('pending','recurring_active');
-                CREATE INDEX idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
-                CREATE INDEX idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
-                CREATE INDEX idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
-                CREATE INDEX idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;
-                CREATE INDEX idx_tasks_manual_active
-                    ON tasks(agent_id, created_at DESC)
-                    WHERE trigger_type = 'manual'
-                    AND status IN ('pending', 'in_progress', 'blocked');
-                CREATE UNIQUE INDEX idx_tasks_unique_recurring
-                    ON tasks(agent_id, label COLLATE NOCASE)
-                    WHERE trigger_type = 'recurring'
-                    AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
-                CREATE UNIQUE INDEX idx_tasks_unique_reminder
-                    ON tasks(agent_id, label COLLATE NOCASE)
-                    WHERE status IN ('pending', 'in_progress', 'recurring_active')
-                    AND (action_type = 'send_message' OR action_type = 'resume_agent')
-                    AND trigger_type NOT IN ('callback');")?;
+        // Rebuild tasks table to add 'a2a' to trigger_type CHECK constraint
+        tx.execute_batch(
+            "CREATE TABLE tasks_new (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                team_run_id TEXT REFERENCES team_runs(id) ON DELETE SET NULL,
+                parent_task_id TEXT REFERENCES tasks_new(id) ON DELETE SET NULL,
+                depth INTEGER NOT NULL DEFAULT 0 CHECK (depth BETWEEN 0 AND 3),
+                label TEXT NOT NULL,
+                trigger_type TEXT NOT NULL CHECK (
+                    trigger_type IN ('time','recurring','callback','user_reply','event','condition','manual','a2a')
+                ),
+                cron_expr TEXT,
+                event_source TEXT,
+                event_offset_secs INTEGER,
+                condition_expr TEXT,
+                next_fire_at TEXT,
+                timeout_at TEXT,
+                action_type TEXT NOT NULL CHECK (
+                    action_type IN (
+                        'send_message','resume_agent','inject_context',
+                        'run_skill','invoke_orchestrator','none'
+                    )
+                ),
+                action_config TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    status IN ('pending','in_progress','completed','failed',
+                               'cancelled','expired','recurring_active','delivered','blocked')
+                ),
+                process_id INTEGER,
+                input_context TEXT,
+                result TEXT,
+                reference_url TEXT,
+                source TEXT,
+                created_by_session TEXT,
+                created_trace_id TEXT,
+                execution_trace_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                fired_at TEXT,
+                completed_at TEXT
+            );
+            INSERT INTO tasks_new SELECT * FROM tasks;
+            DROP TABLE tasks;
+            ALTER TABLE tasks_new RENAME TO tasks;
+            CREATE INDEX idx_tasks_agent_status ON tasks(agent_id, status);
+            CREATE INDEX idx_tasks_next_fire ON tasks(next_fire_at)
+                WHERE status IN ('pending','recurring_active');
+            CREATE INDEX idx_tasks_schedulable
+                ON tasks(agent_id, next_fire_at ASC)
+                WHERE status IN ('pending','recurring_active');
+            CREATE INDEX idx_tasks_parent ON tasks(parent_task_id, agent_id) WHERE parent_task_id IS NOT NULL;
+            CREATE INDEX idx_tasks_session ON tasks(created_by_session) WHERE created_by_session IS NOT NULL;
+            CREATE INDEX idx_tasks_trace ON tasks(created_trace_id) WHERE created_trace_id IS NOT NULL;
+            CREATE INDEX idx_tasks_exec_trace ON tasks(execution_trace_id) WHERE execution_trace_id IS NOT NULL;
+            CREATE INDEX idx_tasks_manual_active
+                ON tasks(agent_id, created_at DESC)
+                WHERE trigger_type = 'manual'
+                AND status IN ('pending', 'in_progress', 'blocked');
+            CREATE UNIQUE INDEX idx_tasks_unique_recurring
+                ON tasks(agent_id, label COLLATE NOCASE)
+                WHERE trigger_type = 'recurring'
+                AND status NOT IN ('cancelled', 'failed', 'expired', 'delivered');
+            CREATE UNIQUE INDEX idx_tasks_unique_reminder
+                ON tasks(agent_id, label COLLATE NOCASE)
+                WHERE status IN ('pending', 'in_progress', 'recurring_active')
+                AND (action_type = 'send_message' OR action_type = 'resume_agent')
+                AND trigger_type NOT IN ('callback');")?;
 
-            // Create thin mapping table
-            self.conn.execute_batch(
-                "CREATE TABLE a2a_task_map (
-                    a2a_task_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    context_id TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                CREATE INDEX idx_a2a_task_map_task ON a2a_task_map(task_id);",
-            )?;
+        // Create thin mapping table
+        tx.execute_batch(
+            "CREATE TABLE a2a_task_map (
+                a2a_task_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                context_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_a2a_task_map_task ON a2a_task_map(task_id);",
+        )?;
 
-            // Create A2A tables with FK to mapping table
-            self.conn.execute_batch(
-                "CREATE TABLE a2a_artifacts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES a2a_task_map(a2a_task_id) ON DELETE CASCADE,
-                    artifact_id TEXT NOT NULL,
-                    name TEXT,
-                    description TEXT,
-                    parts TEXT NOT NULL,
-                    metadata TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );
-                CREATE TABLE a2a_push_notification_configs (
-                    id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL REFERENCES a2a_task_map(a2a_task_id) ON DELETE CASCADE,
-                    url TEXT NOT NULL,
-                    token TEXT,
-                    auth_scheme TEXT,
-                    auth_credentials TEXT,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-                );",
-            )?;
+        // Create A2A tables with FK to mapping table
+        tx.execute_batch(
+            "CREATE TABLE a2a_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES a2a_task_map(a2a_task_id) ON DELETE CASCADE,
+                artifact_id TEXT NOT NULL,
+                name TEXT,
+                description TEXT,
+                parts TEXT NOT NULL,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE TABLE a2a_push_notification_configs (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES a2a_task_map(a2a_task_id) ON DELETE CASCADE,
+                url TEXT NOT NULL,
+                token TEXT,
+                auth_scheme TEXT,
+                auth_credentials TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );",
+        )?;
 
-            // Recreate unified_timeline VIEW (tasks table was rebuilt)
-            self.conn
-                .execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
-            self.conn.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
+        // Recreate unified_timeline VIEW (tasks table was rebuilt)
+        tx.execute_batch("DROP VIEW IF EXISTS unified_timeline;")?;
+        tx.execute_batch(UNIFIED_TIMELINE_VIEW_SQL)?;
 
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (13)", [])?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (13)", [])?;
 
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
-                Err(e)
-            }
-        }
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(())
     }
 
     fn migrate_v13_to_v14(&self) -> Result<()> {
@@ -2788,14 +2713,15 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v16_to_v17(&self) -> Result<()> {
+    fn migrate_v16_to_v17(&mut self) -> Result<()> {
         info!("migrating database schema v16 → v17 (add task dedup index on reference_url)");
 
         // Wrap in transaction for atomicity (matches pattern in migrate_v7_to_v8, etc.)
-        self.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-
-             -- Step 1: Cancel duplicate active tasks with the same (agent_id, reference_url).
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "-- Step 1: Cancel duplicate active tasks with the same (agent_id, reference_url).
              -- Keep the earliest-created item per group (by rowid for deterministic tiebreaking
              -- when created_at timestamps collide), cancel the rest with a metadata breadcrumb.
              UPDATE tasks SET status = 'cancelled',
@@ -2825,45 +2751,45 @@ impl Database {
                AND reference_url IS NOT NULL
                AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered');
 
-             INSERT INTO schema_version (version) VALUES (17);
-
-             COMMIT;",
+             INSERT INTO schema_version (version) VALUES (17);",
         )?;
+        tx.commit()?;
 
         Ok(())
     }
 
-    fn migrate_v17_to_v18(&self) -> Result<()> {
+    fn migrate_v17_to_v18(&mut self) -> Result<()> {
         info!("migrating database schema v17 → v18 (widen reminder dedup index for resume_agent)");
 
         // The old index only covered action_type = 'send_message'. The new index covers
         // both 'send_message' and 'resume_agent' to prevent duplicate reminders regardless
         // of action type. See #363.
-        self.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-
-             DROP INDEX IF EXISTS idx_tasks_unique_reminder;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_tasks_unique_reminder;
              CREATE UNIQUE INDEX idx_tasks_unique_reminder
              ON tasks(agent_id, label COLLATE NOCASE)
              WHERE status IN ('pending', 'in_progress', 'recurring_active')
                AND (action_type = 'send_message' OR action_type = 'resume_agent')
                AND trigger_type NOT IN ('callback');
 
-             INSERT INTO schema_version (version) VALUES (18);
-
-             COMMIT;",
+             INSERT INTO schema_version (version) VALUES (18);",
         )?;
+        tx.commit()?;
 
         Ok(())
     }
 
-    fn migrate_v18_to_v19(&self) -> Result<()> {
+    fn migrate_v18_to_v19(&mut self) -> Result<()> {
         info!("migrating database schema v18 → v19 (add task_id to sessions for reverse lookup)");
 
-        self.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-
-             ALTER TABLE sessions ADD COLUMN task_id TEXT;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN task_id TEXT;
 
              CREATE INDEX idx_sessions_task_id ON sessions(task_id) WHERE task_id IS NOT NULL;
 
@@ -2871,70 +2797,84 @@ impl Database {
              UPDATE sessions SET task_id = json_extract(metadata, '$.task_id')
                WHERE json_extract(metadata, '$.task_id') IS NOT NULL AND task_id IS NULL;
 
-             INSERT INTO schema_version (version) VALUES (19);
-
-             COMMIT;",
+             INSERT INTO schema_version (version) VALUES (19);",
         )?;
+        tx.commit()?;
 
         Ok(())
     }
 
-    fn migrate_v19_to_v20(&self) -> Result<()> {
+    fn migrate_v19_to_v20(&mut self) -> Result<()> {
         info!("migrating database schema v19 → v20 (skill_overrides: llm_provider, llm_model)");
 
         // Idempotent: skip ALTER if columns already exist (defensive — re-runs).
         let has_provider = self.column_exists("skill_overrides", "llm_provider")?;
         let has_model = self.column_exists("skill_overrides", "llm_model")?;
 
-        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut sql = String::new();
         if !has_provider {
             sql.push_str("ALTER TABLE skill_overrides ADD COLUMN llm_provider TEXT;\n");
         }
         if !has_model {
             sql.push_str("ALTER TABLE skill_overrides ADD COLUMN llm_model TEXT;\n");
         }
-        sql.push_str("INSERT INTO schema_version (version) VALUES (20);\nCOMMIT;");
+        sql.push_str("INSERT INTO schema_version (version) VALUES (20);");
 
-        self.conn.execute_batch(&sql)?;
+        tx.execute_batch(&sql)?;
+        tx.commit()?;
         Ok(())
     }
 
-    fn migrate_v20_to_v21(&self) -> Result<()> {
+    fn migrate_v20_to_v21(&mut self) -> Result<()> {
         info!("migrating database schema v20 → v21 (llm_calls: prompt_variant)");
 
         let has_col = self.column_exists("llm_calls", "prompt_variant")?;
 
-        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut sql = String::new();
         if !has_col {
             sql.push_str("ALTER TABLE llm_calls ADD COLUMN prompt_variant TEXT;\n");
         }
-        sql.push_str("INSERT INTO schema_version (version) VALUES (21);\nCOMMIT;");
+        sql.push_str("INSERT INTO schema_version (version) VALUES (21);");
 
-        self.conn.execute_batch(&sql)?;
+        tx.execute_batch(&sql)?;
+        tx.commit()?;
         Ok(())
     }
 
-    fn migrate_v21_to_v22(&self) -> Result<()> {
+    fn migrate_v21_to_v22(&mut self) -> Result<()> {
         info!("migrating database schema v21 → v22 (messages: internal flag)");
 
         let has_col = self.column_exists("messages", "internal")?;
 
-        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut sql = String::new();
         if !has_col {
             sql.push_str("ALTER TABLE messages ADD COLUMN internal INTEGER NOT NULL DEFAULT 0;\n");
         }
-        sql.push_str("INSERT INTO schema_version (version) VALUES (22);\nCOMMIT;");
+        sql.push_str("INSERT INTO schema_version (version) VALUES (22);");
 
-        self.conn.execute_batch(&sql)?;
+        tx.execute_batch(&sql)?;
+        tx.commit()?;
         Ok(())
     }
 
-    fn migrate_v22_to_v23(&self) -> Result<()> {
+    fn migrate_v22_to_v23(&mut self) -> Result<()> {
         info!("migrating database schema v22 → v23 (tasks: type column)");
 
         let has_col = self.column_exists("tasks", "type")?;
 
-        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut sql = String::new();
         if !has_col {
             // SQLite 3.37+ supports CHECK constraints in ALTER TABLE ADD COLUMN.
             // The DEFAULT backfills all existing rows to 'issue', preserving behavior.
@@ -2943,24 +2883,29 @@ impl Database {
                  CHECK (type IN ('issue', 'milestone', 'project'));\n",
             );
         }
-        sql.push_str("INSERT INTO schema_version (version) VALUES (23);\nCOMMIT;");
+        sql.push_str("INSERT INTO schema_version (version) VALUES (23);");
 
-        self.conn.execute_batch(&sql)?;
+        tx.execute_batch(&sql)?;
+        tx.commit()?;
         Ok(())
     }
 
-    fn migrate_v23_to_v24(&self) -> Result<()> {
+    fn migrate_v23_to_v24(&mut self) -> Result<()> {
         info!("migrating database schema v23 → v24 (skill_overrides: enabled column)");
 
         let has_col = self.column_exists("skill_overrides", "enabled")?;
 
-        let mut sql = String::from("BEGIN IMMEDIATE;\n");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut sql = String::new();
         if !has_col {
             sql.push_str("ALTER TABLE skill_overrides ADD COLUMN enabled INTEGER;\n");
         }
-        sql.push_str("INSERT INTO schema_version (version) VALUES (24);\nCOMMIT;");
+        sql.push_str("INSERT INTO schema_version (version) VALUES (24);");
 
-        self.conn.execute_batch(&sql)?;
+        tx.execute_batch(&sql)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2973,14 +2918,14 @@ impl Database {
     ///   `kg_subject_relationships`
     /// - Provenance: `kg_chunk_subjects`, `kg_chunk_subject_relationships`
     /// - Tracking: `kg_extractions`, `kg_resolutions_log`
-    fn migrate_v24_to_v25(&self) -> Result<()> {
+    fn migrate_v24_to_v25(&mut self) -> Result<()> {
         info!("migrating database schema v24 -> v25 (knowledge graph tables)");
 
-        self.conn
-            .execute_batch(
-                "BEGIN IMMEDIATE;
-
-                -- KG domain layer (global, no agent_id)
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+                "-- KG domain layer (global, no agent_id)
                 CREATE TABLE IF NOT EXISTS kg_entities (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_key TEXT NOT NULL UNIQUE,
@@ -3127,10 +3072,10 @@ impl Database {
                 );
                 CREATE INDEX IF NOT EXISTS idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
 
-                INSERT INTO schema_version (version) VALUES (25);
-                COMMIT;",
+                INSERT INTO schema_version (version) VALUES (25);",
             )
             .context("failed to migrate v24 -> v25 (knowledge graph tables)")?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -3144,18 +3089,19 @@ impl Database {
     /// Idempotent at the migration-chain level (the version gate in
     /// `run_migrations` prevents re-run); `column_exists` guards the inner
     /// ALTER against manual invocation.
-    fn migrate_v25_to_v26(&self) -> Result<()> {
+    fn migrate_v25_to_v26(&mut self) -> Result<()> {
         info!("migrating database schema v25 -> v26 (kg_extractions.source_doc_hash)");
 
         if !self.column_exists("kg_extractions", "source_doc_hash")? {
-            self.conn
-                .execute_batch(
-                    "BEGIN IMMEDIATE;
-                 ALTER TABLE kg_extractions ADD COLUMN source_doc_hash TEXT;
-                 INSERT INTO schema_version (version) VALUES (26);
-                 COMMIT;",
-                )
-                .context("failed to migrate v25 -> v26 (add kg_extractions.source_doc_hash)")?;
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(
+                "ALTER TABLE kg_extractions ADD COLUMN source_doc_hash TEXT;
+                 INSERT INTO schema_version (version) VALUES (26);",
+            )
+            .context("failed to migrate v25 -> v26 (add kg_extractions.source_doc_hash)")?;
+            tx.commit()?;
         } else {
             // Column already exists (manual re-run in a test / recovery scenario).
             // Just record the version bump.
@@ -3177,7 +3123,7 @@ impl Database {
     ///    FKs via temp lookup tables, drops backups, writes `v27_coalesce_complete`
     ///    marker to `schema_meta`. `docs_root` resolved from `MIKA_KG_DOCS_ROOT`
     ///    env var or CWD fallback.
-    fn migrate_v26_to_v27(&self) -> Result<()> {
+    fn migrate_v26_to_v27(&mut self) -> Result<()> {
         info!("migrating database schema v26 -> v27 (docs_root_hash shared-corpus)");
 
         // Idempotency guard: if kg_chunks already has docs_root_hash, we've run.
@@ -3253,12 +3199,9 @@ impl Database {
 
         // Build the full migration: DDL (rename to backup + create v27 tables) +
         // coalesce (read from backups, dedup, write to v27, drop backups) + finalize.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
         let sql = format!(
-            "PRAGMA foreign_keys = OFF;
-
-                 BEGIN IMMEDIATE;
-
-                 -- Create schema_meta table for migration state tracking.
+            "-- Create schema_meta table for migration state tracking.
                  CREATE TABLE IF NOT EXISTS schema_meta (
                      key TEXT PRIMARY KEY,
                      value TEXT NOT NULL
@@ -3420,16 +3363,16 @@ impl Database {
                  -- v27 coalesce: read from backup tables, dedup, write to v27 tables.
                  {coalesce}
 
-                 INSERT INTO schema_version (version) VALUES (27);
-
-                 COMMIT;
-
-                 PRAGMA foreign_keys = ON;"
+                 INSERT INTO schema_version (version) VALUES (27);"
         );
 
-        self.conn
-            .execute_batch(&sql)
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(&sql)
             .context("failed to migrate v26 -> v27 (docs_root_hash shared-corpus)")?;
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         // Log post-coalesce counts from the new v27 tables.
         let post_chunks: i64 = self
@@ -3486,7 +3429,7 @@ impl Database {
     /// Maps `agent_id → {docs_root_hash, docs_root_path}` so the query path knows
     /// which corpora to fan out across without re-deriving from identity.
     /// Backfills from existing `kg_subject_resolutions → kg_subject_entities` joins.
-    fn migrate_v27_to_v28(&self) -> Result<()> {
+    fn migrate_v27_to_v28(&mut self) -> Result<()> {
         // Idempotency: skip if table already exists.
         let exists: bool = self
             .conn
@@ -3505,10 +3448,11 @@ impl Database {
             return Ok(());
         }
 
-        self.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-
-             CREATE TABLE agent_kg_corpora (
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE agent_kg_corpora (
                  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                  docs_root_hash TEXT NOT NULL,
                  docs_root_path TEXT NOT NULL,
@@ -3524,10 +3468,9 @@ impl Database {
                  JOIN kg_subject_entities e ON e.id = r.subject_entity_id
                  WHERE e.docs_root_hash IS NOT NULL AND e.docs_root IS NOT NULL;
 
-             UPDATE schema_version SET version = 28;
-
-             COMMIT;",
+             UPDATE schema_version SET version = 28;",
         )?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -3732,57 +3675,27 @@ impl Database {
     /// `enabled = false` disables the skill; `enabled = true` explicitly enables it.
     /// When setting to `true` (the default) and all other override columns are NULL,
     /// the row is deleted (default-equals-delete).
-    pub fn set_skill_enabled(&self, agent_id: &str, skill_name: &str, enabled: bool) -> Result<()> {
+    pub fn set_skill_enabled(
+        &mut self,
+        agent_id: &str,
+        skill_name: &str,
+        enabled: bool,
+    ) -> Result<()> {
         let db_val: Option<bool> = if enabled { None } else { Some(false) };
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let result: rusqlite::Result<()> = (|| {
-            self.conn.execute(
-                "INSERT INTO skill_overrides (agent_id, skill_name, enabled)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(agent_id, skill_name) DO UPDATE SET enabled = excluded.enabled",
-                params![agent_id, skill_name, db_val],
-            )?;
-            // Default-equals-delete: if all columns are NULL, remove the row.
-            if enabled {
-                self.conn.execute(
-                    "DELETE FROM skill_overrides
-                      WHERE agent_id = ?1 AND skill_name = ?2
-                        AND always_on IS NULL
-                        AND llm_provider IS NULL
-                        AND llm_model IS NULL
-                        AND enabled IS NULL",
-                    params![agent_id, skill_name],
-                )?;
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e.into())
-            }
-        }
-    }
-
-    /// Clear the LLM override columns for a skill. If the resulting row has no
-    /// remaining override values (all columns NULL), the row is deleted.
-    ///
-    /// The UPDATE and prune DELETE are wrapped in an atomic transaction so a
-    /// crash between them cannot leave a half-cleared row.
-    pub fn delete_skill_llm_override(&self, agent_id: &str, skill_name: &str) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let result: rusqlite::Result<()> = (|| {
-            self.conn.execute(
-                "UPDATE skill_overrides
-                    SET llm_provider = NULL, llm_model = NULL
-                  WHERE agent_id = ?1 AND skill_name = ?2",
-                params![agent_id, skill_name],
-            )?;
-            self.conn.execute(
+        // RAII transaction: Drop without commit() auto-rolls back, preventing
+        // stuck transactions that pin the WAL snapshot (mika#636).
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO skill_overrides (agent_id, skill_name, enabled)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id, skill_name) DO UPDATE SET enabled = excluded.enabled",
+            params![agent_id, skill_name, db_val],
+        )?;
+        // Default-equals-delete: if all columns are NULL, remove the row.
+        if enabled {
+            tx.execute(
                 "DELETE FROM skill_overrides
                   WHERE agent_id = ?1 AND skill_name = ?2
                     AND always_on IS NULL
@@ -3791,18 +3704,39 @@ impl Database {
                     AND enabled IS NULL",
                 params![agent_id, skill_name],
             )?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT;")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e.into())
-            }
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clear the LLM override columns for a skill. If the resulting row has no
+    /// remaining override values (all columns NULL), the row is deleted.
+    ///
+    /// The UPDATE and prune DELETE are wrapped in an atomic transaction so a
+    /// crash between them cannot leave a half-cleared row.
+    pub fn delete_skill_llm_override(&mut self, agent_id: &str, skill_name: &str) -> Result<()> {
+        // RAII transaction: Drop without commit() auto-rolls back, preventing
+        // stuck transactions that pin the WAL snapshot (mika#636).
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE skill_overrides
+                SET llm_provider = NULL, llm_model = NULL
+              WHERE agent_id = ?1 AND skill_name = ?2",
+            params![agent_id, skill_name],
+        )?;
+        tx.execute(
+            "DELETE FROM skill_overrides
+              WHERE agent_id = ?1 AND skill_name = ?2
+                AND always_on IS NULL
+                AND llm_provider IS NULL
+                AND llm_model IS NULL
+                AND enabled IS NULL",
+            params![agent_id, skill_name],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Delete an override for a skill (revert to bundled default).
@@ -5610,32 +5544,34 @@ impl Database {
     }
 
     pub fn replace_with_summary(
-        &self,
+        &mut self,
         agent_id: &str,
         summary: &str,
         compacted_through_id: i64,
     ) -> Result<i64> {
         let system_session = self.get_or_create_system_session(agent_id)?;
-        self.conn.execute_batch("BEGIN")?;
+        // RAII transaction: Drop without commit() auto-rolls back, preventing
+        // stuck transactions that pin the WAL snapshot (mika#636).
+        let tx = self.conn.transaction()?;
         // Delete old non-summary messages up to compacted_through_id
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM messages
              WHERE agent_id = ?1 AND role != 'summary' AND id <= ?2",
             params![agent_id, compacted_through_id],
         )?;
         // Remove old summary
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM messages WHERE agent_id = ?1 AND role = 'summary'",
             params![agent_id],
         )?;
         // Insert new summary (no trace_id — summaries span multiple traces)
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO messages (session_id, agent_id, role, content, compacted_through_id)
              VALUES (?1, ?2, 'summary', ?3, ?4)",
             params![system_session, agent_id, summary, compacted_through_id],
         )?;
-        let row_id = self.conn.last_insert_rowid();
-        self.conn.execute_batch("COMMIT")?;
+        let row_id = tx.last_insert_rowid();
+        tx.commit()?;
         Ok(row_id)
     }
 
@@ -8719,7 +8655,7 @@ mod tests {
 
     #[test]
     fn test_replace_with_summary() {
-        let (db, sid) = db_with_session();
+        let (mut db, sid) = db_with_session();
         let id1 = db.save_message("mika", &sid, "user", "msg1", None).unwrap();
         db.save_message("mika", &sid, "assistant", "reply1", None)
             .unwrap();
@@ -10030,7 +9966,7 @@ mod tests {
 
     #[test]
     fn test_skill_llm_override_round_trip() {
-        let db = db();
+        let mut db = db();
 
         // Set LLM override on a skill with no existing row.
         db.set_skill_llm_override("mika", "qa-review", "anthropic", "claude-sonnet-4-6")
@@ -10058,7 +9994,7 @@ mod tests {
 
     #[test]
     fn test_skill_llm_override_preserves_always_on() {
-        let db = db();
+        let mut db = db();
 
         // Start with always_on set.
         db.set_skill_override("mika", "qa-review", true).unwrap();
@@ -10142,7 +10078,7 @@ mod tests {
 
     #[test]
     fn test_set_skill_enabled_disable() {
-        let db = db();
+        let mut db = db();
         db.set_skill_enabled("mika", "foo", false).unwrap();
         let overrides = db.get_skill_overrides("mika").unwrap();
         let ov = overrides.iter().find(|o| o.skill_name == "foo").unwrap();
@@ -10151,7 +10087,7 @@ mod tests {
 
     #[test]
     fn test_set_skill_enabled_enable_deletes_row() {
-        let db = db();
+        let mut db = db();
         // Disable first
         db.set_skill_enabled("mika", "foo", false).unwrap();
         assert_eq!(db.get_skill_overrides("mika").unwrap().len(), 1);
@@ -10162,7 +10098,7 @@ mod tests {
 
     #[test]
     fn test_set_skill_enabled_preserves_always_on() {
-        let db = db();
+        let mut db = db();
         // Set always_on first
         db.set_skill_override("mika", "foo", true).unwrap();
         // Now disable
@@ -10175,7 +10111,7 @@ mod tests {
 
     #[test]
     fn test_set_skill_enabled_enable_with_always_on_keeps_row() {
-        let db = db();
+        let mut db = db();
         // Set both always_on and disabled
         db.set_skill_override("mika", "foo", true).unwrap();
         db.set_skill_enabled("mika", "foo", false).unwrap();
@@ -10189,7 +10125,7 @@ mod tests {
 
     #[test]
     fn test_set_skill_enabled_preserves_llm_override() {
-        let db = db();
+        let mut db = db();
         db.set_skill_llm_override("mika", "foo", "anthropic", "claude-sonnet-4-6")
             .unwrap();
         db.set_skill_enabled("mika", "foo", false).unwrap();
@@ -10201,7 +10137,7 @@ mod tests {
 
     #[test]
     fn test_set_skill_enabled_round_trip() {
-        let db = db();
+        let mut db = db();
         // Disable → enable → state is clean
         db.set_skill_enabled("mika", "bar", false).unwrap();
         assert_eq!(db.get_skill_overrides("mika").unwrap().len(), 1);
@@ -10217,7 +10153,7 @@ mod tests {
 
     #[test]
     fn test_delete_skill_llm_override_with_enabled_keeps_row() {
-        let db = db();
+        let mut db = db();
         db.set_skill_llm_override("mika", "foo", "anthropic", "claude-sonnet-4-6")
             .unwrap();
         db.set_skill_enabled("mika", "foo", false).unwrap();
@@ -11965,7 +11901,7 @@ mod tests {
         );
 
         // Run incremental migrations: v24 -> v25 -> v26 -> v27 -> v28
-        let db2 = Database { conn: conn2 };
+        let mut db2 = Database { conn: conn2 };
         db2.migrate_v24_to_v25().unwrap();
         db2.migrate_v25_to_v26().unwrap();
         db2.migrate_v26_to_v27().unwrap();
@@ -12131,5 +12067,220 @@ mod tests {
             .count_chunks_for_docs_root_hash("other_hash_000000")
             .unwrap();
         assert_eq!(other, 0);
+    }
+
+    // --- Transaction RAII tests (mika#636) ---
+
+    /// Test 1: A committed RAII transaction persists writes visible to a
+    /// separate connection.
+    #[test]
+    fn test_transaction_commit_persists() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        // Connection A: write inside a committed transaction.
+        {
+            let mut conn_a = Connection::open(path).unwrap();
+            conn_a.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            conn_a
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+                .unwrap();
+
+            let tx = conn_a.transaction().unwrap();
+            tx.execute("INSERT INTO t (val) VALUES ('hello')", [])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Connection B: verify the row is visible.
+        let conn_b = Connection::open(path).unwrap();
+        let count: i64 = conn_b
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Test 2: A transaction dropped without commit() auto-rolls back — the
+    /// write is invisible to a separate connection.
+    #[test]
+    fn test_transaction_drop_without_commit_rolls_back() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        // Connection A: write inside a transaction that is dropped (not committed).
+        {
+            let mut conn_a = Connection::open(path).unwrap();
+            conn_a.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            conn_a
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+                .unwrap();
+
+            let tx = conn_a.transaction().unwrap();
+            tx.execute("INSERT INTO t (val) VALUES ('dropped')", [])
+                .unwrap();
+            // Intentionally NOT calling tx.commit() — drop triggers ROLLBACK.
+            drop(tx);
+
+            // Even on the same connection, the row should not be visible.
+            let count: i64 = conn_a
+                .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "row should be rolled back on same connection");
+        }
+
+        // Connection B: also invisible.
+        let conn_b = Connection::open(path).unwrap();
+        let count: i64 = conn_b
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "row should be rolled back for other connections");
+    }
+
+    /// Test 3: RAII Transaction rollback preserves prior state when an error
+    /// occurs mid-transaction. Uses the same DEFERRED transaction pattern as
+    /// `replace_with_summary` to verify that `Transaction::drop` rolls back
+    /// partial writes.
+    #[test]
+    fn test_replace_with_summary_rollback_on_error() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let mut conn = Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+             INSERT INTO t (val) VALUES ('original');",
+        )
+        .unwrap();
+
+        // Verify baseline.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Simulate a transaction that partially succeeds then fails.
+        // This mirrors the replace_with_summary pattern: DELETE + INSERT
+        // where the INSERT can fail.
+        let result: Result<(), rusqlite::Error> = (|| {
+            let tx = conn.transaction()?;
+            // First operation succeeds — deletes the original row.
+            tx.execute("DELETE FROM t WHERE val = 'original'", [])?;
+            // Second operation fails — NOT NULL constraint violation.
+            tx.execute("INSERT INTO t (val) VALUES (NULL)", [])?;
+            tx.commit()?;
+            Ok(())
+        })();
+
+        assert!(
+            result.is_err(),
+            "INSERT NULL should violate NOT NULL constraint"
+        );
+
+        // The original row should still be present — RAII Transaction::drop
+        // rolled back the DELETE when the INSERT failed.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "original row should be preserved after rollback");
+
+        let val: String = conn
+            .query_row("SELECT val FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            val, "original",
+            "original value should be preserved after rollback"
+        );
+    }
+
+    /// Test 6: Cross-connection staleness regression test.
+    ///
+    /// Opens two connections to the same WAL-mode DB with `cache=private`
+    /// (disables in-process shared cache to simulate cross-process visibility).
+    /// Connection A writes a session. Connection B reads sessions. Without
+    /// the WAL checkpoint fix, B would see stale data if A's transaction was
+    /// held; with the fix + checkpoint, B sees fresh data.
+    #[test]
+    fn test_dashboard_sees_writes_from_separate_connection() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        // Open Connection A with cache=private to simulate cross-process isolation.
+        let uri_a = format!("file:{}?cache=private", path);
+        let mut conn_a = Connection::open_with_flags(
+            &uri_a,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        conn_a.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+
+        // Create schema (minimal: agents + sessions tables).
+        conn_a
+            .execute_batch(
+                "CREATE TABLE agents (
+                     id TEXT PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     home_dir TEXT NOT NULL DEFAULT '',
+                     active BOOLEAN NOT NULL DEFAULT 1,
+                     last_seen TEXT,
+                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 );
+                 CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY,
+                     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     channel_type TEXT NOT NULL DEFAULT 'cli',
+                     started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     ended_at TEXT,
+                     metadata TEXT,
+                     parent_session_id TEXT,
+                     task_id TEXT
+                 );
+                 INSERT INTO agents (id, name) VALUES ('test', 'test');
+                 INSERT INTO sessions (id, agent_id, channel_type) VALUES ('s1', 'test', 'cli');",
+            )
+            .unwrap();
+
+        // Open Connection B with cache=private (simulates dashboard reader).
+        let uri_b = format!("file:{}?cache=private", path);
+        let conn_b = Connection::open_with_flags(
+            &uri_b,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+
+        // B sees the initial session.
+        let count_before: i64 = conn_b
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_before, 1);
+
+        // A writes a new session (committed transaction, RAII style).
+        {
+            let tx = conn_a.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO sessions (id, agent_id, channel_type) VALUES ('s2', 'test', 'cli')",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Without a checkpoint, B may still see stale data due to WAL snapshot.
+        // Run PASSIVE checkpoint on A's connection to advance the snapshot.
+        conn_a
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            .unwrap();
+
+        // B should now see the new session after the checkpoint.
+        let count_after: i64 = conn_b
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_after, 2,
+            "dashboard connection should see writes after WAL checkpoint"
+        );
     }
 }

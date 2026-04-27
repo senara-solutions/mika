@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_replace_with_summary_preserves_recent() {
-        let (db, sid) = test_db_with_session();
+        let (mut db, sid) = test_db_with_session();
         for i in 0..60 {
             db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
                 .unwrap();
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_incremental_compaction() {
-        let (db, sid) = test_db_with_session();
+        let (mut db, sid) = test_db_with_session();
 
         for i in 0..60 {
             db.save_message("mika", &sid, "user", &format!("batch1 msg {i}"), None)
