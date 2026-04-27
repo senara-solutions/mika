@@ -4,6 +4,7 @@ import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/time
 import { useTraceLlmCalls } from '../api/llmCalls.ts'
 import { useTraceToolCalls } from '../api/toolCalls.ts'
 import { CopyButton as UiCopyButton, EmptyState, StatusBadge, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
+import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
@@ -96,29 +97,11 @@ function formatLatency(ms: number): string {
   return `${ms}ms`
 }
 
-function llmStatusBadge(status: string) {
+function llmStatusVariant(status: string): { variant: StatusBadgeVariant; label: string } {
   switch (status) {
-    case 'success':
-      return (
-        <span className="inline-flex items-center gap-1 text-emerald-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-          <span className="text-[10px]">success</span>
-        </span>
-      )
-    case 'error':
-      return (
-        <span className="inline-flex items-center gap-1 text-red-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-          <span className="text-[10px]">error</span>
-        </span>
-      )
-    default:
-      return (
-        <span className="inline-flex items-center gap-1 text-muted/60">
-          <span className="w-1.5 h-1.5 rounded-full bg-muted/40" />
-          <span className="text-[10px]">{status}</span>
-        </span>
-      )
+    case 'success': return { variant: 'success', label: 'Success' }
+    case 'error': return { variant: 'error', label: 'Error' }
+    default: return { variant: 'neutral', label: status }
   }
 }
 
@@ -646,7 +629,7 @@ export default function TraceDetail() {
                     <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.input_tokens)}</td>
                     <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">{formatTokens(row.output_tokens)}</td>
                     <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">{formatLatency(row.latency_ms)}</td>
-                    <td className="px-4 py-3">{llmStatusBadge(row.status)}</td>
+                    <td className="px-4 py-3"><StatusBadge {...llmStatusVariant(row.status)} /></td>
                   </tr>
                 ))}
               </tbody>
@@ -715,17 +698,7 @@ export default function TraceDetail() {
                           {row.skill_name ?? <span className="text-muted/30">-</span>}
                         </td>
                         <td className="px-4 py-3">
-                          {row.success ? (
-                            <span className="inline-flex items-center gap-1 text-emerald-400">
-                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                              <span className="text-[10px]">ok</span>
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 text-red-400">
-                              <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-                              <span className="text-[10px]">fail</span>
-                            </span>
-                          )}
+                          <StatusBadge variant={row.success ? 'success' : 'error'} label={row.success ? 'Ok' : 'Fail'} />
                         </td>
                         <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
                           {formatLatency(row.latency_ms)}
