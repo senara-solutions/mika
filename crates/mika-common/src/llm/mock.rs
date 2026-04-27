@@ -17,6 +17,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -25,12 +26,31 @@ use super::LlmProvider;
 use super::error::LlmError;
 use super::types::*;
 
-/// A pre-configured mock response — either a successful LLM response or an error.
+/// A pre-configured mock response — either a successful LLM response, an error,
+/// or a delayed wrapper that simulates a slow provider call before producing
+/// the inner outcome.
+#[derive(Clone)]
 pub enum MockResponse {
     /// A successful LLM response.
     Success(LlmResponse),
     /// An LLM error (rate limit, network failure, etc.).
     Error(LlmError),
+    /// Sleep for `sleep_ms` virtual milliseconds, then resolve as `inner`.
+    ///
+    /// **Always uses `tokio::time::sleep`** — never `std::thread::sleep` — so
+    /// `tokio::time::pause()` + `tokio::time::advance()` can drive the clock
+    /// in tests without real wall-clock waits. Critical for the deadline-during-
+    /// LLM-call eval scenario from mika#848: a 350-second virtual delay would
+    /// hang the test if implemented with blocking sleep, but is instant under
+    /// virtual time when the test uses `tokio::time::pause()`.
+    ///
+    /// Nesting `Delayed` inside `Delayed` is not supported and will panic at
+    /// resolve time. If you need multiple delays in sequence, push multiple
+    /// `Delayed` entries onto the response sequence instead.
+    Delayed {
+        sleep_ms: u64,
+        inner: Box<MockResponse>,
+    },
 }
 
 /// Configuration for `MockLlmProvider` trait method return values.
@@ -104,19 +124,36 @@ impl LlmProvider for MockLlmProvider {
         self.captured_requests.lock().unwrap().push(request.clone());
 
         let index = self.cursor.fetch_add(1, Ordering::SeqCst);
-        let responses = self.responses.lock().unwrap();
-        if index >= responses.len() {
-            panic!(
-                "MockLlmProvider: exhausted all {} responses at call {}. \
-                 Add more responses or verify agent behavior.",
-                responses.len(),
-                index + 1
-            );
-        }
 
-        match &responses[index] {
-            MockResponse::Success(resp) => Ok(resp.clone()),
-            MockResponse::Error(err) => Err(err.clone()),
+        // Scope the lock so the MutexGuard is fully dropped before any `.await`
+        // — `MutexGuard` is `!Send` and Rust's NLL still treats it as alive
+        // across the await without an explicit scope.
+        let response = {
+            let responses = self.responses.lock().unwrap();
+            if index >= responses.len() {
+                panic!(
+                    "MockLlmProvider: exhausted all {} responses at call {}. \
+                     Add more responses or verify agent behavior.",
+                    responses.len(),
+                    index + 1
+                );
+            }
+            responses[index].clone()
+        };
+
+        match response {
+            MockResponse::Success(resp) => Ok(resp),
+            MockResponse::Error(err) => Err(err),
+            MockResponse::Delayed { sleep_ms, inner } => {
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                match *inner {
+                    MockResponse::Success(resp) => Ok(resp),
+                    MockResponse::Error(err) => Err(err),
+                    MockResponse::Delayed { .. } => panic!(
+                        "MockResponse::Delayed cannot nest — push multiple Delayed entries onto the sequence instead"
+                    ),
+                }
+            }
         }
     }
 
@@ -287,6 +324,18 @@ pub fn max_tokens_response(text: &str) -> MockResponse {
     })
 }
 
+/// Wrap an inner mock response with a virtual sleep before it resolves.
+///
+/// Uses `tokio::time::sleep`, so combining this with `tokio::time::pause()` and
+/// `tokio::time::advance()` lets tests drive the clock without wall-clock waits.
+/// See `MockResponse::Delayed` for the full contract.
+pub fn delayed_response(sleep_ms: u64, inner: MockResponse) -> MockResponse {
+    MockResponse::Delayed {
+        sleep_ms,
+        inner: Box::new(inner),
+    }
+}
+
 /// Create a ContentFilter stop reason response.
 pub fn content_filter_response() -> MockResponse {
     MockResponse::Success(LlmResponse {
@@ -312,6 +361,7 @@ mod tests {
                 assert!(!r.has_tool_calls());
             }
             MockResponse::Error(_) => panic!("Expected Success"),
+            MockResponse::Delayed { .. } => panic!("Expected Success, got Delayed"),
         }
     }
 
@@ -333,6 +383,7 @@ mod tests {
                 }
             }
             MockResponse::Error(_) => panic!("Expected Success"),
+            MockResponse::Delayed { .. } => panic!("Expected Success, got Delayed"),
         }
     }
 
@@ -347,6 +398,7 @@ mod tests {
                 assert_eq!(r.tool_calls().len(), 2);
             }
             MockResponse::Error(_) => panic!("Expected Success"),
+            MockResponse::Delayed { .. } => panic!("Expected Success, got Delayed"),
         }
     }
 
@@ -359,6 +411,7 @@ mod tests {
                 assert_eq!(r.reasoning.as_deref(), Some("Let me think..."));
             }
             MockResponse::Error(_) => panic!("Expected Success"),
+            MockResponse::Delayed { .. } => panic!("Expected Success, got Delayed"),
         }
     }
 
@@ -370,6 +423,7 @@ mod tests {
                 assert_eq!(r.stop_reason, LlmStopReason::MaxTokens);
             }
             MockResponse::Error(_) => panic!("Expected Success"),
+            MockResponse::Delayed { .. } => panic!("Expected Success, got Delayed"),
         }
     }
 
@@ -381,6 +435,7 @@ mod tests {
                 assert_eq!(r.stop_reason, LlmStopReason::ContentFilter);
             }
             MockResponse::Error(_) => panic!("Expected Success"),
+            MockResponse::Delayed { .. } => panic!("Expected Success, got Delayed"),
         }
     }
 

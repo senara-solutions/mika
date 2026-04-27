@@ -171,7 +171,7 @@ Add `mika/docs/solutions/runtime-errors/agent-deadline-graceful-exit-2026-04-27.
 - Changing `AGENT_TOTAL_TIMEOUT_SECS = 300`.
 - Changing the per-provider HTTP timeout (120s in `claude.rs`, 120s in `openai.rs`).
 - Tool-call timeout changes.
-- Adding a runtime-configurable deadline for production (the new `AgentParams.total_timeout: Option<Duration>` field is test-utils-gated; production paths pass `None`).
+- Adding a runtime-configurable deadline for production. The new `*_with_deadline` test-only entry points are documented as test-internal (no `cfg` gate, but the naming + docstring is the contract — `cfg(any(test, feature = "test-utils"))` was rejected because Rust integration tests don't see the lib's `cfg(test)`). `AgentParams` carries no deadline knob.
 - Auditing other `tokio::time::timeout` callsites (lines 437, 2047, 2070, 2097 — those are short-scoped continuation/utility timeouts, not the turn-level 300s budget).
 - Per-step deadline checks within `dispatch_tool` — tools self-cap at 30s and the tool timeout is a different mechanism. (Note: `attempt_continuation_turn` *is* now in scope per F3, contrary to the original plan.)
 - Threading `deadline` into prelude async helpers (`resolve_contexts`, `match_skills`, etc.) — current prelude `.await` sites are sub-100ms. Re-open this scope item if any future prelude step has a documented slow path.
@@ -182,7 +182,7 @@ Add `mika/docs/solutions/runtime-errors/agent-deadline-graceful-exit-2026-04-27.
 |------|------------|
 | A misbehaving tool exceeds its own 30s timeout silently and the deadline never fires while it hangs. | The `tokio::time::timeout(TOOL_TIMEOUT_SECS, ...)` inside `dispatch_tool` is unaffected by this change — tools still self-cap. |
 | A misbehaving provider exceeds 120s without timing out (e.g., never closes the connection). | The 120s `reqwest` client timeout is OS-level; if the provider never responds, the socket layer terminates. Worst case: 120s wait, then error. |
-| The new `AgentParams.total_timeout` field gets passed `Some(short_duration)` from production code by accident. | Field is `Option<Duration>` defaulting to `None` (which yields the 300s constant). Test-utils-gated builder helpers in `EvalHarness` are the only setters in this PR. Reviewers will catch any production callsite that sets it. |
+| Production code accidentally bypasses the global budget by calling `run_*_with_deadline`. | The `*_with_deadline` entry points are publicly visible (Rust integration tests need them) but documented as test-only. Naming makes intent obvious; reviewers catch any production callsite that uses them. The lint guard at `scripts/check-loop-select.sh` is orthogonal — adding a similar grep guard for `*_with_deadline` callsites outside `tests/` is a low-cost follow-up if drift becomes a real risk. |
 | Removing the outer timeout reveals a latent deadlock that was previously masked. | The continuation-turn timeout (60s, line 437) and continuation guards remain in place. If a deadlock exists, this change makes it observable rather than masking it as a 5-min hang. That's a feature, not a regression. |
 
 ## Files touched (estimate)

@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::async_db::AsyncDatabase;
@@ -414,16 +415,27 @@ struct ContinuationResult {
 /// Strips the step-awareness nudge, disables tools and thinking, then makes one
 /// final LLM call asking for a summary. Falls back to `format_step_exceeded_fallback`
 /// if the API call fails or times out. Used by Conversation, Team, and Silent modes.
+///
+/// `tool_call_summaries` and `system_prompt_original_len` are passed in directly
+/// (extracted from `LoopResult::MaxStepsExceeded` by the caller) so this helper
+/// stays decoupled from the variant shape.
+///
+/// `deadline` clamps the inner LLM-call timeout to `min(CONTINUATION_TIMEOUT_SECS,
+/// deadline - now)`. The caller is expected to gate entry on `deadline > now +
+/// CONTINUATION_TIMEOUT_SECS` (see mika#848 F3a) — the `debug_assert!` here is
+/// the test-time enforcement that this gate fires first.
 async fn attempt_continuation_turn(
     request: &mut LlmRequest,
     llm: &dyn LlmProvider,
-    loop_result: &LoopResult,
+    tool_call_summaries: &[ToolCallSummary],
+    system_prompt_original_len: usize,
     label: &str,
+    deadline: Instant,
 ) -> ContinuationResult {
     // Strip the step-awareness nudge from the system prompt so the continuation
     // turn does not see stale "2 steps remaining" text.
     if let Some(ref mut system) = request.system {
-        system.truncate(loop_result.system_prompt_original_len);
+        system.truncate(system_prompt_original_len);
     }
     request.tools = None;
     request.thinking = None;
@@ -434,11 +446,20 @@ async fn attempt_continuation_turn(
         ),
     });
 
-    let continuation = tokio::time::timeout(
-        Duration::from_secs(CONTINUATION_TIMEOUT_SECS),
-        llm.send_message(request),
-    )
-    .await;
+    // Clamp the continuation timeout to the remaining deadline budget so an
+    // in-flight LLM call here can never push the turn past the agent total
+    // timeout. The caller's gate (mika#848 F3a) should have already prevented
+    // entry when remaining < CONTINUATION_TIMEOUT_SECS.
+    let now = Instant::now();
+    debug_assert!(
+        deadline > now,
+        "deadline already passed at continuation entry — gate (F3a) should have prevented this"
+    );
+    let remaining = deadline.saturating_duration_since(now);
+    let continuation_timeout =
+        std::cmp::min(Duration::from_secs(CONTINUATION_TIMEOUT_SECS), remaining);
+
+    let continuation = tokio::time::timeout(continuation_timeout, llm.send_message(request)).await;
 
     match continuation {
         Ok(Ok(resp)) => {
@@ -446,7 +467,7 @@ async fn attempt_continuation_turn(
             let u = Some(resp.usage);
             if t.is_empty() {
                 ContinuationResult {
-                    text: format_step_exceeded_fallback(&loop_result.tool_call_summaries),
+                    text: format_step_exceeded_fallback(tool_call_summaries),
                     usage: u,
                 }
             } else {
@@ -456,24 +477,24 @@ async fn attempt_continuation_turn(
         Ok(Err(e)) => {
             warn!(
                 error = %e,
-                tool_calls = loop_result.tool_call_summaries.len(),
+                tool_calls = tool_call_summaries.len(),
                 label,
                 "continuation turn API error after max steps"
             );
             ContinuationResult {
-                text: format_step_exceeded_fallback(&loop_result.tool_call_summaries),
+                text: format_step_exceeded_fallback(tool_call_summaries),
                 usage: None,
             }
         }
         Err(_) => {
             warn!(
-                timeout_secs = CONTINUATION_TIMEOUT_SECS,
-                tool_calls = loop_result.tool_call_summaries.len(),
+                timeout_secs = continuation_timeout.as_secs(),
+                tool_calls = tool_call_summaries.len(),
                 label,
                 "continuation turn timed out after max steps"
             );
             ContinuationResult {
-                text: format_step_exceeded_fallback(&loop_result.tool_call_summaries),
+                text: format_step_exceeded_fallback(tool_call_summaries),
                 usage: None,
             }
         }
@@ -481,17 +502,48 @@ async fn attempt_continuation_turn(
 }
 
 /// Result from the shared tool-step loop.
-struct LoopResult {
-    text: Option<String>,
-    thinking: Option<String>,
-    usage: Option<LlmUsage>,
-    max_steps_exceeded: bool,
-    /// Accumulated tool call summaries from all loop steps.
-    /// Used by the `max_steps_exceeded` fallback path to persist metadata.
-    tool_call_summaries: Vec<ToolCallSummary>,
-    /// Original system prompt length before step-awareness nudge was appended.
-    /// Used to strip the nudge before the continuation turn.
-    system_prompt_original_len: usize,
+///
+/// **Exhaustiveness contract:** This enum must NOT carry `#[non_exhaustive]`. The
+/// compiler's match-exhaustiveness check is the machine-enforcement surface that
+/// guarantees all three outer handlers (`run_agent_inner`, `run_silent_inner`,
+/// `run_team_agent_inner`) handle every variant. A wildcard `_ =>` arm could
+/// silently route a future variant into the wrong fallback. See mika#848.
+///
+/// `#[allow(dead_code)]` is intentional: variant fields carry forensic value
+/// (steps completed, partial summaries, last usage) for diagnostic logging and
+/// for future observability hooks even when current consumers ignore them via
+/// `..` destructuring. Removing them now would force a future re-add.
+#[allow(dead_code)]
+enum LoopResult {
+    /// Loop completed normally — either with a final text response or tool-only.
+    Done {
+        text: Option<String>,
+        thinking: Option<String>,
+        usage: Option<LlmUsage>,
+        /// Accumulated tool call summaries from all loop steps.
+        tool_call_summaries: Vec<ToolCallSummary>,
+        /// Original system prompt length before step-awareness nudge was appended.
+        system_prompt_original_len: usize,
+    },
+    /// Loop exited because `MAX_TOOL_STEPS` was reached without an EndTurn.
+    /// Caller is expected to attempt a continuation turn for a final summary.
+    MaxStepsExceeded {
+        thinking: Option<String>,
+        usage: Option<LlmUsage>,
+        tool_call_summaries: Vec<ToolCallSummary>,
+        system_prompt_original_len: usize,
+    },
+    /// Loop exited because the agent total-turn deadline was reached between steps.
+    /// Caller is expected to emit the mode-appropriate fallback message. The
+    /// in-flight LLM call (if any) was allowed to complete and persisted its
+    /// `llm_calls` row before this variant was returned. See mika#848.
+    DeadlineExceeded {
+        steps_completed: usize,
+        partial_summaries: Vec<ToolCallSummary>,
+        last_usage: Option<LlmUsage>,
+        thinking: Option<String>,
+        system_prompt_original_len: usize,
+    },
 }
 
 /// Remove image blocks from prior tool results to prevent unbounded memory
@@ -567,6 +619,7 @@ async fn run_loop(
     store_tool_calls: bool,
     prompt_variant: Option<&str>,
     internal: bool,
+    deadline: Instant,
 ) -> Result<LoopResult> {
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
@@ -642,6 +695,28 @@ async fn run_loop(
 
     let max_steps = mode.max_steps();
     for step in 0..max_steps {
+        // Deadline check at iteration top — refuses to start the next step when
+        // the agent total-turn deadline has been reached. Any in-flight LLM HTTP
+        // call from the previous step has already completed (or transport-timed-
+        // out) and persisted its `llm_calls` row by the time we re-enter this
+        // check. See mika#848.
+        if Instant::now() >= deadline {
+            warn!(
+                target: "mika::otel",
+                trace_id = %tool_ctx.trace_id,
+                steps_completed = step,
+                mode = mode.label(),
+                "agent deadline exceeded — exiting loop gracefully"
+            );
+            return Ok(LoopResult::DeadlineExceeded {
+                steps_completed: step,
+                partial_summaries: all_tool_summaries,
+                last_usage,
+                thinking: thinking_text,
+                system_prompt_original_len: system_prompt_len,
+            });
+        }
+
         debug!(
             step,
             label = mode.label(),
@@ -1167,11 +1242,10 @@ async fn run_loop(
                         .await?;
                     }
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
-                    return Ok(LoopResult {
+                    return Ok(LoopResult::Done {
                         text: Some(text),
                         thinking: thinking_text,
                         usage: last_usage,
-                        max_steps_exceeded: false,
                         tool_call_summaries: all_tool_summaries,
                         system_prompt_original_len: system_prompt_len,
                     });
@@ -1179,11 +1253,10 @@ async fn run_loop(
 
                 if !mode.follow_up_on_empty() {
                     info!(step, label = mode.label(), "agent done");
-                    return Ok(LoopResult {
+                    return Ok(LoopResult::Done {
                         text: None,
                         thinking: None,
                         usage: None,
-                        max_steps_exceeded: false,
                         tool_call_summaries: all_tool_summaries,
                         system_prompt_original_len: system_prompt_len,
                     });
@@ -1221,11 +1294,10 @@ async fn run_loop(
                     );
                 }
                 info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
-                return Ok(LoopResult {
+                return Ok(LoopResult::Done {
                     text: None,
                     thinking: thinking_text,
                     usage: last_usage,
-                    max_steps_exceeded: false,
                     tool_call_summaries: all_tool_summaries,
                     system_prompt_original_len: system_prompt_len,
                 });
@@ -1263,11 +1335,9 @@ async fn run_loop(
         label = mode.label(),
         max_steps, "agent exceeded max tool steps"
     );
-    Ok(LoopResult {
-        text: None,
+    Ok(LoopResult::MaxStepsExceeded {
         thinking: thinking_text,
         usage: last_usage,
-        max_steps_exceeded: true,
         tool_call_summaries: all_tool_summaries,
         system_prompt_original_len: system_prompt_len,
     })
@@ -1439,14 +1509,13 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         span.record("correlated_task_id", task_id.as_str());
     }
 
-    let timeout_result = tokio::time::timeout(
-        Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_agent_inner(params, &trace_id).instrument(span),
-    )
-    .await;
+    let deadline = Instant::now() + Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS);
+    let result = run_agent_inner(params, &trace_id, deadline)
+        .instrument(span)
+        .await;
 
-    match timeout_result {
-        Ok(Ok(output)) => {
+    match result {
+        Ok(output) => {
             // Post-turn compaction: summarize old messages if threshold exceeded.
             // Runs inline (not spawned) — acceptable latency for CLI mode.
             // Server mode sets skip_compaction=true and spawns compaction outside the agent lock.
@@ -1463,36 +1532,67 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
             }
             Ok(output)
         }
-        Ok(Err(e)) => Err(e),
-        Err(_elapsed) => {
-            warn!(
-                timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
-                "agent loop total timeout exceeded"
-            );
-            let fallback =
-                "I'm sorry, that took too long. Let me try a simpler approach next time.";
-            params
-                .db
-                .save_message_with_metadata(
-                    params.session_id,
-                    "assistant",
-                    fallback,
-                    None,
-                    Some(&trace_id),
-                    params.internal,
-                )
-                .await?;
-            Ok(AgentOutput {
-                text: Some(fallback.to_string()),
-                thinking: None,
-                usage: None,
-            })
-        }
+        Err(e) => Err(e),
     }
 }
 
-/// Inner agent loop, separated so the outer function can wrap it in a timeout.
-async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<AgentOutput> {
+/// **Test-only entry point** that exposes the `deadline: Instant` parameter.
+///
+/// Production callers use [`run_agent`], which computes the deadline internally
+/// from `AGENT_TOTAL_TIMEOUT_SECS`. Tests construct a short deadline (often
+/// under a `tokio::time::pause()` clock) and pass it here to exercise the
+/// deadline-exceeded code path without waiting wall-clock seconds.
+///
+/// **No production code path uses this entry point.** The [`AgentParams`] type
+/// intentionally has no deadline knob — see mika#848 F4. If you find yourself
+/// reaching for this from production code, you are routing through the wrong
+/// contract; either use [`run_agent`] (which honors the global budget) or add
+/// a justified scope item to extend the contract.
+///
+/// `cfg`-gating with `#[cfg(any(test, feature = "test-utils"))]` was rejected
+/// because Rust's integration test model treats `tests/*.rs` as a separate crate
+/// that does not see the `test` cfg of the lib it depends on, so the function
+/// would be invisible to the eval suite without an awkward self-dev-dep. The
+/// naming (`*_with_deadline`) and docstring are the contract enforcement here.
+pub async fn run_agent_with_deadline(
+    params: &AgentParams<'_>,
+    deadline: Instant,
+) -> Result<AgentOutput> {
+    let trace_id = params
+        .trace_id
+        .clone()
+        .unwrap_or_else(mika_common::trace::generate_trace_id);
+    if !params.is_callback_turn {
+        let save_text = if params.user_images.is_empty() {
+            params.user_message.to_string()
+        } else {
+            format!(
+                "[{} image(s) attached]\n{}",
+                params.user_images.len(),
+                params.user_message
+            )
+        };
+        params
+            .db
+            .save_message_with_metadata(
+                params.session_id,
+                "user",
+                &save_text,
+                None,
+                Some(&trace_id),
+                params.internal,
+            )
+            .await?;
+    }
+    run_agent_inner(params, &trace_id, deadline).await
+}
+
+/// Inner agent loop, separated so the outer function can compute the deadline.
+async fn run_agent_inner(
+    params: &AgentParams<'_>,
+    trace_id: &str,
+    deadline: Instant,
+) -> Result<AgentOutput> {
     let db = params.db;
     let llm = params.llm;
     let tools = params.tools;
@@ -1793,6 +1893,20 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
             .await;
     }
 
+    // Prelude deadline check (mika#848 F3b) — if prompt assembly, context resolution,
+    // or skill matching above already burned the entire turn budget, skip the loop
+    // and emit the fallback directly. Prelude `.await` sites are empirically sub-100ms
+    // today; this gate is defensive against future slow paths.
+    if Instant::now() >= deadline {
+        warn!(
+            target: "mika::otel",
+            trace_id = %trace_id,
+            mode = "conversation",
+            "agent deadline exceeded during prelude — skipping loop"
+        );
+        return persist_deadline_fallback(db, session_id, trace_id, params.internal).await;
+    }
+
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     let result = run_loop(
@@ -1812,33 +1926,95 @@ async fn run_agent_inner(params: &AgentParams<'_>, trace_id: &str) -> Result<Age
         store_tools,
         prompt_variant.as_deref(),
         params.internal,
+        deadline,
     )
     .await?;
 
-    if result.max_steps_exceeded {
-        let cont = attempt_continuation_turn(&mut request, llm, &result, "agent").await;
+    match result {
+        LoopResult::Done {
+            text,
+            thinking,
+            usage,
+            tool_call_summaries: _,
+            system_prompt_original_len: _,
+        } => Ok(AgentOutput {
+            text,
+            thinking,
+            usage,
+        }),
+        LoopResult::MaxStepsExceeded {
+            thinking,
+            usage,
+            tool_call_summaries,
+            system_prompt_original_len,
+        } => {
+            // Continuation entry gate (mika#848 F3a) — skip continuation when its 60s
+            // ceiling would push us past the agent total deadline.
+            if Instant::now() + Duration::from_secs(CONTINUATION_TIMEOUT_SECS) > deadline {
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %trace_id,
+                    mode = "conversation",
+                    "max-steps exceeded but deadline too close for continuation — emitting fallback"
+                );
+                return persist_deadline_fallback(db, session_id, trace_id, params.internal).await;
+            }
+            let cont = attempt_continuation_turn(
+                &mut request,
+                llm,
+                &tool_call_summaries,
+                system_prompt_original_len,
+                "agent",
+                deadline,
+            )
+            .await;
 
-        let metadata = tool_calls_metadata_json(&result.tool_call_summaries);
-        db.save_message_with_metadata(
-            session_id,
-            "assistant",
-            &cont.text,
-            metadata.as_deref(),
-            Some(trace_id),
-            params.internal,
-        )
-        .await?;
-        return Ok(AgentOutput {
-            text: Some(cont.text),
-            thinking: result.thinking,
-            usage: cont.usage.or(result.usage),
-        });
+            let metadata = tool_calls_metadata_json(&tool_call_summaries);
+            db.save_message_with_metadata(
+                session_id,
+                "assistant",
+                &cont.text,
+                metadata.as_deref(),
+                Some(trace_id),
+                params.internal,
+            )
+            .await?;
+            Ok(AgentOutput {
+                text: Some(cont.text),
+                thinking,
+                usage: cont.usage.or(usage),
+            })
+        }
+        LoopResult::DeadlineExceeded { .. } => {
+            persist_deadline_fallback(db, session_id, trace_id, params.internal).await
+        }
     }
+}
 
+/// Persist the conversation-mode deadline-exceeded fallback message and return
+/// the corresponding `AgentOutput`. Centralizes the fallback shape so the three
+/// callsites (prelude gate, continuation-skip gate, `LoopResult::DeadlineExceeded`)
+/// stay in sync.
+async fn persist_deadline_fallback(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    internal: bool,
+) -> Result<AgentOutput> {
+    let fallback = "I'm sorry, that took too long. Let me try a simpler approach next time.";
+    db.save_message_with_metadata(
+        session_id,
+        "assistant",
+        fallback,
+        None,
+        Some(trace_id),
+        internal,
+    )
+    .await?;
     Ok(AgentOutput {
-        text: result.text,
-        thinking: result.thinking,
-        usage: result.usage,
+        text: Some(fallback.to_string()),
+        thinking: None,
+        usage: None,
     })
 }
 
@@ -2234,32 +2410,22 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         trigger = %trigger_label,
     );
 
-    let timeout_result = tokio::time::timeout(
-        Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS),
-        run_silent_inner(params).instrument(silent_span),
-    )
-    .await;
-
-    match timeout_result {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            warn!(
-                timeout_secs = AGENT_TOTAL_TIMEOUT_SECS,
-                trigger_label, "silent agent timeout exceeded"
-            );
-            // Record failed reflection run on timeout
-            if matches!(&params.trigger, SilentTrigger::Reflection) {
-                let _ = params
-                    .db
-                    .record_reflection_run("failed", 0, Some("Timed out"))
-                    .await;
-            }
-            Ok(())
-        }
-    }
+    let deadline = Instant::now() + Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS);
+    run_silent_inner(params, deadline)
+        .instrument(silent_span)
+        .await
 }
 
-async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
+/// **Test-only entry point** for silent mode that exposes the deadline.
+/// See [`run_agent_with_deadline`] for the gating rationale.
+pub async fn run_silent_agent_with_deadline(
+    params: &SilentAgentParams<'_>,
+    deadline: Instant,
+) -> Result<()> {
+    run_silent_inner(params, deadline).await
+}
+
+async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> Result<()> {
     let db = params.db;
     let llm = params.llm;
     let tools = params.tools;
@@ -2560,6 +2726,23 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         SilentTrigger::SkillRun { .. } => "skill_run",
         SilentTrigger::Reminder { .. } => "reminder",
     };
+
+    // Prelude deadline check (mika#848 F3b) — see run_agent_inner for rationale.
+    if Instant::now() >= deadline {
+        warn!(
+            target: "mika::otel",
+            trigger_label,
+            session_id = params.session_id,
+            "silent agent deadline exceeded during prelude — skipping loop"
+        );
+        if matches!(&params.trigger, SilentTrigger::Reflection) {
+            let _ = db
+                .record_reflection_run("failed", 0, Some("Timed out"))
+                .await;
+        }
+        return Ok(());
+    }
+
     let result = run_loop(
         llm,
         tools,
@@ -2577,29 +2760,74 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>) -> Result<()> {
         store_tools,
         prompt_variant.as_deref(),
         false, // silent mode messages are never internal
+        deadline,
     )
     .await?;
 
-    // Continuation turn: if the agent ran out of tool steps, attempt one final
-    // summary turn and notify the user. Without this, the callback result would
-    // be silently swallowed. See #375.
-    if result.max_steps_exceeded {
-        warn!(
-            trigger = trigger_label,
-            max_steps = params.trigger.max_steps(),
-            session_id = params.session_id,
-            "silent agent exceeded max tool steps"
-        );
+    // Match all three LoopResult variants. Compiler enforces exhaustiveness — see
+    // mika#848 F4 / `LoopResult`'s exhaustiveness contract.
+    match result {
+        LoopResult::Done { .. } => {}
+        LoopResult::MaxStepsExceeded {
+            tool_call_summaries,
+            system_prompt_original_len,
+            ..
+        } => {
+            warn!(
+                trigger = trigger_label,
+                max_steps = params.trigger.max_steps(),
+                session_id = params.session_id,
+                "silent agent exceeded max tool steps"
+            );
 
-        let cont = attempt_continuation_turn(&mut request, llm, &result, trigger_label).await;
+            // Gate continuation entry (mika#848 F3a) — skip when its 60s ceiling
+            // would push past the deadline.
+            if Instant::now() + Duration::from_secs(CONTINUATION_TIMEOUT_SECS) > deadline {
+                warn!(
+                    target: "mika::otel",
+                    trigger_label,
+                    session_id = params.session_id,
+                    "silent agent max-steps exceeded but deadline too close for continuation"
+                );
+                if matches!(&params.trigger, SilentTrigger::Reflection) {
+                    let _ = db
+                        .record_reflection_run("failed", 0, Some("Timed out"))
+                        .await;
+                }
+                return Ok(());
+            }
 
-        if let Some(ref sender) = params.message_sender {
-            let _ = sender
-                .send(&format!(
-                    "[Background task exceeded tool step limit]\n\n{}",
-                    cont.text
-                ))
-                .await;
+            let cont = attempt_continuation_turn(
+                &mut request,
+                llm,
+                &tool_call_summaries,
+                system_prompt_original_len,
+                trigger_label,
+                deadline,
+            )
+            .await;
+
+            if let Some(ref sender) = params.message_sender {
+                let _ = sender
+                    .send(&format!(
+                        "[Background task exceeded tool step limit]\n\n{}",
+                        cont.text
+                    ))
+                    .await;
+            }
+        }
+        LoopResult::DeadlineExceeded { .. } => {
+            warn!(
+                trigger_label,
+                session_id = params.session_id,
+                "silent agent deadline exceeded"
+            );
+            if matches!(&params.trigger, SilentTrigger::Reflection) {
+                let _ = db
+                    .record_reflection_run("failed", 0, Some("Timed out"))
+                    .await;
+            }
+            return Ok(());
         }
     }
 
@@ -2696,35 +2924,34 @@ pub struct TeamAgentParams<'a> {
 /// - Returns `Some(text)` when the assistant produced a text response,
 ///   or `None` for tool-use-only turns.
 pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
-    let timeout_result = tokio::time::timeout(
-        Duration::from_secs(TEAM_AGENT_TIMEOUT_SECS),
-        run_team_agent_inner(params),
-    )
-    .await;
-
-    match timeout_result {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            warn!(
-                timeout_secs = TEAM_AGENT_TIMEOUT_SECS,
-                "team agent loop total timeout exceeded"
-            );
-            Ok(Some(
-                "Agent timed out while processing team task.".to_string(),
-            ))
-        }
-    }
+    let deadline = Instant::now() + Duration::from_secs(TEAM_AGENT_TIMEOUT_SECS);
+    run_team_agent_inner(params, deadline).await
 }
 
-async fn run_team_agent_inner(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
-    run_team_agent_inner_impl(params)
+/// **Test-only entry point** for team mode that exposes the deadline.
+/// See [`run_agent_with_deadline`] for the gating rationale.
+pub async fn run_team_agent_with_deadline(
+    params: &TeamAgentParams<'_>,
+    deadline: Instant,
+) -> Result<Option<String>> {
+    run_team_agent_inner(params, deadline).await
+}
+
+async fn run_team_agent_inner(
+    params: &TeamAgentParams<'_>,
+    deadline: Instant,
+) -> Result<Option<String>> {
+    run_team_agent_inner_impl(params, deadline)
         .instrument(
             tracing::info_span!(target: "mika::otel", "team_agent", agent = %params.agent_name),
         )
         .await
 }
 
-async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
+async fn run_team_agent_inner_impl(
+    params: &TeamAgentParams<'_>,
+    deadline: Instant,
+) -> Result<Option<String>> {
     let llm = params.llm;
     let tools = params.tools;
 
@@ -2873,6 +3100,24 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
     let mode = LoopMode::Team;
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
+
+    // Prelude deadline check (mika#848 F3b).
+    if Instant::now() >= deadline {
+        warn!(
+            target: "mika::otel",
+            agent = %params.agent_name,
+            "team agent deadline exceeded during prelude — skipping loop"
+        );
+        let fallback = "Agent timed out while processing team task.";
+        if let Some(task_id) = params.child_task_id {
+            let _ = params
+                .db
+                .update_task_completed(task_id, Some(fallback))
+                .await;
+        }
+        return Ok(Some(fallback.to_string()));
+    }
+
     let result = run_loop(
         effective_llm,
         tools,
@@ -2890,49 +3135,94 @@ async fn run_team_agent_inner_impl(params: &TeamAgentParams<'_>) -> Result<Optio
         store_tools,
         prompt_variant.as_deref(),
         false, // team mode messages are never internal
+        deadline,
     )
     .await?;
 
-    if result.max_steps_exceeded {
-        let cont = attempt_continuation_turn(&mut request, llm, &result, "team agent").await;
-
-        // Auto-complete child task if this agent was spawned as part of a team task tree
-        if let Some(task_id) = params.child_task_id {
-            match params
-                .db
-                .update_task_completed(task_id, Some(&cont.text))
-                .await
-            {
-                Ok(false) => warn!(
-                    task_id,
-                    "child task completion had no effect (already completed or agent_id mismatch)"
-                ),
-                Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
-                Ok(true) => {}
+    match result {
+        LoopResult::Done { text, .. } => {
+            if let Some(task_id) = params.child_task_id {
+                let result_text = text.as_deref().unwrap_or("");
+                match params
+                    .db
+                    .update_task_completed(task_id, Some(result_text))
+                    .await
+                {
+                    Ok(false) => warn!(
+                        task_id,
+                        "child task completion had no effect (already completed or agent_id mismatch)"
+                    ),
+                    Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
+                    Ok(true) => {}
+                }
             }
+            Ok(text)
         }
+        LoopResult::MaxStepsExceeded {
+            tool_call_summaries,
+            system_prompt_original_len,
+            ..
+        } => {
+            // Gate continuation entry (mika#848 F3a).
+            if Instant::now() + Duration::from_secs(CONTINUATION_TIMEOUT_SECS) > deadline {
+                warn!(
+                    target: "mika::otel",
+                    agent = %params.agent_name,
+                    "team agent max-steps exceeded but deadline too close for continuation"
+                );
+                let fallback = "Agent timed out while processing team task.";
+                if let Some(task_id) = params.child_task_id {
+                    let _ = params
+                        .db
+                        .update_task_completed(task_id, Some(fallback))
+                        .await;
+                }
+                return Ok(Some(fallback.to_string()));
+            }
 
-        return Ok(Some(cont.text));
-    }
+            let cont = attempt_continuation_turn(
+                &mut request,
+                llm,
+                &tool_call_summaries,
+                system_prompt_original_len,
+                "team agent",
+                deadline,
+            )
+            .await;
 
-    // Auto-complete child task if this agent was spawned as part of a team task tree
-    if let Some(task_id) = params.child_task_id {
-        let result_text = result.text.as_deref().unwrap_or("");
-        match params
-            .db
-            .update_task_completed(task_id, Some(result_text))
-            .await
-        {
-            Ok(false) => warn!(
-                task_id,
-                "child task completion had no effect (already completed or agent_id mismatch)"
-            ),
-            Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
-            Ok(true) => {}
+            if let Some(task_id) = params.child_task_id {
+                match params
+                    .db
+                    .update_task_completed(task_id, Some(&cont.text))
+                    .await
+                {
+                    Ok(false) => warn!(
+                        task_id,
+                        "child task completion had no effect (already completed or agent_id mismatch)"
+                    ),
+                    Err(e) => warn!(task_id, error = %e, "failed to complete child task"),
+                    Ok(true) => {}
+                }
+            }
+
+            Ok(Some(cont.text))
+        }
+        LoopResult::DeadlineExceeded { .. } => {
+            warn!(
+                target: "mika::otel",
+                agent = %params.agent_name,
+                "team agent deadline exceeded"
+            );
+            let fallback = "Agent timed out while processing team task.";
+            if let Some(task_id) = params.child_task_id {
+                let _ = params
+                    .db
+                    .update_task_completed(task_id, Some(fallback))
+                    .await;
+            }
+            Ok(Some(fallback.to_string()))
         }
     }
-
-    Ok(result.text)
 }
 
 // -- Skill helpers --
