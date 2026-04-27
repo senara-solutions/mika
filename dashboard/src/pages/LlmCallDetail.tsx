@@ -1,6 +1,7 @@
 import { Link, useParams } from 'react-router'
 import { useLlmCall } from '../api/llmCalls.ts'
-import { CopyButton, formatRelativeTime } from '@senara-solutions/ui'
+import { CopyButton, StatusBadge, formatRelativeTime } from '@senara-solutions/ui'
+import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
 function formatTokens(n: number | null): string {
@@ -14,29 +15,11 @@ function formatLatency(ms: number): string {
   return `${ms}ms`
 }
 
-function statusBadge(status: string) {
+function llmStatusVariant(status: string): { variant: StatusBadgeVariant; label: string } {
   switch (status) {
-    case 'success':
-      return (
-        <span className="inline-flex items-center gap-1.5 text-emerald-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-          success
-        </span>
-      )
-    case 'error':
-      return (
-        <span className="inline-flex items-center gap-1.5 text-red-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-          error
-        </span>
-      )
-    default:
-      return (
-        <span className="inline-flex items-center gap-1.5 text-muted/60">
-          <span className="w-1.5 h-1.5 rounded-full bg-muted/40" />
-          {status}
-        </span>
-      )
+    case 'success': return { variant: 'success', label: 'Success' }
+    case 'error': return { variant: 'error', label: 'Error' }
+    default: return { variant: 'neutral', label: status }
   }
 }
 
@@ -72,7 +55,7 @@ export default function LlmCallDetail() {
             {call.provider} / {call.model}
           </h2>
           <div className="flex items-center gap-3 mt-2">
-            {statusBadge(call.status)}
+            <StatusBadge {...llmStatusVariant(call.status)} />
             <CopyButton text={call.id} title="Copy ID" />
           </div>
         </div>

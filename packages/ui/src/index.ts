@@ -1,5 +1,6 @@
 // Components
 export { default as StatusBadge } from './components/StatusBadge.tsx'
+export type { StatusBadgeVariant, StatusBadgeProps } from './components/StatusBadge.tsx'
 export { default as Pagination } from './components/Pagination.tsx'
 export { default as EmptyState } from './components/EmptyState.tsx'
 export type { EmptyStateProps } from './components/EmptyState.tsx'

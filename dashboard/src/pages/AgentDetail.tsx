@@ -90,7 +90,7 @@ export default function AgentDetail() {
           <div>
             <div className="flex items-center gap-3">
               <h2 className="text-heading text-xl font-semibold">{agent.name}</h2>
-              <StatusBadge active={agent.active} />
+              <StatusBadge variant={agent.active ? 'success' : 'warning'} label={agent.active ? 'Active' : 'Inactive'} />
             </div>
             <p className="text-xs text-muted/50 font-mono mt-0.5">
               ID: {agent.id} &middot; Created {formatRelativeTime(agent.created_at)}

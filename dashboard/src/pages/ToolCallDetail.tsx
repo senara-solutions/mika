@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router'
 import { useToolCall } from '../api/toolCalls.ts'
-import { CopyButton, formatRelativeTime } from '@senara-solutions/ui'
+import { CopyButton, StatusBadge, formatRelativeTime } from '@senara-solutions/ui'
 import { MetadataRow } from '../components/MetadataRow.tsx'
 
 function formatLatency(ms: number): string {
@@ -51,17 +51,7 @@ export default function ToolCallDetail() {
         <div>
           <h2 className="text-heading text-xl font-semibold font-mono">{call.tool_name}</h2>
           <div className="flex items-center gap-3 mt-2">
-            {call.success ? (
-              <span className="inline-flex items-center gap-1.5 text-emerald-400 text-sm">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                success
-              </span>
-            ) : (
-              <span className="inline-flex items-center gap-1.5 text-red-400 text-sm">
-                <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-                failed
-              </span>
-            )}
+            <StatusBadge variant={call.success ? 'success' : 'error'} label={call.success ? 'Success' : 'Failed'} />
             <span className={`inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full ${sourceBadge(call.tool_source)}`}>
               {call.tool_source}
             </span>

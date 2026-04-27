@@ -1,33 +1,16 @@
 import { Link } from 'react-router'
 import { useLlmCalls, type LlmCallsFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, formatTimestamp } from '@senara-solutions/ui'
+import { Pagination, EmptyState, StatusBadge, formatTimestamp } from '@senara-solutions/ui'
+import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
 
-function statusBadge(status: string) {
+function llmStatusVariant(status: string): { variant: StatusBadgeVariant; label: string } {
   switch (status) {
-    case 'success':
-      return (
-        <span className="inline-flex items-center gap-1 text-emerald-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-          <span className="text-[10px]">success</span>
-        </span>
-      )
-    case 'error':
-      return (
-        <span className="inline-flex items-center gap-1 text-red-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-          <span className="text-[10px]">error</span>
-        </span>
-      )
-    default:
-      return (
-        <span className="inline-flex items-center gap-1 text-muted/60">
-          <span className="w-1.5 h-1.5 rounded-full bg-muted/40" />
-          <span className="text-[10px]">{status}</span>
-        </span>
-      )
+    case 'success': return { variant: 'success', label: 'Success' }
+    case 'error': return { variant: 'error', label: 'Error' }
+    default: return { variant: 'neutral', label: status }
   }
 }
 
@@ -165,7 +148,7 @@ export default function LlmCalls() {
                       {formatLatency(row.latency_ms)}
                     </td>
                     <td className="px-4 py-3">
-                      {statusBadge(row.status)}
+                      <StatusBadge {...llmStatusVariant(row.status)} />
                     </td>
                     <td className="px-4 py-3">
                       {row.trace_id ? (

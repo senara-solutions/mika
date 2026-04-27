@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router'
 import { useTraceDetail, useTraceMessages, type TraceMessage } from '../api/timeline.ts'
 import { useTraceLlmCalls } from '../api/llmCalls.ts'
 import { useTraceToolCalls } from '../api/toolCalls.ts'
-import { CopyButton as UiCopyButton, EmptyState, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
+import { CopyButton as UiCopyButton, EmptyState, StatusBadge, formatTimestamp, eventTypeBadge, eventTypeColor } from '@senara-solutions/ui'
 import InvestigationPanel, {
   type InvestigationScope,
 } from '../components/InvestigationPanel.tsx'
@@ -237,17 +237,7 @@ function ToolCallsTable({
                       {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                     </td>
                     <td className="px-2 py-2">
-                      {tc.success ? (
-                        <span className="inline-flex items-center gap-1 text-emerald-400">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                          <span className="text-[10px]">ok</span>
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 text-red-400">
-                          <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-                          <span className="text-[10px]">fail</span>
-                        </span>
-                      )}
+                      <StatusBadge variant={tc.success ? 'success' : 'error'} label={tc.success ? 'Ok' : 'Fail'} />
                     </td>
                     <td className="px-2 py-2 font-mono text-heading font-medium max-w-[160px] truncate">
                       {tc.name}
