@@ -373,7 +373,7 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 ## Conversation Compaction & Rewind
 
-**Compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt.
+**Compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt. `replace_with_summary` uses RAII `rusqlite::Transaction` (DEFERRED) — auto-rollback on error prevents stuck transactions that pin the WAL snapshot (#636).
 
 **Rewind:** `rewind.rs` — two-phase flow: `preview_rewind()` then `execute_rewind()` with automatic reversal of memory/fact mutations via audit log. TUI: `/undo` (1 exchange), `/rewind [N | to <message_id>]`. Server: `POST /api/v1/rewind/{resolve,preview,execute}`.
 
@@ -400,6 +400,8 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 **Request logging:** `tower_http::trace::TraceLayer` middleware. `inject_request_meta` middleware copies method+path for top-level JSON fields. `/health` logged at DEBUG. Agent lock via `tokio::sync::Mutex<()>` with non-blocking `try_lock` (429 if busy).
 
 **Failed sends flush:** Before each message processing, flushes up to 5 pending failed outbound sends from DB.
+
+**WAL checkpoint (#636):** `server::checkpoint::spawn_dashboard_checkpoint_task()` runs `PRAGMA wal_checkpoint(PASSIVE)` on the dashboard DB connection every 60 seconds. Defense-in-depth against stale WAL snapshots: if a transaction leak pins the connection's read snapshot, the periodic checkpoint forces the connection to advance. Structured log events: `checkpoint.start`, `checkpoint.complete` (with `busy_pages`, `log_pages`, `checkpointed_pages`), `checkpoint.error`, `checkpoint.stopped`. Hard-coded 60s interval (future tunable: `MIKA_DASHBOARD_CHECKPOINT_INTERVAL_SECS`). If WAL grows despite PASSIVE checkpoints, escalate to RESTART mode per the operating-envelope trigger documented in `checkpoint.rs`.
 
 ## Observability
 
