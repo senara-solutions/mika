@@ -130,10 +130,11 @@ Before applying the generic pipeline-failure path, classify the callback result 
 >
 > **Secondary trigger (conservative heuristic, time-bounded):** When ALL of the following hold simultaneously:
 > - `tasks.result` is NULL or empty (subprocess output not captured)
+> - Branch can be resolved (see Branch resolution below) — if branch is unresolvable, skip the secondary trigger entirely
 > - No PR exists on origin for the task's branch (`run_gh("pr list --head <branch>")` returns empty)
 > - Task status is currently `in_progress`
-> - Task `created_at` is more than **2 hours** ago
-> - Task `updated_at` is more than 30 minutes ago (recently-updated tasks are still making progress)
+> - Task `created_at` is more than **2 hours** ago (safety ceiling: no legitimate pipeline exceeds 2 hours)
+> - Task `updated_at` is more than 30 minutes ago (any pipeline still active has updated_at < 30 min ago)
 >
 > Run the grounding check below. Active pipelines are NOT triggered because their `updated_at` will be recent.
 >
@@ -143,11 +144,11 @@ Before applying the generic pipeline-failure path, classify the callback result 
 > git -C <repo-path> log --oneline origin/main..<branch>
 > ```
 >
-> Branch resolution: from the task's `metadata.claude_pilot.branch` (set when claude-pilot dispatch succeeds) or, if absent, from the issue body's `> - **Branch:**` callout (per the plan-on-branch convention).
+> Branch resolution: from the task's `metadata.claude_pilot.branch` (set when claude-pilot dispatch succeeds) or, if absent, from the issue body's `> - **Branch:**` callout (per the plan-on-branch convention). If branch cannot be resolved from either source, skip the grounding check entirely — fall through to the "On failure" handler (Step 4.5) and include a note to Vincent: "branch unknown, grounding check skipped — manual inspection needed."
 >
 > **Decision tree:**
-> - **`git log` returns ≥ 1 commit:** verdict is `recover_unpushed_work`. Apply the handler below. Do NOT redispatch claude-pilot. Do NOT apply the generic pipeline-failure path.
-> - **`git log` returns 0 commits:** verdict is genuine no-progress failure. Fall through to the generic pipeline-failure path below.
+> - **`git log` returns ≥ 1 commit:** verdict is `recover_unpushed_work`. Apply the handler below. Do NOT redispatch claude-pilot. Do NOT apply any other failure handler.
+> - **`git log` returns 0 commits:** verdict is genuine no-progress failure. Fall through to the "On failure" handler (Step 4.5) which checks for PRs then diagnoses. Do NOT fall through to "On pipeline failure" (that path requires the `PIPELINE FAILURE:` prefix which `error_max_turns` callbacks do not produce).
 >
 > **Handler when verdict is `recover_unpushed_work` (atomicity: write metadata BEFORE send_message):**
 >
@@ -161,7 +162,7 @@ Before applying the generic pipeline-failure path, classify the callback result 
 >      "branch": "<branch-name>",
 >      "tip_sha": "<commit-sha from git log output>",
 >      "commit_count": <int>,
->      "turn_count_at_exhaustion": <int from metadata>,
+>      "turn_count_at_exhaustion": <int from metadata claude_pilot.turns, or omit if unavailable>,
 >      "claude_pilot_log_path": "/var/log/claude-pilot/<subprocess-task-id>.log",
 >      "suggested_recovery_command": "WT=$(git -C /data/workspace/mika-platform/<repo> worktree list --porcelain | awk -v b=<branch> '/^worktree /{p=$2} /^branch refs\\/heads\\/'b'$/{print p}'); [ -z \"$WT\" ] && { WT=/data/workspace/mika-platform/.claude/worktrees/<sanitized-branch>/<repo>; git -C /data/workspace/mika-platform/<repo> worktree add \"$WT\" <branch>; }; cd \"$WT\" && git rebase origin/main && git push origin <branch> && gh pr create --repo senara-solutions/<repo>"
 >    }
@@ -299,6 +300,7 @@ If `update_task_status` returns `{"error": "task_not_found", ...}`, the task ID 
 **Status rules:**
 - PR merged (GitHub auto-merge or "merge anyway") → `completed`
 - PR open, awaiting QA or review → remain `in_progress`
+- `recover_unpushed_work` verdict (`unpushed_recovery_pending: true`) → remain `in_progress` (work exists on local branch, awaiting operator push)
 - Block verdict received (via webhook) → `blocked`
 - claude-pilot failed → `failed` (in sprint mode) / `blocked` or `cancelled` (in single-issue mode)
 
