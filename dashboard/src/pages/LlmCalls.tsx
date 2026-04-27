@@ -1,7 +1,7 @@
-import { Link } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { useLlmCalls, type LlmCallsFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, StatusBadge, formatTimestamp } from '@senara-solutions/ui'
+import { Pagination, EmptyState, StatusBadge, ListRow, formatTimestamp } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
@@ -26,6 +26,7 @@ function formatLatency(ms: number): string {
 }
 
 export default function LlmCalls() {
+  const navigate = useNavigate()
   const { searchParams, setSearchParams, updateFilter, setPage } = useSearchParamsFilter()
 
   const filters: LlmCallsFilters = {
@@ -116,16 +117,12 @@ export default function LlmCalls() {
               </thead>
               <tbody className="divide-y divide-white/[0.03]">
                 {data.data.map((row) => (
-                  <tr key={row.id} className="hover:bg-white/[0.02] transition-colors">
-                    <td className="px-2 py-3">
-                      <Link
-                        to={`/llm-calls/${row.id}`}
-                        className="text-accent/40 hover:text-accent transition-colors text-xs"
-                        title="View details"
-                      >
-                        &rarr;
-                      </Link>
-                    </td>
+                  <ListRow
+                    key={row.id}
+                    variant="navigable"
+                    onClick={() => navigate(`/llm-calls/${row.id}`)}
+                    ariaLabel={`View details for LLM call ${row.id}`}
+                  >
                     <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
                       {formatTimestamp(row.created_at)}
                     </td>
@@ -162,7 +159,7 @@ export default function LlmCalls() {
                         <span className="text-muted/30 text-xs">-</span>
                       )}
                     </td>
-                  </tr>
+                  </ListRow>
                 ))}
               </tbody>
             </table>

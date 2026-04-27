@@ -2,9 +2,9 @@ import { useState, Fragment } from 'react'
 import { Link } from 'react-router'
 import { useToolCalls, type ToolCallsFilters } from '../api/toolCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { CopyButton, Pagination, EmptyState, StatusBadge, formatTimestamp } from '@senara-solutions/ui'
+import { CopyButton, Pagination, EmptyState, StatusBadge, ListRow, formatTimestamp } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
-import { Search, ChevronRight, ChevronDown } from 'lucide-react'
+import { Search } from 'lucide-react'
 
 function formatLatency(ms: number): string {
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
@@ -139,20 +139,18 @@ export default function ToolCalls() {
                   const isOpen = expanded.has(row.id)
                   return (
                     <Fragment key={row.id}>
-                      <tr
-                        onClick={() => toggleExpand(row.id)}
-                        className="hover:bg-white/[0.02] transition-colors cursor-pointer"
+                      <ListRow
+                        variant="expandable"
+                        isExpanded={isOpen}
+                        onToggle={() => toggleExpand(row.id)}
+                        ariaLabel={`Toggle details for tool call ${row.tool_name}`}
                       >
-                        <td className="px-2 py-3 text-muted/30">
-                          {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                        </td>
                         <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
                           {formatTimestamp(row.created_at)}
                         </td>
                         <td className="px-4 py-3 text-xs font-mono font-medium max-w-[180px] truncate">
                           <Link
                             to={`/tool-calls/${row.id}`}
-                            onClick={(e) => e.stopPropagation()}
                             className="text-accent hover:text-accent-light transition-colors"
                           >
                             {row.tool_name}
@@ -176,7 +174,6 @@ export default function ToolCalls() {
                           {row.trace_id ? (
                             <Link
                               to={`/traces/${row.trace_id}`}
-                              onClick={(e) => e.stopPropagation()}
                               className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
                             >
                               {row.trace_id.slice(0, 8)}...
@@ -185,7 +182,7 @@ export default function ToolCalls() {
                             <span className="text-muted/30 text-xs">-</span>
                           )}
                         </td>
-                      </tr>
+                      </ListRow>
                       {isOpen && (
                         <tr>
                           <td colSpan={8} className="px-6 py-4 bg-white/[0.02]">
