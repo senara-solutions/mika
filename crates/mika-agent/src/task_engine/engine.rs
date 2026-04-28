@@ -22,6 +22,13 @@ const MAX_PER_TICK: usize = 10;
 /// How many ticks between periodic DB scans for tasks created outside the engine.
 const DB_SCAN_INTERVAL_TICKS: u64 = 60;
 
+/// Grace period (seconds) before the reaper transitions an orphaned parent
+/// self_dev task to `failed`. 600s ≈ 3× the upper bound of observed callback
+/// duration (mika#868 audit: 187s LLM latency). Long enough for #870's
+/// re-enter recovery to complete; short enough that the operator's dispatch
+/// queue clears within one tick-cycle after grace expires. See #871.
+const REAPER_GRACE_SECONDS: i64 = 600;
+
 /// The unified task engine: a min-heap BinaryHeap backed by SQLite, driven by a
 /// 1-second tick loop that fires tasks whose `next_fire_at <= now`.
 ///
@@ -221,6 +228,9 @@ impl TaskEngine {
             if !self.dispatcher.cli_mode {
                 self.dispatch_undelivered_callbacks().await;
             }
+            // Reap parent self_dev tasks left in_progress after their callback
+            // subtask delivered without producing a PR (#871).
+            self.reap_orphaned_parent_tasks().await;
         }
 
         let now = crate::timestamp::now();
@@ -385,6 +395,110 @@ impl TaskEngine {
 
         if stale_skipped > 0 {
             info!(count = stale_skipped, "cleared stale failed callback tasks");
+        }
+    }
+
+    /// Reap parent self_dev tasks left `in_progress` after their callback
+    /// subtask delivered without producing a PR (#871).
+    ///
+    /// Transitions matched parents to `failed` with an audit-event trail.
+    /// The `NOT EXISTS` sibling guard defers reaping when #870's correction
+    /// loop has launched a retry via `create_task`.
+    async fn reap_orphaned_parent_tasks(&self) {
+        let candidates = match self
+            .db
+            .find_orphaned_parent_tasks(REAPER_GRACE_SECONDS)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "task_engine_reaper: failed to query orphaned parents");
+                return;
+            }
+        };
+
+        for parent in candidates {
+            let trace_id = mika_common::trace::generate_trace_id();
+            let system_session = format!("system-{}", parent.agent_id);
+
+            // Use update_task_failed (guarded UPDATE with terminal-state check)
+            // instead of raw update_task_status to avoid overwriting concurrent
+            // terminal transitions. Returns false when the parent already left
+            // in_progress (race with operator action or duplicate query rows).
+            match self
+                .db
+                .update_task_failed(&parent.id, "callback_delivered_without_pr_url")
+                .await
+            {
+                Ok(true) => {
+                    // Transition succeeded — emit audit event
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_reaper",
+                            &parent.id,
+                            Some("in_progress"),
+                            Some("failed"),
+                            Some("callback_delivered_without_pr_url"),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        warn!(
+                            parent_id = %parent.id,
+                            error = %e,
+                            "task_engine_reaper: failed to write audit event"
+                        );
+                    }
+
+                    // F6: surface pre-existing leaks reaped from before deploy
+                    let age_hours = compute_reaper_age_hours(&parent.created_at);
+                    if age_hours > 24 {
+                        info!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            age_hours,
+                            "task_engine_reaper: reaping pre-existing orphan \
+                             (possible backfill from before reaper deployment)"
+                        );
+                    } else {
+                        info!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            "task_engine_reaper: transitioned orphaned parent to failed"
+                        );
+                    }
+                }
+                Ok(false) => {
+                    // Parent already transitioned away from in_progress
+                    // (concurrent operator action or duplicate query row) — skip.
+                    debug!(
+                        parent_id = %parent.id,
+                        "task_engine_reaper: parent already in terminal state, skipping"
+                    );
+                }
+                Err(e) => {
+                    // F5: audit-event-on-error so operators catch silent-reaper-failure
+                    let _ = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_reaper",
+                            &parent.id,
+                            Some("in_progress"),
+                            None,
+                            Some(&format!("reaper_db_error: {e}")),
+                            Some(&trace_id),
+                        )
+                        .await;
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_reaper: db error during transition"
+                    );
+                }
+            }
         }
     }
 
@@ -616,6 +730,17 @@ impl TaskEngine {
         });
         // Engine lock released when fire_task() returns (immediately after spawn)
     }
+}
+
+/// Compute how many hours old a task is based on its `created_at` timestamp.
+/// Returns 0 on parse failure (conservative — won't trigger the backfill log).
+fn compute_reaper_age_hours(created_at: &str) -> i64 {
+    crate::timestamp::parse(created_at)
+        .map(|dt| {
+            let now = chrono::Utc::now();
+            (now - dt).num_hours()
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

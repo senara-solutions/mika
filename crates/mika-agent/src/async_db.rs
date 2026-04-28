@@ -448,6 +448,17 @@ impl AsyncDatabase {
         self.with_db(move |db| db.mark_task_delivered(&i)).await
     }
 
+    /// Find orphaned parent self_dev tasks whose callback subtask delivered
+    /// without producing a PR. See [`Database::find_orphaned_parent_tasks`].
+    pub async fn find_orphaned_parent_tasks(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::OrphanedParentTask>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_orphaned_parent_tasks(&a, grace_seconds))
+            .await
+    }
+
     pub async fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
         let i = id.to_owned();
         self.with_db(move |db| db.set_task_process_id(&i, process_id))

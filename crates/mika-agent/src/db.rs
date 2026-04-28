@@ -168,6 +168,16 @@ pub struct Task {
     pub r#type: String,
 }
 
+/// A parent self_dev task left `in_progress` after its callback subtask
+/// delivered without producing a PR. Used by the task engine reaper (#871).
+#[derive(Debug, Clone)]
+pub struct OrphanedParentTask {
+    pub id: String,
+    pub agent_id: String,
+    pub callback_task_id: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewTask {
     pub agent_id: String,
@@ -4665,6 +4675,58 @@ impl Database {
             params![id],
         )?;
         Ok(n > 0)
+    }
+
+    /// Find parent self_dev tasks left `in_progress` whose callback subtask
+    /// delivered without producing a PR (#871).
+    ///
+    /// A parent is "orphaned" when:
+    /// - `status = 'in_progress'`, `source = 'self_dev'`, `trigger_type = 'manual'`
+    /// - Its latest callback subtask is `status = 'delivered'`
+    /// - The callback's `updated_at` is older than `grace_seconds` ago
+    /// - Parent metadata does NOT contain `$.claude_pilot.pr_url`
+    /// - No other active callback child exists (defers to #870's retry loop)
+    pub fn find_orphaned_parent_tasks(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+    ) -> Result<Vec<OrphanedParentTask>> {
+        let grace_modifier = format!("-{grace_seconds} seconds");
+        let mut stmt = self.conn.prepare(
+            "SELECT parent.id, parent.agent_id, parent.created_at,
+                    MIN(child.id) AS callback_task_id
+             FROM tasks parent
+             JOIN tasks child ON parent.id = child.parent_task_id
+             WHERE parent.agent_id = ?1
+               AND parent.status = 'in_progress'
+               AND parent.source = 'self_dev'
+               AND parent.trigger_type = 'manual'
+               AND child.trigger_type = 'callback'
+               AND child.action_type = 'resume_agent'
+               AND child.status = 'delivered'
+               AND child.updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND (parent.metadata IS NULL
+                    OR json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NULL)
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks sibling
+                 WHERE sibling.parent_task_id = parent.id
+                   AND sibling.id != child.id
+                   AND sibling.status IN ('pending', 'in_progress')
+               )
+             GROUP BY parent.id
+             ORDER BY parent.id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, grace_modifier], |row| {
+                Ok(OrphanedParentTask {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    callback_task_id: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
@@ -9856,6 +9918,172 @@ mod tests {
         assert!(db.mark_task_delivered(&id).unwrap());
         // Second claim returns false (already delivered)
         assert!(!db.mark_task_delivered(&id).unwrap());
+    }
+
+    // -- find_orphaned_parent_tasks tests (#871) --
+
+    /// Helper: create a parent self_dev task (manual, in_progress, source=self_dev)
+    /// and a delivered callback child. Returns (parent_id, child_id).
+    fn create_orphaned_parent_setup(db: &Database) -> (String, String) {
+        // Parent: manual, in_progress, source=self_dev
+        let mut parent = new_task("mika", "Implement mika#868", "manual", "none");
+        parent.source = Some("self_dev".to_string());
+        let parent_id = db.create_task(&parent).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+
+        // Child: callback, resume_agent, delivered
+        let mut child = callback_task("mika");
+        child.parent_task_id = Some(parent_id.clone());
+        let child_id = db.create_task(&child).unwrap();
+        // Complete then deliver the child
+        assert!(
+            db.update_task_completed(&child_id, "mika", Some("done"))
+                .unwrap()
+        );
+        assert!(db.mark_task_delivered(&child_id).unwrap());
+
+        (parent_id, child_id)
+    }
+
+    #[test]
+    fn test_find_orphaned_parent_tasks_failure_path() {
+        let db = db();
+        let (parent_id, child_id) = create_orphaned_parent_setup(&db);
+
+        // Backdate the child's updated_at so it's past the grace period (700s > 600s)
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, parent_id);
+        assert_eq!(orphans[0].callback_task_id, child_id);
+    }
+
+    #[test]
+    fn test_find_orphaned_parent_tasks_happy_path_pr_url_present() {
+        let db = db();
+        let (parent_id, child_id) = create_orphaned_parent_setup(&db);
+
+        // Set pr_url on parent metadata — reaper should NOT match
+        let meta = r#"{"claude_pilot": {"pr_url": "https://github.com/x/y/pull/1"}}"#;
+        db.conn
+            .execute(
+                "UPDATE tasks SET metadata = ?1 WHERE id = ?2",
+                params![meta, parent_id],
+            )
+            .unwrap();
+
+        // Backdate child past grace
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "parent with pr_url should not be reaped"
+        );
+    }
+
+    #[test]
+    fn test_find_orphaned_parent_tasks_grace_period_not_elapsed() {
+        let db = db();
+        let (_parent_id, _child_id) = create_orphaned_parent_setup(&db);
+
+        // Child was just delivered (updated_at = now), well within 600s grace
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "parent within grace period should not be reaped"
+        );
+    }
+
+    #[test]
+    fn test_find_orphaned_parent_tasks_active_sibling_defers() {
+        let db = db();
+        let (parent_id, child_id) = create_orphaned_parent_setup(&db);
+
+        // Backdate the delivered child past grace
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        // Add a sibling callback child that's still in_progress (e.g., #870 retry)
+        let mut sibling = callback_task("mika");
+        sibling.parent_task_id = Some(parent_id.clone());
+        let sibling_id = db.create_task(&sibling).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![sibling_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "parent with active sibling callback should not be reaped"
+        );
+    }
+
+    #[test]
+    fn test_find_orphaned_parent_tasks_excludes_other_agents() {
+        let db = db();
+        db.register_agent("agent_a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
+
+        // Create orphaned parent under agent_a
+        let mut parent = new_task("agent_a", "Implement task", "manual", "none");
+        parent.source = Some("self_dev".to_string());
+        let parent_id = db.create_task(&parent).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+
+        let mut child = NewTask {
+            agent_id: "agent_a".to_string(),
+            ..callback_task("agent_a")
+        };
+        child.parent_task_id = Some(parent_id.clone());
+        let child_id = db.create_task(&child).unwrap();
+        assert!(
+            db.update_task_completed(&child_id, "agent_a", Some("done"))
+                .unwrap()
+        );
+        assert!(db.mark_task_delivered(&child_id).unwrap());
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        // agent_b should see nothing
+        let orphans = db.find_orphaned_parent_tasks("agent_b", 600).unwrap();
+        assert!(orphans.is_empty());
+
+        // agent_a should see the orphan
+        let orphans = db.find_orphaned_parent_tasks("agent_a", 600).unwrap();
+        assert_eq!(orphans.len(), 1);
     }
 
     #[test]
