@@ -26,6 +26,7 @@ HMAC-SHA256 signature validation via `X-Hub-Signature-256`. Event routing:
 - 256KB body limit
 - Multi-tenant routing via `github_repos` table lookup with `agent_base_url` fallback for single-tenant mode
 - Machine user assignee filtering: `MIKA_GITHUB_APP_LOGIN` in per-agent `.env` (e.g., `~/.mika/agents/mika-dev/.env`) should match the machine user login (e.g., `mika-platform-dev`). Filtering logic lives in the self-dev skill prompt, not in gateway code.
+- **Webhook skill denylist (#845):** `WEBHOOK_SKILL_DENYLIST` const in `github.rs` blocks operator-only skills from being triggered via webhook events. For `issues.labeled` events, the label name is checked against the denylist (case-insensitive). Denylisted events are dropped with `StatusCode::OK` (prevents GitHub retries) and a `warn!` log. Currently contains `"dev-groom"`. This is Layer 3 defense-in-depth — Layer 1 (`well_known_agents.rs` `disabled_skills`) is the primary check at the agent level.
 
 ### Inbound delivery retry (#589)
 
