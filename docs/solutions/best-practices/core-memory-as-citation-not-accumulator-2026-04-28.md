@@ -149,6 +149,8 @@ If a future agent genuinely needs more identity surface than 500 tokens, that's 
 - mika#862, mika#863, mika#864 — engine-side guard tickets that the rules cited from core memory point at as their structural migration path
 - `feedback_compound_infra_fixes.md` (mika-platform memory) — infra fixes evaporate fast; compound them
 - `docs/memory-classification.md` — Layer 1/2/3 design that today's audit confirms is correct (the failure was in *application*, not in *layer design*)
+- `docs/solutions/best-practices/structural-check-replaces-human-discipline-2026-04-27.md` — methodological precedent for threshold-based promotion (N=3 prompt-discipline → CI gate). The N≥2 promotion threshold in this doc is the same shape applied to memory accretion.
+- `docs/solutions/architecture-patterns/structural-readonly-agent-binds-at-every-layer-2026-04-25.md` — methodological precedent for layer-aware decomposition. The three-way filter is structurally analogous: decompose accreted items into independent buckets, each with its own binding mechanism (drop-and-cite / promote-to-doc / recurrence-watch).
 
 ## Out of scope (separate tickets)
 
@@ -158,7 +160,19 @@ If a future agent genuinely needs more identity surface than 500 tokens, that's 
 
 ## Post-deploy steps (operator)
 
-After this PR merges and the next mika-server restart picks up the new `MIKA_ARCH_SOUL`, the live core-memory blocks still hold the old accreted content. To complete the extraction:
+**Step 0 — Refresh the provisioned soul.md on existing hosts.** The `provision_well_known_agents()` path is idempotent and skips agents that already exist on disk (`crates/mika-agent/src/well_known_agents.rs:351-413`). Hosts that have ever booted with `MIKA_DEV_MODE=true` will keep their old `~/.mika/agents/mika-arch/soul.md` template *without* the new `## Foundational references` section unless explicitly refreshed. To pull in the new template:
+
+```bash
+sudo rc-service mika-server stop
+rm ~/.mika/agents/mika-arch/soul.md
+sudo rc-service mika-server start
+# Verify:
+grep -A 5 "## Foundational references" ~/.mika/agents/mika-arch/soul.md
+```
+
+This step is host-by-host and is NOT applied automatically by deploy. Operators with manually-customized mika-arch souls should diff before deletion.
+
+After this is done — and the live core-memory blocks still hold the old accreted content — to complete the extraction:
 
 ```bash
 # mika-dev self_model: extract per the bucket assignments above
