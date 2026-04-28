@@ -122,9 +122,9 @@ New XML block emission in `build_silent_prompt()` (analogue of `prompt.rs:815–
 
 <core-memory-promotion-instructions>
 Review the promotion candidates above. For each candidate:
-1. Read the candidate's bucket classification and evidence. The three-way filter is defined in docs/solutions/best-practices/core-memory-as-citation-not-accumulator-2026-04-28.md — consult it for bucket definitions.
+1. Read the candidate's bucket classification and evidence. The three-way filter is defined in docs/solutions/best-practices/core-memory-as-citation-not-accumulator-2026-04-28.md — use query_knowledge_graph (with include_context=true) to fetch the policy text at runtime; the agent has no direct file-read path to docs/solutions/. The lexical ingestor must have indexed the file (covered automatically when the agent's [kg].docs_roots includes the repo's docs/solutions/ — true for mika-arch by default; for mika-dev verify MIKA_KG_DOCS_ROOT or [kg].docs_roots covers the repo docs).
 2. For Bucket 1 (existing_artifact): use update_core_memory action=replace to drop the in-line content and replace with a one-line citation to the existing artifact.
-3. For Bucket 2 (recurrence_promote): if a compound doc does not already exist, note it for creation (or file a ticket). Once the doc exists, use update_core_memory to replace the in-line content with a citation.
+3. For Bucket 2 (recurrence_promote): if a compound doc does not already exist, file a work item via create_task (type=issue, label=promote-to-compound-doc). Once the doc exists, use update_core_memory to replace the in-line content with a citation. **send_message to operator is the secondary path when an interactive channel is attached; during autonomous reflection (no user channel), create_task is the primary surface — send_message returns NoChannel framing silently and the candidate would be lost.**
 4. For Bucket 3 (recurrence_watch): check whether N has incremented since the annotation was written. If yes, re-classify as Bucket 2. If no, leave the item in place — it is correctly parked.
 5. Do NOT use read_agent_file to read core_memory sections (engine-blocked). Do NOT use search_memory with category=core_memory (redirected). Core memory is already in your system prompt.
 6. Surface your decisions via update_core_memory calls. Stay within the 5-edit cap for this reflection session.
@@ -200,9 +200,18 @@ The XML block shape is specified in C3.3 above. Key design decisions:
 
 4. **Negative — empty candidates, block omitted.** Seed core memory with only identity content (no accreted rules). Assert `<core-memory-promotion-candidates>` block is NOT present in the system prompt. Mirrors `test_silent_prompt_omits_task_health_when_none`.
 
-5. **Negative — non-Reflection trigger, block omitted.** Run with `SilentTrigger::Heartbeat`. Assert block is NOT present regardless of core memory content.
+5. **Negative — non-Reflection trigger, block omitted.** Run with `SilentTrigger::Heartbeat`. Assert block is NOT present regardless of core memory content. Heartbeat is a sufficient sample only if the implementation gates the fetch with a positive `matches!(trigger, SilentTrigger::Reflection)` check (whitelist). If the implementation uses an exclusion list, this scenario must be expanded to cover Callback, SkillRun, and Reminder as well.
 
-**Assertion style:** Hard assertions only (no LLM-judge). Frozen fixtures. Content assertions via substring match on the built system prompt string.
+6. **Boundary — `MAX_PROMOTION_CANDIDATES` cap and priority ordering.** Seed 11 distinct candidates spanning all three buckets (e.g., 4 Bucket 1, 5 Bucket 2, 2 Bucket 3-with-incremented-N). Assert exactly 10 candidate lines emitted in the surfaced block, with Bucket 1 entries first, then Bucket 2, then Bucket 3 — matching the priority sort defined in C3.1. Asserts both the cap value and the ordering rule.
+
+7. **Boundary — Bucket 2 N=1 must not classify.** Seed core memory with content containing exactly one ticket reference (`#100`) and no `[recurrence-watch:]` annotation. Assert NO Bucket 2 candidate is emitted (the N≥2 threshold guards against false-positive promotion of single-incident content).
+
+8. **Near-miss — false-positive prevention.** Seed near-miss content for each bucket and assert NO candidate is emitted:
+   - **Bucket 1 near-miss:** content containing the substring `docs/solutions` inside a longer non-citation context (e.g., a sentence describing the directory naming convention rather than citing a specific file). Assert no Bucket 1 candidate.
+   - **Bucket 2 near-miss:** content containing the same ticket reference repeated twice (`#100` … `#100`). Assert no Bucket 2 candidate (N=1 distinct, repeats don't count).
+   - **Bucket 3 near-miss:** content containing the literal string `recurrence-watch` outside an annotation bracket. Assert no Bucket 3 candidate.
+
+**Assertion style:** Hard assertions only (no LLM-judge). Frozen fixtures. Content assertions via substring match on the built system prompt string. **Co-occurrence requirement:** for positive scenarios, the bucket label string (e.g., `[recurrence_promote]`) must be asserted to appear on the SAME candidate line as the seeded section name — NOT anywhere in the prompt. The bucket label strings (`existing_artifact`, `recurrence_promote`, `recurrence_watch`) also appear in the static `<core-memory-promotion-instructions>` block per C3.3, so a substring-only assertion (`prompt.contains("recurrence_promote")`) passes regardless of classifier emission. Use line-level matching via the candidates block content (e.g., `extract_candidates_block(prompt).contains_line("[recurrence_promote] current_priorities:")`) or equivalent. **Frozen-fixture maintenance note:** when C4 heuristics are tuned in the implementation ticket or in subsequent maintenance, frozen-fixture seed content may need to be updated to remain a clean test case — distinguish deliberate fixture updates (heuristic tuning) from regressions by paired commits that update both the heuristic and its fixtures, and document the tuning rationale in the commit message per the KG eval `judge-deprecation-as-reset` pattern.
 
 ## C7. Cost, Latency Budget, and Retirement Criterion
 
@@ -252,7 +261,8 @@ Per `pre-tool-context-redundancy-check.md`, the candidates block MUST NOT recomm
 **Approved suggestions in the candidates block:**
 - `update_core_memory action=replace` — to drop in-line content and replace with citation
 - `store_fact` — to promote content to Layer 2 structured facts
-- File a ticket (via `send_message` to operator) — for Bucket 2 items needing a new compound doc
+- `create_task` (type=issue) — primary path for Bucket 2 items needing a new compound doc; works in autonomous reflection mode where there is no user channel
+- `send_message` to operator — secondary path when an interactive channel is attached. **Important:** during `SilentTrigger::Reflection` runs there is typically no user channel; `GatewayMessageSender` returns `Ok(NoChannel)` silently and the candidate is lost. The implementation must ensure the surfaced suggestion routes to `create_task` when no channel is attached, and the `<core-memory-promotion-instructions>` block must reflect this (instruction 3 above). This pattern follows the `task-engine` autonomous-mode ticket-filing convention.
 
 These approved suggestions are encoded in the `<core-memory-promotion-instructions>` block (C3.3, instructions 2–4) and in the `suggested_action` field of each `PromotionCandidate` (C3.1).
 
