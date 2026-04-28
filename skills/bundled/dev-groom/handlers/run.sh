@@ -38,7 +38,7 @@ fi
 
 # Fetch issue details
 ISSUE_JSON=$(gh issue view "$ISSUE" --repo "senara-solutions/$REPO" --json title,body,labels 2>&1) || {
-    echo "{\"error\": \"failed to fetch issue: $ISSUE_JSON\"}"
+    printf '%s' "$ISSUE_JSON" | jq -Rsc '{ error: ("failed to fetch issue: " + .) }'
     exit 1
 }
 
@@ -47,7 +47,7 @@ LABELS=$(printf '%s\n' "$ISSUE_JSON" | jq -r '[.labels[].name] | join(",")' 2>/d
 BODY=$(printf '%s\n' "$ISSUE_JSON" | jq -r '.body // empty')
 
 # Check for existing branch callout in issue body
-EXISTING_BRANCH=$(printf '%s\n' "$BODY" | grep -oP '> - \*\*Branch:\*\* `\K[^`]+' | head -1 || true)
+EXISTING_BRANCH=$(printf '%s\n' "$BODY" | sed -n 's/.*> - \*\*Branch:\*\* `\([^`]*\)`.*/\1/p' | head -1)
 
 # Branch slug derivation
 if [ -n "$BRANCH_OVERRIDE" ]; then
@@ -80,9 +80,12 @@ fi
 # Sanitize branch for worktree path
 SANITIZED=$(printf '%s' "$BRANCH" | tr '/' '-')
 
+# Resolve repo root for plan file sequencing
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+PLAN_DIR="$REPO_ROOT/docs/plans"
+
 # Plan file sequence number
 TODAY=$(date +%Y-%m-%d)
-PLAN_DIR="docs/plans"
 
 # Extract the slug tail for the plan filename
 SLUG_TAIL=$(printf '%s' "$BRANCH" | sed 's|.*/||')
@@ -96,7 +99,8 @@ PLAN_TYPE=$(printf '%s' "$BRANCH" | sed -nE 's|^([^/]+)/.*|\1|p')
 : "${PLAN_TYPE:=feat}"
 
 PLAN_FILE="${TODAY}-${NEXT_SEQ}-${PLAN_TYPE}-${SLUG_TAIL}-plan.md"
-PLAN_PATH="${PLAN_DIR}/${PLAN_FILE}"
+# Output relative path so the LLM sees docs/plans/... not an absolute path
+PLAN_PATH="docs/plans/${PLAN_FILE}"
 
 # Worktree path
 WORKTREE_BASE="../../.claude/worktrees/${SANITIZED}/${REPO}"

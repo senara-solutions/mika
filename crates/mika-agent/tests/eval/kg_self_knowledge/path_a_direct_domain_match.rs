@@ -149,8 +149,10 @@ async fn test_path_a_groom_name_match_routes_to_dev_groom() {
     let db = test_db();
     assert_schema_version(&db).await;
 
-    // Seed dev-groom skill
-    seed_domain_entity(
+    // Seed dev-groom skill with a relationship so traversal returns Ok (not
+    // TraversalEmpty). An isolated entity with no edges returns TraversalEmpty
+    // per the KG query engine's contract.
+    let dev_groom_id = seed_domain_entity(
         &db,
         &DomainEntitySpec {
             entity_type: "skill",
@@ -159,6 +161,18 @@ async fn test_path_a_groom_name_match_routes_to_dev_groom() {
         },
     )
     .await;
+
+    // Add a problem_type entity and relate it so traversal has an edge
+    let problem_id = seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "problem_type",
+            name: "ungroomed-ticket",
+            properties_json: None,
+        },
+    )
+    .await;
+    seed_domain_relationship(&db, dev_groom_id, problem_id, "SOLVED_BY").await;
 
     // Also seed dev-pilot tool to verify routing distinction
     seed_domain_entity(
@@ -183,6 +197,10 @@ async fn test_path_a_groom_name_match_routes_to_dev_groom() {
     };
 
     let result = query_knowledge_graph(&db, &input).await.unwrap();
+
+    // Status must be Ok before checking entries — prevents the negative assertion
+    // below from passing vacuously on an empty result.
+    assert_eq!(result.status, KgQueryStatus::Ok);
 
     // dev-groom skill entity must be found
     assert!(
