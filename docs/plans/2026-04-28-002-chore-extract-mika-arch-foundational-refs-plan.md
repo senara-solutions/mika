@@ -14,13 +14,19 @@ This plan was authored *retroactively* after PR #866 was already opened. The PR 
 
 This is the same prompt-level-discipline-fails-under-load pattern that today's compound doc `required-tools-gate-evasion-patterns-2026-04-28.md` Rule 3 documents — applied to the operator side. The doc that argues prompt-level rules don't bind under load shipped *without* the discipline it advocates for. The recurrence-watch annotation belongs on the operator dispatch path, not just the agent's core memory.
 
-Concrete data point for the eventual `prompt-level-output-discipline-fails-under-load.md` compound doc: this incident extends the recurrence catalogue from agent-side (mika#654, mika#788) to operator-side (this PR, plus PR #860 which had a similar shape). The structural counterpart on the operator side is the engine guards filed today (mika#862, #863, #864) plus the future PR-creation hook that requires a plan-doc citation in the PR body before opening. That hook isn't filed yet — adding a TODO note here so it doesn't get lost.
+**Prior solution-doc precedents that would have prevented this** (per /ce:review learnings-researcher):
+- `mika-platform/docs/solutions/cross-repo-patterns/2026-03-21-artifact-driven-pipeline-enforcement.md` — THE foundational "instructions are not enforceable; artifacts are" precedent. PR #227 in March 2026 demonstrated the exact same failure mode — Claude labels sections to match pipeline steps but does work inline without invoking `/ce:plan`. Reading this doc pre-PR would have surfaced the discipline gap before ship.
+- `mika-platform/docs/solutions/dev-loop/2026-04-13-cross-repo-secondary-pr-needs-plan-doc.md` — direct precedent for the same retroactive-plan failure shape (PR opened without plan, plan added retroactively).
+- `mika/docs/solutions/best-practices/plan-on-branch-load-bearing-contract-2026-04-26.md` — "Each pipeline stage reads the artifact the prior stage produced." PR #866 had no plan because the prior stage (planning) didn't run.
+- `mika/docs/solutions/architecture-patterns/well-known-agent-provisioning-dev-mode.md` — canonical doc on provisioning idempotency that the Risk + rollback section depends on.
+
+Concrete data point for the eventual `prompt-level-output-discipline-fails-under-load.md` compound doc: this incident extends the recurrence catalogue from agent-side (mika#654, mika#788) to operator-side (this PR, PR #860, and the March PR #227 from the artifact-enforcement doc). **Recurrence count is now N=4 across the same failure class.** Per `mika/docs/solutions/best-practices/structural-check-replaces-human-discipline-2026-04-27.md`, when human-discipline mitigation fails N=3+, the response is a structural CI check, not another prompt-level rule. **The future PR-creation hook that requires a plan-doc citation in the PR body before opening should be filed as a ticket now**, not left as a TODO. (Filing as a follow-up after this PR merges; tracked in PR #866 description.)
 
 ## Why
 
 mika-arch's `current_priorities` core memory block had accreted to 372/500 tokens, with an item ("Foundational citation surface") holding 5 doc paths the agent cites during reviews:
 
-- `docs/architecture/north-star.md`
+- `docs/design/north-star.md`
 - `docs/design/luminescent-core.md`
 - `docs/solutions/best-practices/mika-arch-first-dogfood-2026-04-25.md`
 - `docs/solutions/workflow-issues/grooming-branch-callout-required-2026-04-25.md`

@@ -606,7 +606,7 @@ execute shell commands.
 Cite these when relevant in reviews. They are the durable artifacts behind the principles you enforce; previously held inline in `current_priorities` core memory (accretion-prone), moved here per the three-way filter (existing artifact = drop in-line + cite from soul). See `docs/solutions/best-practices/core-memory-as-citation-not-accumulator-2026-04-28.md`.
 
 - `docs/architecture/review-guide.md` — SOLID/DRY/YAGNI/KISS/Orthogonality with citations to mika code (canonical principles reference; already cited above)
-- `docs/architecture/north-star.md` — the WHY behind every visual decision across the Mika ecosystem
+- `docs/design/north-star.md` — the WHY behind every visual decision across the Mika ecosystem
 - `docs/design/luminescent-core.md` — design system rulebook
 - `docs/solutions/best-practices/mika-arch-first-dogfood-2026-04-25.md` — disposition-keyword drift on first-pass output
 - `docs/solutions/workflow-issues/grooming-branch-callout-required-2026-04-25.md` — plan-on-branch discipline
@@ -894,6 +894,17 @@ mod tests {
                 .unwrap();
         assert!(relay_soul.contains("Mika Relay"));
         assert!(relay_soul.contains("Permission Relay Agent"));
+
+        let arch_soul =
+            fs::read_to_string(mika_common::agent::agent_dir(home, "mika-arch").join("soul.md"))
+                .unwrap();
+        assert!(arch_soul.contains("Mika Architect"));
+        assert!(arch_soul.contains("Plan Review Agent"));
+        // Foundational references section guards against accidental deletion of the citation
+        // surface that mika-arch consults during reviews. See PR #866 / mika#860.
+        assert!(arch_soul.contains("## Foundational references"));
+        assert!(arch_soul.contains("docs/design/north-star.md"));
+        assert!(arch_soul.contains("required-tools-gate-evasion-patterns-2026-04-28.md"));
     }
 
     #[test]
