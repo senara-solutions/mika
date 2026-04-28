@@ -1398,15 +1398,15 @@ async fn run_loop(
                     // exactly the bug scenario from #870.  This inline check mirrors
                     // the INTENT_GUARDS entry for the empty-text path.
                     if matches!(response.stop_reason, LlmStopReason::EndTurn)
-                        && !intent_guard_retries.contains("callback_terminal_action")
+                        && !intent_guard_retries.contains(CALLBACK_TERMINAL_ACTION_LABEL)
                         && callback_trigger_active(&user_input_text)
                         && !callback_terminal_action_satisfied(&all_tool_summaries)
                     {
-                        intent_guard_retries.insert("callback_terminal_action");
+                        intent_guard_retries.insert(CALLBACK_TERMINAL_ACTION_LABEL);
                         warn!(
                             step,
                             label = mode.label(),
-                            intent_guard = "callback_terminal_action",
+                            intent_guard = CALLBACK_TERMINAL_ACTION_LABEL,
                             "Intent-precondition guard fired on empty-text exit — re-prompting"
                         );
                         request.messages.push(LlmMessage {
@@ -1418,12 +1418,7 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(
-                                INTENT_GUARDS
-                                    .iter()
-                                    .find(|g| g.label == "callback_terminal_action")
-                                    .expect("callback_terminal_action guard must exist")
-                                    .correction_message
-                                    .to_string(),
+                                CALLBACK_TERMINAL_ACTION_CORRECTION.to_string(),
                             ),
                         });
                         continue;
@@ -4092,19 +4087,25 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     // task_engine/dispatcher.rs).  AND-shape: BOTH update_task_status AND
     // send_message required; create_task (relaunch) optional.
     IntentPrecondition {
-        label: "callback_terminal_action",
+        label: CALLBACK_TERMINAL_ACTION_LABEL,
         trigger: callback_trigger_active,
         satisfied: callback_terminal_action_satisfied,
-        correction_message: "[Your response was rejected because this callback turn ended \
-             without the required terminal actions. Callback turns MUST: \
-             (1) call `update_task_status` to mark the parent self_dev task terminal \
-             (`failed`/`pending`/`completed` based on the callback result), AND \
-             (2) call `send_message` to notify the operator of the result. \
-             Optionally call `create_task` to relaunch claude-pilot if the failure mode \
-             is retry-safe. EndTurn without (1) AND (2) will be rejected. \
-             Re-read the callback framing and produce both terminal actions before EndTurn.]",
+        correction_message: CALLBACK_TERMINAL_ACTION_CORRECTION,
     },
 ];
+
+/// #870 — Shared label and correction message for the callback terminal
+/// action guard.  Used by both the INTENT_GUARDS registry entry (non-empty
+/// text path) and the inline empty-text guard in the Silent mode exit path.
+const CALLBACK_TERMINAL_ACTION_LABEL: &str = "callback_terminal_action";
+const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[Your response was rejected because \
+     this callback turn ended without the required terminal actions. Callback turns MUST: \
+     (1) call `update_task_status` to mark the parent self_dev task terminal \
+     (`failed`/`pending`/`completed` based on the callback result), AND \
+     (2) call `send_message` to notify the operator of the result. \
+     Optionally call `create_task` to relaunch claude-pilot if the failure mode \
+     is retry-safe. EndTurn without (1) AND (2) will be rejected. \
+     Re-read the callback framing and produce both terminal actions before EndTurn.]";
 
 /// Marker prefix emitted by `mika_gateway::github::format_event_text` for
 /// `issues.labeled` events where the label name is `ready`.  See
