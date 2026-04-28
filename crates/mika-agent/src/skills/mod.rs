@@ -939,7 +939,7 @@ mod tests {
                 long_running: true,
                 estimated_duration_secs: Some(600),
             },
-            skill_dir: PathBuf::from("/skills/claude-pilot"),
+            skill_dir: PathBuf::from("/skills/dev-pilot"),
         }];
 
         // Http-handler always_on skill
