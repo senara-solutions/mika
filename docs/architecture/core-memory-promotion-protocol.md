@@ -134,7 +134,7 @@ Review the promotion candidates above. For each candidate:
 
 **Trust tagging:** `trust="internal"` per the `<rewind_reversals trust="internal">` pattern from `rewind-context-marker-confabulation-prevention.md`. Signals to the agent that this content is system-generated, not from conversation.
 
-**No-internal-tags update:** When implementation lands, add `<core-memory-promotion-candidates>` to the no-internal-tags-in-responses list at `prompt.rs:441–445`:
+**No-internal-tags update:** When implementation lands, add `<core-memory-promotion-candidates>` to the no-internal-tags-in-responses list at `prompt.rs:441–445`. The current list contains four tags (`<context>`, `<callback_result>`, `<task-health>`, `<rewind_reversals>`); the update preserves all four and appends the new tag:
 
 ```rust
 "- **No internal tags in responses:** Never include internal XML tags like <context>, \
@@ -142,6 +142,10 @@ Review the promotion candidates above. For each candidate:
  <core-memory-promotion-candidates> in your responses. \
  These are system metadata injected for your context — they are not for user display.\n",
 ```
+
+**`INTERNAL_TAG_NAMES` registration:** Add `core-memory-promotion-candidates` to the `INTERNAL_TAG_NAMES` constant at `crates/mika-common/src/llm/mod.rs:23–31`. This drives the `strip_internal_tags()` regex pass that scrubs echoed internal tags from LLM response text — a separate stripping layer from the no-internal-tags prompt instruction above. Both layers must be updated at implementation time and both must be removed at retirement (see C7).
+
+**Tag-naming convention:** This block uses kebab-case (`core-memory-promotion-candidates`), consistent with structural-block tags like `<task-health>`, `<task-health-instructions>`, and `<active-work-items>`. The atomic-marker tags `rewind_reversals` and `callback_result` use snake_case, but the `<rewind_reversals trust="internal">` precedent is cited only for the `trust=...` attribute pattern, not the case convention. Structural blocks that wrap candidate content + instructions follow the kebab-case shape of the `task-health` family.
 
 **Omission rule:** When `promotion_candidates` is `None` or the candidates list is empty, the entire `<core-memory-promotion-candidates>` block is omitted from the prompt. Mirrors the task-health pattern at `prompt.rs:819` (`if has_items || has_anomalies`).
 
@@ -190,7 +194,9 @@ The XML block shape is specified in C3.3 above. Key design decisions:
 
 2. **Positive — Bucket 2 candidate surfaced.** Seed core memory with content containing N≥2 distinct ticket references. Assert `recurrence_promote` classification.
 
-3. **Positive — Bucket 3 re-evaluation surfaced.** Seed core memory with `[recurrence-watch: N=1, #100]` annotation and a newer `#200` reference in the same block. Assert `recurrence_watch` classification (N has incremented).
+3. **Positive — Bucket 3 re-evaluation transitions to Bucket 2.** Seed core memory with `[recurrence-watch: N=1, #100]` annotation and a newer `#200` reference in the same block. Per C1 ("Surface only when a new occurrence has been detected … triggering re-evaluation to Bucket 2") and C4 Bucket 2 third bullet, the classifier MUST emit `recurrence_promote` for this seed — the watch annotation is the trigger condition, but the surfaced bucket is Bucket 2. Assert `recurrence_promote` classification.
+
+   **Bucket 3 NOT-surfaced sub-case:** Seed `[recurrence-watch: N=1, #100]` with no newer ticket reference. Assert NO promotion candidate is emitted for this content (the watch is correctly parked).
 
 4. **Negative — empty candidates, block omitted.** Seed core memory with only identity content (no accreted rules). Assert `<core-memory-promotion-candidates>` block is NOT present in the system prompt. Mirrors `test_silent_prompt_omits_task_health_when_none`.
 
@@ -206,7 +212,7 @@ The XML block shape is specified in C3.3 above. Key design decisions:
 - **DB query count:** Target ≤ 3 per scan. One `get_all_core_memory(agent_id)` call + up to 2 file-existence checks for Bucket 1 citation verification. Analogous to `get_task_health_summary` query profile.
 - **Latency target:** < 100ms per scan. Core memory blocks are small (≤ 2500 tokens total across 5 blocks). Pattern-matching against them is sub-millisecond. File-existence checks are the latency floor.
 - **Step budget:** The scan runs before the LLM turn, not during it. It consumes zero agent steps. The agent's responses to surfaced candidates use the existing 5-edit Reflection cap — no new step budget.
-- **Max-steps interaction:** Per `silent-callback-max-steps-exhaustion.md`, Reflection has a default 10-step budget (`MAX_TOOL_STEPS`). The promotion-candidates surface does not change this — it adds context to the system prompt, not additional tool calls. The agent decides how many of its 10 steps to spend on promotion actions vs. other reflection tasks.
+- **Max-steps interaction:** Per `conversation-mode-max-steps-too-low.md` (#386, 2026-04-03), `MAX_TOOL_STEPS` was unified to 20 across all silent-trigger modes — Reflection now runs with a 20-step budget. The promotion-candidates surface does not change this — it adds context to the system prompt, not additional tool calls. The agent decides how many of its 20 steps to spend on promotion actions vs. other reflection tasks. **Implementation note:** if a future ticket adds a new `SilentTrigger` variant, `SilentTrigger::max_steps()` MUST be matched exhaustively (no wildcard arm) — see `silent-callback-max-steps-exhaustion.md` and `reminder-trigger-max-steps-exhaustion.md` for the recurrence pattern this prevents.
 
 ### Retirement Criterion
 
@@ -218,8 +224,9 @@ The future PR landing the write-time guard MUST include deletion of:
 1. The `get_core_memory_promotion_candidates()` DB function
 2. The `promotion_candidates` field on `SilentPromptContext`
 3. The `<core-memory-promotion-candidates>` XML emission block in `build_silent_prompt()`
-4. The `<core-memory-promotion-candidates>` entry in the no-internal-tags list
-5. The associated test fixtures in `tests/eval/reflection_promotion_candidates/`
+4. The `<core-memory-promotion-candidates>` entry in the no-internal-tags list at `crates/mika-agent/src/prompt.rs:441–445`
+5. The `core-memory-promotion-candidates` entry in `INTERNAL_TAG_NAMES` at `crates/mika-common/src/llm/mod.rs:23–31` (drives the response-text stripping regex; leaving it in place after the surface retires would silently scrub matching content from any future LLM output)
+6. The associated test fixtures in `tests/eval/reflection_promotion_candidates/` and any `test_strip_core_memory_promotion_candidates_tag` unit test added to `mika-common/src/llm/mod.rs` at implementation time
 
 This deletion path is pre-specified here so it is discoverable without archaeology.
 
@@ -249,13 +256,15 @@ Per `pre-tool-context-redundancy-check.md`, the candidates block MUST NOT recomm
 
 These approved suggestions are encoded in the `<core-memory-promotion-instructions>` block (C3.3, instructions 2–4) and in the `suggested_action` field of each `PromotionCandidate` (C3.1).
 
+**Operator-equivalence gap (out of scope for this spec, surfaced for visibility):** No CLI command provides surgical core-memory replacement equivalent to the agent's `update_core_memory action=replace`. `mika memory reset <block>` is full-block-only. An operator who wants to apply a Bucket 1 promotion manually must either instruct the agent via `mika ask` or write directly to the SQLite store. The plan companion-docs lists `mika core-memory set --agent X --section Y --content "..."` as a separate enhancement ticket. The spec does not require this CLI to exist for the reflection-pass to function — the agent surface is sufficient — but reviewers and operators should know the surgical-replacement path is currently agent-only.
+
 ## C10. Implementation Deferred
 
 Implementation is a sibling ticket filed post-merge of this PR. The implementation realizes:
 
 1. **DB layer:** `get_core_memory_promotion_candidates()` with the `CoreMemoryPromotionCandidates` / `PromotionCandidate` / `PromotionBucket` types (C3.1).
 2. **Engine layer:** Reflection-gated fetch in `run_silent_agent()`, threading through `SilentPromptContext` (C3.2).
-3. **Prompt layer:** `<core-memory-promotion-candidates trust="internal">` XML block emission with `<core-memory-promotion-instructions>` (C3.3). No-internal-tags list update.
+3. **Prompt layer:** `<core-memory-promotion-candidates trust="internal">` XML block emission with `<core-memory-promotion-instructions>` (C3.3). No-internal-tags list update at `crates/mika-agent/src/prompt.rs:441–445` AND `INTERNAL_TAG_NAMES` registration at `crates/mika-common/src/llm/mod.rs:23–31` (with paired `test_strip_core_memory_promotion_candidates_tag` unit test).
 4. **Heuristics:** Bucket-classification pattern-matching (C4), tuned against real core-memory blocks.
 5. **Tests:** Eval harness scenarios per C6 (positive and negative cases, hard assertions, frozen fixtures).
 
