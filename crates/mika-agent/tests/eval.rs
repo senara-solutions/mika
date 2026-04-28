@@ -33,6 +33,7 @@ mod eval {
     mod kg_v27_migration;
 
     mod test_basic_conversation;
+    mod test_callback_terminal_action;
     mod test_callback_turn;
     mod test_completion_claim_guard;
     mod test_deadline_in_flight_llm_call;
