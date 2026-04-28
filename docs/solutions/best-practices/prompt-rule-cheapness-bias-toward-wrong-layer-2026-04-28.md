@@ -126,6 +126,14 @@ Reach for this lens when you are about to:
 - **What we shipped:** This doc, framed honestly as a citation handle for human design review — surfacing the bias as a recognizable class so future authors notice the cheap-impulse moment before shipping it. The load-bearing fixes from today's session are the structural tickets filed alongside (mika#864, mika#861, mika#866 + mika#867, mika-platform#62), not this doc.
 - **What that costs us:** Honesty about scope. The doc is worth writing because human reviewers reading it during design review can recognize the pattern and route around it. It is not worth writing if it gets cited in agent prompts as authority for "the agent should ask question 1-4" — that would be the parallel-duplication failure mode it warns against, applied to itself.
 
+### Example 6 — Author-side cheap-impulse during this doc's composition (2026-04-28)
+
+The author of this doc committed it to the in-flight worktree (mika#868's `feat/promotion-protocol-prompts-and-reflection-spec` branch) rather than creating a fresh branch, advancing the branch tip while mika-dev's autonomous pipeline ran from the prior tip (`0683dd8a`). Zero file overlap; recovered cleanly via `resolve_pr_conflicts` post-pipeline (the codebase's designed recovery mechanism for mid-pipeline base advancement, named explicitly in `mika/CLAUDE.md` § "Git discipline").
+
+The cheap impulse: "I have a worktree open, I'll commit there." Worktree-convenience bias toward the wrong commit target — the operator-side analogue of prompt-rule cheapness bias toward the wrong enforcement layer. The structural correlate would be a pre-commit hook that warns when committing to a branch with an in-flight dispatch task on the same ticket; the prep work for that fix is filed (see senara-solutions/mika-platform issue list) at N=2 (Example 4 + Example 6) per the same N=3 promotion threshold this doc names in § "When to Apply".
+
+**Why this is in the doc.** Example 5 was a *prediction* that prompt-level catalogues fail to bind under load, even for actively-engaged readers. Example 6 is the *immediate-occurrence evidence*: the author committed the failure mode while writing the doc, with the doc itself active in working context. The recursive-observation framing in Example 5 said "this will happen"; Example 6 says "this happened, mid-authoring, by the author." That's stronger as evidence than any future Example 7 or 8 reading the doc and recurring would be. The doc warns about a pattern; the doc demonstrates the pattern in its own authoring; the doc names the demonstration. That self-demonstration is the closest a prompt-level artifact can get to structural credibility.
+
 ## Citations
 
 **Foundational meta-rule:**
