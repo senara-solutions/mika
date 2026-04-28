@@ -12,6 +12,9 @@
 //! - Integration: would use real embedding client (gated by #340)
 //!
 //! Reference: mika#740 D2 scenario 4, D3 tier table
+//!
+//! NOTE: Broader skill-routing coverage (e.g., asserting that "implement <issue>"
+//! routes to `run_claude_pilot` with `skill: "dev-pilot"`) is deferred to mika#806.
 
 use super::kg_fixtures::*;
 use mika_agent::kg::query::{KgQueryInput, KgQueryStatus, query_knowledge_graph};
@@ -53,7 +56,7 @@ async fn test_path_c_chunk_to_subject_to_domain_bridge() {
             source_doc_path: "docs/solutions/self-dev-workflow.md",
             source_doc_hash: "abc123",
             text: "The self-dev skill orchestrates the autonomous development loop. \
-               It coordinates claude-pilot sessions and manages PR lifecycle.",
+               It coordinates dev-pilot sessions and manages PR lifecycle.",
         },
     )
     .await;
