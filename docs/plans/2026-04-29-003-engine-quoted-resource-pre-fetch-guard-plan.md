@@ -212,6 +212,20 @@ No schema changes. No new dependencies. No new env vars.
 
 ## Verification
 
+### Phase 0 — pre-implementation tool-registry verification (F8 gate)
+
+Before writing any implementation code, run:
+
+```bash
+grep -rn "read_file\b" crates/mika-agent/src/tools/
+```
+
+**Expected:** zero hits (confirming `read_file` is NOT a registered tool, so R3's uniform `gh_read` mapping for the File kind is correct).
+
+**Fallback if hits exist:** R3's mapping is wrong. Update R3 to include `read_file` in the File-kind row, and update mika#863's issue body Acceptance Criteria #3 with an edit-notice noting the registry-correction.
+
+This Phase 0 verification was already performed during grooming (2026-04-29 with the worktree at SHA `46361cb8`) — zero hits confirmed. Re-run at implementation time as a pre-commit gate so the assumption stays grounded if the registry evolves between groom and implementation. Same pre-commit-discovery discipline applied across mika#821 F6, mika-platform#52 F2, mika#788 Step 4.
+
 ### Unit / integration
 
 ```bash
@@ -309,4 +323,4 @@ Out of Scope explicitly states: other skills (mika-dev, mika-qa, etc.) do NOT op
 ## Architect verdict
 
 - **First-pass (mika-arch session `9baeceda-21eb-4249-b2e5-e2eac9ebebcc`):** ITERATE. Two blockers (F1 skill-invocation-scoped lifetime, F2 per-kind tool mapping verification) + five sharpenings (F3-F7). All resolved in this revision.
-- **Second-pass:** pending.
+- **Second-pass (same session, continuity preserved):** GROOMED. All seven findings resolved (F2 conditionally — pending implementation-time verification gate). One residual: F8 — F2-verification grep added as Phase 0 pre-commit gate (`grep -rn "read_file\b" crates/mika-agent/src/tools/`, expected zero hits, fallback documented). Verification was already performed during grooming with zero hits confirmed; the Phase 0 step keeps the assumption grounded if the registry evolves between groom and implementation.
