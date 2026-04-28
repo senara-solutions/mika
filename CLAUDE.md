@@ -69,7 +69,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 ## Commands
 
 - `cargo build` — Build all crates
-- `cargo test` — Run all tests (~3253 tests)
+- `cargo test` — Run all tests (~3312 tests)
 - `cargo test -p mika-agent --test eval` — Run agent loop integration tests (eval harness)
 - `MIKA_EVAL_REAL_PROVIDERS=anthropic,openai cargo test -p mika-agent --test eval -- --ignored` — Run real-provider eval matrix (requires API keys)
 - `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval` — Run KG provider comparison eval (requires API keys for all selected providers)
