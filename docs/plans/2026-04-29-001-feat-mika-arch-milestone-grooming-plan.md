@@ -203,6 +203,8 @@ Per the carve-out doc § "When to revisit", instance #3 promotes codification-pr
 
 The aggregation rule is **enforced by the operator command** (`/mika-groom-milestone.md`), not by the skill prompt. The skill emits per-sub-issue dispositions individually; the command aggregates and emits the milestone-level `Disposition: <KEYWORD>` final line. This keeps the skill's output contract single-shape (per D1) and the aggregation deterministic (per D2 — closed alphabet preserved).
 
+**Per-sub-issue worktree reuse on milestone re-dispatch** follows the per-ticket flow's existing reuse logic in `/mika-groom-ticket` Phase 2 — no new behavior. READY sub-issues short-circuit at plan-presence detection (the per-ticket flow already handles "worktree exists, plan committed, branch clean" idempotently); only ITERATE sub-issues get re-groomed. This is the linkage R5 inherits from the per-ticket flow.
+
 ## Open Questions
 
 ### Resolved During Planning
