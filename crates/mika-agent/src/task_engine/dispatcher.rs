@@ -1000,6 +1000,11 @@ fn extract_callback_fields(result: &str) -> serde_json::Value {
         LazyLock::new(|| Regex::new(r"Cost:\s*\$([0-9]+(?:\.[0-9]+)?)").unwrap());
     static RE_DURATION: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"Duration:\s*(\d+)ms").unwrap());
+    // PR URL emitted by dev-pilot/handlers/run.sh:398 — `PR: <url>`.
+    // Anchored at line start (multiline) so free-text mentions don't match.
+    // See mika#871 R4 for the integration contract.
+    static RE_PR_URL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^PR:\s+(https?://github\.com/\S+)").unwrap());
 
     let mut map = serde_json::Map::new();
 
@@ -1029,6 +1034,9 @@ fn extract_callback_fields(result: &str) -> serde_json::Value {
         && let Ok(n) = cap[1].parse::<u64>()
     {
         map.insert("duration_ms".into(), serde_json::Value::Number(n.into()));
+    }
+    if let Some(cap) = RE_PR_URL.captures(result) {
+        map.insert("pr_url".into(), serde_json::Value::String(cap[1].into()));
     }
 
     if map.is_empty() {
@@ -1605,5 +1613,52 @@ mod tests {
     fn test_is_team_child_callback_neither_set() {
         let task = make_task_with_team_fields(None, None);
         assert!(!is_team_child_callback(&task));
+    }
+
+    // -- extract_callback_fields pr_url tests (#871 R4) --
+
+    #[test]
+    fn test_extract_callback_fields_parses_pr_url() {
+        let input = "claude-pilot completed (status: done).\n\
+                      Session: abc123\n\
+                      Turns: 42\n\
+                      Cost: $1.23\n\
+                      Duration: 180000ms\n\
+                      PR: https://github.com/senara-solutions/mika/pull/871";
+
+        let val = extract_callback_fields(input);
+        let pr_url = val
+            .get("claude_pilot")
+            .and_then(|cp| cp.get("pr_url"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            pr_url,
+            Some("https://github.com/senara-solutions/mika/pull/871")
+        );
+    }
+
+    #[test]
+    fn test_extract_callback_fields_no_pr_url() {
+        let input = "claude-pilot completed (status: done).\n\
+                      Session: abc123\n\
+                      Turns: 10\n\
+                      Cost: $0.50\n\
+                      Duration: 60000ms";
+
+        let val = extract_callback_fields(input);
+        let pr_url = val.get("claude_pilot").and_then(|cp| cp.get("pr_url"));
+        assert!(
+            pr_url.is_none(),
+            "should not have pr_url when line is absent"
+        );
+    }
+
+    #[test]
+    fn test_extract_callback_fields_pr_url_not_matched_in_prose() {
+        // PR: in the middle of a line should not match (regex anchored to ^)
+        let input = "Session: abc123\nSome text PR: https://github.com/x/y/pull/1 more text";
+        let val = extract_callback_fields(input);
+        let pr_url = val.get("claude_pilot").and_then(|cp| cp.get("pr_url"));
+        assert!(pr_url.is_none(), "mid-line PR: should not match");
     }
 }
