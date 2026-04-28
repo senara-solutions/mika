@@ -4693,7 +4693,8 @@ impl Database {
     ) -> Result<Vec<OrphanedParentTask>> {
         let grace_modifier = format!("-{grace_seconds} seconds");
         let mut stmt = self.conn.prepare(
-            "SELECT parent.id, parent.agent_id, parent.created_at, child.id AS callback_task_id
+            "SELECT parent.id, parent.agent_id, parent.created_at,
+                    MIN(child.id) AS callback_task_id
              FROM tasks parent
              JOIN tasks child ON parent.id = child.parent_task_id
              WHERE parent.agent_id = ?1
@@ -4712,6 +4713,7 @@ impl Database {
                    AND sibling.id != child.id
                    AND sibling.status IN ('pending', 'in_progress')
                )
+             GROUP BY parent.id
              ORDER BY parent.id",
         )?;
         let rows = stmt

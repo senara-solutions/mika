@@ -421,9 +421,17 @@ impl TaskEngine {
             let trace_id = mika_common::trace::generate_trace_id();
             let system_session = format!("system-{}", parent.agent_id);
 
-            match self.db.update_task_status(&parent.id, "failed").await {
-                Ok(()) => {
-                    // Emit audit event for the transition
+            // Use update_task_failed (guarded UPDATE with terminal-state check)
+            // instead of raw update_task_status to avoid overwriting concurrent
+            // terminal transitions. Returns false when the parent already left
+            // in_progress (race with operator action or duplicate query rows).
+            match self
+                .db
+                .update_task_failed(&parent.id, "callback_delivered_without_pr_url")
+                .await
+            {
+                Ok(true) => {
+                    // Transition succeeded — emit audit event
                     if let Err(e) = self
                         .db
                         .log_audit_event(
@@ -461,6 +469,14 @@ impl TaskEngine {
                             "task_engine_reaper: transitioned orphaned parent to failed"
                         );
                     }
+                }
+                Ok(false) => {
+                    // Parent already transitioned away from in_progress
+                    // (concurrent operator action or duplicate query row) — skip.
+                    debug!(
+                        parent_id = %parent.id,
+                        "task_engine_reaper: parent already in terminal state, skipping"
+                    );
                 }
                 Err(e) => {
                     // F5: audit-event-on-error so operators catch silent-reaper-failure
