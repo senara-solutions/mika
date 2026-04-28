@@ -57,17 +57,24 @@ Both are explicitly closed alphabets defined by skill design. Regex would make t
 - **R2.** `validate_skill` (`crates/mika-agent/src/skills/index.rs:637`) extended to reject malformed `[output]` entries at skill-load time per the existing #510/#511 validation pattern. Specifically: each entry must be a non-empty string; whole-list-must-be-non-empty-or-omitted. **F5 resolution — empty-list severity is `Warn`, not `Fail`:** an explicit `required_suffix_lines = []` is suspicious (likely author oversight — they meant to add entries but didn't) but is NOT a correctness violation (the engine's no-op for empty list is well-defined: no constraint applied). Hard-rejection on author-uncertainty would create a load-failure footgun for skill development workflows where the field is being added incrementally. Warn-level diagnostic surfaces the issue in `mika skills list`'s warning section without blocking the skill's load. Returns a `SkillDiagnostic` per existing helper functions.
 - **R3.** New post-condition guard in `crates/mika-agent/src/agent.rs` at the existing chain site (~lines 955-1333). **Position: END of the chain (per F4)** — after the persistence-evaluation guard at the chain's tail, before the EndTurn return path. Rationale: other guards' rejections (text-tool-call, prose-style, completion-claim, fabricated-action, intent-precondition, persistence-eval) take precedence so a turn that would already be rejected for a more fundamental reason doesn't waste a suffix-line check. **Trigger:** at least one matched skill (Keyword OR AlwaysOn) declares non-empty `output.required_suffix_lines`. **Satisfaction check (read (b) per F7):** assistant's last 3 non-empty lines (after `.trim_end()` per line + skipping fully-blank lines) contain AT LEAST ONE line that exactly equals an entry in the union of required-suffix-lines from all matched skills. The "any-of-last-3" read is chosen over the stricter "last-non-empty-line-only" read because skill outputs commonly end with a code-fence close, a blank trailing line, or a footer that isn't the verdict — strict-last-line would false-negative on standard markdown formatting. The looser read accepts these formatting tails while keeping the verdict near the end. Test scenarios MUST match this read (not the strict alternative). **On violation:** reject EndTurn, inject corrective system message naming the skill path + the accept-set + instruction to re-emit with the verdict appended. Single-retry tracked via new flag `required_suffix_line_retry_done` initialized at `agent.rs:~798` alongside the existing 6 retry flags.
 - **R4.** **Last-3-lines scan rationale:** assistant text often ends with markdown trailing whitespace, an empty line, or a code-fence close. Scanning the last 3 non-empty lines (rather than strictly the last line) accommodates the mika-arch output convention without over-relaxing — verdict lines that appear earlier in the response (e.g., in the body of a section) don't satisfy. The window is small enough that the verdict still has to be near the end; large enough to tolerate formatting.
-- **R5.** **Corrective system message:**
+- **R5.** **Corrective system message** (action-first, context-second per pass-2 sharpening — match `webhook_zero_tools`' template shape):
   ```
-  [Your response was rejected because the active skill <skill_path> declares
-   `[output] required_suffix_lines = <list>`, but your assistant text did not end
-   with any of those literal lines (last 3 non-empty lines were inspected). Re-emit
-   the same response with one of the required lines appended verbatim on its own
-   line at the end. Do not paraphrase the line — the suffix is a structural contract
-   parsed by downstream consumers (e.g., /mika-groom-ticket Phase 4 disposition
-   parser). See feedback_prompt_enforcement_fragile.md for why prompt-level "MUST"
-   doesn't bind here.]
+  [Your response must end with one of these literal lines (any of the last 3
+   non-empty lines, after whitespace trim, will satisfy):
+     - "Verdict: GROOMED"
+     - "Verdict: ESCALATE"
+   Re-emit the same response with one of the required lines appended verbatim
+   on its own line at the end. Do not paraphrase — the suffix is a structural
+   contract parsed by downstream consumers (e.g., /mika-groom-ticket Phase 4
+   disposition parser).
+
+   (Required by skill: <skill_path>, [output].required_suffix_lines.
+   See feedback_prompt_enforcement_fragile.md for why prompt-level "MUST"
+   doesn't bind here.)]
   ```
+  Accept-set listed FIRST so the LLM reads the actionable constraint before the
+  provenance context. Skill path + meta-doc citation deferred to the parenthetical
+  trailer. Same action-first/context-second principle as `webhook_zero_tools`.
 - **R6.** mika-arch's two skills opt in. Files:
   - `mika/skills/bundled/mika-arch-second-review/skill.toml` — add `[output] required_suffix_lines = ["Verdict: GROOMED", "Verdict: ESCALATE"]`.
   - `mika/skills/bundled/mika-arch-groom-ticket/skill.toml` — add `[output] required_suffix_lines = ["Disposition: READY", "Disposition: ITERATE", "Disposition: ESCALATE"]`.
@@ -268,4 +275,4 @@ R3 now explicitly chooses the "any-of-last-3" read (b) over the strict "last-non
 ## Architect verdict
 
 - **First-pass (mika-arch session `fcf8d04b-86b3-4f27-8139-4340c3875b16`):** ITERATE. One blocker (F1 compound-doc forward-pointer specificity) + six sharpenings (F2-S, F3-F7). All resolved in this revision.
-- **Second-pass:** pending.
+- **Second-pass (same session, continuity preserved):** GROOMED. All seven findings resolved. Two remaining uncertainties dispositioned (AlwaysOn-inclusion is architecturally correct; multi-skill multi-naming YAGNI deferred). One residual: corrective message in R5 reordered to action-first / context-second per `webhook_zero_tools`' template shape — accept-set values listed before skill path + meta-doc citation, so the LLM reads the actionable constraint before the provenance.
