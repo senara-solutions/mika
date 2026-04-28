@@ -170,6 +170,20 @@ No schema changes. No new dependencies. No new env vars (the new env-var read of
 
 ## Verification
 
+### Phase 0 — pre-implementation issue-body verification (F1 residual sharpening)
+
+Before writing any implementation code, run:
+
+```bash
+gh issue view 861 --repo senara-solutions/mika --json body | grep -q "residual escape hatch"
+```
+
+**Expected:** match found (confirming the issue body's "residual escape hatch" trailer characterization that grounds R1's label-first priority order).
+
+**Fallback if no match:** the priority-order claim is ungrounded against the issue body's current wording. Re-evaluate against whatever the body actually says — if body specifies trailer-first or is silent, swap the priority order to trailer → label → reject and update R1/R3 accordingly.
+
+This Phase 0 verification was performed during grooming (the brief's "residual escape hatch" citation came from the issue-body content available in this session's context). Re-run at implementation time as a pre-commit gate so the priority-order claim stays grounded if the issue body is edited between groom and implementation. Same pre-commit-discovery discipline applied across mika#863 F8, mika#821 F6, mika-platform#52 F2.
+
 ### Unit (bash test fixture)
 
 ```bash
@@ -249,4 +263,4 @@ The issue body's case table already covers asymmetry: case C (`documentation` la
 ## Architect verdict
 
 - **First-pass (mika-arch session `2f02cec3-aee4-4d2e-bebd-a0c65a0af88b`):** ITERATE. Two blockers (F1 priority order, F2 branch-name fallback) + four sharpenings (F3 warn-bare rationale, F4 cross-repo non-handling, F5 structured prefix, F6 asymmetry coverage). All resolved in this revision.
-- **Second-pass:** pending.
+- **Second-pass (same session, continuity preserved):** GROOMED. All six findings resolved (F1 conditionally — pending Phase 0 grep verification gate). Two remaining uncertainties correctly deferred (test-fixture format = implementation-detail; dual-form regex shape = readability-over-cleverness deferred). One residual: F1 grounded on the brief's citation of "residual escape hatch" wording from the issue body — Phase 0 grep gate (`gh issue view 861 ... | grep -q "residual escape hatch"`) added to verify the priority-order claim before the first implementation commit. Output-format compatibility confirmed: exit-code contract unchanged, new structured `[pipeline-exempt: ...]` log lines are additive (no downstream parser consumes them).
