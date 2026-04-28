@@ -145,6 +145,40 @@ pub struct GitHubRepository {
 
 // -- Event routing --
 
+/// Skills that MUST NOT be instantiated via webhook-driven event flows.
+///
+/// Defense-in-depth for operator-only skills (#845). Layer 1 (well_known_agents.rs
+/// disabled_skills) is the primary check; this gateway-side denylist catches future
+/// routing-path additions that might bypass Layer 1.
+///
+/// The guard checks whether the formatted event text contains skill trigger
+/// keywords that would activate a denylisted skill. If detected, the event
+/// is dropped with a warning — the skill never reaches the agent.
+const WEBHOOK_SKILL_DENYLIST: &[&str] = &["dev-groom"];
+
+/// Check if a labeled event's label name matches a denylisted skill.
+///
+/// Only applies to `issues.labeled` events — returns `true` when the label name
+/// matches a denylisted skill (case-insensitive). For all other event types,
+/// returns `false` (Layer 1 disabled_skills is the primary defense).
+fn is_webhook_denylisted_skill(
+    event_type: &str,
+    action: Option<&str>,
+    label_name: Option<&str>,
+) -> bool {
+    // Only gate on issues.labeled — other event types rely on Layer 1
+    if event_type != "issues" || action != Some("labeled") {
+        return false;
+    }
+    let Some(name) = label_name else {
+        return false;
+    };
+    let name_lower = name.to_lowercase();
+    WEBHOOK_SKILL_DENYLIST
+        .iter()
+        .any(|skill| name_lower == *skill)
+}
+
 /// Route a GitHub event to the target agent name based on event type and action.
 ///
 /// Returns `None` for unroutable events (silently dropped).
@@ -565,6 +599,25 @@ pub(crate) async fn handle_github_webhook(
         delivery_id = %delivery_id,
         "GitHub webhook routing event to agent"
     );
+
+    // 9b. Webhook skill denylist guard (#845, Layer 3 defense-in-depth).
+    // Only applies to issues.labeled events — checks the label name against the
+    // denylist. Layer 1 (well_known_agents.rs disabled_skills) is the primary
+    // defense; this gateway-side guard catches routing-path additions that bypass
+    // Layer 1.
+    {
+        let label_name = event.label.as_ref().and_then(|l| l.name.as_deref());
+        if is_webhook_denylisted_skill(event_type, event.action.as_deref(), label_name) {
+            warn!(
+                event_type,
+                delivery_id = %delivery_id,
+                target_agent,
+                label_name = ?label_name,
+                "GitHub webhook dropped by skill denylist guard (operator-only skill trigger detected)"
+            );
+            return StatusCode::OK;
+        }
+    }
 
     // 10. Semaphore for backpressure
     let permit = match state.webhook_semaphore.clone().try_acquire_owned() {
@@ -2325,5 +2378,68 @@ mod tests {
         // A 0ms delay should pass through unchanged (jitter_range = 0).
         let d = Duration::from_millis(0);
         assert_eq!(apply_jitter(d), d);
+    }
+
+    // -- Webhook skill denylist guard tests (#845) --
+
+    #[test]
+    fn test_webhook_denylist_blocks_dev_groom_label() {
+        // issues.labeled with label name "dev-groom" must be blocked.
+        assert!(is_webhook_denylisted_skill(
+            "issues",
+            Some("labeled"),
+            Some("dev-groom"),
+        ));
+    }
+
+    #[test]
+    fn test_webhook_denylist_case_insensitive() {
+        assert!(is_webhook_denylisted_skill(
+            "issues",
+            Some("labeled"),
+            Some("Dev-Groom"),
+        ));
+        assert!(is_webhook_denylisted_skill(
+            "issues",
+            Some("labeled"),
+            Some("DEV-GROOM"),
+        ));
+    }
+
+    #[test]
+    fn test_webhook_denylist_allows_normal_events() {
+        // issues.labeled with a non-denylisted label passes through.
+        assert!(!is_webhook_denylisted_skill(
+            "issues",
+            Some("labeled"),
+            Some("ready"),
+        ));
+        // Non-labeled issue events pass through even if free-text mentions
+        // "dev-groom" (no false-positive on body content).
+        assert!(!is_webhook_denylisted_skill(
+            "issues",
+            Some("assigned"),
+            None,
+        ));
+        // Other event types always pass through (Layer 1 is the primary defense).
+        assert!(!is_webhook_denylisted_skill(
+            "pull_request",
+            Some("opened"),
+            None,
+        ));
+        assert!(!is_webhook_denylisted_skill(
+            "issue_comment",
+            Some("created"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_webhook_denylist_contains_dev_groom() {
+        // Verify the denylist contains dev-groom
+        assert!(
+            WEBHOOK_SKILL_DENYLIST.contains(&"dev-groom"),
+            "WEBHOOK_SKILL_DENYLIST must contain dev-groom for operator-only enforcement"
+        );
     }
 }

@@ -229,6 +229,7 @@ skills/bundled/
 ├── self-dev-webhook-qa/   # QA webhook handler for self-dev
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
 ├── dev-pilot/             # Claude Code integration (worktree setup, rebase-or-abort guard, claude-pilot dispatch)
+├── dev-groom/              # Operator-triggered two-pass grooming flow
 ├── qa-review/             # PR review skill
 ├── qa-review-build-callback/ # Build callback handler for QA review
 ├── permission-policy/     # Permission handler for claude-pilot sessions

@@ -79,12 +79,14 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
     // mika-arch-* skills are review-class for the architect agent only;
     // exclude them from mika-dev to prevent context pollution and arch-style
     // keyword triggers firing on dev work.
+    // dev-groom is operator-only (#845) — mika-dev must NOT auto-invoke grooming.
     disabled_skills: &[
         "qa-review",
         "qa-review-build-callback",
         "skill-review",
         "mika-arch-groom-ticket",
         "mika-arch-second-review",
+        "dev-groom",
     ],
     config_toml: None,
     identity_source: None,
@@ -111,6 +113,8 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
         // focused on PR review without arch-style triggers.
         "mika-arch-groom-ticket",
         "mika-arch-second-review",
+        // dev-groom is operator-only (#845) — mika-qa must NOT invoke grooming.
+        "dev-groom",
     ],
     config_toml: None,
     identity_source: None,
@@ -147,6 +151,7 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
         "self-check",
         "mika-arch-groom-ticket",
         "mika-arch-second-review",
+        "dev-groom",
         // Community (hardcoded BUNDLED_SKILLS):
         "tmux",
         "shell-exec",
@@ -1109,7 +1114,13 @@ mod tests {
         // disabled lists should not overlap EXCEPT for skills that are owned
         // by a third agent (mika-arch). Both dev and qa correctly exclude
         // mika-arch's review skills to prevent context pollution.
-        let allowed_overlap: &[&str] = &["mika-arch-groom-ticket", "mika-arch-second-review"];
+        // Skills owned by third-party agents (mika-arch) or operator-only skills
+        // are legitimately disabled on both mika-dev and mika-qa.
+        let allowed_overlap: &[&str] = &[
+            "mika-arch-groom-ticket",
+            "mika-arch-second-review",
+            "dev-groom", // operator-only (#845) — disabled for both dev and qa
+        ];
         for dev_skill in MIKA_DEV.disabled_skills {
             if allowed_overlap.contains(dev_skill) {
                 continue;
