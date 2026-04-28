@@ -285,4 +285,4 @@ Reaper logs a distinct `info!` when `age_hours > 24` to surface backfill scope p
 ## Architect verdict
 
 - **First-pass (mika-arch session `da320154-dbfe-40ce-9a2e-b0fd80b4ad67`):** ITERATE. Two blockers (F1 atomic deployment, F2 `delivered_at` semantics) + four sharpenings (F3 calibration, F4 regex source, F5 audit-on-error, F6 backfill log). All resolved in this revision.
-- **Second-pass:** pending.
+- **Second-pass (same session, continuity preserved):** GROOMED. All six findings resolved with structural evidence. Two remaining uncertainties correctly deferred as YAGNI (`json_extract` performance, `tasks.type` scope). One residual non-plan note: PR description must include a sentence naming the `NOT EXISTS` sibling-guard's interaction with #870's optional `create_task` terminal action — the guard defers to retries launched by #870's correction loop; only parents whose entire child graph is terminal are reaped. (Captured here so the implementer carries it into the eventual PR body.)
