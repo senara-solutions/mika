@@ -1,18 +1,42 @@
 #!/usr/bin/env bash
 # Verify that the /mika pipeline produced required artifacts before PR creation.
 #
-# Checks:
-#   1. A plan doc exists in docs/plans/*.md (in the branch diff)
-#   2. Source code changes exist beyond the plan doc
-#   3. A compound doc exists in docs/solutions/*.md (in the branch diff)
+# Bucket-comparison logic — categorizes the PR's changed files and rejects
+# pathological splits (docs-only or code-only PRs) that mika-platform#17/#18
+# established as a recurring failure mode.
+#
+# Buckets (applied to the union of committed/staged/unstaged diffs vs base):
+#   docs    = docs/plans/** or docs/solutions/**
+#   source  = everything NOT under docs/, .github/, or .claude/worktrees/
+#   other   = the rest (.github/, docs/adr/, docs/brainstorms/, README.md, ...)
+#
+# Decisions:
+#   docs && source           -> pass
+#   docs && !source          -> REJECT (docs-only PR)
+#   !docs && source          -> REJECT (code-only PR)
+#   !docs && !source         -> warn + pass (pure config or no diff)
+#
+# Exempt trailers (any commit in the base..HEAD range):
+#   Pipeline-Exempt: docs-only  -> bypass docs-only rejection
+#   Pipeline-Exempt: code-only  -> bypass code-only rejection
+#
+# Note: this script previously enforced an unconditional plan-doc-presence
+# AND compound-doc-presence check. Both were strictly subsumed by the bucket
+# logic — docs/plans presence is covered by DOCS_BUCKET, source presence by
+# SOURCE_BUCKET, compound docs satisfy DOCS_BUCKET, and the exempt trailers
+# provide the escape hatch for legitimate docs-only / code-only PRs (e.g.
+# standalone /ce:compound shipments). Running the strict checks in addition
+# rejected legitimate /ce:compound docs-only PRs with no escape mechanism.
+# Aligned with mika-platform/scripts/verify-pipeline.sh; mika#861 tracks
+# layering label-inheritance on top of this for the as-above-so-below path.
 #
 # Usage:
 #   ./scripts/verify-pipeline.sh              # local (compares to main)
-#   ./scripts/verify-pipeline.sh origin/main  # CI (compares to origin/main)
+#   ./scripts/verify-pipeline.sh origin/main  # CI (compares to origin/main or base SHA)
 #
 # Exit codes:
-#   0 - all checks passed
-#   1 - missing artifacts
+#   0 - all checks passed (possibly with warnings)
+#   1 - missing artifacts or pathological split
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -28,25 +52,68 @@ ALL=$(printf '%s\n%s\n%s' "$COMMITTED" "$STAGED" "$UNSTAGED" | sort -u | grep -v
 
 ERRORS=0
 
-# Check 1: Plan doc in docs/plans/
+# Capture PLAN purely for the final "passed" message.
 PLAN=$(echo "$ALL" | grep '^docs/plans/.*\.md$' || true)
-if [[ -z "$PLAN" ]]; then
-  echo "MISSING: No plan doc in docs/plans/. Run /ce:plan." >&2
-  ERRORS=$((ERRORS + 1))
-fi
-
-# Check 2: Source changes beyond plan doc and .claude/ config
-CODE=$(echo "$ALL" | grep -v '^docs/plans/' | grep -v '^\.claude/' || true)
-if [[ -z "$CODE" ]]; then
-  echo "MISSING: No source changes beyond plan doc. Run /ce:work." >&2
-  ERRORS=$((ERRORS + 1))
-fi
-
-# Check 3: Compound doc in docs/solutions/
 COMPOUND=$(echo "$ALL" | grep '^docs/solutions/.*\.md$' || true)
-if [[ -z "$COMPOUND" ]]; then
-  echo "MISSING: No compound doc in docs/solutions/. Run /ce:compound." >&2
-  ERRORS=$((ERRORS + 1))
+
+DOCS_BUCKET=$(echo "$ALL" | grep -E '^docs/(plans|solutions)/' || true)
+SOURCE_BUCKET=$(echo "$ALL" \
+  | grep -v -E '^docs/' \
+  | grep -v -E '^\.github/' \
+  | grep -v -E '^\.claude/worktrees/' \
+  || true)
+
+# OTHER = ALL minus DOCS_BUCKET minus SOURCE_BUCKET
+if [[ -n "$ALL" ]]; then
+  EXCLUDE=$(printf '%s\n%s\n' "$DOCS_BUCKET" "$SOURCE_BUCKET" | grep -v '^$' || true)
+  if [[ -n "$EXCLUDE" ]]; then
+    OTHER_BUCKET=$(echo "$ALL" | grep -v -F -x -f <(echo "$EXCLUDE") || true)
+  else
+    OTHER_BUCKET="$ALL"
+  fi
+else
+  OTHER_BUCKET=""
+fi
+
+# Exempt trailers: scan commit messages in base..HEAD
+COMMIT_BODIES=$(git log --format=%B "${MERGE_BASE}..HEAD" 2>/dev/null || true)
+EXEMPT_DOCS_ONLY=0
+EXEMPT_CODE_ONLY=0
+if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only(\s.*)?$'; then
+  EXEMPT_DOCS_ONLY=1
+fi
+if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only(\s.*)?$'; then
+  EXEMPT_CODE_ONLY=1
+fi
+
+if [[ -n "$DOCS_BUCKET" && -z "$SOURCE_BUCKET" ]]; then
+  if [[ "$EXEMPT_DOCS_ONLY" == "1" ]]; then
+    echo "warn: docs-only PR allowed by Pipeline-Exempt: docs-only trailer" >&2
+  else
+    echo "REJECT: docs-only PR: plan/solution present but no source changes" >&2
+    echo "        Add 'Pipeline-Exempt: docs-only — <reason>' trailer to a commit" >&2
+    echo "        if this docs-only ship is intentional (e.g. standalone /ce:compound)." >&2
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+if [[ -z "$DOCS_BUCKET" && -n "$SOURCE_BUCKET" ]]; then
+  if [[ "$EXEMPT_CODE_ONLY" == "1" ]]; then
+    echo "warn: code-only PR allowed by Pipeline-Exempt: code-only trailer" >&2
+  else
+    echo "REJECT: code-only PR: source changes present but no plan/solution doc" >&2
+    echo "        Add 'Pipeline-Exempt: code-only — <reason>' trailer to a commit" >&2
+    echo "        if this code-only ship is intentional." >&2
+    ERRORS=$((ERRORS + 1))
+  fi
+fi
+
+if [[ -z "$DOCS_BUCKET" && -z "$SOURCE_BUCKET" ]]; then
+  if [[ -n "$OTHER_BUCKET" ]]; then
+    echo "warn: no docs or source changes, only config/other files" >&2
+  else
+    echo "warn: no diff against $BASE_REF" >&2
+  fi
 fi
 
 if [[ $ERRORS -gt 0 ]]; then
@@ -54,4 +121,4 @@ if [[ $ERRORS -gt 0 ]]; then
   exit 1
 fi
 
-echo "Pipeline verification passed. Plan: $PLAN Compound: $COMPOUND"
+echo "Pipeline verification passed. Plan: ${PLAN:-<none>} Compound: ${COMPOUND:-<none>}"
