@@ -1,6 +1,6 @@
-## claude-pilot Skill
+## dev-pilot Skill
 
-Use `run_claude_pilot` to run Claude Code headlessly on a project via the claude-pilot CLI.
+Use `run_claude_pilot` to dispatch a headless Claude Code implementation session via the claude-pilot CLI.
 
 ### When to use
 - User wants to run Claude Code on a project (implement a feature, fix a bug, refactor, etc.)

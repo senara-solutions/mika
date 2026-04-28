@@ -5789,7 +5789,7 @@ mod tests {
     fn test_collect_required_tools_ignores_dependency_matched_skills() {
         // Skill pulled in as a dependency should NOT contribute required_tools
         let s1 = make_skill_entry_with_constraints(
-            "claude-pilot",
+            "dev-pilot",
             30,
             &["run_claude_pilot"],
             &["run_claude_pilot"],
@@ -6001,7 +6001,7 @@ mod tests {
             .model_name("x-ai/grok-4.1-fast")
             .build();
         let s1 =
-            make_skill_entry_with_llm("claude-pilot", Some("anthropic"), Some("claude-sonnet-4-6"));
+            make_skill_entry_with_llm("dev-pilot", Some("anthropic"), Some("claude-sonnet-4-6"));
         let matched = vec![MatchedSkill {
             entry: &s1,
             reason: MatchReason::Dependency,

@@ -1,6 +1,6 @@
 [skill]
-name = "claude-pilot"
-description = "Run Claude Code headlessly on a project via the claude-pilot CLI"
+name = "dev-pilot"
+description = "Dispatch a headless Claude Code implementation session via the claude-pilot CLI"
 version = "0.1.0"
 always_on = false
 timeout_secs = 600

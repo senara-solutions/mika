@@ -646,7 +646,7 @@ impl SkillRegistry {
     ///
     /// Unlike `safe_always_on_skills()`, this method resolves skill
     /// dependencies via BFS (same algorithm as `match_skills()` in
-    /// `matcher.rs`). This ensures dependency skills like `claude-pilot`
+    /// `matcher.rs`). This ensures dependency skills like `dev-pilot`
     /// (which provides `run_claude_pilot` but has `always_on = false`) are
     /// included when an always-on skill (e.g. `self-dev`) declares them as
     /// dependencies (#578).
@@ -930,8 +930,8 @@ mod tests {
             skill_dir: PathBuf::from("/skills/memory"),
         }];
 
-        // Exec-handler always_on skill (e.g. claude-pilot)
-        let mut exec_entry = make_entry("claude-pilot", true, true);
+        // Exec-handler always_on skill (e.g. dev-pilot)
+        let mut exec_entry = make_entry("dev-pilot", true, true);
         exec_entry.skill_tools = vec![ResolvedSkillTool {
             definition: dummy_def.clone(),
             handler: ToolHandler::Exec {
@@ -971,7 +971,7 @@ mod tests {
             .map(|e| e.manifest.skill.name.as_str())
             .collect();
         assert!(names.contains(&"memory"));
-        assert!(names.contains(&"claude-pilot"));
+        assert!(names.contains(&"dev-pilot"));
         assert!(names.contains(&"webhook"));
         assert!(names.contains(&"guidelines"));
 
@@ -1046,26 +1046,26 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         };
 
-        // always_on skill that depends on "claude-pilot"
-        let self_dev = make_entry_with_deps("self-dev", true, true, &["claude-pilot"]);
+        // always_on skill that depends on "dev-pilot"
+        let self_dev = make_entry_with_deps("self-dev", true, true, &["dev-pilot"]);
 
         // NOT always_on, but provides the exec tool
-        let mut claude_pilot = make_entry_with_deps("claude-pilot", false, true, &[]);
-        claude_pilot.skill_tools = vec![ResolvedSkillTool {
+        let mut dev_pilot = make_entry_with_deps("dev-pilot", false, true, &[]);
+        dev_pilot.skill_tools = vec![ResolvedSkillTool {
             definition: dummy_def.clone(),
             handler: ToolHandler::Exec {
                 command: "./run.sh".to_string(),
                 long_running: true,
                 estimated_duration_secs: Some(600),
             },
-            skill_dir: PathBuf::from("/skills/claude-pilot"),
+            skill_dir: PathBuf::from("/skills/dev-pilot"),
         }];
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
             disabled: Vec::new(),
             validated_warnings: Vec::new(),
-            skills: vec![self_dev, claude_pilot],
+            skills: vec![self_dev, dev_pilot],
         };
 
         let callback = registry.callback_safe_skills();
@@ -1075,7 +1075,7 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"self-dev"));
-        assert!(names.contains(&"claude-pilot"));
+        assert!(names.contains(&"dev-pilot"));
     }
 
     #[test]
@@ -1188,24 +1188,24 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         };
 
-        let self_dev = make_entry_with_deps("self-dev", true, true, &["claude-pilot"]);
+        let self_dev = make_entry_with_deps("self-dev", true, true, &["dev-pilot"]);
 
-        let mut claude_pilot = make_entry_with_deps("claude-pilot", false, true, &[]);
-        claude_pilot.skill_tools = vec![ResolvedSkillTool {
+        let mut dev_pilot = make_entry_with_deps("dev-pilot", false, true, &[]);
+        dev_pilot.skill_tools = vec![ResolvedSkillTool {
             definition: dummy_def.clone(),
             handler: ToolHandler::Exec {
                 command: "./run.sh".to_string(),
                 long_running: true,
                 estimated_duration_secs: Some(600),
             },
-            skill_dir: PathBuf::from("/skills/claude-pilot"),
+            skill_dir: PathBuf::from("/skills/dev-pilot"),
         }];
 
         let registry = SkillRegistry {
             skipped: Vec::new(),
             disabled: Vec::new(),
             validated_warnings: Vec::new(),
-            skills: vec![self_dev, claude_pilot],
+            skills: vec![self_dev, dev_pilot],
         };
 
         // safe_always_on_skills: only self-dev (no dep resolution, exec filtered anyway)
