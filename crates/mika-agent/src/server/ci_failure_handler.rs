@@ -649,7 +649,7 @@ fn format_dispatch_pre_digest(
     }
 
     parts.push(
-        "\nAction required: dispatch run_claude_pilot to fix the CI failure on this branch. \
+        "\nAction required: dispatch run_claude_pilot with skill: \"dev-pilot\" to fix the CI failure on this branch. \
          Do NOT re-increment ci_fix_count — the structural handler already updated it.\n\
          </ci_failure_handler>"
             .to_string(),

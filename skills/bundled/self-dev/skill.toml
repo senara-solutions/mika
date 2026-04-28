@@ -8,7 +8,7 @@ max_prompt_size = 57344
 dependencies = [
     "build-mika",
     "deploy-mika",
-    "claude-pilot",
+    "dev-pilot",
     "browser-control",
     "resolve-pr-conflicts",
 ]

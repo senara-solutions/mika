@@ -102,7 +102,7 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
         "self-dev-iterate",
         "self-dev-webhook-qa",
         "self-dev-webhook-ci",
-        "claude-pilot",
+        "dev-pilot",
         "permission-policy",
         "agents-teams",
         "address-pr-comments",
@@ -119,9 +119,10 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
 
 /// mika-relay agent specification.
 ///
-/// Lightweight agent for handling claude-pilot `can_use_tool` permission
-/// relay events. Only the `permission-policy` skill is enabled; all other
-/// bundled skills are disabled. Uses haiku for cheap, fast JSON classification.
+/// Lightweight agent for handling claude-pilot (the binary) `can_use_tool`
+/// permission relay events. Only the `permission-policy` skill is enabled;
+/// all other bundled skills are disabled. Uses haiku for cheap, fast JSON
+/// classification.
 pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
     name: "mika-relay",
     display_name: "Relay",
@@ -137,7 +138,7 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
         "qa-review",
         "qa-review-build-callback",
         "skill-review",
-        "claude-pilot",
+        "dev-pilot",
         "build-mika",
         "deploy-mika",
         "agents-teams",
@@ -765,7 +766,7 @@ mod tests {
         "self-dev-webhook-qa",
         "self-dev-webhook-ci",
         "self-dev-sprint",
-        "claude-pilot",
+        "dev-pilot",
         "build-mika",
         "deploy-mika",
         "agents-teams",

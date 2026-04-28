@@ -11,6 +11,9 @@
 //! - `entry_method` indicates direct match (path A)
 //!
 //! Reference: mika#740 D2 scenario 2
+//!
+//! NOTE: Broader skill-routing coverage (e.g., asserting that "implement <issue>"
+//! routes to `run_claude_pilot` with `skill: "dev-pilot"`) is deferred to mika#806.
 
 use super::kg_fixtures::*;
 use mika_agent::kg::query::{KgQueryInput, KgQueryStatus, TraversalInput, query_knowledge_graph};
@@ -95,7 +98,7 @@ async fn test_path_a_name_match_via_question() {
         &db,
         &DomainEntitySpec {
             entity_type: "skill",
-            name: "claude-pilot",
+            name: "dev-pilot",
             properties_json: None,
         },
     )

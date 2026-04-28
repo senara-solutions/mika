@@ -213,7 +213,7 @@ Skills are bundled and discovered at build time via `crates/mika-agent/build.rs`
 - Live next to the Rust engine code they depend on
 - Correctness depends on lockstep with engine schemas and contracts
 - Ship atomically with the engine (discovered at build time)
-- Examples: `self-dev`, `claude-pilot`, `qa-review`, `permission-policy`
+- Examples: `self-dev`, `dev-pilot`, `qa-review`, `permission-policy`
 
 **Community Skills** (in `mika-skills` repo):
 - Standalone skills with no engine dependencies
@@ -228,7 +228,7 @@ skills/bundled/
 ├── self-dev-iterate/      # PR iteration handler for self-dev
 ├── self-dev-webhook-qa/   # QA webhook handler for self-dev
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
-├── claude-pilot/          # Claude Code integration (worktree setup, rebase-or-abort guard, claude-pilot dispatch)
+├── dev-pilot/             # Claude Code integration (worktree setup, rebase-or-abort guard, claude-pilot dispatch)
 ├── qa-review/             # PR review skill
 ├── qa-review-build-callback/ # Build callback handler for QA review
 ├── permission-policy/     # Permission handler for claude-pilot sessions

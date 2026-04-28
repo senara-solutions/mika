@@ -1,6 +1,6 @@
 #!/bin/sh
-# Handler for the claude-pilot skill (long-running exec).
-# Input: JSON on stdin with prompt in repo#number format (e.g., "mika-skills#8").
+# Handler for the dev-pilot skill (long-running exec).
+# Input: JSON on stdin with skill, prompt, and task_id fields.
 #        __mika_task_id and __mika_agent are injected by the executor.
 # Output: Delivers result via `mika ask --task-id` callback when claude-pilot finishes.
 #
@@ -94,10 +94,21 @@ PR: ${_PR_URL}"
 trap deliver_callback EXIT
 
 # Parse user-provided fields
+SKILL=$(printf '%s\n' "$INPUT" | jq -r '.skill // empty')
 PROMPT=$(printf '%s\n' "$INPUT" | jq -r '.prompt // empty')
 USER_TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.task_id // empty')
 DRY_RUN=$(printf '%s\n' "$INPUT" | jq -r '.dry_run // empty')
 ITERATION_CTX=$(printf '%s\n' "$INPUT" | jq -r '.iteration_context // empty')
+
+# Validate skill argument
+if [ -z "$SKILL" ]; then
+    echo "Error: missing required argument 'skill'; valid values: [\"dev-pilot\"]" >&2
+    exit 1
+fi
+if [ "$SKILL" != "dev-pilot" ]; then
+    echo "Error: invalid skill '${SKILL}'; valid values: [\"dev-pilot\"]" >&2
+    exit 1
+fi
 
 # mika-platform root — base for sub-repo resolution
 # Resolve symlinks so constructed paths use canonical form
