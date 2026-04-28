@@ -225,4 +225,4 @@ R4's corrective message now includes the literal path `docs/solutions/best-pract
 ## Architect verdict
 
 - **First-pass (mika-arch session `ab2c26e8-70b7-4132-a91a-99a5a1a6ebd7`):** ITERATE. Two blockers (F1 turn-start snapshot, F2 named capture groups) + four sharpenings (F3-F6). All resolved in this revision.
-- **Second-pass:** pending.
+- **Second-pass (same session, continuity preserved):** GROOMED. All six findings resolved with structural evidence. Two remaining uncertainties correctly deferred (threading mechanism = implementation detail; modal-verb capture = YAGNI). One residual pre-push tweak: scenario 2 (genuine unavailability) MUST include a snapshot-fidelity assertion verifying `enabled_tool_names` in the post-condition context matches the tool array offered to `MockLlmProvider`. This catches the regression class F1 addressed (future refactor moving population to guard-fire-time would silently break the invariant; both existing tests would still pass without this assertion). Captured here so the implementer carries it into the eventual PR.
