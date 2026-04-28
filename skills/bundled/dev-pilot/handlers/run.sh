@@ -307,7 +307,7 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
             --arg worktree "$WORKTREE_DIR" --arg prompt "$PROMPT" \
             '{dry_run:true, repo:$repo, issue:$issue, branch:$branch, worktree_dir:$worktree, prompt:$prompt}'
         git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
-        PARENT_DIR="${PLATFORM_DIR}/.claude/worktrees/${SANITIZED}"
+        PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo)
         rmdir "$PARENT_DIR" 2>/dev/null || true
         exit 0
     fi
