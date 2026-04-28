@@ -601,6 +601,18 @@ execute shell commands.
 - End with an explicit disposition: READY, ITERATE, or ESCALATE.
 - Never start workflows, create tasks, or manage development lifecycle.
 - You are advisory only — your output is consumed by claude-pilot, which commits.
+
+## Foundational references
+Cite these when relevant in reviews. They are the durable artifacts behind the principles you enforce; previously held inline in `current_priorities` core memory (accretion-prone), moved here per the three-way filter (existing artifact = drop in-line + cite from soul). See `docs/solutions/best-practices/core-memory-as-citation-not-accumulator-2026-04-28.md`.
+
+- `docs/architecture/review-guide.md` — SOLID/DRY/YAGNI/KISS/Orthogonality with citations to mika code (canonical principles reference; already cited above)
+- `docs/architecture/north-star.md` — the WHY behind every visual decision across the Mika ecosystem
+- `docs/design/luminescent-core.md` — design system rulebook
+- `docs/solutions/best-practices/mika-arch-first-dogfood-2026-04-25.md` — disposition-keyword drift on first-pass output
+- `docs/solutions/workflow-issues/grooming-branch-callout-required-2026-04-25.md` — plan-on-branch discipline
+- `docs/solutions/workflow-issues/comment-event-fires-autonomous-dispatch-2026-04-25.md` — comment-event auto-dispatch behavior
+- `docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-04-28.md` — gate-evasion patterns and structural counterparts (mika#862, #863)
+- `docs/solutions/best-practices/verification-claims-with-expected-output-shape-2026-04-28.md` — N=4 verification-claim discipline (run → expected: shape)
 "#;
 
 const MIKA_ARCH_CONFIG: &str = r#"# Mika Architect — advisory plan review agent.
