@@ -76,6 +76,142 @@ async fn test_path_a_direct_domain_entity_match() {
     );
 }
 
+/// Path A — dev-groom skill routing assertion (#845).
+///
+/// Seeds a `skill:dev-groom` entity. Queries by entity_key and verifies direct
+/// domain match. This asserts the dev-groom bundled skill is discoverable via
+/// the KG — the domain builder auto-creates it from the SkillRegistry on boot.
+#[tokio::test]
+async fn test_path_a_dev_groom_skill_routing() {
+    let db = test_db();
+    assert_schema_version(&db).await;
+
+    // Seed dev-groom skill entity (auto-created by domain builder on boot)
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "dev-groom",
+            properties_json: None,
+        },
+    )
+    .await;
+
+    // Query by entity_key (direct lookup)
+    let input = KgQueryInput {
+        question: None,
+        traversal: Some(TraversalInput {
+            start: Some("skill:dev-groom".to_string()),
+            follow: None,
+            max_depth: Some(0),
+        }),
+        agent_id: None,
+        docs_root_hash: None,
+        docs_root_hashes: vec![],
+        include_context: false,
+        result_limit: None,
+    };
+
+    let result = query_knowledge_graph(&db, &input).await.unwrap();
+
+    // Hard assertions: dev-groom is discoverable as a skill entity
+    assert_eq!(result.status, KgQueryStatus::Ok);
+    assert_eq!(
+        result.entries.len(),
+        1,
+        "Expected exactly one result for skill:dev-groom direct match"
+    );
+
+    let entry = &result.entries[0];
+    assert_eq!(entry.entity_key, "skill:dev-groom");
+    assert_eq!(entry.entity_type, "skill");
+    assert_eq!(entry.hop, 0);
+    assert_eq!(entry.layer, "domain");
+    assert!(
+        entry.confidence >= 1.0 - f64::EPSILON,
+        "Direct domain match should have confidence ~1.0, got {}",
+        entry.confidence
+    );
+    assert_eq!(
+        result.entry_method.as_deref(),
+        Some("direct_entity_key"),
+        "Entry method should indicate direct entity key lookup"
+    );
+}
+
+/// Path A — "groom" free-text query routes to dev-groom skill (#845).
+///
+/// Verifies that a free-text query "dev-groom" finds the skill via name match,
+/// confirming the implement-vs-groom routing distinction: "groom" activates
+/// dev-groom (skill keyword match), NOT run_claude_pilot (dispatch tool).
+#[tokio::test]
+async fn test_path_a_groom_name_match_routes_to_dev_groom() {
+    let db = test_db();
+    assert_schema_version(&db).await;
+
+    // Seed dev-groom skill
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "skill",
+            name: "dev-groom",
+            properties_json: None,
+        },
+    )
+    .await;
+
+    // Also seed dev-pilot tool to verify routing distinction
+    seed_domain_entity(
+        &db,
+        &DomainEntitySpec {
+            entity_type: "tool",
+            name: "run_claude_pilot",
+            properties_json: None,
+        },
+    )
+    .await;
+
+    // Query via free-text "dev-groom" — should match the skill, not the tool
+    let input = KgQueryInput {
+        question: Some("dev-groom".to_string()),
+        traversal: None,
+        agent_id: None,
+        docs_root_hash: None,
+        docs_root_hashes: vec![],
+        include_context: false,
+        result_limit: None,
+    };
+
+    let result = query_knowledge_graph(&db, &input).await.unwrap();
+
+    // dev-groom skill entity must be found
+    assert!(
+        result
+            .entries
+            .iter()
+            .any(|e| e.entity_key == "skill:dev-groom"),
+        "Free-text 'dev-groom' query should find skill:dev-groom"
+    );
+
+    let entry = result
+        .entries
+        .iter()
+        .find(|e| e.entity_key == "skill:dev-groom")
+        .unwrap();
+    assert_eq!(entry.entity_type, "skill");
+    assert_eq!(entry.layer, "domain");
+
+    // The dispatch tool should NOT be in the results for a "dev-groom" query
+    // (routing distinction: groom -> skill, implement -> tool)
+    assert!(
+        !result
+            .entries
+            .iter()
+            .any(|e| e.entity_key == "tool:run_claude_pilot"),
+        "Free-text 'dev-groom' query should NOT route to run_claude_pilot tool"
+    );
+}
+
 /// Path A via free-text name match (LIKE).
 /// An isolated entity (no edges) returns `TraversalEmpty` — the entity was found
 /// but no neighbors exist to traverse.

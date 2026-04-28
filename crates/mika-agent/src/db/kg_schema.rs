@@ -205,6 +205,7 @@ mod tests {
     #[test]
     fn format_entity_key_happy_path() {
         assert_eq!(format_entity_key("skill", "self-dev"), "skill:self-dev");
+        assert_eq!(format_entity_key("skill", "dev-groom"), "skill:dev-groom");
         assert_eq!(
             format_entity_key("tool", "run_claude_pilot"),
             "tool:run_claude_pilot"

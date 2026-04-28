@@ -145,6 +145,28 @@ pub struct GitHubRepository {
 
 // -- Event routing --
 
+/// Skills that MUST NOT be instantiated via webhook-driven event flows.
+///
+/// Defense-in-depth for operator-only skills (#845). Layer 1 (well_known_agents.rs
+/// disabled_skills) is the primary check; this gateway-side denylist catches future
+/// routing-path additions that might bypass Layer 1.
+///
+/// The guard checks whether the formatted event text contains skill trigger
+/// keywords that would activate a denylisted skill. If detected, the event
+/// is dropped with a warning — the skill never reaches the agent.
+const WEBHOOK_SKILL_DENYLIST: &[&str] = &["dev-groom"];
+
+/// Check if the formatted event text would trigger a denylisted skill.
+///
+/// Returns `true` if the text contains a denylisted skill name as a trigger,
+/// meaning the webhook event should be dropped.
+fn is_webhook_denylisted_skill(text: &str) -> bool {
+    let text_lower = text.to_lowercase();
+    WEBHOOK_SKILL_DENYLIST
+        .iter()
+        .any(|skill| text_lower.contains(skill))
+}
+
 /// Route a GitHub event to the target agent name based on event type and action.
 ///
 /// Returns `None` for unroutable events (silently dropped).
@@ -566,6 +588,21 @@ pub(crate) async fn handle_github_webhook(
         "GitHub webhook routing event to agent"
     );
 
+    // 9b. Webhook skill denylist guard (#845, Layer 3 defense-in-depth).
+    // Check the formatted event text for denylisted skill trigger keywords.
+    // Layer 1 (well_known_agents.rs disabled_skills) is the primary defense;
+    // this gateway-side guard catches routing-path additions that bypass Layer 1.
+    let preview_text = format_event_text(event_type, &event);
+    if is_webhook_denylisted_skill(&preview_text) {
+        warn!(
+            event_type,
+            delivery_id = %delivery_id,
+            target_agent,
+            "GitHub webhook dropped by skill denylist guard (operator-only skill trigger detected)"
+        );
+        return StatusCode::OK;
+    }
+
     // 10. Semaphore for backpressure
     let permit = match state.webhook_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -575,8 +612,8 @@ pub(crate) async fn handle_github_webhook(
         }
     };
 
-    // 11. Format message text
-    let text = format_event_text(event_type, &event);
+    // 11. Format message text (reuse preview from step 9b denylist guard)
+    let text = preview_text;
     let request_id = if delivery_id.is_empty() {
         uuid::Uuid::new_v4().to_string()
     } else {
@@ -2325,5 +2362,47 @@ mod tests {
         // A 0ms delay should pass through unchanged (jitter_range = 0).
         let d = Duration::from_millis(0);
         assert_eq!(apply_jitter(d), d);
+    }
+
+    // -- Webhook skill denylist guard tests (#845) --
+
+    #[test]
+    fn test_webhook_denylist_blocks_dev_groom() {
+        // Synthetic event text that mentions dev-groom must be blocked.
+        assert!(is_webhook_denylisted_skill(
+            "groom mika issue#845 via dev-groom"
+        ));
+        assert!(is_webhook_denylisted_skill(
+            "[GitHub] Issue labeled dev-groom on repo#1"
+        ));
+    }
+
+    #[test]
+    fn test_webhook_denylist_case_insensitive() {
+        assert!(is_webhook_denylisted_skill("Dev-Groom ticket reference"));
+        assert!(is_webhook_denylisted_skill("DEV-GROOM uppercase"));
+    }
+
+    #[test]
+    fn test_webhook_denylist_allows_normal_events() {
+        // Normal webhook events should pass through.
+        assert!(!is_webhook_denylisted_skill(
+            "[GitHub] Issue assigned on senara-solutions/mika#100"
+        ));
+        assert!(!is_webhook_denylisted_skill(
+            "[GitHub] PR opened: feat/add-health-endpoint"
+        ));
+        assert!(!is_webhook_denylisted_skill(
+            "[GitHub] Issue labeled ready on senara-solutions/mika#841"
+        ));
+    }
+
+    #[test]
+    fn test_webhook_denylist_contains_dev_groom() {
+        // Verify the denylist contains dev-groom
+        assert!(
+            WEBHOOK_SKILL_DENYLIST.contains(&"dev-groom"),
+            "WEBHOOK_SKILL_DENYLIST must contain dev-groom for operator-only enforcement"
+        );
     }
 }
