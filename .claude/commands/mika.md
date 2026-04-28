@@ -34,33 +34,34 @@ Before running the pipeline, set up an isolated worktree:
 1. **Parse branch:** Determine the branch name using this priority order (first match wins):
    a. **Explicit `branch:` prefix:** If `$ARGUMENTS` starts with `branch:<name>`, extract `<name>` and strip the prefix.
    b. **Issue body callout:** If an issue was fetched above, search the issue body for a line matching `> - **Branch:**` followed by a backtick-wrapped branch name (e.g., `` `feat/687/domain-graph-builder` ``). Extract that branch name. This is how pre-planned tickets communicate their branch — **always use it when present**.
-   c. **Derive from args (deterministic):** Only if (a) and (b) both miss, derive the branch name using this **exact bash recipe** — do not re-derive with the LLM or substitute your own kebab-casing, since redispatches must produce the same slug:
+   c. **Derive via canonical script:** Only if (a) and (b) both miss, invoke the canonical script `mika-platform/scripts/derive-branch-name`. The script enforces priority order (body callout → conventional-commit prefix → label override → default `feat`) and the canonical 40-char truncation. See senara-solutions/mika-platform#58 for context on the drift class this eliminates.
       ```bash
-      # Inputs: $ISSUE_NUMBER (optional, set when an issue was fetched), raw title/text
-      raw="${ISSUE_TITLE:-$ARGUMENTS}"
-      if printf '%s' "$raw" | grep -qE '^(feat|fix|chore|docs|eval|test|refactor|perf)(\([^)]+\))?: '; then
-        type=$(printf '%s' "$raw" | sed -nE 's/^([a-z]+)(\([^)]+\))?: .*$/\1/p')
-        body=$(printf '%s' "$raw" | sed -E 's/^[a-z]+(\([^)]+\))?: *//')
-      else
-        type=feat
-        body="$raw"
-      fi
-      slug=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]' \
-        | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
-        | cut -c1-45 | sed -E 's/-[^-]*$//; s/-+$//')
-      if [ -n "${ISSUE_NUMBER:-}" ]; then
-        BRANCH="${type}/${ISSUE_NUMBER}/${slug}"
-      else
-        BRANCH="${type}/${slug}"
-      fi
+      # Walk up from $PWD to locate mika-platform/scripts/ — works from
+      # both <meta>/mika/ (main checkout) and <meta>/.claude/worktrees/<slug>/mika/.
+      SCRIPTS_DIR=""
+      d="$(pwd)"
+      while [ "$d" != "/" ]; do
+        if [ -x "$d/scripts/derive-branch-name" ]; then SCRIPTS_DIR="$d/scripts"; break; fi
+        d=$(dirname "$d")
+      done
+      [ -z "$SCRIPTS_DIR" ] && { echo "Error: could not locate mika-platform scripts/" >&2; exit 1; }
+
+      BRANCH=$("$SCRIPTS_DIR/derive-branch-name" \
+        --title "${ISSUE_TITLE:-$ARGUMENTS}" \
+        --issue "${ISSUE_NUMBER:-}" \
+        --labels "${LABELS:-}" \
+        --body-callout "${ISSUE_BODY:-}")
       ```
 2. **Skip if no branch or no args:** If there are no arguments (backlog eval mode), skip worktree creation and run the pipeline in the current directory.
 3. **Detect existing worktree (MANDATORY):** Run `git rev-parse --git-dir` and `git rev-parse --git-common-dir`. If they differ, you are ALREADY inside a worktree. **STOP worktree setup immediately** — set `CREATED_WORKTREE=false`, run `command -v lefthook >/dev/null 2>&1 && lefthook install` (non-blocking — skip silently if lefthook is not installed), and proceed directly to the Pipeline section below. Do NOT attempt to create, remove, or modify any worktree. Do NOT clean up or recreate. Just use the current directory as-is.
 4. **Sync main:** Run `git fetch origin main:main` to fast-forward local `main` to match remote. This ensures the worktree branches from the latest code. If it fails (e.g., `main` is checked out with uncommitted changes), fall back to `git fetch origin` and use `origin/main` as the base ref in the next step.
-5. **Create worktree:** Set `WORKTREE=../.claude/worktrees/<sanitized-branch>/mika/` (sanitize branch name: replace `/` with `-`). Record `ORIGINAL_DIR=$(pwd)`.
-   - If the worktree path already exists, remove it first: `git worktree remove --force <WORKTREE>` (ignore errors).
-   - Try: `git worktree add -b <branch> <WORKTREE> main`
-   - If that fails (branch already exists): `git worktree add <WORKTREE> <branch>`
+5. **Create worktree:** Compute the worktree path via `derive-worktree-path` (enforces the invariant `slug == sanitize(branch_ref)`). Record `ORIGINAL_DIR=$(pwd)`.
+   ```bash
+   WORKTREE=$("$SCRIPTS_DIR/derive-worktree-path" --branch "$BRANCH" --repo mika)
+   ```
+   - If the worktree path already exists, remove it first: `git worktree remove --force "$WORKTREE"` (ignore errors).
+   - Try: `git worktree add -b "$BRANCH" "$WORKTREE" main`
+   - If that fails (branch already exists): `git worktree add "$WORKTREE" "$BRANCH"`
    - cd into the worktree. Set `CREATED_WORKTREE=true`.
 6. **Install lefthook hooks:** Run `command -v lefthook >/dev/null 2>&1 && lefthook install` to ensure pre-commit hooks (fmt, clippy, secrets scan) are active in the worktree. Non-blocking — skip silently if lefthook is not installed.
 
