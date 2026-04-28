@@ -1,6 +1,13 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+
+## [Unreleased]
+
+### Fixed
+
+- *(agent)* Callback turns now require both `update_task_status` AND `send_message` before EndTurn; missing terminal actions are rejected and re-prompted via the intent-precondition registry (#870)
+
 ## [v0.5.0](https://github.com/senara-solutions/mika/releases/tag/v0.5.0) — 2026-04-03
 
 ### Added

@@ -86,7 +86,15 @@ pub fn build_callback_trigger_context(
          that the result does not explicitly mention.\n\n\
          Follow the workflow defined by your active skills for this callback type. \
          If no skill-specific workflow applies, use send_message to notify the user \
-         with a clear, concise summary of the key findings and any recommended actions."
+         with a clear, concise summary of the key findings and any recommended actions.\n\n\
+         This turn MUST end with both of the following before EndTurn:\n\
+         1. update_task_status — mark the parent self_dev task terminal \
+         (failed/pending/completed) based on the callback result\n\
+         2. send_message — notify the operator of the result\n\n\
+         Optionally also call create_task to relaunch claude-pilot if the failure mode \
+         is retry-safe.\n\n\
+         EndTurn without both (1) and (2) will be rejected by the engine and you will \
+         be re-prompted."
     )
 }
 
@@ -1383,6 +1391,44 @@ async fn run_loop(
                 }
 
                 if !mode.follow_up_on_empty() {
+                    // #870 — Callback terminal action guard for empty-text exits.
+                    // The INTENT_GUARDS registry (evaluated above) only fires when
+                    // text is non-empty.  In Silent callback mode, the LLM may
+                    // return EndTurn with empty text after diagnostic tool calls —
+                    // exactly the bug scenario from #870.  This inline check mirrors
+                    // the INTENT_GUARDS entry for the empty-text path.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains("callback_terminal_action")
+                        && callback_trigger_active(&user_input_text)
+                        && !callback_terminal_action_satisfied(&all_tool_summaries)
+                    {
+                        intent_guard_retries.insert("callback_terminal_action");
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = "callback_terminal_action",
+                            "Intent-precondition guard fired on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                INTENT_GUARDS
+                                    .iter()
+                                    .find(|g| g.label == "callback_terminal_action")
+                                    .expect("callback_terminal_action guard must exist")
+                                    .correction_message
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
                     info!(step, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
                         text: None,
@@ -4038,6 +4084,26 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
              section in the self-dev skill prompt to find the parent task, locate the \
              next child, and resume execution.]",
     },
+    // #870 — callback turns must update parent task AND notify operator before
+    // EndTurn.  Without this guard, the callback session can run diagnostic
+    // tool calls and exit with zero assistant messages, leaving the operator
+    // blind to dev-run failures.  F1 callback-site audit confirmed only one
+    // callback flow exists today (long_running:run_claude_pilot via
+    // task_engine/dispatcher.rs).  AND-shape: BOTH update_task_status AND
+    // send_message required; create_task (relaunch) optional.
+    IntentPrecondition {
+        label: "callback_terminal_action",
+        trigger: callback_trigger_active,
+        satisfied: callback_terminal_action_satisfied,
+        correction_message: "[Your response was rejected because this callback turn ended \
+             without the required terminal actions. Callback turns MUST: \
+             (1) call `update_task_status` to mark the parent self_dev task terminal \
+             (`failed`/`pending`/`completed` based on the callback result), AND \
+             (2) call `send_message` to notify the operator of the result. \
+             Optionally call `create_task` to relaunch claude-pilot if the failure mode \
+             is retry-safe. EndTurn without (1) AND (2) will be rejected. \
+             Re-read the callback framing and produce both terminal actions before EndTurn.]",
+    },
 ];
 
 /// Marker prefix emitted by `mika_gateway::github::format_event_text` for
@@ -4124,6 +4190,23 @@ fn resume_reconcile_satisfied(summaries: &[ToolCallSummary]) -> bool {
     summaries
         .iter()
         .any(|s| s.success && RESUME_RECONCILE_TOOLS.contains(&s.name.as_str()))
+}
+
+/// #870 — Detects callback turns by matching the synthetic user message
+/// format emitted by `run_silent_agent` for `SilentTrigger::Callback`.
+/// The user message is `[callback: {label}]` (see agent.rs line ~2767).
+fn callback_trigger_active(msg: &str) -> bool {
+    msg.starts_with("[callback:")
+}
+
+/// #870 — Returns `true` when BOTH `update_task_status` AND `send_message`
+/// have been called (success or failure — attempts count).  The issue body's
+/// Expected Behavior prescribes AND-shape: update parent task AND notify
+/// operator.  `create_task` (relaunch) is optional.
+fn callback_terminal_action_satisfied(summaries: &[ToolCallSummary]) -> bool {
+    let has_update = summaries.iter().any(|s| s.name == "update_task_status");
+    let has_send = summaries.iter().any(|s| s.name == "send_message");
+    has_update && has_send
 }
 
 #[cfg(test)]
