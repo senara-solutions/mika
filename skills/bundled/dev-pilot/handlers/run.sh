@@ -205,30 +205,19 @@ if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
         exit 1
     fi
 
-    # Check issue body for a pre-committed branch callout (from planning sessions).
-    # Format: > - **Branch:** `feat/687/domain-graph-builder`
-    # This takes priority over title-derived branch names so claude-pilot lands
-    # on the branch where the plan file was committed.
+    # Branch-name derivation is centralized in mika-platform/scripts/derive-branch-name.
+    # The script enforces priority order (body callout > conventional-commit prefix in
+    # title > label override > default feat) and the canonical 40-char truncation.
+    # See senara-solutions/mika-platform#58 for context on the drift class this eliminates.
     ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // empty')
-    CALLOUT_BRANCH=$(printf '%s' "$ISSUE_BODY" | grep -oP '>\s*-?\s*\*\*Branch:\*\*\s*`\K[^`]+' | head -1)
+    ISSUE_TITLE=$(printf '%s' "$ISSUE_JSON" | jq -r '.title')
+    LABELS=$(printf '%s' "$ISSUE_JSON" | jq -r '[.labels[].name] | join(",")' 2>/dev/null)
 
-    if [ -n "$CALLOUT_BRANCH" ]; then
-        BRANCH="$CALLOUT_BRANCH"
-    else
-        # Derive branch type from labels
-        LABELS=$(printf '%s' "$ISSUE_JSON" | jq -r '.labels[].name' 2>/dev/null)
-        BRANCH_TYPE="feat"
-        if printf '%s' "$LABELS" | grep -qi '^bug$'; then
-            BRANCH_TYPE="fix"
-        elif printf '%s' "$LABELS" | grep -qi '^chore$'; then
-            BRANCH_TYPE="chore"
-        fi
-
-        # Derive branch name: type/number/kebab-title
-        ISSUE_TITLE=$(printf '%s' "$ISSUE_JSON" | jq -r '.title')
-        KEBAB_TITLE=$(printf '%s' "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | cut -c1-40)
-        BRANCH="${BRANCH_TYPE}/${ISSUE_NUM}/${KEBAB_TITLE}"
-    fi
+    BRANCH=$("$PLATFORM_DIR/scripts/derive-branch-name" \
+        --title "$ISSUE_TITLE" \
+        --issue "$ISSUE_NUM" \
+        --labels "$LABELS" \
+        --body-callout "$ISSUE_BODY")
 
     # Sync main before branching to avoid stale worktrees.
     # Use plain `fetch origin main` (not the `main:main` refspec form) because the
@@ -243,9 +232,9 @@ if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
     # `origin/main` below and get the latest merged tip.
     git -C "$SUB_REPO_DIR" fetch origin main 2>/dev/null || true
 
-    # Create worktree
-    SANITIZED=$(printf '%s' "$BRANCH" | tr '/' '-')
-    WORKTREE_DIR="${PLATFORM_DIR}/.claude/worktrees/${SANITIZED}/${REPO}"
+    # Worktree path is centralized in mika-platform/scripts/derive-worktree-path —
+    # enforces the invariant `worktree_path_slug == sanitize(branch_ref)` in one line.
+    WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO")
 
     # Reuse existing worktree if valid
     if [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
