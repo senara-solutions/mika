@@ -6123,6 +6123,7 @@ mod tests {
 
     // -- collect_required_tools pre-fetch augmentation tests (#863) --
 
+    /// Like `make_skill_entry_with_constraints` but also sets the pre-fetch opt-in flag.
     fn make_skill_entry_with_pre_fetch(
         name: &str,
         timeout: u64,
@@ -6130,53 +6131,13 @@ mod tests {
         required_tools: &[&str],
         pre_fetch: bool,
     ) -> SkillEntry {
-        use crate::skills::manifest::Constraints;
-        SkillEntry {
-            manifest: SkillManifest {
-                skill: SkillInfo {
-                    name: name.to_string(),
-                    description: format!("{name} skill"),
-                    version: "0.1.0".to_string(),
-                    always_on: false,
-                    timeout_secs: timeout,
-                    dependencies: vec![],
-                    max_prompt_size: None,
-                },
-                triggers: Triggers {
-                    keywords: vec![name.to_string()],
-                },
-                llm: Default::default(),
-                constraints: Constraints {
-                    required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
-                    required_fetches_for_quoted_resources: pre_fetch,
-                },
-                context: std::collections::HashMap::new(),
-                variants: Default::default(),
-            },
-            dir: PathBuf::from(format!("/skills/{name}")),
-            keywords_lower: vec![name.to_lowercase()],
-            prompt_snippet: String::new(),
-            skill_tools: tool_names
-                .iter()
-                .map(|tn| ResolvedSkillTool {
-                    definition: ToolDefinition {
-                        name: tn.to_string(),
-                        description: format!("{tn} tool"),
-                        input_schema: serde_json::json!({"type": "object"}),
-                    },
-                    handler: ToolHandler::Builtin {
-                        function: tn.to_string(),
-                    },
-                    skill_dir: PathBuf::from(format!("/skills/{name}")),
-                })
-                .collect(),
-            enabled: true,
-            has_override: false,
-            provider_overrides: std::collections::HashMap::new(),
-            model_prompts: std::collections::HashMap::new(),
-            model_overrides: std::collections::HashMap::new(),
-            generated_model_prompts: std::collections::HashMap::new(),
-        }
+        let mut entry =
+            make_skill_entry_with_constraints(name, timeout, tool_names, required_tools);
+        entry
+            .manifest
+            .constraints
+            .required_fetches_for_quoted_resources = pre_fetch;
+        entry
     }
 
     #[test]

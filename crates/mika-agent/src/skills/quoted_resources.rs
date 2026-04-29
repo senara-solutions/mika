@@ -73,7 +73,6 @@ pub fn detect_quoted_resources(message: &str) -> Vec<QuotedResource> {
             // Check the line preceding the fence (header line) and the first
             // few lines inside the fence for resource markers.
             let header_line = if i > 0 { lines[i - 1].trim() } else { "" };
-            let _fence_start = i;
 
             // Find the closing fence
             let fence_end = lines
@@ -145,7 +144,10 @@ fn detect_issue_block(header: &str, content: &[&str]) -> Option<QuotedResource> 
     // Check first few lines of fence content
     for line in content {
         if let Some(caps) = ISSUE_HEADER_RE.captures(line) {
-            let number: u32 = caps.get(1)?.as_str().parse().ok()?;
+            let Some(m) = caps.get(1) else { continue };
+            let Ok(number) = m.as_str().parse::<u32>() else {
+                continue;
+            };
             return Some(QuotedResource {
                 kind: ResourceKind::Issue { number },
                 repo: None,
@@ -171,7 +173,10 @@ fn detect_pr_block(header: &str, content: &[&str]) -> Option<QuotedResource> {
     // Check first few lines of fence content
     for line in content {
         if let Some(caps) = PR_HEADER_RE.captures(line) {
-            let number: u32 = caps.get(1)?.as_str().parse().ok()?;
+            let Some(m) = caps.get(1) else { continue };
+            let Ok(number) = m.as_str().parse::<u32>() else {
+                continue;
+            };
             return Some(QuotedResource {
                 kind: ResourceKind::PullRequest { number },
                 repo: None,
@@ -197,7 +202,10 @@ fn detect_gh_issue_view(header: &str, content: &[&str]) -> Option<QuotedResource
     // Check first few lines of fence content
     for line in content {
         if let Some(caps) = GH_ISSUE_VIEW_RE.captures(line) {
-            let number: u32 = caps.get(1)?.as_str().parse().ok()?;
+            let Some(m) = caps.get(1) else { continue };
+            let Ok(number) = m.as_str().parse::<u32>() else {
+                continue;
+            };
             return Some(QuotedResource {
                 kind: ResourceKind::Issue { number },
                 repo: None,
@@ -397,19 +405,38 @@ fn collect_required_tools() {
     }
 
     #[test]
-    fn test_no_detection_on_code_example() {
+    fn test_no_detection_on_code_example_without_resource_header() {
+        // A Rust code block containing `issue/{variable}` should NOT trigger
+        // detection because the variable interpolation doesn't match `issue/<digits>`.
         let msg = r#"Here is a code example:
 ```rust
 let issue_number = 42;
 println!("Processing issue/{issue_number}");
 ```
 "#;
-        // The `issue/{issue_number}` is inside a code block but without a
-        // preceding header line — should not detect.
-        let _resources = detect_quoted_resources(msg);
-        // This is a known edge case: the regex may match `issue/` patterns inside
-        // code fences. The detection is conservative but not perfect.
-        // For the primary use case (operator briefs), this is acceptable.
+        let resources = detect_quoted_resources(msg);
+        assert!(
+            resources.is_empty(),
+            "Code example with issue/{{variable}} should not trigger detection, got: {resources:?}"
+        );
+    }
+
+    #[test]
+    fn test_repo_issue_header_with_repo_prefix() {
+        // REPO_ISSUE_RE: `owner/repo issue/NNN` header preceding a fence
+        let msg = r#"Review this:
+senara-solutions/mika issue/788
+```
+The issue body about gate evasion.
+```
+"#;
+        let resources = detect_quoted_resources(msg);
+        assert_eq!(resources.len(), 1);
+        assert!(matches!(
+            &resources[0].kind,
+            ResourceKind::Issue { number: 788 }
+        ));
+        assert_eq!(resources[0].repo.as_deref(), Some("senara-solutions/mika"));
     }
 
     #[test]
