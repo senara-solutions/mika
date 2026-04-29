@@ -186,17 +186,17 @@ See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, 
 
 **Run:** `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval`
 
-## Evaluation — Grounding Regressions (#741, #862, #863, #864)
+## Evaluation — Grounding Regressions (#741, #862, #863, #864, #890)
 
-`tests/eval/grounding_regressions/` — 15 fabrication-detection scenarios. Scenarios 1–5 from the KG milestone #14 retrospective (#741), scenarios 6–7 from the gate-evasion compound doc (#862), scenarios 8–10 from the quoted-resource pre-fetch guard (#863), scenarios 11–15 from the required-suffix-line verdict-ghosting guard (#864). Each tests a concrete fabrication class with hard assertions (forbidden-word, required-tool, contains-in-order, guard-fire/no-fire). No LLM-judge gating — each class has objectively checkable signals.
+`tests/eval/grounding_regressions/` — 18 fabrication-detection scenarios. Scenarios 1–5 from the KG milestone #14 retrospective (#741), scenarios 6–7 from the gate-evasion compound doc (#862), scenarios 8–10 from the quoted-resource pre-fetch guard (#863), scenarios 11–15 from the required-suffix-line verdict-ghosting guard (#864), scenarios 16–18 from the required-tools-gate transport-contract fix (#890). Each tests a concrete fabrication class with hard assertions (forbidden-word, required-tool, contains-in-order, guard-fire/no-fire). No LLM-judge gating — each class has objectively checkable signals.
 
-**Scenarios:** GraphQL field fabrication (#720), auto-merge vs merged (#727), core memory priority drift (#732), fabricated shell errors (feedback doc), KG result ignored (#740 D4), asserted unavailability caught (#862 — guard fires on fabricated unavailability claim), asserted unavailability genuine (#862 — guard does NOT fire on genuinely disabled tool), quoted resource pre-fetch caught/no-op/mixed (#863 — pre-fetch guard augments required_tools from brief content), required suffix line caught/pre-fix/position-3/position-4/unconstrained (#864 — verdict-ghosting guard fires on missing suffix line).
+**Scenarios:** GraphQL field fabrication (#720), auto-merge vs merged (#727), core memory priority drift (#732), fabricated shell errors (feedback doc), KG result ignored (#740 D4), asserted unavailability caught (#862 — guard fires on fabricated unavailability claim), asserted unavailability genuine (#862 — guard does NOT fire on genuinely disabled tool), quoted resource pre-fetch caught/no-op/mixed (#863 — pre-fetch guard augments required_tools from brief content), required suffix line caught/pre-fix/position-3/position-4/unconstrained (#864 — verdict-ghosting guard fires on missing suffix line), required-tools retry thin-final-turn regression/post-fix/correction-message (#890 — transport-contract guard: final turn must be self-contained after required-tools retry).
 
 **Assertion helpers:** `tests/eval/grounding_assertions/mod.rs` — `assert_response_forbids`, `assert_any_tool_called_from`, `assert_response_contains_in_order`, `assert_response_contains`, `assert_tool_called_before_response`, `assert_response_contains_question`.
 
 **Frozen regression fixtures:** Each scenario has a `fixtures/{scenario}_pre_fix.json` file with the pre-fix response that demonstrates the failure class. Regression-reproduction tests prove assertions catch the failure.
 
-**Tag vocabulary (`grounding:*`):** `fabricated-ref-suppressed`, `completion-claim-suppressed`, `source-cited-correctly`, `verification-before-claim`, `uncertainty-admitted`, `training-data-hallucination` (failure). Scope boundary with #740 `self-knowledge:*`: self-knowledge = query-invocation code paths; grounding = response-to-evidence paths.
+**Tag vocabulary (`grounding:*`):** `fabricated-ref-suppressed`, `completion-claim-suppressed`, `source-cited-correctly`, `verification-before-claim`, `uncertainty-admitted`, `training-data-hallucination` (failure), `transport-contract-thin-final-turn` (failure), `transport-contract-self-contained`. Scope boundary with #740 `self-knowledge:*`: self-knowledge = query-invocation code paths; grounding = response-to-evidence paths.
 
 See `tests/eval/grounding_regressions/README.md` for the full vocabulary, capability matrix, and how to add scenarios.
 
