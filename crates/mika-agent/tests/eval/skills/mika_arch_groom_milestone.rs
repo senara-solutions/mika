@@ -73,11 +73,15 @@ fn make_milestone_skill() -> SkillEntry {
             variants: Default::default(),
         },
         dir: PathBuf::from("/skills/mika-arch-groom-milestone"),
-        keywords_lower: vec![
-            "groom-milestone".to_string(),
-            "milestone-review".to_string(),
-            "milestone-groom".to_string(),
-        ],
+        // Derive `keywords_lower` from `triggers.keywords` rather than
+        // re-listing the strings — guards against future copy-trap where a
+        // mixed-case keyword would silently end up in `keywords_lower` without
+        // normalization. Mirrors the canonical pattern in
+        // `tests/eval/grounding_regressions/required_suffix_line_caught.rs`.
+        keywords_lower: ["groom-milestone", "milestone-review", "milestone-groom"]
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect(),
         prompt_snippet: String::new(),
         skill_tools: vec![],
         enabled: true,
@@ -89,10 +93,17 @@ fn make_milestone_skill() -> SkillEntry {
     }
 }
 
-/// Returns the last non-empty line of `text` after trimming. Mirrors the
-/// engine's required-suffix-line guard logic (`crates/mika-agent/CLAUDE.md`
-/// § Post-Conditions guard #8) so the test asserts on the exact line the
-/// guard would inspect.
+/// Returns the last non-empty line of `text` after trimming.
+///
+/// This is the **strictest subset** of the engine's required-suffix-line guard
+/// (`crates/mika-agent/CLAUDE.md` § Post-Conditions guard #8): the guard accepts
+/// a match in any of the last 3 non-empty lines, while this helper only inspects
+/// the literal final line. The narrower check enforces the *literal final-line
+/// discipline* the parent plan inherits from
+/// `docs/solutions/best-practices/mika-arch-first-dogfood-2026-04-25.md` —
+/// `Disposition: <KEYWORD>` MUST be the literal final line, not merely within
+/// the guard's window. Do not use this helper as a stand-in for the guard's
+/// scan logic; it is a stricter contract intentionally.
 fn last_nonempty_line(text: &str) -> &str {
     text.lines()
         .map(|l| l.trim())
@@ -206,7 +217,23 @@ Disposition: READY";
         output
     );
 
-    // R2.2: per-sub-issue summary section present (the n=1 entry).
+    // R2.2: structural milestone-shape distinguishers — these section headers
+    // appear in milestone-shaped output but not in per-ticket-shaped output.
+    // Without this assertion, scenario 2 only checks tokens (`Scope: milestone`,
+    // `#900`) that any shaped response could include verbatim. The section
+    // headers are the load-bearing structural distinguisher.
+    assert!(
+        output.contains("Per-sub-issue disposition summary:"),
+        "Expected milestone-shape header `Per-sub-issue disposition summary:` for n=1 case, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("Sequencing:"),
+        "Expected milestone-shape header `Sequencing:` for n=1 case, got:\n{}",
+        output
+    );
+
+    // R2.2: per-sub-issue summary section references the n=1 entry.
     assert!(
         output.contains("#900"),
         "Expected per-sub-issue line referencing #900 in summary, got:\n{}",
@@ -218,6 +245,15 @@ Disposition: READY";
         last_nonempty_line(output),
         "Disposition: READY",
         "Expected `Disposition: READY` as literal final line for single-sub-issue READY case"
+    );
+
+    // No guard re-prompt — a regression where the suffix-line guard incorrectly
+    // fires on a valid `Disposition: READY` final line for the n=1 case would
+    // otherwise pass silently because the text assertions match the canned mock.
+    assert_eq!(
+        trace.llm_call_count, 1,
+        "Expected single LLM call (no guard re-prompt) for n=1 READY case, got {}",
+        trace.llm_call_count
     );
 
     Ok(())
@@ -276,6 +312,15 @@ Disposition: ITERATE";
         output
     );
 
+    // No guard re-prompt — `Disposition: ITERATE` is in the suffix-line accept
+    // set; a regression where the guard incorrectly rejects ITERATE would
+    // silently pass the text assertions otherwise.
+    assert_eq!(
+        trace.llm_call_count, 1,
+        "Expected single LLM call (no guard re-prompt) for ITERATE case, got {}",
+        trace.llm_call_count
+    );
+
     Ok(())
 }
 
@@ -332,6 +377,15 @@ Disposition: ESCALATE";
         lower.contains("missing") || lower.contains("plan path") || lower.contains("sub-issues"),
         "Expected missing-section language referencing schema gap, got:\n{}",
         output
+    );
+
+    // No guard re-prompt — `Disposition: ESCALATE` is in the suffix-line accept
+    // set; a regression where the guard incorrectly rejects ESCALATE would
+    // silently pass the text assertions otherwise.
+    assert_eq!(
+        trace.llm_call_count, 1,
+        "Expected single LLM call (no guard re-prompt) for ESCALATE case, got {}",
+        trace.llm_call_count
     );
 
     Ok(())
