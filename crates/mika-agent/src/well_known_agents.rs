@@ -175,9 +175,10 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
 /// mika-arch agent specification.
 ///
 /// Read-only architect agent for plan-stage review. Uses identity-driven
-/// skill allowlist (only `mika-arch-groom-ticket` and `mika-arch-second-review`
-/// are enabled). Base model is Kimi; per-skill LLM overrides route to
-/// Opus 4.7 (groom-ticket) and Sonnet 4.6 (second-review).
+/// skill allowlist (`mika-arch-groom-ticket`, `mika-arch-groom-milestone`,
+/// and `mika-arch-second-review` are enabled). Base model is Kimi; per-skill
+/// LLM overrides route to Opus 4.7 (groom-ticket, groom-milestone) and
+/// Sonnet 4.6 (second-review).
 ///
 /// Identity is computed at provision time from `Settings.kg_docs_roots` so
 /// `[kg].docs_roots` contains absolute paths. Without `MIKA_KG_DOCS_ROOTS`
