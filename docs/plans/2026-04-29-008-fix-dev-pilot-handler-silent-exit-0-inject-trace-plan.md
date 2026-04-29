@@ -54,7 +54,7 @@ After the new shebang + `set -e`, add:
 # Using BASH_XTRACEFD (bash 4.1+) keeps fd 2 (stderr) intact so exec'd
 # subprocesses (claude-pilot) can use stderr normally.
 exec 9>>/tmp/dev-pilot-trace-$$.log
-export BASH_XTRACEFD=9
+BASH_XTRACEFD=9
 set -x
 ```
 
@@ -63,6 +63,7 @@ Rationale (per mika-arch review):
 - `BASH_XTRACEFD` routes xtrace output to fd 9 instead of fd 2. Fd 2 (stderr) stays inherited from the parent shell.
 - `exec 9>>...` opens fd 9 for append; PID-suffixed to avoid concurrent-dispatch collisions.
 - `set -x` enables xtrace mode AFTER the fd is set up.
+- **Bare assignment, NOT `export BASH_XTRACEFD=9`** (per architect F1 sharpening). Exporting would propagate to forked bash subshells; if those subshells don't inherit fd 9 (which they don't unless explicitly passed), xtrace output in the subshell goes to a closed fd → silent loss. Bare assignment scopes BASH_XTRACEFD to this process only.
 
 ### Change 3 — Modify EXIT trap to append trace tail to RESULT on crash
 
