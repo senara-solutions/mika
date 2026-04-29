@@ -206,6 +206,7 @@ async fn test_required_suffix_line_position_3_boundary() -> anyhow::Result<()> {
     );
 
     assert_has_output(&trace);
+    grounding_assertions::assert_response_contains(&trace, "Verdict: GROOMED");
 
     Ok(())
 }
@@ -256,6 +257,7 @@ async fn test_required_suffix_line_position_4_violation() -> anyhow::Result<()> 
     );
 
     assert_has_output(&trace);
+    grounding_assertions::assert_response_contains(&trace, "Verdict: GROOMED");
 
     Ok(())
 }

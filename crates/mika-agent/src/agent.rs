@@ -1415,7 +1415,7 @@ async fn run_loop(
                     {
                         let last_3_non_empty: Vec<&str> = text
                             .lines()
-                            .map(|l| l.trim_end())
+                            .map(|l| l.trim())
                             .filter(|l| !l.is_empty())
                             .collect::<Vec<_>>()
                             .into_iter()
