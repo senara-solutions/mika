@@ -17,3 +17,6 @@ keywords = [
 [constraints]
 required_tools = ["gh_read"]
 required_fetches_for_quoted_resources = true
+
+[output]
+required_suffix_lines = ["Verdict: GROOMED", "Verdict: ESCALATE"]

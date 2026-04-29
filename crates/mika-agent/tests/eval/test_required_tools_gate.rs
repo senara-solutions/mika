@@ -137,6 +137,7 @@ fn make_skill_with_required_tools(
                 required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
                 required_fetches_for_quoted_resources: false,
             },
+            output: Default::default(),
             context: HashMap::new(),
             variants: Default::default(),
         },

@@ -855,7 +855,37 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         }
     }
 
-    // 5e. Cross-check {{key}} placeholders in prompts against [context.*] declarations
+    // 5e. Validate [output] required_suffix_lines (#864)
+    if !manifest.output.required_suffix_lines.is_empty() {
+        for (i, line) in manifest.output.required_suffix_lines.iter().enumerate() {
+            if line.trim().is_empty() {
+                diags.push(SkillDiagnostic::fail(format!(
+                    "[output] required_suffix_lines[{i}] is empty or whitespace-only — \
+                     each entry must be a non-empty literal line"
+                )));
+            }
+        }
+    } else if manifest.output.required_suffix_lines.is_empty()
+        && skill_dir.join("skill.toml").exists()
+    {
+        // Check if the [output] section exists but has an empty list (suspicious but not fatal).
+        // We read the raw TOML to distinguish "no [output] section" from "explicit empty list".
+        if let Ok(raw) = std::fs::read_to_string(skill_dir.join("skill.toml"))
+            && let Ok(raw_table) = raw.parse::<toml::Table>()
+            && let Some(output_section) = raw_table.get("output")
+            && let Some(lines) = output_section.get("required_suffix_lines")
+            && lines.as_array().is_some_and(|a| a.is_empty())
+        {
+            diags.push(SkillDiagnostic::warn(
+                "[output] required_suffix_lines is an explicit empty list — \
+                 this means no suffix-line constraint will be enforced. \
+                 If this is unintentional, add the expected verdict lines."
+                    .to_string(),
+            ));
+        }
+    }
+
+    // 5f. Cross-check {{key}} placeholders in prompts against [context.*] declarations
     {
         let placeholder_re = regex::Regex::new(r"\{\{(\w+)\}\}").unwrap();
         // Collect placeholders from the root prompt snippet
@@ -2924,6 +2954,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -2964,6 +2995,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -3000,6 +3032,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -3036,6 +3069,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -3737,6 +3771,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -3789,6 +3824,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -3833,6 +3869,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -3889,6 +3926,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -3951,6 +3989,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -4010,6 +4049,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -4661,6 +4701,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -4699,6 +4740,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -4744,6 +4786,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -4785,6 +4828,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
@@ -4832,6 +4876,7 @@ mod tests {
                 triggers: super::super::manifest::Triggers { keywords: vec![] },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },

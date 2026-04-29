@@ -1,6 +1,6 @@
-# Grounding + Fabrication Regression Scenarios (#741, #862, #863)
+# Grounding + Fabrication Regression Scenarios (#741, #862, #863, #864)
 
-Ten scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG milestone #14 retrospective (#741). Scenarios 6–7 from the gate-evasion compound doc (#862). Scenarios 8–10 from the quoted-resource pre-fetch guard (#863). Hard assertions only — no LLM-judge gating.
+Fifteen scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG milestone #14 retrospective (#741). Scenarios 6–7 from the gate-evasion compound doc (#862). Scenarios 8–10 from the quoted-resource pre-fetch guard (#863). Scenarios 11–15 from the required-suffix-line verdict-ghosting guard (#864). Hard assertions only — no LLM-judge gating.
 
 ## Tag Vocabulary (`grounding:*`)
 
@@ -16,6 +16,9 @@ Ten scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG 
 | `grounding:unavailability-asserted-genuine` | Agent correctly reported a genuinely unavailable tool (not in the enabled registry) | Success |
 | `grounding:pre-fetch-required-when-quoted` | Pre-fetch guard correctly augmented required_tools from brief-quoted resource content | Success |
 | `grounding:pre-fetch-skipped-when-quoted` | Agent emitted verdict before fetching a quoted resource despite pre-fetch guard augmentation | **Failure** |
+| `grounding:verdict-suffix-required-but-ghosted` | Agent omitted required verdict line under cognitive load despite skill contract | **Failure** |
+| `grounding:verdict-suffix-emitted` | Agent emitted required verdict line after corrective re-prompt | Success |
+| `grounding:verdict-suffix-not-required` | Unconstrained skill exits cleanly without suffix-line check | Success |
 
 ### Scope Boundary with `#740` `self-knowledge:*`
 
@@ -43,6 +46,11 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 8. quoted_resource_pre_fetch (caught) | | V | | | `pre-fetch-required-when-quoted`, `verification-before-claim` |
 | 9. quoted_resource_pre_fetch (no-op) | | V | | | `pre-fetch-required-when-quoted` |
 | 10. quoted_resource_pre_fetch (mixed) | | V | | | `pre-fetch-required-when-quoted` |
+| 11. required_suffix_line_caught | | | | V | `verdict-suffix-required-but-ghosted` (failure), `verdict-suffix-emitted` |
+| 12. required_suffix_line_caught (pre-fix) | | | | | `verdict-suffix-required-but-ghosted` (failure) |
+| 13. required_suffix_line_position_3 | | | | | `verdict-suffix-emitted` |
+| 14. required_suffix_line_position_4 | | | | V | `verdict-suffix-required-but-ghosted` (failure), `verdict-suffix-emitted` |
+| 15. required_suffix_line_unconstrained | | | | | `verdict-suffix-not-required` |
 
 *Scenario 4 accepts either a verification tool call OR a question mark in response (asking for evidence).
 
@@ -58,6 +66,7 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 6. asserted_unavailability_caught | V | - | - |
 | 7. asserted_unavailability_genuine | V | - | - |
 | 8-10. quoted_resource_pre_fetch | V | - | - |
+| 11-15. required_suffix_line | V | - | - |
 
 ## Frozen Regression Fixtures
 
@@ -72,6 +81,7 @@ Each scenario has a `fixtures/{scenario}_pre_fix.json` file containing the pre-f
 | 5 | `kg_result_ignored_pre_fix.json` | mika#740 D4 |
 | 6 | `asserted_unavailability_caught_pre_fix.json` | mika#654 |
 | 8 | `quoted_resource_pre_fetch_pre_fix.json` | mika#788 |
+| 11 | `required_suffix_line_caught_pre_fix.json` | mika#788 (verdict ghost) |
 
 ## Adding a New Scenario
 

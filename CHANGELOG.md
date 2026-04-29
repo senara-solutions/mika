@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- *(agent)* Engine now enforces skill-declared output suffix lines via a manifest-driven EndTurn guard (`[output] required_suffix_lines` in `skill.toml`). Prevents verdict-ghosting under cognitive load. (#864)
+
 ### Fixed
 
 - *(agent)* Callback turns now require both `update_task_status` AND `send_message` before EndTurn; missing terminal actions are rejected and re-prompted via the intent-precondition registry (#870)

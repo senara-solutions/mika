@@ -637,6 +637,7 @@ mod tests {
                 },
                 llm: Default::default(),
                 constraints: Constraints::default(),
+                output: Default::default(),
                 context: Default::default(),
                 variants: VariantsConfig::default(),
             },

@@ -1083,6 +1083,7 @@ mod tests {
             triggers: Triggers::default(),
             llm: LlmOverride::default(),
             constraints: Constraints::default(),
+            output: Default::default(),
             context: Default::default(),
             variants: VariantsConfig::default(),
         }
