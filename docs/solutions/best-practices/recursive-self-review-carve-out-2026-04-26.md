@@ -75,17 +75,21 @@ The distinction held: mika-arch reviews implementation-of-tools-she-uses but ext
 
 ## When to revisit this carve-out
 
-If two conditions become true:
+**Historical context** — the two conditions below were the original triggers for revisiting. Condition 2 is now satisfied; condition 1 remains precautionary.
 
-1. **mika-arch's vested-interest reasoning becomes empirically demonstrable.** If a future review of her own surface produces reasoning that an external reviewer flags as biased (rationalized toward yes when no was warranted), the carve-out has empirical justification beyond optics. Until that happens, the carve-out is precautionary, not corrective.
-2. **A formal review-guide section codifies the carve-out.** If we want this discipline to outlast the current operator/architect arrangement, it should live in `review-guide.md` as a structural rule, not just here. Consider adding a "self-review boundary" subsection if the carve-out gets exercised more than 3 times.
+1. **mika-arch's vested-interest reasoning becomes empirically demonstrable.** If a future review of her own surface produces reasoning that an external reviewer flags as biased (rationalized toward yes when no was warranted), the carve-out has empirical justification beyond optics. Until that happens, the carve-out is precautionary, not corrective. *(Status: not yet observed.)*
+2. **~~A formal review-guide section codifies the carve-out.~~** *(Satisfied 2026-04-29.)* The rule is now codified in `docs/architecture/review-guide.md` § 7 "Self-review boundary". Three instances formed the evidence base: mika#788 (first instance), mika#872 (second instance — promotion protocol prompts), mika#879 (third instance — milestone grooming; triggered the 3-instance codification threshold). The review-guide section is now the authoritative reference; this compound doc remains as origin context and the detailed rationale record.
 
-Until then: this compound is the durable record. Future operators reading "why didn't we send #818 through mika-arch" find this doc.
+This compound doc is the origin record. The review-guide section (§ 7) is the authoritative rule for reviewers. Future operators reading "why didn't we send #818 through mika-arch" find this doc for the full reasoning; reviewers enforcing the rule cite § 7.
 
 ## Related
 
 - senara-solutions/mika#818 — first instance exercising the carve-out (drop memory-write tools from `MIKA_ARCH_DISABLED_TOOLS`).
+- senara-solutions/mika#788 — first instance of mika-arch bundled skill surface change triggering external review.
+- senara-solutions/mika#872 — second instance (promotion protocol prompts and reflection spec).
+- senara-solutions/mika#879 — third instance (milestone grooming); triggered the 3-instance codification threshold.
 - senara-solutions/mika#817 — counter-example where the carve-out doesn't apply (gh_read.file_view extension; mika-arch reviews implementation, not her own config).
+- `mika/docs/architecture/review-guide.md` § 7 Self-review boundary — the codified rule (added 2026-04-29).
 - `mika/docs/architecture/review-guide.md` § 5 Orthogonality — the agent self-state vs platform side-effects distinction (commit `2bba6223`) that mika#818 cites and that the carve-out's reasoning rests on.
 - `mika-platform/.claude/commands/mika-groom-ticket.md` — the standard grooming workflow this carve-out diverges from.
 - `mika/docs/solutions/best-practices/mika-arch-first-dogfood-2026-04-25.md` — broader context on the architect's operational discipline; the operator-proxy memory-seeding pattern (added 2026-04-26) is a parallel scaffolding pattern for related gaps.

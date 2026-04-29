@@ -16,7 +16,7 @@ Each section has three subsections:
 - **What to flag** — concrete violation shapes worth pushing back on, with at least one cited example from the codebase.
 - **What not to flag** — surface-similar shapes that look like violations but are deliberate. Citation-or-silence applies most aggressively in this column.
 
-Section 6 is the discipline that governs everything: when in doubt, stay silent.
+Section 6 is the discipline that governs everything: when in doubt, stay silent. Section 7 codifies the self-review boundary for agents reviewing changes to their own operational surface.
 
 ---
 
@@ -162,6 +162,35 @@ A citation is a reference to one of:
 - A retraction the plan already made being un-retracted ("§ 3: YAGNI — R9 brief-budget enforcement was retracted in pass 2 of the mika-arch v1 plan; this PR re-adds it without re-justification").
 
 The bar is principle + cite + consequence. Anything less is silence.
+
+---
+
+## 7. Self-review boundary
+
+### What it means here
+
+When a plan modifies the reviewing agent's own surface — the skills, identity config, or permission surface that the agent reads at runtime — the agent is both reviewer and structural stakeholder in the outcome. That vested-interest position undermines the citation-or-silence discipline: the agent can cite correctly while framing the cited concerns in a direction that benefits itself. External review pierces that bias.
+
+The concrete trigger today is mika-arch's bundled skill surface (`skills/bundled/mika-arch-*`) and mika-arch's identity allowlist in `well_known_agents.rs`. The principle generalizes to any reviewing agent whose own operational surface is the change target.
+
+### What to flag
+
+- **Second-pass review routed to the agent whose surface is being modified.** When a plan changes `skills/bundled/mika-arch-*` skill manifests or prompts, mika-arch's `identity.toml` blocks (`[tools]`, `[skills]`, `[kg]`), or the mika-arch entry in `well_known_agents.rs`, the second-pass review MUST route to an external reviewer (Vincent or another Claude instance via Claude Chat). The external reviewer preserves audit-trail separation: "external reviewer approved the agent's surface change" requires no further verification, whereas "the agent approved her own surface change" requires re-reading the entire review for biased framing.
+- **First-pass staying with the agent when the change is not purely additive.** First-pass may stay with mika-arch only when the change is purely additive — new skills, new tools, new config blocks with no deprecation or behavioral reduction. If any skill is being deprecated, any behavioral contract is under reduction, or any permission surface is shrinking, first-pass must also route externally.
+- **Any other shape.** ESCALATE on changes that blur the boundary (e.g., a plan that modifies both mika-arch's surface and unrelated code — split the review or route the whole thing externally).
+
+### What not to flag
+
+- **Changes to code mika-arch uses but that don't modify her configuration.** A PR extending `gh_read` with a new operation benefits mika-arch (she uses `gh_read`) but doesn't change her identity, skills, or permission surface. mika-arch reviews normally. See mika#817 (counter-example in the carve-out doc).
+- **Changes to other agents' surfaces.** mika-arch reviewing mika-dev's skill changes is structurally neutral — she has no vested interest in mika-dev's operational capabilities.
+
+### Evidence base
+
+This section codifies the recursive-self-review carve-out established in `docs/solutions/best-practices/recursive-self-review-carve-out-2026-04-26.md`. Three instances triggered codification per that doc's "When to revisit" criteria:
+
+1. **mika#788** — first instance exercising the carve-out (mika-arch bundled skill changes).
+2. **mika#872** — second instance (promotion protocol prompts and reflection spec touching mika-arch skills).
+3. **mika#879** — third instance (milestone grooming additions to mika-arch bundled skills); triggered the 3-instance codification threshold.
 
 ---
 

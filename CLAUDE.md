@@ -241,6 +241,7 @@ skills/bundled/
 ├── agents-teams/          # Agent/team management
 ├── skill-review/          # Skill review handler
 ├── mika-arch-groom-ticket/  # First-pass plan review (Opus 4.7) — produces READY/ITERATE/ESCALATE
+├── mika-arch-groom-milestone/ # Milestone-level plan review (Opus 4.7) — per-sub-issue + sequencing + cross-cutting
 └── mika-arch-second-review/ # Second-pass plan review (Sonnet 4.6) — produces GROOMED/ESCALATE
 ```
 
