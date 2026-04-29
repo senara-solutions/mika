@@ -224,12 +224,13 @@ Skills are bundled and discovered at build time via `crates/mika-agent/build.rs`
 
 ```
 skills/bundled/
+├── _shared/               # Shared dispatch library (dispatch-lib.sh) — NOT a skill, excluded from build-time discovery
 ├── self-dev/              # Main self-development orchestration (per-issue + milestone + project workflows)
 ├── self-dev-iterate/      # PR iteration handler for self-dev
 ├── self-dev-webhook-qa/   # QA webhook handler for self-dev
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
-├── dev-pilot/             # Claude Code integration (worktree setup, rebase-or-abort guard, claude-pilot dispatch)
-├── dev-groom/              # Operator-triggered two-pass grooming flow
+├── dev-pilot/             # Claude Code implementation dispatch (thin wrapper → _shared/dispatch-lib.sh, entry: /mika)
+├── dev-groom/             # Operator-triggered grooming dispatch (thin wrapper → _shared/dispatch-lib.sh, entry: /mika-groom-ticket)
 ├── qa-review/             # PR review skill
 ├── qa-review-build-callback/ # Build callback handler for QA review
 ├── permission-policy/     # Permission handler for claude-pilot sessions
@@ -251,7 +252,7 @@ The `build.rs` walks `skills/bundled/` and generates `BUNDLED_SKILL_MANIFESTS` c
 - Skill name and manifest (from `skill.toml`)
 - System prompt content (from `system_prompt.md`)
 
-Skills are loaded at runtime from this generated constant — no filesystem access required.
+Skills are loaded at runtime from this generated constant — no filesystem access required. Directories starting with `.` (dotfiles) or `_` (convention-reserved for shared support libraries like `_shared/`) are excluded from discovery. The `_shared/` directory contains `dispatch-lib.sh` — shared plumbing for claude-pilot dispatch skills (dev-pilot, dev-groom).
 
 ### Adding a New Bundled Skill
 
