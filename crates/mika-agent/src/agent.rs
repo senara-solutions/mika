@@ -1122,7 +1122,11 @@ async fn run_loop(
                                         "[Your response was rejected because you did not call the \
                                          required tool(s): {}. You MUST call these tools with real \
                                          data before producing your response. Do not fabricate or \
-                                         assume results — call the tools now.]",
+                                         assume results — call the tools now. When you produce \
+                                         your corrected response, restate the full content — do \
+                                         not reference your prior turn. Only the final response \
+                                         is persisted to the conversation log; prior turns exist \
+                                         only in the in-memory loop context.]",
                                         missing_names.join(", ")
                                     )),
                                 });

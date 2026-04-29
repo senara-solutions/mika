@@ -95,3 +95,7 @@ The required-tools-gate fires *after* the verdict is shaped (current chain: text
 - `mika/docs/solutions/best-practices/mika-arch-first-dogfood-2026-04-25.md` — prior architect-discipline doc covering disposition-keyword paraphrasing; same agent, different failure surface.
 - `crates/mika-agent/src/agent/` — required-tools-gate implementation in the EndTurn post-condition chain.
 - `mika-platform` memory: `feedback_prompt_enforcement_fragile.md` — the underlying meta-rule this doc is a specific instance of.
+
+## Adjacent: Transport-Contract Failure (mika#890)
+
+This doc tracks *evasion* — the gate didn't fire because the LLM rationalized around its trigger. An adjacent but distinct failure family is *transport-contract* — the gate fired correctly, but the post-correction turn was a thin pointer-summary instead of a self-contained response. Only the final `EndTurn` is persisted to `messages`; the substantive content from mid-loop `ToolUse` turns is lost. See mika#890 and its plan at `docs/plans/2026-04-29-006-fix-required-tools-gate-retry-self-contained-plan.md` for the fix (engine correction message + skill-prompt reinforcement). The two families share a guard (required-tools gate) but differ in failure mode: evasion = gate doesn't fire; transport-contract = gate fires but persisted output is incomplete.

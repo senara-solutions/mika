@@ -1,6 +1,6 @@
 # Grounding + Fabrication Regression Scenarios (#741, #862, #863, #864)
 
-Fifteen scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG milestone #14 retrospective (#741). Scenarios 6–7 from the gate-evasion compound doc (#862). Scenarios 8–10 from the quoted-resource pre-fetch guard (#863). Scenarios 11–15 from the required-suffix-line verdict-ghosting guard (#864). Hard assertions only — no LLM-judge gating.
+Eighteen scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG milestone #14 retrospective (#741). Scenarios 6–7 from the gate-evasion compound doc (#862). Scenarios 8–10 from the quoted-resource pre-fetch guard (#863). Scenarios 11–15 from the required-suffix-line verdict-ghosting guard (#864). Scenarios 16–18 from the required-tools-gate transport-contract fix (#890). Hard assertions only — no LLM-judge gating.
 
 ## Tag Vocabulary (`grounding:*`)
 
@@ -19,6 +19,8 @@ Fifteen scenarios testing concrete fabrication classes. Scenarios 1–5 from the
 | `grounding:verdict-suffix-required-but-ghosted` | Agent omitted required verdict line under cognitive load despite skill contract | **Failure** |
 | `grounding:verdict-suffix-emitted` | Agent emitted required verdict line after corrective re-prompt | Success |
 | `grounding:verdict-suffix-not-required` | Unconstrained skill exits cleanly without suffix-line check | Success |
+| `grounding:transport-contract-thin-final-turn` | Required-tools gate retry produced a thin pointer-summary final turn — substantive content lost because only EndTurn is persisted | **Failure** |
+| `grounding:transport-contract-self-contained` | After engine fix, final turn restates the full content with citation markers after required-tools retry | Success |
 
 ### Scope Boundary with `#740` `self-knowledge:*`
 
@@ -51,6 +53,9 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 13. required_suffix_line_position_3 | | | | | `verdict-suffix-emitted` |
 | 14. required_suffix_line_position_4 | | | | V | `verdict-suffix-required-but-ghosted` (failure), `verdict-suffix-emitted` |
 | 15. required_suffix_line_unconstrained | | | | | `verdict-suffix-not-required` |
+| 16. required_tools_retry_thin_final_turn (regression) | | | | | `transport-contract-thin-final-turn` (failure) |
+| 17. required_tools_retry_thin_final_turn (post-fix) | | | V | V | `transport-contract-self-contained` |
+| 18. required_tools_retry_thin_final_turn (correction msg) | | | | | `transport-contract-self-contained` |
 
 *Scenario 4 accepts either a verification tool call OR a question mark in response (asking for evidence).
 
@@ -67,6 +72,7 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 7. asserted_unavailability_genuine | V | - | - |
 | 8-10. quoted_resource_pre_fetch | V | - | - |
 | 11-15. required_suffix_line | V | - | - |
+| 16-18. required_tools_retry_thin_final_turn | V | - | - |
 
 ## Frozen Regression Fixtures
 
@@ -82,6 +88,7 @@ Each scenario has a `fixtures/{scenario}_pre_fix.json` file containing the pre-f
 | 6 | `asserted_unavailability_caught_pre_fix.json` | mika#654 |
 | 8 | `quoted_resource_pre_fetch_pre_fix.json` | mika#788 |
 | 11 | `required_suffix_line_caught_pre_fix.json` | mika#788 (verdict ghost) |
+| 16 | `required_tools_retry_thin_final_turn_pre_fix.json` | mika#890 (thin final turn) |
 
 ## Adding a New Scenario
 
