@@ -443,7 +443,7 @@ async fn handle_block_ac(
         }
 
         // Update metadata
-        let _ = update_verdict_block_metadata(
+        if let Err(e) = update_verdict_block_metadata(
             db,
             &task_id,
             &task.metadata,
@@ -453,7 +453,10 @@ async fn handle_block_ac(
             &event.review_url,
             &truncate_body(&event.body),
         )
-        .await;
+        .await
+        {
+            warn!(error = %e, task_id = %task_id, "Failed to update block[ac] escalation metadata");
+        }
 
         // Log audit event
         if let Err(e) = db
@@ -508,7 +511,7 @@ async fn handle_block_ac(
     let new_count = count + 1;
 
     // Update metadata with new count
-    let _ = update_verdict_block_metadata(
+    if let Err(e) = update_verdict_block_metadata(
         db,
         &task_id,
         &task.metadata,
@@ -518,7 +521,10 @@ async fn handle_block_ac(
         &event.review_url,
         &truncate_body(&event.body),
     )
-    .await;
+    .await
+    {
+        warn!(error = %e, task_id = %task_id, "Failed to update block[ac] dispatch metadata");
+    }
 
     // Log audit event
     if let Err(e) = db
@@ -629,7 +635,7 @@ async fn handle_block_ci(
             warn!(error = %e, task_id = %task_id, "Failed to mark task blocked after ci retry limit");
         }
 
-        let _ = update_verdict_block_metadata(
+        if let Err(e) = update_verdict_block_metadata(
             db,
             &task_id,
             &task.metadata,
@@ -639,7 +645,10 @@ async fn handle_block_ci(
             &event.review_url,
             &truncate_body(&event.body),
         )
-        .await;
+        .await
+        {
+            warn!(error = %e, task_id = %task_id, "Failed to update block[ci] escalation metadata");
+        }
 
         if let Err(e) = db
             .log_audit_event(
@@ -677,7 +686,7 @@ async fn handle_block_ci(
 
     let new_count = count + 1;
 
-    let _ = update_verdict_block_metadata(
+    if let Err(e) = update_verdict_block_metadata(
         db,
         &task_id,
         &task.metadata,
@@ -687,7 +696,10 @@ async fn handle_block_ci(
         &event.review_url,
         &truncate_body(&event.body),
     )
-    .await;
+    .await
+    {
+        warn!(error = %e, task_id = %task_id, "Failed to update block[ci] dispatch metadata");
+    }
 
     if let Err(e) = db
         .log_audit_event(
@@ -773,7 +785,7 @@ async fn handle_escalate(
     }
 
     // Update metadata
-    let _ = update_escalation_metadata(
+    if let Err(e) = update_escalation_metadata(
         db,
         &task_id,
         &task.metadata,
@@ -781,7 +793,10 @@ async fn handle_escalate(
         &event.review_url,
         &truncate_body(&event.body),
     )
-    .await;
+    .await
+    {
+        warn!(error = %e, task_id = %task_id, "Failed to update escalation metadata for block[{reason}]");
+    }
 
     // Log audit event
     if let Err(e) = db
@@ -857,14 +872,17 @@ async fn handle_hold_review(
     let task_id = task.id.clone();
 
     // Update metadata
-    let _ = update_hold_metadata(
+    if let Err(e) = update_hold_metadata(
         db,
         &task_id,
         &task.metadata,
         &event.review_url,
         &truncate_body(&event.body),
     )
-    .await;
+    .await
+    {
+        warn!(error = %e, task_id = %task_id, "Failed to update hold[review] metadata");
+    }
 
     // Log audit event
     if let Err(e) = db
@@ -930,7 +948,7 @@ async fn handle_missing_verdict(
         reviewer = %event.reviewer,
         review_url = %event.review_url,
         body_truncated = truncated,
-        body_excerpt = %&body_excerpt[..body_excerpt.len().min(200)],
+        body_excerpt = %truncate_body_for_log(&body_excerpt),
         "verdict_classification_failed: no parseable VERDICT: line in review body"
     );
 
@@ -938,14 +956,17 @@ async fn handle_missing_verdict(
     if let Some(task) = find_task_for_verdict(db, &pr_url, event).await {
         let task_id = task.id.clone();
 
-        let _ = update_hold_metadata(
+        if let Err(e) = update_hold_metadata(
             db,
             &task_id,
             &task.metadata,
             &event.review_url,
             &body_excerpt,
         )
-        .await;
+        .await
+        {
+            warn!(error = %e, task_id = %task_id, "Failed to update hold metadata for missing verdict");
+        }
 
         // Log audit event
         if let Err(e) = db
@@ -1082,6 +1103,21 @@ fn truncate_body(body: &str) -> String {
     } else {
         body.to_string()
     }
+}
+
+/// UTF-8 safe truncation for log fields (max 200 chars).
+fn truncate_body_for_log(body: &str) -> &str {
+    if body.len() <= 200 {
+        return body;
+    }
+    // Find a valid char boundary at or before byte offset 200
+    let boundary = body
+        .char_indices()
+        .take_while(|&(i, _)| i < 200)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    &body[..boundary]
 }
 
 /// Send a notification via the message sender, absorbing errors.

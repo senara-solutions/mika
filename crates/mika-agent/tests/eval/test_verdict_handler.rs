@@ -377,6 +377,71 @@ async fn verdict_block_pipeline_escalates() -> Result<()> {
 }
 
 // -------------------------------------------------------------------------
+// Test: block[ci] retry limit -> Handled with escalation (#889 R3)
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn verdict_block_ci_retry_limit_escalates() -> Result<()> {
+    let db = test_db().await;
+    let pr_url = "https://github.com/senara-solutions/mika/pull/42";
+    let task_id = create_task_with_pr_url(&db, pr_url).await;
+
+    // Pre-set the retry counter to 3 (limit reached)
+    let metadata = json!({
+        "claude_pilot": { "pr_url": pr_url },
+        "verdict_block_ci": { "count": 3 }
+    });
+    db.update_task_metadata(&task_id, &serde_json::to_string(&metadata).unwrap())
+        .await
+        .expect("update metadata");
+
+    let text = pr_review_text(
+        "commented",
+        "senara-solutions/mika",
+        42,
+        "mika-qa",
+        "VERDICT: block[ci]\nREASON: CI still failing after 3 fix attempts.",
+    );
+
+    let action =
+        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
+            .await;
+
+    match action {
+        VerdictAction::Handled { pre_digest } => {
+            assert!(
+                pre_digest.contains("retry limit"),
+                "pre-digest should mention retry limit"
+            );
+            assert!(
+                pre_digest.contains("Do NOT dispatch"),
+                "pre-digest should prevent dispatch"
+            );
+            assert!(
+                pre_digest.contains("retry budget is exhausted"),
+                "pre-digest should say budget exhausted"
+            );
+        }
+        VerdictAction::Passthrough { .. } => {
+            panic!("block[ci] at retry limit should be handled as escalation");
+        }
+    }
+
+    // Verify task was marked blocked
+    let task = db
+        .get_task(&task_id)
+        .await
+        .expect("get task")
+        .expect("task should exist");
+    assert_eq!(
+        task.status, "blocked",
+        "task should be blocked after ci retry limit"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
 // Test: hold[review] verdict with task -> Handled (#889 R5)
 // -------------------------------------------------------------------------
 
