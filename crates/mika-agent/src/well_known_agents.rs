@@ -85,6 +85,7 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
         "qa-review-build-callback",
         "skill-review",
         "mika-arch-groom-ticket",
+        "mika-arch-groom-milestone",
         "mika-arch-second-review",
         "dev-groom",
     ],
@@ -112,6 +113,7 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
         // mika-arch-* skills are for the architect agent only — keep mika-qa
         // focused on PR review without arch-style triggers.
         "mika-arch-groom-ticket",
+        "mika-arch-groom-milestone",
         "mika-arch-second-review",
         // dev-groom is operator-only (#845) — mika-qa must NOT invoke grooming.
         "dev-groom",
@@ -150,6 +152,7 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
         "resolve-pr-conflicts",
         "self-check",
         "mika-arch-groom-ticket",
+        "mika-arch-groom-milestone",
         "mika-arch-second-review",
         "dev-groom",
         // Community (hardcoded BUNDLED_SKILLS):
@@ -172,9 +175,10 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
 /// mika-arch agent specification.
 ///
 /// Read-only architect agent for plan-stage review. Uses identity-driven
-/// skill allowlist (only `mika-arch-groom-ticket` and `mika-arch-second-review`
-/// are enabled). Base model is Kimi; per-skill LLM overrides route to
-/// Opus 4.7 (groom-ticket) and Sonnet 4.6 (second-review).
+/// skill allowlist (`mika-arch-groom-ticket`, `mika-arch-groom-milestone`,
+/// and `mika-arch-second-review` are enabled). Base model is Kimi; per-skill
+/// LLM overrides route to Opus 4.7 (groom-ticket, groom-milestone) and
+/// Sonnet 4.6 (second-review).
 ///
 /// Identity is computed at provision time from `Settings.kg_docs_roots` so
 /// `[kg].docs_roots` contains absolute paths. Without `MIKA_KG_DOCS_ROOTS`
@@ -191,6 +195,11 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
     llm_overrides: &[
         LlmOverrideSpec {
             skill_name: "mika-arch-groom-ticket",
+            provider: "anthropic",
+            model: "claude-opus-4-7",
+        },
+        LlmOverrideSpec {
+            skill_name: "mika-arch-groom-milestone",
             provider: "anthropic",
             model: "claude-opus-4-7",
         },
@@ -308,7 +317,7 @@ docs_roots = [
 {roots_block}]
 
 [skills]
-allowlist = ["mika-arch-groom-ticket", "mika-arch-second-review"]
+allowlist = ["mika-arch-groom-ticket", "mika-arch-groom-milestone", "mika-arch-second-review"]
 
 [tools]
 {tools_block}
@@ -599,6 +608,7 @@ execute shell commands.
 - Reference docs/architecture/review-guide.md for architectural principles.
 - Produce annotated plan content with inline findings.
 - End with an explicit disposition: READY, ITERATE, or ESCALATE.
+- For milestone-scoped reviews, add `Scope: milestone` before the disposition and surface cross-cutting concerns across sub-issues.
 - Never start workflows, create tasks, or manage development lifecycle.
 - You are advisory only — your output is consumed by claude-pilot, which commits.
 
@@ -1141,6 +1151,7 @@ mod tests {
         // are legitimately disabled on both mika-dev and mika-qa.
         let allowed_overlap: &[&str] = &[
             "mika-arch-groom-ticket",
+            "mika-arch-groom-milestone",
             "mika-arch-second-review",
             "dev-groom", // operator-only (#845) — disabled for both dev and qa
         ];
@@ -1202,7 +1213,7 @@ mod tests {
 
     #[test]
     fn test_mika_arch_has_llm_overrides() {
-        assert_eq!(MIKA_ARCH.llm_overrides.len(), 2);
+        assert_eq!(MIKA_ARCH.llm_overrides.len(), 3);
         assert_eq!(
             MIKA_ARCH.llm_overrides[0].skill_name,
             "mika-arch-groom-ticket"
@@ -1211,10 +1222,16 @@ mod tests {
         assert_eq!(MIKA_ARCH.llm_overrides[0].model, "claude-opus-4-7");
         assert_eq!(
             MIKA_ARCH.llm_overrides[1].skill_name,
-            "mika-arch-second-review"
+            "mika-arch-groom-milestone"
         );
         assert_eq!(MIKA_ARCH.llm_overrides[1].provider, "anthropic");
-        assert_eq!(MIKA_ARCH.llm_overrides[1].model, "claude-sonnet-4-6");
+        assert_eq!(MIKA_ARCH.llm_overrides[1].model, "claude-opus-4-7");
+        assert_eq!(
+            MIKA_ARCH.llm_overrides[2].skill_name,
+            "mika-arch-second-review"
+        );
+        assert_eq!(MIKA_ARCH.llm_overrides[2].provider, "anthropic");
+        assert_eq!(MIKA_ARCH.llm_overrides[2].model, "claude-sonnet-4-6");
     }
 
     #[test]
@@ -1240,8 +1257,9 @@ mod tests {
         let docs_roots = identity.kg.docs_roots.expect("should have docs_roots");
         assert_eq!(docs_roots.len(), 2);
         let allowlist = identity.skills.allowlist.expect("should have allowlist");
-        assert_eq!(allowlist.len(), 2);
+        assert_eq!(allowlist.len(), 3);
         assert!(allowlist.contains(&"mika-arch-groom-ticket".to_string()));
+        assert!(allowlist.contains(&"mika-arch-groom-milestone".to_string()));
         assert!(allowlist.contains(&"mika-arch-second-review".to_string()));
         // Tool denylist must be present and contain the load-bearing items.
         assert_eq!(
@@ -1290,8 +1308,8 @@ mod tests {
         seed_well_known_skill_overrides(&mut db, "mika-arch");
 
         let overrides = db.get_skill_overrides("mika-arch").unwrap();
-        // Should have 2 LLM overrides (no disabled_skills for mika-arch)
-        assert_eq!(overrides.len(), 2);
+        // Should have 3 LLM overrides (no disabled_skills for mika-arch)
+        assert_eq!(overrides.len(), 3);
 
         let groom = overrides
             .iter()
@@ -1299,6 +1317,13 @@ mod tests {
             .expect("groom-ticket override should exist");
         assert_eq!(groom.llm_provider.as_deref(), Some("anthropic"));
         assert_eq!(groom.llm_model.as_deref(), Some("claude-opus-4-7"));
+
+        let milestone = overrides
+            .iter()
+            .find(|o| o.skill_name == "mika-arch-groom-milestone")
+            .expect("groom-milestone override should exist");
+        assert_eq!(milestone.llm_provider.as_deref(), Some("anthropic"));
+        assert_eq!(milestone.llm_model.as_deref(), Some("claude-opus-4-7"));
 
         let review = overrides
             .iter()
