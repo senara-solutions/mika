@@ -59,3 +59,4 @@ Verdict: ESCALATE
 - **Tool kit.** `gh_read`, `query_knowledge_graph`, `conversation_search`, `recent_chats`, `web_search`.
 - **Citation required.** Every concern must cite its source.
 - **Two-pass maximum.** This is the final automated review pass. No ITERATE verdicts.
+- **Self-contained final response.** Your final response must be self-contained. If a prior turn was rejected (e.g., by the required-tools gate) and you re-issued the review after fetching ground truth, restate the full annotated findings in your final response — do not refer to prior turns with phrases like "see above." Only the final response is persisted.

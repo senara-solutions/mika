@@ -1,0 +1,43 @@
+{
+  "description": "Pre-fix fixture reproducing the mika#890 thin-final-turn trace shape. The required-tools gate rejects a substantive EndTurn (step 0) because the agent didn't call the required tool. After correction, the agent calls the tool and produces a self-contained review (step 2). But the final EndTurn (step 4) is a thin pointer-summary — 'Disposition stands: ITERATE with the revised findings above' — because the LLM treats the prior review as 'already in context'. Only the final EndTurn is persisted to `messages`; the substantive content from step 2 is lost.",
+  "incident": "mika#890 — mika-arch session f2e6595d during /mika-groom-ticket mika#886 first-pass (2026-04-29)",
+  "fabrication_class": "transport_contract_thin_final_turn",
+  "user_message": "groom-ticket: Review the implementation plan for mika#886.",
+  "step_sequence": [
+    {
+      "step": 0,
+      "stop_reason": "EndTurn",
+      "description": "Substantive review with citation markers but WITHOUT calling required tool. Rejected by required-tools gate.",
+      "content": "[KEY-FINDING-1] Concern: the key shape in the issue body does not match the schema defined in architecture.md section 4 — the plan assumes `session_id` is a top-level field but the schema nests it under `metadata.session`. This structural mismatch would cause silent failures in the persistence layer.\n\n[KEY-FINDING-2] Concern: record-at-dispatch failure mode — if the dispatch call fails after the task status is set to in_progress, the agent has no rollback path. The plan's retry strategy (exponential backoff) does not address the intermediate state.\n\nDisposition: ITERATE\n\nFindings require resolution before second pass."
+    },
+    {
+      "step": 1,
+      "stop_reason": "ToolUse",
+      "description": "Agent calls gh_read (the required tool) after correction.",
+      "tool": "gh_read",
+      "input": {"op": "issue_view", "target": "886", "repo": "senara-solutions/mika"}
+    },
+    {
+      "step": 2,
+      "stop_reason": "ToolUse",
+      "description": "Agent calls update_core_memory with full substantive review (this is where the real content lives, but ToolUse text is NOT persisted to messages).",
+      "tool": "update_core_memory",
+      "input": {"section": "current_priorities", "content": "Catalogued: thin-final-turn pattern after required-tools retry"}
+    },
+    {
+      "step": 3,
+      "stop_reason": "ToolUse",
+      "description": "Another tool call.",
+      "tool": "update_core_memory",
+      "input": {"section": "self_model", "content": "Lesson: restate findings after retry"}
+    },
+    {
+      "step": 4,
+      "stop_reason": "EndTurn",
+      "description": "Thin pointer-summary. This is the ONLY text persisted to messages. Substantive content from steps 0 and 2 is lost.",
+      "content": "Disposition stands: ITERATE with the revised findings above. The prior turn's review was issued without ground-truth verification of the issue body — required-tools gate correctly forced the correction. Two structural deviations from issue body (key shape) and one architectural concern (record-at-dispatch failure mode) require resolution before second pass."
+    }
+  ],
+  "markers": ["[KEY-FINDING-1]", "[KEY-FINDING-2]"],
+  "note": "The pre-fix final turn (step 4) is 363 chars. The substantive review (step 0) is ~900 chars with citation markers. The assertion checks that the final turn contains both markers — which it does NOT in the pre-fix shape, proving the assertion has teeth."
+}
