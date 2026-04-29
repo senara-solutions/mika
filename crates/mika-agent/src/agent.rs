@@ -754,6 +754,7 @@ async fn run_loop(
     mcp_manager: Option<&McpManager>,
     long_running_ctx: Option<&executor::LongRunningContext>,
     required_tools: &HashSet<String>,
+    enabled_tool_names: &HashSet<String>,
     store_llm_calls: bool,
     store_tool_calls: bool,
     prompt_variant: Option<&str>,
@@ -1285,6 +1286,59 @@ async fn run_loop(
                         if intent_rejected {
                             continue;
                         }
+                    }
+
+                    // #862 — Asserted-unavailability guard. Catches assistant text
+                    // claiming a tool is unavailable ("X is not callable", "I don't
+                    // have access to X", "X is skill-scoped") when X is in the
+                    // agent's *turn-start enabled-tool set* and no successful call
+                    // to X exists in the turn's tool-call trace. Single retry via
+                    // intent_guard_retries (same tracking as INTENT_GUARDS entries).
+                    // Inline rather than in the const array because it checks
+                    // assistant text (not user input) and needs enabled_tool_names
+                    // + dynamic correction message. See gate-evasion compound doc
+                    // Rule 2.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(ASSERTED_UNAVAILABILITY_LABEL)
+                        && let Some(tool_name) =
+                            detect_asserted_unavailability(&text, enabled_tool_names)
+                        && !asserted_unavailability_satisfied(
+                            &tool_name,
+                            enabled_tool_names,
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries.insert(ASSERTED_UNAVAILABILITY_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            tool = %tool_name,
+                            intent_guard = ASSERTED_UNAVAILABILITY_LABEL,
+                            "Asserted-unavailability guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[Your response was rejected because you claimed \
+                                 {tool_name} is unavailable, but {tool_name} is in \
+                                 your active tool registry for this session. Attempt \
+                                 the call directly. If it fails (auth, rate limit, \
+                                 network, permission), surface the actual failure — \
+                                 that is a real signal. 'Not callable' without an \
+                                 attempt is a fabrication. See docs/solutions/\
+                                 best-practices/\
+                                 required-tools-gate-evasion-patterns-2026-04-28.md \
+                                 Rule 2.]",
+                            )),
+                        });
+                        continue;
                     }
 
                     // Persistence evaluation guard: if the agent is ending a turn
@@ -1885,6 +1939,13 @@ async fn run_agent_inner(
         skill_tool_defs.extend_from_slice(mcp.tool_definitions());
     }
 
+    // #862 — Turn-start snapshot of enabled tool names for the
+    // asserted-unavailability guard. Captures the tool set the LLM actually
+    // sees (after identity denylist + skill overrides + MCP) so the guard
+    // verifies what the LLM was offered, not what the engine would offer now.
+    let enabled_tool_names: HashSet<String> =
+        skill_tool_defs.iter().map(|d| d.name.clone()).collect();
+
     let history = db.load_recent_messages(20).await?;
 
     // Build initial message list from history.
@@ -2094,6 +2155,7 @@ async fn run_agent_inner(
         params.mcp_manager,
         lr_ctx.as_ref(),
         &required_tools,
+        &enabled_tool_names,
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -2861,6 +2923,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         pr_reviews_posted: None, // Silent mode: no session-scoped dedup needed
     };
 
+    // #862 — Turn-start snapshot of enabled tool names (silent mode).
+    let enabled_tool_names: HashSet<String> =
+        skill_tool_defs.iter().map(|d| d.name.clone()).collect();
+
     let llm_tool_defs: Vec<LlmToolDefinition> =
         skill_tool_defs.into_iter().map(Into::into).collect();
     let tools_for_request = if llm_tool_defs.is_empty() {
@@ -2933,6 +2999,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         None, // MCP tools excluded from silent mode
         None, // long_running not supported in silent mode
         &no_required_tools,
+        &enabled_tool_names,
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -3215,6 +3282,10 @@ async fn run_team_agent_inner_impl(
         skill_tool_defs.extend_from_slice(mcp.tool_definitions());
     }
 
+    // #862 — Turn-start snapshot of enabled tool names (team mode).
+    let enabled_tool_names: HashSet<String> =
+        skill_tool_defs.iter().map(|d| d.name.clone()).collect();
+
     // Single-turn: just the task message, no history
     let messages = vec![LlmMessage {
         role: LlmRole::User,
@@ -3313,6 +3384,7 @@ async fn run_team_agent_inner_impl(
         params.mcp_manager,
         None, // long_running: team agents will be wired in Phase 4
         &required_tools,
+        &enabled_tool_names,
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -4208,6 +4280,77 @@ fn callback_terminal_action_satisfied(summaries: &[ToolCallSummary]) -> bool {
     let has_update = summaries.iter().any(|s| s.name == "update_task_status");
     let has_send = summaries.iter().any(|s| s.name == "send_message");
     has_update && has_send
+}
+
+// ---------------------------------------------------------------------------
+// #862 — Asserted-unavailability guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the asserted-unavailability
+/// guard (#862). Inline guard (not in `INTENT_GUARDS` const array) because it
+/// checks *assistant* text, not user-input text, and needs the enabled-tool-set
+/// snapshot + dynamic correction message.
+const ASSERTED_UNAVAILABILITY_LABEL: &str = "asserted_unavailability";
+
+/// Five regex patterns from the gate-evasion compound doc (Rule 2).
+/// Each uses a named capture group `(?P<tool>...)` so extraction is
+/// `captures["tool"]` uniformly (F2 resolution).
+static ASSERTED_UNAVAILABILITY_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        vec![
+            regex::Regex::new(
+                r"(?i)\bi (?:don'?t|do not) have access to (?P<tool>[a-z_][a-z0-9_]*)",
+            )
+            .expect("asserted_unavailability pattern 1"),
+            regex::Regex::new(
+                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) is not (?:available|callable|accessible)",
+            )
+            .expect("asserted_unavailability pattern 2"),
+            regex::Regex::new(
+                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) isn'?t (?:available|callable|accessible)",
+            )
+            .expect("asserted_unavailability pattern 3"),
+            regex::Regex::new(r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) is skill-scoped")
+                .expect("asserted_unavailability pattern 4"),
+            regex::Regex::new(r"(?i)\bcannot call (?P<tool>[a-z_][a-z0-9_]*)")
+                .expect("asserted_unavailability pattern 5"),
+        ]
+    });
+
+/// Detects asserted-unavailability phrases in assistant text.
+///
+/// Scans the text for one of the five compound-doc-cited patterns. If a match
+/// is found AND the captured tool name is in the `enabled_tools` set (turn-start
+/// snapshot), returns `Some(tool_name)`. Otherwise returns `None`.
+///
+/// Two-layer false-positive filter (F5): the snake-case capture group constraint
+/// filters most natural-language matches; the enabled-set lookup filters the rest.
+/// A sentence like "the service is not available" extracts `service`, which is
+/// not in the registry → `None` → no violation.
+fn detect_asserted_unavailability(text: &str, enabled_tools: &HashSet<String>) -> Option<String> {
+    for re in ASSERTED_UNAVAILABILITY_PATTERNS.iter() {
+        for caps in re.captures_iter(text) {
+            let tool_name = &caps["tool"];
+            if enabled_tools.contains(tool_name) {
+                return Some(tool_name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Returns `true` when the asserted-unavailability guard should NOT fire
+/// (i.e., the assertion is structurally true or backed by a real attempt).
+///
+/// Satisfied when:
+/// - `tool_name` is NOT in `enabled_tools` (assertion is structurally true), OR
+/// - a successful call to `tool_name` exists in the turn's tool summaries.
+fn asserted_unavailability_satisfied(
+    tool_name: &str,
+    enabled_tools: &HashSet<String>,
+    summaries: &[ToolCallSummary],
+) -> bool {
+    !enabled_tools.contains(tool_name) || summaries.iter().any(|s| s.name == tool_name && s.success)
 }
 
 #[cfg(test)]
@@ -7215,6 +7358,163 @@ mod tests {
             "webhook_ready_label_dispatch (idx={ready_idx}) must precede \
              webhook_zero_tools (idx={zero_idx}) so the more specific trigger \
              fires first"
+        );
+    }
+
+    // -- #862 asserted-unavailability detection tests --
+
+    #[test]
+    fn test_detect_asserted_unavailability_pattern_1_dont_have_access() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        assert_eq!(
+            detect_asserted_unavailability("I don't have access to gh_read", &enabled),
+            Some("gh_read".to_string())
+        );
+        assert_eq!(
+            detect_asserted_unavailability("I do not have access to gh_read", &enabled),
+            Some("gh_read".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_pattern_2_is_not_available() {
+        let mut enabled = HashSet::new();
+        enabled.insert("search_memory".to_string());
+        assert_eq!(
+            detect_asserted_unavailability("search_memory is not available", &enabled),
+            Some("search_memory".to_string())
+        );
+        assert_eq!(
+            detect_asserted_unavailability("search_memory is not callable", &enabled),
+            Some("search_memory".to_string())
+        );
+        assert_eq!(
+            detect_asserted_unavailability("search_memory is not accessible", &enabled),
+            Some("search_memory".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_pattern_3_isnt() {
+        let mut enabled = HashSet::new();
+        enabled.insert("run_gh".to_string());
+        assert_eq!(
+            detect_asserted_unavailability("run_gh isn't available here", &enabled),
+            Some("run_gh".to_string())
+        );
+        assert_eq!(
+            detect_asserted_unavailability("run_gh isnt callable", &enabled),
+            Some("run_gh".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_pattern_4_skill_scoped() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        assert_eq!(
+            detect_asserted_unavailability("gh_read is skill-scoped", &enabled),
+            Some("gh_read".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_pattern_5_cannot_call() {
+        let mut enabled = HashSet::new();
+        enabled.insert("store_fact".to_string());
+        assert_eq!(
+            detect_asserted_unavailability("cannot call store_fact in this mode", &enabled),
+            Some("store_fact".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_not_in_registry() {
+        let enabled = HashSet::new(); // empty — no tools enabled
+        assert_eq!(
+            detect_asserted_unavailability("gh_read is not available", &enabled),
+            None,
+            "Should not detect when tool is not in enabled set"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_natural_language_filtered() {
+        let mut enabled = HashSet::new();
+        enabled.insert("search_memory".to_string());
+        // "service" is snake_case but not a tool name
+        assert_eq!(
+            detect_asserted_unavailability("the service is not available", &enabled),
+            None,
+            "Natural language 'service' should not match"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_case_insensitive() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        assert_eq!(
+            detect_asserted_unavailability("I DON'T HAVE ACCESS TO gh_read", &enabled),
+            Some("gh_read".to_string())
+        );
+    }
+
+    #[test]
+    fn test_asserted_unavailability_satisfied_not_in_registry() {
+        let enabled = HashSet::new();
+        let summaries = vec![];
+        assert!(
+            asserted_unavailability_satisfied("gh_read", &enabled, &summaries),
+            "Tool not in enabled set = assertion is true = satisfied"
+        );
+    }
+
+    #[test]
+    fn test_asserted_unavailability_satisfied_successful_call() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "gh_read".to_string(),
+            input_summary: "op: issue_view".to_string(),
+            output_summary: "Issue #862: ...".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(
+            asserted_unavailability_satisfied("gh_read", &enabled, &summaries),
+            "Tool called successfully = satisfied"
+        );
+    }
+
+    #[test]
+    fn test_asserted_unavailability_not_satisfied_no_call() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        let summaries = vec![]; // no calls
+        assert!(
+            !asserted_unavailability_satisfied("gh_read", &enabled, &summaries),
+            "Tool in enabled set with no call = NOT satisfied"
+        );
+    }
+
+    #[test]
+    fn test_asserted_unavailability_not_satisfied_failed_call() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "gh_read".to_string(),
+            input_summary: "op: issue_view".to_string(),
+            output_summary: "Error: auth failed".to_string(),
+            success: false,
+            non_zero_exit: false,
+        }];
+        assert!(
+            !asserted_unavailability_satisfied("gh_read", &enabled, &summaries),
+            "Tool in enabled set with failed call = NOT satisfied (only successful calls count)"
         );
     }
 }
