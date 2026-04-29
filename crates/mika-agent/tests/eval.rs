@@ -29,6 +29,10 @@ mod eval {
     // KG provider evaluation matrix: provider comparison for extraction + resolution (#762)
     pub mod kg_provider_eval;
 
+    // Per-skill eval scenarios — output-shape contracts validated through the
+    // agent loop with synthetic skills + mock LLM (mika#879 Unit 1 onwards).
+    pub mod skills;
+
     // v26->v27 KG migration invariant tests: coalesce per-agent data (#787)
     mod kg_v27_migration;
 
