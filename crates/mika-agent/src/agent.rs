@@ -1905,7 +1905,7 @@ async fn run_agent_inner(
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
-    let required_tools = collect_required_tools(&matched);
+    let required_tools = collect_required_tools(&matched, params.user_message);
 
     // Build active skill paths for context-redundancy checks in read tools.
     // Each matched skill's system_prompt.md is already injected into the system prompt
@@ -3275,7 +3275,7 @@ async fn run_team_agent_inner_impl(
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
-    let required_tools = collect_required_tools(&matched);
+    let required_tools = collect_required_tools(&matched, params.task_message);
 
     // Append MCP tool definitions (if any MCP servers are connected)
     if let Some(mcp) = params.mcp_manager {
@@ -3631,13 +3631,49 @@ fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str, model_name: &
 /// This prevents always-on skills (like self-dev) from requiring tools on every message —
 /// constraints are only enforced when the user's message actually triggered the skill's
 /// keywords. See #265, #270.
-fn collect_required_tools(matched: &[MatchedSkill<'_>]) -> HashSet<String> {
-    matched
+///
+/// ## Pre-fetch augmentation (mika#863)
+///
+/// When a keyword-matched skill declares `required_fetches_for_quoted_resources = true`,
+/// the user message is scanned for quoted fetchable resources (issue bodies, PR diffs,
+/// file content in fenced blocks). The corresponding fetch tool names are merged into
+/// the required set. This runs ONCE at agent-loop entry against the initial user message
+/// — corrective re-prompts from intent guards do NOT re-trigger detection.
+fn collect_required_tools(matched: &[MatchedSkill<'_>], user_message: &str) -> HashSet<String> {
+    let mut required: HashSet<String> = matched
         .iter()
         .filter(|m| m.reason == MatchReason::Keyword)
         .flat_map(|m| m.entry.manifest.constraints.required_tools.iter())
         .cloned()
-        .collect()
+        .collect();
+
+    // mika#863 pre-fetch augmentation: opt-in skills extend required_tools
+    // with brief-derived fetches. Only Keyword-matched skills contribute
+    // (same scoping as static required_tools per #265).
+    let needs_pre_fetch = matched.iter().any(|m| {
+        m.reason == MatchReason::Keyword
+            && m.entry
+                .manifest
+                .constraints
+                .required_fetches_for_quoted_resources
+    });
+
+    if needs_pre_fetch {
+        let resources = crate::skills::quoted_resources::detect_quoted_resources(user_message);
+        for resource in &resources {
+            required.insert(
+                crate::skills::quoted_resources::resource_to_required_tool(resource).to_string(),
+            );
+        }
+        if !resources.is_empty() {
+            tracing::info!(
+                count = resources.len(),
+                "pre-fetch guard: augmented required_tools with brief-quoted resource fetches"
+            );
+        }
+    }
+
+    required
 }
 
 /// Filter required tools to only those available in the current tool set.
@@ -4563,6 +4599,7 @@ mod tests {
                 llm: Default::default(),
                 constraints: Constraints {
                     required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
+                    required_fetches_for_quoted_resources: false,
                 },
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
@@ -5970,7 +6007,7 @@ mod tests {
                 reason: MatchReason::Keyword,
             },
         ];
-        let required = collect_required_tools(&matched);
+        let required = collect_required_tools(&matched, "");
         assert!(required.is_empty());
     }
 
@@ -5994,7 +6031,7 @@ mod tests {
                 reason: MatchReason::Keyword,
             },
         ];
-        let required = collect_required_tools(&matched);
+        let required = collect_required_tools(&matched, "");
         assert_eq!(required.len(), 2);
         assert!(required.contains("run_gh"));
         assert!(required.contains("run_lint"));
@@ -6013,7 +6050,7 @@ mod tests {
             entry: &s1,
             reason: MatchReason::AlwaysOn,
         }];
-        let required = collect_required_tools(&matched);
+        let required = collect_required_tools(&matched, "");
         assert!(
             required.is_empty(),
             "always_on skills should not enforce required_tools"
@@ -6033,7 +6070,7 @@ mod tests {
             entry: &s1,
             reason: MatchReason::Dependency,
         }];
-        let required = collect_required_tools(&matched);
+        let required = collect_required_tools(&matched, "");
         assert!(
             required.is_empty(),
             "dependency skills should not enforce required_tools"
@@ -6053,7 +6090,7 @@ mod tests {
             entry: &s1,
             reason: MatchReason::Keyword,
         }];
-        let required = collect_required_tools(&matched);
+        let required = collect_required_tools(&matched, "");
         assert_eq!(required.len(), 1);
         assert!(required.contains("run_claude_pilot"));
     }
@@ -6078,10 +6115,135 @@ mod tests {
                 reason: MatchReason::Keyword,
             },
         ];
-        let required = collect_required_tools(&matched);
+        let required = collect_required_tools(&matched, "");
         assert_eq!(required.len(), 1);
         assert!(required.contains("run_tests"));
         assert!(!required.contains("run_claude_pilot"));
+    }
+
+    // -- collect_required_tools pre-fetch augmentation tests (#863) --
+
+    fn make_skill_entry_with_pre_fetch(
+        name: &str,
+        timeout: u64,
+        tool_names: &[&str],
+        required_tools: &[&str],
+        pre_fetch: bool,
+    ) -> SkillEntry {
+        use crate::skills::manifest::Constraints;
+        SkillEntry {
+            manifest: SkillManifest {
+                skill: SkillInfo {
+                    name: name.to_string(),
+                    description: format!("{name} skill"),
+                    version: "0.1.0".to_string(),
+                    always_on: false,
+                    timeout_secs: timeout,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: Triggers {
+                    keywords: vec![name.to_string()],
+                },
+                llm: Default::default(),
+                constraints: Constraints {
+                    required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
+                    required_fetches_for_quoted_resources: pre_fetch,
+                },
+                context: std::collections::HashMap::new(),
+                variants: Default::default(),
+            },
+            dir: PathBuf::from(format!("/skills/{name}")),
+            keywords_lower: vec![name.to_lowercase()],
+            prompt_snippet: String::new(),
+            skill_tools: tool_names
+                .iter()
+                .map(|tn| ResolvedSkillTool {
+                    definition: ToolDefinition {
+                        name: tn.to_string(),
+                        description: format!("{tn} tool"),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    handler: ToolHandler::Builtin {
+                        function: tn.to_string(),
+                    },
+                    skill_dir: PathBuf::from(format!("/skills/{name}")),
+                })
+                .collect(),
+            enabled: true,
+            has_override: false,
+            provider_overrides: std::collections::HashMap::new(),
+            model_prompts: std::collections::HashMap::new(),
+            model_overrides: std::collections::HashMap::new(),
+            generated_model_prompts: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_collect_required_tools_pre_fetch_augments_on_quoted_issue() {
+        // Skill with pre-fetch opt-in, user message contains quoted issue body
+        let s1 =
+            make_skill_entry_with_pre_fetch("arch-review", 30, &["gh_read"], &["gh_read"], true);
+        let matched = vec![MatchedSkill {
+            entry: &s1,
+            reason: MatchReason::Keyword,
+        }];
+        let msg = "Review this plan:\n\nissue/788\n```\nThe issue body here.\n```\n";
+        let required = collect_required_tools(&matched, msg);
+        assert!(
+            required.contains("gh_read"),
+            "gh_read should be in required set (static + augmented)"
+        );
+    }
+
+    #[test]
+    fn test_collect_required_tools_pre_fetch_no_augment_on_plain_prose() {
+        // Skill with pre-fetch opt-in, but user message has no fenced content
+        let s1 =
+            make_skill_entry_with_pre_fetch("arch-review", 30, &["gh_read"], &["gh_read"], true);
+        let matched = vec![MatchedSkill {
+            entry: &s1,
+            reason: MatchReason::Keyword,
+        }];
+        let msg = "Review plan for #788. Check issue #654 too.";
+        let required = collect_required_tools(&matched, msg);
+        // gh_read is still in required set from static required_tools
+        assert!(required.contains("gh_read"));
+        // But the augmentation didn't add anything additional
+        assert_eq!(required.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_required_tools_pre_fetch_skipped_for_always_on() {
+        // AlwaysOn skill with pre-fetch opt-in should NOT trigger augmentation
+        let s1 =
+            make_skill_entry_with_pre_fetch("arch-review", 30, &["gh_read"], &["gh_read"], true);
+        let matched = vec![MatchedSkill {
+            entry: &s1,
+            reason: MatchReason::AlwaysOn,
+        }];
+        let msg = "Review this:\n\nissue/788\n```\nThe issue body.\n```\n";
+        let required = collect_required_tools(&matched, msg);
+        // AlwaysOn doesn't contribute any required_tools at all (#265)
+        assert!(
+            required.is_empty(),
+            "AlwaysOn skills should not enforce required_tools or pre-fetch"
+        );
+    }
+
+    #[test]
+    fn test_collect_required_tools_pre_fetch_disabled_by_default() {
+        // Skill WITHOUT pre-fetch opt-in — quoted resources do not augment
+        let s1 = make_skill_entry_with_pre_fetch("qa-review", 30, &["run_gh"], &["run_gh"], false);
+        let matched = vec![MatchedSkill {
+            entry: &s1,
+            reason: MatchReason::Keyword,
+        }];
+        let msg = "Review this:\n\nissue/788\n```\nThe issue body.\n```\n";
+        let required = collect_required_tools(&matched, msg);
+        // Only static required_tools, no augmentation
+        assert_eq!(required.len(), 1);
+        assert!(required.contains("run_gh"));
     }
 
     // -- filter_available_required_tools tests (#516, #517) --

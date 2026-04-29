@@ -1,6 +1,6 @@
-# Grounding + Fabrication Regression Scenarios (#741, #862)
+# Grounding + Fabrication Regression Scenarios (#741, #862, #863)
 
-Seven scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG milestone #14 retrospective (#741). Scenarios 6–7 from the gate-evasion compound doc (#862). Hard assertions only — no LLM-judge gating.
+Ten scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG milestone #14 retrospective (#741). Scenarios 6–7 from the gate-evasion compound doc (#862). Scenarios 8–10 from the quoted-resource pre-fetch guard (#863). Hard assertions only — no LLM-judge gating.
 
 ## Tag Vocabulary (`grounding:*`)
 
@@ -14,6 +14,8 @@ Seven scenarios testing concrete fabrication classes. Scenarios 1–5 from the K
 | `grounding:training-data-hallucination` | Agent produced a response matching training-data pattern but not the provided evidence (e.g., naming unrelated skill when KG said `self-dev`) | **Failure** |
 | `grounding:unavailability-asserted-without-attempt` | Agent claimed a tool is unavailable without attempting the call (e.g., "gh_read is not callable") when the tool is in the active registry | **Failure** |
 | `grounding:unavailability-asserted-genuine` | Agent correctly reported a genuinely unavailable tool (not in the enabled registry) | Success |
+| `grounding:pre-fetch-required-when-quoted` | Pre-fetch guard correctly augmented required_tools from brief-quoted resource content | Success |
+| `grounding:pre-fetch-skipped-when-quoted` | Agent emitted verdict before fetching a quoted resource despite pre-fetch guard augmentation | **Failure** |
 
 ### Scope Boundary with `#740` `self-knowledge:*`
 
@@ -38,6 +40,9 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 5. kg_result_ignored | V | | | V | `source-cited-correctly`, `training-data-hallucination` (failure) |
 | 6. asserted_unavailability_caught | | V | | | `unavailability-asserted-without-attempt` (failure), `verification-before-claim` |
 | 7. asserted_unavailability_genuine | | | | | `unavailability-asserted-genuine` |
+| 8. quoted_resource_pre_fetch (caught) | | V | | | `pre-fetch-required-when-quoted`, `verification-before-claim` |
+| 9. quoted_resource_pre_fetch (no-op) | | V | | | `pre-fetch-required-when-quoted` |
+| 10. quoted_resource_pre_fetch (mixed) | | V | | | `pre-fetch-required-when-quoted` |
 
 *Scenario 4 accepts either a verification tool call OR a question mark in response (asking for evidence).
 
@@ -52,6 +57,7 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 5. kg_result_ignored | V | V | V |
 | 6. asserted_unavailability_caught | V | - | - |
 | 7. asserted_unavailability_genuine | V | - | - |
+| 8-10. quoted_resource_pre_fetch | V | - | - |
 
 ## Frozen Regression Fixtures
 
@@ -65,6 +71,7 @@ Each scenario has a `fixtures/{scenario}_pre_fix.json` file containing the pre-f
 | 4 | `fabricated_shell_errors_pre_fix.json` | feedback doc |
 | 5 | `kg_result_ignored_pre_fix.json` | mika#740 D4 |
 | 6 | `asserted_unavailability_caught_pre_fix.json` | mika#654 |
+| 8 | `quoted_resource_pre_fetch_pre_fix.json` | mika#788 |
 
 ## Adding a New Scenario
 

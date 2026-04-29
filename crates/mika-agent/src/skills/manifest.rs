@@ -86,12 +86,19 @@ pub struct Constraints {
     /// Names can reference skill-defined tools, builtin tools, or MCP tools.
     #[serde(default)]
     pub required_tools: Vec<String>,
+
+    /// When true, the engine inspects the user message at turn-start for quoted
+    /// fetchable resources (issue/PR/file blocks) and augments the required_tools
+    /// set with the corresponding fetch tool calls. Closes mika#863 (Rule 1
+    /// brief-as-claims-not-facts pattern). Opt-in per skill — defaults to false.
+    #[serde(default)]
+    pub required_fetches_for_quoted_resources: bool,
 }
 
 impl Constraints {
     /// Returns `true` if no constraints are configured.
     pub fn is_empty(&self) -> bool {
-        self.required_tools.is_empty()
+        self.required_tools.is_empty() && !self.required_fetches_for_quoted_resources
     }
 }
 
@@ -642,6 +649,53 @@ mod tests {
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert!(manifest.llm.is_empty());
         assert_eq!(manifest.constraints.required_tools, vec!["run_gh"]);
+    }
+
+    #[test]
+    fn test_parse_constraints_required_fetches_for_quoted_resources() {
+        let toml_str = r#"
+            [skill]
+            name = "arch-review"
+            description = "Architecture review"
+
+            [constraints]
+            required_tools = ["gh_read"]
+            required_fetches_for_quoted_resources = true
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.constraints.is_empty());
+        assert!(manifest.constraints.required_fetches_for_quoted_resources);
+        assert_eq!(manifest.constraints.required_tools, vec!["gh_read"]);
+    }
+
+    #[test]
+    fn test_constraints_is_empty_false_when_only_quoted_resources_opt_in() {
+        let toml_str = r#"
+            [skill]
+            name = "arch-review"
+            description = "Architecture review"
+
+            [constraints]
+            required_fetches_for_quoted_resources = true
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.constraints.is_empty());
+        assert!(manifest.constraints.required_fetches_for_quoted_resources);
+        assert!(manifest.constraints.required_tools.is_empty());
+    }
+
+    #[test]
+    fn test_constraints_required_fetches_defaults_false() {
+        let toml_str = r#"
+            [skill]
+            name = "qa-review"
+            description = "Review PRs"
+
+            [constraints]
+            required_tools = ["run_gh"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.constraints.required_fetches_for_quoted_resources);
     }
 
     // -- [context] section tests --

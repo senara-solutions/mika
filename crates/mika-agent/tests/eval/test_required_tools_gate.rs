@@ -135,6 +135,7 @@ fn make_skill_with_required_tools(
             llm: Default::default(),
             constraints: Constraints {
                 required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
+                required_fetches_for_quoted_resources: false,
             },
             context: HashMap::new(),
             variants: Default::default(),

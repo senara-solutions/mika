@@ -1,0 +1,24 @@
+{
+  "scenario": "quoted_resource_pre_fetch_pre_fix",
+  "description": "Pre-fix response reproducing the mika#788 trace shape: architect issues verdict against brief-quoted issue body without calling gh_read. The brief contains a triple-backtick fence with 'issue/788' header and the issue body. The agent skips the gh_read call and issues 'Disposition: ITERATE' based solely on the quoted content.",
+  "reference": "mika#788 — recurrence 2 of the required-tools-gate evasion pattern",
+  "failure_class": "sufficiency_hallucination",
+  "trace_id": "pre_fix_788_quoted_resource",
+  "turns": [
+    {
+      "role": "user",
+      "content": "groom-ticket: Review the plan for engine: quoted-resource pre-fetch guard.\n\nissue/788\n```\n## Why\nThe architect issued a first-pass verdict against a brief-quoted issue body without calling gh_read.\n\n## Acceptance criteria\n- [ ] Brief-marker detection\n- [ ] Resource to fetch-tool mapping\n```"
+    },
+    {
+      "role": "assistant",
+      "content": "Disposition: ITERATE\n\nF1 — The plan references issue #788 but the quoted body in the brief provides sufficient context for evaluation. The acceptance criteria are clear.\n\nF2 — The plan does not specify how quoted resources are detected in the brief content.",
+      "tool_calls": [],
+      "note": "Pre-fix failure: verdict issued without calling gh_read. The agent treated the brief-quoted body as constituting the content rather than as a claim about the content."
+    }
+  ],
+  "expected_behavior": {
+    "guard_fires": true,
+    "guard_name": "required_tools_gate",
+    "reason": "gh_read is in the required set (both static from skill manifest and augmented by pre-fetch guard detecting the quoted issue/788 fence). Agent did not call gh_read before EndTurn."
+  }
+}
