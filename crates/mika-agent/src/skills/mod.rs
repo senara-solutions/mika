@@ -7,6 +7,7 @@ pub mod install;
 pub mod manifest;
 pub mod marketplace;
 pub mod matcher;
+pub mod quoted_resources;
 pub mod review_filter;
 pub mod variants;
 
