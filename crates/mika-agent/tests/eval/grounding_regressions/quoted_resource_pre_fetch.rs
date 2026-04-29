@@ -98,6 +98,7 @@ fn make_pre_fetch_skill(name: &str, keywords: &[&str]) -> SkillEntry {
                 required_tools: vec!["gh_read".to_string()],
                 required_fetches_for_quoted_resources: true,
             },
+            output: Default::default(),
             context: HashMap::new(),
             variants: Default::default(),
         },

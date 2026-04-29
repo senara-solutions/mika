@@ -35,6 +35,11 @@ pub struct SkillManifest {
     /// Used to enforce tool execution before accepting a response.
     #[serde(default)]
     pub constraints: Constraints,
+    /// Optional output format constraints for skill responses.
+    /// Used to enforce verdict-line contracts via EndTurn post-condition guard.
+    /// See mika#864.
+    #[serde(default)]
+    pub output: Output,
     /// Declarative context requirements. Each key maps to a `{{key}}` placeholder
     /// in the system prompt. The engine pre-fetches the data before the LLM turn.
     #[serde(default)]
@@ -99,6 +104,30 @@ impl Constraints {
     /// Returns `true` if no constraints are configured.
     pub fn is_empty(&self) -> bool {
         self.required_tools.is_empty() && !self.required_fetches_for_quoted_resources
+    }
+}
+
+/// Output format constraints on skill responses.
+///
+/// Declared in the `[output]` section of `skill.toml`. Skills that need to enforce
+/// a verdict-line contract opt in via `required_suffix_lines` listing the literal
+/// exhaustive accept-set. The EndTurn post-condition guard scans the assistant's last
+/// 3 non-empty lines for an exact match; missing match rejects EndTurn once.
+///
+/// See mika#864 for the verdict-ghosting failure mode this addresses.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Output {
+    /// Exhaustive list of literal lines, one of which must appear as one of the
+    /// assistant's last 3 non-empty lines (after trimming whitespace) in any turn
+    /// that ends with EndTurn while this skill is active. Empty list = no constraint.
+    #[serde(default)]
+    pub required_suffix_lines: Vec<String>,
+}
+
+impl Output {
+    /// Returns `true` if no output constraints are configured.
+    pub fn is_empty(&self) -> bool {
+        self.required_suffix_lines.is_empty()
     }
 }
 
@@ -696,6 +725,73 @@ mod tests {
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert!(!manifest.constraints.required_fetches_for_quoted_resources);
+    }
+
+    // -- [output] section tests --
+
+    #[test]
+    fn test_parse_output_required_suffix_lines() {
+        let toml_str = r#"
+            [skill]
+            name = "arch-second-review"
+            description = "Second-pass plan review"
+
+            [output]
+            required_suffix_lines = ["Verdict: GROOMED", "Verdict: ESCALATE"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.output.is_empty());
+        assert_eq!(
+            manifest.output.required_suffix_lines,
+            vec!["Verdict: GROOMED", "Verdict: ESCALATE"]
+        );
+    }
+
+    #[test]
+    fn test_parse_no_output_defaults_empty() {
+        // Backward compat: skill.toml without [output] should parse fine
+        let toml_str = r#"
+            [skill]
+            name = "simple"
+            description = "No output constraints"
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.output.is_empty());
+        assert!(manifest.output.required_suffix_lines.is_empty());
+    }
+
+    #[test]
+    fn test_output_coexists_with_constraints() {
+        let toml_str = r#"
+            [skill]
+            name = "arch-groom"
+            description = "First-pass plan review"
+
+            [constraints]
+            required_tools = ["gh_read"]
+
+            [output]
+            required_suffix_lines = ["Disposition: READY", "Disposition: ITERATE", "Disposition: ESCALATE"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.constraints.is_empty());
+        assert_eq!(manifest.constraints.required_tools, vec!["gh_read"]);
+        assert!(!manifest.output.is_empty());
+        assert_eq!(manifest.output.required_suffix_lines.len(), 3);
+    }
+
+    #[test]
+    fn test_output_empty_list_parses() {
+        let toml_str = r#"
+            [skill]
+            name = "test-skill"
+            description = "Explicit empty list"
+
+            [output]
+            required_suffix_lines = []
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.output.is_empty());
     }
 
     // -- [context] section tests --

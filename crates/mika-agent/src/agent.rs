@@ -740,6 +740,10 @@ fn strip_prior_images(messages: &mut [LlmMessage]) {
 /// If the assistant produces a text response without calling all required tools, the
 /// engine rejects the response and re-prompts (once). This prevents the model from
 /// fabricating results instead of actually using tools. See #270.
+///
+/// `required_suffix_lines` specifies literal lines (from matched skills' `[output]` sections)
+/// that must appear in the assistant's last 3 non-empty lines. If none match, the response
+/// is rejected once with a corrective re-prompt. See #864.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     llm: &dyn LlmProvider,
@@ -754,6 +758,7 @@ async fn run_loop(
     mcp_manager: Option<&McpManager>,
     long_running_ctx: Option<&executor::LongRunningContext>,
     required_tools: &HashSet<String>,
+    required_suffix_lines: &[String],
     enabled_tool_names: &HashSet<String>,
     store_llm_calls: bool,
     store_tool_calls: bool,
@@ -805,6 +810,10 @@ async fn run_loop(
     // Guards against turns that produce institutional knowledge without calling
     // store_fact/update_fact/update_core_memory (#648).
     let mut persistence_eval_retry_done = false;
+    // Whether we already injected a required-suffix-line correction. Only allow one retry.
+    // Guards against verdict-ghosting: skills declaring `[output] required_suffix_lines`
+    // must have one of the listed lines in the last 3 non-empty lines of the response. See #864.
+    let mut required_suffix_line_retry_done = false;
     // Intent-precondition registry retry tracking (#702). Each entry label
     // gets inserted on first fire; presence prevents re-fire. Replaces the
     // former `webhook_zero_tools_retry_done` boolean and generalizes to all
@@ -1394,6 +1403,66 @@ async fn run_loop(
                         }
                     }
 
+                    // #864 — Required-suffix-line guard. Skills can declare an exhaustive
+                    // accept-set for their final line; missing match rejects EndTurn once.
+                    // Position: END of the chain — other guards' rejections take precedence
+                    // so a turn rejected for a more fundamental reason doesn't waste a
+                    // suffix-line check.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !required_suffix_line_retry_done
+                        && !required_suffix_lines.is_empty()
+                    {
+                        let last_3_non_empty: Vec<&str> = text
+                            .lines()
+                            .map(|l| l.trim_end())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .take(3)
+                            .collect();
+                        let satisfied = last_3_non_empty
+                            .iter()
+                            .any(|line| required_suffix_lines.iter().any(|req| *line == req));
+                        if !satisfied {
+                            required_suffix_line_retry_done = true;
+                            let lines_display: Vec<String> = required_suffix_lines
+                                .iter()
+                                .map(|l| format!("  - \"{l}\""))
+                                .collect();
+                            warn!(
+                                step,
+                                label = mode.label(),
+                                "Required-suffix-line guard: assistant response missing \
+                                 required verdict line — re-prompting (#864)"
+                            );
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::Assistant,
+                                content: LlmContent::Blocks(
+                                    mika_common::llm::response_content_to_blocks(&response.content),
+                                ),
+                            });
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::User,
+                                content: LlmContent::Text(format!(
+                                    "[Your response must end with one of these literal lines \
+                                     (any of the last 3 non-empty lines, after whitespace \
+                                     trim, will satisfy):\n{}\n\
+                                     Re-emit the same response with one of the required lines \
+                                     appended verbatim on its own line at the end. Do not \
+                                     paraphrase — the suffix is a structural contract parsed \
+                                     by downstream consumers.\n\n\
+                                     (Required by skill [output].required_suffix_lines. \
+                                     See feedback_prompt_enforcement_fragile.md for why \
+                                     prompt-level \"MUST\" doesn't bind here.)]",
+                                    lines_display.join("\n"),
+                                )),
+                            });
+                            continue;
+                        }
+                    }
+
                     // #846 — operator notification when the ready-label dispatch
                     // guard fired but run_claude_pilot still wasn't called after
                     // the retry.  Without this the failure is silent past
@@ -1906,6 +1975,7 @@ async fn run_agent_inner(
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched, params.user_message);
+    let required_suffix_lines = collect_required_suffix_lines(&matched);
 
     // Build active skill paths for context-redundancy checks in read tools.
     // Each matched skill's system_prompt.md is already injected into the system prompt
@@ -2155,6 +2225,7 @@ async fn run_agent_inner(
         params.mcp_manager,
         lr_ctx.as_ref(),
         &required_tools,
+        &required_suffix_lines,
         &enabled_tool_names,
         store_llm,
         store_tools,
@@ -2986,6 +3057,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         return Ok(());
     }
 
+    let no_required_suffix_lines: Vec<String> = Vec::new();
     let result = run_loop(
         llm,
         tools,
@@ -2999,6 +3071,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         None, // MCP tools excluded from silent mode
         None, // long_running not supported in silent mode
         &no_required_tools,
+        &no_required_suffix_lines,
         &enabled_tool_names,
         store_llm,
         store_tools,
@@ -3276,6 +3349,7 @@ async fn run_team_agent_inner_impl(
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched, params.task_message);
+    let required_suffix_lines = collect_required_suffix_lines(&matched);
 
     // Append MCP tool definitions (if any MCP servers are connected)
     if let Some(mcp) = params.mcp_manager {
@@ -3384,6 +3458,7 @@ async fn run_team_agent_inner_impl(
         params.mcp_manager,
         None, // long_running: team agents will be wired in Phase 4
         &required_tools,
+        &required_suffix_lines,
         &enabled_tool_names,
         store_llm,
         store_tools,
@@ -3674,6 +3749,21 @@ fn collect_required_tools(matched: &[MatchedSkill<'_>], user_message: &str) -> H
     }
 
     required
+}
+
+/// Collect required suffix lines from keyword-matched and always-on skills' `[output]`
+/// sections. Returns the union of all declared `required_suffix_lines` entries.
+///
+/// Both `Keyword` and `AlwaysOn` matched skills contribute — unlike `required_tools`
+/// (which only fires on Keyword), suffix-line contracts apply whenever the skill's
+/// prompt is active. `Dependency`-matched skills do not contribute. See #864.
+fn collect_required_suffix_lines(matched: &[MatchedSkill<'_>]) -> Vec<String> {
+    matched
+        .iter()
+        .filter(|m| matches!(m.reason, MatchReason::Keyword | MatchReason::AlwaysOn))
+        .flat_map(|m| m.entry.manifest.output.required_suffix_lines.iter())
+        .cloned()
+        .collect()
 }
 
 /// Filter required tools to only those available in the current tool set.
@@ -4601,6 +4691,7 @@ mod tests {
                     required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
                     required_fetches_for_quoted_resources: false,
                 },
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },

@@ -99,6 +99,7 @@ mod tests {
                 },
                 llm: Default::default(),
                 constraints: Default::default(),
+                output: Default::default(),
                 context: std::collections::HashMap::new(),
                 variants: Default::default(),
             },
