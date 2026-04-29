@@ -45,8 +45,11 @@ The verdict handler (`server::verdict_handler`) intercepts `pull_request_review.
 2. **Extract verdict** from the review body using `parse_verdict()` — case-insensitive match on `VERDICT:` at start of line
 3. **Act on verdict:**
    - `pass` → look up task by `metadata.claude_pilot.pr_url`, check status is `in_progress`, then call `run_gh_checks` + `classify_checks` + `run_gh_merge` (reused from `pr_merge_with_gate`)
-   - `block[*]` / `hold[*]` → pass through to LLM (LLM still drives retry logic)
-   - Missing → log warning, pass through with `verdict_missing=true` enrichment
+   - `block[ac]` → look up task, dispatch claude-pilot with AC-fix prompt, bounded retry counter (max 3), escalate on limit (#889)
+   - `block[ci]` → look up task, dispatch claude-pilot with CI-fix prompt, bounded retry counter (max 3), escalate on limit (#889)
+   - `block[security]` / `block[pipeline]` → mark task blocked, notify operator, NO auto-dispatch (#889)
+   - `hold[review]` → notify operator, leave task in_progress (#889)
+   - Missing → safe-default hold[review] semantics + `verdict_classification_failed` structured log event (#889)
 4. **Pre-digest** the result for the LLM as a fait accompli — the LLM receives "merge initiated" rather than the raw review text
 
 Key design decisions:
