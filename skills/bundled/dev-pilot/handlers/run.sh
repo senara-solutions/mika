@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Handler for the dev-pilot skill (long-running exec).
 # Input: JSON on stdin with skill, prompt, and task_id fields.
 #        __mika_task_id and __mika_agent are injected by the executor.
@@ -9,6 +9,16 @@
 # For free-text prompts: passes prompt as-is to claude-pilot (no worktree).
 
 set -e
+
+# --- Diagnostic trace (mika#887) ---
+# Open dedicated fd 9 for xtrace output, redirect to per-PID trace file.
+# Using BASH_XTRACEFD (bash 4.1+) keeps fd 2 (stderr) intact so exec'd
+# subprocesses (claude-pilot) can use stderr normally.
+# Bare assignment (not export) — scoped to this process only; exporting would
+# propagate to forked bash subshells that don't inherit fd 9, causing silent loss.
+exec 9>>/tmp/dev-pilot-trace-$$.log
+BASH_XTRACEFD=9
+set -x
 
 # Ensure ~/.local/bin is in PATH (mika CLI needed for callback delivery)
 export PATH="$HOME/.local/bin:$PATH"
@@ -70,6 +80,28 @@ ${_STDERR_TAIL}"
     [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"
     if [ -z "$RESULT" ]; then
         RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result."
+    fi
+    # --- Diagnostic trace tail (mika#887) ---
+    # On crash path (RESULT was empty before above fallback), append xtrace tail
+    # so the crash is diagnosable from the database alone.
+    _TRACE_FILE="/tmp/dev-pilot-trace-$$.log"
+    if [ -f "$_TRACE_FILE" ]; then
+        case "$RESULT" in
+            "HANDLER CRASH"*)
+                # Crash path: append trace tail, preserve file for forensics
+                _TRACE_TAIL=$(tail -50 "$_TRACE_FILE" 2>/dev/null | sed 's/^/    /')
+                if [ -n "$_TRACE_TAIL" ]; then
+                    RESULT="${RESULT}
+
+Trace tail (last 50 lines):
+${_TRACE_TAIL}"
+                fi
+                ;;
+            *)
+                # Success/recovery path: clean up trace file
+                rm -f "$_TRACE_FILE"
+                ;;
+        esac
     fi
     # Issue #138: best-effort PR URL discovery on crash recovery path.
     # If claude-pilot created a PR before crashing, include the URL so the
@@ -434,6 +466,8 @@ else
 fi
 CALLBACK_EXIT=$?
 CALLBACK_SENT=1
+# Success path: clean up trace file (mika#887)
+rm -f "/tmp/dev-pilot-trace-$$.log"
 set -e
 
 if [ "$CALLBACK_EXIT" -ne 0 ]; then
