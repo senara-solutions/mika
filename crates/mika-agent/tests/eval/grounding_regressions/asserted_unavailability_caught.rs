@@ -114,12 +114,12 @@ async fn test_regression_asserted_unavailability_pre_fix_shape() -> anyhow::Resu
         .run("What do you know about gate-evasion patterns?")
         .await?;
 
-    // The guard fired once (llm_call_count > 1) but the agent still didn't call
-    // search_memory — this is the pre-fix failure shape. The guard did its job
-    // (single retry), but the agent didn't comply on the second attempt.
-    assert!(
-        trace.llm_call_count > 1,
-        "Expected guard to fire at least once, got llm_call_count={}",
+    // The guard fired exactly once (single-retry semantics) — 2 LLM calls total:
+    // initial turn + corrective re-prompt. The agent still didn't call search_memory
+    // on the retry — this is the pre-fix failure shape.
+    assert_eq!(
+        trace.llm_call_count, 2,
+        "Expected exactly 1 guard-retry (2 LLM calls), got {}",
         trace.llm_call_count
     );
 

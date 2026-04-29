@@ -4312,7 +4312,7 @@ static ASSERTED_UNAVAILABILITY_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> 
             .expect("asserted_unavailability pattern 3"),
             regex::Regex::new(r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) is skill-scoped")
                 .expect("asserted_unavailability pattern 4"),
-            regex::Regex::new(r"(?i)\bcannot call (?P<tool>[a-z_][a-z0-9_]*)")
+            regex::Regex::new(r"(?i)\bcannot call (?:the )?(?P<tool>[a-z_][a-z0-9_]*)")
                 .expect("asserted_unavailability pattern 5"),
         ]
     });
@@ -4330,9 +4330,13 @@ static ASSERTED_UNAVAILABILITY_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> 
 fn detect_asserted_unavailability(text: &str, enabled_tools: &HashSet<String>) -> Option<String> {
     for re in ASSERTED_UNAVAILABILITY_PATTERNS.iter() {
         for caps in re.captures_iter(text) {
-            let tool_name = &caps["tool"];
-            if enabled_tools.contains(tool_name) {
-                return Some(tool_name.to_string());
+            // Normalize to lowercase: `(?i)` makes the capture group match
+            // mixed-case text (e.g., "Search_Memory"), but the enabled_tools
+            // HashSet contains lowercase names from tool definitions. Without
+            // normalization, a mixed-case capture silently fails the lookup.
+            let tool_name = caps["tool"].to_ascii_lowercase();
+            if enabled_tools.contains(&tool_name) {
+                return Some(tool_name);
             }
         }
     }
@@ -4344,13 +4348,17 @@ fn detect_asserted_unavailability(text: &str, enabled_tools: &HashSet<String>) -
 ///
 /// Satisfied when:
 /// - `tool_name` is NOT in `enabled_tools` (assertion is structurally true), OR
-/// - a successful call to `tool_name` exists in the turn's tool summaries.
+/// - a call to `tool_name` was *attempted* in this turn (success or failure).
+///   The guard's purpose is to force an attempt, not a successful outcome.
+///   When the tool was called and returned a real error (auth, rate limit,
+///   network), the agent has evidence of the failure mode — that is a real
+///   signal, not a fabrication.
 fn asserted_unavailability_satisfied(
     tool_name: &str,
     enabled_tools: &HashSet<String>,
     summaries: &[ToolCallSummary],
 ) -> bool {
-    !enabled_tools.contains(tool_name) || summaries.iter().any(|s| s.name == tool_name && s.success)
+    !enabled_tools.contains(tool_name) || summaries.iter().any(|s| s.name == tool_name)
 }
 
 #[cfg(test)]
@@ -7427,6 +7435,12 @@ mod tests {
             detect_asserted_unavailability("cannot call store_fact in this mode", &enabled),
             Some("store_fact".to_string())
         );
+        // Article-prefixed form: "cannot call the <tool>"
+        assert_eq!(
+            detect_asserted_unavailability("I cannot call the store_fact tool directly", &enabled),
+            Some("store_fact".to_string()),
+            "Article 'the' before tool name must not capture 'the' instead of the tool"
+        );
     }
 
     #[test]
@@ -7458,6 +7472,16 @@ mod tests {
         assert_eq!(
             detect_asserted_unavailability("I DON'T HAVE ACCESS TO gh_read", &enabled),
             Some("gh_read".to_string())
+        );
+        // Mixed-case tool name in LLM text — should be normalized to lowercase
+        assert_eq!(
+            detect_asserted_unavailability("Search_Memory is not callable", &{
+                let mut s = HashSet::new();
+                s.insert("search_memory".to_string());
+                s
+            }),
+            Some("search_memory".to_string()),
+            "Mixed-case captured tool name must be normalized to match lowercase registry"
         );
     }
 
@@ -7501,7 +7525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_asserted_unavailability_not_satisfied_failed_call() {
+    fn test_asserted_unavailability_satisfied_failed_call() {
         let mut enabled = HashSet::new();
         enabled.insert("gh_read".to_string());
         let summaries = vec![ToolCallSummary {
@@ -7513,8 +7537,9 @@ mod tests {
             non_zero_exit: false,
         }];
         assert!(
-            !asserted_unavailability_satisfied("gh_read", &enabled, &summaries),
-            "Tool in enabled set with failed call = NOT satisfied (only successful calls count)"
+            asserted_unavailability_satisfied("gh_read", &enabled, &summaries),
+            "Tool in enabled set with failed call = satisfied (attempt was made, \
+             real failure surfaced — not a fabrication)"
         );
     }
 }
