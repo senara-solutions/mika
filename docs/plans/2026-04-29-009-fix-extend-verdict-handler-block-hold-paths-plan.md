@@ -43,6 +43,10 @@ Current shape (line 31): `Handled { pre_digest: String }`. New handlers return t
 
 Per architect F2 fix path (a): retry counter lives in `tasks.metadata` JSON as `verdict_block_ac.count`. No new column, no migration. Existing pattern from `handle_pass_verdict`'s `update_verdict_metadata()` call.
 
+### Pin 5 — AC-parser regex must be derived from qa-review skill prompt before coding
+
+Read `skills/bundled/qa-review/system_prompt.md`. Derive the AC-failure line shape (the format mika-qa uses to signal unsatisfied ACs in its review body). Pin the resulting regex BEFORE implementing `extract_unsatisfied_acs()` in Change 5. The fallback contract (2000-char ceiling + `verdict_ac_extraction_fallback` log event) means parser failure causes no correctness loss; this Pin is about quality-of-prompt-content for the auto-dispatched claude-pilot session, not correctness.
+
 ---
 
 ## Why
@@ -146,7 +150,10 @@ async fn handle_block_ac(
 }
 
 const BLOCK_AC_MAX_RETRIES: u32 = 3;
+const BLOCK_CI_MAX_RETRIES: u32 = 3;
 ```
+
+**Per architect F9 sharpening:** declare these as separate consts, NOT a shared `MAX_RETRIES`. Future calibration may diverge between AC and CI thresholds (e.g., CI is auto-fixable so could allow more retries; AC depends on plan-quality so may need stricter cap). Separate symbols keep that adjustability.
 
 **Why bounded:** without a counter, a `block[ac]` verdict that fixes some ACs but the next mika-qa review surfaces NEW ACs creates an unbounded loop (architect F2). The mika#524 `pass → merge` loop terminates by design (`pass` is terminal); `block[ac]` does NOT terminate by design.
 
