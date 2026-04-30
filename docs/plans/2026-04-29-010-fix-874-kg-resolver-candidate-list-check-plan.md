@@ -9,7 +9,16 @@ groomed_by: /mika-groom-milestone (per-sub-issue inline draft, B-with-guardrail)
 arch_first_pass_session: 3ac2706e-dbc6-428e-8111-b85ee1075645
 arch_first_pass_disposition: ITERATE
 arch_first_pass_findings_key: mika874_first_pass_findings
+arch_second_pass_disposition: ESCALATE
+arch_second_pass_findings_keys:
+  - vested_interest_carve_out_evidence_shapes  # F9
+  - schema_bump_deploy_risk_discipline         # F8
 external_consult_basis: peer-review brief on F4 + ops-surface evidence (Signal C — sqlite3 query against kg_resolutions_log is canonical operator workflow per mika/CLAUDE.md "Post-restart safety check #757")
+follow_ups_filed:
+  - senara-solutions/mika#901  # mika-arch emit-findings-verbatim (ready)
+  - senara-solutions/mika#904  # review-guide.md §7 carve-out sharpening (p1)
+  - senara-solutions/mika#905  # schema-bump-rollback-semantics best-practices doc (p2)
+external_second_pass_required: true  # honoring F9 here while disagreeing with the trigger (see §F9 counter-argument)
 ---
 
 # Plan — mika#874: candidate-list check rejects valid LLM matches as no_match
@@ -273,3 +282,100 @@ Cost-prediction sanity: the same OpenRouter pricing math from `mika/CLAUDE.md` S
 ## Sequencing note for milestone#19
 
 #874 and #875 are independent (F7) — no ordering required. Joint-metric monitoring distinguishes their respective success signals. The architect's milestone-level review should consider both in the sequencing record.
+
+---
+
+## Change 5 — Schema-bump rollback semantics audit (F8 — addresses second-pass blocker)
+
+mika-arch's second-pass ESCALATE flagged F8: the v26→v27 migration shape covers correctness but not rollback semantics. Audit conducted 2026-04-30 against the v28 baseline branch (`fix/874/kg-resolver-candidate-list-check-rejects`, base `244c1cc8`) using `rg` patterns from the schema-bump audit checklist (mika#905 will codify this checklist into a best-practices doc).
+
+### Audit methodology
+
+```
+rg -n 'outcome\.as_str|outcome\s*==|"matched_exact"|"matched_llm"|"no_match"|outcome\s*FROM' \
+   crates/mika-agent/src/
+```
+
+Plus targeted reads of the top-of-file const block at `entity_resolver.rs:51-59`, the `ResolutionStats` struct at `entity_resolver.rs:118-135`, the write sites at `entity_resolver.rs:398/415/427`, the stats JSON formatter at `entity_resolver.rs:1159-1163`, and all server/dashboard consumers under `crates/mika-agent/src/server/`.
+
+### Audit findings — v28 binary parser tolerance for unknown `outcome` values
+
+| Consumer site | Type | Behavior on unknown `outcome` value |
+|---------------|------|-------------------------------------|
+| `entity_resolver.rs:53-55` (const block) | write-side typed labels | N/A — consts can't accept unknown values; v28 binary cannot WRITE `matched_llm_db_fallback` |
+| `entity_resolver.rs:398, 415, 427` (DB writes) | UPSERT with `outcome::*` const | N/A — only writes the three known values |
+| `entity_resolver.rs:1159-1163` (stats JSON formatter) | format string with hardcoded keys | Only formats from `ResolutionStats` counters built at write time; unknown rows in DB do not feed back into this formatter |
+| `entity_resolver.rs:118-135` (`ResolutionStats`) | counter struct, populated at write time | New v29 rows in DB do not back-fill this struct; v28's stats output simply does not count them |
+| `server/mod.rs:1095, 1100-1101` (resolution startup logging) | reads `stats.matched_exact` etc. from `ResolutionStats` | Same as above — counters are write-time, not read-time aggregates |
+
+**Zero `match outcome.as_str()` arms in production code.** The codebase does not parse `outcome` strings into typed enum branches. Reads from `kg_resolutions_log.outcome` happen exclusively via:
+- Operator ad-hoc SQL (Signal C in `mika/CLAUDE.md`) — does not break on unfamiliar values; the canonical Signal C query is `WHERE NOT EXISTS` shaped, outcome value is irrelevant.
+- Test code at `tests/eval/kg_fixtures/mod.rs:912`, `tests/eval/kg_self_knowledge/*.rs` — string equality assertions on test-seeded values, not v28's production read paths.
+
+### Forward-compat assertion (preferred over operator runbook)
+
+**Under v28 binary running against v29 DB (rollback or multi-instance deploy):**
+- v28 cannot WRITE `matched_llm_db_fallback` (the const doesn't exist).
+- v28 reading the column produces unfamiliar string values, but no Rust read-side parser exists to choke on them.
+- v28's `ResolutionStats` counters under-count v29-written rows, but this is a metric-attribution loss, not a binary failure or data corruption.
+- Operator SQL (Signal C, post-restart safety check #757) returns rows with the unfamiliar value visible; ops can ignore or filter as needed.
+
+**No "drain new writes before downgrade" runbook required.** The v28 binary is forward-compatible against v29 DB rows by construction (no read-side parser to break), and the worst observable effect is metric under-attribution which is recoverable on the next v29 redeploy.
+
+**One caveat for completeness:** the `idx_kg_res_log_pending` index on `(agent_id, outcome)` makes v28's existing pending-detection queries slightly less efficient on a v29 DB (the index includes new outcome values v28 doesn't filter on), but query plans remain valid. Not material.
+
+### Why this audit, not a generalized doc
+
+mika#905 will extract `docs/solutions/best-practices/schema-bump-rollback-semantics-<date>.md` as a reusable checklist. Generalizing the pattern is out of scope for this p0 fix per `feedback_keep_simple.md` and `feedback_pipeline_match_severity.md`. The audit lives here because F8 is a BLOCKING finding on this specific plan; the pattern goes to mika#905.
+
+---
+
+## F9 counter-argument — carve-out trigger disagreement, external second-pass routed anyway
+
+mika-arch's second-pass ESCALATE invoked F9 (architect-self-review carve-out) on three grounds, with the third — "iteration history reveals vested interest" — cited as the strongest. **This plan disagrees with F9's trigger logic, while honoring its conclusion for #874 specifically.**
+
+### The disagreement
+
+F9's third ground asserts: "when a plan's iteration history shows decisions reshaped to benefit the reviewer's own consumption surface, that IS the vested-interest signature, regardless of whether the reasoning is sound."
+
+This trigger fires on **outcome shape** (the decision benefits the reviewer's surface), invariant to **causation** (who drove the reshaping). The F4 flip in this plan (out-of-scope → schema bump) was driven by:
+
+1. **External peer-review brief** (operator's `/mika-ask-a-friend` consultation with another Claude instance) — not mika-arch.
+2. **Operator decision** based on the peer's analysis — not mika-arch.
+3. **Citation of canonical operator workflow** (Signal C in `mika/CLAUDE.md` "Post-restart safety check #757") — independent of mika-arch's first-pass critique.
+
+mika-arch's first-pass under key `mika874_first_pass_findings` tagged F4 BLOCKING with: "if schema migration out of scope, add explicit Out-of-Scope with rationale." The first-pass asked for *explicitness*, not for the flip itself. The decision to flip happened externally to the reviewer; the reviewer is now citing that external-driven flip as evidence of its own vested interest. **Logically inverted under a causation-aware reading of `review-guide.md` §7.**
+
+### Why this disagreement is itself the carve-out's purpose
+
+If mika-arch raises a recursion concern unprompted, overruling that erodes the very recursion safety §7 exists to provide. The right move is to:
+
+1. **Honor F9 here.** Route the second-pass external for #874 specifically. The plan does not auto-dispatch on the reviewer's verdict.
+2. **Not capitulate.** Document the disagreement explicitly so the carve-out doesn't fire unaudited on #875/#876/#877 (and beyond). The trigger needs sharpening, not silent compliance.
+3. **File the trigger sharpening.** mika#904 (`review-guide.md §7: sharpen recursive-self-review carve-out — distinguish causation from outcome-shape; specify identity vs prompt vs memory isolation`) was filed during this iteration. Until it lands, the strict outcome-shape reading governs; after it lands, the causation-aware reading governs.
+
+This is the move described in mika-arch's own F9 record — "Brief's explicit deferral ('proceeding by spec inheritance unless you object') is the operator-correct shape — architect must object when carve-out applies, not ratify by silence." The architect objected; the operator honors the objection here while challenging the trigger.
+
+### What "external second-pass" means in practice for this plan
+
+- This plan's `Verdict: GROOMED | ESCALATE` is to be returned by an external reviewer (operator's peer brief routed through `/mika-ask-a-friend`, NOT a follow-up `/mika-ask-arch` call to mika-arch).
+- The external brief includes: this plan in full, the F1–F9 finding history, the F8 rollback audit (Change 5), this F9 counter-argument section, and the explicit ask "Verdict: GROOMED | ESCALATE on the patched plan."
+- If the external reviewer returns `Verdict: ESCALATE`, the per-ticket flow halts under `/mika-groom-ticket` Phase 4 step 15 (no third pass). Operator decides whether to revise further or proceed manually.
+- If `Verdict: GROOMED`, this plan proceeds to Phase 5 (finalize/commit/push, attach issue body callouts) and into milestone#19's sequencing record.
+
+### Sequencing implication for #875–#877
+
+The F9 trigger as currently written (outcome-shape) would also fire on #875–#877's second-passes — they all touch mika-arch's KG infrastructure and any improvement they produce benefits mika-arch's surface. Under the strict reading, every per-ticket second-pass routes external; cumulative cost: 4 external second-passes for milestone#19's per-ticket loop alone, plus the milestone-level external pass that's already wired in.
+
+**Mitigation:** the milestone sequencing record (Phase 6 of `/mika-groom-milestone`) will record this disagreement and explicitly defer the per-ticket second-pass routing decision to mika#904's resolution. If mika#904 lands before #875's grooming starts, #875–#877 second-passes route to mika-arch under the causation-aware reading (none of them have an F4-flip-shaped vested-interest signature; their fixes are mechanical Stage-1 / extractor / corpora work). If mika#904 has not landed, operator decides per-ticket whether to honor the strict reading or override on causation-aware grounds.
+
+---
+
+## State summary at end of grooming
+
+- **Plan committed:** at `0d493be8` on branch `fix/874/kg-resolver-candidate-list-check-rejects`. This commit addresses F1–F7. The F8 audit + F9 counter-argument additions are a follow-up commit.
+- **mika-arch first-pass:** ITERATE (Disposition), session `3ac2706e-dbc6-428e-8111-b85ee1075645`, findings under `mika874_first_pass_findings`.
+- **mika-arch second-pass:** ESCALATE (Verdict), same session, additional findings under `vested_interest_carve_out_evidence_shapes` (F9) and `schema_bump_deploy_risk_discipline` (F8).
+- **External second-pass:** required per F9 honoring; pending operator-routed peer-review brief.
+- **Follow-ups filed:** mika#901 (architect emit-findings-verbatim — bumped to `ready`), mika#904 (§7 carve-out sharpening), mika#905 (schema-bump-rollback best-practices doc).
+- **Plan disposition:** `READY pending external second-pass`. Not GROOMED until external reviewer returns Verdict.
