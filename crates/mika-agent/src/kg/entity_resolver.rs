@@ -742,6 +742,55 @@ impl SubjectEntityResolver {
             .await
     }
 
+    /// Count pending entities without fetching full rows (#906).
+    ///
+    /// Mirrors `get_pending_entities`'s WHERE clause (same `docs_root_hash
+    /// IN (?,?,...)` multi-corpus pattern, same `LEFT JOIN kg_resolutions_log`
+    /// pending semantics) but with `SELECT COUNT(*)` projection.
+    ///
+    /// Used by the periodic resolver tick for observability (pending_before /
+    /// pending_after logging). Cheap — one SQLite query, no row materialization.
+    pub async fn count_pending(&self) -> Result<u64> {
+        let agent_id = self.db.agent_id.clone();
+        let docs_root_hashes = self.docs_root_hashes.clone();
+
+        self.db
+            .with_db(move |db| {
+                if docs_root_hashes.is_empty() {
+                    return Ok(0);
+                }
+                let hash_placeholders: Vec<String> =
+                    docs_root_hashes.iter().map(|_| "?".to_string()).collect();
+                let sql = format!(
+                    "SELECT COUNT(*)
+                     FROM kg_subject_entities e
+                     LEFT JOIN kg_resolutions_log r
+                         ON r.subject_entity_id = e.id AND r.agent_id = ?
+                     WHERE e.docs_root_hash IN ({})
+                       AND e.type IN ('skill', 'tool', 'agent', 'problem_type')
+                       AND (
+                         r.id IS NULL
+                         OR r.source_extraction_trace_id != (
+                             SELECT cs.extraction_trace_id
+                             FROM kg_chunk_subjects cs
+                             WHERE cs.subject_entity_id = e.id
+                             ORDER BY cs.created_at DESC LIMIT 1
+                         )
+                       )",
+                    hash_placeholders.join(","),
+                );
+                let mut stmt = db.conn.prepare(&sql)?;
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(agent_id)];
+                for h in &docs_root_hashes {
+                    params.push(Box::new(h.clone()));
+                }
+                let count: u64 =
+                    stmt.query_row(rusqlite::params_from_iter(params), |row| row.get(0))?;
+                Ok(count)
+            })
+            .await
+    }
+
     /// Get pending entities — never attempted or stale from re-extraction (D4).
     /// Scoped to all the agent's docs_root_hashes via IN-list (#798).
     async fn get_pending_entities(&self) -> Result<Vec<PendingEntity>> {

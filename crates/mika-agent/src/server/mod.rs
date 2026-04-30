@@ -1147,6 +1147,19 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                         ),
                     }
                 });
+
+                // Periodic resolver tick (#906): drains Stage-2 backlog every
+                // 30 min at the existing budget, decoupling drain rate from
+                // restart cadence. The startup spawn above handles the immediate
+                // post-restart drain; this tick handles steady-state.
+                crate::kg::resolver_tick::spawn_resolver_tick_task(
+                    agent_name.clone(),
+                    agent_state.db.clone(),
+                    resolution_llm.clone(),
+                    &agent_state.kg_config,
+                    kg_batch_budget,
+                    None, // default 30-min interval
+                );
             }
         }
     }

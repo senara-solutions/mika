@@ -323,7 +323,7 @@ docs_roots = [
 
 **Two-stage pipeline (D1):** Stage 1: case-insensitive exact match against `kg_entities.entity_key`. If match found and extraction confidence > 0.9, resolve immediately (confidence = extraction_confidence). Stage 2: LLM disambiguation with candidate list (max 50) and source chunk prose context. Combined confidence = min(extraction_confidence, llm_confidence). Discovered types (solution_path, failure_mode, pattern) skip resolution entirely — no domain counterpart exists.
 
-**Execution contexts (D5):** (1) Startup: background `tokio::spawn` per agent after extraction tasks, non-blocking. (2) Compound hook: `IngestionOrchestrator` spawns async resolution after extraction commits. (3) `resolve_pending()` catches entities missed by either path.
+**Execution contexts (D5):** (1) Startup: background `tokio::spawn` per agent after extraction tasks, non-blocking. (2) Compound hook: `IngestionOrchestrator` spawns async resolution after extraction commits. (3) Periodic tick (#906): `kg::resolver_tick::spawn_resolver_tick_task()` runs `resolve_pending(budget)` every 30 minutes per KG-enabled agent, decoupling drain rate from restart cadence. First fire skipped (startup spawn covers it). Fail-open (log-and-skip per C2.3). Lifecycle tied to tokio runtime drop (same pattern as `checkpoint_task`). Structured log events: `kg_resolver_tick.start`, `kg_resolver_tick.complete`, `kg_resolver_tick.error`.
 
 **Pending-entity detection (D4):** `kg_resolutions_log` tracking table with `UNIQUE(agent_id, subject_entity_id)`. Pending query: subject entities with well-known types that have no log row, or whose `source_extraction_trace_id` differs from the latest `kg_chunk_subjects` extraction.
 
