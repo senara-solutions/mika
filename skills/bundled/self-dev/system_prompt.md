@@ -239,27 +239,37 @@ After claude-pilot creates a PR, proceed directly to Step 6 with `in_progress`.
 
 When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the operator has set the `ready` label on the ticket — the canonical positive-consent signal for autonomous dispatch.
 
-> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846).** Removing the label without attempting `run_claude_pilot` will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
+> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846, #907).** The guard accepts EITHER a `run_claude_pilot` attempt (dispatch path) OR a `send_message` call (grooming-rejection path). Ending the turn without either will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
 
-**Atomic handler (label removal first, dispatch second — per mika#841):**
+**Atomic handler (label removal first, then grooming check, then dispatch — per mika#841, #907):**
 
 1. **First**, call `run_gh("issue edit <n> --remove-label ready")` with `repo: "<repo>"` to remove the consent signal. Label-removal-first lets the operator re-add the label to retry if subsequent steps fail.
 
    **On `run_gh` failure (non-zero exit):** Do NOT call `create_task` or `run_claude_pilot`. Send the operator a `send_message` with the gh stderr and stop the turn — the label is still present, and they can fix permissions and re-add to retry.
 
-2. **Second**, call `run_gh` with args `issue view <n> --json title,body --repo <repo>` to fetch the issue title and body — required input for `create_task`.
+2. **Second**, call `run_gh` with args `issue view <n> --json title,body --repo <repo>` to fetch the issue title and body — required input for the grooming check and `create_task`.
 
-3. **Third**, call `create_task` with `reference_url: "https://github.com/<repo>/issues/<n>"`, `label: <issue title>`, `description: <issue body>`, and `source: "self_dev"`. `create_task` is idempotent on `reference_url`, so a duplicate webhook reuses an existing `task_id`. Capture the returned `task_id` (UUID).
+3. **Third (GROOMING PRE-FLIGHT — mika#907)**, scan the fetched issue body for the grooming marker: `> - **Plan:**`. This callout is written by the architect grooming pipeline (`/mika-groom-ticket`) and its presence confirms the ticket has been groomed.
 
-4. **IMMEDIATELY after Step 3, call `run_claude_pilot`.** No other tool calls permitted between Step 3 and this call. Do not read files, analyze code, plan, summarize, or list "next steps." Call `run_claude_pilot` NOW.
+   **If the marker is NOT found in the issue body:** Do NOT call `create_task` or `run_claude_pilot`. Call `send_message` to notify the operator:
+
+   > "Ready-label dispatch blocked on `<repo>#<n>`: issue body lacks the grooming marker (`> - **Plan:**`). The ticket must be groomed before dispatch. Run `/mika-groom-ticket <repo>#<n>` to produce the plan, then re-add the `ready` label."
+
+   Stop the turn after `send_message`. The engine guard accepts `send_message` as valid completion for this path.
+
+   **If the marker IS found:** Proceed to Step 4.
+
+4. **Fourth**, call `create_task` with `reference_url: "https://github.com/<repo>/issues/<n>"`, `label: <issue title>`, `description: <issue body>`, and `source: "self_dev"`. `create_task` is idempotent on `reference_url`, so a duplicate webhook reuses an existing `task_id`. Capture the returned `task_id` (UUID).
+
+5. **IMMEDIATELY after Step 4, call `run_claude_pilot`.** No other tool calls permitted between Step 4 and this call. Do not read files, analyze code, plan, summarize, or list "next steps." Call `run_claude_pilot` NOW.
 
    ```json
-   {"prompt": "<repo>#<n>", "task_id": "<UUID from Step 3>"}
+   {"prompt": "<repo>#<n>", "task_id": "<UUID from Step 4>"}
    ```
 
    If `run_claude_pilot` returns a terminal error (`global_dispatch_active`, `task_not_dispatchable`, `dispatch_blocked_by`, `dispatch_limit_exceeded`), do NOT retry. Send the operator a `send_message` naming the rejection cause and stop — the engine guard accepts the attempt as satisfying the dispatch contract.
 
-**GATE: If Step 1 succeeded but you have NOT attempted `run_claude_pilot` in this turn, call Steps 2–4 immediately — do not end the turn.**
+**GATE: If Step 1 succeeded but you have completed NEITHER `run_claude_pilot` NOR `send_message` (grooming rejection) in this turn, call Steps 2–5 immediately — do not end the turn.**
 
 **Other label-add events** (`bug`, `enhancement`, `p1-important`, etc.) — any `[GitHub] Issue labeled <name> on ...` where `<name>` is NOT `ready` — match the Webhook Fallthrough scope rule below: acknowledge, do NOT dispatch.
 

@@ -53,6 +53,7 @@ mod eval {
     mod test_persistence_eval_guard;
     mod test_phantom_retry_guard;
     mod test_pr_review_idempotency;
+    mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;
     mod test_request_wellformedness;
     mod test_required_tools_gate;
