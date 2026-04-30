@@ -156,6 +156,9 @@ pub struct GitHubRepository {
 /// is dropped with a warning — the skill never reaches the agent.
 const WEBHOOK_SKILL_DENYLIST: &[&str] = &["dev-groom"];
 
+const DEFAULT_GITHUB_BODY_TRUNCATION_CHARS: usize = 2_000;
+const GITHUB_REVIEW_BODY_TRUNCATION_CHARS: usize = 16_000;
+
 /// Check if a labeled event's label name matches a denylisted skill.
 ///
 /// Only applies to `issues.labeled` events — returns `true` when the label name
@@ -234,7 +237,10 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .and_then(|i| i.title.as_deref())
                 .unwrap_or("(no title)");
             let url = issue.and_then(|i| i.html_url.as_deref()).unwrap_or("");
-            let body = truncate_body(issue.and_then(|i| i.body.as_deref()).unwrap_or(""), 2000);
+            let body = truncate_body(
+                issue.and_then(|i| i.body.as_deref()).unwrap_or(""),
+                DEFAULT_GITHUB_BODY_TRUNCATION_CHARS,
+            );
 
             // For label-add events, emit a structured marker with the specific
             // label name so mika-dev's prompt can pattern-match unambiguously.
@@ -276,7 +282,10 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .map(|u| u.login.as_str())
                 .unwrap_or("unknown");
             let comment_url = comment.and_then(|c| c.html_url.as_deref()).unwrap_or("");
-            let body = truncate_body(comment.and_then(|c| c.body.as_deref()).unwrap_or(""), 2000);
+            let body = truncate_body(
+                comment.and_then(|c| c.body.as_deref()).unwrap_or(""),
+                DEFAULT_GITHUB_BODY_TRUNCATION_CHARS,
+            );
 
             format!(
                 "[GitHub] New comment on {repo_name}#{number} ({title}) by @{commenter}\n{comment_url}\n\n{body}"
@@ -291,7 +300,10 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .and_then(|p| p.head.as_ref())
                 .and_then(|h| h.ref_name.as_deref())
                 .unwrap_or("unknown");
-            let body = truncate_body(pr.and_then(|p| p.body.as_deref()).unwrap_or(""), 2000);
+            let body = truncate_body(
+                pr.and_then(|p| p.body.as_deref()).unwrap_or(""),
+                DEFAULT_GITHUB_BODY_TRUNCATION_CHARS,
+            );
 
             let mut text = format!(
                 "[GitHub] PR {action}: {repo_name}#{number} — {title} (branch: {branch})\n{url}"
@@ -321,7 +333,10 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
                 .unwrap_or("unknown");
             let state = review.and_then(|r| r.state.as_deref()).unwrap_or("unknown");
             let review_url = review.and_then(|r| r.html_url.as_deref()).unwrap_or("");
-            let body = truncate_body(review.and_then(|r| r.body.as_deref()).unwrap_or(""), 2000);
+            let body = truncate_body(
+                review.and_then(|r| r.body.as_deref()).unwrap_or(""),
+                GITHUB_REVIEW_BODY_TRUNCATION_CHARS,
+            );
 
             let mut text = format!(
                 "[GitHub] PR review ({state}) on {repo_name}#{number} ({title}) by @{reviewer}\n{review_url}"
@@ -1253,6 +1268,104 @@ mod tests {
         assert!(text.contains("[GitHub] PR opened"));
         assert!(text.contains("org/repo#10"));
         assert!(text.contains("fix/bug"));
+    }
+
+    #[test]
+    fn test_format_event_text_pr_review_preserves_verdict_past_legacy_cap() {
+        let long_review = format!(
+            "{}\nVERDICT: pass\nReady to merge.",
+            "review detail. ".repeat(220)
+        );
+        assert!(long_review.chars().count() > DEFAULT_GITHUB_BODY_TRUNCATION_CHARS);
+        assert!(long_review.chars().count() < GITHUB_REVIEW_BODY_TRUNCATION_CHARS);
+
+        let event = GitHubWebhookEvent {
+            action: Some("submitted".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: None,
+            pull_request: Some(GitHubPullRequest {
+                number: Some(909),
+                title: Some("Fix review routing".to_string()),
+                html_url: Some("https://github.com/senara-solutions/mika/pull/909".to_string()),
+                body: None,
+                head: Some(GitHubRef {
+                    ref_name: Some("fix/review-routing".to_string()),
+                }),
+                merged: None,
+            }),
+            comment: None,
+            review: Some(GitHubReview {
+                state: Some("approved".to_string()),
+                body: Some(long_review),
+                html_url: Some("https://github.com/senara-solutions/mika/pull/909#pullrequestreview-1".to_string()),
+                user: Some(GitHubUser {
+                    login: "mika-qa".to_string(),
+                    user_type: Some("Bot".to_string()),
+                }),
+            }),
+            requested_reviewer: None,
+            label: None,
+            repository: Some(GitHubRepository {
+                full_name: Some("senara-solutions/mika".to_string()),
+                html_url: None,
+            }),
+        };
+
+        let text = format_event_text("pull_request_review", &event);
+        assert!(text.contains("[GitHub] PR review (approved)"));
+        assert!(text.contains("by @mika-qa"));
+        assert!(text.contains("VERDICT: pass"));
+        assert!(!text.contains("[truncated]"));
+    }
+
+    #[test]
+    fn test_format_event_text_pr_review_still_truncates_above_review_cap() {
+        let long_review = format!(
+            "{}\nVERDICT: pass\n{}",
+            "lead detail. ".repeat(20),
+            "tail detail. ".repeat(2_000)
+        );
+        assert!(long_review.chars().count() > GITHUB_REVIEW_BODY_TRUNCATION_CHARS);
+
+        let event = GitHubWebhookEvent {
+            action: Some("submitted".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: None,
+            pull_request: Some(GitHubPullRequest {
+                number: Some(909),
+                title: Some("Fix review routing".to_string()),
+                html_url: Some("https://github.com/senara-solutions/mika/pull/909".to_string()),
+                body: None,
+                head: Some(GitHubRef {
+                    ref_name: Some("fix/review-routing".to_string()),
+                }),
+                merged: None,
+            }),
+            comment: None,
+            review: Some(GitHubReview {
+                state: Some("approved".to_string()),
+                body: Some(long_review),
+                html_url: Some("https://github.com/senara-solutions/mika/pull/909#pullrequestreview-1".to_string()),
+                user: Some(GitHubUser {
+                    login: "mika-qa".to_string(),
+                    user_type: Some("Bot".to_string()),
+                }),
+            }),
+            requested_reviewer: None,
+            label: None,
+            repository: Some(GitHubRepository {
+                full_name: Some("senara-solutions/mika".to_string()),
+                html_url: None,
+            }),
+        };
+
+        let text = format_event_text("pull_request_review", &event);
+        assert!(text.contains("VERDICT: pass"));
+        assert!(text.contains("[truncated]"));
     }
 
     #[test]
