@@ -31,4 +31,5 @@ pub mod entity_resolver;
 pub mod ingestion_orchestrator;
 pub mod lexical_ingestor;
 pub mod query;
+pub mod resolver_tick;
 pub mod subject_extractor;
