@@ -102,6 +102,10 @@ let placeholders: Vec<String> = docs_root_hashes.iter().map(|_| "?".to_string())
 
 `crates/mika-agent/src/server/checkpoint.rs::spawn_dashboard_checkpoint_task()` runs `PRAGMA wal_checkpoint(PASSIVE)` every 60s via `tokio::time::interval`. Documented in `crates/mika-agent/CLAUDE.md` § HTTP Server. Lifecycle: tied to tokio runtime drop (no explicit shutdown hook). Body fully bounded per iteration (no held resources). Fail mode: log-and-skip via `tracing::warn!`. The resolver tick mirrors this shape.
 
+### Pin 4: Documentation parity surface for the new periodic task
+
+Per architect F9 sharpening, ran `grep -rln "checkpoint_task\|spawn_dashboard\|periodic.*task" docs/` and `grep -in "checkpoint_task\|background task\|tokio task\|tick" docs/runtime-structure.md` to identify documentation surfaces that enumerate background tasks. Result: `docs/runtime-structure.md` has no background-tasks section; `docs/architecture.md` mentions periodic dispatch in passing but has no canonical enumeration; the authoritative surface for periodic tokio-task documentation is `crates/mika-agent/CLAUDE.md` (§ HTTP Server documents `checkpoint_task`; § Knowledge Graph — Entity Resolver documents the resolver's two existing execution contexts). **Implication:** Unit 2's targeting of `crates/mika-agent/CLAUDE.md` covers the documentation parity requirement; no additional documentation surface needs editing.
+
 ## Context & Research
 
 ### Relevant Code and Patterns
@@ -206,7 +210,7 @@ let placeholders: Vec<String> = docs_root_hashes.iter().map(|_| "?".to_string())
     ```
   - Wire into agent init at the same call site as the existing startup background resolver. The startup spawn handles immediate post-restart drain; the tick handles steady-state.
   - The 30-min interval is hard-coded. Future tunable env var (`MIKA_KG_RESOLVER_TICK_INTERVAL_SECS`) deferred (Future Work section).
-  - **`count_pending` helper:** if `EntityResolver` does not already expose a public `count_pending` method, add one (just runs `SELECT COUNT(*)` against the existing pending-entities query). This is a small additive surface — no behavior change to `resolve_pending` itself. If reading the agent-init wiring reveals that the count is already exposed via stats, prefer that over adding a new method.
+  - **`count_pending` helper:** if `EntityResolver` does not already expose a public `count_pending` method, add one (just runs `SELECT COUNT(*)` against the existing pending-entities query). This is a small additive surface — no behavior change to `resolve_pending` itself. If reading the agent-init wiring reveals that the count is already exposed via stats, prefer that over adding a new method. **SQL shape (per architect F8 sharpening):** if (b), the new method's SQL mirrors `get_pending_entities`'s WHERE clause (same `docs_root_hash IN (?,?,...)` multi-corpus pattern, same `LEFT JOIN kg_resolutions_log r ON r.subject_entity_id = e.id` pending semantics) but with `SELECT COUNT(*)` projection. This pre-authors the multi-corpus semantics at the count layer to match Pin 2's IN-list pattern.
 
   **Patterns to follow:**
   - `crates/mika-agent/src/server/checkpoint.rs::spawn_dashboard_checkpoint_task()` — interval shape, log-event-on-each-fire shape, fail-open shape, lifecycle (tokio-runtime-drop, no explicit shutdown).
