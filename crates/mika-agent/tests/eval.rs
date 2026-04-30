@@ -62,6 +62,7 @@ mod eval {
     mod test_task_not_found_retry;
     mod test_tool_calling;
     mod test_verdict_handler;
+    mod test_webhook_no_unauthorized_dispatch_guard;
     mod test_webhook_queue;
     mod test_webhook_zero_tools_guard;
 }

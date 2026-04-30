@@ -4273,6 +4273,35 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
              that grooming is required before dispatch. Do not end this turn \
              until you have either dispatched or notified.]",
     },
+    // #910 — non-ready [GitHub] webhook turns must NOT call run_claude_pilot.
+    // Per mika#841 Layer 1 source-check, only `[GitHub] Issue labeled ready on`
+    // webhooks may dispatch.  All other [GitHub] events (comments, other labels,
+    // edits, PR reviews, check suites) must use Webhook Fallthrough:
+    // acknowledge without calling run_claude_pilot.
+    //
+    // Composes with webhook_ready_label_dispatch (positive case: ready label
+    // MUST dispatch) without overlap — trigger predicates are mutually exclusive
+    // on the READY_LABEL_DISPATCH_MARKER prefix.
+    //
+    // The satisfied predicate checks for SUCCESSFUL run_claude_pilot calls only.
+    // Failed attempts (e.g., task_not_dispatchable, global_dispatch_active) are
+    // already blocked by the dispatch-readiness guard in executor.rs — no need
+    // for double-rejection.  The issue is unauthorized *successful* dispatch.
+    //
+    // Three documented incidents (#798, #838, #910) establish the ratchet
+    // condition: prompt-level rules drift in the limit; engine-level invariants
+    // don't.
+    IntentPrecondition {
+        label: "webhook_no_unauthorized_dispatch",
+        trigger: webhook_no_unauthorized_dispatch_trigger,
+        satisfied: webhook_no_unauthorized_dispatch_satisfied,
+        correction_message: "[Your response was rejected. You called \
+             run_claude_pilot on a [GitHub] webhook turn that was NOT a 'ready' \
+             label event. Per Layer 1 source-check (mika#841), only '[GitHub] \
+             Issue labeled ready on' webhooks may dispatch. All other [GitHub] \
+             events (comments, other labels, edits) must use Webhook Fallthrough: \
+             acknowledge without calling run_claude_pilot.]",
+    },
     // #696 — webhook events require at least one successful tool call.
     IntentPrecondition {
         label: "webhook_zero_tools",
@@ -4354,6 +4383,25 @@ fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
     summaries
         .iter()
         .any(|s| s.name == "run_claude_pilot" || s.name == "send_message")
+}
+
+/// #910 — Triggers on `[GitHub]` webhook turns that are NOT ready-label
+/// dispatch events.  Inverse of `ready_label_dispatch_trigger` on the
+/// `[GitHub]` domain.  Uses `READY_LABEL_DISPATCH_MARKER` for consistency
+/// with the positive-case guard.
+fn webhook_no_unauthorized_dispatch_trigger(msg: &str) -> bool {
+    msg.starts_with("[GitHub]") && !msg.starts_with(READY_LABEL_DISPATCH_MARKER)
+}
+
+/// #910 — Returns `true` when `run_claude_pilot` was NOT successfully called
+/// during this turn.  The guard is satisfied (i.e. the turn is allowed) when
+/// no successful dispatch occurred.  Failed `run_claude_pilot` attempts are
+/// ignored — the dispatch-readiness guard in `executor.rs` already blocked
+/// them structurally.
+fn webhook_no_unauthorized_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
+    !summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" && s.success)
 }
 
 /// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
@@ -7675,6 +7723,187 @@ mod tests {
             "webhook_ready_label_dispatch (idx={ready_idx}) must precede \
              webhook_zero_tools (idx={zero_idx}) so the more specific trigger \
              fires first"
+        );
+    }
+
+    // -- #910 webhook_no_unauthorized_dispatch trigger tests --
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_matches_comment_events() {
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] New comment on senara-solutions/mika#906 by @samidarko\nhttps://github.com/senara-solutions/mika/issues/906#issuecomment-123\n\nGroomed end-to-end."
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_matches_non_ready_labels() {
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled bug on mika#999"
+        ));
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled p1-important on mika#999"
+        ));
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled enhancement on mika#999"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_matches_pr_review() {
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] PR review (approved) on senara-solutions/mika#694 by reviewer"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_matches_check_suite() {
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Check suite failure on branch fix/foo"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_rejects_ready_label() {
+        // Ready-label events must NOT trigger this guard — the positive-case
+        // guard (webhook_ready_label_dispatch) handles them.
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled ready on mika#999"
+        ));
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 \u{2014} title"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_rejects_direct_prompts() {
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "implement mika issue#999"
+        ));
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "dispatch mika#906"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_rejects_empty() {
+        assert!(!webhook_no_unauthorized_dispatch_trigger(""));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_rejects_callback() {
+        // Callback triggers have a different prefix.
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "[callback: run_claude_pilot]"
+        ));
+    }
+
+    // -- #910 webhook_no_unauthorized_dispatch satisfied tests --
+
+    #[test]
+    fn no_unauthorized_dispatch_satisfied_when_empty() {
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&[]));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_satisfied_when_only_run_gh() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_satisfied_when_pilot_failed() {
+        // Failed run_claude_pilot (e.g., task_not_dispatchable) is already
+        // blocked by the dispatch-readiness guard — no double-rejection needed.
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_claude_pilot".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: false,
+            non_zero_exit: true,
+        }];
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_not_satisfied_when_pilot_succeeded() {
+        // This is the unauthorized dispatch case — run_claude_pilot succeeded
+        // on a non-ready webhook turn.
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "run_gh".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "create_task".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 2,
+                name: "run_claude_pilot".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(!webhook_no_unauthorized_dispatch_satisfied(&summaries));
+    }
+
+    // -- #910 ordering invariant --
+
+    #[test]
+    fn no_unauthorized_dispatch_guard_ordering() {
+        // webhook_no_unauthorized_dispatch must appear AFTER
+        // webhook_ready_label_dispatch (which handles the positive case)
+        // and BEFORE webhook_zero_tools (logical grouping of webhook guards).
+        let labels: Vec<&str> = INTENT_GUARDS.iter().map(|g| g.label).collect();
+        let ready_idx = labels
+            .iter()
+            .position(|l| *l == "webhook_ready_label_dispatch")
+            .expect("webhook_ready_label_dispatch must be registered");
+        let no_dispatch_idx = labels
+            .iter()
+            .position(|l| *l == "webhook_no_unauthorized_dispatch")
+            .expect("webhook_no_unauthorized_dispatch must be registered");
+        let zero_idx = labels
+            .iter()
+            .position(|l| *l == "webhook_zero_tools")
+            .expect("webhook_zero_tools must be registered");
+        assert!(
+            ready_idx < no_dispatch_idx,
+            "webhook_ready_label_dispatch (idx={ready_idx}) must precede \
+             webhook_no_unauthorized_dispatch (idx={no_dispatch_idx})"
+        );
+        assert!(
+            no_dispatch_idx < zero_idx,
+            "webhook_no_unauthorized_dispatch (idx={no_dispatch_idx}) must precede \
+             webhook_zero_tools (idx={zero_idx})"
+        );
+    }
+
+    #[test]
+    fn intent_guards_registry_count() {
+        // Five guards after adding webhook_no_unauthorized_dispatch.
+        assert_eq!(
+            INTENT_GUARDS.len(),
+            5,
+            "INTENT_GUARDS should have exactly 5 entries"
         );
     }
 
