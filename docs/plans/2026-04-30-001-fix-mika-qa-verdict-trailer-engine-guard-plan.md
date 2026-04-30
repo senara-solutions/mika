@@ -108,6 +108,8 @@ pub struct RequiredToolArgSuffix {
 
 `Vec` not `HashMap`: deterministic iteration order for log/error messages, no surprise dedup; manifest can declare the same tool/arg twice (validated at load) for clarity if multiple skills opt in.
 
+**Matcher implementation (per architect F10):** `str::contains` against each trimmed non-empty line of the body argument — NOT regex or glob — to preserve literal `[` / `]` character semantics in token names like `block[ac]`. Bracket characters in glob/regex contexts have meta-meaning ("any character in set"); fixed-string containment is the only safe matcher for the closed-alphabet token list.
+
 ### Change 2 — qa-review skill.toml opt-in (architect F1 literal list)
 
 ```toml
@@ -158,6 +160,8 @@ fn extract_pr_review_body(argv: &[String]) -> Option<String> {
 ```
 
 **Loud-fail at manifest validation (architect F3):** in `validate_skill()` (or the manifest-load path), iterate `output.required_tool_arg_suffixes` entries and assert each `arg` value is a key in `LOGICAL_KEY_TO_EXTRACTOR`. Unknown key → return a `SkillDiagnostic::Fail` with structured message naming the unknown key and listing valid keys. Skill load fails — does NOT silently no-op the validation.
+
+**Maintenance discipline for `LOGICAL_KEY_TO_EXTRACTOR` (per architect F9):** Adding a new logical key requires simultaneous update to `LOGICAL_KEY_TO_EXTRACTOR` AND a corresponding unit test verifying extraction from a synthetic argv fixture (parallel to mika#864's "guards land with their fixture" discipline). The `validate_skill()` loud-fail is the runtime enforcement mechanism: any skill manifest declaring an unknown logical key surfaces immediately at load time, before the table diverges silently in production.
 
 ### Change 4 — Engine validation in `executor.rs` `run_gh` dispatch path
 
