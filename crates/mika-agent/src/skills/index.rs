@@ -387,6 +387,16 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
 
+        // Skip dotfiles (.gitkeep, .DS_Store, etc.) and underscore-prefixed
+        // support directories (_shared/, _templates/, etc.) — convention reserved
+        // for non-skill plumbing per CLAUDE.md skills/bundled/ contract.
+        // Mirrors the filter in `build_support/bundled_skills_discover.rs`. DRY
+        // violation: file follow-up to extract a shared `is_bundled_skill_dir(&str) -> bool`
+        // helper consumed by both build-time and runtime scanners.
+        if dir_name.starts_with('.') || dir_name.starts_with('_') {
+            continue;
+        }
+
         // Detect broken symlinks (linked skills whose target was removed)
         if let Ok(meta) = std::fs::symlink_metadata(&path)
             && meta.file_type().is_symlink()
