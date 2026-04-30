@@ -4,7 +4,7 @@ description = "Orchestrator: delegates implementation work to Claude Code via cl
 version = "0.2.0"
 always_on = true
 timeout_secs = 30
-max_prompt_size = 57344
+max_prompt_size = 64000
 dependencies = [
     "build-mika",
     "deploy-mika",
