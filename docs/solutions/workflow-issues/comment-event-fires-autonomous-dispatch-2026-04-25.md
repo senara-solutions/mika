@@ -1,6 +1,7 @@
 ---
 title: "GitHub issue-comment events autonomously fire mika-dev → claude-pilot, with the comment body as the working context"
 date: 2026-04-25
+last_updated: 2026-04-30
 category: workflow-issues
 module: self-dev
 problem_type: workflow_issue
@@ -203,3 +204,37 @@ Three layers changed:
 Negative-detection (mika#807/#801) was completeness-bound — heuristics fail on inputs they don't enumerate. A grooming signal not in the heuristic's deny-list bypasses the guard. Positive-consent is closure-bound — the rule enumerates the two valid dispatch triggers; everything else is inert by construction. Same allowlist-vs-denylist pattern from security: denylists fail the moment someone invents a new attack shape; allowlists hold by construction.
 
 **Architect review:** mika-arch session `3801e5e4-5a7b-4d57-a9e0-f217964c913b` (lifecycle ESCALATE → operator-resolved as supersession); session `8959665a-7fa4-4e39-bc36-da48faf0d50d` (#841 first-pass ITERATE → revisions → second-pass GROOMED).
+
+## Update 2026-04-30 — Third incident and engine-level structural fix (#910)
+
+**Incident:** mika-dev session on `[GitHub] New comment on senara-solutions/mika#906` by @samidarko. The comment was the `/mika-groom-ticket` Phase-5 closing template containing the verbatim substring `implement mika issue#906`. Despite the Layer 1 source-check rule from mika#841 being intact in the prompt, mika-dev dispatched `run_claude_pilot` (task `1157f5e8-e788-40d6-ba62-ebfd8f36e073`, claude-pilot pid 9265). Same failure shape as mika#838.
+
+**Ratchet condition established:** Three documented incidents in the same class (#798, #838, #910) prove the prompt-level source-check rule drifts under load. The LLM's trained pattern-matching on `implement <repo> issue#<n>` — which appears in the Layer 1 routing table as a positive dispatch example — overrides the conditional source-check constraint. Per `docs/solutions/architecture-patterns/engine-guards-vs-prompt-rules-for-agent-behavior-2026-04-19.md`, this is an "against-gradient" behavior: the model's trained response (dispatch when it sees dispatch-like phrases) conflicts with the prompt rule (don't dispatch on webhook turns).
+
+**Engine-level fix — `webhook_no_unauthorized_dispatch` IntentPrecondition guard (mika#910):**
+
+Added a new entry to the `INTENT_GUARDS` registry in `crates/mika-agent/src/agent.rs` at index 1 (between `webhook_ready_label_dispatch` and `webhook_zero_tools`):
+
+- **Trigger:** `msg.starts_with("[GitHub]") && !msg.starts_with(READY_LABEL_DISPATCH_MARKER)` — fires on all `[GitHub]` webhook turns except ready-label events. Mutually exclusive with the positive-case guard's trigger.
+- **Satisfied:** `!summaries.iter().any(|s| s.name == "run_claude_pilot" && s.success)` — the guard is satisfied (turn allowed) when no successful `run_claude_pilot` call occurred. Failed attempts are ignored — the dispatch-readiness guard in `executor.rs` already blocks those structurally.
+- **Correction message:** Cites mika#841 Layer 1 source-check and instructs the LLM to use Webhook Fallthrough (acknowledge without dispatch).
+
+**Design decisions:**
+- Success-only check (not any-attempt): Unlike `webhook_ready_label_dispatch` which counts any `run_claude_pilot` attempt, this guard only rejects *successful* calls. Failed attempts hit structural guards (`task_not_dispatchable`, `global_dispatch_active`) that provide better-targeted feedback than the generic correction message.
+- Single-retry semantics: Consistent with all other `INTENT_GUARDS` entries. After one rejection, a second `run_claude_pilot` call in the same turn proceeds unchecked. Acceptable because all three documented incidents dispatched on the first attempt — the LLM is not adversarially persistent, it genuinely misclassifies the turn.
+
+**Composition with existing guards:**
+
+| Guard | Inspects | Invariant defended |
+|---|---|---|
+| `webhook_ready_label_dispatch` (#846) | tool-call sequence after `ready` trigger | Ready-label events MUST attempt `run_claude_pilot` |
+| **`webhook_no_unauthorized_dispatch` (#910)** | **trigger message shape** | **Non-ready `[GitHub]` events MUST NOT dispatch** |
+| `webhook_zero_tools` (#696) | tool-call success | Webhook events MUST call at least one tool |
+
+All three are message-shape or input-content predicates with mutually complementary scopes. No coupling to tool ordering.
+
+**Test coverage:** 13 unit tests (trigger positive/negative, satisfied positive/negative, ordering invariant, registry count) + 5 integration tests via EvalHarness (guard fires on comment, skips on ready-label, skips on direct prompt, acknowledge-only passes, fires only once).
+
+**Prompt rule retained as defense-in-depth:** The Layer 1 source-check precondition and Ready-Label Dispatch handler remain in the self-dev skill prompt. They serve as soft guidance for the LLM — the engine guard is the structural backstop.
+
+**Status:** The positive-consent dispatch gate (mika#841) is now enforced at two layers: prompt (soft) and engine (structural). The failure class is closed by construction — the engine rejects the tool call regardless of what the LLM decides.
