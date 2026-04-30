@@ -1,1 +1,35 @@
-[]
+[
+  {
+    "name": "run_claude_pilot",
+    "description": "Dispatch a headless Claude Code grooming session via claude-pilot. Long-running — returns a task ID immediately, results arrive via callback when Claude Code finishes.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "skill": {
+          "type": "string",
+          "enum": ["dev-groom"],
+          "description": "Which skill prompt to run. Must be 'dev-groom' (grooming dispatch)."
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Issue reference in repo#number format (e.g., 'mika#214', 'mika-skills#8'). The handler derives the branch, creates a worktree, and runs the /mika-groom-ticket pipeline. For free-text prompts, pass a plain string — sent to claude-pilot as-is without worktree setup."
+        },
+        "task_id": {
+          "type": "string",
+          "description": "The UUID returned by create_task (36-char format like '15383984-a3e7-41bf-ac6f-630ba9a89d63'). Used for log filename and task correlation at /var/log/claude-pilot/{task_id}.log. Do NOT pass issue references (e.g., 'mika-284') — pass the task UUID."
+        },
+        "iteration_context": {
+          "type": "string",
+          "description": "Iteration feedback for an existing grooming session. When present alongside a repo#number prompt, appended to the prompt so the /mika-groom-ticket pipeline addresses specific feedback rather than starting from scratch."
+        }
+      },
+      "required": ["skill", "prompt", "task_id"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh",
+      "long_running": true,
+      "estimated_duration_secs": 7200
+    }
+  }
+]

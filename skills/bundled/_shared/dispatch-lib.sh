@@ -1,0 +1,445 @@
+#!/bin/bash
+# Shared dispatch library for claude-pilot skills (dev-pilot, dev-groom, etc.)
+#
+# Single entrypoint: dispatch_claude_pilot "$ENTRY_COMMAND"
+# Reads JSON from process-inherited stdin (fd 0).
+# Sets up worktree, scrubs env, installs EXIT trap, runs claude-pilot,
+# and delivers the result via mika callback.
+#
+# Callers MUST NOT set their own EXIT trap (it would be overwritten silently —
+# bash trap is process-scoped, not function-scoped).
+#
+# Adding a third sibling skill (e.g., dev-explore) requires only:
+#   1. A new skill.toml + system_prompt.md
+#   2. A thin run.sh that sources this file and calls dispatch_claude_pilot "/your-command"
+#   3. A tools.json with the run_claude_pilot entry (skill enum set to the new skill name)
+# No edits to this file or existing sibling skills.
+
+# --- Internal helpers (underscore-prefixed, not part of the API contract) ---
+
+_dispatch_lib_exit_trap() {
+    _EXIT_CODE=$?
+    # Guard: skip if already delivered or no task ID
+    [ "$CALLBACK_SENT" -eq 1 ] && { [ -n "$STDOUT_FILE" ] && rm -f "$STDOUT_FILE"; [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; rm -f "$TRACE_FILE"; return; }
+    [ -z "$TASK_ID" ] && { [ -n "$STDOUT_FILE" ] && rm -f "$STDOUT_FILE"; [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; rm -f "$TRACE_FILE"; return; }
+    # Try to recover result from stdout file if RESULT was never populated.
+    if [ -z "$RESULT" ] && [ -n "$STDOUT_FILE" ] && [ -f "$STDOUT_FILE" ]; then
+        _RECOVERED_RAW=$(cat "$STDOUT_FILE" 2>/dev/null)
+        # Issue #135: extract first JSON line from possible preamble (dotenvx banner)
+        _RECOVERED=$(printf '%s\n' "$_RECOVERED_RAW" | grep -m1 '^{' || true)
+        : "${_RECOVERED:=$_RECOVERED_RAW}"
+        _STATUS=$(printf '%s\n' "$_RECOVERED" | jq -r '.status // empty' 2>/dev/null)
+        if [ -n "$_STATUS" ]; then
+            RESULT="claude-pilot completed (status: ${_STATUS}, recovered from crash).
+Exit code: ${_EXIT_CODE}
+Stdout recovered from file."
+        fi
+    fi
+    # Capture stderr tail on crash path BEFORE deleting the file (#104)
+    if [ -z "$RESULT" ] && [ -n "$STDERR_FILE" ] && [ -f "$STDERR_FILE" ]; then
+        _STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" 2>/dev/null)
+        if [ -n "$_STDERR_TAIL" ]; then
+            RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result.
+
+Stderr (last 10KB):
+${_STDERR_TAIL}"
+        fi
+    fi
+    # Clean up temp files AFTER capture
+    [ -n "$STDOUT_FILE" ] && rm -f "$STDOUT_FILE"
+    [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"
+    if [ -z "$RESULT" ]; then
+        RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result."
+    fi
+    # --- Diagnostic trace tail (mika#887) ---
+    if [ -f "$TRACE_FILE" ]; then
+        case "$RESULT" in
+            "HANDLER CRASH"*)
+                # Crash path: append trace tail, preserve file for forensics
+                _TRACE_TAIL=$(tail -50 "$TRACE_FILE" 2>/dev/null | sed 's/^/    /')
+                if [ -n "$_TRACE_TAIL" ]; then
+                    RESULT="${RESULT}
+
+Trace tail (last 50 lines):
+${_TRACE_TAIL}"
+                fi
+                ;;
+            *)
+                # Success/recovery path: clean up trace file
+                rm -f "$TRACE_FILE"
+                ;;
+        esac
+    fi
+    # Issue #138: best-effort PR URL discovery on crash recovery path.
+    if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
+        _PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+        if [ -n "$_PR_URL" ]; then
+            RESULT="${RESULT}
+PR: ${_PR_URL}"
+        fi
+    fi
+    RESULT=$(printf '%s' "$RESULT" | head -c 92000)
+    set +e
+    if [ -n "$AGENT" ]; then
+        mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"
+    else
+        mika ask --task-id "$TASK_ID" --task-complete -- "$RESULT"
+    fi
+    CALLBACK_SENT=1
+    set -e
+}
+
+_parse_input_json() {
+    # Read input JSON from stdin
+    INPUT=$(cat)
+
+    # Parse callback fields injected by the long-running executor
+    TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.__mika_task_id // empty')
+    AGENT=$(printf '%s\n' "$INPUT" | jq -r '.__mika_agent // empty')
+
+    if [ -z "$TASK_ID" ]; then
+        echo "Error: no __mika_task_id in input (not running as long-running handler?)" >&2
+        exit 1
+    fi
+
+    # Parse user-provided fields
+    SKILL=$(printf '%s\n' "$INPUT" | jq -r '.skill // empty')
+    PROMPT=$(printf '%s\n' "$INPUT" | jq -r '.prompt // empty')
+    USER_TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.task_id // empty')
+    DRY_RUN=$(printf '%s\n' "$INPUT" | jq -r '.dry_run // empty')
+    ITERATION_CTX=$(printf '%s\n' "$INPUT" | jq -r '.iteration_context // empty')
+}
+
+_validate_inputs() {
+    local EXPECTED_SKILL="$1"
+
+    if [ -z "$SKILL" ]; then
+        echo "Error: missing required argument 'skill'; valid values: [\"${EXPECTED_SKILL}\"]" >&2
+        exit 1
+    fi
+    if [ "$SKILL" != "$EXPECTED_SKILL" ]; then
+        echo "Error: invalid skill '${SKILL}'; valid values: [\"${EXPECTED_SKILL}\"]" >&2
+        exit 1
+    fi
+
+    if [ -z "$PROMPT" ]; then
+        echo "Error: prompt is required" >&2
+        exit 1
+    fi
+
+    if [ -z "$USER_TASK_ID" ]; then
+        echo "Error: task_id is required" >&2
+        exit 1
+    fi
+
+    # Warn if task_id doesn't look like a UUID (non-blocking)
+    if ! printf '%s' "$USER_TASK_ID" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+        echo "WARNING: task_id '$USER_TASK_ID' does not match UUID format (expected 36-char UUID like '15383984-a3e7-41bf-ac6f-630ba9a89d63'). Logs will land at /var/log/claude-pilot/${USER_TASK_ID}.log — this may break log-to-task correlation." >&2
+    fi
+}
+
+_setup_gh_auth() {
+    # GitHub App installation token for gh CLI.
+    # See mika#520 for context on why we check GH_TOKEN before calling gh auth login.
+    if [ -z "${GH_TOKEN:-}" ]; then
+        GH_APP_TOKEN=$(mika ${AGENT:+--agent "$AGENT"} token github 2>/dev/null)
+        if [ -n "$GH_APP_TOKEN" ]; then
+            echo "$GH_APP_TOKEN" | gh auth login --with-token 2>/dev/null
+            gh auth switch --user "mika-platform-bot[bot]" 2>/dev/null || true
+        else
+            echo "WARNING: mika token github failed — gh CLI will fall back to host credentials" >&2
+        fi
+    fi
+}
+
+_scrub_env() {
+    unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
+}
+
+_set_up_worktree() {
+    # --- Parse repo#number format ---
+    # Matches: mika#214, mika-skills#8, mika-cloud#50
+    REPO=""
+    ISSUE_NUM=""
+    if printf '%s' "$PROMPT" | grep -qE '^[a-zA-Z0-9_-]+#[0-9]+$'; then
+        REPO=$(printf '%s' "$PROMPT" | sed 's/#.*//')
+        ISSUE_NUM=$(printf '%s' "$PROMPT" | sed 's/.*#//')
+    fi
+
+    if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
+        # --- repo#number mode: derive everything from the issue ---
+        LOG_ID="$TASK_ID"
+
+        # Validate repo directory exists (mika-platform itself IS PLATFORM_DIR)
+        if [ "$REPO" = "$PLATFORM_REPO_NAME" ]; then
+            SUB_REPO_DIR="$PLATFORM_DIR"
+        else
+            SUB_REPO_DIR="$PLATFORM_DIR/$REPO"
+        fi
+        if [ ! -d "$SUB_REPO_DIR/.git" ] && ! [ -f "$SUB_REPO_DIR/.git" ]; then
+            echo "Error: $SUB_REPO_DIR is not a git repository" >&2
+            exit 1
+        fi
+
+        # Fetch issue — validates it exists and is open, gets labels + title + body
+        ISSUE_JSON=$(gh issue view "$ISSUE_NUM" --repo "senara-solutions/$REPO" --json state,title,labels,body 2>/dev/null) || {
+            echo "Error: Issue #${ISSUE_NUM} not found in senara-solutions/${REPO}. Aborting." >&2
+            exit 1
+        }
+
+        ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state')
+        if [ "$ISSUE_STATE" = "CLOSED" ]; then
+            echo "Error: Issue #${ISSUE_NUM} in senara-solutions/${REPO} is closed. Reopen first." >&2
+            exit 1
+        fi
+
+        # Branch-name derivation is centralized in mika-platform/scripts/derive-branch-name.
+        # See senara-solutions/mika-platform#58 for context on the drift class this eliminates.
+        ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // empty')
+        ISSUE_TITLE=$(printf '%s' "$ISSUE_JSON" | jq -r '.title')
+        LABELS=$(printf '%s' "$ISSUE_JSON" | jq -r '[.labels[].name] | join(",")' 2>/dev/null)
+
+        BRANCH=$("$PLATFORM_DIR/scripts/derive-branch-name" \
+            --title "$ISSUE_TITLE" \
+            --issue "$ISSUE_NUM" \
+            --labels "$LABELS" \
+            --body-callout "$ISSUE_BODY")
+
+        # Sync main before branching to avoid stale worktrees.
+        git -C "$SUB_REPO_DIR" fetch origin main 2>/dev/null || true
+
+        # Worktree path is centralized in mika-platform/scripts/derive-worktree-path
+        WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO")
+
+        # Reuse existing worktree if valid
+        if [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+            git -C "$WORKTREE_DIR" checkout "$BRANCH" 2>/dev/null || true
+        else
+            git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            if ! git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" origin/main 2>/dev/null; then
+                git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH"
+            fi
+        fi
+
+        # Rebase-or-abort guard
+        BEHIND=$(git -C "$WORKTREE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+        if [ "$BEHIND" -gt 0 ]; then
+            if git -C "$WORKTREE_DIR" rebase origin/main 2>/dev/null; then
+                echo "Rebased ${BRANCH} onto origin/main (${BEHIND} commits caught up)." >&2
+            else
+                CONFLICTS=$(git -C "$WORKTREE_DIR" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')
+                git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
+                RESULT="STATUS=REBASE_CONFLICT
+Branch ${BRANCH} is ${BEHIND} commits behind origin/main.
+Conflicted files: ${CONFLICTS:-<unable to capture>}
+Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
+                exit 1
+            fi
+        fi
+
+        # Copy gitignored .claude/ config into worktree (relay + permissions only)
+        mkdir -p "$WORKTREE_DIR/.claude"
+        cp "$PLATFORM_DIR/.claude/claude-pilot.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+        cp "$PLATFORM_DIR/.claude/settings.local.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+
+        CWD_ARGS="--cwd $WORKTREE_DIR"
+        if [ -f "$WORKTREE_DIR/.claude/claude-pilot.json" ]; then
+            CWD_ARGS="$CWD_ARGS --relay-config $WORKTREE_DIR/.claude/claude-pilot.json"
+        elif [ -f "$PLATFORM_DIR/.claude/claude-pilot.json" ]; then
+            CWD_ARGS="$CWD_ARGS --relay-config $PLATFORM_DIR/.claude/claude-pilot.json"
+        fi
+
+        # The prompt becomes the QUALIFIED issue reference.
+        # Must use `${REPO}#${ISSUE_NUM}` (not bare `#${ISSUE_NUM}`) — see mika#138.
+        PROMPT="${REPO}#${ISSUE_NUM}"
+
+        # Append iteration context if provided
+        if [ -n "$ITERATION_CTX" ]; then
+            ITERATION_CTX=$(printf '%s' "$ITERATION_CTX" | head -c 4096)
+            PROMPT=$(printf '%s#%s\n\nITERATION CONTEXT:\n%s' "$REPO" "$ISSUE_NUM" "$ITERATION_CTX")
+        fi
+
+        # Save pre-run HEAD SHA for post-flight diff check
+        PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+    else
+        # --- Free-text mode: pass prompt as-is, no worktree ---
+        PRE_RUN_HEAD=""
+        LOG_ID="$TASK_ID"
+        CWD_ARGS="--cwd $PLATFORM_DIR"
+
+        if [ -n "$ITERATION_CTX" ]; then
+            echo "Warning: iteration_context provided but prompt is not in repo#number format — ignoring" >&2
+        fi
+    fi
+}
+
+_handle_dry_run() {
+    if [ "$DRY_RUN" = "true" ] || [ "$DRY_RUN" = "1" ]; then
+        if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
+            jq -n --arg repo "$REPO" --argjson issue "$ISSUE_NUM" --arg branch "$BRANCH" \
+                --arg worktree "$WORKTREE_DIR" --arg prompt "$PROMPT" \
+                '{dry_run:true, repo:$repo, issue:$issue, branch:$branch, worktree_dir:$worktree, prompt:$prompt}'
+            git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo)
+            rmdir "$PARENT_DIR" 2>/dev/null || true
+        else
+            jq -n --arg prompt "$PROMPT" \
+                '{dry_run:true, repo:null, issue:null, branch:null, worktree_dir:null, prompt:$prompt}'
+        fi
+        exit 0
+    fi
+}
+
+_run_claude_pilot() {
+    local ENTRY_COMMAND="$1"
+
+    STDERR_FILE=$(mktemp)
+    STDOUT_FILE=$(mktemp)
+    set +e
+    # CWD_ARGS is intentionally word-split (multiple flags)
+    # shellcheck disable=SC2086
+    claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    PILOT_EXIT=$?
+    # Issue #135: extract first JSON-object line from stdout
+    PILOT_OUTPUT_RAW=$(cat "$STDOUT_FILE" 2>/dev/null)
+    PILOT_OUTPUT=$(printf '%s\n' "$PILOT_OUTPUT_RAW" | grep -m1 '^{' || true)
+    : "${PILOT_OUTPUT:=$PILOT_OUTPUT_RAW}"
+    rm -f "$STDOUT_FILE"
+
+    # Build result message from structured stdout
+    STATUS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.status // empty' 2>/dev/null)
+    SESSION_ID=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null)
+    TURNS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.turns // empty' 2>/dev/null)
+    COST=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.cost_usd // empty' 2>/dev/null)
+    DURATION=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.duration_ms // empty' 2>/dev/null)
+
+    if [ -n "$STATUS" ]; then
+        RESULT="claude-pilot completed (status: ${STATUS}).
+Session: ${SESSION_ID:-unknown}
+Turns: ${TURNS:-unknown}
+Cost: \$${COST:-unknown}
+Duration: ${DURATION:-unknown}ms"
+
+        if [ "$PILOT_EXIT" -ne 0 ]; then
+            RESULT="${RESULT}
+Note: process exited with code ${PILOT_EXIT} after session completed — result is valid."
+        fi
+
+        # Post-flight diff check: detect zero-commit "success" in repo#number mode.
+        if [ -n "$PRE_RUN_HEAD" ] && [ -n "$REPO" ]; then
+            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+            if [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ]; then
+                RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
+
+${RESULT}"
+            fi
+        fi
+
+        # Issue #138: Discover actual PR URL from the branch
+        if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
+            PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+            if [ -n "$PR_URL" ]; then
+                RESULT="${RESULT}
+PR: ${PR_URL}"
+            fi
+        fi
+    elif [ "$PILOT_EXIT" -eq 0 ]; then
+        RESULT="claude-pilot completed (exit 0) but output was not structured JSON.
+
+Stdout:
+${PILOT_OUTPUT_RAW}"
+    else
+        RESULT="Log path: /var/log/claude-pilot/${LOG_ID}.log
+
+claude-pilot FAILED (exit code ${PILOT_EXIT}).
+
+Stdout:
+${PILOT_OUTPUT_RAW}"
+    fi
+
+    # Append stderr tail for debugging context (last 10KB)
+    if [ -s "$STDERR_FILE" ]; then
+        STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE")
+        RESULT="${RESULT}
+
+Logs (last 10KB):
+${STDERR_TAIL}"
+    fi
+    rm -f "$STDERR_FILE"
+
+    # Truncate to ~90KB to stay within the 100KB callback limit
+    RESULT=$(printf '%s' "$RESULT" | head -c 92000)
+}
+
+_deliver_callback() {
+    set +e
+    if [ -n "$AGENT" ]; then
+        mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"
+    else
+        mika ask --task-id "$TASK_ID" --task-complete -- "$RESULT"
+    fi
+    CALLBACK_EXIT=$?
+    CALLBACK_SENT=1
+    # Success path: clean up trace file (mika#887)
+    rm -f "$TRACE_FILE"
+    set -e
+
+    if [ "$CALLBACK_EXIT" -ne 0 ]; then
+        echo "ERROR: callback delivery failed (exit $CALLBACK_EXIT) for task $TASK_ID" >&2
+    fi
+}
+
+# --- Public API ---
+
+# Single entrypoint. Args: $1 = entry slash command (e.g., "/mika" or "/mika-groom-ticket")
+# Reads JSON from process stdin (fd 0) — inherited from the calling handler script.
+# Sets up worktree, scrubs env, invokes relay, installs EXIT trap, runs claude-pilot.
+# Delivers result via callback when complete.
+dispatch_claude_pilot() {
+    local ENTRY_COMMAND="$1"
+    local EXPECTED_SKILL="${2:-}"
+
+    # --- Diagnostic trace (mika#887) ---
+    TRACE_FILE="/tmp/dev-pilot-trace-$$.log"
+    exec 9>>"$TRACE_FILE" 2>/dev/null || exec 9>/dev/null
+    BASH_XTRACEFD=9
+    set -x
+
+    # Ensure ~/.local/bin is in PATH (mika CLI needed for callback delivery)
+    export PATH="$HOME/.local/bin:$PATH"
+
+    # Dependency checks
+    command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed" >&2; exit 1; }
+    command -v mika >/dev/null 2>&1 || { echo "Error: mika CLI is required but not in PATH" >&2; exit 1; }
+    command -v claude-pilot >/dev/null 2>&1 || { echo "Error: claude-pilot CLI is required but not in PATH" >&2; exit 1; }
+
+    # mika-platform root — base for sub-repo resolution
+    PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+    PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+    PLATFORM_REPO_NAME=$(basename "$PLATFORM_DIR")
+
+    # Initialize callback guard
+    CALLBACK_SENT=0
+
+    _parse_input_json
+
+    # Install EXIT trap for crash-recovery callback delivery
+    trap '_dispatch_lib_exit_trap' EXIT
+
+    # Derive expected skill from entry command if not provided
+    if [ -z "$EXPECTED_SKILL" ]; then
+        case "$ENTRY_COMMAND" in
+            "/mika")                EXPECTED_SKILL="dev-pilot" ;;
+            "/mika-groom-ticket")   EXPECTED_SKILL="dev-groom" ;;
+            *)                      EXPECTED_SKILL="$SKILL" ;;  # Fallback: accept whatever was passed
+        esac
+    fi
+
+    _validate_inputs "$EXPECTED_SKILL"
+    _setup_gh_auth
+    _scrub_env
+    _set_up_worktree
+    _handle_dry_run
+    _run_claude_pilot "$ENTRY_COMMAND"
+    _deliver_callback
+}

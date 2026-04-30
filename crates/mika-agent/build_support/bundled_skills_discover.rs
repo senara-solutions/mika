@@ -70,7 +70,14 @@ pub fn discover_bundled_skills(base: &Path) -> Vec<DiscoveredSkill> {
             continue;
         }
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
+        let name_str = name.to_string_lossy();
+        // Skip dotfile directories (.gitkeep, .DS_Store, etc.)
+        if name_str.starts_with('.') {
+            continue;
+        }
+        // Skip underscore-prefixed directories (_shared/, _templates/, etc.)
+        // These are convention-reserved for non-skill support directories.
+        if name_str.starts_with('_') {
             continue;
         }
         let path = entry.path();

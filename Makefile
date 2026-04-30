@@ -54,6 +54,10 @@ check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
 
 test: ## Run all tests
 	cargo test
+	@bash scripts/test-dispatch-symmetry.sh
+
+test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structurally symmetric (mika#893 R5)
+	@bash scripts/test-dispatch-symmetry.sh
 
 lint: ## Run clippy
 	cargo clippy
