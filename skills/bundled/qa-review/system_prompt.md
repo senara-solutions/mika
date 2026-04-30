@@ -360,7 +360,7 @@ Post your verdict as a GitHub pull request review using `run_gh`. The review typ
 | `block[ac]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 | `block` (other sub-types) | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 
-The `<verdict_body>` is your full verdict output: DIFF ANALYSIS + PLAN-AC VERIFICATION (always when Step 2.5 ran) + BUILD VERIFICATION (when Step 3e ran) + FINDINGS (if any) + VERDICT + REASON + (when `block[ac]`) Plan amendment required:.
+The `<verdict_body>` is your full verdict output, structured **VERDICT-FIRST** so the routing token survives any transport-layer truncation: `VERDICT: <class>[<detail>]` as line 1, `REASON: <one-line summary>` as line 2, blank line, then DIFF ANALYSIS + PLAN-AC VERIFICATION (always when Step 2.5 ran) + BUILD VERIFICATION (when Step 3e ran) + FINDINGS (if any) + (when `block[ac]`) Plan amendment required:. The closing `VERDICT:` + `REASON:` block at the bottom of the body remains as a human-readable conclusion echo — both occurrences must agree (the engine's regex captures the first match per `crates/mika-agent/src/server/verdict.rs:97`). Mika#909 / mika#898 incident (2026-04-30): gateway truncates review.body at 16k chars; placing VERDICT at the top guarantees survival even on edge-case body sizes that exceed the cap. See `docs/solutions/workflow-issues/qa-verdict-truncation-2026-04-30.md` if compounded.
 
 **Tool call format:** `run_gh` takes a JSON object with `command` (array of strings) and `repo` (string). Example for a pass verdict:
 ```json
@@ -379,6 +379,9 @@ After completing all checks — **including the successful `run_gh pr review` ca
 **Format — follow exactly. Every verdict MUST include DIFF ANALYSIS (Step 3d), PLAN-AC VERIFICATION (Step 2.5.6, always), BUILD VERIFICATION (Step 3e, when applicable), and (when verdict is `block[ac]`) Plan amendment required: (Step 2.5.8) echo-backs:**
 
 ```
+VERDICT: pass
+REASON: Pipeline artifacts present, diff review clean, all plan ACs satisfied
+
 DIFF ANALYSIS:
 Files reviewed: 8
 Key changes:
@@ -410,6 +413,9 @@ BUILD VERIFICATION: skipped (no Behavioral ACs in plan)
 
 Or for a `block[ac]` verdict (one or more plan ACs unsatisfied):
 ```
+VERDICT: block[ac]
+REASON: Plan AC for v1 metadata block unsatisfied — 10 of 11 fields missing; JSON --verbose silently ignored.
+
 DIFF ANALYSIS:
 Files reviewed: 4
 Key changes:
@@ -444,6 +450,9 @@ Plan amendment required:
 Or with security findings (severity determines the verdict line):
 
 ```
+VERDICT: block[security]
+REASON: Security issues — hardcoded credentials and SQL injection vector
+
 DIFF ANALYSIS:
 Files reviewed: 3
 Key changes:
