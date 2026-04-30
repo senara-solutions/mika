@@ -1467,11 +1467,12 @@ async fn run_loop(
                         }
                     }
 
-                    // #846 — operator notification when the ready-label dispatch
-                    // guard fired but run_claude_pilot still wasn't called after
-                    // the retry.  Without this the failure is silent past
-                    // label-removal: the ready label disappears but no dispatch
-                    // happens and no PR is created.
+                    // #846 + #907 — operator notification when the ready-label
+                    // dispatch guard fired but neither run_claude_pilot nor
+                    // send_message was called after the retry.  Without this the
+                    // failure is silent past label-removal: the ready label
+                    // disappears but neither dispatch nor grooming-rejection
+                    // notification happens.
                     if intent_guard_retries.contains("webhook_ready_label_dispatch")
                         && !ready_label_dispatch_satisfied(&all_tool_summaries)
                     {
@@ -1486,9 +1487,11 @@ async fn run_loop(
                         if let Some(ref sender) = tool_ctx.message_sender {
                             let notification = format!(
                                 "Ready-label dispatch stalled on {location}: the `ready` \
-                                 label was removed but run_claude_pilot was never called. \
-                                 Investigate trace_id {} in /var/log/mika/server.log. \
-                                 To retry, re-add the `ready` label.",
+                                 label was removed but neither dispatch (run_claude_pilot) \
+                                 nor grooming-rejection notification (send_message) \
+                                 completed. Investigate trace_id {} in \
+                                 /var/log/mika/server.log. To retry, re-add the `ready` \
+                                 label.",
                                 tool_ctx.trace_id
                             );
                             let _ = sender.send(&notification).await;
@@ -4230,31 +4233,45 @@ struct IntentPrecondition {
 /// "trigger + tool-signature" pattern (e.g. persistence nudge, completion
 /// claim) remain as inline code outside this registry.
 const INTENT_GUARDS: &[IntentPrecondition] = &[
-    // #846 — ready-label webhook events require run_claude_pilot dispatch.
+    // #846 + #907 — ready-label webhook events require EITHER dispatch
+    // (run_claude_pilot) OR grooming-rejection notification (send_message).
+    //
     // More specific than webhook_zero_tools (which any successful tool satisfies),
     // so it is evaluated FIRST.  Without this guard, the LLM successfully removes
     // the `ready` label via run_gh and EndTurns — webhook_zero_tools is satisfied
     // by the run_gh call but the dispatch never happens.
     //
-    // The satisfied predicate counts run_claude_pilot ATTEMPTS (success or
-    // failure), not just successes.  Terminal failures (global_dispatch_active,
-    // task_not_dispatchable, dispatch_blocked_by, dispatch_limit_exceeded) are
-    // structural and not recoverable by re-prompt — the LLM should handle them
-    // by notifying the operator (the prompt's Step 4 covers this).  Forcing a
-    // retry on those failures would only produce misleading "never called"
-    // operator notifications when the dispatch was in fact attempted (#846
-    // adversarial review).
+    // OR-shape (#907): The satisfied predicate accepts run_claude_pilot attempt
+    // OR send_message.  The skill prompt's Ready-Label Dispatch handler checks
+    // for the `> - **Plan:**` grooming marker in the issue body before dispatch.
+    // If the marker is absent, the agent notifies the operator via send_message
+    // instead of dispatching.  The guard accepts both paths as valid completion.
+    //
+    // The send_message match is intentionally over-broad — any send_message
+    // satisfies, not just grooming-rejection notifications.  This is acceptable
+    // because: (a) the prompt is the primary grooming gate, the guard is a
+    // backstop; (b) the trigger is very specific (only ready-label events);
+    // (c) content-based discrimination on truncated input_summary is fragile.
+    // Same pattern as callback_terminal_action's send_message matching.
+    //
+    // run_claude_pilot ATTEMPTS (success or failure) count, not just successes.
+    // Terminal failures (global_dispatch_active, task_not_dispatchable, etc.)
+    // are structural and not recoverable by re-prompt — the LLM handles them
+    // via send_message per the prompt's Step 5 (#846 adversarial review).
     IntentPrecondition {
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
         satisfied: ready_label_dispatch_satisfied,
         correction_message: "[Your response was rejected. The `ready` label has been \
-             removed but you did NOT attempt run_claude_pilot. The Ready-Label \
-             Dispatch handler requires the full sequence: (1) run_gh \
-             `issue view <n> --json title,body --repo <repo>` to fetch the issue, \
-             (2) create_task with the issue reference, (3) run_claude_pilot with \
-             prompt=\"<repo>#<n>\" and task_id=<UUID from create_task>. \
-             Do not end this turn until run_claude_pilot has been called.]",
+             removed but you completed neither dispatch nor grooming-rejection \
+             notification. The Ready-Label Dispatch handler requires you to: \
+             (1) run_gh `issue view <n> --json title,body --repo <repo>` to fetch \
+             the issue, (2) check the issue body for the grooming marker \
+             `> - **Plan:**`. If the marker is PRESENT: call create_task then \
+             run_claude_pilot with prompt=\"<repo>#<n>\" and task_id=<UUID>. \
+             If the marker is ABSENT: call send_message to notify the operator \
+             that grooming is required before dispatch. Do not end this turn \
+             until you have either dispatched or notified.]",
     },
     // #696 — webhook events require at least one successful tool call.
     IntentPrecondition {
@@ -4320,16 +4337,23 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
     msg.starts_with(READY_LABEL_DISPATCH_MARKER)
 }
 
-/// Returns `true` when `run_claude_pilot` was attempted during this turn,
-/// regardless of success.  Counting attempts (not just successes) avoids
-/// misleading "never called" operator notifications on terminal-failure paths
-/// like `global_dispatch_active` (concurrent webhook), `task_not_dispatchable`,
-/// `dispatch_blocked_by`, and `dispatch_limit_exceeded`.  Those failures are
-/// structural and not recoverable by re-prompt — the LLM handles them via
-/// `send_message` per the prompt's Step 4.  See `INTENT_GUARDS` comment for
-/// the rationale and #846 adversarial review for the failure scenarios.
+/// Returns `true` when the ready-label dispatch turn completed via one of
+/// two valid paths: (a) `run_claude_pilot` was attempted (dispatch path), or
+/// (b) `send_message` was called (grooming-rejection or error notification
+/// path).
+///
+/// OR-shape (#907): The prompt's Ready-Label Dispatch handler checks for the
+/// `> - **Plan:**` grooming marker in the issue body.  If absent, the agent
+/// calls `send_message` to notify the operator instead of dispatching.  The
+/// guard accepts both paths as valid completion shapes.
+///
+/// `run_claude_pilot` attempts count regardless of success — terminal failures
+/// (global_dispatch_active, task_not_dispatchable, etc.) are structural and
+/// not recoverable by re-prompt.  See `INTENT_GUARDS` comment and #846.
 fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries.iter().any(|s| s.name == "run_claude_pilot")
+    summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "send_message")
 }
 
 /// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
@@ -7524,6 +7548,73 @@ mod tests {
     #[test]
     fn ready_label_not_satisfied_when_empty() {
         assert!(!ready_label_dispatch_satisfied(&[]));
+    }
+
+    // -- #907 OR-shape: send_message also satisfies the guard --
+
+    #[test]
+    fn ready_label_satisfied_when_send_message_called() {
+        // Grooming-rejection path: agent detects missing `> - **Plan:**`
+        // marker and notifies operator via send_message instead of dispatching.
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "run_gh".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "send_message".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(ready_label_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn ready_label_satisfied_when_both_dispatch_and_notification() {
+        // Both run_claude_pilot and send_message present (e.g., dispatch
+        // succeeded then operator was notified).
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "run_claude_pilot".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "send_message".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(ready_label_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn ready_label_satisfied_when_send_message_failed() {
+        // send_message attempt counts regardless of success (same as
+        // run_claude_pilot attempts — see #846 rationale).
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "send_message".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: false,
+            non_zero_exit: false,
+        }];
+        assert!(ready_label_dispatch_satisfied(&summaries));
     }
 
     // -- parse_ready_label_location tests (#846 operator notification) --
