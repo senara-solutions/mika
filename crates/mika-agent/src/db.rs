@@ -3507,34 +3507,44 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        // Collect IDs and content of rows that have non-NULL input or output.
+        // Collect IDs and content of rows that have non-NULL text fields.
         let mut stmt = tx.prepare(
-            "SELECT id, input, output FROM tool_calls WHERE input IS NOT NULL OR output IS NOT NULL",
+            "SELECT id, input, output, error_message FROM tool_calls
+             WHERE input IS NOT NULL OR output IS NOT NULL OR error_message IS NOT NULL",
         )?;
-        let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
         let mut updated = 0u64;
-        for (id, input, output) in &rows {
+        for (id, input, output, error_msg) in &rows {
             let scrubbed_input = input.as_deref().map(scrub_secrets);
             let scrubbed_output = output.as_deref().map(scrub_secrets);
+            let scrubbed_error = error_msg.as_deref().map(scrub_secrets);
 
             // Only UPDATE if scrubbing changed at least one field.
             let input_changed = matches!(&scrubbed_input, Some(std::borrow::Cow::Owned(_)));
             let output_changed = matches!(&scrubbed_output, Some(std::borrow::Cow::Owned(_)));
+            let error_changed = matches!(&scrubbed_error, Some(std::borrow::Cow::Owned(_)));
 
-            if input_changed || output_changed {
+            if input_changed || output_changed || error_changed {
                 tx.execute(
-                    "UPDATE tool_calls SET input = ?1, output = ?2 WHERE id = ?3",
-                    params![scrubbed_input.as_deref(), scrubbed_output.as_deref(), id,],
+                    "UPDATE tool_calls SET input = ?1, output = ?2, error_message = ?3 WHERE id = ?4",
+                    params![
+                        scrubbed_input.as_deref(),
+                        scrubbed_output.as_deref(),
+                        scrubbed_error.as_deref(),
+                        id,
+                    ],
                 )?;
                 updated += 1;
             }
@@ -5159,6 +5169,7 @@ impl Database {
         use crate::secret_scrubber::scrub_secrets;
         let scrubbed_input = input.map(scrub_secrets);
         let scrubbed_output = output.map(scrub_secrets);
+        let scrubbed_error = error_message.map(scrub_secrets);
 
         // Truncate large inputs/outputs to prevent DB bloat.
         // Uses char_indices for UTF-8 safe boundary (byte slicing panics on multi-byte chars).
@@ -5188,7 +5199,7 @@ impl Database {
                 success,
                 non_zero_exit,
                 latency_ms,
-                error_message,
+                scrubbed_error.as_deref(),
             ],
         )?;
         Ok(())
@@ -12868,6 +12879,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, clean_output, "clean content should be unchanged");
+    }
+
+    #[test]
+    fn test_save_tool_call_scrubs_secrets_in_error_message() {
+        let db = db();
+        // When a tool fails, error_message carries the same content as output.
+        // Both must be scrubbed.
+        let secret_error =
+            "Error reading .env: MIKA_GITHUB_TOKEN=github_pat_11CBQ5ABC1234567890abcdef";
+        db.save_tool_call(
+            "tc-err",
+            "mika",
+            "test-session",
+            None,
+            None,
+            0,
+            "read_agent_file",
+            "builtin",
+            None,
+            Some(r#"{"path":".env"}"#),
+            Some(secret_error),
+            false,
+            false,
+            100,
+            Some(secret_error),
+        )
+        .unwrap();
+
+        let (output, err_msg): (Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT output, error_message FROM tool_calls WHERE id = 'tc-err'",
+                [],
+                |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let output = output.unwrap();
+        let err_msg = err_msg.unwrap();
+        assert!(
+            !output.contains("github_pat_11CBQ5"),
+            "secret in output should be redacted: {output}"
+        );
+        assert!(
+            !err_msg.contains("github_pat_11CBQ5"),
+            "secret in error_message should be redacted: {err_msg}"
+        );
     }
 
     #[test]

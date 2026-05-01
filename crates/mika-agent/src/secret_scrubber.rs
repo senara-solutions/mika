@@ -253,8 +253,15 @@ mod tests {
     fn scrubs_gh_token_env_var() {
         let input = "GH_TOKEN=ghp_ABCDEFghij1234567890";
         let result = scrub_secrets(input);
-        // Both GH_TOKEN= and ghp_ patterns fire
-        assert!(result.contains("GH_TOKEN=<REDACTED>") || result.contains("ghp_<REDACTED>"));
+        // The raw secret must be gone regardless of which pattern wins
+        assert!(
+            !result.contains("ghp_ABCDEFghij"),
+            "raw secret must be redacted: {result}"
+        );
+        assert!(
+            result.contains("<REDACTED>"),
+            "should have redaction marker: {result}"
+        );
     }
 
     #[test]
