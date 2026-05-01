@@ -17,6 +17,7 @@ use crate::compaction;
 use crate::mcp::McpManager;
 use crate::messaging::MessageSender;
 use crate::prompt;
+use crate::secret_scrubber::scrub_secrets;
 use crate::skills::SkillRegistry;
 use crate::skills::builtin_handlers;
 use crate::skills::context;
@@ -2393,7 +2394,9 @@ async fn process_tool_calls(
                 reused
             } else {
                 debug!(tool = %name, "executing tool");
-                let input_summary = truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX);
+                let input_summary =
+                    scrub_secrets(&truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX))
+                        .into_owned();
                 let dispatch = ToolDispatchCtx {
                     tools,
                     skill_tools,
@@ -2453,13 +2456,17 @@ async fn process_tool_calls(
                 }
 
                 let image_count = output.images.len();
-                let output_summary = if image_count > 0 {
-                    truncate_summary(
-                        &format!("{} [+{image_count} image(s)]", output.content),
-                        OUTPUT_SUMMARY_MAX,
-                    )
-                } else {
-                    truncate_summary(&output.content, OUTPUT_SUMMARY_MAX)
+                let output_summary = {
+                    let raw = if image_count > 0 {
+                        truncate_summary(
+                            &format!("{} [+{image_count} image(s)]", output.content),
+                            OUTPUT_SUMMARY_MAX,
+                        )
+                    } else {
+                        truncate_summary(&output.content, OUTPUT_SUMMARY_MAX)
+                    };
+                    // Scrub secret-shaped values from metadata summaries (#908).
+                    scrub_secrets(&raw).into_owned()
                 };
                 let non_zero_exit = !output.is_error && has_non_zero_exit_prefix(&output.content);
                 summaries.push(ToolCallSummary {

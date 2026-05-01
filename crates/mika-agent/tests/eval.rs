@@ -60,6 +60,7 @@ mod eval {
     mod test_schema_divergence;
     mod test_self_knowledge_kg;
     mod test_task_not_found_retry;
+    mod test_tool_call_secret_redaction;
     mod test_tool_calling;
     mod test_verdict_handler;
     mod test_webhook_no_unauthorized_dispatch_guard;

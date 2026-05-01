@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 28;
+pub const CURRENT_SCHEMA_VERSION: i64 = 29;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1001,6 +1001,11 @@ impl Database {
             info!(version = 28, "database migrated to v28");
         }
 
+        if (3..=28).contains(&version) {
+            self.migrate_v28_to_v29()?;
+            info!(version = 29, "database migrated to v29");
+        }
+
         Ok(())
     }
 
@@ -1055,7 +1060,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (28);
+            INSERT INTO schema_version (version) VALUES (29);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -3487,6 +3492,78 @@ impl Database {
         Ok(())
     }
 
+    /// Backfill migration: scrub secret-shaped values from existing tool_calls
+    /// rows (#908). Data-only — no DDL changes. Applies `scrub_secrets()` to
+    /// `input` and `output` columns, updating only rows that change.
+    fn migrate_v28_to_v29(&mut self) -> Result<()> {
+        use crate::secret_scrubber::scrub_secrets;
+
+        let version = self.schema_version()?;
+        if version >= 29 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Collect IDs and content of rows that have non-NULL text fields.
+        let mut stmt = tx.prepare(
+            "SELECT id, input, output, error_message FROM tool_calls
+             WHERE input IS NOT NULL OR output IS NOT NULL OR error_message IS NOT NULL",
+        )?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut updated = 0u64;
+        for (id, input, output, error_msg) in &rows {
+            let scrubbed_input = input.as_deref().map(scrub_secrets);
+            let scrubbed_output = output.as_deref().map(scrub_secrets);
+            let scrubbed_error = error_msg.as_deref().map(scrub_secrets);
+
+            // Only UPDATE if scrubbing changed at least one field.
+            let input_changed = matches!(&scrubbed_input, Some(std::borrow::Cow::Owned(_)));
+            let output_changed = matches!(&scrubbed_output, Some(std::borrow::Cow::Owned(_)));
+            let error_changed = matches!(&scrubbed_error, Some(std::borrow::Cow::Owned(_)));
+
+            if input_changed || output_changed || error_changed {
+                tx.execute(
+                    "UPDATE tool_calls SET input = ?1, output = ?2, error_message = ?3 WHERE id = ?4",
+                    params![
+                        scrubbed_input.as_deref(),
+                        scrubbed_output.as_deref(),
+                        scrubbed_error.as_deref(),
+                        id,
+                    ],
+                )?;
+                updated += 1;
+            }
+        }
+
+        tx.execute("UPDATE schema_version SET version = 29", [])?;
+        tx.commit()?;
+
+        if updated > 0 {
+            info!(
+                updated_rows = updated,
+                total_rows = rows.len(),
+                "v28→v29: scrubbed secrets from existing tool_calls rows"
+            );
+        }
+
+        Ok(())
+    }
+
     /// v27 startup guard: refuse to open the database if the coalesce step
     /// from #787 has not run. Pins to `schema_version == 27` — future v28
     /// should carry its own guard, not inherit v27's.
@@ -5085,11 +5162,23 @@ impl Database {
         latency_ms: u64,
         error_message: Option<&str>,
     ) -> Result<()> {
+        // Scrub secret-shaped values before persistence (#908).
+        // Order: scrub → truncate → INSERT. The LLM's in-memory result is NOT
+        // scrubbed — only the durable copy in tool_calls is sanitized.
+        // `scrub_secrets` returns Cow::Borrowed when no secrets found (zero alloc).
+        use crate::secret_scrubber::scrub_secrets;
+        let scrubbed_input = input.map(scrub_secrets);
+        let scrubbed_output = output.map(scrub_secrets);
+        let scrubbed_error = error_message.map(scrub_secrets);
+
         // Truncate large inputs/outputs to prevent DB bloat.
         // Uses char_indices for UTF-8 safe boundary (byte slicing panics on multi-byte chars).
-        let truncated_input = input.map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_BYTES));
-        let truncated_output =
-            output.map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_BYTES));
+        let truncated_input = scrubbed_input
+            .as_deref()
+            .map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_BYTES));
+        let truncated_output = scrubbed_output
+            .as_deref()
+            .map(|s| Self::truncate_utf8_safe(s, Self::TOOL_CALL_MAX_BYTES));
         self.conn.execute(
             "INSERT INTO tool_calls (id, agent_id, session_id, trace_id, llm_call_id,
              step, tool_name, tool_source, skill_name, input, output,
@@ -5110,7 +5199,7 @@ impl Database {
                 success,
                 non_zero_exit,
                 latency_ms,
-                error_message,
+                scrubbed_error.as_deref(),
             ],
         )?;
         Ok(())
@@ -12274,7 +12363,7 @@ mod tests {
             "kg_entities should not exist at v24"
         );
 
-        // Run incremental migrations: v24 -> v25 -> v26 -> v27 -> v28
+        // Run incremental migrations: v24 -> v25 -> v26 -> v27 -> v28 -> v29
         let mut db2 = Database { conn: conn2 };
         db2.migrate_v24_to_v25().unwrap();
         db2.migrate_v25_to_v26().unwrap();
@@ -12291,6 +12380,7 @@ mod tests {
             .unwrap();
 
         db2.migrate_v27_to_v28().unwrap();
+        db2.migrate_v28_to_v29().unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -12656,5 +12746,257 @@ mod tests {
             count_after, 2,
             "dashboard connection should see writes after WAL checkpoint"
         );
+    }
+
+    // ===== Secret scrubbing at save_tool_call boundary (#908) =====
+
+    #[test]
+    fn test_save_tool_call_scrubs_secrets_in_output() {
+        let db = db();
+        db.save_tool_call(
+            "tc-1",
+            "mika",
+            "test-session",
+            None,
+            None,
+            0,
+            "read_agent_file",
+            "builtin",
+            None,
+            Some(r#"{"path":".env"}"#),
+            Some("MIKA_GITHUB_TOKEN=github_pat_11CBQ5ABC1234567890abcdef\nMIKA_LOG_FORMAT=json"),
+            true,
+            false,
+            100,
+            None,
+        )
+        .unwrap();
+
+        let (input, output): (Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT input, output FROM tool_calls WHERE id = 'tc-1'",
+                [],
+                |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        // Output should have secret redacted but non-secret preserved
+        let output = output.unwrap();
+        assert!(
+            !output.contains("github_pat_11CBQ5"),
+            "secret should be redacted in output: {output}"
+        );
+        assert!(
+            output.contains("MIKA_GITHUB_TOKEN=<REDACTED>"),
+            "env var assignment should be redacted: {output}"
+        );
+        assert!(
+            output.contains("MIKA_LOG_FORMAT=json"),
+            "non-secret env var should be preserved: {output}"
+        );
+
+        // Input should be unchanged (no secrets)
+        let input = input.unwrap();
+        assert_eq!(input, r#"{"path":".env"}"#);
+    }
+
+    #[test]
+    fn test_save_tool_call_scrubs_secrets_in_input() {
+        let db = db();
+        db.save_tool_call(
+            "tc-2",
+            "mika",
+            "test-session",
+            None,
+            None,
+            0,
+            "run_shell",
+            "builtin",
+            None,
+            Some(r#"{"command":"echo ghp_ABCDEFghij1234567890"}"#),
+            Some("ghp_ABCDEFghij1234567890"),
+            true,
+            false,
+            50,
+            None,
+        )
+        .unwrap();
+
+        let (input, output): (Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT input, output FROM tool_calls WHERE id = 'tc-2'",
+                [],
+                |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let input = input.unwrap();
+        assert!(
+            !input.contains("ghp_ABCDEFghij"),
+            "secret should be redacted in input: {input}"
+        );
+        assert!(
+            input.contains("ghp_<REDACTED>"),
+            "should have redaction marker: {input}"
+        );
+
+        let output = output.unwrap();
+        assert_eq!(output, "ghp_<REDACTED>");
+    }
+
+    #[test]
+    fn test_save_tool_call_preserves_clean_content() {
+        let db = db();
+        let clean_output = "File contents:\nname = mika\nversion = 0.5.0";
+        db.save_tool_call(
+            "tc-3",
+            "mika",
+            "test-session",
+            None,
+            None,
+            0,
+            "read_agent_file",
+            "builtin",
+            None,
+            Some(r#"{"path":"Cargo.toml"}"#),
+            Some(clean_output),
+            true,
+            false,
+            30,
+            None,
+        )
+        .unwrap();
+
+        let output: String = db
+            .conn
+            .query_row(
+                "SELECT output FROM tool_calls WHERE id = 'tc-3'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(output, clean_output, "clean content should be unchanged");
+    }
+
+    #[test]
+    fn test_save_tool_call_scrubs_secrets_in_error_message() {
+        let db = db();
+        // When a tool fails, error_message carries the same content as output.
+        // Both must be scrubbed.
+        let secret_error =
+            "Error reading .env: MIKA_GITHUB_TOKEN=github_pat_11CBQ5ABC1234567890abcdef";
+        db.save_tool_call(
+            "tc-err",
+            "mika",
+            "test-session",
+            None,
+            None,
+            0,
+            "read_agent_file",
+            "builtin",
+            None,
+            Some(r#"{"path":".env"}"#),
+            Some(secret_error),
+            false,
+            false,
+            100,
+            Some(secret_error),
+        )
+        .unwrap();
+
+        let (output, err_msg): (Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT output, error_message FROM tool_calls WHERE id = 'tc-err'",
+                [],
+                |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let output = output.unwrap();
+        let err_msg = err_msg.unwrap();
+        assert!(
+            !output.contains("github_pat_11CBQ5"),
+            "secret in output should be redacted: {output}"
+        );
+        assert!(
+            !err_msg.contains("github_pat_11CBQ5"),
+            "secret in error_message should be redacted: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v28_to_v29_scrubs_existing_rows() {
+        let mut db = db();
+
+        // Temporarily set schema to 28 so migration will run
+        db.conn
+            .execute("UPDATE schema_version SET version = 28", [])
+            .unwrap();
+
+        // Insert a row with a secret directly (bypassing the scrubber via raw SQL)
+        db.conn
+            .execute(
+                "INSERT INTO tool_calls (id, agent_id, session_id, step, tool_name, tool_source, input, output, success, non_zero_exit, latency_ms)
+                 VALUES ('old-1', 'mika', 'test-session', 0, 'read_agent_file', 'builtin', '{\"path\":\".env\"}', 'MIKA_GITHUB_TOKEN=github_pat_11CBQ5ABC1234567890abcdef', 1, 0, 100)",
+                [],
+            )
+            .unwrap();
+
+        // Insert a clean row that should not be modified
+        db.conn
+            .execute(
+                "INSERT INTO tool_calls (id, agent_id, session_id, step, tool_name, tool_source, input, output, success, non_zero_exit, latency_ms)
+                 VALUES ('old-2', 'mika', 'test-session', 1, 'search_memory', 'builtin', '{\"query\":\"test\"}', 'No results found', 1, 0, 50)",
+                [],
+            )
+            .unwrap();
+
+        // Run migration
+        db.migrate_v28_to_v29().unwrap();
+
+        // Verify version bumped
+        assert_eq!(db.schema_version().unwrap(), 29);
+
+        // Verify secret row was scrubbed
+        let output: String = db
+            .conn
+            .query_row(
+                "SELECT output FROM tool_calls WHERE id = 'old-1'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !output.contains("github_pat_11CBQ5"),
+            "migration should have scrubbed secret: {output}"
+        );
+        assert!(
+            output.contains("<REDACTED>"),
+            "migration should have redacted: {output}"
+        );
+
+        // Verify clean row was unchanged
+        let clean_output: String = db
+            .conn
+            .query_row(
+                "SELECT output FROM tool_calls WHERE id = 'old-2'",
+                [],
+                |row: &rusqlite::Row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(clean_output, "No results found");
+    }
+
+    #[test]
+    fn test_migrate_v28_to_v29_idempotent() {
+        let mut db = db();
+        // DB is already at v29 (db() creates at CURRENT_SCHEMA_VERSION)
+        // Running migration again should be a no-op
+        db.migrate_v28_to_v29().unwrap();
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 }
