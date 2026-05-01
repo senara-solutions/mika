@@ -1146,17 +1146,22 @@ The `list_skills` agent tool runs `validate_loaded()` and reports the skipped co
 
 mika-qa-bot posts PR verdicts as GitHub reviews with:
 
-- **Review state:** `COMMENTED` (NOT `APPROVED` or `CHANGES_REQUESTED`)
-- **Body:** contains a `VERDICT: <class>[<detail>]` token (e.g., `VERDICT: approve`, `VERDICT: hold[review]`, `VERDICT: reject`)
+| Verdict | Review state | Routing |
+| --- | --- | --- |
+| `pass` | `APPROVED` | Satisfies branch protection's "1 approval required" gate (per mika-skills#55, 2026-03-30) so `pr_merge_with_gate` (mika-skills#119, 2026-04-11) clears without manual operator clicks. |
+| `hold[*]`, `block[*]` | `COMMENTED` | Stays advisory; preserves the operator's "merge anyway" escape hatch. |
+| **never** | `CHANGES_REQUESTED` | Forbidden — it conflates advisory verdicts with GitHub's review-required gate (mika#487 invariant). |
+
+- **Body:** contains a `VERDICT: <class>[<detail>]` token (e.g., `VERDICT: pass`, `VERDICT: hold[review]`, `VERDICT: block[tests]`)
 
 **The `state` field is NOT authoritative. The `VERDICT:` token in the body is.**
 
-QA is advisory — it never blocks GitHub's native merge button. Using `CHANGES_REQUESTED` would conflate advisory verdicts with GitHub's review-required gate and is explicitly rejected.
+QA is advisory for hold/block verdicts — it never uses `CHANGES_REQUESTED` to block GitHub's native merge button. Using `CHANGES_REQUESTED` would conflate advisory verdicts with GitHub's review-required gate and is explicitly rejected.
 
 ### BAD — gating on state
 
 ```rust
-// ❌ never fires for qa-bot — all qa-bot reviews are state=COMMENTED
+// ❌ state alone cannot distinguish qa-bot routing outcomes safely
 if review.state == "CHANGES_REQUESTED" { retry() }
 ```
 
@@ -1164,7 +1169,7 @@ if review.state == "CHANGES_REQUESTED" { retry() }
 
 ```rust
 // ✅ parse the VERDICT: token from the review body
-if body.contains("VERDICT: hold") || body.contains("VERDICT: reject") { retry() }
+if body.contains("VERDICT: hold") || body.contains("VERDICT: block") { retry() }
 ```
 
 Any webhook filter, routing rule, or verdict parser that gates on `state` instead of body content is a bug. See issue [#487](https://github.com/senara-solutions/mika/issues/487) for the incident that motivated this contract.
