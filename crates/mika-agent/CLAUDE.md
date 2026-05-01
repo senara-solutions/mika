@@ -315,6 +315,8 @@ docs_roots = [
 
 **LLM policy (C2):** Model from `MIKA_KG_EXTRACTION_MODEL` → `MIKA_KG_INGESTION_MODEL` fallback. Retry taxonomy per C2.2 (transport: 3 attempts with backoff; semantic: one retry with prompt reinforcement; config: no retry). Log-and-skip per C2.3. `llm_calls` rows per C2.4. Audit events per C3.3.
 
+**Parse tolerance (#876):** `parse_extraction_json` tolerates reasoning prose before/after the JSON object — a common failure mode with haiku-class models (sibling of #768). Three-layer parsing: (1) strip markdown code fences, (2) direct `serde_json::from_str`, (3) `extract_first_json_object()` brace-matching fallback that locates the first balanced `{…}` in surrounding text with string-literal/escape-aware depth tracking. Schema validation stays strict — only surrounding-prose tolerance is added. When the slow path (layer 3) succeeds, emits `extraction_parse_slow_path` WARN for operator visibility. The extraction prompt also includes a JSON-only output instruction as defense-in-depth.
+
 ## Knowledge Graph — Entity Resolver
 
 `src/kg/entity_resolver.rs` — Per-agent entity resolution that bridges subject graph entities to domain graph nodes (#691). Two-stage pipeline: exact match (case-insensitive) then LLM disambiguation for unresolved or ambiguous cases.
