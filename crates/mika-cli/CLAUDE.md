@@ -62,7 +62,7 @@ Requires `MIKA_GATEWAY_URL` (default: `http://localhost:3001`) and `MIKA_INTERNA
 
 ## Knowledge Graph CLI
 
-`mika kg status` — show KG state summary across all agents (entity counts, chunk counts, last extraction, enabled flag, corpus grouping by `docs_root_hash`). `--agent X` filters to one agent with extended detail. Supports `--format text|json`.
+`mika kg status` — show KG state summary across all agents (entity counts, chunk counts, last extraction, enabled flag, corpus grouping by `docs_root_hash`). Multi-corpus agents (e.g., mika-arch) display one row per corpus with per-corpus resolution counts (#877); agent name and enabled flag are shown on the first row only. `--agent X` filters to one agent. Supports `--format text|json`.
 
 `mika kg list-agents` — quick enumeration of agents with KG state (agent name, enabled flag, `docs_root_hash`, chunk count). Supports `--agent X` filter and `--format text|json`.
 
