@@ -37,6 +37,22 @@ fn open_db(db_path: &Path) -> Result<mika_agent::db::Database> {
     mika_agent::db::Database::open(db_path)
 }
 
+fn truncate_docs_root(docs_root: &str, max_display: usize) -> String {
+    if docs_root.chars().count() > max_display {
+        let suffix: String = docs_root
+            .chars()
+            .rev()
+            .take(max_display - 2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("..{suffix}")
+    } else {
+        docs_root.to_string()
+    }
+}
+
 fn format_count(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
@@ -135,26 +151,30 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
     let mut agent_states = Vec::new();
     for agent_name in &agent_names {
         let agent_home = mika_common::home::resolve_agent_home(global_home, agent_name);
-        let state = build_agent_kg_state(&db, global_home, &agent_home, agent_name);
-        agent_states.push(state);
+        let states = build_agent_kg_states(&db, global_home, &agent_home, agent_name);
+        agent_states.extend(states);
     }
 
-    // Build corpus groups
+    // Build corpus groups — each state is one (agent, corpus) pair
     let mut corpus_map: std::collections::HashMap<String, CorpusGroup> =
         std::collections::HashMap::new();
-    let mut disabled_count = 0;
+    let mut disabled_agents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut enabled_agents: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut drift_agents: Vec<String> = Vec::new();
 
     for state in &agent_states {
         if !state.enabled {
-            disabled_count += 1;
+            disabled_agents.insert(state.agent_id.clone());
             continue;
         }
+        enabled_agents.insert(state.agent_id.clone());
         if state.error.is_some() {
             continue;
         }
         if state.drift {
-            drift_agents.push(state.agent_id.clone());
+            if !drift_agents.contains(&state.agent_id) {
+                drift_agents.push(state.agent_id.clone());
+            }
             continue;
         }
         if let Some(ref hash) = state.docs_root_hash {
@@ -165,17 +185,21 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                     docs_root: state.docs_root.clone().unwrap_or_default(),
                     agents: vec![],
                 });
-            entry.agents.push(state.agent_id.clone());
+            // Deduplicate agent names within a corpus group
+            if !entry.agents.contains(&state.agent_id) {
+                entry.agents.push(state.agent_id.clone());
+            }
         }
     }
 
     let corpora: Vec<CorpusGroup> = corpus_map.into_values().collect();
     let unique_corpora = corpora.len();
+    let total_agents = enabled_agents.len() + disabled_agents.len();
 
     let summary = KgSummary {
-        total_agents: agent_states.len(),
+        total_agents,
         unique_corpora,
-        disabled_count,
+        disabled_count: disabled_agents.len(),
         corpora,
     };
 
@@ -232,8 +256,20 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                 "-".repeat(18)
             );
 
+            let mut prev_agent: Option<String> = None;
             for state in &agent_states {
-                let enabled_str = if state.enabled { "true" } else { "false" };
+                // Show agent name only on the first row for each agent
+                let show_agent = prev_agent.as_ref() != Some(&state.agent_id);
+                let agent_col = if show_agent {
+                    state.agent_id.as_str()
+                } else {
+                    ""
+                };
+                let enabled_str = if show_agent {
+                    if state.enabled { "true" } else { "false" }
+                } else {
+                    ""
+                };
                 let docs_root = state.docs_root.as_deref().unwrap_or("N/A");
                 let drift_tag = if state.drift { "  [DRIFT]" } else { "" };
                 let error_tag = if let Some(ref e) = state.error {
@@ -244,23 +280,11 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                 let last_ext = state.last_extraction.as_deref().unwrap_or("N/A");
 
                 // Truncate docs_root for display (char-safe, no byte slicing)
-                let docs_display = if docs_root.chars().count() > 34 {
-                    let suffix: String = docs_root
-                        .chars()
-                        .rev()
-                        .take(32)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    format!("..{suffix}")
-                } else {
-                    docs_root.to_string()
-                };
+                let docs_display = truncate_docs_root(docs_root, 34);
 
                 println!(
                     "  {:<20} {:<8} {:<36} {:>8} {:>10} {:>10} {:>8} {}{}{}",
-                    state.agent_id,
+                    agent_col,
                     enabled_str,
                     docs_display,
                     format_count(state.chunks),
@@ -271,6 +295,7 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                     drift_tag,
                     error_tag,
                 );
+                prev_agent = Some(state.agent_id.clone());
             }
             println!();
         }
@@ -279,12 +304,17 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
     Ok(())
 }
 
-fn build_agent_kg_state(
+/// Build per-corpus KG state entries for an agent.
+///
+/// For single-corpus agents, returns a single-element Vec. For multi-corpus
+/// agents (e.g., mika-arch with 4 corpora), returns one entry per corpus so
+/// the CLI can display per-corpus resolution coverage (#877).
+fn build_agent_kg_states(
     db: &mika_agent::db::Database,
     global_home: &Path,
     agent_home: &Path,
     agent_name: &str,
-) -> AgentKgState {
+) -> Vec<AgentKgState> {
     let identity = mika_agent::prompt::load_identity(agent_home);
 
     // Resolve per-agent KG config
@@ -292,7 +322,7 @@ fn build_agent_kg_state(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(agent = agent_name, error = %e, "Failed to load settings for KG status");
-            return AgentKgState {
+            return vec![AgentKgState {
                 agent_id: agent_name.to_string(),
                 enabled: identity.kg.enabled,
                 docs_root: None,
@@ -304,81 +334,69 @@ fn build_agent_kg_state(
                 last_extraction: None,
                 drift: false,
                 error: Some(format!("config error: {e}")),
-            };
+            }];
         }
     };
 
     let kg_config = mika_agent::kg::config::resolve_per_agent_docs_root(&identity, &settings);
 
     match kg_config {
-        Ok(mika_agent::kg::config::KgAgentConfig::Disabled { .. }) => AgentKgState {
-            agent_id: agent_name.to_string(),
-            enabled: false,
-            docs_root: None,
-            docs_root_hash: None,
-            chunks: 0,
-            subjects: 0,
-            resolved: 0,
-            pending: 0,
-            last_extraction: None,
-            drift: false,
-            error: None,
-        },
-        Ok(mika_agent::kg::config::KgAgentConfig::Enabled { ref corpora }) => {
-            // Use the first corpus for summary display (back-compat with single-root UI).
-            // Multi-corpus detail is available via `mika kg status --agent X`.
-            let first = corpora.first();
-            let docs_root_hash = first.map(|c| c.docs_root_hash.clone());
-            let docs_root = first.map(|c| c.docs_root.display().to_string());
-
-            // Aggregate row counts across all corpora
-            let mut chunks = 0u64;
-            let mut subjects = 0u64;
-            let mut last_extraction: Option<String> = None;
-            for corpus in corpora {
-                chunks += db
-                    .kg_count_rows("kg_chunks", "docs_root_hash", &corpus.docs_root_hash)
-                    .unwrap_or(0);
-                subjects += db
-                    .kg_count_rows(
-                        "kg_subject_entities",
-                        "docs_root_hash",
-                        &corpus.docs_root_hash,
-                    )
-                    .unwrap_or(0);
-                if let Ok(Some(ts)) = db.kg_last_extraction(&corpus.docs_root_hash)
-                    && last_extraction.as_ref().is_none_or(|prev| ts > *prev)
-                {
-                    last_extraction = Some(ts);
-                }
-            }
-            let resolved = db
-                .kg_count_rows("kg_subject_resolutions", "agent_id", agent_name)
-                .unwrap_or(0);
-
-            // Pending = subjects that have no resolution log entry for this agent
-            let pending = subjects.saturating_sub(resolved);
-
-            // Drift detection — multi-corpus agents naturally have multiple hashes
-            let drift = false;
-
-            AgentKgState {
+        Ok(mika_agent::kg::config::KgAgentConfig::Disabled { .. }) => {
+            vec![AgentKgState {
                 agent_id: agent_name.to_string(),
-                enabled: true,
-                docs_root,
-                docs_root_hash,
-                chunks,
-                subjects,
-                resolved,
-                pending,
-                last_extraction,
-                drift,
+                enabled: false,
+                docs_root: None,
+                docs_root_hash: None,
+                chunks: 0,
+                subjects: 0,
+                resolved: 0,
+                pending: 0,
+                last_extraction: None,
+                drift: false,
                 error: None,
-            }
+            }]
+        }
+        Ok(mika_agent::kg::config::KgAgentConfig::Enabled { ref corpora }) => {
+            // Emit one row per corpus for full multi-corpus visibility (#877).
+            corpora
+                .iter()
+                .map(|corpus| {
+                    let chunks = db
+                        .kg_count_rows("kg_chunks", "docs_root_hash", &corpus.docs_root_hash)
+                        .unwrap_or(0);
+                    let subjects = db
+                        .kg_count_rows(
+                            "kg_subject_entities",
+                            "docs_root_hash",
+                            &corpus.docs_root_hash,
+                        )
+                        .unwrap_or(0);
+                    let resolved = db
+                        .kg_count_resolved_for_corpus(agent_name, &corpus.docs_root_hash)
+                        .unwrap_or(0);
+                    let pending = subjects.saturating_sub(resolved);
+                    let last_extraction =
+                        db.kg_last_extraction(&corpus.docs_root_hash).ok().flatten();
+
+                    AgentKgState {
+                        agent_id: agent_name.to_string(),
+                        enabled: true,
+                        docs_root: Some(corpus.docs_root.display().to_string()),
+                        docs_root_hash: Some(corpus.docs_root_hash.clone()),
+                        chunks,
+                        subjects,
+                        resolved,
+                        pending,
+                        last_extraction,
+                        drift: false,
+                        error: None,
+                    }
+                })
+                .collect()
         }
         Err(e) => {
             tracing::warn!(agent = agent_name, error = %e, "KG config error");
-            AgentKgState {
+            vec![AgentKgState {
                 agent_id: agent_name.to_string(),
                 enabled: identity.kg.enabled,
                 docs_root: identity
@@ -394,7 +412,7 @@ fn build_agent_kg_state(
                 last_extraction: None,
                 drift: false,
                 error: Some(format!("{e}")),
-            }
+            }]
         }
     }
 }
@@ -1131,5 +1149,182 @@ mod tests {
         let expected = "archive_bot_v2";
         let input = "archive_bot_v2";
         assert_eq!(input, expected);
+    }
+
+    // truncate_docs_root tests (#877)
+
+    #[test]
+    fn test_truncate_docs_root_short_path() {
+        assert_eq!(truncate_docs_root("/short/path", 34), "/short/path");
+    }
+
+    #[test]
+    fn test_truncate_docs_root_exact_limit() {
+        let path = "x".repeat(34);
+        assert_eq!(truncate_docs_root(&path, 34), path);
+    }
+
+    #[test]
+    fn test_truncate_docs_root_over_limit() {
+        let path = "/data/workspace/mika-platform/mika/docs/solutions";
+        let truncated = truncate_docs_root(path, 34);
+        assert!(
+            truncated.starts_with(".."),
+            "Expected leading '..' but got: {truncated}"
+        );
+        assert_eq!(truncated.chars().count(), 34);
+    }
+
+    #[test]
+    fn test_truncate_docs_root_na() {
+        assert_eq!(truncate_docs_root("N/A", 34), "N/A");
+    }
+
+    // Multi-corpus AgentKgState serialization tests (#877)
+
+    #[test]
+    fn test_agent_kg_state_json_shape_multi_corpus() {
+        let states = vec![
+            AgentKgState {
+                agent_id: "mika-arch".to_string(),
+                enabled: true,
+                docs_root: Some("/data/mika/docs/solutions".to_string()),
+                docs_root_hash: Some("abc123".to_string()),
+                chunks: 2845,
+                subjects: 30164,
+                resolved: 8082,
+                pending: 22082,
+                last_extraction: Some("2026-04-29T12:00:00Z".to_string()),
+                drift: false,
+                error: None,
+            },
+            AgentKgState {
+                agent_id: "mika-arch".to_string(),
+                enabled: true,
+                docs_root: Some("/data/mika-skills/docs/solutions".to_string()),
+                docs_root_hash: Some("def456".to_string()),
+                chunks: 345,
+                subjects: 164,
+                resolved: 4,
+                pending: 160,
+                last_extraction: Some("2026-04-29T12:00:00Z".to_string()),
+                drift: false,
+                error: None,
+            },
+        ];
+
+        let json = serde_json::to_value(&states).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["agent_id"], "mika-arch");
+        assert_eq!(arr[0]["docs_root_hash"], "abc123");
+        assert_eq!(arr[0]["resolved"], 8082);
+        assert_eq!(arr[1]["agent_id"], "mika-arch");
+        assert_eq!(arr[1]["docs_root_hash"], "def456");
+        assert_eq!(arr[1]["resolved"], 4);
+    }
+
+    #[test]
+    fn test_corpus_group_dedup_agents() {
+        // Verify that the corpus grouping logic doesn't produce duplicate agent
+        // entries when an agent has multiple corpora sharing the same hash
+        // (shouldn't happen in practice, but defensive)
+        let mut corpus_map: std::collections::HashMap<String, CorpusGroup> =
+            std::collections::HashMap::new();
+
+        let hash = "abc123".to_string();
+        let entry = corpus_map
+            .entry(hash.clone())
+            .or_insert_with(|| CorpusGroup {
+                docs_root_hash: hash.clone(),
+                docs_root: "/some/path".to_string(),
+                agents: vec![],
+            });
+        if !entry.agents.contains(&"mika-arch".to_string()) {
+            entry.agents.push("mika-arch".to_string());
+        }
+        // Simulate second insert for same agent (shouldn't happen, but defensive)
+        let entry = corpus_map.get_mut(&hash).unwrap();
+        if !entry.agents.contains(&"mika-arch".to_string()) {
+            entry.agents.push("mika-arch".to_string());
+        }
+
+        assert_eq!(entry.agents.len(), 1);
+    }
+
+    #[test]
+    fn test_summary_counts_agents_not_corpus_rows() {
+        // With multi-corpus agents, the summary should count unique agents,
+        // not (agent, corpus) pairs
+        let agent_states = vec![
+            AgentKgState {
+                agent_id: "mika-arch".to_string(),
+                enabled: true,
+                docs_root: Some("/path1".to_string()),
+                docs_root_hash: Some("hash1".to_string()),
+                chunks: 100,
+                subjects: 50,
+                resolved: 10,
+                pending: 40,
+                last_extraction: None,
+                drift: false,
+                error: None,
+            },
+            AgentKgState {
+                agent_id: "mika-arch".to_string(),
+                enabled: true,
+                docs_root: Some("/path2".to_string()),
+                docs_root_hash: Some("hash2".to_string()),
+                chunks: 50,
+                subjects: 25,
+                resolved: 5,
+                pending: 20,
+                last_extraction: None,
+                drift: false,
+                error: None,
+            },
+            AgentKgState {
+                agent_id: "mika-dev".to_string(),
+                enabled: true,
+                docs_root: Some("/path1".to_string()),
+                docs_root_hash: Some("hash1".to_string()),
+                chunks: 100,
+                subjects: 50,
+                resolved: 10,
+                pending: 40,
+                last_extraction: None,
+                drift: false,
+                error: None,
+            },
+        ];
+
+        let mut enabled_agents: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut corpus_map: std::collections::HashMap<String, CorpusGroup> =
+            std::collections::HashMap::new();
+
+        for state in &agent_states {
+            enabled_agents.insert(state.agent_id.clone());
+            if let Some(ref hash) = state.docs_root_hash {
+                let entry = corpus_map
+                    .entry(hash.clone())
+                    .or_insert_with(|| CorpusGroup {
+                        docs_root_hash: hash.clone(),
+                        docs_root: state.docs_root.clone().unwrap_or_default(),
+                        agents: vec![],
+                    });
+                if !entry.agents.contains(&state.agent_id) {
+                    entry.agents.push(state.agent_id.clone());
+                }
+            }
+        }
+
+        // 2 unique agents, 2 unique corpora
+        assert_eq!(enabled_agents.len(), 2);
+        assert_eq!(corpus_map.len(), 2);
+        // hash1 is shared by both agents
+        assert_eq!(corpus_map["hash1"].agents.len(), 2);
+        // hash2 is only mika-arch
+        assert_eq!(corpus_map["hash2"].agents.len(), 1);
     }
 }

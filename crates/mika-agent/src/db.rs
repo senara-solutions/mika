@@ -8542,6 +8542,26 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Count resolved subject entities for an agent within a specific corpus.
+    ///
+    /// Joins `kg_subject_resolutions` through `kg_subject_entities` to scope
+    /// the count to a single `docs_root_hash`. Used by `mika kg status` to
+    /// display per-corpus resolution coverage for multi-corpus agents (#877).
+    pub fn kg_count_resolved_for_corpus(
+        &self,
+        agent_id: &str,
+        docs_root_hash: &str,
+    ) -> Result<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM kg_subject_resolutions sr \
+             JOIN kg_subject_entities se ON sr.subject_entity_id = se.id \
+             WHERE sr.agent_id = ?1 AND se.docs_root_hash = ?2",
+            params![agent_id, docs_root_hash],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Get the most recent extraction timestamp for a docs_root_hash.
     pub fn kg_last_extraction(&self, docs_root_hash: &str) -> Result<Option<String>> {
         self.conn
