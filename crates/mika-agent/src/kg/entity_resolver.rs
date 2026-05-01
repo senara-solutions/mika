@@ -1618,4 +1618,338 @@ mod tests {
     fn max_candidates_constant() {
         assert_eq!(MAX_DISAMBIGUATION_CANDIDATES, 50);
     }
+
+    // -----------------------------------------------------------------------
+    // F3 path tests (#874) — DB-fallback validation branch
+    //
+    // These tests exercise the four outcome paths in `disambiguate_with_llm`
+    // when the LLM returns a `matched_key`:
+    //   Path 1: matched_key in the in-prompt candidate list → matched_llm
+    //   Path 2: matched_key not in candidates, exists in kg_entities same type → matched_llm_db_fallback
+    //   Path 3: matched_key not in candidates, exists in kg_entities different type → no_match
+    //   Path 4: matched_key not in candidates or kg_entities at all → no_match
+    //
+    // All tests use a subject entity with confidence = 0.8 (below the 0.9
+    // exact-match threshold) and a name that does NOT match any domain entity
+    // (avoids Stage 1 short-circuit). The mock LLM returns a single JSON
+    // response per the disambiguation protocol.
+    // -----------------------------------------------------------------------
+
+    /// Helper: create an in-memory AsyncDatabase with a test agent, session,
+    /// and corpus mapping — mirrors kg_fixtures::test_db() but avoids
+    /// cross-crate test dependency for unit tests in the same module.
+    fn f3_test_db() -> crate::async_db::AsyncDatabase {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let agent_id = "test-agent";
+        db.register_agent(agent_id, agent_id, "/tmp/mika-test/test-agent")
+            .unwrap();
+        db.register_agent_corpus(agent_id, "0000000000000000", "/test/docs/solutions")
+            .unwrap();
+        db.create_session("test-session", agent_id, "test").unwrap();
+        crate::async_db::AsyncDatabase::new_with_agent(db, agent_id)
+    }
+
+    /// Helper: seed a domain entity into kg_entities.
+    async fn f3_seed_domain_entity(
+        db: &crate::async_db::AsyncDatabase,
+        entity_type: &str,
+        name: &str,
+    ) -> i64 {
+        let entity_key = format!("{entity_type}:{name}");
+        let etype = entity_type.to_string();
+        let name = name.to_string();
+        db.with_db(move |db| {
+            db.execute_sql(
+                "INSERT INTO kg_entities (entity_key, type, name) VALUES (?1, ?2, ?3)",
+                &[&entity_key as &dyn rusqlite::types::ToSql, &etype, &name],
+            )?;
+            Ok(db.last_insert_rowid())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Helper: seed a subject entity into kg_subject_entities.
+    async fn f3_seed_subject_entity(
+        db: &crate::async_db::AsyncDatabase,
+        entity_type: &str,
+        name: &str,
+        confidence: f64,
+    ) -> i64 {
+        let entity_key = format!("{entity_type}:{name}");
+        let etype = entity_type.to_string();
+        let name = name.to_string();
+        db.with_db(move |db| {
+            db.execute_sql(
+                "INSERT INTO kg_subject_entities \
+                 (docs_root_hash, docs_root, entity_key, type, name, confidence) \
+                 VALUES ('0000000000000000', '/test/docs/solutions', ?1, ?2, ?3, ?4)",
+                &[
+                    &entity_key as &dyn rusqlite::types::ToSql,
+                    &etype,
+                    &name,
+                    &confidence,
+                ],
+            )?;
+            Ok(db.last_insert_rowid())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Helper: read resolution log outcome for a subject entity.
+    async fn f3_get_outcome(
+        db: &crate::async_db::AsyncDatabase,
+        subject_entity_id: i64,
+    ) -> Option<String> {
+        let agent_id = db.agent_id.clone();
+        db.with_db(move |db| {
+            let result = db.conn.query_row(
+                "SELECT outcome FROM kg_resolutions_log \
+                 WHERE agent_id = ?1 AND subject_entity_id = ?2",
+                rusqlite::params![agent_id, subject_entity_id],
+                |row| row.get::<_, String>(0),
+            );
+            match result {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Helper: check if a resolution row exists.
+    async fn f3_get_resolution(
+        db: &crate::async_db::AsyncDatabase,
+        subject_entity_id: i64,
+    ) -> Option<(i64, f64)> {
+        let agent_id = db.agent_id.clone();
+        db.with_db(move |db| {
+            let result = db.conn.query_row(
+                "SELECT domain_entity_id, confidence FROM kg_subject_resolutions \
+                 WHERE agent_id = ?1 AND subject_entity_id = ?2",
+                rusqlite::params![agent_id, subject_entity_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+            );
+            match result {
+                Ok(v) => Ok(Some(v)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    /// F3 Path 1: LLM candidate is in the resolved (in-prompt) list.
+    /// The matched_key appears in `get_domain_candidates` output (≤50 entries).
+    /// Expected: outcome = matched_llm, resolution row written.
+    #[tokio::test]
+    async fn f3_path1_in_list_accept() {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let db = f3_test_db();
+
+        // Seed a domain entity that WILL be in the candidate list (< 50 skills).
+        let domain_id = f3_seed_domain_entity(&db, "skill", "self-dev").await;
+
+        // Seed a subject entity with a DIFFERENT name so Stage 1 exact match misses.
+        // Confidence = 0.8 < 0.9 threshold → falls through to Stage 2.
+        let subject_id = f3_seed_subject_entity(&db, "skill", "selfdev_typo", 0.8).await;
+
+        // Mock LLM returns the domain entity key (which IS in the candidate list).
+        let mock = MockLlmProvider::builder()
+            .response(text_response(
+                r#"{"match": "skill:self-dev", "confidence": 0.85}"#,
+            ))
+            .build();
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            Some(Arc::new(mock)),
+            vec!["0000000000000000".to_string()],
+            Some("test-f3-path1"),
+        );
+
+        let stats = resolver
+            .resolve_doc_entities(&[subject_id], "extraction-trace-1", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.matched_llm, 1, "Path 1 should produce matched_llm");
+        assert_eq!(
+            stats.matched_llm_db_fallback, 0,
+            "Path 1 should NOT trigger DB fallback"
+        );
+
+        let outcome = f3_get_outcome(&db, subject_id).await;
+        assert_eq!(outcome.as_deref(), Some(outcome::MATCHED_LLM));
+
+        let resolution = f3_get_resolution(&db, subject_id).await;
+        assert!(resolution.is_some(), "resolution row should be written");
+        let (resolved_domain_id, _) = resolution.unwrap();
+        assert_eq!(resolved_domain_id, domain_id);
+    }
+
+    /// F3 Path 2: DB-fallback hit, same type.
+    /// The LLM returns a matched_key that exists in kg_entities under the same
+    /// type but is NOT in the 50-cap in-prompt candidate list.
+    /// Expected: outcome = matched_llm_db_fallback, counter incremented.
+    #[tokio::test]
+    async fn f3_path2_db_fallback_same_type() {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let db = f3_test_db();
+
+        // Seed 51 domain skill entities so "skill:zzz-target" (alphabetically last)
+        // falls outside the 50-cap candidate window.
+        for i in 0..50 {
+            f3_seed_domain_entity(&db, "skill", &format!("aaa-filler-{i:03}")).await;
+        }
+        // This one sorts after all "aaa-filler-*" entries → outside the 50-cap.
+        let target_id = f3_seed_domain_entity(&db, "skill", "zzz-target").await;
+
+        // Subject entity with a name that won't exact-match anything.
+        let subject_id = f3_seed_subject_entity(&db, "skill", "zzz_target_typo", 0.8).await;
+
+        // Mock LLM returns "skill:zzz-target" — not in the in-prompt list but
+        // exists in kg_entities under the same type.
+        let mock = MockLlmProvider::builder()
+            .response(text_response(
+                r#"{"match": "skill:zzz-target", "confidence": 0.90}"#,
+            ))
+            .build();
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            Some(Arc::new(mock)),
+            vec!["0000000000000000".to_string()],
+            Some("test-f3-path2"),
+        );
+
+        let stats = resolver
+            .resolve_doc_entities(&[subject_id], "extraction-trace-2", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.matched_llm_db_fallback, 1,
+            "Path 2 should increment matched_llm_db_fallback"
+        );
+        assert_eq!(
+            stats.matched_llm, 0,
+            "Path 2 should NOT count as regular matched_llm"
+        );
+
+        let outcome = f3_get_outcome(&db, subject_id).await;
+        assert_eq!(outcome.as_deref(), Some(outcome::MATCHED_LLM_DB_FALLBACK));
+
+        let resolution = f3_get_resolution(&db, subject_id).await;
+        assert!(resolution.is_some(), "resolution row should be written");
+        let (resolved_domain_id, _) = resolution.unwrap();
+        assert_eq!(resolved_domain_id, target_id);
+    }
+
+    /// F3 Path 3: Cross-type rejected.
+    /// The LLM returns a matched_key that exists in kg_entities but under a
+    /// DIFFERENT entity type than the subject. Type-bounded DB lookup rejects it.
+    /// Expected: outcome = no_match, no resolution row.
+    #[tokio::test]
+    async fn f3_path3_cross_type_rejected() {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let db = f3_test_db();
+
+        // Seed a domain entity under "tool" type.
+        f3_seed_domain_entity(&db, "tool", "run_gh").await;
+
+        // Also seed at least one "skill" domain entity so the candidate list
+        // is non-empty (empty candidates → early return before LLM call).
+        f3_seed_domain_entity(&db, "skill", "some-skill").await;
+
+        // Subject entity is type "skill".
+        let subject_id = f3_seed_subject_entity(&db, "skill", "run_gh_typo", 0.8).await;
+
+        // Mock LLM returns "tool:run_gh" — exists in kg_entities but wrong type.
+        let mock = MockLlmProvider::builder()
+            .response(text_response(
+                r#"{"match": "tool:run_gh", "confidence": 0.80}"#,
+            ))
+            .build();
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            Some(Arc::new(mock)),
+            vec!["0000000000000000".to_string()],
+            Some("test-f3-path3"),
+        );
+
+        let stats = resolver
+            .resolve_doc_entities(&[subject_id], "extraction-trace-3", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.no_match, 1, "Path 3 should produce no_match");
+        assert_eq!(stats.matched_llm, 0);
+        assert_eq!(stats.matched_llm_db_fallback, 0);
+
+        let outcome = f3_get_outcome(&db, subject_id).await;
+        assert_eq!(outcome.as_deref(), Some(outcome::NO_MATCH));
+
+        let resolution = f3_get_resolution(&db, subject_id).await;
+        assert!(
+            resolution.is_none(),
+            "no resolution row should be written for cross-type rejection"
+        );
+    }
+
+    /// F3 Path 4: DB miss — matched_key does not exist in kg_entities at all.
+    /// Expected: outcome = no_match, no resolution row, WARN log with
+    /// db_fallback_attempted=true and db_fallback_hit=false fields.
+    #[tokio::test]
+    async fn f3_path4_db_miss() {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let db = f3_test_db();
+
+        // Seed one domain skill entity so the candidate list is non-empty.
+        f3_seed_domain_entity(&db, "skill", "some-real-skill").await;
+
+        // Subject entity.
+        let subject_id = f3_seed_subject_entity(&db, "skill", "nonexistent_typo", 0.8).await;
+
+        // Mock LLM returns a key that does NOT exist in kg_entities at all.
+        let mock = MockLlmProvider::builder()
+            .response(text_response(
+                r#"{"match": "skill:totally-made-up", "confidence": 0.75}"#,
+            ))
+            .build();
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            Some(Arc::new(mock)),
+            vec!["0000000000000000".to_string()],
+            Some("test-f3-path4"),
+        );
+
+        let stats = resolver
+            .resolve_doc_entities(&[subject_id], "extraction-trace-4", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.no_match, 1, "Path 4 should produce no_match");
+        assert_eq!(stats.matched_llm, 0);
+        assert_eq!(stats.matched_llm_db_fallback, 0);
+
+        let outcome = f3_get_outcome(&db, subject_id).await;
+        assert_eq!(outcome.as_deref(), Some(outcome::NO_MATCH));
+
+        let resolution = f3_get_resolution(&db, subject_id).await;
+        assert!(
+            resolution.is_none(),
+            "no resolution row should be written for DB miss"
+        );
+    }
 }

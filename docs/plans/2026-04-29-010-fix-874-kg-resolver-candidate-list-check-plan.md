@@ -149,13 +149,15 @@ A future maintainer who sees both layers should not assume one is removable. The
 
 No drift to `agent` / `kind` / `entity` shorthands. All snake_case, all consistent with existing kg/ events.
 
-### Change 3 — Schema migration v28 → v29
+### Change 3 — Schema migration v29 → v30
+
+> **Note (post-implementation):** The plan originally described this as v28→v29. In practice, v28→v29 was consumed by mika#915 (secret scrubbing backfill migration). The actual migration is v29→v30. All code references below use the correct version numbers as implemented.
 
 Mirrors the v26→v27 shape at `db.rs:3340+` — an `ALTER TABLE RENAME` + `CREATE TABLE` + `INSERT INTO ... SELECT *` + `DROP` + index recreate, all inside a single `transaction_with_behavior(TransactionBehavior::Immediate)`.
 
 ```sql
--- v28 -> v29: add 'matched_llm_db_fallback' to kg_resolutions_log.outcome CHECK
-ALTER TABLE kg_resolutions_log RENAME TO kg_resolutions_log_v28_backup;
+-- v29 -> v30: add 'matched_llm_db_fallback' to kg_resolutions_log.outcome CHECK
+ALTER TABLE kg_resolutions_log RENAME TO kg_resolutions_log_v29_backup;
 
 CREATE TABLE kg_resolutions_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
