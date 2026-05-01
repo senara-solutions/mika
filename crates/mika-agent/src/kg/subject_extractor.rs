@@ -992,6 +992,11 @@ Rules:
         if let Some(json_substr) = extract_first_json_object(cleaned)
             && let Ok(output) = serde_json::from_str(json_substr)
         {
+            warn!(
+                trace_id = %self.trace_id,
+                event = "extraction_parse_slow_path",
+                "direct JSON parse failed but brace-matching recovered — LLM emitted prose around JSON"
+            );
             return Ok(output);
         }
 
@@ -1426,8 +1431,15 @@ fn extract_first_json_object(text: &str) -> Option<&str> {
                 depth += 1;
             }
             b'}' => {
+                if depth == 0 {
+                    // Stray closing brace before any opening brace — skip.
+                    continue;
+                }
                 depth -= 1;
                 if depth == 0 {
+                    // Safety: '{' (0x7B) and '}' (0x7D) are single-byte ASCII;
+                    // byte indices from iterating bytes are valid UTF-8 char
+                    // boundaries here.
                     return start.map(|s| &text[s..=i]);
                 }
             }
@@ -1750,6 +1762,16 @@ mod tests {
     fn extract_json_object_returns_none_when_no_balanced_braces() {
         let input = "This is just prose, no JSON here.";
         assert!(extract_first_json_object(input).is_none());
+    }
+
+    #[test]
+    fn extract_json_object_ignores_leading_close_brace() {
+        // Stray `}` in prose before the JSON must not corrupt depth tracking
+        let input = "} some prose {\"entities\": [], \"relationships\": []}";
+        let result = extract_first_json_object(input);
+        assert_eq!(result, Some("{\"entities\": [], \"relationships\": []}"));
+        let output: ExtractionOutput = serde_json::from_str(result.unwrap()).unwrap();
+        assert!(output.entities.is_empty());
     }
 
     #[test]
