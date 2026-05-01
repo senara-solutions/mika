@@ -70,7 +70,7 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
 
 - `crates/mika-agent/src/kg/subject_extractor.rs` — per-agent extraction loop. The `extract_pending(budget: u32)` entry point caps per-batch LLM calls. Need to verify it iterates over ALL `agent_kg_corpora.docs_root_hash` rows for the agent, not just the first.
 - `crates/mika-agent/src/kg/entity_resolver.rs` — per-agent resolver. `resolve_pending(budget: u32)` similarly needs to iterate all corpora.
-- `crates/mika-agent/src/kg/resolver_tick.rs` (mika#906, deployed today) — periodic 30-min resolver tick. If the secondary corpora are simply waiting for the tick to drain a backlog, that's a wait-not-fix scenario; R1's investigation must confirm whether tick coverage includes secondaries.
+- `crates/mika-agent/src/kg/resolver_tick.rs` (mika#906, deployed today) — periodic 30-min resolver tick. If the secondary corpora are simply waiting for the tick to drain a backlog, that's a wait-not-fix scenario; R1's verification confirms whether tick coverage includes secondaries via `kg_resolver_tick.complete` log events keyed by `docs_root_hash`.
 - `crates/mika-cli/src/...` (or `crates/mika-common/src/cli/`) — `mika kg status` formatter. Issue body cites `KG state summary (1 agents — 1 unique corpora + 0 disabled)` as the broken output line. Need to inspect the query that builds this summary — likely SELECTs distinct `docs_root_hash` per agent but the JOIN drops secondaries silently.
 
 ### Institutional Learnings
@@ -79,7 +79,7 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
 - mika#874 (p0-critical, milestone#19 sibling, awaiting Vincent's verdict relay) — Stage-2 resolver candidate-list check rejects valid LLM matches. Direct upstream cause of secondary-corpus 0-resolution rates.
 - mika#875 (CLOSED) — Stage-1 exact-match returned 0 across all batches. Already shipped; secondary corpora may have backlog from when this was broken.
 - mika#876 (GROOMED, milestone#19 sibling) — subject_extractor returns 0 entities/relationships on malformed-JSON batches. Upstream cause of secondary-corpus subject-count deficit.
-- mika#906 (deployed today) — periodic resolver tick (30-min intervals) decouples drain rate from restart cadence. After R3's re-extract triggers, the tick should drain the secondary-corpus pending pool over ~17–18 hours per the post-restart safety check § Signal E.
+- mika#906 (deployed today) — periodic resolver tick (30-min intervals) decouples drain rate from restart cadence. After R2's re-extract triggers, the tick should drain the secondary-corpus pending pool over ~17–18 hours per the post-restart safety check § Signal E.
 - `docs/architecture/kg-id-convention.md` and `docs/architecture/kg-implementation-conventions.md` — sole-writer contracts for KG tables. Stay within `kg::subject_extractor` and `kg::entity_resolver` write surfaces; don't add a new writer.
 - `docs/solutions/database-issues/kg-v27-stuck-migration-recovery-2026-04-24.md` — historical context on the multi-corpus migration; not directly applicable but informs the operational shape of corpus-level state.
 
@@ -90,22 +90,19 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
 ## Key Technical Decisions
 
 - **Backfill via natural drain mechanisms, not a one-shot migration.** mika#906's resolver tick (30-min, 500-budget per agent) is the canonical drain mechanism. Trigger re-extraction in mika-arch's secondary corpora by inserting marker rows or invalidating the extraction-idempotency hash, then let the tick drain. Avoid a custom one-shot script — the tick is the durable path. If the tick can't reach steady state within the post-restart SLA (Signal E), THAT is a tick-coverage bug worth filing separately, not a reason to bypass the tick here.
-- **CLI display fix is a self-contained sub-unit.** Independent of the runtime fix; can ship as a separate commit on the same branch. Doesn't need to wait for R3's drain to complete — surfacing the secondary corpora rows (even at low coverage) is itself an operator-readiness improvement.
-- **R1 investigation MAY conclude no code change is needed.** If #874 + #876 alone explain the 0-resolution rates and the resolver tick will drain secondaries naturally, R2 has no implementation. Document this conclusion explicitly in the plan rather than inventing busy work. The empirical re-verification (R3, R4) is then the substantive output.
-- **Architect should pressure-test the assumption that `entity_resolver.rs` iterates all corpora.** The issue body cites this as a "verify, don't assume" item. The first claude-pilot session should grep the resolver for the corpus-iteration loop and confirm by reading the code, not infer from memory.
+- **CLI display fix is a self-contained sub-unit.** Independent of the runtime fix; can ship as a separate commit on the same branch. Doesn't need to wait for R2's drain to complete — surfacing the secondary corpora rows (even at low coverage) is itself an operator-readiness improvement.
+- **R1 is verification, not investigation.** Issue body's stated cause hypothesis is anchored verbatim ("Likely #876 hit these batches hardest" + "downstream of #874+#875 pile-up"). R1's deliverable is empirical confirmation post-#874+#876 deploy that resolved/total > 50% per secondary corpus, not a multi-cause investigation. Per architect persisted preference `verification_vs_investigation_unit_framing`.
 
 ## Open Questions
 
 ### Resolved During Planning
 
 - **Is mika#875 still open?** No — CLOSED, already shipped on main. Acceptance criterion's reference to "after #874, #875, #876 land" simplifies to "after #874, #876 land."
-- **Does this ticket need to wait for both #874 and #876?** Yes for R3 and R4 (re-extract + re-resolve verification). The CLI display fix (R5) and the R1 investigation can start as soon as the milestone-workflow dispatches this ticket — they don't depend on the resolver/extractor being functionally correct.
+- **Does this ticket need to wait for both #874 and #876?** Yes for R1's verification post-deploy and R2's backfill cycle. The CLI display fix (R4) is independent of all upstream gates and can ship as a separate commit on the branch.
 
 ### Deferred to Implementation
 
-- **Is the resolver iterating all corpora correctly, or is there a per-agent-first-corpus bug?** R1's investigation answers this. The plan can't pre-decide because the answer determines R2's existence and shape.
-- **Does mika#800 (race condition) factor in?** R1 should rule in or rule out by examining whether the secondary-corpus subject deficit aligns with the race symptom (multiple extractors writing to the same corpus simultaneously) vs. the parse-failure symptom (#876).
-- **Will the resolver tick drain naturally, or does a forced trigger help?** Implementation may add a `mika kg backfill --agent mika-arch --corpus <name>` CLI subcommand if the tick alone is insufficient. Decision deferred to implementation; the plan accepts either outcome.
+- **Will the resolver tick drain naturally, or does a forced trigger help?** Implementation may add a `mika kg backfill --agent mika-arch --corpus <name>` CLI subcommand if the tick alone is insufficient to hit R3's > 50% threshold within Signal E's window. Decision deferred to implementation; the plan accepts either outcome (preferred natural drain, fallback SQL invalidation).
 
 ## Implementation Units
 
@@ -135,7 +132,7 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
   - Test expectation: none — empirical verification unit, no behavioral change in code. Output is the documented snapshot.
 
   **Verification:**
-  - The architect's second-pass review reads the post-deploy SQL output as evidence-grounded.
+  - **Pass threshold:** `resolved/total` ratio per secondary corpus exceeds 50% (matches R3's issue-acceptance bound). If the resolver tick has run for ~17–18 hours post-deploy and the ratio is still below 50% on any secondary, R1's verification fails and Unit 2's fallback path (SQL invalidation) becomes the operating mechanism. The architect's second-pass review reads the post-deploy SQL output against this explicit threshold.
   - Unit 2's backfill design adapts based on whether natural drain is sufficient or fallback SQL invalidation is needed.
 
 - [ ] **Unit 2: Trigger backfill cycle on mika-arch secondary corpora**
@@ -212,7 +209,7 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
 
 | Risk | Mitigation |
 |------|------------|
-| Unit 1 concludes no code change is needed but the secondaries still don't recover after #874/#876 deploy | Unit 3's fallback path (SQL invalidation + tick) handles this. If even the fallback fails to hit R4 within Signal E's window, file mika#800-class follow-up rather than expanding scope here. |
+| Unit 1's verification shows secondaries still don't recover after #874/#876 deploy | Unit 2's fallback path (SQL invalidation + tick) handles this. If even the fallback fails to hit R3's > 50% threshold within Signal E's window, file a follow-up ticket: tick coverage gap on secondaries. |
 | #874 doesn't ship before this ticket dispatches (Vincent's verdict relay still pending) | Unit 1 + Unit 4 can run independently. Unit 3's verification waits. The plan structure allows partial progress. |
 | Re-extraction triggers excessive LLM cost on backfill | mika#906's tick budget (default 500 calls per agent per cycle) bounds the per-cycle exposure; full drain is multi-cycle by design. |
 | Unit 4's display fix surfaces an even worse picture (e.g., a 5th corpus that wasn't expected) | Acceptable outcome — the display surfacing reality is the goal. If the picture is unexpected, file follow-up tickets. |
@@ -220,7 +217,7 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
 
 ## Documentation / Operational Notes
 
-- After Unit 3's empirical re-verification, capture the post-backfill SQL output in a compound doc at `docs/solutions/kg/multi-corpus-backfill-recovery-after-resolver-extractor-fixes-2026-05-XX.md`. The compound doc should explain the operational shape: when secondary-corpus deficit appears, what the SQL diagnostic looks like, and which mechanisms (#874, #876, #906 tick, manual SQL invalidation) restore coverage.
+- After Unit 2's empirical re-verification, capture the post-backfill SQL output in a compound doc at `docs/solutions/kg/multi-corpus-backfill-recovery-after-resolver-extractor-fixes-2026-05-XX.md`. The compound doc should explain the operational shape: when secondary-corpus deficit appears, what the SQL diagnostic looks like, and which mechanisms (#874, #876, #906 tick, manual SQL invalidation) restore coverage. **Authored during /ce:work, not during the groom** — per architect persisted preference `compound_doc_timing_forward_vs_retroactive_groom`, forward grooms author compound docs after empirical operational shape is known (drain latency, multi-cycle measurements). Retroactive grooms differ; this is forward.
 - Update `docs/runtime-structure.md` if the backfill SQL becomes part of the operator runbook.
 - mika-arch's `~/.mika/agents/mika-arch/identity.toml` already has the 4 `[kg].docs_roots` entries per CLAUDE.md; no identity changes needed.
 
