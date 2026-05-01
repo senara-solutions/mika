@@ -46,24 +46,23 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
 
 ## Requirements Trace
 
-- **R1.** Investigate and document the root cause for ~0 resolutions on the 3 secondary corpora — distinguish "extractor silently skipping secondaries" vs. "extractor running but downstream of #876's parse failures" vs. "resolver iterating only the primary corpus." Decide whether code changes to `entity_resolver.rs` / `subject_extractor.rs` are needed beyond what #874 + #876 already fix.
-- **R2.** If the resolver or extractor has a bug specific to multi-corpus iteration (independent of #874/#876), fix it.
-- **R3.** Re-extraction + re-resolution after #874 + #876 deploy: trigger a one-time backfill cycle on mika-arch's secondary corpora to bring their resolution coverage up to operating parity.
-- **R4.** `resolved/total > 50%` for all 4 mika-arch corpora after backfill (issue acceptance).
-- **R5.** `mika kg status --agent mika-arch` surfaces all 4 corpora rows, not just the primary. CLI display fix in `crates/mika-cli/` or `crates/mika-common/src/cli/` (per issue body's "Files to inspect").
-- **R6.** Spot-check: graph traversal from a known entity in `mika-platform/docs/solutions/cross-repo-patterns/` returns related entities — proves cross-corpus reachability is restored.
+- **R1.** Verify the operator's stated cause hypothesis empirically post-#874+#876 deploy: re-run the issue body's diagnostic SQL and confirm secondary-corpus subject extraction recovers (driven by #876's parse-tolerance fix) and resolution coverage recovers (driven by #874's Stage-2 candidate-list fix + #875's already-shipped Stage-1 fix). The hypothesis is named verbatim in the issue body: *"Likely #876 (extraction returning 0 entities) hit these batches hardest"* and *"Resolution then produced 0–4 matches on the secondaries (downstream of #874 + #875 pile-up)"*. R1's deliverable is the verification, not a multi-candidate investigation.
+- **R2.** Trigger backfill cycle on mika-arch's secondary corpora after #874+#876 deploy so resolution coverage reaches operating parity. Preferred path: rely on mika#906's resolver tick + mika#757's extraction idempotency for natural drain. Fallback: SQL invalidation of `kg_extractions.source_doc_hash` to force re-fire.
+- **R3.** `resolved/total > 50%` for all 4 mika-arch corpora after backfill (issue acceptance).
+- **R4.** `mika kg status --agent mika-arch` surfaces all 4 corpora rows, not just the primary. CLI display fix in `crates/mika-cli/` or `crates/mika-common/src/cli/` (per issue body's "Files to inspect").
+- **R5.** Spot-check: graph traversal from a known entity in `mika-platform/docs/solutions/cross-repo-patterns/` returns related entities — proves cross-corpus reachability is restored.
 
 ## Scope Boundaries
 
 - This ticket does NOT fix #874 or #876. Those are independent milestone#19 sub-issues with their own plans.
-- This ticket does NOT address mika#800 (per-agent extractor loop race on shared corpus) unless investigation in R1 surfaces it as a root cause for the secondary-corpus deficit. If R1 concludes the race is operative, file an out-of-scope note here and do the fix on mika#800.
+- This ticket does NOT address mika#800 (per-agent extractor loop race on shared corpus). mika#800's body characterizes it as *"no data loss, purely a cost optimization"* — the race produces duplicate compute, not missing data. Therefore mika#800 cannot be the cause of secondary-corpus zero-resolution; category error to enumerate it as an alternative cause. Out of scope.
+- No multi-corpus iteration bug hunt. The issue body's data table empirically disconfirms a per-agent-first-corpus iteration bug: mika-skills shows 4 resolved (non-zero), so the resolver IS visiting that secondary corpus. If iteration skipped secondaries entirely, mika-skills would be 0. The deficit shape (low non-zero across secondaries) is consistent with the upstream extraction/resolution defects, not an iteration bug.
 - No new corpora added; no changes to which agents use which corpora.
 - No changes to chunking logic — the chunk counts in the actual-behavior table are healthy (chunking ran on all 4 corpora successfully).
 
 ### Deferred to Separate Tasks
 
-- **mika#800** (race condition on shared corpus): if R1 surfaces this as the operative cause, the fix lives there; this ticket cites the dependency.
-- **Backfill orchestration tooling** if a recurring multi-restart resolver-tick (mika#906 already landed) isn't sufficient to drain the secondary-corpus backlog within the SLA implied by R4.
+- **Backfill orchestration tooling** if a recurring multi-restart resolver-tick (mika#906 already landed) isn't sufficient to drain the secondary-corpus backlog within the SLA implied by R3.
 
 ## Context & Research
 
@@ -110,74 +109,42 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
 
 ## Implementation Units
 
-- [ ] **Unit 1: Investigate root cause of secondary-corpus deficit**
+- [ ] **Unit 1: Verify operator's stated cause hypothesis post-#874+#876 deploy**
 
-  **Goal:** Distinguish the three candidate root causes (extractor silently skipping secondaries, downstream of #876 parse failures, resolver iterating only first corpus). Produce a written diagnosis that informs Unit 2's existence and scope.
+  **Goal:** Re-run the issue body's diagnostic SQL after #874 and #876 ship. Confirm the predicted recovery: secondary-corpus subject extraction climbs (driven by #876's parse-tolerance fix) and resolution coverage climbs (driven by #874's Stage-2 fix + #875's already-shipped Stage-1 fix). Document the post-deploy snapshot for the closing comment.
 
   **Requirements:** R1
 
-  **Dependencies:** None — can run before #874/#876 ship.
+  **Dependencies:** mika#874 and mika#876 must have merged before this unit runs. No code changes.
 
   **Files:**
-  - Read: `crates/mika-agent/src/kg/subject_extractor.rs` (extraction loop)
-  - Read: `crates/mika-agent/src/kg/entity_resolver.rs` (resolver loop)
-  - Read: `crates/mika-agent/src/kg/resolver_tick.rs` (tick coverage)
-  - Read: `crates/mika-agent/src/db/kg_schema.rs` (idempotency contract for extraction)
-  - Modify (output): inline notes + `## Open Questions § Deferred to Implementation` updates in this plan documenting the diagnosis
+  - Read: `~/.mika/data/mika.db` (run the issue body's diagnostic SQL)
+  - Read: `~/.mika/agents/mika-arch/logs/mika.log.YYYY-MM-DD` (post-deploy `subject_extraction_*` and `kg_resolver_tick.*` events keyed by `docs_root_hash`)
+  - Modify (output): post-deploy snapshot table inline in the closing comment + this plan's verification section
 
   **Approach:**
-  - Trace `extract_pending` and `resolve_pending` from entry to inner loop. Confirm both iterate the agent's full `agent_kg_corpora` row set (every `docs_root_hash`), not just the primary.
-  - Run the SQL from the issue body's Steps to Reproduce against the current `~/.mika/data/mika.db` post-deploy. Compare numbers to the 2026-04-29 snapshot — has #874's not-yet-merged state already drained primary further? Has #876's pending fix improved the secondary subject count?
-  - Cross-reference mika#800's race description against the secondary deficit: if the race is operative, expect "duplicate extraction calls without progress"; if it's #876's parse failures, expect "extraction calls return 0 entities silently." Distinguish empirically by grepping the agent log for `subject_extraction_*` events keyed by `docs_root_hash`.
+  - After #874+#876 deploy, wait one full resolver-tick cycle (~30 min) so the natural drain mechanism runs.
+  - Re-execute the issue body's Steps to Reproduce SQL. Compare the post-deploy resolved/total ratios to the 2026-04-29 baseline.
+  - Grep `kg_resolver_tick.complete` log events post-deploy: confirm `pending_after` trends toward 0 across hourly windows for mika-arch's 4 corpora (matches mika#906 post-restart safety check Signal E).
+  - Pin the operator's stated cause hypothesis verbatim in the verification commit message: *"Recovery driven by #876's parse-tolerance fix (extraction) + #874's Stage-2 candidate-list fix (resolution). #875's Stage-1 fix already in place."*
 
   **Patterns to follow:**
-  - `docs/architecture/kg-implementation-conventions.md` § C2 (LLM call policy) for retry/log-and-skip semantics that may be hiding the deficit.
+  - `mika#906` post-restart safety check Signals A–E shape — same diagnostic discipline (cite signal, expected trend, observed value).
 
   **Test scenarios:**
-  - Test expectation: none — investigation unit, no behavioral change. Output is the documented diagnosis.
+  - Test expectation: none — empirical verification unit, no behavioral change in code. Output is the documented snapshot.
 
   **Verification:**
-  - The architect's second-pass review reads the diagnosis as evidence-grounded (cites file:line, log lines, SQL output).
-  - Unit 2's existence (and shape, if any) is justified by Unit 1's diagnosis; Unit 3's verification design is informed by knowing what was actually broken.
+  - The architect's second-pass review reads the post-deploy SQL output as evidence-grounded.
+  - Unit 2's backfill design adapts based on whether natural drain is sufficient or fallback SQL invalidation is needed.
 
-- [ ] **Unit 2: Code fix for multi-corpus iteration (only if Unit 1 surfaces a bug independent of #874/#876)**
+- [ ] **Unit 2: Trigger backfill cycle on mika-arch secondary corpora**
 
-  **Goal:** Fix any per-agent corpus-iteration bug Unit 1 surfaces in `subject_extractor.rs` or `entity_resolver.rs`. **This unit may have no implementation if Unit 1 concludes #874 + #876 fully explain the secondary-corpus deficit.**
+  **Goal:** Drive mika-arch's 3 secondary corpora to the R3 SLA (>50% resolved per corpus) by triggering re-extraction + re-resolution after #874+#876 deploy.
 
-  **Requirements:** R2
+  **Requirements:** R2, R3, R5
 
-  **Dependencies:** Unit 1's diagnosis.
-
-  **Files:**
-  - Modify: `crates/mika-agent/src/kg/subject_extractor.rs` (if extractor has a multi-corpus bug)
-  - Modify: `crates/mika-agent/src/kg/entity_resolver.rs` (if resolver has a multi-corpus bug)
-  - Test: corresponding inline `#[cfg(test)] mod tests` in each file
-
-  **Approach:**
-  - If Unit 1 finds the extractor or resolver iterates only the first corpus per agent: fix the iteration to cover all `agent_kg_corpora` rows for the agent. The sole-writer contract for `kg_subject_entities`/`kg_subject_resolutions` is preserved — the fix is an enumeration change, not a new writer.
-  - If Unit 1 finds the bug is NOT in iteration but in some other shared-corpus seam (e.g., a `docs_root_hash` parameter being passed once instead of per-corpus), the fix lives at that seam.
-
-  **Patterns to follow:**
-  - Existing per-agent loops in the same files. The iteration shape should match the multi-corpus aggregation primitive shipped in mika#798.
-
-  **Test scenarios:**
-  - Happy path: agent with 4 corpora, each with pending entities; assert `extract_pending` / `resolve_pending` processes all 4 and returns aggregated stats.
-  - Edge case: agent with 1 corpus; assert behavior unchanged (no regression on the single-corpus path).
-  - Edge case: agent with 4 corpora where 3 have empty pending pools; assert all 4 are visited even when 3 are no-ops.
-  - Failure mode: agent with 4 corpora, one of which has a transient extraction error; assert the loop continues (per C2.3 log-and-skip) rather than aborting on the first error.
-  - **If Unit 1 concludes no code change needed: write `Test expectation: none — Unit 1 diagnosis concluded #874 + #876 fully explain the deficit; no iteration bug to test against.`**
-
-  **Verification:**
-  - `cargo test -p mika-agent kg::subject_extractor` and `cargo test -p mika-agent kg::entity_resolver` pass.
-  - If no fix needed: Unit 1's diagnosis is committed verbatim and forms the verification surface.
-
-- [ ] **Unit 3: Re-extract + re-resolve mika-arch secondary corpora**
-
-  **Goal:** Trigger backfill cycle on mika-arch's 3 secondary corpora so resolution coverage reaches the R4 SLA (>50% per corpus).
-
-  **Requirements:** R3, R4
-
-  **Dependencies:** Units 1 and 2 (Unit 2 may be empty). **Also depends on mika#874 and mika#876 having merged** — re-extracting before those ship would reproduce the same deficits.
+  **Dependencies:** Unit 1's verification snapshot. **Also depends on mika#874 and mika#876 having merged** — re-extracting before those ship would reproduce the same deficits.
 
   **Files:**
   - Modify (potentially): `crates/mika-agent/src/kg/subject_extractor.rs` — if a forced-re-extract entry point is needed (e.g., invalidating idempotency markers per `docs_root_hash`).
@@ -186,7 +153,7 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
   **Approach:**
   - Preferred: rely on the resolver tick (mika#906) and extraction idempotency to naturally re-fire after #876 deploys with the parse fix. If the source doc hashes change (because doc content changed, even subtly), extraction re-runs.
   - Fallback: invalidate `kg_extractions.source_doc_hash` for secondary corpora — sets pending state, next tick batch processes them. Operational change, no code change. Document the SQL in `docs/runtime-structure.md` as a recovery pattern.
-  - If neither natural-drain nor SQL-invalidation hits the R4 SLA within Signal E's 17–18 hour steady state, file mika#800-class follow-up: tick coverage gap on secondaries.
+  - If neither natural-drain nor SQL-invalidation hits the R3 SLA within Signal E's 17–18 hour steady state, file a follow-up ticket: tick coverage gap on secondaries.
   - Validate empirically: re-run the issue body's Steps to Reproduce SQL post-backfill; capture the output table for the closing comment.
 
   **Patterns to follow:**
@@ -195,19 +162,19 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
   **Test scenarios:**
   - Integration: against a fixture DB seeded with mika-arch + 4 corpora where 3 secondaries have pending extraction state, run the tick once and assert all 4 corpora are visited and at least one entity is extracted per corpus.
   - Operational: run the SQL invalidation against a real `~/.mika/data/mika.db` (post-#874/#876 deploy), wait one tick cycle, re-query — secondary subject counts should increase.
-  - Acceptance check: the actual-behavior table from the issue body, re-captured. Resolved/total ratios must be > 50% per R4. Capture the post-backfill table in the closing comment.
+  - Acceptance check: the actual-behavior table from the issue body, re-captured. Resolved/total ratios must be > 50% per R3. Capture the post-backfill table in the closing comment.
 
   **Verification:**
   - The actual-behavior SQL re-run shows resolved/total > 50% on all 4 corpora.
-  - mika-arch can graph-traverse from `mika-platform/docs/solutions/cross-repo-patterns/` and reach related entities (R6 spot-check).
+  - mika-arch can graph-traverse from `mika-platform/docs/solutions/cross-repo-patterns/` and reach related entities (R5 spot-check).
 
-- [ ] **Unit 4: CLI status display surfaces all corpora rows**
+- [ ] **Unit 3: CLI status display surfaces all corpora rows**
 
   **Goal:** `mika kg status --agent mika-arch` lists every registered corpus with its own row. Currently displays only the primary (per the issue body's "1 agents — 1 unique corpora + 0 disabled" line).
 
-  **Requirements:** R5
+  **Requirements:** R4
 
-  **Dependencies:** None — independent of all other units. Can ship as a separate commit on this branch even before R3's drain finishes.
+  **Dependencies:** None — independent of all other units. Can ship as a separate commit on this branch even before Unit 2's drain finishes.
 
   **Files:**
   - Modify: `crates/mika-cli/` or `crates/mika-common/src/cli/` (the formatter that emits the `KG state summary` line — issue body cites this surface).
@@ -234,7 +201,7 @@ The issue body should carry an explicit `blockedBy: mika#874, mika#876` GitHub e
 
 ## System-Wide Impact
 
-- **Interaction graph:** Re-extraction in Unit 3 fans out across mika-arch's 4 corpora; the existing per-agent locking pattern (mika#800-adjacent) is preserved. CLI display change in Unit 4 is read-only and additive.
+- **Interaction graph:** Re-extraction in Unit 2 fans out across mika-arch's 4 corpora; the existing per-agent locking pattern is preserved. CLI display change in Unit 3 is read-only and additive.
 - **Error propagation:** No new error paths. Per C2.3 log-and-skip, transient extraction errors on secondaries don't abort the loop.
 - **State lifecycle risks:** Re-extraction overwrites `kg_subject_entities` rows for the secondary corpora; preserve the sole-writer contract per `docs/architecture/kg-implementation-conventions.md`. UPSERT semantics already handle re-runs idempotently.
 - **API surface parity:** None — internal subsystem.
