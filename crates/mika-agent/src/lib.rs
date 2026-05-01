@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod messaging;
 pub mod prompt;
 pub mod rewind;
+pub mod secret_scrubber;
 pub mod server;
 pub mod skills;
 pub mod startup;
