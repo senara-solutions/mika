@@ -1467,11 +1467,12 @@ async fn run_loop(
                         }
                     }
 
-                    // #846 — operator notification when the ready-label dispatch
-                    // guard fired but run_claude_pilot still wasn't called after
-                    // the retry.  Without this the failure is silent past
-                    // label-removal: the ready label disappears but no dispatch
-                    // happens and no PR is created.
+                    // #846 + #907 — operator notification when the ready-label
+                    // dispatch guard fired but neither run_claude_pilot nor
+                    // send_message was called after the retry.  Without this the
+                    // failure is silent past label-removal: the ready label
+                    // disappears but neither dispatch nor grooming-rejection
+                    // notification happens.
                     if intent_guard_retries.contains("webhook_ready_label_dispatch")
                         && !ready_label_dispatch_satisfied(&all_tool_summaries)
                     {
@@ -1486,9 +1487,11 @@ async fn run_loop(
                         if let Some(ref sender) = tool_ctx.message_sender {
                             let notification = format!(
                                 "Ready-label dispatch stalled on {location}: the `ready` \
-                                 label was removed but run_claude_pilot was never called. \
-                                 Investigate trace_id {} in /var/log/mika/server.log. \
-                                 To retry, re-add the `ready` label.",
+                                 label was removed but neither dispatch (run_claude_pilot) \
+                                 nor grooming-rejection notification (send_message) \
+                                 completed. Investigate trace_id {} in \
+                                 /var/log/mika/server.log. To retry, re-add the `ready` \
+                                 label.",
                                 tool_ctx.trace_id
                             );
                             let _ = sender.send(&notification).await;
@@ -4230,31 +4233,74 @@ struct IntentPrecondition {
 /// "trigger + tool-signature" pattern (e.g. persistence nudge, completion
 /// claim) remain as inline code outside this registry.
 const INTENT_GUARDS: &[IntentPrecondition] = &[
-    // #846 — ready-label webhook events require run_claude_pilot dispatch.
+    // #846 + #907 — ready-label webhook events require EITHER dispatch
+    // (run_claude_pilot) OR grooming-rejection notification (send_message).
+    //
     // More specific than webhook_zero_tools (which any successful tool satisfies),
     // so it is evaluated FIRST.  Without this guard, the LLM successfully removes
     // the `ready` label via run_gh and EndTurns — webhook_zero_tools is satisfied
     // by the run_gh call but the dispatch never happens.
     //
-    // The satisfied predicate counts run_claude_pilot ATTEMPTS (success or
-    // failure), not just successes.  Terminal failures (global_dispatch_active,
-    // task_not_dispatchable, dispatch_blocked_by, dispatch_limit_exceeded) are
-    // structural and not recoverable by re-prompt — the LLM should handle them
-    // by notifying the operator (the prompt's Step 4 covers this).  Forcing a
-    // retry on those failures would only produce misleading "never called"
-    // operator notifications when the dispatch was in fact attempted (#846
-    // adversarial review).
+    // OR-shape (#907): The satisfied predicate accepts run_claude_pilot attempt
+    // OR send_message.  The skill prompt's Ready-Label Dispatch handler checks
+    // for the `> - **Plan:**` grooming marker in the issue body before dispatch.
+    // If the marker is absent, the agent notifies the operator via send_message
+    // instead of dispatching.  The guard accepts both paths as valid completion.
+    //
+    // The send_message match is intentionally over-broad — any send_message
+    // satisfies, not just grooming-rejection notifications.  This is acceptable
+    // because: (a) the prompt is the primary grooming gate, the guard is a
+    // backstop; (b) the trigger is very specific (only ready-label events);
+    // (c) content-based discrimination on truncated input_summary is fragile.
+    // Same pattern as callback_terminal_action's send_message matching.
+    //
+    // run_claude_pilot ATTEMPTS (success or failure) count, not just successes.
+    // Terminal failures (global_dispatch_active, task_not_dispatchable, etc.)
+    // are structural and not recoverable by re-prompt — the LLM handles them
+    // via send_message per the prompt's Step 5 (#846 adversarial review).
     IntentPrecondition {
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
         satisfied: ready_label_dispatch_satisfied,
         correction_message: "[Your response was rejected. The `ready` label has been \
-             removed but you did NOT attempt run_claude_pilot. The Ready-Label \
-             Dispatch handler requires the full sequence: (1) run_gh \
-             `issue view <n> --json title,body --repo <repo>` to fetch the issue, \
-             (2) create_task with the issue reference, (3) run_claude_pilot with \
-             prompt=\"<repo>#<n>\" and task_id=<UUID from create_task>. \
-             Do not end this turn until run_claude_pilot has been called.]",
+             removed but you completed neither dispatch nor grooming-rejection \
+             notification. The Ready-Label Dispatch handler requires you to: \
+             (1) run_gh `issue view <n> --json title,body --repo <repo>` to fetch \
+             the issue, (2) check the issue body for the grooming marker \
+             `> - **Plan:**`. If the marker is PRESENT: call create_task then \
+             run_claude_pilot with prompt=\"<repo>#<n>\" and task_id=<UUID>. \
+             If the marker is ABSENT: call send_message to notify the operator \
+             that grooming is required before dispatch. Do not end this turn \
+             until you have either dispatched or notified.]",
+    },
+    // #910 — non-ready [GitHub] webhook turns must NOT call run_claude_pilot.
+    // Per mika#841 Layer 1 source-check, only `[GitHub] Issue labeled ready on`
+    // webhooks may dispatch.  All other [GitHub] events (comments, other labels,
+    // edits, PR reviews, check suites) must use Webhook Fallthrough:
+    // acknowledge without calling run_claude_pilot.
+    //
+    // Composes with webhook_ready_label_dispatch (positive case: ready label
+    // MUST dispatch) without overlap — trigger predicates are mutually exclusive
+    // on the READY_LABEL_DISPATCH_MARKER prefix.
+    //
+    // The satisfied predicate checks for SUCCESSFUL run_claude_pilot calls only.
+    // Failed attempts (e.g., task_not_dispatchable, global_dispatch_active) are
+    // already blocked by the dispatch-readiness guard in executor.rs — no need
+    // for double-rejection.  The issue is unauthorized *successful* dispatch.
+    //
+    // Three documented incidents (#798, #838, #910) establish the ratchet
+    // condition: prompt-level rules drift in the limit; engine-level invariants
+    // don't.
+    IntentPrecondition {
+        label: "webhook_no_unauthorized_dispatch",
+        trigger: webhook_no_unauthorized_dispatch_trigger,
+        satisfied: webhook_no_unauthorized_dispatch_satisfied,
+        correction_message: "[Your response was rejected. You called \
+             run_claude_pilot on a [GitHub] webhook turn that was NOT a 'ready' \
+             label event. Per Layer 1 source-check (mika#841), only '[GitHub] \
+             Issue labeled ready on' webhooks may dispatch. All other [GitHub] \
+             events (comments, other labels, edits) must use Webhook Fallthrough: \
+             acknowledge without calling run_claude_pilot.]",
     },
     // #696 — webhook events require at least one successful tool call.
     IntentPrecondition {
@@ -4320,16 +4366,42 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
     msg.starts_with(READY_LABEL_DISPATCH_MARKER)
 }
 
-/// Returns `true` when `run_claude_pilot` was attempted during this turn,
-/// regardless of success.  Counting attempts (not just successes) avoids
-/// misleading "never called" operator notifications on terminal-failure paths
-/// like `global_dispatch_active` (concurrent webhook), `task_not_dispatchable`,
-/// `dispatch_blocked_by`, and `dispatch_limit_exceeded`.  Those failures are
-/// structural and not recoverable by re-prompt — the LLM handles them via
-/// `send_message` per the prompt's Step 4.  See `INTENT_GUARDS` comment for
-/// the rationale and #846 adversarial review for the failure scenarios.
+/// Returns `true` when the ready-label dispatch turn completed via one of
+/// two valid paths: (a) `run_claude_pilot` was attempted (dispatch path), or
+/// (b) `send_message` was called (grooming-rejection or error notification
+/// path).
+///
+/// OR-shape (#907): The prompt's Ready-Label Dispatch handler checks for the
+/// `> - **Plan:**` grooming marker in the issue body.  If absent, the agent
+/// calls `send_message` to notify the operator instead of dispatching.  The
+/// guard accepts both paths as valid completion shapes.
+///
+/// `run_claude_pilot` attempts count regardless of success — terminal failures
+/// (global_dispatch_active, task_not_dispatchable, etc.) are structural and
+/// not recoverable by re-prompt.  See `INTENT_GUARDS` comment and #846.
 fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries.iter().any(|s| s.name == "run_claude_pilot")
+    summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "send_message")
+}
+
+/// #910 — Triggers on `[GitHub]` webhook turns that are NOT ready-label
+/// dispatch events.  Inverse of `ready_label_dispatch_trigger` on the
+/// `[GitHub]` domain.  Uses `READY_LABEL_DISPATCH_MARKER` for consistency
+/// with the positive-case guard.
+fn webhook_no_unauthorized_dispatch_trigger(msg: &str) -> bool {
+    msg.starts_with("[GitHub]") && !msg.starts_with(READY_LABEL_DISPATCH_MARKER)
+}
+
+/// #910 — Returns `true` when `run_claude_pilot` was NOT successfully called
+/// during this turn.  The guard is satisfied (i.e. the turn is allowed) when
+/// no successful dispatch occurred.  Failed `run_claude_pilot` attempts are
+/// ignored — the dispatch-readiness guard in `executor.rs` already blocked
+/// them structurally.
+fn webhook_no_unauthorized_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
+    !summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" && s.success)
 }
 
 /// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
@@ -7526,6 +7598,73 @@ mod tests {
         assert!(!ready_label_dispatch_satisfied(&[]));
     }
 
+    // -- #907 OR-shape: send_message also satisfies the guard --
+
+    #[test]
+    fn ready_label_satisfied_when_send_message_called() {
+        // Grooming-rejection path: agent detects missing `> - **Plan:**`
+        // marker and notifies operator via send_message instead of dispatching.
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "run_gh".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "send_message".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(ready_label_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn ready_label_satisfied_when_both_dispatch_and_notification() {
+        // Both run_claude_pilot and send_message present (e.g., dispatch
+        // succeeded then operator was notified).
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "run_claude_pilot".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "send_message".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(ready_label_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn ready_label_satisfied_when_send_message_failed() {
+        // send_message attempt counts regardless of success (same as
+        // run_claude_pilot attempts — see #846 rationale).
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "send_message".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: false,
+            non_zero_exit: false,
+        }];
+        assert!(ready_label_dispatch_satisfied(&summaries));
+    }
+
     // -- parse_ready_label_location tests (#846 operator notification) --
 
     #[test]
@@ -7584,6 +7723,187 @@ mod tests {
             "webhook_ready_label_dispatch (idx={ready_idx}) must precede \
              webhook_zero_tools (idx={zero_idx}) so the more specific trigger \
              fires first"
+        );
+    }
+
+    // -- #910 webhook_no_unauthorized_dispatch trigger tests --
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_matches_comment_events() {
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] New comment on senara-solutions/mika#906 by @samidarko\nhttps://github.com/senara-solutions/mika/issues/906#issuecomment-123\n\nGroomed end-to-end."
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_matches_non_ready_labels() {
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled bug on mika#999"
+        ));
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled p1-important on mika#999"
+        ));
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled enhancement on mika#999"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_matches_pr_review() {
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] PR review (approved) on senara-solutions/mika#694 by reviewer"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_matches_check_suite() {
+        assert!(webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Check suite failure on branch fix/foo"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_rejects_ready_label() {
+        // Ready-label events must NOT trigger this guard — the positive-case
+        // guard (webhook_ready_label_dispatch) handles them.
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled ready on mika#999"
+        ));
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 \u{2014} title"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_rejects_direct_prompts() {
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "implement mika issue#999"
+        ));
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "dispatch mika#906"
+        ));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_rejects_empty() {
+        assert!(!webhook_no_unauthorized_dispatch_trigger(""));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_trigger_rejects_callback() {
+        // Callback triggers have a different prefix.
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
+            "[callback: run_claude_pilot]"
+        ));
+    }
+
+    // -- #910 webhook_no_unauthorized_dispatch satisfied tests --
+
+    #[test]
+    fn no_unauthorized_dispatch_satisfied_when_empty() {
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&[]));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_satisfied_when_only_run_gh() {
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_satisfied_when_pilot_failed() {
+        // Failed run_claude_pilot (e.g., task_not_dispatchable) is already
+        // blocked by the dispatch-readiness guard — no double-rejection needed.
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_claude_pilot".to_string(),
+            input_summary: String::new(),
+            output_summary: String::new(),
+            success: false,
+            non_zero_exit: true,
+        }];
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&summaries));
+    }
+
+    #[test]
+    fn no_unauthorized_dispatch_not_satisfied_when_pilot_succeeded() {
+        // This is the unauthorized dispatch case — run_claude_pilot succeeded
+        // on a non-ready webhook turn.
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "run_gh".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "create_task".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 2,
+                name: "run_claude_pilot".to_string(),
+                input_summary: String::new(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(!webhook_no_unauthorized_dispatch_satisfied(&summaries));
+    }
+
+    // -- #910 ordering invariant --
+
+    #[test]
+    fn no_unauthorized_dispatch_guard_ordering() {
+        // webhook_no_unauthorized_dispatch must appear AFTER
+        // webhook_ready_label_dispatch (which handles the positive case)
+        // and BEFORE webhook_zero_tools (logical grouping of webhook guards).
+        let labels: Vec<&str> = INTENT_GUARDS.iter().map(|g| g.label).collect();
+        let ready_idx = labels
+            .iter()
+            .position(|l| *l == "webhook_ready_label_dispatch")
+            .expect("webhook_ready_label_dispatch must be registered");
+        let no_dispatch_idx = labels
+            .iter()
+            .position(|l| *l == "webhook_no_unauthorized_dispatch")
+            .expect("webhook_no_unauthorized_dispatch must be registered");
+        let zero_idx = labels
+            .iter()
+            .position(|l| *l == "webhook_zero_tools")
+            .expect("webhook_zero_tools must be registered");
+        assert!(
+            ready_idx < no_dispatch_idx,
+            "webhook_ready_label_dispatch (idx={ready_idx}) must precede \
+             webhook_no_unauthorized_dispatch (idx={no_dispatch_idx})"
+        );
+        assert!(
+            no_dispatch_idx < zero_idx,
+            "webhook_no_unauthorized_dispatch (idx={no_dispatch_idx}) must precede \
+             webhook_zero_tools (idx={zero_idx})"
+        );
+    }
+
+    #[test]
+    fn intent_guards_registry_count() {
+        // Five guards after adding webhook_no_unauthorized_dispatch.
+        assert_eq!(
+            INTENT_GUARDS.len(),
+            5,
+            "INTENT_GUARDS should have exactly 5 entries"
         );
     }
 

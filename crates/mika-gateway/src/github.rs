@@ -1299,7 +1299,10 @@ mod tests {
             review: Some(GitHubReview {
                 state: Some("approved".to_string()),
                 body: Some(long_review),
-                html_url: Some("https://github.com/senara-solutions/mika/pull/909#pullrequestreview-1".to_string()),
+                html_url: Some(
+                    "https://github.com/senara-solutions/mika/pull/909#pullrequestreview-1"
+                        .to_string(),
+                ),
                 user: Some(GitHubUser {
                     login: "mika-qa".to_string(),
                     user_type: Some("Bot".to_string()),
@@ -1349,7 +1352,10 @@ mod tests {
             review: Some(GitHubReview {
                 state: Some("approved".to_string()),
                 body: Some(long_review),
-                html_url: Some("https://github.com/senara-solutions/mika/pull/909#pullrequestreview-1".to_string()),
+                html_url: Some(
+                    "https://github.com/senara-solutions/mika/pull/909#pullrequestreview-1"
+                        .to_string(),
+                ),
                 user: Some(GitHubUser {
                     login: "mika-qa".to_string(),
                     user_type: Some("Bot".to_string()),
@@ -1365,6 +1371,68 @@ mod tests {
 
         let text = format_event_text("pull_request_review", &event);
         assert!(text.contains("VERDICT: pass"));
+        assert!(text.contains("[truncated]"));
+    }
+
+    /// Regression fixture for the mika#909/#898 failure shape: VERDICT placed at
+    /// the very end of a body that exceeds the 16 KB review cap. The verdict line
+    /// must be clipped — this documents the structural cap boundary. If a future
+    /// cap raise is needed, this test documents the failure mode that drove the
+    /// prior raise.
+    #[test]
+    fn test_format_event_text_pr_review_verdict_at_bottom_clips_when_body_exceeds_cap() {
+        // Build a body where VERDICT appears well past the 16 KB boundary
+        let preamble = "review preamble. ".repeat(1_200); // ~20,400 chars
+        let long_review = format!("{preamble}\nVERDICT: pass\nReady to merge.");
+        assert!(long_review.chars().count() > GITHUB_REVIEW_BODY_TRUNCATION_CHARS);
+
+        // Verify VERDICT is positioned past the cap
+        let verdict_offset = long_review.find("VERDICT: pass").unwrap();
+        assert!(verdict_offset > GITHUB_REVIEW_BODY_TRUNCATION_CHARS);
+
+        let event = GitHubWebhookEvent {
+            action: Some("submitted".to_string()),
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: None,
+            pull_request: Some(GitHubPullRequest {
+                number: Some(909),
+                title: Some("Fix review routing".to_string()),
+                html_url: Some("https://github.com/senara-solutions/mika/pull/909".to_string()),
+                body: None,
+                head: Some(GitHubRef {
+                    ref_name: Some("fix/review-routing".to_string()),
+                }),
+                merged: None,
+            }),
+            comment: None,
+            review: Some(GitHubReview {
+                state: Some("approved".to_string()),
+                body: Some(long_review),
+                html_url: Some(
+                    "https://github.com/senara-solutions/mika/pull/909#pullrequestreview-1"
+                        .to_string(),
+                ),
+                user: Some(GitHubUser {
+                    login: "mika-qa".to_string(),
+                    user_type: Some("Bot".to_string()),
+                }),
+            }),
+            requested_reviewer: None,
+            label: None,
+            repository: Some(GitHubRepository {
+                full_name: Some("senara-solutions/mika".to_string()),
+                html_url: None,
+            }),
+        };
+
+        let text = format_event_text("pull_request_review", &event);
+        // VERDICT is past the cap — must be clipped
+        assert!(
+            !text.contains("VERDICT: pass"),
+            "VERDICT should be clipped when positioned past the 16KB cap"
+        );
         assert!(text.contains("[truncated]"));
     }
 

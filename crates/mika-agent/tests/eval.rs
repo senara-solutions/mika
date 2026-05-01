@@ -53,6 +53,7 @@ mod eval {
     mod test_persistence_eval_guard;
     mod test_phantom_retry_guard;
     mod test_pr_review_idempotency;
+    mod test_ready_label_grooming_guard;
     mod test_real_provider_matrix;
     mod test_request_wellformedness;
     mod test_required_tools_gate;
@@ -61,6 +62,7 @@ mod eval {
     mod test_task_not_found_retry;
     mod test_tool_calling;
     mod test_verdict_handler;
+    mod test_webhook_no_unauthorized_dispatch_guard;
     mod test_webhook_queue;
     mod test_webhook_zero_tools_guard;
 }
