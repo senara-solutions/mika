@@ -52,6 +52,7 @@ const RESOLUTION_SESSION_ID: &str = "resolution";
 mod outcome {
     pub const MATCHED_EXACT: &str = "matched_exact";
     pub const MATCHED_LLM: &str = "matched_llm";
+    pub const MATCHED_LLM_DB_FALLBACK: &str = "matched_llm_db_fallback";
     pub const NO_MATCH: &str = "no_match";
     pub const SKIPPED_DISCOVERED_TYPE: &str = "skipped_discovered_type";
     pub const SKIPPED_NO_LLM: &str = "skipped_no_llm";
@@ -97,8 +98,14 @@ enum ResolutionResult {
         domain_entity_id: i64,
         confidence: f64,
     },
-    /// LLM picked a match.
+    /// LLM picked a match (in-prompt candidate list).
     LlmMatch {
+        domain_entity_id: i64,
+        confidence: f64,
+    },
+    /// LLM picked a match not in the in-prompt candidate list, but validated
+    /// against `kg_entities` via DB fallback lookup (#874).
+    LlmMatchDbFallback {
         domain_entity_id: i64,
         confidence: f64,
     },
@@ -120,6 +127,7 @@ pub struct ResolutionStats {
     pub total: usize,
     pub matched_exact: usize,
     pub matched_llm: usize,
+    pub matched_llm_db_fallback: usize,
     pub no_match: usize,
     pub skipped_discovered: usize,
     pub skipped_no_llm: usize,
@@ -365,6 +373,7 @@ impl SubjectEntityResolver {
             total = stats.total,
             matched_exact = stats.matched_exact,
             matched_llm = stats.matched_llm,
+            matched_llm_db_fallback = stats.matched_llm_db_fallback,
             no_match = stats.no_match,
             skipped_discovered = stats.skipped_discovered,
             skipped_no_llm = stats.skipped_no_llm,
@@ -419,6 +428,23 @@ impl SubjectEntityResolver {
                 )
                 .await;
                 stats.matched_llm += 1;
+            }
+            ResolutionResult::LlmMatchDbFallback {
+                domain_entity_id,
+                confidence,
+            } => {
+                self.write_resolution(entity.id, *domain_entity_id, *confidence)
+                    .await;
+                let model = self.llm.as_ref().map(|l| l.model_name().to_string());
+                self.write_log(
+                    entity.id,
+                    outcome::MATCHED_LLM_DB_FALLBACK,
+                    extraction_trace_id,
+                    model.as_deref(),
+                    Some(duration_ms),
+                )
+                .await;
+                stats.matched_llm_db_fallback += 1;
             }
             ResolutionResult::NoMatch => {
                 let model = self.llm.as_ref().map(|l| l.model_name().to_string());
@@ -535,16 +561,26 @@ impl SubjectEntityResolver {
         }
 
         match self.disambiguate_with_llm(llm, entity).await {
-            Ok(Some((domain_id, llm_confidence))) => {
+            Ok(Some((domain_id, llm_confidence, db_fallback))) => {
                 // D2: confidence = min(extraction_confidence, llm_confidence).
                 let combined_confidence = entity.confidence.min(llm_confidence);
-                (
-                    ResolutionResult::LlmMatch {
-                        domain_entity_id: domain_id,
-                        confidence: combined_confidence,
-                    },
-                    true,
-                )
+                if db_fallback {
+                    (
+                        ResolutionResult::LlmMatchDbFallback {
+                            domain_entity_id: domain_id,
+                            confidence: combined_confidence,
+                        },
+                        true,
+                    )
+                } else {
+                    (
+                        ResolutionResult::LlmMatch {
+                            domain_entity_id: domain_id,
+                            confidence: combined_confidence,
+                        },
+                        true,
+                    )
+                }
             }
             Ok(None) => (ResolutionResult::NoMatch, true),
             Err(e) => (
@@ -587,11 +623,15 @@ impl SubjectEntityResolver {
     }
 
     /// Stage 2: LLM disambiguation with chunk context and candidate list.
+    ///
+    /// Returns `(domain_entity_id, confidence, db_fallback)`. `db_fallback` is
+    /// `true` when the LLM's `matched_key` was not in the in-prompt candidate
+    /// slice but was validated against `kg_entities` via DB lookup (#874).
     async fn disambiguate_with_llm(
         &self,
         llm: &Arc<dyn LlmProvider>,
         entity: &PendingEntity,
-    ) -> Result<Option<(i64, f64)>> {
+    ) -> Result<Option<(i64, f64, bool)>> {
         let agent_id = self.db.agent_id.clone();
 
         // 1. Fetch domain candidates of the same type (bounded to MAX_DISAMBIGUATION_CANDIDATES).
@@ -660,33 +700,107 @@ impl SubjectEntityResolver {
 
         match parsed.matched {
             Some(matched_key) => {
-                // Validate: matched entity_key must be in the candidate list.
-                if let Some(candidate) = candidates
-                    .iter()
-                    .find(|c| c.entity_key.eq_ignore_ascii_case(&matched_key))
-                {
-                    if (0.0..=1.0).contains(&parsed.confidence) {
-                        Ok(Some((candidate.id, parsed.confidence)))
-                    } else {
-                        warn!(
-                            trace_id = %self.trace_id,
-                            agent_id = %agent_id,
-                            entity_key = %entity.entity_key,
-                            confidence = parsed.confidence,
-                            event = "resolution_confidence_out_of_range",
-                        );
-                        Ok(None)
-                    }
-                } else {
+                // Validate confidence range first (shared across all accept paths).
+                if !(0.0..=1.0).contains(&parsed.confidence) {
                     warn!(
                         trace_id = %self.trace_id,
                         agent_id = %agent_id,
                         entity_key = %entity.entity_key,
-                        matched_key = %matched_key,
-                        event = "resolution_matched_key_not_in_candidates",
-                        "LLM returned entity_key not in candidate list — treating as no_match"
+                        confidence = parsed.confidence,
+                        event = "resolution_confidence_out_of_range",
                     );
-                    Ok(None)
+                    return Ok(None);
+                }
+
+                // Path 1: matched_key in the in-prompt candidate list.
+                if let Some(candidate) = candidates
+                    .iter()
+                    .find(|c| c.entity_key.eq_ignore_ascii_case(&matched_key))
+                {
+                    return Ok(Some((candidate.id, parsed.confidence, false)));
+                }
+
+                // Path 2–4: matched_key NOT in the in-prompt slice — DB fallback (#874).
+                // Type-bounded lookup against kg_entities.
+                match self
+                    .try_domain_entity_by_key(&entity.entity_type, &matched_key)
+                    .await
+                {
+                    Ok(Some(domain_candidate)) => {
+                        // Path 2: DB-fallback hit, same type → accept as matched_llm_db_fallback.
+                        info!(
+                            trace_id = %self.trace_id,
+                            agent_id = %agent_id,
+                            entity_key = %entity.entity_key,
+                            entity_type = %entity.entity_type,
+                            matched_key = %matched_key,
+                            domain_entity_id = domain_candidate.id,
+                            event = "resolution_matched_key_db_fallback_hit",
+                        );
+                        Ok(Some((domain_candidate.id, parsed.confidence, true)))
+                    }
+                    Ok(None) => {
+                        // matched_key not found under same type — check if it exists
+                        // under a different type (Path 3) or not at all (Path 4).
+                        match self.try_domain_entity_any_type(&matched_key).await {
+                            Ok(Some(found_entity_key)) => {
+                                // Path 3: cross-type match → reject with diagnostic.
+                                let found_type =
+                                    found_entity_key.split(':').next().unwrap_or("unknown");
+                                warn!(
+                                    trace_id = %self.trace_id,
+                                    agent_id = %agent_id,
+                                    entity_key = %entity.entity_key,
+                                    entity_type = %entity.entity_type,
+                                    matched_key = %matched_key,
+                                    found_type = %found_type,
+                                    event = "resolution_matched_key_cross_type_rejected",
+                                );
+                            }
+                            Ok(None) => {
+                                // Path 4: not in kg_entities at all → no_match.
+                                warn!(
+                                    trace_id = %self.trace_id,
+                                    agent_id = %agent_id,
+                                    entity_key = %entity.entity_key,
+                                    entity_type = %entity.entity_type,
+                                    matched_key = %matched_key,
+                                    db_fallback_attempted = true,
+                                    db_fallback_hit = false,
+                                    event = "resolution_matched_key_not_in_candidates",
+                                    "LLM returned entity_key not in candidate list or kg_entities — treating as no_match"
+                                );
+                            }
+                            Err(e) => {
+                                // Diagnostic lookup failed — fall through to no_match.
+                                warn!(
+                                    trace_id = %self.trace_id,
+                                    agent_id = %agent_id,
+                                    entity_key = %entity.entity_key,
+                                    matched_key = %matched_key,
+                                    error = %e,
+                                    event = "resolution_matched_key_not_in_candidates",
+                                    "LLM returned entity_key not in candidate list (diagnostic lookup failed) — treating as no_match"
+                                );
+                            }
+                        }
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        // DB fallback lookup failed — treat as no_match (fail-open for diagnosis).
+                        warn!(
+                            trace_id = %self.trace_id,
+                            agent_id = %agent_id,
+                            entity_key = %entity.entity_key,
+                            matched_key = %matched_key,
+                            error = %e,
+                            db_fallback_attempted = true,
+                            db_fallback_hit = false,
+                            event = "resolution_matched_key_not_in_candidates",
+                            "DB fallback lookup failed — treating as no_match"
+                        );
+                        Ok(None)
+                    }
                 }
             }
             None => Ok(None), // LLM said no match.
@@ -879,6 +993,66 @@ impl SubjectEntityResolver {
                     .filter_map(|r| r.ok())
                     .collect();
                 Ok(candidates)
+            })
+            .await
+    }
+
+    /// Defensive DB lookup for an LLM-returned `matched_key` not in the in-prompt
+    /// candidates slice. Type-bounded via range scan to refuse cross-type matches
+    /// at the SQL level (mirrors `get_domain_candidates`). See #874.
+    async fn try_domain_entity_by_key(
+        &self,
+        entity_type: &str,
+        matched_key: &str,
+    ) -> Result<Option<DomainCandidate>> {
+        let range_start = format!("{entity_type}:");
+        let range_end = format!("{entity_type};");
+        let key = matched_key.to_string();
+
+        self.db
+            .with_db(move |db| {
+                let mut stmt = db.conn.prepare(
+                    "SELECT id, entity_key, properties_json FROM kg_entities
+                     WHERE entity_key >= ?1 AND entity_key < ?2
+                       AND LOWER(entity_key) = LOWER(?3)
+                     LIMIT 1",
+                )?;
+                let result =
+                    stmt.query_row(rusqlite::params![range_start, range_end, key], |row| {
+                        Ok(DomainCandidate {
+                            id: row.get(0)?,
+                            entity_key: row.get(1)?,
+                            properties_json: row.get(2)?,
+                        })
+                    });
+                match result {
+                    Ok(c) => Ok(Some(c)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(anyhow::Error::from(e)),
+                }
+            })
+            .await
+    }
+
+    /// Diagnostic-only: detect whether `matched_key` exists in `kg_entities` under
+    /// a DIFFERENT type. Used to emit the `cross_type_rejected` event. Returns the
+    /// entity_key if found (from which the caller extracts the type prefix).
+    async fn try_domain_entity_any_type(&self, matched_key: &str) -> Result<Option<String>> {
+        let key = matched_key.to_string();
+
+        self.db
+            .with_db(move |db| {
+                let mut stmt = db.conn.prepare(
+                    "SELECT entity_key FROM kg_entities
+                     WHERE LOWER(entity_key) = LOWER(?1)
+                     LIMIT 1",
+                )?;
+                let result = stmt.query_row(rusqlite::params![key], |row| row.get::<_, String>(0));
+                match result {
+                    Ok(ek) => Ok(Some(ek)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(anyhow::Error::from(e)),
+                }
             })
             .await
     }
@@ -1205,10 +1379,11 @@ impl SubjectEntityResolver {
     async fn emit_audit_event(&self, stats: &ResolutionStats) {
         let target_key = format!("kg_resolution:{}", self.trace_id);
         let after_value = format!(
-            r#"{{"total":{},"matched_exact":{},"matched_llm":{},"no_match":{},"skipped_discovered":{},"skipped_no_llm":{},"errors":{}}}"#,
+            r#"{{"total":{},"matched_exact":{},"matched_llm":{},"matched_llm_db_fallback":{},"no_match":{},"skipped_discovered":{},"skipped_no_llm":{},"errors":{}}}"#,
             stats.total,
             stats.matched_exact,
             stats.matched_llm,
+            stats.matched_llm_db_fallback,
             stats.no_match,
             stats.skipped_discovered,
             stats.skipped_no_llm,

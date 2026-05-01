@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 29;
+pub const CURRENT_SCHEMA_VERSION: i64 = 30;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1006,6 +1006,11 @@ impl Database {
             info!(version = 29, "database migrated to v29");
         }
 
+        if (3..=29).contains(&version) {
+            self.migrate_v29_to_v30()?;
+            info!(version = 30, "database migrated to v30");
+        }
+
         Ok(())
     }
 
@@ -1060,7 +1065,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (29);
+            INSERT INTO schema_version (version) VALUES (30);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1594,7 +1599,8 @@ impl Database {
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
                 subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
                 outcome TEXT NOT NULL CHECK (outcome IN (
-                    'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
+                    'matched_exact', 'matched_llm', 'matched_llm_db_fallback',
+                    'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
                 )),
                 resolution_trace_id TEXT NOT NULL,
                 source_extraction_trace_id TEXT,
@@ -3560,6 +3566,75 @@ impl Database {
                 "v28→v29: scrubbed secrets from existing tool_calls rows"
             );
         }
+
+        Ok(())
+    }
+
+    /// v29→v30: Expand `kg_resolutions_log.outcome` CHECK constraint to include
+    /// `'matched_llm_db_fallback'` (#874). Table rebuild mirroring the v26→v27
+    /// shape: RENAME → CREATE → INSERT INTO ... SELECT → DROP → recreate index.
+    fn migrate_v29_to_v30(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 30 {
+            return Ok(());
+        }
+
+        let count_before: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_resolutions_log", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+
+             ALTER TABLE kg_resolutions_log RENAME TO kg_resolutions_log_v29_backup;
+
+             CREATE TABLE kg_resolutions_log (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                 subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                 outcome TEXT NOT NULL CHECK (outcome IN (
+                     'matched_exact', 'matched_llm', 'matched_llm_db_fallback',
+                     'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
+                 )),
+                 resolution_trace_id TEXT NOT NULL,
+                 source_extraction_trace_id TEXT,
+                 model TEXT,
+                 duration_ms INTEGER,
+                 resolved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                 UNIQUE (agent_id, subject_entity_id)
+             );
+
+             INSERT INTO kg_resolutions_log
+                 (id, agent_id, subject_entity_id, outcome, resolution_trace_id,
+                  source_extraction_trace_id, model, duration_ms, resolved_at)
+             SELECT id, agent_id, subject_entity_id, outcome, resolution_trace_id,
+                    source_extraction_trace_id, model, duration_ms, resolved_at
+             FROM kg_resolutions_log_v29_backup;
+
+             DROP TABLE kg_resolutions_log_v29_backup;
+
+             CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
+
+             PRAGMA foreign_keys = ON;
+
+             UPDATE schema_version SET version = 30;",
+        )?;
+        tx.commit()?;
+
+        let count_after: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_resolutions_log", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        info!(
+            count_before = count_before,
+            count_after = count_after,
+            "v29→v30: expanded kg_resolutions_log outcome CHECK constraint (#874)"
+        );
 
         Ok(())
     }
@@ -12381,6 +12456,7 @@ mod tests {
 
         db2.migrate_v27_to_v28().unwrap();
         db2.migrate_v28_to_v29().unwrap();
+        db2.migrate_v29_to_v30().unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -12994,9 +13070,127 @@ mod tests {
     #[test]
     fn test_migrate_v28_to_v29_idempotent() {
         let mut db = db();
-        // DB is already at v29 (db() creates at CURRENT_SCHEMA_VERSION)
+        // DB is already at CURRENT_SCHEMA_VERSION (db() creates at latest)
         // Running migration again should be a no-op
         db.migrate_v28_to_v29().unwrap();
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v29_to_v30_expands_check_constraint() {
+        let mut db = db();
+
+        // Seed subject entities so FK constraints are satisfied.
+        // The db() helper creates fresh schema with kg_subject_entities table.
+        db.conn
+            .execute_batch(
+                "INSERT INTO kg_subject_entities (id, docs_root_hash, docs_root, entity_key, type, name, confidence, trace_id)
+                 VALUES (1, 'abcd1234', '/docs', 'skill:test1', 'skill', 'test1', 0.9, 'trace-1');
+                 INSERT INTO kg_subject_entities (id, docs_root_hash, docs_root, entity_key, type, name, confidence, trace_id)
+                 VALUES (2, 'abcd1234', '/docs', 'skill:test2', 'skill', 'test2', 0.9, 'trace-2');
+                 INSERT INTO kg_subject_entities (id, docs_root_hash, docs_root, entity_key, type, name, confidence, trace_id)
+                 VALUES (3, 'abcd1234', '/docs', 'skill:test3', 'skill', 'test3', 0.9, 'trace-3');",
+            )
+            .unwrap();
+
+        // Temporarily set schema to 29 so migration will run.
+        // We need to rebuild the table with the old CHECK constraint first.
+        db.conn
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP INDEX IF EXISTS idx_kg_res_log_pending;
+                 ALTER TABLE kg_resolutions_log RENAME TO kg_resolutions_log_old;
+                 CREATE TABLE kg_resolutions_log (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                     outcome TEXT NOT NULL CHECK (outcome IN (
+                         'matched_exact', 'matched_llm', 'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
+                     )),
+                     resolution_trace_id TEXT NOT NULL,
+                     source_extraction_trace_id TEXT,
+                     model TEXT,
+                     duration_ms INTEGER,
+                     resolved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     UNIQUE (agent_id, subject_entity_id)
+                 );
+                 INSERT INTO kg_resolutions_log SELECT * FROM kg_resolutions_log_old;
+                 DROP TABLE kg_resolutions_log_old;
+                 CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
+                 PRAGMA foreign_keys = ON;
+                 UPDATE schema_version SET version = 29;",
+            )
+            .unwrap();
+
+        // Verify matched_llm_db_fallback is REJECTED before migration.
+        let insert_result = db.conn.execute(
+            "INSERT INTO kg_resolutions_log (agent_id, subject_entity_id, outcome, resolution_trace_id) \
+             VALUES ('mika', 1, 'matched_llm_db_fallback', 'trace-pre')",
+            [],
+        );
+        assert!(
+            insert_result.is_err(),
+            "v29 schema should reject matched_llm_db_fallback"
+        );
+
+        // Seed a row with an existing outcome to verify preservation.
+        db.conn
+            .execute(
+                "INSERT INTO kg_resolutions_log (agent_id, subject_entity_id, outcome, resolution_trace_id) \
+                 VALUES ('mika', 1, 'matched_exact', 'trace-seed')",
+                [],
+            )
+            .unwrap();
+
+        let count_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_resolutions_log", [], |r| r.get(0))
+            .unwrap();
+
+        // Run migration.
+        db.migrate_v29_to_v30().unwrap();
+
+        // Verify version bumped.
+        assert_eq!(db.schema_version().unwrap(), 30);
+
+        // Verify row count preserved.
+        let count_after: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_resolutions_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_before, count_after, "row count should be preserved");
+
+        // Verify matched_llm_db_fallback is ACCEPTED after migration.
+        // Use a different subject_entity_id to avoid UNIQUE violation.
+        let insert_result = db.conn.execute(
+            "INSERT INTO kg_resolutions_log (agent_id, subject_entity_id, outcome, resolution_trace_id) \
+             VALUES ('mika', 2, 'matched_llm_db_fallback', 'trace-post')",
+            [],
+        );
+        assert!(
+            insert_result.is_ok(),
+            "v30 schema should accept matched_llm_db_fallback: {:?}",
+            insert_result.err()
+        );
+
+        // Verify invalid values still rejected.
+        let invalid_result = db.conn.execute(
+            "INSERT INTO kg_resolutions_log (agent_id, subject_entity_id, outcome, resolution_trace_id) \
+             VALUES ('mika', 3, 'invalid_value', 'trace-invalid')",
+            [],
+        );
+        assert!(
+            invalid_result.is_err(),
+            "invalid outcome should still be rejected"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v29_to_v30_idempotent() {
+        let mut db = db();
+        // DB is already at CURRENT_SCHEMA_VERSION (db() creates at latest)
+        // Running migration again should be a no-op
+        db.migrate_v29_to_v30().unwrap();
         assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 }
