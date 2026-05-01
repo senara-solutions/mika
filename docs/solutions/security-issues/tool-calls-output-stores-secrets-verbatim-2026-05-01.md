@@ -32,7 +32,7 @@ tags:
 - `tool_calls` row `461c76a1` (2026-04-13) contained a real GitHub PAT from `read_agent_file({path: ".env"})` for `mika-qa` agent
 - 17-day exposure window before discovery during the #903 bash `set -x` audit
 - Dashboard API at `/api/v1/traces/:trace_id/tool-calls` served the secret to any holder of `MIKA_DASHBOARD_TOKEN`
-- Three columns at risk: `tool_calls.output`, `tool_calls.input`, and `tool_calls.error_message`
+- Three columns at risk: `tool_calls.output`, `tool_calls.input`, and `tool_calls.error_message` (the third was added to scope post-implementation per the plan amendment in `docs/plans/2026-05-01-001-fix-tool-calls-redact-secret-shaped-values-plan.md` Key Decisions §"No scrub on `error_message`")
 
 ## What Didn't Work
 
@@ -49,7 +49,7 @@ Engine-side `scrub_secrets()` function applied at the `Database::save_tool_call(
 - Pattern minimum length requirements (10+ chars after prefix) reduce false positives
 
 **Three application points:**
-1. `Database::save_tool_call()` — scrubs `input`, `output`, AND `error_message` before the INSERT, before truncation
+1. `Database::save_tool_call()` — scrubs `input`, `output`, AND `error_message` before the INSERT, before truncation (the `error_message` scrub was added in commit `52284f6` post-implementation; rationale recorded in the plan's Key Decisions amendment block)
 2. `ToolCallSummary` metadata — scrubs `input_summary` and `output_summary` before serialization to `messages.metadata`
 3. Schema v28->v29 backfill migration — one-shot sweep of existing `tool_calls` rows
 
@@ -65,7 +65,7 @@ The `RegexSet` + individual `Regex` pattern ensures the common case (no secrets 
 
 - **Treat all persistence as an output boundary.** When adding new columns or tables that store tool/LLM output, apply `scrub_secrets()` at the write site. The existing `MIKA_STORE_TOOL_CALLS` toggle gates whether writes happen; when they do, they must be scrubbed.
 - **Extend patterns when adding new secret types.** The `SECRET_PATTERNS` constant in `secret_scrubber.rs` is the single source of truth. Each new pattern needs positive and negative test cases.
-- **Review finding: don't forget error paths.** The initial plan ruled out `error_message` scrubbing on the rationale that "error messages are tool failure descriptions, not file content." Empirically that rationale doesn't hold — HTTP client errors, webhook auth failures, and exec-handler errors routinely re-emit request context including bearer tokens reflected in URL parameters, API keys in auth headers reflected in error text, and raw response bodies on auth failures. The implementation pivoted during code review (commit `52284f6`) to scrub `error_message` alongside `input` and `output`. Plan amendment ratifying this scope extension is recorded in the plan doc Key Decisions section. **General lesson:** when reasoning about "X is for Y, not Z," check the empirical content of X — error messages have proven structurally capable of carrying the same secret-shaped payloads as success responses.
+- **Review finding: don't forget error paths.** The initial plan ruled out `error_message` scrubbing on the rationale that "error messages are tool failure descriptions, not file content." Empirically that rationale doesn't hold — HTTP client errors, webhook auth failures, and exec-handler errors routinely re-emit request context including bearer tokens reflected in URL parameters, API keys in auth headers reflected in error text, and raw response bodies on auth failures. The implementation pivoted during code review (commit `52284f6`) to scrub `error_message` alongside `input` and `output`. Plan amendment ratifying this scope extension is recorded in `docs/plans/2026-05-01-001-fix-tool-calls-redact-secret-shaped-values-plan.md` Key Decisions §"No scrub on `error_message`". **General lesson:** when reasoning about "X is for Y, not Z," check the empirical content of X — error messages have proven structurally capable of carrying the same secret-shaped payloads as success responses.
 - **lefthook `no-secrets` hook exclusion.** The test file `secret_scrubber.rs` contains realistic token patterns for testing. Added `grep -v 'secret_scrubber'` to the no-secrets hook to avoid false positives on test data.
 
 ## Related Issues
