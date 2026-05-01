@@ -776,6 +776,8 @@ impl SubjectExtractor {
         let system = format!(
             r#"You are a knowledge graph extraction agent. Extract named entities and fact triples from the following document.
 
+CRITICAL: Respond with a single JSON object only. Do NOT include any explanatory prose, markdown headers, code fences, reasoning, or summary text before or after the JSON. Your entire response must be parseable as JSON from the first byte to the last byte.
+
 Return ONLY valid JSON matching this schema:
 {{
   "entities": [
@@ -963,6 +965,15 @@ Rules:
     }
 
     /// Parse extraction JSON from LLM response text.
+    ///
+    /// Tolerates reasoning prose before/after the JSON object (common with
+    /// haiku-class models — see mika#768, mika#876). The parser:
+    /// 1. Strips markdown code fences (existing behavior).
+    /// 2. Attempts direct `serde_json::from_str` on the cleaned text.
+    /// 3. On failure, uses `extract_first_json_object` to locate the first
+    ///    balanced `{…}` substring and parses that.
+    /// 4. If neither succeeds, returns the original parse error (preserves
+    ///    C2.2 retry semantics).
     fn parse_extraction_json(&self, text: &str) -> Result<ExtractionOutput> {
         // Strip markdown code fences if present
         let cleaned = text
@@ -972,7 +983,20 @@ Rules:
             .unwrap_or(text.trim());
         let cleaned = cleaned.strip_suffix("```").unwrap_or(cleaned).trim();
 
-        serde_json::from_str(cleaned).with_context(|| {
+        // Fast path: clean JSON parses directly (common case)
+        if let Ok(output) = serde_json::from_str(cleaned) {
+            return Ok(output);
+        }
+
+        // Slow path: extract first balanced JSON object from surrounding prose
+        if let Some(json_substr) = extract_first_json_object(cleaned)
+            && let Ok(output) = serde_json::from_str(json_substr)
+        {
+            return Ok(output);
+        }
+
+        // Neither path worked — return the original error for C2.2 retry
+        serde_json::from_str::<ExtractionOutput>(cleaned).with_context(|| {
             format!(
                 "failed to parse extraction JSON: {}",
                 mika_common::text::safe_truncate(cleaned, 200)
@@ -1364,6 +1388,56 @@ impl LlmResponseExt for mika_common::llm::LlmResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Brace-matching JSON extraction (mika#876)
+// ---------------------------------------------------------------------------
+
+/// Extract the first balanced JSON object (`{…}`) from text that may contain
+/// surrounding prose. Handles string literals (including escaped quotes) so
+/// that braces inside strings do not affect depth tracking.
+///
+/// Returns `Some(&str)` borrowing the balanced substring, or `None` if no
+/// balanced object is found. Does NOT allocate.
+fn extract_first_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut start = None;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            if b == b'\\' {
+                escape_next = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return start.map(|s| &text[s..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1618,5 +1692,97 @@ mod tests {
         let json = r#"{"entities": [], "relationships": []}"#;
         let result: Result<ExtractionOutput, _> = serde_json::from_str(json);
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_first_json_object — brace-matching helper (mika#876)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_json_object_plain() {
+        let input = r#"{"entities": [], "relationships": []}"#;
+        let result = extract_first_json_object(input);
+        assert_eq!(result, Some(input));
+    }
+
+    #[test]
+    fn extract_json_object_with_reasoning_prefix() {
+        let input = "Here is the extraction:\n\n{\"entities\": [], \"relationships\": []}";
+        let result = extract_first_json_object(input);
+        assert_eq!(result, Some("{\"entities\": [], \"relationships\": []}"));
+        // Verify it parses as valid ExtractionOutput
+        let output: ExtractionOutput = serde_json::from_str(result.unwrap()).unwrap();
+        assert!(output.entities.is_empty());
+    }
+
+    #[test]
+    fn extract_json_object_with_reasoning_suffix() {
+        let input =
+            "{\"entities\": [], \"relationships\": []}\n\nThe document covers several topics.";
+        let result = extract_first_json_object(input);
+        assert_eq!(result, Some("{\"entities\": [], \"relationships\": []}"));
+        let output: ExtractionOutput = serde_json::from_str(result.unwrap()).unwrap();
+        assert!(output.entities.is_empty());
+    }
+
+    #[test]
+    fn extract_json_object_with_reasoning_both_sides() {
+        let input = "Analysis of the document:\n\n{\"entities\": [{\"type\": \"problem_type\", \"name\": \"state_drift\", \"description\": \"drift in state\", \"chunk_indices\": [0], \"confidence\": 0.9}], \"relationships\": []}\n\nNotes: the entity was found in chunk 0.";
+        let result = extract_first_json_object(input);
+        assert!(result.is_some());
+        let output: ExtractionOutput = serde_json::from_str(result.unwrap()).unwrap();
+        assert_eq!(output.entities.len(), 1);
+        assert_eq!(output.entities[0].name, "state_drift");
+    }
+
+    #[test]
+    fn extract_json_object_with_string_containing_brace() {
+        // String literal containing `}` must NOT terminate the object
+        let input = r#"{"entities": [{"type": "failure_mode", "name": "brace_in_output", "description": "output contains } character", "chunk_indices": [0], "confidence": 0.85}], "relationships": []}"#;
+        let result = extract_first_json_object(input);
+        assert_eq!(result, Some(input));
+        let output: ExtractionOutput = serde_json::from_str(result.unwrap()).unwrap();
+        assert_eq!(output.entities.len(), 1);
+        assert_eq!(output.entities[0].name, "brace_in_output");
+    }
+
+    #[test]
+    fn extract_json_object_returns_none_when_no_balanced_braces() {
+        let input = "This is just prose, no JSON here.";
+        assert!(extract_first_json_object(input).is_none());
+    }
+
+    #[test]
+    fn extract_json_object_returns_none_for_unbalanced() {
+        let input = "Here is some text { that never closes";
+        assert!(extract_first_json_object(input).is_none());
+    }
+
+    #[test]
+    fn extract_json_object_with_escaped_quotes_in_string() {
+        // Escaped quotes inside strings must not break string-state tracking
+        let input = r#"Some preamble {"entities": [{"type": "pattern", "name": "escaped_\"quote\"", "chunk_indices": [0], "confidence": 0.8}], "relationships": []}"#;
+        let result = extract_first_json_object(input);
+        assert!(result.is_some());
+        // The extracted substring should start at the first `{`
+        assert!(result.unwrap().starts_with('{'));
+        assert!(result.unwrap().ends_with('}'));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_extraction_json integration — validates R4 (strict schema) via
+    // extract_first_json_object fallback path (mika#876)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_strict_validation_still_rejects_invalid_schema() {
+        // Prose + JSON missing required "relationships" field → should fail
+        // even though brace-matching finds the JSON object.
+        let input = "Here is the result:\n\n{\"entities\": []}";
+        let result = extract_first_json_object(input);
+        assert!(result.is_some());
+        // The extracted JSON is schema-invalid (missing "relationships")
+        let parse_result: Result<ExtractionOutput, _> = serde_json::from_str(result.unwrap());
+        assert!(parse_result.is_err());
     }
 }
