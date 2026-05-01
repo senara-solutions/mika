@@ -115,7 +115,7 @@ The prompt + model split provides genuine *structural* diversity (different reas
 
 - **`review-guide.md` § 6 (citation-or-silence):** the discipline that makes the carve-out load-bearing in the first place. If reviewers could cite anything to justify any framing, vested interest wouldn't matter. Because §6 holds reviewers to citation-or-silence, the framing axis (which citations get emphasized) is where vested interest expresses itself.
 - **`mika/docs/solutions/best-practices/recursive-self-review-carve-out-2026-04-26.md`:** the codification doc. Three instances enumerated. The doc currently describes the rule by surface-shape; needs lockstep update.
-- **mika#788, mika#872, mika#879** (cited in Pin 2): the three precedent instances. The sharpening should not reverse those classifications — the rule narrows the trigger but preserves the consequence.
+- **mika#818, mika#868, mika#879** (corrected per Pin 2; originally mis-cited as #788/#872/#879): the three precedent instances. The sharpening should not reverse those classifications — the rule narrows the trigger but preserves the consequence.
 
 ### Institutional Learnings
 
@@ -282,10 +282,10 @@ Per ticket AC:
 
 - Related issue: mika#904
 - Sibling ticket: mika#901 (verbatim findings emit) — drives operator-side recovery from architect thin-emission; cumulative cost concern shared.
-- Earlier instances feeding the codification: mika#788, mika#872, mika#879 (per `recursive-self-review-carve-out-2026-04-26.md` "Three instances").
+- Earlier instances feeding the codification: mika#818, mika#868, mika#879 (corrected from #788/#872/#879 per Pin 2's authoritative enumeration).
 - Empirical case driving this sharpening: mika#874 second-pass ESCALATE on F9 (2026-04-30).
 - Doc references:
-  - `mika/docs/architecture/review-guide.md:172-194` — § 7 (Pin 1)
+  - `mika/docs/architecture/review-guide.md` § 7 — Self-review boundary (Pin 1)
   - `mika/docs/solutions/best-practices/recursive-self-review-carve-out-2026-04-26.md` — companion (Pin 2)
 - Institutional learnings:
   - `mika/docs/solutions/architecture-patterns/engine-guards-vs-prompt-rules-for-agent-behavior-2026-04-19.md` (informs why this stays at doc-level vs structural enforcement)
