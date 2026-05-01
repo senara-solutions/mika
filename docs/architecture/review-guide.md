@@ -171,11 +171,34 @@ The bar is principle + cite + consequence. Anything less is silence.
 
 When a plan modifies the reviewing agent's own surface — the skills, identity config, or permission surface that the agent reads at runtime — the agent is both reviewer and structural stakeholder in the outcome. That vested-interest position undermines the citation-or-silence discipline: the agent can cite correctly while framing the cited concerns in a direction that benefits itself. External review pierces that bias.
 
+The carve-out fires when **both** conditions hold: (a) the plan modifies the reviewer's surface AND (b) the iteration history shows reviewer-driven reshaping. Outcome-shape alone does not trigger the carve-out — coincidental alignment between an externally-driven decision and reviewer benefit is not vested interest.
+
 The concrete trigger today is mika-arch's bundled skill surface (`skills/bundled/mika-arch-*`) and mika-arch's identity allowlist in `well_known_agents.rs`. The principle generalizes to any reviewing agent whose own operational surface is the change target.
+
+### How to test (iteration-history provenance)
+
+The deterministic test for whether the carve-out fires is **provenance**: trace which party FIRST introduced the position the plan now ratifies.
+
+Read the iteration-history trace top-to-bottom. The first tool/message/comment that asserts the position the final plan ratifies is the **introducer**. Apply these rules:
+
+**Carve-out fires (reviewer-driven):**
+- Reviewer's first-pass critique authored the position that the plan now ratifies.
+- Reviewer emitted pressure (explicit or implicit) to reshape the plan toward the position.
+- Reviewer's persisted memory cited by second-pass, where the persisted position was originally authored by the reviewer (not merely transported through reviewer persistence — see memory-cite transport below).
+
+**Carve-out does NOT fire (externally-driven):**
+- Operator judgment introduced the position (e.g., operator chose a design direction after weighing options).
+- External peer review introduced the position (e.g., a Claude Chat session, a human reviewer, or another agent outside the reviewing agent's identity).
+- Citation of canonical operator workflow documents independent of the reviewer introduced the position (e.g., `mika/CLAUDE.md` § Post-restart safety check, an ADR, a compound doc authored before the current review cycle).
+
+**Memory-cite transport boundary:** when second-pass cites reviewer's persisted memory (`store_fact` rows readable via `search_memory`), trace through the persistence to the original introducer. Reviewer-persisted-but-operator-introduced positions are still operator-introduced — persistence is transport, not position-authoring. Apply the provenance test to the underlying introducer, not the persister.
+
+**§6/§7 division:** reviewer pressure on non-substrate plans is handled by § 6 (citation-or-silence). § 7 specifically defends substrate-reshaping. Both gates (surface-shape AND provenance) must hold for § 7 to fire — non-substrate cases never need § 7 review regardless of reviewer pressure.
 
 ### What to flag
 
-- **Second-pass review routed to the agent whose surface is being modified.** When a plan changes `skills/bundled/mika-arch-*` skill manifests or prompts, mika-arch's `identity.toml` blocks (`[tools]`, `[skills]`, `[kg]`), or the mika-arch entry in `well_known_agents.rs`, the second-pass review MUST route to an external reviewer (Vincent or another Claude instance via Claude Chat). The external reviewer preserves audit-trail separation: "external reviewer approved the agent's surface change" requires no further verification, whereas "the agent approved her own surface change" requires re-reading the entire review for biased framing.
+- **Second-pass review routed to the agent whose surface is being modified — provided the iteration-history test (above) shows reviewer-driven reshaping.** When both conditions hold and a plan changes `skills/bundled/mika-arch-*` skill manifests or prompts, mika-arch's `identity.toml` blocks (`[tools]`, `[skills]`, `[kg]`), or the mika-arch entry in `well_known_agents.rs`, the second-pass review MUST route to an external reviewer (Vincent or another Claude instance via Claude Chat). The external reviewer preserves audit-trail separation: "external reviewer approved the agent's surface change" requires no further verification, whereas "the agent approved her own surface change" requires re-reading the entire review for biased framing.
+- **Memory-shared coupling between first-pass and second-pass on the same ticket.** mika-arch's two skills (`mika-arch-groom-ticket` Opus 4.7 + `mika-arch-second-review` Sonnet 4.6) share an agent-scoped memory store. Persisted `store_fact` rows from first-pass are readable by second-pass via `search_memory`. The prompt+model split alone does NOT defuse the carve-out as long as memory is shared — second-pass reading first-pass's persisted reasoning IS the recursive-self-review boundary. Memory-shared coupling is what makes the second-pass non-independent, regardless of prompt-and-model diversity. Identity-shared alone (any review by an agent on its own substrate, regardless of memory state) is over-conservative — it fires on cases where prompt-and-memory split eliminates the recursive coupling. Memory-shared captures the actual coupling vector.
 - **First-pass staying with the agent when the change is not purely additive.** First-pass may stay with mika-arch only when the change is purely additive — new skills, new tools, new config blocks with no deprecation or behavioral reduction. If any skill is being deprecated, any behavioral contract is under reduction, or any permission surface is shrinking, first-pass must also route externally.
 - **Any other shape.** ESCALATE on changes that blur the boundary (e.g., a plan that modifies both mika-arch's surface and unrelated code — split the review or route the whole thing externally).
 
@@ -183,14 +206,22 @@ The concrete trigger today is mika-arch's bundled skill surface (`skills/bundled
 
 - **Changes to code mika-arch uses but that don't modify her configuration.** A PR extending `gh_read` with a new operation benefits mika-arch (she uses `gh_read`) but doesn't change her identity, skills, or permission surface. mika-arch reviews normally. See mika#817 (counter-example in the carve-out doc).
 - **Changes to other agents' surfaces.** mika-arch reviewing mika-dev's skill changes is structurally neutral — she has no vested interest in mika-dev's operational capabilities.
+- **Coincidental outcome-shape alignment with no reviewer-driven causation.** When a plan's iteration history shows the reshaping originated in operator judgment, external peer review, or citation of canonical operator workflow documents independent of the reviewer, the carve-out does not fire on outcome-shape grounds alone. Example: mika#874 F4 flip was driven by external peer review + operator decision through Signal C in `mika/CLAUDE.md` (Post-restart safety check #757); reviewer's contribution was a procedural ask (be explicit), not the design choice. F9 does not apply.
+
+**Future work:** if memory-key namespacing between `mika-arch-groom-ticket` and `mika-arch-second-review` skills is introduced (separate ticket), the memory-shared trigger axis would be defused, narrowing the carve-out to agent-identity-shared cases.
 
 ### Evidence base
 
 This section codifies the recursive-self-review carve-out established in `docs/solutions/best-practices/recursive-self-review-carve-out-2026-04-26.md`. Three instances triggered codification per that doc's "When to revisit" criteria:
 
-1. **mika#788** — first instance exercising the carve-out (mika-arch bundled skill changes).
-2. **mika#872** — second instance (promotion protocol prompts and reflection spec touching mika-arch skills).
+1. **mika#818** — first instance exercising the carve-out (drop memory-write tools from `MIKA_ARCH_DISABLED_TOOLS`).
+2. **mika#868** — second instance (promotion protocol prompts and reflection spec touching mika-arch skills).
 3. **mika#879** — third instance (milestone grooming additions to mika-arch bundled skills); triggered the 3-instance codification threshold.
+4. **mika#874** — worked example demonstrating the sharpened rule (causation vs outcome-shape). Under the provenance test, second-pass F9 ESCALATE was incorrect: the F4 flip was driven by external peer review + operator decision, not by reviewer pressure. Deterministic verdict: F9 does not apply; mika-arch second-pass is appropriate quality gate. See the companion compound doc for the full walk-through.
+
+**Three-state taxonomy:** (1) NEITHER condition holds → review normally; (2) surface-shape only (no reviewer-driven causation) → review normally (carve-out narrowed); (3) BOTH conditions hold → fire carve-out, route external. The pre-sharpening default (surface-shape alone fires) is now case (2).
+
+**Escalation threshold:** if the sharpened rule fails to discriminate (false-positives recur 3 times OR mika#874-class deterministic-verdict cases recur with iteration-history ambiguity), escalate to an engine-layer substrate-adjacency detector.
 
 ---
 
