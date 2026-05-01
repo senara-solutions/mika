@@ -17,7 +17,9 @@ This plan's purpose:
 2. Author the compound-doc cross-references the community contributor couldn't produce without /mika tooling (Unit 3)
 3. Provide a ratification surface for architect review
 
-Squash merge applies `Co-authored-by: alceops <alce.ops@gmail.com>` trailer to preserve attribution.
+Squash merge applies `Co-authored-by: alceops <alce.ops@gmail.com>` trailer to preserve attribution on Units 1 and 2 (alceops's commits).
+
+**Unit 3 delivery mechanism.** Unit 3 (compound doc) is net-new operator-authored meta-artifact, NOT part of alceops's cherry-picked commits. Author manually in this worktree and commit before merge as an operator-only commit (no `Co-authored-by` trailer needed — alceops did not author the institutional-lesson capture). Mark Unit 3 `[x]` once committed. /ce:work dispatch is **SKIPPED** for all three units under the archaeological-record contract — Units 1 and 2 already exist on the branch (cherry-picks); Unit 3 is operator-authored at grooming time, not at /ce:work time.
 
 This contract is distinct from the default forward-validation flow where /ce:work runs the implementation against current main. Choosing archaeological-record here is correct because alceops's code is already approved, cherry-picks preserve authorship, and the gap is genuinely meta-artifacts not implementation. Future community contributions following the same shape (no Claude Code locally, plan-doc-check hook blocks merge) should follow this archaeological-record pattern.
 
@@ -187,7 +189,7 @@ The doc's two existing claims need to be split: keep the load-bearing *"state fi
 - Visual diff confirms the load-bearing sentence is unchanged.
 - Cross-references to mika-skills#55 and mika-skills#119 are present and correctly numbered.
 
-- [ ] **Unit 3: Compound doc — per-event-type cap-calibration**
+- [x] **Unit 3: Compound doc — per-event-type cap-calibration**
 
 **Goal:** Author a compound doc capturing the institutional lesson surfaced by mika#909 and mika#898: gateway truncation caps must be calibrated per-event-type, not globally, because body-shape pressure differs between operator-curated surfaces (issue/PR/comment, mostly short and human-authored) and agent-emitted structured surfaces (pull_request_review, structured-and-long with VERDICT tokens). This is the load-bearing lesson the /mika pipeline would have produced via /ce:compound; it doesn't exist in the repo because the community contributor lacked Claude Code locally.
 
@@ -196,7 +198,7 @@ The doc's two existing claims need to be split: keep the load-bearing *"state fi
 **Dependencies:** None.
 
 **Files:**
-- Create: `docs/solutions/best-practices/gateway-truncation-cap-per-event-type-calibration-2026-05-01.md`
+- Create: `docs/solutions/best-practices/gateway-truncation-cap-per-event-type-calibration-2026-05-01.md` — filename retains `truncation` for grep-discoverability; future truncation-incident diagnosis will `grep -r truncation docs/solutions/` to find calibration history.
 
 **Approach:**
 - Frontmatter (YAML): `module: mika-gateway`, `tags: [transport, truncation, qa-verdict, per-event-calibration]`, `problem_type: workflow_issue`, `category: best-practices`, `applies_when` listing the conditions under which this lesson applies.
