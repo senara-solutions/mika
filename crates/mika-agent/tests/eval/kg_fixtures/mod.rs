@@ -18,11 +18,19 @@
 //! the new column (it stays NULL for fixture rows, which is the correct default).
 
 use mika_agent::async_db::AsyncDatabase;
-use mika_agent::db::Database;
+use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 
 /// Current schema version this fixture module is pinned to.
 /// Bump this when updating fixtures for a new schema version.
-const PINNED_SCHEMA_VERSION: i32 = 28;
+/// Type is i64 to match db.rs::CURRENT_SCHEMA_VERSION source of truth.
+const PINNED_SCHEMA_VERSION: i64 = 29;
+
+const _: () = assert!(
+    CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,
+    "KG eval fixtures pin out of sync with db.rs CURRENT_SCHEMA_VERSION. \
+     Bump PINNED_SCHEMA_VERSION in tests/eval/kg_fixtures/mod.rs and update \
+     seed_* helpers. See docs/plans/740-kg-self-knowledge-eval.md D5.",
+);
 
 /// Default docs_root_hash for test fixtures. 16 hex chars matching the
 /// `hash_docs_root` format. Used by seed_* helpers for shared-layer tables.
@@ -60,9 +68,9 @@ pub fn test_db_with_agent(agent_id: &str) -> AsyncDatabase {
 /// Assert the schema version matches the fixture pin.
 /// Call from scenario setup to catch schema drift early.
 pub async fn assert_schema_version(db: &AsyncDatabase) {
-    let version: i32 = db
+    let version: i64 = db
         .with_db(|db| {
-            db.query_scalar::<i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version", &[])
+            db.query_scalar::<i64>("SELECT COALESCE(MAX(version), 0) FROM schema_version", &[])
                 .map(|v| v.unwrap_or(0))
         })
         .await
