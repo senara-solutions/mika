@@ -7,6 +7,10 @@ date: 2026-05-01
 
 # fix: Redact secret-shaped values in tool_calls persistence
 
+## Plan Contract
+
+**Retroactive archaeological-record contract.** Implementation Units 1–4 `[x]` complete in commits `7f7f11d` (Units 1–4 + plan + compound doc), `52284f6` (error_message scope extension — see F1 amendment in Key Decisions below), `db2191f` (compound doc). /ce:work dispatch is **SKIPPED** — implementation shipped via sprint dispatch (`mika ask --agent mika-dev "implement sprint: ..."` at 2026-04-30T20:07:55) prior to architect review, per the documented bypass gap in mika#919. Unit 5 deferred to mika#918 (see Implementation Units below). No `Co-authored-by` trailer required — mika-dev + claude-pilot authorship throughout. Retroactive groom initiated 2026-05-01 once mika#919's grooming-bypass gap was identified post-dispatch; this plan now serves as the authoritative archaeological record so the Knowledge Graph indexes the rationale alongside the code.
+
 ## Overview
 
 Add a secret-scrubbing layer at the `tool_calls` database persistence boundary so that secret-shaped values (API keys, tokens, PEM private keys, env var assignments containing secrets) are redacted before being written to SQLite. The LLM's in-memory tool output remains unscrubbed — only the durable copy in `tool_calls.input` and `tool_calls.output` is sanitized. A one-shot backfill migration scrubs existing rows.
@@ -64,6 +68,12 @@ Evidence: `tool_calls` row `461c76a1` (2026-04-13) contained a real GitHub PAT f
 - **Schema bump v28→v29 for backfill**: The backfill is a data-only migration (no DDL). Using the schema migration path ensures it runs exactly once, is idempotent, and follows the established pattern.
 - **No scrub on `error_message`**: Error messages from tool failures should not contain secrets (they are error descriptions, not file content). Keeping them unscrubbed preserves debugging utility. If a future audit surfaces secrets in error messages, the scrubber is trivially applied.
 
+  > **AMENDED by commit `52284f6`** (architect F1, ratified 2026-05-01): scrub IS applied to `error_message`. Rationale: HTTP client, webhook, and auth-layer error messages can embed request context including token values (e.g., bearer tokens reflected in URL parameters, API keys in auth headers re-emitted in error text, raw response bodies on auth failures). The original "error descriptions, not file content" rationale was under-argued — tool failure context is structurally capable of containing secrets. Scrubbing `error_message` is consistent with the defense-in-depth posture of Units 1–4 and matches the same INSERT-time chokepoint already established for input/output. Operator has reviewed and ratifies this scope extension.
+
+- **Backfill migration shape — single-pass within one Immediate transaction** (architect F2 closure, 2026-05-01): `migrate_v28_to_v29()` opens a single `TransactionBehavior::Immediate` transaction, SELECTs all `tool_calls` rows where any of `input`/`output`/`error_message` are non-NULL into memory (`Vec<(id, input, output, error_message)>`), iterates in Rust applying `scrub_secrets()` to each field via `Cow`, and UPDATEs only rows where scrubbing produced an `Owned` value (`matches!(_, Some(Cow::Owned(_)))`) on at least one column. Schema-version bump and commit happen at the tail of the same transaction. **Not batched.** Rationale: SQLite's single-writer model means batching does not reduce lock contention; a single-pass migration with idempotent UPDATE-only-on-diff is correct for SQLite deployments. Large-instance latency risk is acknowledged and accepted — the migration runs at startup before the agent processes events, so the worst-case effect is a slower first boot, not user-facing latency. If a future deployment surfaces unacceptable startup-latency on a large `tool_calls` table, batching is a localized refactor of `migrate_v28_to_v29()` (the Rust loop, the data-only contract, and the idempotency story all stay the same).
+
+- **False-positive calibration — placeholder values are deliberately redacted** (architect F6 sharpening, 2026-05-01): Placeholder values in `.env.example` like `MIKA_API_KEY=your_key_here` will be redacted by the `MIKA_*=value` patterns. False-positive cost (operator sees `<REDACTED>` in tool output where they expected the placeholder string) is materially lower than false-negative cost (real key persists unredacted in the database for the documented 17-day audit horizon). Value-side length and character-class validation could reduce false positives but adds complexity and risks new false-negative classes (e.g., a token format we haven't seen yet whose value looks "non-secret-shaped"). Deferred.
+
 ## Open Questions
 
 ### Resolved During Planning
@@ -72,9 +82,12 @@ Evidence: `tool_calls` row `461c76a1` (2026-04-13) contained a real GitHub PAT f
 - **Should the backfill use `regex` in SQL or in Rust?** In Rust. SQLite's `REGEXP` requires loading an extension. The migration will SELECT rows, scrub in Rust, and UPDATE in batches within a transaction.
 - **Should `error_message` be scrubbed?** No — error messages are tool failure descriptions, not file content. The blast radius is minimal and debugging value is high.
 
+### Resolved Post-Implementation (architect first-pass closure, 2026-05-01)
+
+- **Exact batch size for the backfill migration** — RESOLVED: not batched. Single-pass within one `TransactionBehavior::Immediate` transaction. See Key Decisions §"Backfill migration shape" for full rationale.
+
 ### Deferred to Implementation
 
-- Exact batch size for the backfill migration (likely 500-1000 rows per transaction for WAL friendliness).
 - Whether the `RegexSet` pattern set needs tuning after seeing real-world false positive rates.
 
 ## Implementation Units
@@ -199,7 +212,11 @@ Evidence: `tool_calls` row `461c76a1` (2026-04-13) contained a real GitHub PAT f
   - Migration test in the existing migration test suite
   - `CURRENT_SCHEMA_VERSION == 29`
 
-- [x] **Unit 5: Integration test — end-to-end secret redaction through `read_agent_file`**
+- [→ mika#918] **Unit 5: Integration test — end-to-end secret redaction through `read_agent_file`** — DEFERRED
+
+  **Status (architect F3 closure, 2026-05-01):** Unit 5 is **NOT shipped on this plan**. The EvalHarness integration test (R3+R5) was identified as missing during PR #915 review — mika-qa blocked PR #915 with `block[ac]` on this Unit. Vincent filed mika#918 the same day as a follow-up specifically for this delivery. mika#918 is the canonical dispatch target for Unit 5; this plan will not re-deliver it.
+
+  /ce:work dispatch on this plan SKIPPED for Unit 5 — dispatch lives in mika#918's own plan-on-branch (`fix/918/...`). mika-qa's `block[ac]` on PR #915 clears when mika#918 lands; the two tickets ship in sequence (#908 → #918) with PR #915 merging once #918 unblocks the AC.
 
   **Goal:** Prove the full pipeline: tool returns secrets → DB has redacted values → live tool result retains real values.
 
@@ -245,9 +262,16 @@ Evidence: `tool_calls` row `461c76a1` (2026-04-13) contained a real GitHub PAT f
 | Backfill migration takes too long on large DBs | Batch processing within a transaction. The `tool_calls` table is pruned by retention policy, so row count is bounded. |
 | New secret formats not covered by patterns | The pattern list is extensible. Document the pattern list in the module for future additions. Log a structured event when scrubbing fires so operators can audit coverage. |
 
+## Future Work
+
+- **`scrubber_fired` structured log event** (architect F5 sharpening): When `scrub_secrets()` returns `Owned`, emit a `scrubber_fired` structured log line with fields `tool_call_id`, `column` (one of `input`/`output`/`error_message`), `pattern_index` (which regex matched). Operators can then audit how often each pattern fires, which surfaces missed patterns when a known-leaking tool produces zero `scrubber_fired` lines. **Prioritization threshold:** first post-deploy report of a scrub miss that this observability would have caught. File a follow-up ticket once the threshold is hit. Until then, the patterns themselves are the contract — no telemetry needed for the happy path.
+
 ## Sources & References
 
 - Related issue: #908
+- Architect grooming session: `4dbf2391-b2e6-4a09-a8d3-db9881cac54d` (first-pass ITERATE 2026-05-01, F1–F6)
+- Sibling follow-up: mika#918 (Unit 5 R3+R5 EvalHarness integration test, mika-qa `block[ac]` on PR #915)
+- Sibling structural fix: mika#919 (operator-CLI dispatch grooming bypass — root cause of why this plan is being groomed retroactively)
 - Sibling issue: #903 (bash set -x leak class)
 - `docs/solutions/security-issues/bash-set-x-leaks-secrets-in-trace-and-callback-2026-04-30.md`
 - `docs/solutions/architecture-patterns/runtime-observability-llm-tool-call-recording.md`
