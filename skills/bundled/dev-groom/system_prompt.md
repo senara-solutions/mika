@@ -10,8 +10,16 @@ The user message contains a typed ticket reference: `<repo> issue#<n>`. Parse in
 
 1. Fetch the issue: `gh issue view <n> --repo senara-solutions/<repo> --json title,body,labels`.
 2. Branch slug derivation:
-   - If the issue body contains `> - **Branch:** \`<slug>\``, use that slug verbatim.
-   - Otherwise, derive deterministically: `<type>/<n>/<sanitized-title>`. Type from labels: `enhancement` -> `feat`, `bug` -> `fix`, else `chore`. If the title has a conventional prefix (`feat(...): ...`), extract the type from it.
+   - If the issue body contains `> - **Branch:** \`<slug>\``, use that slug verbatim (callout takes priority — script is NOT invoked when callout matches).
+   - Otherwise, invoke the canonical script:
+   ```bash
+   ISSUE_TITLE=$(gh issue view <n> --repo senara-solutions/<repo> --json title -q .title)
+   LABELS=$(gh issue view <n> --repo senara-solutions/<repo> --json labels -q '[.labels[].name] | join(",")')
+   ISSUE_BODY=$(gh issue view <n> --repo senara-solutions/<repo> --json body -q .body)
+   SCRIPTS_DIR="$(dirname "$(git rev-parse --git-common-dir)")/scripts"
+   BRANCH=$("$SCRIPTS_DIR/derive-branch-name" --title "$ISSUE_TITLE" --issue <n> --labels "$LABELS" --body-callout "$ISSUE_BODY")
+   ```
+   *Do not re-derive in prompt logic — slug recipe is owned by the script and must match the meta-repo dispatcher and dev-pilot dispatcher.*
 3. The branch slug is **immutable** after worktree creation. Semantic accuracy goes in the plan filename, not the branch name. Never `git branch -m`.
 
 ### Phase 2 — Set up worktree and draft the plan
