@@ -268,7 +268,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 5. **IMMEDIATELY after Step 4, call `run_claude_pilot`.** No other tool calls permitted between Step 4 and this call. Do not read files, analyze code, plan, summarize, or list "next steps." Call `run_claude_pilot` NOW.
 
    ```json
-   {"prompt": "<repo>#<n>", "task_id": "<UUID from Step 4>"}
+   {"skill": "dev-pilot", "prompt": "<repo>#<n>", "task_id": "<UUID from Step 4>"}
    ```
 
    If `run_claude_pilot` returns a terminal error (`global_dispatch_active`, `task_not_dispatchable`, `dispatch_blocked_by`, `dispatch_limit_exceeded`), do NOT retry. Send the operator a `send_message` naming the rejection cause and stop — the engine guard accepts the attempt as satisfying the dispatch contract.

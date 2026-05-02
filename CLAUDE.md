@@ -233,7 +233,7 @@ skills/bundled/
 ├── self-dev-webhook-qa/   # QA webhook handler for self-dev
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
 ├── dev-pilot/             # Claude Code implementation dispatch (thin wrapper → _shared/dispatch-lib.sh, entry: /mika)
-├── dev-groom/             # Operator-triggered grooming dispatch (thin wrapper → _shared/dispatch-lib.sh, entry: /mika-groom-ticket)
+├── dev-groom/             # Operator-triggered grooming dispatch (prompt-only sibling — host: dev-pilot via run_claude_pilot, entry: /mika-groom-ticket)
 ├── qa-review/             # PR review skill
 ├── qa-review-build-callback/ # Build callback handler for QA review
 ├── permission-policy/     # Permission handler for claude-pilot sessions
