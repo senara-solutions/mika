@@ -91,7 +91,21 @@ Rationale:
 
 **Branch naming across repos:** same slug for traceability (`fix/935/skills-mika-ask-intra-platform-agent`).
 
-**PR cross-referencing:** each PR body cites the companion: `Companion PR: senara-solutions/<other-repo>#<number>`. Unit 1's PR body explicitly lists the gap-window verification result and the rollback command.
+**PR cross-referencing (architect F9):** each PR body MUST include the following:
+
+- **Unit 1 PR (claude-pilot-py):**
+  1. Link to mika#935 (origin issue).
+  2. Link to Unit 2 PR (when filed; back-fill if Unit 2 PR opens after Unit 1).
+  3. The 6 corner-case categories from Unit 1's Approach section (env-var prefix, compound separators, flag re-ordering, `--` separator, equals form, quoting variants).
+  4. Gap-window verification result (smoke + probe) and the rollback command (`uv tool install --force <prior-version-spec>`).
+
+- **Unit 2 PR (mika-platform):**
+  1. Link to mika#935 (origin issue).
+  2. Link to Unit 1 PR (already merged at this point per sequencing contract).
+  3. The F1 hook-layer pin: `handlers.rs:80-110` symbol + the 5 decision branches.
+  4. The pre-implementation `agent_id` access verification result (per F8).
+
+These cross-references are NOT optional polish — they are the audit-trail discovery surface for future readers tracing how the dispatch reframe shipped across repos.
 
 ## Context & Research
 
@@ -318,6 +332,8 @@ pub(crate) fn pre_classify_pilot_event(
 6. Otherwise → `None`
 
 **Threading the `None` case:** existing `handle_message` proceeds unchanged. No refactor of the existing code path.
+
+**`agent_id` access pattern (architect F8):** the precise access pattern at `handlers.rs:80` was not verified at groom time without filesystem access. Implementation step 1 of Unit 2 is to verify `agent_id` access at `handlers.rs:80` (likely a parameter, self-field, or `context.agent_id()` call); if the actual access differs from the assumed parameter, update `pre_classify_pilot_event`'s signature to match the available access shape. The function signature is otherwise final.
 
 **Approach:**
 - Pre-classifier function signature (directional): `pre_classify_pilot_event(message: &str) -> Option<PermissionAction>` returning `Some(Allow)` for matching intra-platform dispatch, `None` to fall through to existing LLM flow.
