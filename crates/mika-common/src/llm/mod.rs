@@ -8,6 +8,7 @@ pub mod types;
 
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -16,6 +17,12 @@ use serde::Deserialize;
 
 pub use error::LlmError;
 pub use types::*;
+
+/// Estimated typical LLM call duration for deadline-aware retry abort.
+/// Conservative: covers Sonnet 4.6 observed p95 (49s) with headroom.
+pub const TYPICAL_CALL_DURATION_SECS: u64 = 90;
+/// Buffer added to typical call duration for retry abort decisions.
+pub const RETRY_BUFFER_SECS: u64 = 30;
 
 /// Internal tag names that should be stripped from LLM response text.
 /// These tags are injected into conversation history for LLM context (tool history,
@@ -86,6 +93,23 @@ pub fn strip_internal_tags(text: &str) -> String {
 pub trait LlmProvider: Send + Sync {
     /// Send a message and return the complete response.
     async fn send_message(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError>;
+
+    /// Send a message with deadline awareness.
+    ///
+    /// When the remaining time before `deadline` is less than
+    /// `TYPICAL_CALL_DURATION + RETRY_BUFFER` (120s), abort the retry chain
+    /// early instead of starting another attempt that would almost certainly
+    /// be cancelled by the outer deadline anyway.
+    ///
+    /// Default implementation ignores the deadline and delegates to `send_message`.
+    async fn send_message_with_deadline(
+        &self,
+        request: &LlmRequest,
+        deadline: Option<Instant>,
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = deadline;
+        self.send_message(request).await
+    }
 
     /// Human-readable provider name (e.g., "anthropic", "openai").
     fn provider_name(&self) -> &str;
@@ -613,5 +637,60 @@ Bye."#;
         let input =
             r#"Hi <context type="x">data</context> and <context type="y">more data context > end"#;
         assert_eq!(strip_internal_tags(input), "Hi  and  end");
+    }
+
+    // -- send_message_with_deadline default implementation tests --
+
+    #[tokio::test]
+    async fn test_send_message_with_deadline_none_delegates_to_send_message() {
+        use super::mock::*;
+
+        let provider = MockLlmProvider::builder()
+            .response(text_response("Hello!"))
+            .build();
+
+        let request = LlmRequest {
+            model: "test".into(),
+            system: None,
+            messages: vec![],
+            tools: None,
+            max_tokens: 100,
+            thinking: None,
+        };
+
+        // None deadline should delegate to send_message (default trait impl)
+        let result = provider
+            .send_message_with_deadline(&request, None)
+            .await
+            .unwrap();
+        assert_eq!(result.text(), "Hello!");
+        assert_eq!(provider.calls_made(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_with_deadline_some_delegates_to_send_message() {
+        use super::mock::*;
+
+        let provider = MockLlmProvider::builder()
+            .response(text_response("World!"))
+            .build();
+
+        let request = LlmRequest {
+            model: "test".into(),
+            system: None,
+            messages: vec![],
+            tools: None,
+            max_tokens: 100,
+            thinking: None,
+        };
+
+        // Some deadline (far future) should also delegate successfully
+        let deadline = Instant::now() + std::time::Duration::from_secs(600);
+        let result = provider
+            .send_message_with_deadline(&request, Some(deadline))
+            .await
+            .unwrap();
+        assert_eq!(result.text(), "World!");
+        assert_eq!(provider.calls_made(), 1);
     }
 }

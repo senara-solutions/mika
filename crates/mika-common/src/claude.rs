@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -18,6 +18,8 @@ const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 // Values derived from OpenClaw's pi-ai SDK (the reference implementation).
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75";
 const CLAUDE_CODE_APP_HEADER: &str = "cli";
+
+use crate::llm::{RETRY_BUFFER_SECS, TYPICAL_CALL_DURATION_SECS};
 
 // -- Auth --
 
@@ -380,6 +382,19 @@ impl ClaudeClient {
 
     /// Send a message to Claude with retry on transient errors (429, 500, 529).
     pub async fn send_message(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
+        self.send_message_with_deadline(request, None).await
+    }
+
+    /// Send a message with deadline-aware retry abort.
+    ///
+    /// When `deadline` is `Some` and the remaining time is insufficient for
+    /// another LLM call attempt, the retry chain aborts early instead of
+    /// starting a doomed retry.
+    pub async fn send_message_with_deadline(
+        &self,
+        request: &MessagesRequest,
+        deadline: Option<Instant>,
+    ) -> Result<MessagesResponse> {
         let span = info_span!(
             target: "mika::otel",
             "llm_call",
@@ -398,7 +413,7 @@ impl ClaudeClient {
         }
 
         let response = self
-            .send_message_inner(request)
+            .send_message_inner(request, deadline)
             .instrument(span.clone())
             .await?;
 
@@ -423,8 +438,12 @@ impl ClaudeClient {
         Ok(response)
     }
 
-    /// Inner implementation of send_message with retry logic.
-    async fn send_message_inner(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
+    /// Inner implementation of send_message with retry logic and optional deadline.
+    async fn send_message_inner(
+        &self,
+        request: &MessagesRequest,
+        deadline: Option<Instant>,
+    ) -> Result<MessagesResponse> {
         info!(
             model = %request.model,
             max_tokens = request.max_tokens,
@@ -451,6 +470,23 @@ impl ClaudeClient {
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
+                // Deadline-aware retry abort: if the remaining time before the
+                // agent deadline cannot fit another LLM call attempt, bail out
+                // instead of wasting time on a doomed retry.
+                if let Some(dl) = deadline {
+                    let remaining = dl.saturating_duration_since(Instant::now());
+                    if remaining
+                        < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
+                    {
+                        warn!(
+                            attempt,
+                            remaining_ms = remaining.as_millis() as u64,
+                            "aborting retry chain — remaining deadline insufficient for another attempt"
+                        );
+                        break;
+                    }
+                }
+
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
                 warn!(
                     attempt,
@@ -523,16 +559,38 @@ impl ClaudeClient {
             }
         }
 
+        // Distinguish deadline-abort from normal retry exhaustion for diagnostics.
+        let deadline_aborted = deadline.is_some_and(|dl| {
+            dl.saturating_duration_since(Instant::now())
+                < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
+        });
+
         Err(last_error
-            .map(|e| match &e {
-                ClaudeApiError::HttpError { status, .. } if *status >= 500 => {
-                    anyhow::Error::from(e)
-                        .context("Claude API is temporarily unavailable. Please try again shortly.")
+            .map(|e| {
+                let base = match &e {
+                    ClaudeApiError::HttpError { status, .. } if *status >= 500 => {
+                        anyhow::Error::from(e).context(
+                            "Claude API is temporarily unavailable. Please try again shortly.",
+                        )
+                    }
+                    _ => anyhow::Error::from(e)
+                        .context("Claude API is busy. Please wait a moment and try again."),
+                };
+                if deadline_aborted {
+                    base.context("retry chain aborted: deadline budget insufficient")
+                } else {
+                    base
                 }
-                _ => anyhow::Error::from(e)
-                    .context("Claude API is busy. Please wait a moment and try again."),
             })
-            .unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
+            .unwrap_or_else(|| {
+                if deadline_aborted {
+                    anyhow::anyhow!(
+                        "retry chain aborted: deadline budget insufficient (no prior error)"
+                    )
+                } else {
+                    anyhow::anyhow!("max retries exceeded")
+                }
+            }))
     }
 
     async fn send_once(

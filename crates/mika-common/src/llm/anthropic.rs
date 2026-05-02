@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use tracing::warn;
@@ -40,11 +42,19 @@ impl AnthropicProvider {
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn send_message(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.send_message_with_deadline(request, None).await
+    }
+
+    async fn send_message_with_deadline(
+        &self,
+        request: &LlmRequest,
+        deadline: Option<Instant>,
+    ) -> Result<LlmResponse, LlmError> {
         let anthropic_request = to_anthropic_request(request);
 
         let response = self
             .client
-            .send_message(&anthropic_request)
+            .send_message_with_deadline(&anthropic_request, deadline)
             .await
             .map_err(|e| LlmError::ProviderError(e.to_string()))?;
 

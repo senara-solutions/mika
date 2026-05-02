@@ -491,7 +491,11 @@ async fn attempt_continuation_turn(
         std::cmp::min(Duration::from_secs(CONTINUATION_TIMEOUT_SECS), remaining);
 
     let llm_call_start = std::time::Instant::now();
-    let continuation = tokio::time::timeout(continuation_timeout, llm.send_message(request)).await;
+    let continuation = tokio::time::timeout(
+        continuation_timeout,
+        llm.send_message_with_deadline(request, Some(deadline.into())),
+    )
+    .await;
     let latency_ms = llm_call_start.elapsed().as_millis() as u64;
 
     match continuation {
@@ -899,7 +903,9 @@ async fn run_loop(
         }
 
         let llm_call_start = std::time::Instant::now();
-        let llm_result = llm.send_message(request).await;
+        let llm_result = llm
+            .send_message_with_deadline(request, Some(deadline.into()))
+            .await;
         let llm_call_latency_ms = llm_call_start.elapsed().as_millis() as u64;
 
         // Record the LLM call in the database (success or error)
