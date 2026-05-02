@@ -48,7 +48,7 @@ Per `feedback_qa_provider_perf.md`: "DeepSeek best for qa-review; Claude halluci
 - **R3.** Existing retry-on-transient behavior is preserved when the remaining deadline is sufficient.
 - **R4.** No change to `mika-arch-second-review` (already on Sonnet 4.6).
 - **R5.** No change to other agents' Opus routing (mika-arch is the sole subject of this fix).
-- **R6.** After fix: mika-arch grooming completes a two-pass review within 60 seconds per pass on a canonical brief, with both `mika-arch-groom-ticket` and `mika-arch-second-review` skills ENABLED.
+- **R6.** After fix: mika-arch grooming completes a two-pass review within **90 seconds per pass** on a canonical brief, with both `mika-arch-groom-ticket` and `mika-arch-second-review` skills ENABLED. (Calibrated per pass-1 F3: Sonnet 4.6 observed p50 ≈ 36s, observed max = 49s on 32606-token first pass; 90s ceiling = observed max + ~85% headroom for normal variance. Re-calibrate if token counts change significantly.)
 
 ## Scope Boundaries
 
@@ -60,7 +60,9 @@ Per `feedback_qa_provider_perf.md`: "DeepSeek best for qa-review; Claude halluci
 
 ### Deferred to Separate Tasks
 
-- **Sonnet 4.6 persistence-meta hallucination** ("No new facts warrant persistence"). Surfaced on two turns across two sessions. Root cause unconfirmed; could be (a) skill envelope's system prompt vocabulary, (b) Sonnet training conditioning, (c) interaction with `kimi-k2.5` orchestration shell context. Fix surface unclear. **Filing ticket title:** `fix(mika-arch): Sonnet 4.6 emits persistence-meta hallucination on review prompts (mika#939 follow-up)`. Filed before THIS PR merges.
+- **Sonnet 4.6 persistence-meta hallucination** ("No new facts warrant persistence"). Surfaced on two turns across two sessions. Root cause unconfirmed; could be (a) skill envelope's system prompt vocabulary, (b) Sonnet training conditioning, (c) interaction with `kimi-k2.5` orchestration shell context. Fix surface unclear.
+  - **Companion task title (per pass-1 F5, SHARPENING):** `fix(mika-arch): Sonnet 4.6 emits persistence-meta hallucination on review prompts (mika#939 follow-up)`
+  - **Filing gate (per pass-1 F5, matches mika#938 F2 canonical shape):** Companion ticket MUST be filed BEFORE this PR merges. PR description includes a checkbox: `[ ] mika#939-hallucination-followup ticket filed (link: ___)`; reviewer blocks merge if unchecked.
 - **Anthropic Opus 4.7 reliability monitoring.** Today's transient-error chain may indicate provider-side incident OR persistent issue. If after R1's fix any agent still routes to Opus 4.7 and shows transient-error frequency > 1% over 7 days, file investigation ticket.
 - **Skill `[llm:]` annotation discoverability.** Today's debug required reading `mika skills list` output. A `mika skills show <skill>` showing the LLM annotation would help. File separately.
 
@@ -143,26 +145,54 @@ None — this is grounded in mika-side telemetry + log + config evidence.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Move `mika-arch-groom-ticket` to Sonnet 4.6**
+- [ ] **Unit 1: Move `mika-arch-groom-ticket` to Sonnet 4.6 + reconcile DB-vs-source drift on second-review**
 
-**Goal:** Edit the per-skill LLM annotation in `mika/skills/bundled/mika-arch-groom-ticket/skill.toml` (or equivalent skill-definition file) to route to `claude-sonnet-4-6` instead of `claude-opus-4-7`.
+**Goal:** Edit the source-level LLM override in `crates/mika-agent/src/well_known_agents.rs:199` to route `mika-arch-groom-ticket` to `claude-sonnet-4-6`. Reconcile the DB-vs-source drift on `mika-arch-second-review` (DB shows Opus, source says Sonnet) by either reseeding from source OR investigating the manual override mechanism.
 
-**Requirements:** R1, R4 (no change to second-review), R5 (no change to other agents).
+**Pre-implementation pin (per pass-1 F1, BLOCKING):**
+
+DB state queried at plan-commit time (2026-05-02):
+```
+sqlite3 ~/.mika/data/mika.db "SELECT * FROM skill_overrides WHERE agent_id = 'mika-arch'"
+mika-arch | mika-arch-groom-ticket    | anthropic | claude-opus-4-7 | enabled
+mika-arch | mika-arch-second-review   | anthropic | claude-opus-4-7 | enabled
+```
+
+Source state at `crates/mika-agent/src/well_known_agents.rs:195-211`:
+```rust
+llm_overrides: &[
+    LlmOverrideSpec { skill_name: "mika-arch-groom-ticket",    provider: "anthropic", model: "claude-opus-4-7" },
+    LlmOverrideSpec { skill_name: "mika-arch-groom-milestone", provider: "anthropic", model: "claude-opus-4-7" },
+    LlmOverrideSpec { skill_name: "mika-arch-second-review",   provider: "anthropic", model: "claude-sonnet-4-6" },
+]
+```
+
+**Drift discovered:** DB has `mika-arch-second-review` on Opus 4.7; source has it on Sonnet 4.6. Unit 1 scope = THREE actions:
+1. Edit source line 199: `mika-arch-groom-ticket` Opus → Sonnet.
+2. Edit source line 204: `mika-arch-groom-milestone` Opus → Sonnet (NEW finding — same Opus failure mode applies to milestone grooming; ship together for symmetry).
+3. Reconcile second-review DB drift: investigate why DB-vs-source diverged. Options: (a) reseed via `delete + reinsert`; (b) call `set_skill_override("mika-arch-second-review", anthropic, claude-sonnet-4-6)` from a one-shot migration; (c) discover a manual `mika skills override` invocation history. The /ce:work investigation surfaces the cause; the fix re-aligns DB with source.
+
+**Requirements:** R1, R4 (no functional change to second-review behavior — only reconcile state), R5 (no change to other agents).
 
 **Dependencies:** None.
 
 **Files:**
-- Modify: `mika/skills/bundled/mika-arch-groom-ticket/skill.toml`
+- Modify: `crates/mika-agent/src/well_known_agents.rs` (lines 195-211 — change groom-ticket and groom-milestone Opus → Sonnet; second-review unchanged in source)
+- Modify: `crates/mika-agent/src/well_known_agents.rs` (test assertions at lines 1233, 1239, 1330, 1337 — update to expect Sonnet 4.6 for groom-ticket and groom-milestone)
+- New migration OR runtime reseeding: `crates/mika-agent/src/well_known_agents.rs` `seed_well_known_skill_overrides` function (line 1319 referenced by tests). Implementer determines whether the function reseeds existing rows or only inserts on missing — if only inserts, an operator post-merge action OR a delete-and-reseed migration is needed for the second-review DB drift correction.
 
 **Approach:**
 
-1. Read the file and locate the LLM-routing annotation (key likely `llm`, `anthropic_model`, or similar).
-2. Change value from `claude-opus-4-7` to `claude-sonnet-4-6`.
-3. Verify `mika-arch-second-review`'s skill.toml: if it currently shows Opus 4.7 (per audit output), reconcile to Sonnet 4.6 to match config comment AND to keep both skills consistent. Audit found both skills annotated with Opus in `mika skills list`; the agent config comment says second-review is on Sonnet — investigate this drift during /ce:work and surface findings.
+1. Edit `well_known_agents.rs:199` — `model: "claude-opus-4-7"` → `model: "claude-sonnet-4-6"`.
+2. Edit `well_known_agents.rs:204` — same change for `mika-arch-groom-milestone`.
+3. Update test assertions in same file: lines 1233, 1239 (compile-time MIKA_ARCH constant) and lines 1330, 1337 (DB state after seeding test).
+4. Investigate `seed_well_known_skill_overrides` semantics. If it re-asserts source on every run → no migration needed; deploy fixes both. If it only inserts on missing rows → second-review's DB drift won't be corrected by deploy alone; requires operator-applied `DELETE + reinsert` (post-merge action documented in Operational Notes).
+5. Verify second-review's expected behavior: it MUST land on Sonnet 4.6 in DB after deploy + any post-merge action. /ce:work confirms via `sqlite3 ~/.mika/data/mika.db "SELECT * FROM skill_overrides WHERE agent_id='mika-arch'"`.
 
 **Patterns to follow:**
 
-- `mika/skills/bundled/mika-arch-second-review/skill.toml` — the existing-on-Sonnet pattern (verify actual state; reconcile drift if needed).
+- `crates/mika-agent/src/well_known_agents.rs:206-211` — the existing Sonnet 4.6 entry for second-review is the pattern. Mirror its shape for groom-ticket and groom-milestone.
+- Test pattern at `crates/mika-agent/src/well_known_agents.rs:1233-1337` — update assertions in lockstep with constants.
 
 **Test scenarios:**
 
@@ -194,10 +224,23 @@ None — this is grounded in mika-side telemetry + log + config evidence.
 
 **Approach:**
 
-1. Add a deadline parameter (or context struct) to the public retry-aware send function. Default to `None` for callers that don't have deadline visibility (preserves backwards compatibility).
-2. Before each retry attempt, if `deadline.is_some()`, compute `remaining = deadline - now`. If `remaining < TYPICAL_CALL_DURATION + RETRY_BUFFER` (constants TBD per Decision 2), break out of the retry loop with the last error rather than entering another `send_once`.
-3. Log the abort: `warn!(attempt, remaining_ms = remaining.as_millis(), "aborting retry chain — remaining deadline insufficient for another attempt")`.
-4. Existing retry behavior preserved when `deadline.is_none()` or when remaining budget is sufficient.
+**Calibration pin (per pass-1 F2, BLOCKING):**
+- `TYPICAL_CALL_DURATION = 90s` — covers Sonnet 4.6 observed p95 (49s on first-pass per audit; 24s on second-pass) with headroom; well under the 2-min API timeout that caused today's incident.
+- `RETRY_BUFFER = 30s` — small margin to avoid edge-case borderline aborts.
+- Abort condition: `remaining < 120s` (= TYPICAL_CALL_DURATION + RETRY_BUFFER).
+- /ce:work may adjust based on source-inspection of existing per-call timeout constants in `claude.rs:452-498` if they require different calibration; the plan pins a defensible starting value.
+
+**Function signature pin (per pass-1 F4, SHARPENING):**
+- Function under modification: identified by `grep -n` at `crates/mika-common/src/claude.rs:452-498`. Implementer reads the actual function name (likely `send_with_retry` or `send_message`) and enumerates current callers via `grep -n '<function_name>(' crates/`.
+- Complexity threshold: if callers > 2, pause and reconsider whether `Option<Instant>` threads cleanly. Alternative: introduce a wrapper function `send_with_deadline(request, deadline)` that delegates to the existing function, leaving the original signature unchanged for non-deadline callers. Surface the choice in /ce:work commentary if the wrapper-vs-param decision becomes load-bearing.
+
+**Implementation steps:**
+
+1. Read `claude.rs:452-498` and identify the function being modified + its callers.
+2. Add deadline parameter (or wrapper function per F4 fallback). Default `None` preserves existing behavior.
+3. Before each retry attempt, if `deadline.is_some()`, compute `remaining = deadline - now`. If `remaining < 120s`, break out of the retry loop with the last error rather than entering another `send_once`.
+4. Log the abort: `warn!(attempt, remaining_ms = remaining.as_millis(), "aborting retry chain — remaining deadline insufficient for another attempt")`.
+5. Existing retry behavior preserved when `deadline.is_none()` or when remaining budget is sufficient.
 
 **Patterns to follow:**
 
@@ -255,6 +298,11 @@ None — this is grounded in mika-side telemetry + log + config evidence.
   2. Direct invocation: `mika ask --agent mika-arch --format json --verbose "<test brief>"` completes within 60s.
   3. Re-fire dev-groom canary on mika#931 — should reach Phase 3 step 9 architect call cleanly. If mika#938 fix has not yet shipped, the canary may still hit the pre-classifier deny separately; isolate by direct invocation first.
 - **Monitoring follow-up:** After 7 days post-deploy, query: `SELECT COUNT(*) FROM ... WHERE message LIKE '%transient Claude API error%' AND agent_id = 'mika-arch'`. If non-zero, file Anthropic-side investigation per Deferred to Separate Tasks.
+
+- **Post-merge operator action (per pass-1 F6, SHARPENING):** Update mika-arch core memory `self_model` block to reflect the post-merge LLM routing. The current self_model statement *"I run on Opus 4.7 (per skill_overrides rows seeded 2026-04-26, both mika-arch-groom-ticket and mika-arch-second-review skills)"* will become stale post-merge. Specifically:
+  - Replace with: *"I run on Sonnet 4.6 for groom-ticket and groom-milestone reviews (per skill_overrides rows updated 2026-05-02 via mika#939 / well_known_agents.rs); second-review remains on Sonnet 4.6 (DB-vs-source drift reconciled in same fix)."*
+  - Architect cannot self-update during /ce:work (no memory-write capability in that path); operator applies via dashboard or mika-arch conversation post-merge.
+  - Failure mode if not applied: future architect reviews will cite a stale model name as their own ground truth, propagating the error.
 
 ## Sources & References
 
