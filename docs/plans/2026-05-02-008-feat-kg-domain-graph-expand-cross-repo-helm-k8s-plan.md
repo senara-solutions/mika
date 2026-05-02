@@ -207,3 +207,65 @@ The gap is in the domain graph's coverage breadth, not resolver bugs (mika#874/#
 - **Sibling fixes (milestone#19):** mika#874 (resolver Stage-2), mika#876 (extractor JSON parsing), mika#877 (per-corpus visibility), mika#927 (per-corpus fairness — orthogonal but ships together to maximize observable improvement).
 - **Cross-corpus primitive:** mika#798 (`agent_kg_corpora` table).
 - **Fixture pattern:** `docs/solutions/kg/eval-fixtures-2026-04-24/`.
+
+## Pass-1 iteration (mika-arch ITERATE → applied)
+
+### F1 (BLOCKING) — Concept registry pin (from ACTUAL issue body)
+
+The pass-1 architect response cited a fabricated list ("worktree, plan-on-branch, callout..." etc) NOT present in the issue body. The actual issue body's concept lists, pinned verbatim:
+
+**B1 — `concept:cross-repo:*`** (from ticket § "B1 — mika-platform domain graph coverage"):
+- `concept:cross-repo:companion-pr-pattern`
+- `concept:cross-repo:branch-name-immutable-invariant`
+- `concept:cross-repo:plan-doc-on-branch-contract`
+- `concept:cross-repo:handoff-doc-shape`
+- `concept:cross-repo:coordination-branch-on-origin`
+- `concept:cross-repo:worktree-management`
+- `concept:cross-repo:dispatch-routing`
+
+**B2 — `concept:infra:*`** (from ticket § "B2 — mika-cloud domain graph coverage"):
+- `concept:infra:helm-chart`
+- `concept:infra:helm-release`
+- `concept:infra:helm-values`
+- `concept:infra:helm-templates`
+- `concept:infra:kubernetes-deployment`
+- `concept:infra:kubernetes-statefulset`
+- `concept:infra:kubernetes-service`
+- `concept:infra:kubernetes-configmap`
+- `concept:infra:kubernetes-secret`
+- `concept:infra:provisioning-flow`
+- `concept:infra:service-discovery-customer-id`
+- `concept:infra:aws-eks`
+- `concept:infra:gcp-gke`
+
+These are the v1 lists. /ce:work may add concepts during chunk-content audit if specific subjects extracted from the corpora don't match any v1 entry — but v1 must ship intact.
+
+### F2 (BLOCKING) — Drop `concept:platform:*` namespace
+
+mika-arch's F2 concern (the namespace lacks issue body basis) is partially valid: the issue body's "worktree management primitives" and "cross-repo dispatch routing" ARE listed under B1 (mika-platform corpus). Resolution: fold these into `concept:cross-repo:*` (they're cross-repo-flavor concepts) rather than introducing a third namespace. Net effect: `concept:platform:*` removed; B1 list above incorporates `worktree-management` and `dispatch-routing`. Two namespaces total: `concept:cross-repo:*`, `concept:infra:*`.
+
+### F3 (BLOCKING) — Acceptance criteria align with issue body, no fallback floor
+
+Removing the ≥10% silent fallback floor. Acceptance criteria match issue body verbatim:
+- mika-arch's mika-platform corpus resolved/attempted reaches **≥70%** (R1, hard target).
+- mika-arch's mika-cloud corpus resolved/attempted reaches **≥60%** (R2, hard target).
+- Primary mika corpus rate within ±2% of pre-fix baseline (R5).
+
+If first deploy doesn't reach these targets, the PR is ITERATE (add more concepts, refine matching), not merged-with-lower-bar. Per `feedback_bypass_spec_with_judgment.md`, plan cannot silently override issue body acceptance.
+
+### F4 (SHARPENING) — mika#927 dependency named
+
+**Sequencing constraint:** mika#928's acceptance criteria require fair per-corpus measurement. Without mika#927's per-corpus fairness fix, the secondary corpora's resolved/attempted rates are confounded by Stage-2 budget starvation. **Measurement of R1/R2 must occur after mika#927 lands.** /ce:work for mika#928 may begin in parallel (the code surfaces are orthogonal: `domain_builder.rs` vs `entity_resolver.rs`), but the post-deploy verification step that measures match rates must wait until mika#927 is also deployed.
+
+Both tickets ship under milestone#19; sequence is: mika#927 merges → deploy → mika#928 merges → deploy → verify R1/R2 against post-fairness-fix corpus state.
+
+### F5 (SHARPENING) — Concept-match fixture
+
+Test scenarios extended with explicit concept-match assertions (not just aggregate rates):
+
+| Category | Scenario |
+|---|---|
+| Happy path (concept-match) | Run subject extraction against `mika-platform/docs/solutions/cross-repo-patterns/<sample>.md`. Assert at least one extracted subject matches a `concept:cross-repo:*` entity from the new registry via Stage-1 exact match. |
+| Happy path (concept-match) | Run subject extraction against a mika-cloud Helm chart README or Helm values doc. Assert at least one extracted subject matches a `concept:infra:helm-*` or `concept:infra:kubernetes-*` entity via Stage-1 exact match. |
+
+These verify the end-to-end path (extraction → matching → domain graph hit) for each new namespace, distinct from aggregate-rate measurement.
