@@ -84,6 +84,8 @@ Before running the pipeline, set up an isolated worktree:
    ```
    If a GitHub issue was referenced, include `Closes #<number>` in the PR body.
 
+   **Plan-doc citation (MANDATORY):** Before composing the PR body, run `git diff --name-only main...HEAD | grep '^docs/plans/.*\.md$'`. For each matching path, include a line in the PR body citing the literal path — e.g. `Plan: docs/plans/<file>.md`. The line must contain the exact path so that `grep -E 'docs/plans/[^[:space:]]+\.md'` matches it. Do not substitute prose summaries for the path. This is required by the `plan-doc-check` CI hook.
+
 ## Cleanup
 
 9. Do NOT remove the worktree. Worktrees persist until the PR is merged — needed for CI fixes, review feedback, and acceptance testing. Cleanup happens post-merge.
