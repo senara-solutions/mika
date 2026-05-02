@@ -1,5 +1,5 @@
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -131,6 +131,11 @@ struct OpenAiErrorDetail {
 
 const MAX_RETRIES: u32 = 3;
 
+/// Estimated typical LLM call duration for deadline-aware retry abort.
+const TYPICAL_CALL_DURATION_SECS: u64 = 90;
+/// Buffer added to typical call duration for retry abort decisions.
+const RETRY_BUFFER_SECS: u64 = 30;
+
 /// OpenAI-compatible provider that works with OpenAI, Ollama, vLLM, Groq, etc.
 pub struct OpenAiCompatibleProvider {
     client: reqwest::Client,
@@ -232,8 +237,12 @@ impl OpenAiCompatibleProvider {
         Ok(resp)
     }
 
-    /// Inner implementation of send_message with retry logic.
-    async fn send_message_inner(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+    /// Inner implementation of send_message with retry logic and optional deadline.
+    async fn send_message_inner(
+        &self,
+        request: &LlmRequest,
+        deadline: Option<Instant>,
+    ) -> Result<LlmResponse, LlmError> {
         let openai_request = to_openai_request(request);
 
         info!(
@@ -247,6 +256,23 @@ impl OpenAiCompatibleProvider {
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
+                // Deadline-aware retry abort: if the remaining time before the
+                // agent deadline cannot fit another LLM call attempt, bail out
+                // instead of wasting time on a doomed retry.
+                if let Some(dl) = deadline {
+                    let remaining = dl.saturating_duration_since(Instant::now());
+                    if remaining
+                        < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
+                    {
+                        warn!(
+                            attempt,
+                            remaining_ms = remaining.as_millis() as u64,
+                            "aborting retry chain — remaining deadline insufficient for another attempt"
+                        );
+                        break;
+                    }
+                }
+
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
                 warn!(
                     attempt,
@@ -288,6 +314,14 @@ impl OpenAiCompatibleProvider {
 #[async_trait]
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn send_message(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.send_message_with_deadline(request, None).await
+    }
+
+    async fn send_message_with_deadline(
+        &self,
+        request: &LlmRequest,
+        deadline: Option<Instant>,
+    ) -> Result<LlmResponse, LlmError> {
         let span = info_span!(
             target: "mika::otel",
             "llm_call",
@@ -307,7 +341,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         }
 
         let response = self
-            .send_message_inner(request)
+            .send_message_inner(request, deadline)
             .instrument(span.clone())
             .await?;
 

@@ -196,12 +196,12 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
         LlmOverrideSpec {
             skill_name: "mika-arch-groom-ticket",
             provider: "anthropic",
-            model: "claude-opus-4-7",
+            model: "claude-sonnet-4-6",
         },
         LlmOverrideSpec {
             skill_name: "mika-arch-groom-milestone",
             provider: "anthropic",
-            model: "claude-opus-4-7",
+            model: "claude-sonnet-4-6",
         },
         LlmOverrideSpec {
             skill_name: "mika-arch-second-review",
@@ -476,9 +476,53 @@ pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
         None => return,
     };
 
-    // Check if any overrides already exist (user has customized)
+    // Check if any overrides already exist
     match db.get_skill_overrides(agent_name) {
         Ok(overrides) if !overrides.is_empty() => {
+            // Overrides exist — reconcile LLM overrides that have drifted from
+            // the source spec (e.g., model downgrade from Opus to Sonnet).
+            // This is idempotent: matching rows are no-ops at the DB level.
+            let mut reconciled = 0u32;
+            for llm_ov in spec.llm_overrides {
+                let needs_update = overrides.iter().any(|existing| {
+                    existing.skill_name == llm_ov.skill_name
+                        && (existing.llm_provider.as_deref() != Some(llm_ov.provider)
+                            || existing.llm_model.as_deref() != Some(llm_ov.model))
+                });
+                if needs_update {
+                    if let Err(e) = db.set_skill_llm_override(
+                        agent_name,
+                        llm_ov.skill_name,
+                        llm_ov.provider,
+                        llm_ov.model,
+                    ) {
+                        warn!(
+                            agent = agent_name,
+                            skill = llm_ov.skill_name,
+                            provider = llm_ov.provider,
+                            model = llm_ov.model,
+                            error = %e,
+                            "failed to reconcile LLM override for well-known agent skill"
+                        );
+                    } else {
+                        info!(
+                            agent = agent_name,
+                            skill = llm_ov.skill_name,
+                            provider = llm_ov.provider,
+                            model = llm_ov.model,
+                            "reconciled drifted LLM override for well-known agent skill"
+                        );
+                        reconciled += 1;
+                    }
+                }
+            }
+            if reconciled > 0 {
+                info!(
+                    agent = agent_name,
+                    reconciled_count = reconciled,
+                    "reconciled drifted skill overrides for well-known agent"
+                );
+            }
             return;
         }
         Err(e) => {
@@ -503,7 +547,7 @@ pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
         }
     }
 
-    // Seed per-skill LLM overrides (e.g., mika-arch skills use Opus/Sonnet)
+    // Seed per-skill LLM overrides (e.g., mika-arch skills use Sonnet)
     for llm_ov in spec.llm_overrides {
         if let Err(e) =
             db.set_skill_llm_override(agent_name, llm_ov.skill_name, llm_ov.provider, llm_ov.model)
@@ -1230,13 +1274,13 @@ mod tests {
             "mika-arch-groom-ticket"
         );
         assert_eq!(MIKA_ARCH.llm_overrides[0].provider, "anthropic");
-        assert_eq!(MIKA_ARCH.llm_overrides[0].model, "claude-opus-4-7");
+        assert_eq!(MIKA_ARCH.llm_overrides[0].model, "claude-sonnet-4-6");
         assert_eq!(
             MIKA_ARCH.llm_overrides[1].skill_name,
             "mika-arch-groom-milestone"
         );
         assert_eq!(MIKA_ARCH.llm_overrides[1].provider, "anthropic");
-        assert_eq!(MIKA_ARCH.llm_overrides[1].model, "claude-opus-4-7");
+        assert_eq!(MIKA_ARCH.llm_overrides[1].model, "claude-sonnet-4-6");
         assert_eq!(
             MIKA_ARCH.llm_overrides[2].skill_name,
             "mika-arch-second-review"
@@ -1327,14 +1371,14 @@ mod tests {
             .find(|o| o.skill_name == "mika-arch-groom-ticket")
             .expect("groom-ticket override should exist");
         assert_eq!(groom.llm_provider.as_deref(), Some("anthropic"));
-        assert_eq!(groom.llm_model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(groom.llm_model.as_deref(), Some("claude-sonnet-4-6"));
 
         let milestone = overrides
             .iter()
             .find(|o| o.skill_name == "mika-arch-groom-milestone")
             .expect("groom-milestone override should exist");
         assert_eq!(milestone.llm_provider.as_deref(), Some("anthropic"));
-        assert_eq!(milestone.llm_model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(milestone.llm_model.as_deref(), Some("claude-sonnet-4-6"));
 
         let review = overrides
             .iter()
@@ -1342,6 +1386,81 @@ mod tests {
             .expect("second-review override should exist");
         assert_eq!(review.llm_provider.as_deref(), Some("anthropic"));
         assert_eq!(review.llm_model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_seed_skill_overrides_reconciles_drifted_llm_override() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.register_agent("mika-arch", "Architect", "🏛").unwrap();
+
+        // Simulate a stale DB state: all three skills on opus (the pre-fix drift)
+        db.set_skill_llm_override(
+            "mika-arch",
+            "mika-arch-groom-ticket",
+            "anthropic",
+            "claude-opus-4-7",
+        )
+        .unwrap();
+        db.set_skill_llm_override(
+            "mika-arch",
+            "mika-arch-groom-milestone",
+            "anthropic",
+            "claude-opus-4-7",
+        )
+        .unwrap();
+        db.set_skill_llm_override(
+            "mika-arch",
+            "mika-arch-second-review",
+            "anthropic",
+            "claude-opus-4-7",
+        )
+        .unwrap();
+
+        // Overrides exist, so this hits the reconciliation path
+        seed_well_known_skill_overrides(&mut db, "mika-arch");
+
+        let overrides = db.get_skill_overrides("mika-arch").unwrap();
+        assert_eq!(overrides.len(), 3);
+
+        // All three should now match the source spec (sonnet for all)
+        let groom = overrides
+            .iter()
+            .find(|o| o.skill_name == "mika-arch-groom-ticket")
+            .unwrap();
+        assert_eq!(groom.llm_model.as_deref(), Some("claude-sonnet-4-6"));
+
+        let milestone = overrides
+            .iter()
+            .find(|o| o.skill_name == "mika-arch-groom-milestone")
+            .unwrap();
+        assert_eq!(milestone.llm_model.as_deref(), Some("claude-sonnet-4-6"));
+
+        let review = overrides
+            .iter()
+            .find(|o| o.skill_name == "mika-arch-second-review")
+            .unwrap();
+        assert_eq!(review.llm_model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_seed_skill_overrides_reconciliation_is_idempotent() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.register_agent("mika-arch", "Architect", "🏛").unwrap();
+
+        // First seed — fresh
+        seed_well_known_skill_overrides(&mut db, "mika-arch");
+
+        // Second seed — should be a no-op (overrides match source)
+        seed_well_known_skill_overrides(&mut db, "mika-arch");
+
+        let overrides = db.get_skill_overrides("mika-arch").unwrap();
+        assert_eq!(overrides.len(), 3);
+
+        let groom = overrides
+            .iter()
+            .find(|o| o.skill_name == "mika-arch-groom-ticket")
+            .unwrap();
+        assert_eq!(groom.llm_model.as_deref(), Some("claude-sonnet-4-6"));
     }
 
     #[test]
