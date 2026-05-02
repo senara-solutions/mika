@@ -43,6 +43,7 @@ pub const APPROVED_ENTITY_TYPES: &[&str] = &[
     "solution_path",
     "failure_mode",
     "pattern",
+    "concept",
 ];
 
 /// Approved relationship types with from/to type constraints.
@@ -88,6 +89,7 @@ pub const APPROVED_RELATIONSHIP_TYPES: &[RelationshipConstraint] = &[
             "solution_path",
             "failure_mode",
             "pattern",
+            "concept",
         ],
         to_types: &["agent"],
     },

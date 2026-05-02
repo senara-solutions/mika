@@ -11,7 +11,7 @@
 //!
 //! ## Resolution Pipeline
 //!
-//! For each subject entity with a well-known type (skill, tool, agent, problem_type):
+//! For each subject entity with a well-known type (skill, tool, agent, problem_type, concept):
 //!
 //! 1. **Exact match:** Case-insensitive match against `kg_entities.entity_key`.
 //!    If match found and extraction confidence > 0.9, resolve immediately.
@@ -893,7 +893,7 @@ impl SubjectEntityResolver {
                      LEFT JOIN kg_resolutions_log r
                          ON r.subject_entity_id = e.id AND r.agent_id = ?
                      WHERE e.docs_root_hash IN ({})
-                       AND e.type IN ('skill', 'tool', 'agent', 'problem_type')
+                       AND e.type IN ('skill', 'tool', 'agent', 'problem_type', 'concept')
                        AND (
                          r.id IS NULL
                          OR r.source_extraction_trace_id != (
@@ -1029,7 +1029,7 @@ impl SubjectEntityResolver {
                      LEFT JOIN kg_resolutions_log r
                          ON r.subject_entity_id = e.id AND r.agent_id = ?1
                      WHERE e.docs_root_hash = ?2
-                       AND e.type IN ('skill', 'tool', 'agent', 'problem_type')
+                       AND e.type IN ('skill', 'tool', 'agent', 'problem_type', 'concept')
                        AND (
                          r.id IS NULL
                          OR r.source_extraction_trace_id != (
@@ -1072,7 +1072,7 @@ impl SubjectEntityResolver {
                      LEFT JOIN kg_resolutions_log r
                          ON r.subject_entity_id = e.id AND r.agent_id = ?1
                      WHERE e.docs_root_hash = ?2
-                       AND e.type IN ('skill', 'tool', 'agent', 'problem_type')
+                       AND e.type IN ('skill', 'tool', 'agent', 'problem_type', 'concept')
                        AND (
                          r.id IS NULL
                          OR r.source_extraction_trace_id != (
@@ -1690,6 +1690,7 @@ mod tests {
         assert!(KG_DOMAIN_ENTITY_TYPES.contains(&"tool"));
         assert!(KG_DOMAIN_ENTITY_TYPES.contains(&"agent"));
         assert!(KG_DOMAIN_ENTITY_TYPES.contains(&"problem_type"));
+        assert!(KG_DOMAIN_ENTITY_TYPES.contains(&"concept"));
     }
 
     #[test]

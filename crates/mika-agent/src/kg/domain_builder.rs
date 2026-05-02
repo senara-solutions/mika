@@ -1,18 +1,19 @@
 //! # Domain Graph Builder
 //!
 //! Deterministically populates [`kg_entities`] and [`kg_relationships`] by
-//! enumerating four authoritative sources at server startup:
+//! enumerating five authoritative sources at server startup:
 //!
 //! - [`SkillRegistry`](crate::skills::SkillRegistry) — skill manifests
 //! - [`ToolRegistry`](crate::tools::ToolRegistry) — builtin + skill-owned tools
 //! - [`McpManager`](crate::mcp::McpManager) — MCP server tools (as-of-boot)
 //! - Agent configs — discovered agent names and metadata
+//! - Concept seeds — cross-repo workflow and infrastructure concepts (hardcoded)
 //!
 //! ## Sole-Writer Contract
 //!
 //! This module is the **sole writer** of entity_keys in the `skill:*`, `tool:*`,
-//! `agent:*`, and `problem_type:*` namespaces. No other code path writes these
-//! entity_keys. See `docs/solutions/logic-errors/a2a-dual-write-duplicate-rows.md`.
+//! `agent:*`, `problem_type:*`, and `concept:*` namespaces. No other code path
+//! writes these entity_keys. See `docs/solutions/logic-errors/a2a-dual-write-duplicate-rows.md`.
 //!
 //! ## Invariants
 //!
@@ -46,6 +47,104 @@ const PROBLEM_TYPE_SEEDS: &[&str] = &[
     "duplicate_pr",
     "stale_uuid",
     "fabrication",
+];
+
+/// Seed list for cross-repo workflow concept entities.
+///
+/// These cover mika-platform corpus concepts that span multiple repos:
+/// companion-PR pattern, worktree management, dispatch routing, etc.
+/// Derived from mika#928 ticket body § "B1 — mika-platform domain graph coverage".
+///
+/// Entity keys use hierarchical naming: `concept:cross-repo:<name>`.
+/// The `type` column is `concept`; the `name` column includes the subcategory.
+const CONCEPT_CROSS_REPO_SEEDS: &[(&str, &str)] = &[
+    (
+        "cross-repo:companion-pr-pattern",
+        "Cross-repo PR coordination pattern requiring companion PRs across repos",
+    ),
+    (
+        "cross-repo:branch-name-immutable-invariant",
+        "Branch name immutability invariant enforced across worktrees and dispatch",
+    ),
+    (
+        "cross-repo:plan-doc-on-branch-contract",
+        "Contract for groomed plan documents committed on feature branches",
+    ),
+    (
+        "cross-repo:handoff-doc-shape",
+        "Operator-side coordination document shape for cross-repo handoffs",
+    ),
+    (
+        "cross-repo:coordination-branch-on-origin",
+        "Coordination branch convention for cross-repo feature work",
+    ),
+    (
+        "cross-repo:worktree-management",
+        "Git worktree lifecycle management for isolated parallel development",
+    ),
+    (
+        "cross-repo:dispatch-routing",
+        "Cross-repo dispatch routing from meta-repo to target repo pipelines",
+    ),
+];
+
+/// Seed list for infrastructure concept entities.
+///
+/// These cover mika-cloud corpus concepts: Helm charts, Kubernetes resources,
+/// provisioning flows, and cloud topology primitives.
+/// Derived from mika#928 ticket body § "B2 — mika-cloud domain graph coverage".
+///
+/// Entity keys use hierarchical naming: `concept:infra:<name>`.
+const CONCEPT_INFRA_SEEDS: &[(&str, &str)] = &[
+    (
+        "infra:helm-chart",
+        "Helm chart package for Kubernetes deployment",
+    ),
+    (
+        "infra:helm-release",
+        "Helm release instance deployed to a cluster",
+    ),
+    (
+        "infra:helm-values",
+        "Helm values configuration for chart customization",
+    ),
+    (
+        "infra:helm-templates",
+        "Helm template files generating Kubernetes manifests",
+    ),
+    (
+        "infra:kubernetes-deployment",
+        "Kubernetes Deployment resource for stateless workloads",
+    ),
+    (
+        "infra:kubernetes-statefulset",
+        "Kubernetes StatefulSet resource for stateful workloads",
+    ),
+    (
+        "infra:kubernetes-service",
+        "Kubernetes Service resource for network access to pods",
+    ),
+    (
+        "infra:kubernetes-configmap",
+        "Kubernetes ConfigMap resource for configuration data",
+    ),
+    (
+        "infra:kubernetes-secret",
+        "Kubernetes Secret resource for sensitive data",
+    ),
+    (
+        "infra:provisioning-flow",
+        "Provisioning scripts and flows for cluster and agent setup",
+    ),
+    (
+        "infra:service-discovery-customer-id",
+        "Service discovery convention using mika-{customer_id} naming",
+    ),
+    (
+        "infra:aws-eks",
+        "AWS Elastic Kubernetes Service cluster topology",
+    ),
+    ("infra:gcp-gke", "Google Cloud GKE cluster topology"),
 ];
 
 /// Domain relationship types managed by this builder.
@@ -579,6 +678,37 @@ impl<'a> DomainGraphBuilder<'a> {
             entity_keys.insert(key);
         }
 
+        // --- Concept seeds (cross-repo workflow + infrastructure) ---
+        for (name, description) in CONCEPT_CROSS_REPO_SEEDS {
+            let key = format_entity_key("concept", name);
+            let props = json!({
+                "description": description,
+                "category": "cross-repo",
+            });
+            entities.push(DesiredEntity {
+                entity_key: key.clone(),
+                entity_type: "concept".to_string(),
+                name: name.to_string(),
+                properties_json: Some(props.to_string()),
+            });
+            entity_keys.insert(key);
+        }
+
+        for (name, description) in CONCEPT_INFRA_SEEDS {
+            let key = format_entity_key("concept", name);
+            let props = json!({
+                "description": description,
+                "category": "infra",
+            });
+            entities.push(DesiredEntity {
+                entity_key: key.clone(),
+                entity_type: "concept".to_string(),
+                name: name.to_string(),
+                properties_json: Some(props.to_string()),
+            });
+            entity_keys.insert(key);
+        }
+
         DesiredState {
             entities,
             edges,
@@ -715,8 +845,8 @@ mod tests {
         let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
         let state = builder.enumerate_sources();
 
-        // 2 skills + 2 tools + 0 agents + 5 problem_types = 9
-        assert_eq!(state.entities.len(), 9);
+        // 2 skills + 2 tools + 0 agents + 5 problem_types + 20 concepts = 29
+        assert_eq!(state.entities.len(), 29);
 
         // 1 DEPENDS_ON + 2 PROVIDES = 3
         assert_eq!(state.edges.len(), 3);
@@ -781,10 +911,14 @@ mod tests {
         let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
         let state = builder.enumerate_sources();
 
-        // Only problem_type seeds
-        assert_eq!(state.entities.len(), 5);
+        // 5 problem_type seeds + 20 concept seeds = 25
+        assert_eq!(state.entities.len(), 25);
         for e in &state.entities {
-            assert_eq!(e.entity_type, "problem_type");
+            assert!(
+                e.entity_type == "problem_type" || e.entity_type == "concept",
+                "unexpected entity type: {}",
+                e.entity_type
+            );
         }
     }
 
@@ -890,8 +1024,8 @@ mod tests {
         let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &agents);
         let stats = builder.rebuild().await.expect("rebuild should succeed");
 
-        // 1 skill + 2 tools + 1 agent + 5 problem_types = 9
-        assert_eq!(stats.entities_added, 9);
+        // 1 skill + 2 tools + 1 agent + 5 problem_types + 20 concepts = 29
+        assert_eq!(stats.entities_added, 29);
         assert_eq!(stats.entities_updated, 0);
         assert_eq!(stats.entities_removed, 0);
         assert_eq!(stats.edges_provides, 1); // alpha -> alpha_tool
@@ -1108,5 +1242,191 @@ mod tests {
             .expect("get rowid after");
 
         assert_eq!(rowid_before, rowid_after);
+    }
+
+    #[test]
+    fn enumerate_concept_cross_repo_entities() {
+        let db = make_async_db();
+        let registry = SkillRegistry::empty();
+        let tool_registry = make_tool_registry(&[]);
+
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        let state = builder.enumerate_sources();
+
+        let cross_repo: Vec<_> = state
+            .entities
+            .iter()
+            .filter(|e| {
+                e.entity_type == "concept" && e.entity_key.starts_with("concept:cross-repo:")
+            })
+            .collect();
+
+        // 7 cross-repo concept seeds per plan F1
+        assert_eq!(cross_repo.len(), 7);
+
+        // Verify specific entity keys from the plan's v1 list
+        let keys: HashSet<_> = cross_repo.iter().map(|e| e.entity_key.as_str()).collect();
+        assert!(keys.contains("concept:cross-repo:companion-pr-pattern"));
+        assert!(keys.contains("concept:cross-repo:branch-name-immutable-invariant"));
+        assert!(keys.contains("concept:cross-repo:plan-doc-on-branch-contract"));
+        assert!(keys.contains("concept:cross-repo:handoff-doc-shape"));
+        assert!(keys.contains("concept:cross-repo:coordination-branch-on-origin"));
+        assert!(keys.contains("concept:cross-repo:worktree-management"));
+        assert!(keys.contains("concept:cross-repo:dispatch-routing"));
+
+        // Verify properties contain category and description
+        for entity in &cross_repo {
+            let props: serde_json::Value =
+                serde_json::from_str(entity.properties_json.as_ref().unwrap()).unwrap();
+            assert_eq!(props["category"], "cross-repo");
+            assert!(props["description"].as_str().unwrap().len() > 10);
+        }
+    }
+
+    #[test]
+    fn enumerate_concept_infra_entities() {
+        let db = make_async_db();
+        let registry = SkillRegistry::empty();
+        let tool_registry = make_tool_registry(&[]);
+
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        let state = builder.enumerate_sources();
+
+        let infra: Vec<_> = state
+            .entities
+            .iter()
+            .filter(|e| e.entity_type == "concept" && e.entity_key.starts_with("concept:infra:"))
+            .collect();
+
+        // 13 infra concept seeds per plan F1
+        assert_eq!(infra.len(), 13);
+
+        // Verify specific entity keys
+        let keys: HashSet<_> = infra.iter().map(|e| e.entity_key.as_str()).collect();
+        assert!(keys.contains("concept:infra:helm-chart"));
+        assert!(keys.contains("concept:infra:helm-release"));
+        assert!(keys.contains("concept:infra:helm-values"));
+        assert!(keys.contains("concept:infra:helm-templates"));
+        assert!(keys.contains("concept:infra:kubernetes-deployment"));
+        assert!(keys.contains("concept:infra:kubernetes-statefulset"));
+        assert!(keys.contains("concept:infra:kubernetes-service"));
+        assert!(keys.contains("concept:infra:kubernetes-configmap"));
+        assert!(keys.contains("concept:infra:kubernetes-secret"));
+        assert!(keys.contains("concept:infra:provisioning-flow"));
+        assert!(keys.contains("concept:infra:service-discovery-customer-id"));
+        assert!(keys.contains("concept:infra:aws-eks"));
+        assert!(keys.contains("concept:infra:gcp-gke"));
+
+        // Verify properties contain category
+        for entity in &infra {
+            let props: serde_json::Value =
+                serde_json::from_str(entity.properties_json.as_ref().unwrap()).unwrap();
+            assert_eq!(props["category"], "infra");
+        }
+    }
+
+    #[test]
+    fn concept_entity_keys_roundtrip_through_format() {
+        // Verify hierarchical names with colons work correctly with format_entity_key
+        let key = format_entity_key("concept", "cross-repo:companion-pr-pattern");
+        assert_eq!(key, "concept:cross-repo:companion-pr-pattern");
+
+        let key = format_entity_key("concept", "infra:aws-eks");
+        assert_eq!(key, "concept:infra:aws-eks");
+
+        // Verify the hyphenated names work
+        let key = format_entity_key("concept", "infra:service-discovery-customer-id");
+        assert_eq!(key, "concept:infra:service-discovery-customer-id");
+    }
+
+    #[tokio::test]
+    async fn rebuild_concept_entities_persisted() {
+        let db = make_async_db();
+        let registry = SkillRegistry::empty();
+        let tool_registry = make_tool_registry(&[]);
+
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        builder.rebuild().await.expect("rebuild should succeed");
+
+        // Verify concept entities are in the DB
+        let cross_repo_count: usize = db
+            .with_db(|db| {
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM kg_entities WHERE entity_key LIKE 'concept:cross-repo:%'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+            .expect("count cross-repo");
+        assert_eq!(cross_repo_count, 7);
+
+        let infra_count: usize = db
+            .with_db(|db| {
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM kg_entities WHERE entity_key LIKE 'concept:infra:%'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+            .expect("count infra");
+        assert_eq!(infra_count, 13);
+
+        // Verify the CHECK constraint held (entity_key = type || ':' || name)
+        let check_violations: usize = db
+            .with_db(|db| {
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM kg_entities WHERE type = 'concept' AND entity_key != type || ':' || name",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+            .expect("check violations");
+        assert_eq!(check_violations, 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_concept_entities_idempotent() {
+        let db = make_async_db();
+        let registry = SkillRegistry::empty();
+        let tool_registry = make_tool_registry(&[]);
+
+        // First rebuild
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        let stats1 = builder.rebuild().await.expect("first rebuild");
+        let concept_added = stats1.entities_added;
+        assert!(
+            concept_added >= 20,
+            "should add at least 20 concept entities"
+        );
+
+        // Second rebuild — no new entities
+        let builder2 = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        let stats2 = builder2.rebuild().await.expect("second rebuild");
+        assert_eq!(stats2.entities_added, 0);
+        assert_eq!(stats2.entities_removed, 0);
+
+        // Count should be stable
+        let total_concepts: usize = db
+            .with_db(|db| {
+                db.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM kg_entities WHERE type = 'concept'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .await
+            .expect("count concepts");
+        assert_eq!(total_concepts, 20);
     }
 }

@@ -183,7 +183,7 @@ pub const KG_CHUNK_SOURCE_TYPE: &str = "kg_chunk";
 /// Subject-layer entities (per-agent, LLM-extracted) may use these types when
 /// the mention resolves to a domain entity, or use subject-only types like
 /// `failure_mode`, `solution_path`, etc.
-pub const KG_DOMAIN_ENTITY_TYPES: &[&str] = &["skill", "tool", "agent", "problem_type"];
+pub const KG_DOMAIN_ENTITY_TYPES: &[&str] = &["skill", "tool", "agent", "problem_type", "concept"];
 
 /// Format an entity key from type and name.
 ///
