@@ -926,13 +926,18 @@ impl SubjectEntityResolver {
     /// For single-corpus agents this degenerates to one
     /// `get_pending_entities_for_corpus` call.
     async fn get_pending_entities(&self, total_budget: u32) -> Result<Vec<PendingEntity>> {
-        if self.docs_root_hashes.is_empty() || total_budget == 0 {
+        if self.docs_root_hashes.is_empty() {
             return Ok(Vec::new());
         }
 
+        // When budget is 0, Stage-2 LLM calls are blocked but Stage-1 exact
+        // matches still proceed for free (documented invariant in CLAUDE.md).
+        // Use a minimal selection limit so we don't load the entire backlog.
+        let effective_budget = if total_budget == 0 { 50 } else { total_budget };
+
         // Single-corpus fast path — skip allocation overhead.
         if self.docs_root_hashes.len() == 1 {
-            let limit = (total_budget as usize * 2).max(50) as u32;
+            let limit = (effective_budget as usize * 2).max(50) as u32;
             return self
                 .get_pending_entities_for_corpus(&self.docs_root_hashes[0], limit)
                 .await;
@@ -946,7 +951,7 @@ impl SubjectEntityResolver {
         }
 
         let n = corpus_counts.len() as u32;
-        let budget = total_budget;
+        let budget = effective_budget;
 
         // 2. First pass: assign each corpus min(pending_count, budget / N).
         let base_share = budget / n;
