@@ -63,6 +63,15 @@ struct BashToolInput {
 /// `tier1.py` is the canonical source; this Rust module mirrors for defense-in-depth.
 /// If the pattern set grows beyond 10 entries OR Python and Rust drift, escalate
 /// to build-time codegen.
+///
+/// ## Branch 5 divergence (mika#938)
+///
+/// Branch 5 (backtick/`$(` rejection) now uses quote-aware scanning in this Rust
+/// module via `contains_unquoted_metacharacter()`, while `tier1.py` retains blanket
+/// `String::contains` rejection. This is intentional asymmetry at N=1 divergence —
+/// codegen escalation threshold NOT crossed. Companion fix:
+/// `fix(security): quote-aware metacharacter rejection in tier1.py to match
+/// permission_pre_classifier.rs (mika#938 follow-up)`
 const TIER3_PATTERNS: &[&str] = &[
     "rm -rf",
     "rm -fr",
@@ -85,7 +94,9 @@ const TIER3_PATTERNS: &[&str] = &[
 /// 2. Message doesn't start with `[claude-pilot] ` → `None`
 /// 3. JSON parse fails → `None` (malformed; existing error path applies)
 /// 4. `tool_name != "Bash"` → `None` (only Bash dispatch is pre-classified)
-/// 5. Command contains `$(` or backtick → `None` (command substitution; fall through)
+/// 5. Command contains `$(` or backtick OUTSIDE quoted regions → `None` (would trigger
+///    shell command substitution on execution; literal occurrences inside `"..."` or
+///    `'...'` are allowed — they're passed as message content to `mika ask`)
 /// 6. Command matches intra-platform dispatch AND peer is known AND no TIER 3 → `Some(Allow)`
 /// 7. Otherwise → `None`
 pub fn pre_classify_pilot_event(user_message: &str, agent_id: &str) -> Option<PermissionAction> {
@@ -107,9 +118,11 @@ pub fn pre_classify_pilot_event(user_message: &str, agent_id: &str) -> Option<Pe
 
     let command = &event.tool_input.command;
 
-    // Branch 5: Reject commands with command substitution — these are never
-    // present in legitimate `mika ask` invocations and could hide arbitrary execution.
-    if command.contains("$(") || command.contains('`') {
+    // Branch 5: Reject commands with command substitution characters OUTSIDE quoted
+    // regions. Backtick/`$(` inside `"..."` or `'...'` are literal message content
+    // (e.g., markdown briefs with inline code). Only unquoted occurrences would trigger
+    // shell expansion on actual execution. See mika#938 for the canary-v7 evidence.
+    if contains_unquoted_metacharacter(command) {
         return None;
     }
 
@@ -135,6 +148,70 @@ pub fn pre_classify_pilot_event(user_message: &str, agent_id: &str) -> Option<Pe
 /// Check if a command contains any TIER 3 dangerous pattern.
 fn contains_tier3_pattern(command: &str) -> bool {
     TIER3_PATTERNS.iter().any(|p| command.contains(p))
+}
+
+/// Check if a command contains `$(` or backtick outside quoted regions.
+///
+/// Walks the command bytes left-to-right, tracking quote state (none / single / double).
+/// Returns `true` on first occurrence of `$(` or `` ` `` while in no-quote state.
+/// Per Decision 1 Option C (mika#938): metacharacters inside either single or double
+/// quoted regions are treated as literal (allowed).
+///
+/// Escape handling (mika#938 F1): `\"` inside double-quoted regions does NOT toggle quote
+/// state — the scanner advances past the escape pair atomically. Inside single-quoted
+/// regions, backslash is NOT an escape character (POSIX semantics): `'\''` is the literal
+/// 2-char string `\` followed by the closing quote. The scanner mirrors bash here so that
+/// `'foo\' \`evil\`` correctly closes the single quote at the second `'` and detects the
+/// unquoted backtick that follows.
+///
+/// Unterminated quotes: if a quote opens and never closes, the scanner treats all remaining
+/// bytes as inside the quote (conservative — falls through to LLM on malformed input).
+fn contains_unquoted_metacharacter(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    // None = not in a quote, Some(b) = inside a quote opened by byte b
+    let mut quote_state: Option<u8> = None;
+
+    while i < len {
+        match quote_state {
+            Some(q) => {
+                // Inside a quoted region — advance past escapes (double-quoted only)
+                // and look for close. POSIX: backslash has no special meaning inside
+                // single-quoted strings, so `\` + `'` closes the quote.
+                if q == b'"' && bytes[i] == b'\\' && i + 1 < len {
+                    // Escaped character inside double-quoted region — skip the pair atomically
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    // Closing quote — return to unquoted state
+                    quote_state = None;
+                }
+                i += 1;
+            }
+            None => {
+                // Unquoted region — check for metacharacters or quote openers
+                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                    quote_state = Some(bytes[i]);
+                    i += 1;
+                    continue;
+                }
+                // Check for backtick
+                if bytes[i] == b'`' {
+                    return true;
+                }
+                // Check for `$(`
+                if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    false
 }
 
 /// Classify whether a command (possibly compound) is a pure intra-platform agent dispatch.
@@ -581,15 +658,25 @@ mod tests {
     // === Security tests ===
 
     #[test]
-    fn test_command_substitution_dollar_paren_rejected() {
+    fn test_command_substitution_dollar_paren_inside_quotes_allowed() {
+        // mika#938: `$(` inside quoted message region is literal content — allowed.
+        // (Previously blanket-rejected; now quote-aware per Decision 1 Option C.)
         let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch \"$(cat /etc/passwd)\"""#);
-        assert_eq!(pre_classify_pilot_event(&msg, "mika-relay"), None);
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
     }
 
     #[test]
-    fn test_command_substitution_backtick_rejected() {
+    fn test_command_substitution_backtick_inside_quotes_allowed() {
+        // mika#938: backtick inside quoted message region is literal content — allowed.
+        // (Previously blanket-rejected; now quote-aware per Decision 1 Option C.)
         let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch \"`whoami`\"""#);
-        assert_eq!(pre_classify_pilot_event(&msg, "mika-relay"), None);
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
     }
 
     #[test]
@@ -754,5 +841,234 @@ mod tests {
     #[test]
     fn test_unsafe_companion_arbitrary() {
         assert!(!is_safe_companion_sub_command("some-binary --flag"));
+    }
+
+    // === mika#938: Quote-aware metacharacter tests ===
+
+    // --- contains_unquoted_metacharacter unit tests ---
+
+    #[test]
+    fn test_unquoted_meta_backtick_outside_quotes() {
+        assert!(contains_unquoted_metacharacter("mika ask `whoami`"));
+    }
+
+    #[test]
+    fn test_unquoted_meta_dollar_paren_outside_quotes() {
+        assert!(contains_unquoted_metacharacter(
+            "mika ask $(cat /etc/passwd)"
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_backtick_inside_double_quotes() {
+        assert!(!contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch "brief with `inline code`""#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_dollar_paren_inside_single_quotes() {
+        assert!(!contains_unquoted_metacharacter(
+            "mika ask --agent mika-arch '$(literal) text'"
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_dollar_paren_inside_double_quotes() {
+        assert!(!contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch "$(literal) text""#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_escaped_quote_inside_double_quotes() {
+        // F1 mandatory: `\"` does not toggle quote state — backtick remains inside
+        assert!(!contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch "has \"escaped\" and `backtick`""#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_empty_string() {
+        assert!(!contains_unquoted_metacharacter(""));
+    }
+
+    #[test]
+    fn test_unquoted_meta_no_metacharacters() {
+        assert!(!contains_unquoted_metacharacter(
+            "mika ask --agent mika-arch \"hello\""
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_unterminated_quote_backtick_inside() {
+        // Unterminated quote: scanner treats all remaining bytes as inside the quote
+        // Backtick after the opening quote is inside → not detected → returns false
+        assert!(!contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch "unterminated with `backtick"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_mixed_quotes() {
+        // Single-quoted region containing a literal double-quote and backtick
+        assert!(!contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch 'a"b`c'"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_backslash_in_single_quotes_does_not_escape_close() {
+        // POSIX: backslash is NOT an escape character inside single-quoted regions.
+        // `'foo\'` closes at the second `'` (the `\` is literal). The backtick that
+        // follows is therefore unquoted and must be detected. Regression for the
+        // mika#938 review finding (3-way reviewer agreement).
+        assert!(contains_unquoted_metacharacter(
+            r#"mika ask 'foo\' `whoami`"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_backslash_in_single_quotes_dollar_paren() {
+        // Same divergence — but with `$(...)` instead of backtick.
+        assert!(contains_unquoted_metacharacter(
+            r#"mika ask 'foo\' $(curl evil)"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_backslash_inside_double_quotes_still_escapes() {
+        // Sanity check that the double-quoted path still treats `\"` as an escape.
+        // Without escape handling, the inner `\"` would close the double-quoted region
+        // and the trailing backtick would be detected as unquoted (false positive).
+        assert!(!contains_unquoted_metacharacter(
+            r#"mika ask "has \"escaped\" `safe`""#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_backtick_after_closing_quote() {
+        // Backtick appears AFTER the quoted region closes → unquoted → detected
+        assert!(contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch "msg" `rm -rf /`"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_dollar_paren_after_closing_quote() {
+        assert!(contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch "msg" $(rm -rf /)"#
+        ));
+    }
+
+    // --- Integration tests: pre_classify_pilot_event with quote-aware metacharacter handling ---
+
+    #[test]
+    fn test_938_markdown_brief_with_backticks_in_double_quotes() {
+        // The canonical /mika-ask-arch form from canary v7 that was denied
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-arch --format json --verbose \"Brief with `inline code` and `docs/plans/file.md`\"""#,
+        );
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn test_938_dollar_paren_in_single_quoted_message() {
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-arch --format json --verbose '$(literal) text'""#,
+        );
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn test_938_combined_flags_and_session_id_with_backtick() {
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-arch --format json --verbose --session-id abc-123 \"Second-pass review with `session_id` reference\"""#,
+        );
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn test_938_mika_dev_peer_with_backtick_in_message() {
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-dev --format json --verbose \"Brief with `code`\"""#,
+        );
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn test_938_mika_qa_peer_with_backtick_in_message() {
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-qa --format json --verbose \"Brief with `code`\"""#,
+        );
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn test_938_escaped_inner_quotes_with_backtick() {
+        // F1 mandatory fixture: escaped quotes inside double-quoted region
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-arch \"has \\\"escaped\\\" and `backtick`\"""#,
+        );
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn test_938_empty_message() {
+        let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch \"\"""#);
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn test_938_backtick_outside_quotes_rejected() {
+        // Backtick OUTSIDE the quoted message — would expand on shell execution
+        let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch \"msg\" `rm -rf /`""#);
+        assert_eq!(pre_classify_pilot_event(&msg, "mika-relay"), None);
+    }
+
+    #[test]
+    fn test_938_dollar_paren_outside_quotes_rejected() {
+        let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch \"msg\" $(rm -rf /)""#);
+        assert_eq!(pre_classify_pilot_event(&msg, "mika-relay"), None);
+    }
+
+    #[test]
+    fn test_938_tier3_inside_quoted_message_still_rejected() {
+        // TIER 3 check at line 117 still triggers on `rm -rf` substring
+        // regardless of quoting (per Decision 2: TIER 3 keeps blanket semantics)
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-arch \"msg with rm -rf / inside quotes\"""#,
+        );
+        assert_eq!(pre_classify_pilot_event(&msg, "mika-relay"), None);
+    }
+
+    #[test]
+    fn test_938_compound_with_backtick_injection() {
+        // Negative: backtick-wrapped command appended after the dispatch
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-arch --format json --verbose \"msg\" && `rm -rf /`""#,
+        );
+        assert_eq!(pre_classify_pilot_event(&msg, "mika-relay"), None);
     }
 }

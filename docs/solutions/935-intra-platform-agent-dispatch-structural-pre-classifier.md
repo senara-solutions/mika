@@ -21,7 +21,7 @@ A structural pre-classifier in Rust (`crates/mika-agent/src/server/permission_pr
 
 1. **Allow-list over deny-list for compound commands.** Initial implementation used `any()` (allow if any sub-command matches). Review identified that this allows arbitrary sub-commands alongside a valid dispatch. Fixed to require ALL sub-commands to be recognized safe (either a valid dispatch or a known-safe prefix like `cd`/`pwd`).
 
-2. **Command substitution rejection.** Any command containing `$(` or backticks is immediately rejected — these are never present in legitimate `mika ask` invocations and could hide arbitrary execution.
+2. **Command substitution rejection (quote-aware as of mika#938).** Any command containing `$(` or backticks **outside quoted regions** is rejected — those positions would trigger shell expansion at execution. Literal occurrences inside `"..."` or `'...'` are allowed: legitimate `mika ask` briefs frequently contain backticks (markdown inline code spans) inside the quoted message argument. The original blanket-reject heuristic in PR #937 caused a canary-v7 false-positive on the canonical `/mika-ask-arch` form; mika#938 refined Branch 5 to a quote-aware byte scanner (`contains_unquoted_metacharacter`). POSIX semantics: backslash escapes inside `"..."`, but is literal inside `'...'`.
 
 3. **Safe pipe targets.** Commands piped to safe output formatters (`tail`, `head`, `grep`, `wc`) are allowed. Unknown pipe targets cause fallback to LLM.
 
@@ -32,7 +32,7 @@ A structural pre-classifier in Rust (`crates/mika-agent/src/server/permission_pr
 ### Security Model
 
 - TIER 3 patterns checked on the full command string (catches dangerous patterns even inside quotes)
-- Command substitution ($(), backticks) immediately rejected
+- Command substitution (`$(`, backticks) rejected when **outside quoted regions** (mika#938 quote-aware refinement); literal occurrences inside `"..."` or `'...'` are allowed as message content
 - Compound commands require ALL sub-commands to be on safe list
 - Pipe targets must be from safe output commands list
 - Only fires for `agent_id == "mika-relay"` with `[claude-pilot] ` prefix
@@ -51,6 +51,7 @@ A message like `mika ask --agent mika-arch "explain rm -rf"` will trip the TIER 
 ## References
 
 - Origin issue: mika#935
+- Quote-aware refinement: mika#938 (Branch 5 false-positive on markdown briefs)
 - Architecture doc: `docs/architecture/platform-internal-agent-dispatch.md`
 - Plan: `docs/plans/2026-05-02-003-fix-skills-mika-ask-intra-platform-agent-plan.md`
 - Pre-classifier source: `crates/mika-agent/src/server/permission_pre_classifier.rs`

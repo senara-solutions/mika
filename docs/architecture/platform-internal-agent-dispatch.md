@@ -39,6 +39,7 @@ No prompt edits. No LLM re-tuning. Two-line change.
 ## Safety Invariants
 
 - **TIER 3 patterns always deny.** If the command contains `rm -rf`, `git push --force`, or any other TIER 3 pattern, the pre-classifier falls through to the existing classifier (which also denies).
+- **Unquoted command substitution rejected (mika#938).** Backtick or `$(` **outside** quoted regions causes the pre-classifier to fall through. Literal occurrences inside `"..."` or `'...'` are allowed as message content (markdown briefs frequently include inline-code spans). The scanner mirrors POSIX quote semantics — backslash escapes inside `"..."`, literal inside `'...'`.
 - **Unknown peers fall through.** Only peers in `INTRA_PLATFORM_DISPATCH_PEERS` are structurally allowed. All others go to the LLM classifier.
 - **Only Bash tool calls.** Non-Bash tool permissions (Read, Write, etc.) are not handled by this pre-classifier.
 - **Only mika-relay.** The pre-classifier gates on `agent_id == "mika-relay"` — it has no effect on other agents.
