@@ -157,8 +157,12 @@ fn contains_tier3_pattern(command: &str) -> bool {
 /// Per Decision 1 Option C (mika#938): metacharacters inside either single or double
 /// quoted regions are treated as literal (allowed).
 ///
-/// Escape handling (mika#938 F1): `\"` inside double-quoted and `\'` inside single-quoted
-/// regions do NOT toggle quote state — the scanner advances past the escape pair atomically.
+/// Escape handling (mika#938 F1): `\"` inside double-quoted regions does NOT toggle quote
+/// state — the scanner advances past the escape pair atomically. Inside single-quoted
+/// regions, backslash is NOT an escape character (POSIX semantics): `'\''` is the literal
+/// 2-char string `\` followed by the closing quote. The scanner mirrors bash here so that
+/// `'foo\' \`evil\`` correctly closes the single quote at the second `'` and detects the
+/// unquoted backtick that follows.
 ///
 /// Unterminated quotes: if a quote opens and never closes, the scanner treats all remaining
 /// bytes as inside the quote (conservative — falls through to LLM on malformed input).
@@ -173,9 +177,11 @@ fn contains_unquoted_metacharacter(command: &str) -> bool {
     while i < len {
         match quote_state {
             Some(q) => {
-                // Inside a quoted region — advance past escapes and look for close
-                if bytes[i] == b'\\' && i + 1 < len {
-                    // Escaped character — skip both backslash and the escaped char
+                // Inside a quoted region — advance past escapes (double-quoted only)
+                // and look for close. POSIX: backslash has no special meaning inside
+                // single-quoted strings, so `\` + `'` closes the quote.
+                if q == b'"' && bytes[i] == b'\\' && i + 1 < len {
+                    // Escaped character inside double-quoted region — skip the pair atomically
                     i += 2;
                     continue;
                 }
@@ -908,6 +914,35 @@ mod tests {
         // Single-quoted region containing a literal double-quote and backtick
         assert!(!contains_unquoted_metacharacter(
             r#"mika ask --agent mika-arch 'a"b`c'"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_backslash_in_single_quotes_does_not_escape_close() {
+        // POSIX: backslash is NOT an escape character inside single-quoted regions.
+        // `'foo\'` closes at the second `'` (the `\` is literal). The backtick that
+        // follows is therefore unquoted and must be detected. Regression for the
+        // mika#938 review finding (3-way reviewer agreement).
+        assert!(contains_unquoted_metacharacter(
+            r#"mika ask 'foo\' `whoami`"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_backslash_in_single_quotes_dollar_paren() {
+        // Same divergence — but with `$(...)` instead of backtick.
+        assert!(contains_unquoted_metacharacter(
+            r#"mika ask 'foo\' $(curl evil)"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_backslash_inside_double_quotes_still_escapes() {
+        // Sanity check that the double-quoted path still treats `\"` as an escape.
+        // Without escape handling, the inner `\"` would close the double-quoted region
+        // and the trailing backtick would be detected as unquoted (false positive).
+        assert!(!contains_unquoted_metacharacter(
+            r#"mika ask "has \"escaped\" `safe`""#
         ));
     }
 
