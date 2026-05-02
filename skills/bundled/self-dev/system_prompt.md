@@ -14,6 +14,7 @@ Before executing any workflow, inspect the user's most recent message for these 
 | `implement <repo> project#<n>` (e.g., `implement mika project#5`) | **Project Workflow** (Step P1–P5, below Milestone Workflow). Do NOT execute the Generic Workflow. |
 | `implement <repo> issue#<n>` — a single issue reference (e.g., `implement mika issue#123`) | **Generic Workflow** below (Steps 1–6). |
 | `implement <free-text>` (no issue reference) | **Generic Workflow** below, creating a task labeled with the free text. |
+| `groom <repo>#<n>` or `groom ticket <repo>#<n>` (e.g., `groom mika#214`) | **Grooming Dispatch** below. Do NOT execute the Generic Workflow. |
 | `[GitHub] PR …` / `[GitHub] PR review …` / `[claude-pilot] …` webhook markers | The corresponding webhook skill has priority; fall through to `Webhook Fallthrough` below only if none matched. |
 
 **Self-check while executing:** if you find yourself in Steps 1–3 of the Generic Workflow but the user's original message contained the word "milestone" or "project", STOP. You're on the wrong branch. Go to the Milestone or Project Workflow section and start from Step M1 / P1.
@@ -61,16 +62,19 @@ Apply the same format for other events: iteration launches, QA holds, retry star
 
 > **IMMEDIATELY after Step 2, call `run_claude_pilot`.** No other tool calls are permitted between Step 2 and this call. Do not read files, do not analyze code, do not produce a plan, do not summarize findings, do not list "next steps." Call `run_claude_pilot` NOW.
 
-Call `run_claude_pilot` with the issue reference:
+Call `run_claude_pilot` with `skill="dev-pilot"` and the issue reference:
 
 ```json
 {
+  "skill": "dev-pilot",
   "prompt": "repo#number",
   "task_id": "<task UUID from Step 2 (36-char format, e.g. '15383984-a3e7-41bf-ac6f-630ba9a89d63')>"
 }
 ```
 
-Example: `{"prompt": "mika-skills#8", "task_id": "15383984-a3e7-41bf-ac6f-630ba9a89d63"}`
+Example: `{"skill": "dev-pilot", "prompt": "mika-skills#8", "task_id": "15383984-a3e7-41bf-ac6f-630ba9a89d63"}`
+
+> **Note:** Use `skill="dev-pilot"` for implementation work. For grooming work, see the **Grooming Dispatch** section which uses `skill="dev-groom"`.
 
 The handler derives everything else (branch, worktree, pipeline command).
 
@@ -356,6 +360,57 @@ For `pass + not merged` and `hold` outcomes, the task stays at `in_progress` bec
 - **Do NOT clean up the worktree.** Worktrees persist until the PR is merged.
 - **If sprint mode is active:** query pending sprint tasks (via `list_tasks` filtered by sprint_id in metadata) to determine the next issue. If pending tasks remain, proceed to Step 1 for the next issue. If no pending tasks remain, also check for blocked sprint tasks — if blocked tasks exist the sprint is paused, not complete (wait for Vincent's instruction per Block Resumption Commands in self-dev-sprint). Only when both pending and blocked are empty, generate the sprint completion summary.
 - **Otherwise:** Stop. Wait for Vincent to decide what's next.
+
+---
+
+## Grooming Dispatch
+
+When the user says `groom <repo>#<n>` or `groom ticket <repo>#<n>`:
+
+This workflow dispatches a grooming session via claude-pilot. Grooming produces an architect-reviewed plan on the issue's branch — it does NOT implement the feature. Implementation happens separately after grooming via the Generic Workflow.
+
+**Step G1 — Track the task**
+- Call `list_tasks` and check ALL returned items for a matching `reference_url` (the GitHub issue URL). Check across ALL statuses.
+- If a match exists: reuse that task's `task_id`. Update its status to `in_progress` if needed. Do NOT create a duplicate.
+- If none exists, call `create_task` with:
+  - `label`: `"Groom <repo>#<issue_number>"` (e.g., "Groom mika#214")
+  - `source`: `"self_dev"`
+  - `reference_url`: the GitHub issue URL (e.g., `https://github.com/senara-solutions/mika/issues/214`)
+- Call `update_task_status` with `status: "in_progress"`
+- Remember the `task_id` (UUID)
+
+**Step G2 — Launch claude-pilot for grooming (MANDATORY — do not skip, do not defer)**
+
+> **IMMEDIATELY after Step G1, call `run_claude_pilot`.** No other tool calls permitted between G1 and this call.
+
+Call `run_claude_pilot` with `skill="dev-groom"`:
+
+```json
+{
+  "skill": "dev-groom",
+  "prompt": "<repo>#<number>",
+  "task_id": "<task UUID from Step G1>"
+}
+```
+
+Example: `{"skill": "dev-groom", "prompt": "mika#214", "task_id": "15383984-a3e7-41bf-ac6f-630ba9a89d63"}`
+
+The handler derives everything else (branch, worktree, `/mika-groom-ticket` pipeline command).
+
+**Rules:**
+- **Always pass `skill: "dev-groom"`** — this routes to the grooming pipeline (`/mika-groom-ticket`), not the implementation pipeline.
+- **Always pass `task_id`** — the task UUID from Step G1 (36-char format).
+- **One session per issue** — the handler runs the full grooming pipeline.
+- **Wait for the callback** — results arrive via callback when claude-pilot finishes. Do NOT poll.
+- **Do NOT do the work inline** — never read source code, analyze code, or produce plans yourself. That is claude-pilot's job (running as mika-arch).
+
+**Step G3 — Handle callback**
+
+Same callback handling as the Generic Workflow (metadata extraction, success/failure/pipeline-failure classification). On success, notify Vincent: "Grooming completed for {repo}#{issue_number}. Plan committed on branch. PR: {url}."
+
+**Step G4 — Close out**
+
+Same as Step 6 of the Generic Workflow. Call `update_task_status` with the outcome and metadata.
 
 ---
 

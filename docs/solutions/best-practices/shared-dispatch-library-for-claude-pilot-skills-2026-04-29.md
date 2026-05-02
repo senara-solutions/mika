@@ -34,17 +34,17 @@ Before this refactoring (#893), they were maintained as independent copies. dev-
 
 ## Guidance
 
-All claude-pilot dispatch skills share a single library at `skills/bundled/_shared/dispatch-lib.sh`. Each skill's `handlers/run.sh` is a thin wrapper (< 10 LOC) that sources the library and calls the single entrypoint:
+All claude-pilot dispatch skills share a single library at `skills/bundled/_shared/dispatch-lib.sh`. One host skill (dev-pilot) owns the `run_claude_pilot` tool with a union-enum `skill` parameter (`["dev-pilot", "dev-groom"]`). Sibling skills (dev-groom) are prompt-only — they provide `skill.toml` + `system_prompt.md` but no `tools.json` or handlers. The host skill's handler sources the library and calls the single entrypoint:
 
 ```bash
 #!/bin/bash
 set -e
 source "$(dirname "$0")/../../_shared/dispatch-lib.sh"
-dispatch_claude_pilot "/mika"  # or "/mika-groom-ticket" for dev-groom
+dispatch_claude_pilot  # entry command derived from $SKILL via case switch in lib
 ```
 
 The shared library provides:
-- **`dispatch_claude_pilot "$ENTRY_COMMAND"`** — single API surface
+- **`dispatch_claude_pilot`** — single API surface (no args; derives entry command from `$SKILL`)
 - JSON input parsing, skill validation, UUID format warning
 - GitHub App auth setup (with GH_TOKEN env var detection per mika#520)
 - Env var scrubbing (MIKA_* secrets)
@@ -68,7 +68,7 @@ The `_shared/` directory is excluded from bundled skill discovery via two layers
 
 ### Tool registration
 
-Tool names in mika-agent are globally namespaced (dedup via `seen.insert()` in `inject_skills_and_resolve_tools()`). Both dev-pilot and dev-groom expose `run_claude_pilot` with skill-specific `enum` values in the input schema (`"dev-pilot"` vs `"dev-groom"`). Since the two skills are never keyword-matched simultaneously, only one registration is active per turn — no collision.
+Tool names in mika-agent are globally namespaced (dedup via `seen.insert()` in `inject_skills_and_resolve_tools()`). Only dev-pilot registers the `run_claude_pilot` tool — with a union enum `["dev-pilot", "dev-groom"]` in the `skill` parameter. Sibling skills (dev-groom) do not register their own `run_claude_pilot`, avoiding the schema collision that previously made dev-groom unreachable (mika#932). The skill→entry-command mapping lives in `_shared/dispatch-lib.sh` as a `case` switch.
 
 ## Why This Matters
 
@@ -78,13 +78,13 @@ Without the shared library:
 - New sibling skills (e.g., a hypothetical `dev-explore`) require copying 400+ LOC and keeping it in sync.
 
 With it:
-- Adding a third sibling skill requires only `skill.toml`, `system_prompt.md`, `tools.json`, and a 6-line `run.sh`.
+- Adding a third sibling skill requires only `skill.toml` + `system_prompt.md` (prompt-only), a new arm in the lib's `case` switch, and widening `dev-pilot/tools.json` `skill.enum`. No new handler or `tools.json` needed.
 - Slug derivation is centralized by construction — drift is structurally impossible.
 - Bug fixes land once and propagate to all consumers.
 
 ## When to Apply
 
-- **Adding a new dispatch skill:** Create a thin wrapper that sources `_shared/dispatch-lib.sh` and calls `dispatch_claude_pilot` with the appropriate entry command.
+- **Adding a new dispatch skill:** Create a prompt-only skill (`skill.toml` + `system_prompt.md`), add a `case` arm in `_shared/dispatch-lib.sh`, widen `dev-pilot/tools.json` `skill.enum`, and update `self-dev/system_prompt.md` to teach mika-dev when to dispatch. No handler or `tools.json` needed on the sibling.
 - **Fixing dispatch behavior:** Edit `_shared/dispatch-lib.sh` once. All skills pick up the fix.
 - **Adding a new non-skill support directory:** Use the `_` prefix convention (e.g., `_templates/`, `_fixtures/`) to keep it excluded from bundled skill discovery.
 
@@ -102,20 +102,27 @@ SLUG=$(printf '%s' "$SLUG_BODY" | tr '[:upper:]' '[:lower:]' | ...)
 BRANCH="${TYPE}/${ISSUE}/${SLUG}"
 ```
 
-**After (centralized via shared library):**
+**After (centralized via shared library, mika#932):**
+```
+# dev-groom is now prompt-only (skill.toml + system_prompt.md only).
+# No handlers/, no tools.json. The host skill (dev-pilot) owns the
+# run_claude_pilot tool and the lib derives the entry command from $SKILL.
+```
+
 ```bash
-# dev-groom/handlers/run.sh (6 LOC)
+# dev-pilot/handlers/run.sh (6 LOC) — the only handler
 #!/bin/bash
 set -e
 source "$(dirname "$0")/../../_shared/dispatch-lib.sh"
-dispatch_claude_pilot "/mika-groom-ticket"
+dispatch_claude_pilot  # entry command derived from $SKILL
 ```
 
-Slug derivation now calls `$PLATFORM_DIR/scripts/derive-branch-name` inside `_set_up_worktree()`, matching dev-pilot's behavior exactly.
+Slug derivation calls `$PLATFORM_DIR/scripts/derive-branch-name` inside `_set_up_worktree()`, matching all sibling skills by construction.
 
 ## Related
 
-- mika#893 — this refactoring PR
+- mika#932 — consolidated `run_claude_pilot` to single host skill (dev-pilot) with union enum; dev-groom became prompt-only
+- mika#893 — original refactoring that introduced `_shared/dispatch-lib.sh`
 - mika#892 — slug derivation drift in dev-groom (closed by construction)
 - mika#887 — BASH_XTRACEFD trace injection (migrates to shared lib naturally)
 - mika-platform#58 — centralization of slug derivation scripts

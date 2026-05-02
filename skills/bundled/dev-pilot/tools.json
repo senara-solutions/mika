@@ -1,18 +1,18 @@
 [
   {
     "name": "run_claude_pilot",
-    "description": "Dispatch a headless Claude Code implementation session via claude-pilot. Long-running — returns a task ID immediately, results arrive via callback when Claude Code finishes.",
+    "description": "Dispatch a headless Claude Code session via claude-pilot. Supports implementation (dev-pilot, entry: /mika) and grooming (dev-groom, entry: /mika-groom-ticket). Long-running — returns a task ID immediately, results arrive via callback when Claude Code finishes.",
     "input_schema": {
       "type": "object",
       "properties": {
         "skill": {
           "type": "string",
-          "enum": ["dev-pilot"],
-          "description": "Which skill prompt to run. Currently only 'dev-pilot' (implementation dispatch)."
+          "enum": ["dev-pilot", "dev-groom"],
+          "description": "Which skill prompt to run. 'dev-pilot' for implementation dispatch (/mika pipeline), 'dev-groom' for grooming dispatch (/mika-groom-ticket pipeline)."
         },
         "prompt": {
           "type": "string",
-          "description": "Issue reference in repo#number format (e.g., 'mika#214', 'mika-skills#8'). The handler derives the branch, creates a worktree, and runs the /mika pipeline. For free-text prompts, pass a plain string — sent to claude-pilot as-is without worktree setup."
+          "description": "Issue reference in repo#number format (e.g., 'mika#214', 'mika-skills#8'). The handler derives the branch, creates a worktree, and runs the appropriate pipeline (/mika for dev-pilot, /mika-groom-ticket for dev-groom). For free-text prompts, pass a plain string — sent to claude-pilot as-is without worktree setup."
         },
         "task_id": {
           "type": "string",
@@ -20,7 +20,7 @@
         },
         "iteration_context": {
           "type": "string",
-          "description": "Iteration feedback for an existing PR. When present alongside a repo#number prompt, appended to the prompt so the /mika pipeline addresses specific feedback rather than re-implementing from scratch."
+          "description": "Iteration feedback for an existing PR. When present alongside a repo#number prompt, appended to the prompt so the pipeline addresses specific feedback rather than starting from scratch."
         }
       },
       "required": ["skill", "prompt", "task_id"]
