@@ -102,12 +102,39 @@ None — repo-internal change.
 
 **Approach:**
 
+**Script interface pin (per pass-1 F2, BLOCKING):**
+
+`scripts/derive-branch-name` interface confirmed at plan-commit time via direct read:
+- Truncation: **built-in default 40 chars** (line 9 comment: *"Truncation length: 40 chars."*; logic at lines 200-206). NO `--truncate` flag needed; the script always truncates to 40.
+- Parameters: `--title TEXT` (required unless `--explicit` or `--body-callout` matches), `--issue NUM` (optional; when set, output is `type/NUM/slug`), `--labels CSV` (bug→fix, chore→chore, else feat), `--body-callout TEXT` (extracts `> - **Branch:** \`X\`` from issue body).
+- Exit codes: 0 success, 2 missing required input, 3 explicit-value regex mismatch.
+
+So the invocation needs all four parameters; truncation is automatic. No flag changes required.
+
+**Literal replacement text pin (per pass-1 F1, BLOCKING):**
+
+Replace `system_prompt.md` lines 13-14 with this literal block. Variable names extract from `gh issue view <n>` (which Phase 1 step 1 already fetches as `--json title,body,labels`):
+
+```
+   - If the issue body contains `> - **Branch:** \`<slug>\``, use that slug verbatim (callout takes priority — script is NOT invoked when callout matches).
+   - Otherwise, invoke the canonical script:
+   ```bash
+   ISSUE_TITLE=$(gh issue view <n> --repo senara-solutions/<repo> --json title -q .title)
+   LABELS=$(gh issue view <n> --repo senara-solutions/<repo> --json labels -q '[.labels[].name] | join(",")')
+   ISSUE_BODY=$(gh issue view <n> --repo senara-solutions/<repo> --json body -q .body)
+   SCRIPTS_DIR="$(dirname "$(git rev-parse --git-common-dir)")/scripts"
+   BRANCH=$("$SCRIPTS_DIR/derive-branch-name" --title "$ISSUE_TITLE" --issue <n> --labels "$LABELS" --body-callout "$ISSUE_BODY")
+   ```
+   *Do not re-derive in prompt logic — slug recipe is owned by the script and must match the meta-repo dispatcher and dev-pilot dispatcher.*
+```
+
+Note: dev-groom's existing input parsing (line 7) names the issue number as `<n>` and the repo as `<repo>` (placeholders the model substitutes from the user's typed ticket reference). The bash block uses these placeholders directly; the model substitutes them per dev-groom's existing convention. /ce:work may optionally merge the three `gh issue view` calls with Phase 1 step 1's existing invocation (which already fetches `--json title,body,labels`) — the SHAPE of the script invocation is locked; the variable-fetching mechanism may consolidate.
+
+**Implementation steps:**
+
 1. Read current `system_prompt.md` lines 13-15.
-2. Replace lines 13-14 with:
-   - Line 13 (preserved): callout-takes-priority instruction (verbatim from current).
-   - Line 14 (replaced): canonical script invocation prose. Mirror the pattern from `mika-platform/.claude/commands/mika-groom-ticket.md` Phase 1 step 3 — same `SCRIPTS_DIR=...` / `BRANCH=$(...)` invocation. Add a one-line note: "*Do NOT re-derive the slug in prompt logic — slug recipe is owned by the script and must match the meta-repo dispatcher and dev-pilot dispatcher.*"
-3. Line 15 (preserved): immutability-after-worktree-creation instruction (verbatim from current).
-4. Verify the deployed copy at `~/.mika/agents/mika-dev/skills/dev-groom/system_prompt.md` will pick up the change on next `make deploy` — no special propagation needed (bundled-skill resync mechanism handles it).
+2. Replace lines 13-14 with the literal block above. Preserve callout-takes-priority semantics (R2) and the immutability statement on line 15 (R3) byte-for-byte.
+3. Verify the deployed copy at `~/.mika/agents/mika-dev/skills/dev-groom/system_prompt.md` will pick up the change on next `make deploy` — no special propagation needed (bundled-skill resync mechanism handles it).
 
 **Patterns to follow:**
 
@@ -120,6 +147,7 @@ None — repo-internal change.
 |---|---|
 | Happy path | Dispatch dev-groom on a ticket with label `bug` and conventional-commit-prefixed title (e.g., `fix(server): ...`). Expected: dev-groom's claude-pilot invokes `scripts/derive-branch-name` and produces a slug matching what `/mika-groom-ticket` operator-side would produce for the same ticket. |
 | Happy path | Dispatch dev-groom on a ticket with body callout `> - **Branch:** \`<slug>\``. Expected: callout slug used verbatim (R2 preserved). |
+| Edge case (F3 mandatory) | Dispatch dev-groom on a ticket with existing body callout `> - **Branch:** \`fix/927/custom-slug\``. Replacement instruction reads callout and uses `fix/927/custom-slug` verbatim; **`derive-branch-name` is NOT invoked** (no script invocation in the bash trace). Verifies R2 callout-takes-priority preservation explicitly — distinguishes preserved-path from changed-path. |
 | Edge case | Dispatch dev-groom on a ticket with NO label, NO conv-commit prefix, NO callout. Expected: script defaults to `feat` per priority rule 4 (per `/mika.md` § Branch-name derivation). |
 | Edge case | Dispatch dev-groom on a ticket with title >40 chars. Expected: script truncates to 40 chars (per the script's enforced policy). The OLD in-prompt derivation might have produced a >40 char slug — this fixture validates the divergence is closed. |
 | Integration | Re-dispatch the same ticket via dev-groom AND `/mika-groom-ticket` operator-side. Expected: identical slug from both paths. Validates R5 end-to-end. |
