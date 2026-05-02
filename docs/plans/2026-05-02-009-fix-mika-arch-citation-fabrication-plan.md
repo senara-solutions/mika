@@ -161,3 +161,13 @@ Cross-session attribution is the secondary surface: mika-arch's pass-2 on mika#9
 - **Sibling tickets:** mika#947 (persistence-meta), mika#939 / PR #941 (Opus deadline).
 - **Source files:** `mika/skills/bundled/mika-arch-groom-ticket/system_prompt.md`, `mika/skills/bundled/mika-arch-second-review/system_prompt.md`, `mika/skills/bundled/mika-arch-groom-milestone/system_prompt.md`.
 - **Related institutional knowledge:** `project_mika_arch_failure_modes.md`, `feedback_qa_provider_perf.md`, `mika/docs/architecture/review-guide.md` (citation-or-silence principle).
+
+## Pass-1 iteration
+
+### F1 (BLOCKING) — Acceptance item 2 (telemetry) explicit deferral
+
+Issue body Acceptance item 2 ("When fabrication occurs, it is auto-detected and logged via structured telemetry") is **explicitly deferred** to companion follow-up. Rationale: prompt-level prevention (this fix's KTD-1+KTD-2) addresses the primary failure mode; telemetry-based detection is a separate concern with a different fix surface (KG event infrastructure / structured logging surface). The two are **independent, not gated** — telemetry adds defense-in-depth observability after prevention reduces incident rate.
+
+Companion ticket title (filed before this PR merges): `feat(mika-arch): structured telemetry for citation-fabrication detection (mika#952 follow-up)`. NOT a companion-task filing gate (different from mika#938 F2 and mika#939 F5 shapes — those gates exist for tightly-coupled fixes that MUST ship together; this is independent observability work).
+
+Plan acceptance criteria therefore cover items 1 + 3 from issue body, with item 2 deferred via filed-companion. R4 (0/5 fabrication-rate) remains the primary verification gate.
