@@ -126,6 +126,8 @@ async fn tick_body(
                 + stats.skipped_no_llm
                 + stats.errors;
             let pending_after = pending_before.map(|b| b.saturating_sub(resolved_in_tick as u64));
+            let per_corpus_attempted =
+                serde_json::to_string(&stats.per_corpus_attempted).unwrap_or_default();
             info!(
                 target: "mika::otel",
                 trace_id = %trace_id,
@@ -139,6 +141,7 @@ async fn tick_body(
                 matched_llm = stats.matched_llm,
                 no_match = stats.no_match,
                 duration_ms = stats.duration_ms,
+                per_corpus_attempted = %per_corpus_attempted,
                 event = "kg_resolver_tick.complete",
             );
         }

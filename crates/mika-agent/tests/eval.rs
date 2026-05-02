@@ -49,6 +49,7 @@ mod eval {
     mod test_max_steps_continuation;
     mod test_multi_step;
     mod test_multi_turn_persistence;
+    mod test_per_corpus_fairness_927;
     mod test_per_skill_provider_override;
     mod test_persistence_eval_guard;
     mod test_phantom_retry_guard;
