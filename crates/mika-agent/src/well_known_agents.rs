@@ -328,6 +328,17 @@ allowlist = ["mika-arch-groom-ticket", "mika-arch-groom-milestone", "mika-arch-s
 /// All well-known agents.
 pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] = &[&MIKA_DEV, &MIKA_QA, &MIKA_RELAY, &MIKA_ARCH];
 
+/// Platform agents that can be dispatched via `mika ask --agent <peer>` without
+/// requiring LLM permission classification. These are intra-platform peers that
+/// claude-pilot and mika-relay should structurally allow.
+///
+/// # Sentinel — cross-language duplication (mika#935, architect F2)
+///
+/// This list is duplicated in `claude-pilot-py/src/claude_pilot/tier1.py` as
+/// `INTRA_PLATFORM_AGENTS`. If this list grows beyond 5 entries OR diverges
+/// between languages, escalate to build-time codegen.
+pub const INTRA_PLATFORM_DISPATCH_PEERS: &[&str] = &["mika-arch", "mika-dev", "mika-qa"];
+
 /// Look up a well-known agent by name.
 pub fn find_well_known_agent(name: &str) -> Option<&'static WellKnownAgent> {
     WELL_KNOWN_AGENTS.iter().find(|a| a.name == name).copied()

@@ -10,6 +10,7 @@ mod handlers;
 pub mod investigate;
 pub mod json_extractor;
 pub mod openapi;
+pub mod permission_pre_classifier;
 pub mod rewind;
 pub mod state;
 pub mod types;
