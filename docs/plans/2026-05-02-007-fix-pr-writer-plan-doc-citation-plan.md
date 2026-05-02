@@ -23,6 +23,7 @@ The `plan-doc-check.sh` hook (mika-platform#64) uses `grep -oE 'docs/plans/[^[:s
 - R2. The citation must be machine-parseable: `grep -E 'docs/plans/[^[:space:]]+\.md' PR_BODY` must match
 - R3. The mechanism must work automatically — no manual intervention required
 - R4. A follow-up `/mika` PR on mika-platform must pass the `Plan-Doc Citation` check without label/trailer fallback
+- **R_verify (per pass-1 F3, BLOCKING)**: After merge, run `/mika` on a real ticket that adds source + a plan doc (or use the next real ticket dispatched to mika-dev). Confirm the generated PR body contains a line matching `docs/plans/<file>.md` verbatim. Confirm `Plan-Doc Citation` CI check passes on mika-platform without label/trailer fallback. **This is mandatory, not optional** — the issue body's stated Verification criterion. Test expectation on individual units is "none" (prompt-instruction change), but R_verify is the post-merge integration verification gate.
 
 ## Scope Boundaries
 
@@ -54,7 +55,33 @@ The `plan-doc-check.sh` hook (mika-platform#64) uses `grep -oE 'docs/plans/[^[:s
 - **Fix all four repos, not just two:** The ticket says "out of scope" for propagating the hook, but the writer fix itself should be universal. Per `feedback_cross_repo_awareness.md`, fix the pattern everywhere in one pass. When the hook propagates to other repos, the writer will already be compliant.
 - **Instruction placement:** Add the citation instruction as a sub-bullet of the existing PR creation step, following the established pattern of the `Closes #<number>` instruction.
 - **Citation format:** Use `Plan: docs/plans/<file>.md` — a simple format that satisfies the hook's grep and is readable in PR bodies. The hook checks for `docs/plans/[^[:space:]]+\.md` anywhere in the text, so the exact prefix doesn't matter, but `Plan:` is clear and conventional.
-- **Detection method:** Instruct the agent to check `git diff --name-only main...HEAD | grep '^docs/plans/.*\.md$'` before composing the body. This matches exactly what the CI hook checks (files in the diff range).
+- **Detection method (per pass-1 F4 SHARPENING — main-base assumption named):** Instruct the agent to check `git diff --name-only main...HEAD | grep '^docs/plans/.*\.md$'` before composing the body. This matches the CI hook's check exactly. *Assumes PR base is `main` (current mika convention). If base branch changes, update to `git diff --name-only $(git merge-base HEAD origin/main)...HEAD` or equivalent.*
+
+### Hook surface pin (per pass-1 F1, BLOCKING)
+
+Read `mika-platform/scripts/plan-doc-check.sh` at plan-commit time:
+
+```bash
+PR_BODY="${GITHUB_PR_BODY:-}"
+COMMIT_BODIES=$(git log --format=%B "$BASE..HEAD" 2>/dev/null || true)
+ALL_TEXT="${PR_BODY}"$'\n'"${COMMIT_BODIES}"
+PLAN_PATHS=$(echo "$ALL_TEXT" | grep -oE 'docs/plans/[^[:space:]]+\.md' | sort -u || true)
+```
+
+The hook concatenates **PR body AND commit bodies** into `ALL_TEXT` and greps the union. Either surface satisfies the check. The fix targets the PR body (per the citation instruction at PR-creation step), so the hook is satisfied from the PR-body path; commit-body fallback continues to work for operators who prefer it.
+
+### Scope pin per repo (per pass-1 F2, BLOCKING)
+
+Files + line ranges confirmed at plan-commit time via `find` + `grep` on each repo's `/mika.md`:
+
+| Repo | File path (relative to repo root) | Line — `gh pr create` | Line — `Closes #` | Insertion target |
+|------|-----------------------------------|------------------------|-----------------------|--------------------|
+| mika | `.claude/commands/mika.md` | 83 | 85 | After line 85 |
+| mika-platform | `.claude/commands/mika.md` | 201 | 203 | After line 203 |
+| mika-skills | `.claude/commands/mika.md` | 63 | 65 | After line 65 |
+| mika-cloud | `.claude/commands/mika.md` | 63 | 65 | After line 65 |
+
+All four repos confirmed to have a PR-creation step in `/mika.md` with the `Closes #<number>` instruction at the documented line. The new citation instruction inserts immediately after that line, matching the existing imperative style.
 
 ## Implementation Units
 
