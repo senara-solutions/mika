@@ -97,6 +97,8 @@ Architect flagged that Unit 2 modifies `self-dev/system_prompt.md`, contradictin
 
 **Considered and rejected.** Revert-atomicity insurance for a doc-and-config change is not justified: any realistic revert is a full PR revert, not a surgical revert of one commit inside the PR. Splitting adds ceremony without paying out in any realistic scenario. Unit 1 stays as a single commit.
 
+See mika#932 issue body §Ratification for operator reasoning. Future plans citing this precedent should verify the revert profile matches (two tightly-coupled units in a single PR, no independent deployable state).
+
 ### F3 — `dispatch_claude_pilot` callsite verification (BLOCKING → APPLIED)
 
 Widened the callsite grep across all repos in the workspace:
@@ -221,9 +223,12 @@ No shell-level test added. Shell-test infrastructure does not exist for `_shared
 - Integration (live, post-deploy): a "groom <repo>#<n>" prompt to mika-dev results in a `run_claude_pilot(skill="dev-groom", ...)` tool call. Same DB query as Unit 1 confirms.
 - Regression (live, post-deploy): an "implement <repo>#<n>" prompt to mika-dev still results in `run_claude_pilot(skill="dev-pilot", ...)`. Mika-dev does not confuse the two.
 
+**Acceptance criterion (falsifiable, per architect F8):** After edit, a test message to mika-dev containing "groom ticket #NNN" causes mika-dev to call `run_claude_pilot(skill="dev-groom", ...)` (confirmed via session log `tool_calls` table). A test message containing "implement feature X" causes mika-dev to call `run_claude_pilot(skill="dev-pilot", ...)` — neither dispatches to the wrong skill.
+
 **Verification:**
 - `grep -c 'skill="dev-groom"' mika/skills/bundled/self-dev/system_prompt.md` returns ≥1.
 - Live test post-deploy per the integration scenario above.
+- Falsifiable AC verified live via the test messages above and DB query: `SELECT json_extract(input, '$.skill'), substr(input, 1, 100) FROM tool_calls WHERE tool_name='run_claude_pilot' ORDER BY created_at DESC LIMIT 5;`.
 
 ## System-Wide Impact
 
