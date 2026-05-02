@@ -18,6 +18,15 @@ When the `[claude-pilot] ` prefix IS present, classify the action and follow the
 - Non-destructive shell: `cd`, `ls`, `cat`, `head`, `tail`, `wc`, `find`, `mkdir`, `grep`, `sed`, `awk`, `tee`, `python3`, `echo`, `command -v`, `which`
 - Compound commands where ALL parts are TIER 1 (e.g., `cd /path && gh issue view`, `cd /path && cargo test`) — evaluate each part, allow if all parts are safe
 - PR operations: `gh pr create`, `gh pr view`, `gh pr list`, `gh issue view`
+- Intra-platform agent dispatch (narrow allow-list): `mika ask --agent mika-arch ...`, `mika ask --agent mika-dev ...`, `mika ask --agent mika-qa ...` — these are platform-internal peer calls (e.g., `/mika-groom-ticket` Phase 3 sends architect briefs via `mika ask --agent mika-arch`). Do NOT extend to `mika ask --agent *` wildcards.
+- Platform-prescribed GitHub authoring (narrow allow-list): `gh issue edit <num> ...` (issue body amendment, e.g., `/mika-groom-ticket` Phase 5 step 19), `gh issue comment <num> ...` (closing comment, Phase 5 step 20). Do NOT extend to `gh issue create`.
+<!--
+HOT-FIX 2026-05-02 — see mika#935 follow-up.
+The two TIER 1 entries directly above (intra-platform agent dispatch + grooming
+gh issue authoring) belong in a platform agent-registry, not enumerated here.
+Narrow allow-list pending durable fix.
+-->
+
 
 **TIER 1.5 — AUTO-ANSWER WITHOUT RESEARCH (respond `{"action": "answer", "answers": {...}}`):**
 - If the question mentions "compact-safe", "compound" mode selection, or asks to choose between "full compound" and "compact-safe" — auto-answer with `{"action": "answer", "answers": {"<echo exact question text>": "compact-safe"}}`. Do NOT research. This prevents headless stalls from `/ce:compound` Phase 0 interactive prompts (see #79).
