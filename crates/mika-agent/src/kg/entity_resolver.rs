@@ -22,6 +22,7 @@
 //! Discovered types (solution_path, failure_mode, pattern) skip resolution
 //! entirely — no domain counterpart exists (D8).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -72,6 +73,8 @@ struct PendingEntity {
     #[allow(dead_code)] // Loaded from DB schema; may be used in future diagnostics.
     name: String,
     confidence: f64,
+    /// The corpus this entity belongs to (shared-layer key from v27).
+    docs_root_hash: String,
 }
 
 /// A domain entity candidate for disambiguation.
@@ -139,6 +142,8 @@ pub struct ResolutionStats {
     /// Number of LLM disambiguation calls made. Stage 1 exact matches do NOT
     /// debit this counter — only Stage 2 LLM calls.
     pub llm_calls: u32,
+    /// Per-corpus entity attempt counts for fairness observability (#927).
+    pub per_corpus_attempted: HashMap<String, u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +247,7 @@ impl SubjectEntityResolver {
         let start = Instant::now();
         let agent_id = self.db.agent_id.clone();
 
-        let pending = self.get_pending_entities().await?;
+        let pending = self.get_pending_entities(budget).await?;
 
         info!(
             trace_id = %self.trace_id,
@@ -308,6 +313,12 @@ impl SubjectEntityResolver {
         };
 
         for (i, entity) in entities.iter().enumerate() {
+            // Per-corpus fairness tracking (#927).
+            *stats
+                .per_corpus_attempted
+                .entry(entity.docs_root_hash.clone())
+                .or_insert(0) += 1;
+
             // Stage-2 budget guard: would we call the LLM if needed?
             // `llm_call_allowed = false` tells resolve_single_entity to
             // short-circuit before a Stage-2 call with `SkippedBudget`.
@@ -825,7 +836,7 @@ impl SubjectEntityResolver {
                     docs_root_hashes.iter().map(|_| "?".to_string()).collect();
                 let id_placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
                 let sql = format!(
-                    "SELECT id, entity_key, type, name, confidence
+                    "SELECT id, entity_key, type, name, confidence, docs_root_hash
                      FROM kg_subject_entities
                      WHERE docs_root_hash IN ({}) AND id IN ({})",
                     hash_placeholders.join(","),
@@ -847,6 +858,7 @@ impl SubjectEntityResolver {
                             entity_type: row.get(2)?,
                             name: row.get(3)?,
                             confidence: row.get(4)?,
+                            docs_root_hash: row.get(5)?,
                         })
                     })?
                     .filter_map(|r| r.ok())
@@ -905,25 +917,113 @@ impl SubjectEntityResolver {
             .await
     }
 
-    /// Get pending entities — never attempted or stale from re-extraction (D4).
-    /// Scoped to all the agent's docs_root_hashes via IN-list (#798).
-    async fn get_pending_entities(&self) -> Result<Vec<PendingEntity>> {
+    /// Get pending entities with per-corpus fairness (#927).
+    ///
+    /// Uses single-pass reallocation (plan F2) to distribute `total_budget`
+    /// across corpora, then round-robin interleaves results (KTD-3) so no
+    /// single large corpus starves smaller ones.
+    ///
+    /// For single-corpus agents this degenerates to one
+    /// `get_pending_entities_for_corpus` call.
+    async fn get_pending_entities(&self, total_budget: u32) -> Result<Vec<PendingEntity>> {
+        if self.docs_root_hashes.is_empty() || total_budget == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Single-corpus fast path — skip allocation overhead.
+        if self.docs_root_hashes.len() == 1 {
+            let limit = (total_budget as usize * 2).max(50) as u32;
+            return self
+                .get_pending_entities_for_corpus(&self.docs_root_hashes[0], limit)
+                .await;
+        }
+
+        // 1. Query each corpus's pending count.
+        let mut corpus_counts: Vec<(String, u32)> = Vec::new();
+        for hash in &self.docs_root_hashes {
+            let count = self.count_pending_for_corpus(hash).await?;
+            corpus_counts.push((hash.clone(), count));
+        }
+
+        let n = corpus_counts.len() as u32;
+        let budget = total_budget;
+
+        // 2. First pass: assign each corpus min(pending_count, budget / N).
+        let base_share = budget / n;
+        let mut assigned: Vec<u32> = corpus_counts
+            .iter()
+            .map(|(_, count)| (*count).min(base_share))
+            .collect();
+
+        // 3. Compute remaining budget.
+        let used: u32 = assigned.iter().sum();
+        let mut remaining = budget.saturating_sub(used);
+
+        // 4. Second pass: distribute remaining to corpora with surplus pending.
+        if remaining > 0 {
+            let mut hungry: Vec<usize> = corpus_counts
+                .iter()
+                .enumerate()
+                .filter(|(i, (_, count))| *count > assigned[*i])
+                .map(|(i, _)| i)
+                .collect();
+
+            while remaining > 0 && !hungry.is_empty() {
+                let share = (remaining / hungry.len() as u32).max(1);
+                let mut next_hungry = Vec::new();
+                for &idx in &hungry {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let can_take = corpus_counts[idx].1.saturating_sub(assigned[idx]);
+                    let give = share.min(can_take).min(remaining);
+                    assigned[idx] += give;
+                    remaining -= give;
+                    if assigned[idx] < corpus_counts[idx].1 {
+                        next_hungry.push(idx);
+                    }
+                }
+                hungry = next_hungry;
+            }
+        }
+
+        // 5. Per-corpus limit = max(2 * per_corpus_budget, 50) — KTD-2 oversupply.
+        // 6. Fetch entities per corpus.
+        let mut buckets: Vec<Vec<PendingEntity>> = Vec::new();
+        for (i, (hash, _)) in corpus_counts.iter().enumerate() {
+            let per_corpus_limit = (assigned[i] as usize * 2).max(50) as u32;
+            if assigned[i] == 0 && corpus_counts[i].1 == 0 {
+                buckets.push(Vec::new());
+                continue;
+            }
+            let entities = self
+                .get_pending_entities_for_corpus(hash, per_corpus_limit)
+                .await?;
+            buckets.push(entities);
+        }
+
+        // 7. Round-robin interleave (KTD-3).
+        Ok(interleave_round_robin(buckets))
+    }
+
+    /// Get pending entities for a single corpus, with LIMIT.
+    async fn get_pending_entities_for_corpus(
+        &self,
+        docs_root_hash: &str,
+        limit: u32,
+    ) -> Result<Vec<PendingEntity>> {
         let agent_id = self.db.agent_id.clone();
-        let docs_root_hashes = self.docs_root_hashes.clone();
+        let hash = docs_root_hash.to_string();
+        let limit = limit as i64;
 
         self.db
             .with_db(move |db| {
-                if docs_root_hashes.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let hash_placeholders: Vec<String> =
-                    docs_root_hashes.iter().map(|_| "?".to_string()).collect();
-                let sql = format!(
-                    "SELECT e.id, e.entity_key, e.type, e.name, e.confidence
+                let sql =
+                    "SELECT e.id, e.entity_key, e.type, e.name, e.confidence, e.docs_root_hash
                      FROM kg_subject_entities e
                      LEFT JOIN kg_resolutions_log r
-                         ON r.subject_entity_id = e.id AND r.agent_id = ?
-                     WHERE e.docs_root_hash IN ({})
+                         ON r.subject_entity_id = e.id AND r.agent_id = ?1
+                     WHERE e.docs_root_hash = ?2
                        AND e.type IN ('skill', 'tool', 'agent', 'problem_type')
                        AND (
                          r.id IS NULL
@@ -933,28 +1033,54 @@ impl SubjectEntityResolver {
                              WHERE cs.subject_entity_id = e.id
                              ORDER BY cs.created_at DESC LIMIT 1
                          )
-                       )",
-                    hash_placeholders.join(","),
-                );
-                let mut stmt = db.conn.prepare(&sql)?;
-                // agent_id is first param, then hash params
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(agent_id)];
-                for h in &docs_root_hashes {
-                    params.push(Box::new(h.clone()));
-                }
+                       )
+                     ORDER BY e.id ASC
+                     LIMIT ?3";
+                let mut stmt = db.conn.prepare(sql)?;
                 let entities: Vec<PendingEntity> = stmt
-                    .query_map(rusqlite::params_from_iter(params), |row| {
+                    .query_map(rusqlite::params![agent_id, hash, limit], |row| {
                         Ok(PendingEntity {
                             id: row.get(0)?,
                             entity_key: row.get(1)?,
                             entity_type: row.get(2)?,
                             name: row.get(3)?,
                             confidence: row.get(4)?,
+                            docs_root_hash: row.get(5)?,
                         })
                     })?
                     .filter_map(|r| r.ok())
                     .collect();
                 Ok(entities)
+            })
+            .await
+    }
+
+    /// Count pending entities for a single corpus (lightweight, no row materialisation).
+    async fn count_pending_for_corpus(&self, docs_root_hash: &str) -> Result<u32> {
+        let agent_id = self.db.agent_id.clone();
+        let hash = docs_root_hash.to_string();
+
+        self.db
+            .with_db(move |db| {
+                let sql = "SELECT COUNT(*)
+                     FROM kg_subject_entities e
+                     LEFT JOIN kg_resolutions_log r
+                         ON r.subject_entity_id = e.id AND r.agent_id = ?1
+                     WHERE e.docs_root_hash = ?2
+                       AND e.type IN ('skill', 'tool', 'agent', 'problem_type')
+                       AND (
+                         r.id IS NULL
+                         OR r.source_extraction_trace_id != (
+                             SELECT cs.extraction_trace_id
+                             FROM kg_chunk_subjects cs
+                             WHERE cs.subject_entity_id = e.id
+                             ORDER BY cs.created_at DESC LIMIT 1
+                         )
+                       )";
+                let mut stmt = db.conn.prepare(sql)?;
+                let count: u32 =
+                    stmt.query_row(rusqlite::params![agent_id, hash], |row| row.get(0))?;
+                Ok(count)
             })
             .await
     }
@@ -1413,6 +1539,34 @@ impl SubjectEntityResolver {
 }
 
 // ---------------------------------------------------------------------------
+// Round-robin interleave (#927 KTD-3)
+// ---------------------------------------------------------------------------
+
+/// Interleave entities from multiple corpus buckets in round-robin order.
+///
+/// Produces `[A_0, B_0, C_0, A_1, B_1, C_1, ...]` — ensures fairness when
+/// entities are later processed sequentially with a budget cap.
+fn interleave_round_robin(buckets: Vec<Vec<PendingEntity>>) -> Vec<PendingEntity> {
+    let total: usize = buckets.iter().map(|b| b.len()).sum();
+    let mut result = Vec::with_capacity(total);
+    let mut iters: Vec<std::vec::IntoIter<PendingEntity>> =
+        buckets.into_iter().map(|b| b.into_iter()).collect();
+    loop {
+        let mut advanced = false;
+        for iter in &mut iters {
+            if let Some(entity) = iter.next() {
+                result.push(entity);
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // JSON parsing
 // ---------------------------------------------------------------------------
 
@@ -1578,6 +1732,7 @@ mod tests {
             entity_type: "skill".to_string(),
             name: "self_dev".to_string(),
             confidence: 0.85,
+            docs_root_hash: "0000000000000000".to_string(),
         };
 
         let candidates = vec![
