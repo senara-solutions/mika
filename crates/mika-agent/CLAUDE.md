@@ -202,11 +202,11 @@ See `tests/eval/grounding_regressions/README.md` for the full vocabulary, capabi
 
 ## Knowledge Graph — Domain Graph Builder
 
-`src/kg/domain_builder.rs` — Deterministic startup-time builder that populates `kg_entities` and `kg_relationships` from four authoritative sources: `SkillRegistry`, `ToolRegistry`, `McpManager`, and agent configs. Runs once per server boot in `run_server()` after all agents are initialized. No LLM calls — pure code projection.
+`src/kg/domain_builder.rs` — Deterministic startup-time builder that populates `kg_entities` and `kg_relationships` from five authoritative sources: `SkillRegistry`, `ToolRegistry`, `McpManager`, agent configs, and concept seeds (hardcoded). Runs once per server boot in `run_server()` after all agents are initialized. No LLM calls — pure code projection.
 
-**Entity types:** Skill, Tool, Agent, ProblemType (5 seeds: `ci_failure`, `merge_conflict`, `duplicate_pr`, `stale_uuid`, `fabrication`). **Relationship types:** `DEPENDS_ON` (Skill→Skill from `skill.toml` dependencies), `PROVIDES` (Skill→Tool from skill tools).
+**Entity types:** Skill, Tool, Agent, ProblemType (5 seeds: `ci_failure`, `merge_conflict`, `duplicate_pr`, `stale_uuid`, `fabrication`), Concept (20 seeds: 7 `concept:cross-repo:*` + 13 `concept:infra:*`). **Relationship types:** `DEPENDS_ON` (Skill→Skill from `skill.toml` dependencies), `PROVIDES` (Skill→Tool from skill tools).
 
-**Sole-writer contract:** This module is the sole writer of `skill:*`, `tool:*`, `agent:*`, and `problem_type:*` entity_keys. No other code path writes these namespaces.
+**Sole-writer contract:** This module is the sole writer of `skill:*`, `tool:*`, `agent:*`, `problem_type:*`, and `concept:*` entity_keys. No other code path writes these namespaces.
 
 **Idempotency:** Entity UPSERT via `INSERT ... ON CONFLICT(entity_key) DO UPDATE` preserves rowids (protects `kg_subject_resolutions.domain_entity_id` FK references). Relationships are DELETE-all-then-INSERT per rebuild. Stale entities are pruned with a type-scoped DELETE that only touches `KG_DOMAIN_ENTITY_TYPES`.
 
@@ -299,7 +299,7 @@ docs_roots = [
 
 `src/kg/subject_extractor.rs` — Per-agent LLM-based extraction of named entities and fact triples from previously-ingested documents (#690). Uses constrained NER with approved entity/relationship types and structural validation (not just prompt-based).
 
-**Approved entity types:** `skill`, `tool`, `agent`, `problem_type`, `solution_path`, `failure_mode`, `pattern`. **Approved relationship types:** `SOLVED_BY`, `USES`, `CALLS`, `INDICATES`, `PREVENTS`, `CAUSED_BY`, `MENTIONS` — each with from/to type constraints enforced in code.
+**Approved entity types:** `skill`, `tool`, `agent`, `problem_type`, `solution_path`, `failure_mode`, `pattern`, `concept`. **Approved relationship types:** `SOLVED_BY`, `USES`, `CALLS`, `INDICATES`, `PREVENTS`, `CAUSED_BY`, `MENTIONS` — each with from/to type constraints enforced in code.
 
 **Sole-writer contract:** This module is the sole writer of `kg_subject_entities`, `kg_subject_relationships`, `kg_chunk_subjects`, `kg_chunk_subject_relationships`, and `kg_extractions` rows.
 

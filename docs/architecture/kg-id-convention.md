@@ -11,10 +11,10 @@
 ```
 
 - `<type>` — lowercase entity type from the reserved set (see below).
-- `<name>` — lowercase identifier, `[a-z0-9_-]+`. No colons (would confuse parsing).
-- Separator is a single colon (`:`).
+- `<name>` — lowercase identifier, typically `[a-z0-9_-]+`. Concept entities use hierarchical names with embedded colons (e.g., `cross-repo:companion-pr-pattern`); other types use flat names without colons.
+- Separator is a single colon (`:`) between type and name.
 
-Examples: `skill:self-dev`, `tool:run_claude_pilot`, `agent:mika-dev`, `problem_type:fabrication`.
+Examples: `skill:self-dev`, `tool:run_claude_pilot`, `agent:mika-dev`, `problem_type:fabrication`, `concept:infra:helm-chart`.
 
 ## Reserved Domain Entity Types
 
@@ -26,8 +26,22 @@ The canonical source of truth is `KG_DOMAIN_ENTITY_TYPES` in `crates/mika-agent/
 | `tool` | `tool:<registered tool name>` | `tool:run_claude_pilot` |
 | `agent` | `agent:<agent name from config>` | `agent:mika-dev` |
 | `problem_type` | `problem_type:<slug>` | `problem_type:fabrication` |
+| `concept` | `concept:<category>:<name>` | `concept:infra:helm-chart` |
 
 To add a new domain type: update `KG_DOMAIN_ENTITY_TYPES` in `kg_schema.rs` first, then update this document.
+
+### Concept Entity Naming
+
+Concept entities use hierarchical `<category>:<name>` in the name field, producing three-segment entity keys: `concept:<category>:<name>`. Two categories are currently defined:
+
+| Category | Coverage | Example entity keys |
+|----------|----------|-------------------|
+| `cross-repo` | Cross-repo workflow patterns, coordination primitives, worktree management | `concept:cross-repo:companion-pr-pattern`, `concept:cross-repo:worktree-management` |
+| `infra` | Helm charts, Kubernetes resources, cloud topology, provisioning | `concept:infra:helm-chart`, `concept:infra:kubernetes-deployment`, `concept:infra:aws-eks` |
+
+The `concept` type is seeded by `domain_builder.rs` from hardcoded constants (`CONCEPT_CROSS_REPO_SEEDS`, `CONCEPT_INFRA_SEEDS`). To add new concept entities, update the seed lists in `domain_builder.rs`. To add a new concept category, add a new seed list following the same pattern.
+
+The hierarchical naming is an exception to the general `[a-z0-9_-]+` name convention. The DB CHECK constraint (`entity_key = type || ':' || name`) still holds because `name` is simply everything after the first colon. The category is stored redundantly in `properties_json.category` for query convenience.
 
 ## Subject-Layer Entities
 
