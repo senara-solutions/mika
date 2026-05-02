@@ -1402,11 +1402,8 @@ mod tests {
         // First rebuild
         let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
         let stats1 = builder.rebuild().await.expect("first rebuild");
-        let concept_added = stats1.entities_added;
-        assert!(
-            concept_added >= 20,
-            "should add at least 20 concept entities"
-        );
+        // 5 problem_type + 20 concept = 25 total (no skills/tools/agents)
+        assert_eq!(stats1.entities_added, 25);
 
         // Second rebuild — no new entities
         let builder2 = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);

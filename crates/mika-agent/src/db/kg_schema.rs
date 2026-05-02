@@ -230,6 +230,7 @@ mod tests {
         assert!(KG_DOMAIN_ENTITY_TYPES.contains(&"tool"));
         assert!(KG_DOMAIN_ENTITY_TYPES.contains(&"agent"));
         assert!(KG_DOMAIN_ENTITY_TYPES.contains(&"problem_type"));
+        assert!(KG_DOMAIN_ENTITY_TYPES.contains(&"concept"));
     }
 
     #[test]
