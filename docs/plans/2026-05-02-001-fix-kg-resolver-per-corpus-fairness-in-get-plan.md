@@ -341,3 +341,60 @@ Operator dashboard parsing: the field becomes a JSON string within the JSON log 
   - mika#928 — domain graph expansion (separate, match-rate vs attempt-rate)
 - **Related code:** `crates/mika-agent/src/kg/entity_resolver.rs:910` (the function), `crates/mika-agent/src/kg/resolver_tick.rs:142` (log emission), `crates/mika-agent/src/db.rs:1089` (schema)
 - **Prior solutions doc:** `mika/docs/solutions/best-practices/operator-db-evidence-disconfirmation-when-architect-cant-surface-premise-2026-04-30.md` — applied to verify premise pre-grooming.
+
+## Pass-1 iteration (mika-arch ITERATE → GROOMED)
+
+### F1 (BLOCKING) — Function signature + caller pin
+
+Confirmed at plan-commit time via `grep` on `crates/mika-agent/src/kg/entity_resolver.rs`:
+
+```rust
+// line 241
+pub async fn resolve_pending(&self, budget: u32) -> Result<ResolutionStats>
+
+// line 910
+async fn get_pending_entities(&self) -> Result<Vec<PendingEntity>>
+```
+
+**Callers of `resolve_pending` (production + test):**
+- `crates/mika-agent/src/kg/resolver_tick.rs:118` — production: 30-min tick path
+- `crates/mika-agent/src/kg/ingestion_orchestrator.rs:271` — production: post-extraction-batch resolution
+- `crates/mika-agent/src/server/mod.rs:1094` — production: server-side trigger path
+- `crates/mika-agent/tests/eval/kg_self_knowledge/stage_2_llm_disambiguation.rs:94/175/242` — eval tests
+- `crates/mika-agent/tests/eval/test_kg_budget_757.rs:333/380/394/449` — budget-cap tests
+
+All three production callers pass `budget: u32` — fairness logic applies uniformly. The eval tests pass `u32::MAX` (i.e., no Stage-2 throttling) — fairness behavior should not regress these (with `budget=MAX`, per-corpus sub-budgets also become MAX-equivalent; effective behavior identical).
+
+**`get_pending_entities_for_corpus(hash, per_corpus_budget)` is a NEW helper added alongside the existing `get_pending_entities()`** — existing function preserved for backwards compat (currently no other callers, but staged-not-removed avoids accidental breakage if callers added concurrently).
+
+### F2 (BLOCKING) — Under-allocation behavior
+
+**Decision: redistribute via single-pass reallocation.** When a corpus has fewer pending entities than its per-corpus budget, the unused slots are redistributed to remaining corpora proportionally to their pending-pool sizes. Rationale: with the secondary corpora having pending pools (~50) far smaller than per-corpus budget (~125 if N=4 and budget=500), wasting unused slots would cap effective throughput at ~250/tick (only primary fully utilizes). Redistribution preserves the 500/tick throughput.
+
+**Implementation shape:**
+1. First pass: assign each corpus `min(pending_count, total_budget / N)` entities.
+2. Compute `remaining_budget = total_budget - sum(assigned)`.
+3. Second pass: distribute `remaining_budget` to corpora with `pending_count > assigned[i]` proportionally to `pending_count - assigned[i]`.
+4. Single iteration only — no recursive redistribution. With N=4 and observed pool sizes (17538, 72, 55, 47), second pass gives the bulk to primary, others fully utilized.
+
+Worst-case effective budget: 500/tick (full utilization). Best-case secondaries get 25–50 attempts per tick (vs. starvation today).
+
+### F3 (SHARPENING) — Edge-case fixtures
+
+Test scenarios table extended with three edge cases:
+
+| Category | Scenario |
+|---|---|
+| Edge case (empty corpus) | Seed 4 corpora with pending pools (1000, 0, 50, 50); call `resolve_pending(200)`. Assert: corpus #2 (empty) attempts=0; corpus #1, #3, #4 redistributed (per F2). |
+| Edge case (single-corpus regression) | Seed only 1 corpus with 1000 pending; call `resolve_pending(200)`. Assert: corpus contributed 200 attempts (full budget, no fairness overhead — single-partition case identical to pre-fix global case). |
+| Edge case (under-allocation) | Seed 4 corpora with (500, 10, 10, 10); call `resolve_pending(200)`. Per-corpus initial allocation = 50; corpora #2/#3/#4 only have 10 each (under-allocated). Assert: corpora #2/#3/#4 each attempted 10; corpus #1 received the 120 redistributed slots. |
+
+These are mandatory regression tests per F3 (single-corpus regression), F2 (under-allocation behavior verification), and edge-case-coverage discipline.
+
+### F4 (SHARPENING) — Corpus discovery mechanism
+
+Plan's Implementation Unit adds a single line:
+
+> *"Corpus discovery: at the start of `resolve_pending`, query `SELECT DISTINCT docs_root_hash FROM kg_subject_entities WHERE [pending-status clause] AND docs_root_hash IN (?, ...)` (where the IN-list is the agent's `docs_root_hashes`). Self-discovering, no registry table needed. Cost: one indexed query per tick (N ≈ 4 corpora, indexed on `docs_root_hash`)."*
+
+This grounds the fairness loop's outer iteration. The IN-list filter ensures we only iterate corpora the agent is registered against (per `agent_kg_corpora`).
