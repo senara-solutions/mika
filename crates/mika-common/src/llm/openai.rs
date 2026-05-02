@@ -131,10 +131,7 @@ struct OpenAiErrorDetail {
 
 const MAX_RETRIES: u32 = 3;
 
-/// Estimated typical LLM call duration for deadline-aware retry abort.
-const TYPICAL_CALL_DURATION_SECS: u64 = 90;
-/// Buffer added to typical call duration for retry abort decisions.
-const RETRY_BUFFER_SECS: u64 = 30;
+use super::{RETRY_BUFFER_SECS, TYPICAL_CALL_DURATION_SECS};
 
 /// OpenAI-compatible provider that works with OpenAI, Ollama, vLLM, Groq, etc.
 pub struct OpenAiCompatibleProvider {
@@ -307,7 +304,19 @@ impl OpenAiCompatibleProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| LlmError::ProviderError("max retries exceeded".into())))
+        // Distinguish deadline-abort from normal retry exhaustion for diagnostics.
+        let deadline_aborted = deadline.is_some_and(|dl| {
+            dl.saturating_duration_since(Instant::now())
+                < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
+        });
+
+        Err(last_error.unwrap_or_else(|| {
+            if deadline_aborted {
+                LlmError::ProviderError("retry chain aborted: deadline budget insufficient".into())
+            } else {
+                LlmError::ProviderError("max retries exceeded".into())
+            }
+        }))
     }
 }
 

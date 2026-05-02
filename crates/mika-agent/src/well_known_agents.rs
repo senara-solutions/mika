@@ -466,10 +466,12 @@ pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disable
 
 /// Seed skill overrides for a well-known agent if none exist yet.
 ///
-/// Writes `set_skill_enabled(false)` for each skill in the agent's
-/// `disabled_skills` list. Only runs on first creation — if any
-/// `skill_overrides` rows already exist for this agent, the function
-/// returns early to preserve user customizations.
+/// Seeds skill overrides for a well-known agent. On first creation (no
+/// existing rows), writes `set_skill_enabled(false)` for disabled skills
+/// and seeds LLM overrides. On subsequent runs, reconciles any LLM
+/// overrides that have drifted from the source spec (e.g., model
+/// downgrade from Opus to Sonnet) while preserving non-LLM
+/// customizations.
 pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
     let spec = match find_well_known_agent(agent_name) {
         Some(s) => s,

@@ -18,6 +18,12 @@ use serde::Deserialize;
 pub use error::LlmError;
 pub use types::*;
 
+/// Estimated typical LLM call duration for deadline-aware retry abort.
+/// Conservative: covers Sonnet 4.6 observed p95 (49s) with headroom.
+pub const TYPICAL_CALL_DURATION_SECS: u64 = 90;
+/// Buffer added to typical call duration for retry abort decisions.
+pub const RETRY_BUFFER_SECS: u64 = 30;
+
 /// Internal tag names that should be stripped from LLM response text.
 /// These tags are injected into conversation history for LLM context (tool history,
 /// callback results, task health, etc.) but the LLM may echo them in its response.

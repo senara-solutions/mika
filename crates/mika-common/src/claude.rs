@@ -19,11 +19,7 @@ const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75";
 const CLAUDE_CODE_APP_HEADER: &str = "cli";
 
-/// Estimated typical LLM call duration for deadline-aware retry abort.
-/// Conservative: covers Sonnet 4.6 observed p95 (49s) with headroom.
-const TYPICAL_CALL_DURATION_SECS: u64 = 90;
-/// Buffer added to typical call duration for retry abort decisions.
-const RETRY_BUFFER_SECS: u64 = 30;
+use crate::llm::{RETRY_BUFFER_SECS, TYPICAL_CALL_DURATION_SECS};
 
 // -- Auth --
 
@@ -563,16 +559,38 @@ impl ClaudeClient {
             }
         }
 
+        // Distinguish deadline-abort from normal retry exhaustion for diagnostics.
+        let deadline_aborted = deadline.is_some_and(|dl| {
+            dl.saturating_duration_since(Instant::now())
+                < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
+        });
+
         Err(last_error
-            .map(|e| match &e {
-                ClaudeApiError::HttpError { status, .. } if *status >= 500 => {
-                    anyhow::Error::from(e)
-                        .context("Claude API is temporarily unavailable. Please try again shortly.")
+            .map(|e| {
+                let base = match &e {
+                    ClaudeApiError::HttpError { status, .. } if *status >= 500 => {
+                        anyhow::Error::from(e).context(
+                            "Claude API is temporarily unavailable. Please try again shortly.",
+                        )
+                    }
+                    _ => anyhow::Error::from(e)
+                        .context("Claude API is busy. Please wait a moment and try again."),
+                };
+                if deadline_aborted {
+                    base.context("retry chain aborted: deadline budget insufficient")
+                } else {
+                    base
                 }
-                _ => anyhow::Error::from(e)
-                    .context("Claude API is busy. Please wait a moment and try again."),
             })
-            .unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
+            .unwrap_or_else(|| {
+                if deadline_aborted {
+                    anyhow::anyhow!(
+                        "retry chain aborted: deadline budget insufficient (no prior error)"
+                    )
+                } else {
+                    anyhow::anyhow!("max retries exceeded")
+                }
+            }))
     }
 
     async fn send_once(
