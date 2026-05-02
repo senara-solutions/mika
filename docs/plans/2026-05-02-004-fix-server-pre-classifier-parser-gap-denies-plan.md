@@ -61,7 +61,9 @@ This is a parser correctness issue: the pre-classifier needs quote-aware scannin
 
 ### Deferred to Separate Tasks
 
-- **Companion fix in `claude-pilot-py/src/claude_pilot/tier1.py`** — the Python mirror has the same blanket-rejection logic (per the F5 sentinel pointer). After this Rust fix verifies via canary, file a follow-up to mirror the quote-aware logic in Python. Same pattern, different repo.
+- **Companion fix in `claude-pilot-py/src/claude_pilot/tier1.py`** (per pass-1 F2, BLOCKING — pinned with explicit title + filing gate). The Python mirror keeps blanket-rejection (intentional asymmetry: tier1.py is the primary fast-path; stricter is safer there). Divergence documented in F5 sentinel comment in both files.
+  - **Companion task title:** `fix(security): quote-aware metacharacter rejection in tier1.py to match permission_pre_classifier.rs (mika#938 follow-up)`
+  - **Filing gate:** Companion ticket MUST be filed BEFORE this PR merges. The PR description includes a checkbox for the implementer to confirm the companion ticket is filed; reviewer blocks merge if it isn't.
 - **Hardening the /mika-ask-arch invocation form** — could pass the message via stdin (`mika ask --agent <peer> -` reading the brief from stdin) instead of as a quoted argument. This eliminates the shell-quoting ambiguity entirely. Worth a separate ticket; not blocking this fix.
 - **mika-relay TIER 1 prompt changes** — out of scope per Vincent-locked constraint (don't re-introduce wallpaper trap).
 
@@ -130,9 +132,13 @@ None — this is a Rust parser correctness fix grounded entirely in the existing
 - **Should the rejection logic preserve security inside double-quoted regions?** → Architect's call (Decision 1). Plan picks Option C (allow inside any quoted region) with rationale; alternatives B (allow only in single-quoted) and A (allow inside both, reject only unquoted) are documented as rejected.
 - **Companion fix in tier1.py?** → Deferred to separate task. Same gap exists in Python mirror; mirror after canary verifies the Rust fix.
 
+### Resolved by pass-1 architect
+
+- **F1 (BLOCKING) — escape handling pin.** The byte scanner MUST treat `\"` inside a double-quoted region as an escaped quote: quote state does NOT toggle when `\"` is encountered. The scanner advances past the backslash-quote pair atomically. Symmetric rule for `\'` inside single-quoted regions. Rationale: the de-facto /mika-ask-arch invocation form uses double quotes with escaped inner quotes for nested code references; the alternative (don't track escapes; always toggle on `"`) would conservatively-reject legitimate briefs and force caller-side change. Architect ratified Option C (allow inside any quoted region) at pass-1; escape-aware quote tracking is the consistent extension. Mandatory fixture: `mika ask --agent mika-arch "has \"escaped\" and \`backtick\`"` → `Some(Allow)`.
+
 ### Deferred to Implementation
 
-- **Exact byte-walking implementation of `contains_unquoted_metacharacter`** — derive during /ce:work using `advance_past_quoted` as the precedent. The implementation must handle: empty string, single quotes, double quotes, escaped quotes (`\"` and `\'`), interleaved quote types (`'a"b'` is single-quoted including the literal `"`), unterminated quotes (treat as unclosed; reject conservatively if metacharacter appears after the unclosed quote start? — implementer's call, document the choice).
+- **Exact byte-walking implementation of `contains_unquoted_metacharacter`** — derive during /ce:work using `advance_past_quoted` as the precedent. The escape-handling rule is now LOCKED per F1 above (escape-aware: `\"` and `\'` do not toggle quote state). Implementation must also handle: empty string, mixed quote types (`'a"b'` is single-quoted including the literal `"`), unterminated quotes (per Decision-equivalent: conservative reject — if a quote opens and never closes, fall through to LLM).
 
 ## Implementation Units
 
@@ -170,6 +176,7 @@ None — this is a Rust parser correctness fix grounded entirely in the existing
 | Happy path | `mika ask --agent mika-arch --format json --verbose 'Brief with $(literal) text'` (single-quoted message containing `$(`) → Some(Allow). |
 | Happy path | `mika ask --agent mika-arch --format json --verbose --session-id abc-123 "Second-pass review with \`session_id\` reference"` (combined flags + backtick in quotes) → Some(Allow). |
 | Happy path | Equivalent forms on `mika-dev` and `mika-qa` peers with the same backtick-in-quoted-message shape → Some(Allow). |
+| Edge case (F1 mandatory) | `mika ask --agent mika-arch "has \"escaped\" and \`backtick\`"` (escape-aware quote tracking — `\"` does not toggle state, backtick remains inside double-quoted region) → Some(Allow). Verifies F1 escape-handling pin. |
 | Edge case | `mika ask --agent mika-arch "msg with \"escaped quote\" and \`outer-quoted backtick\`"` (escaped inner quotes; backtick still inside double-quoted region) → Some(Allow). |
 | Edge case | Empty message: `mika ask --agent mika-arch ""` → Some(Allow) (peer match works; no metacharacter to evaluate). |
 | Edge case | Unterminated quote: `mika ask --agent mika-arch "unterminated message with \`backtick\` and no closing quote` (no trailing `"`) → None (conservatively reject; the parser cannot determine the quoted region's end so falls through to LLM). |
@@ -182,10 +189,55 @@ None — this is a Rust parser correctness fix grounded entirely in the existing
 **Verification:**
 
 - `cargo clippy --all-targets --all-features -- -D warnings` passes.
-- `cargo test --all` — 22 existing + new fixtures all pass; total fixture count increases by at least 11 (the table above lists 11 new scenarios; implementer may split or add).
-- `git diff` shows changes confined to `crates/mika-agent/src/server/permission_pre_classifier.rs` only.
-- The F5 sentinel comment at line 60 is updated to note the Python/Rust divergence on branch 5 with pointer to the deferred companion task.
+- `cargo test --all` — 22 existing + new fixtures all pass; total fixture count increases by at least 12 (the table above lists 12 new scenarios after F1's mandatory escape fixture; implementer may split or add).
+- `git diff` shows changes confined to `crates/mika-agent/src/server/permission_pre_classifier.rs` only (Unit 1 surface).
+- The F5 sentinel comment at line 60 is updated to note the Python/Rust divergence on branch 5 with pointer to the companion task title pinned in Scope Boundaries → Deferred to Separate Tasks.
 - The doc-comment at line 88 (Branch 5 description) reflects the new semantics.
+
+- [ ] **Unit 2: Compound doc — test-fixture content coverage discipline**
+
+**Goal:** Author `docs/solutions/best-practices/test-fixture-content-coverage-2026-05-02.md` capturing the N=2 pattern: test fixtures for permission classifiers must cover both **command structure** (env-var prefix, compound separators, flag placement, etc.) AND **representative message content** (markdown briefs with backticks, code spans, technical prose). Per pass-1 F3 (BLOCKING) — N=2 threshold reached, compound doc authors NOW, not via forward-pointer.
+
+**Requirements:** Pass-1 F3.
+
+**Dependencies:** Unit 1's diagnosis must be locked (it is, after pass-1).
+
+**Files:**
+- Create: `docs/solutions/best-practices/test-fixture-content-coverage-2026-05-02.md`
+
+**Approach:**
+
+The compound doc names two grounding cases (N=2):
+
+- **Case 1 — PR #937 (mika#935 Unit 2):** 22 test fixtures covered command structure across 6 corner-case categories (env-var prefix, compound separators, flag re-ordering, `--` separator, equals form, quoting variants). Fixtures used short ASCII messages (`"Test"`, `"hello"`). Result: a corner case bit in production canary v7 — markdown briefs with backticks triggered the blanket rejection that fixtures didn't surface.
+- **Case 2 — mika#938 (this plan):** The remediation. Adds 12+ fixtures covering message-content variants (backticks inside double-quoted, `$()` inside single-quoted, escaped inner quotes, etc.).
+
+The pattern: **fixtures must include representative production message-content shapes, not just structural variants of the command form.** For permission classifiers specifically, the "production shape" includes markdown briefs with inline code, file paths in backticks, and technical prose — the canonical /mika-ask-arch invocation.
+
+The doc names a generalized testing discipline:
+
+> *"When testing parsers/classifiers that process user-controlled CONTENT inside structured commands, fixtures must enumerate both:*
+> *(a) Command-structure variants — flag ordering, compound separators, quote types, env-var prefixes;*
+> *(b) Content-payload variants — representative production message shapes including their characteristic metacharacters (markdown backticks, dollar-paren in code spans, escaped quotes, etc.).*
+> *Skipping (b) leaves the parser exposed to corner cases that only surface when real production traffic flows through."*
+
+Forward-pointer for the next instance: when N=3 surfaces, append to this same doc rather than authoring a third compound entry.
+
+**Patterns to follow:**
+
+- `docs/solutions/best-practices/mika-arch-first-dogfood-2026-04-25.md` — same shape (compound doc capturing a parser/classifier discipline grounded in production evidence). Match the structure: short framing, two grounding cases with citations, generalized rule, escalation criteria.
+- `docs/solutions/workflow-issues/grooming-branch-callout-required-2026-04-25.md` — N=1-to-N=2 progression pattern (started as a forward-pointer in a single ticket; promoted to a compound doc when the second instance surfaced). Mirror the citation discipline.
+
+**Test scenarios:**
+
+- Test expectation: none — pure documentation with no behavioral change.
+
+**Verification:**
+
+- `ls docs/solutions/best-practices/test-fixture-content-coverage-2026-05-02.md` exists in the worktree.
+- Doc cites both grounding cases (PR #937 + mika#938) with specific evidence (canary v7 session ID, 22-fixture count, the actual failing form).
+- Doc names the generalized rule (a + b above) explicitly.
+- Doc carries forward-pointer for N=3 escalation (append vs. new doc).
 
 ## System-Wide Impact
 
@@ -218,7 +270,7 @@ None — this is a Rust parser correctness fix grounded entirely in the existing
 
 - **Rollout:** Standard Rust deploy. `cargo build --release` → `make deploy` → mika-agent restart. mika-relay picks up new logic on next session start (~automatic, no manual intervention).
 - **Verification timeline:** After PR merges and `make deploy` completes, re-fire `mika ask --agent mika-dev "groom mika issue#931"` directly. Watch for three green criteria within 10 minutes + zero `[denied]` lines.
-- **Pattern claim (N=2, eligible for compound doc):** This is the SECOND instance of the broader pattern *"verification fixtures cover command-structure but not message-content; the corner case bites in production."* First instance: mika-platform#76 surfaced canary v6 → exposed mika#935 RR-001 territory (mis-credited to flag injection). This instance: canary v7 → backtick-in-message rejection. Per `compound_doc_timing_forward_vs_retroactive_groom` and `feedback_compound_infra_fixes.md`, N=2 is the threshold for authoring a compound doc. After this fix verifies, author `mika/docs/solutions/best-practices/test-fixture-content-coverage-2026-05-02.md` capturing both instances + the discipline (test fixtures must cover both COMMAND STRUCTURE and MESSAGE CONTENT corner cases). Forward-pointer.
+- **Pattern claim (N=2, compound doc IN PLAN per pass-1 F3 BLOCKING):** This is the SECOND instance of *"verification fixtures cover command-structure but not message-content; the corner case bites in production."* Compound doc authors as Unit 2 of this plan at `docs/solutions/best-practices/test-fixture-content-coverage-2026-05-02.md`. NOT a forward-pointer — N=2 threshold reached, per `compound_doc_timing_forward_vs_retroactive_groom`. Two grounding cases: (1) PR #937 — 22 fixtures covered structure but not content, surfaced via canary v7. (2) mika#938 — this plan, fixes the resulting blanket-rejection bug.
 - **Companion follow-up for tier1.py:** Once this Rust fix verifies, file `senara-solutions/claude-pilot-py` ticket to mirror the quote-aware logic. Same shape, different repo. The F5 sentinel pointer at `permission_pre_classifier.rs:60` should be updated to reference the new ticket.
 - **Ticket body correction:** mika#938's body asserts flag injection. After this plan ships, file a comment on mika#938 explaining the correct root cause for future readers. Do NOT silently rewrite the ticket body — the audit trail of the misdiagnosis is institutionally valuable.
 
