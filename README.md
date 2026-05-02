@@ -19,14 +19,14 @@ CLI Mode (local)                    Hosted Mode (containers)
   +---------+                       +------+-------+
        |                                   |
   +----v--------+            +-------------+-------------+
-  |  Claude API |            |             |             |
+  |   LLM API  |            |             |             |
   +-------------+     +------v---+  +------v---+  +------v---+
                       | Agent A  |  | Agent B  |  | Agent C  |
                       | +SQLite  |  | +SQLite  |  | +SQLite  |
                       +----+-----+  +----+-----+  +----+-----+
                            |             |             |
                       +----v-------------v-------------v----+
-                      |            Claude API               |
+                      |            LLM API (multi-provider) |
                       +-------------------------------------+
 ```
 
@@ -39,9 +39,10 @@ Each customer gets an isolated container with their own SQLite database. No cust
 - **Skills system** -- Extensible filesystem-based tool registry with Git-based marketplace (`mika skills install`)
 - **Proactive heartbeat** -- Check-ins via silent agent loop with rate limiting
 - **Reminders** -- Time-based reminders with recovery on restart
+- **Knowledge Graph** -- Three-layer KG (domain/lexical/subject) in SQLite with LLM-based entity extraction, resolution, and graph traversal for self-knowledge queries
 - **Conversation compaction** -- Automatic summarization of old messages
 - **Slash commands** -- 20 client-side commands with shell-like Tab completion and argument completers
-- **Multi-channel** -- CLI (local) and Telegram (hosted) with WhatsApp planned
+- **Multi-channel** -- CLI (local), Telegram, and GitHub webhooks (hosted) with WhatsApp planned
 - **Per-customer isolation** -- One container per customer
 
 ## Quick Start
@@ -73,21 +74,27 @@ On first run, Mika creates `~/.mika/` with default configuration, personality, a
 | Component | Technology |
 |-----------|-----------|
 | Language | Rust (edition 2024) |
-| LLM | Claude (Sonnet 4.6 default) via direct API |
+| LLM | Multi-provider via `LlmProvider` trait — Anthropic, OpenAI, OpenRouter, Groq, Ollama, Mistral, Google, DeepSeek, Kimi, MiniMax, Qwen (11 providers) |
 | Database | SQLite via rusqlite (per-customer) |
 | HTTP server | Axum 0.8 with tower-http |
 | TUI | ratatui + tui-textarea + crossterm |
 | Async runtime | tokio |
+| MCP client | rmcp (official Rust MCP SDK) — stdio and Streamable HTTP transports |
+| Telemetry | OpenTelemetry + tracing (feature-gated OTLP export, Langfuse-compatible) |
 | Config | config-rs with `MIKA_` env prefix |
 
 ## Project Structure
 
 ```
 crates/
-  mika-common/     Shared: config, Claude API client, logging, home directory
+  mika-common/     Shared: config, LLM providers, OAuth, GitHub App auth, telemetry
   mika-agent/      Agent: SQLite DB, agent loop, tools, skills, HTTP server (mika-server)
-  mika-gateway/    Telegram webhook router: Postgres customer registry, message routing
+  mika-a2a/        A2A (Agent-to-Agent) protocol v0.3: JSON-RPC types, task state machine, SSE streaming
+  mika-gateway/    Telegram + GitHub webhook router: Postgres customer registry, message routing, A2A proxy
   mika-cli/        TUI CLI (mika): ratatui chat, clap subcommands, slash commands
+dashboard/         React observability dashboard (TypeScript + Vite + Tailwind CSS v4)
+packages/ui/       @senara-solutions/ui shared React component library
+skills/bundled/    Engine-coupled skills discovered at build time (self-dev, qa-review, etc.)
 ```
 
 ## Tools
@@ -109,7 +116,7 @@ The agent has 23 builtin tools and 6 conditional management tools:
 
 ```bash
 cargo build          # Build all crates
-cargo test           # Run tests (~1169 tests)
+cargo test           # Run tests (~3500 tests)
 cargo clippy         # Lint
 cargo fmt            # Format
 cargo run --bin mika # Run TUI CLI
