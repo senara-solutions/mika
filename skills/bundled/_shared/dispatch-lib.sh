@@ -1,7 +1,7 @@
 #!/bin/bash
 # Shared dispatch library for claude-pilot skills (dev-pilot, dev-groom, etc.)
 #
-# Single entrypoint: dispatch_claude_pilot "$ENTRY_COMMAND"
+# Single entrypoint: dispatch_claude_pilot (no args — entry command derived from $SKILL)
 # Reads JSON from process-inherited stdin (fd 0).
 # Sets up worktree, scrubs env, installs EXIT trap, runs claude-pilot,
 # and delivers the result via mika callback.
@@ -9,11 +9,10 @@
 # Callers MUST NOT set their own EXIT trap (it would be overwritten silently —
 # bash trap is process-scoped, not function-scoped).
 #
-# Adding a third sibling skill (e.g., dev-explore) requires only:
-#   1. A new skill.toml + system_prompt.md
-#   2. A thin run.sh that sources this file and calls dispatch_claude_pilot "/your-command"
-#   3. A tools.json with the run_claude_pilot entry (skill enum set to the new skill name)
-# No edits to this file or existing sibling skills.
+# One host skill (dev-pilot) owns the `run_claude_pilot` tool with a union-enum
+# `skill` parameter. Sibling skills in the self-dev family extend the enum and
+# add a case in this lib's skill→entry mapping. Sibling skills do not register
+# their own `run_claude_pilot`. See mika#932 for context.
 
 # --- Internal helpers (underscore-prefixed, not part of the API contract) ---
 
@@ -111,16 +110,13 @@ _parse_input_json() {
 }
 
 _validate_inputs() {
-    local EXPECTED_SKILL="$1"
-
     if [ -z "$SKILL" ]; then
-        echo "Error: missing required argument 'skill'; valid values: [\"${EXPECTED_SKILL}\"]" >&2
+        echo "Error: missing required argument 'skill'; valid values: [\"dev-pilot\", \"dev-groom\"]" >&2
         exit 1
     fi
-    if [ "$SKILL" != "$EXPECTED_SKILL" ]; then
-        echo "Error: invalid skill '${SKILL}'; valid values: [\"${EXPECTED_SKILL}\"]" >&2
-        exit 1
-    fi
+
+    # Skill validation is handled by the case switch in dispatch_claude_pilot
+    # which derives ENTRY_COMMAND from SKILL. Unknown skills exit 1 there.
 
     if [ -z "$PROMPT" ]; then
         echo "Error: prompt is required" >&2
@@ -391,14 +387,12 @@ _deliver_callback() {
 
 # --- Public API ---
 
-# Single entrypoint. Args: $1 = entry slash command (e.g., "/mika" or "/mika-groom-ticket")
+# Single entrypoint. No args — entry command is derived from the $SKILL field
+# in the input JSON via the case switch below.
 # Reads JSON from process stdin (fd 0) — inherited from the calling handler script.
 # Sets up worktree, scrubs env, invokes relay, installs EXIT trap, runs claude-pilot.
 # Delivers result via callback when complete.
 dispatch_claude_pilot() {
-    local ENTRY_COMMAND="$1"
-    local EXPECTED_SKILL="${2:-}"
-
     # --- Diagnostic trace (mika#887) ---
     TRACE_FILE="/tmp/dev-pilot-trace-$$.log"
     exec 9>>"$TRACE_FILE" 2>/dev/null || exec 9>/dev/null
@@ -426,16 +420,23 @@ dispatch_claude_pilot() {
     # Install EXIT trap for crash-recovery callback delivery
     trap '_dispatch_lib_exit_trap' EXIT
 
-    # Derive expected skill from entry command if not provided
-    if [ -z "$EXPECTED_SKILL" ]; then
-        case "$ENTRY_COMMAND" in
-            "/mika")                EXPECTED_SKILL="dev-pilot" ;;
-            "/mika-groom-ticket")   EXPECTED_SKILL="dev-groom" ;;
-            *)                      EXPECTED_SKILL="$SKILL" ;;  # Fallback: accept whatever was passed
-        esac
-    fi
+    _validate_inputs
 
-    _validate_inputs "$EXPECTED_SKILL"
+    # SIBLING SKILL DISPATCH MAPPING (mika#932)
+    # Each arm maps a sibling skill to its slash-command entry point.
+    # Adding a sibling requires:
+    #   1. Add a new arm here.
+    #   2. Widen dev-pilot/tools.json `skill.enum` to include the new value.
+    #   3. Update self-dev/system_prompt.md to teach mika-dev when to dispatch.
+    # Threshold for refactor: if N>5 siblings, escalate to skill-scoped tool
+    # registries (Option C from mika#932). Until then, this case switch is
+    # the contract.
+    local ENTRY_COMMAND
+    case "$SKILL" in
+      dev-pilot)  ENTRY_COMMAND="/mika" ;;
+      dev-groom)  ENTRY_COMMAND="/mika-groom-ticket" ;;
+      *) echo "Unknown skill: $SKILL" >&2; exit 1 ;;
+    esac
     _setup_gh_auth
     _scrub_env
     _set_up_worktree
