@@ -139,7 +139,10 @@ fn print_task_detail(t: &Task) {
         println!("  Process ID:    {pid}");
     }
     if let Some(ref v) = t.result {
-        let display = if v.len() > 200 { &v[..200] } else { v };
+        let display = match v.char_indices().nth(200) {
+            Some((i, _)) => &v[..i],
+            None => v,
+        };
         println!("  Result:        {display}");
     }
     println!();
