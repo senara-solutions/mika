@@ -742,6 +742,23 @@ pub async fn handle_task_children(
     }
 }
 
+/// GET /api/v1/tasks/:id/descendants — all descendant tasks (recursive tree).
+pub async fn handle_task_descendants(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_task_descendants(&task_id).await {
+        Ok(descendants) => Json(
+            descendants
+                .into_iter()
+                .map(TaskResponse::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
 // ===== Task Sessions =====
 
 /// Response type for sessions linked to a task tree.

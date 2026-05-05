@@ -127,6 +127,10 @@ fn build_router(state: AppState) -> Router {
             get(dashboard::handle_task_children),
         )
         .route(
+            "/tasks/{task_id}/descendants",
+            get(dashboard::handle_task_descendants),
+        )
+        .route(
             "/tasks/{task_id}/sessions",
             get(dashboard::handle_task_sessions),
         )
