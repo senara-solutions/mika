@@ -66,11 +66,35 @@ The plan's Steps 2A/2B below are kept intact for audit-trail clarity, but **exec
 
 ### Phase 0.5 — Active investigation surface (replaces former Step 2B)
 
-1. **F5 first** (cheapest): add a single `tracing::warn!` line at the top of `validate_required_fields` emitting `tool_name`, `input_keys = input.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default()`, and `required_fields_observed`. Build, deploy, re-trigger the dispatch (or wait for the next mika#666 retry — the bug is deterministic for that ticket). The log line tells us in one read whether the schema was right and the input was wrong, the schema was wrong and the input was right, or both were unexpected.
-2. **F4 second** (if F5 inconclusive): walk `apply_overrides`, `apply_identity_allowlist`, `apply_agent_tool_visibility`, `inject_skills_and_resolve_tools`, and `inject_task_id_field` line-by-line for any write to `input_schema` or its `required` array. Pin the drop site or rule out registry mutation entirely.
+**Prerequisite (operational, per pass-2 U2):** before the F5 trace lands, cancel mika#666's wedged callback child task `723937bf` via `mika tasks cancel 723937bf` to release the `validate_dispatch_readiness` global dispatch slot. The F5 trace requires a dispatch attempt to fire; mika#666 is the deterministic reproducer; the next `ready`-label re-application after fix-deploy needs a clean queue head. Cancellation is in-scope as a one-line operational prerequisite; it is not a separate ticket.
+
+1. **F5 first** (cheapest): add a `tracing::warn!` at the top of `validate_required_fields` emitting:
+   - `tool_name`
+   - `input_keys = input.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default()`
+   - `required_raw = skill_tool.definition.input_schema.get("required").cloned()` (the **pre-`as_array()`** value, per pass-2 F7)
+   - `required_fields_observed` (the post-`as_array()` parsed Vec)
+
+   Logging the raw `required` value before `as_array()` distinguishes "schema lacks `required`" (raw is `None`) from "schema has malformed `required`" (raw is `Some(non-array)` — silently passes today, see Step 3.5) from "schema is correct, input is malformed" (raw is `Some(array(...))`, parsed Vec matches, input lacks `skill`). The single line yields a three-way diagnosis on first fire.
+
+   Build, deploy, re-trigger via `gh issue edit 666 --repo senara-solutions/mika --add-label ready` (the operational prerequisite above must already be in place). The bug is deterministic for mika#666.
+
+2. **F4 second** (if F5 inconclusive or points at registry-mutation):
+   - **U1 check first (cheapest, per pass-2):** assert `dev-pilot` is the unique registrant of the tool name `run_claude_pilot` — `grep -rn '"run_claude_pilot"' skills/bundled/*/tools.json` and check the `SkillRegistry` at runtime via `mika skills list --json`. If a second registrant shadows `dev-pilot` with a different schema, `validate_required_fields` would read the shadow's `input_schema` while we audited dev-pilot's. This is a degenerate F4.
+   - Then walk `apply_overrides`, `apply_identity_allowlist`, `apply_agent_tool_visibility`, `inject_skills_and_resolve_tools`, and `inject_task_id_field` line-by-line for any write to `input_schema` or its `required` array. Pin the drop site or rule out registry mutation entirely.
+
 3. **F6 last** (if F4/F5 both inconclusive): correlate dispatch timestamps against registry-rebuild timestamps in `server.log` (`grep -E "skills.*reloaded|registry.*rebuild" /var/log/mika/server.log`).
 
+**Instrumentation lifecycle (per pass-2 U4):** the F5 `warn!` ships in this PR and stays in code. Level is `DEBUG` for the rapid-path "schema correct, input correct, required fully present" case (silent in production), and `WARN` for any other shape (rare; surfaces immediately if a future regression in this class lands). The split is one-line at the bottom of `validate_required_fields`: `if all_required_fields_present_and_input_complete { tracing::debug!(...) } else { tracing::warn!(...) }`. Removing the instrumentation post-fix would leave the next regression invisible; keeping it adds zero noise on the happy path.
+
 The original Step 2B's "compare via `mika skills info dev-pilot --json`" approach is preserved as a complementary check for F4 — diff the on-disk per-agent state against the in-memory registry view at runtime.
+
+### Step 3.5 — Validator hardens against malformed schema (per pass-2 F7)
+
+Today `validate_required_fields` reads `required` via `.as_array()`. If `required` is present but not an array (malformed schema — `null`, an object, a string), `as_array()` returns `None`, the existing path emits a `skill_tool_malformed_schema_skipped_validation` warn, and the function **silently returns `None` (passes)**. This is the second silent-pass mode in the same function: missing `required` (intentional, schemas without required-fields are valid) AND malformed `required` (a real bug we should reject) both end at the same return point.
+
+**Change:** split the two cases. Missing `required` (key absent) → return `None` as today. Present but non-array → return `Some(ToolOutput::error(...))` with a `malformed_required_schema` structured error and the same WARN log. The implementer touches `validate_required_fields` directly; the change is ~6 lines (replace the silent fall-through after the existing warn with an explicit error return).
+
+This is defense-in-depth — it doesn't fix the production bug (where `required` is correctly an array, per the source file we inspected) but it closes the second silent-pass gap so any future schema-shape drift surfaces as a structured tool error instead of a silent accept.
 
 ## Root-cause hypotheses (ranked, original)
 
@@ -150,9 +174,9 @@ The fix is operational *and* structural; both, not either. The validate-fields r
    - Cancel the stuck `mika#666` callback child task via `mika tasks cancel <child-id>` so `validate_dispatch_readiness` releases the queue.
    - This unfreezes milestone#13 immediately. The runtime validation in #969 takes effect from the next dispatch.
 
-2. **Structural — schema-version gate on `MIKA_DISABLE_BUNDLED_SKILLS`** (`crates/mika-agent/src/startup.rs:33`):
-   - Embed a per-skill schema-version constant at build time (sibling field on `BundledSkill`, sourced from `skill.toml` `[skill] schema_version` or the file-content sha — pick the cheaper).
-   - On startup, when re-seed is *disabled*, compare the on-disk `skill.toml` schema version to the embedded one. If they diverge, emit a `bundled_skill_schema_drift` ERROR log (one line per affected skill) listing the bypassed update.
+2. **Structural — content-hash drift gate on `MIKA_DISABLE_BUNDLED_SKILLS`** (`crates/mika-agent/src/startup.rs:33`) (per pass-2 U3 — content-hash chosen over schema-version):
+   - Embed a per-skill content sha256 at build time (sibling field on `BundledSkill`, computed by `build.rs` over the concatenation of `skill.toml` + `tools.json` + `system_prompt.md`). Cheaper than maintaining a manual `[skill] schema_version` field — every meaningful change to a bundled skill mutates the hash, no operator discipline required.
+   - On startup, when re-seed is *disabled*, compute the on-disk content hash and compare to the embedded one. If they diverge, emit a `bundled_skill_drift` ERROR log (one line per affected skill, naming the skill and showing both hashes truncated to 12 chars).
    - Do NOT force-re-seed when the operator explicitly opted out — that breaks the documented hot-patch workflow. The point is *visibility*, not auto-correction. The error log is the defense.
    - Add a `mika skills doctor` subcommand (or extend `mika status`) that surfaces the same drift on-demand without restart.
 
