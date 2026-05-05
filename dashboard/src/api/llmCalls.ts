@@ -73,3 +73,37 @@ export function useLlmCallToolCalls(llmCallId: string | undefined) {
     enabled: !!llmCallId,
   })
 }
+
+// Cost trend types and hook
+
+export interface CostTrendBucket {
+  timestamp: string
+  cost_usd: number
+  input_tokens: number
+  output_tokens: number
+  call_count: number
+  agent_id: string | null
+}
+
+export interface CostTrendResponse {
+  buckets: CostTrendBucket[]
+  bucket_size: string
+  has_estimated_pricing: boolean
+  estimated_models: string[]
+}
+
+export interface CostTrendFilters {
+  agent_id?: string
+  model?: string
+  from?: string
+  to?: string
+  bucket?: string
+}
+
+export function useCostTrend(filters: CostTrendFilters) {
+  return useQuery<CostTrendResponse>({
+    queryKey: ['cost-trend', filters],
+    queryFn: () =>
+      apiFetch('/llm-calls/cost-trend', filters as Record<string, string | undefined>),
+  })
+}
