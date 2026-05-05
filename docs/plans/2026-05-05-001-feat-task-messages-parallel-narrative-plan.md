@@ -30,7 +30,15 @@ Transaction overhead: a single SQLite transaction for a double-write is sub-micr
 Before touching `executor.rs` or `db.rs`, verify exact line ranges from the production source. These are the load-bearing read targets:
 
 1. **`db.rs:5845`** — `replace_with_summary` DELETE clause. Confirm `WHERE agent_id = ?1 AND role != 'summary' AND id <= ?2`. Verify no undocumented `task_id` column already exists on `messages`.
-2. **`db.rs`** — current schema version constant (search `SCHEMA_VERSION` or equivalent). Confirm the version number that becomes `v_current+1`. **Do not hardcode**: at time of writing, the runtime DB is at v30 but the codebase has the v30→v31 migration landed (#653 `llm_calls.response_text`/`reasoning`). Implementer must run `PRAGMA schema_version` against the deployed DB AND grep for the highest migration constant in `db.rs` to determine the actual `v_current` at implementation time. The migration this plan adds is `v_current+1` regardless of the specific number.
+2. **`db.rs`** — current schema version constant (search `SCHEMA_VERSION` or equivalent). Confirm the version number that becomes `v_current+1`. **Do not hardcode**: at time of writing, the runtime DB was at v30 but the codebase had the v30→v31 migration landed (#653 `llm_calls.response_text`/`reasoning`).
+
+   Implementer must check **both** values at implementation time:
+   - **Deployed DB version:** `sqlite3 ~/.mika/data/mika.db "SELECT MAX(version) FROM schema_version"` (the application's `schema_version` table — NOT the SQLite-internal `PRAGMA schema_version` which is a change counter, not the migration version).
+   - **Codebase's highest migration constant:** grep for the highest migration version in `db.rs`'s migration runner (search for the `migrating database schema vN → vN+1` log lines or the equivalent constant).
+
+   **Halt-and-surface on mismatch:** if the two values disagree, the deployed DB is unmigrated relative to the codebase. Do NOT silently pick one and add a new migration on top. Halt and surface to the operator: "DB at vN, codebase has migrations up to vN+k pending — run a deploy that triggers migration before adding new migration vN+k+1." This is a precondition gap, not a fix this plan owns.
+
+   Once both values agree, `v_current` is that shared number and the migration this plan adds is `v_current+1`.
 3. **`db.rs:5714`** — `INSERT INTO messages` column list. This is the site that gets the transaction wrapper.
 4. **`agent.rs::run_loop`** — message-save call sites at lines 1798, 1892, 2247, 2303, 2224, 2279, 2313. Confirm which carry a `task_id`-carrying context today and which don't.
 5. **`dispatcher.rs::dispatch_resume_agent`** — locate the `messages` INSERT site (or the `db.*` call that writes callback-turn messages). Confirm `task_id` is accessible from the `Task` struct at that call site.
