@@ -881,6 +881,36 @@ pub async fn handle_llm_calls(
     .into_response()
 }
 
+// ===== Cost Trend =====
+
+#[derive(Debug, Deserialize)]
+pub struct CostTrendQuery {
+    pub agent_id: Option<String>,
+    pub model: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub bucket: Option<String>,
+}
+
+/// GET /api/v1/llm-calls/cost-trend — cost over time aggregation.
+pub async fn handle_cost_trend(
+    State(state): State<AppState>,
+    Query(q): Query<CostTrendQuery>,
+) -> impl IntoResponse {
+    let filters = db::CostTrendFilters {
+        agent_id: q.agent_id,
+        model: q.model,
+        from: q.from,
+        to: q.to,
+        bucket: q.bucket,
+    };
+
+    match state.dashboard_db.query_cost_trend(filters).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
 // ===== Tool Calls =====
 
 #[derive(Debug, Deserialize)]

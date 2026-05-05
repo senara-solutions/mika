@@ -2028,6 +2028,13 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn query_cost_trend(
+        &self,
+        filters: crate::db::CostTrendFilters,
+    ) -> Result<crate::db::CostTrendResponse> {
+        self.with_db(move |db| db.query_cost_trend(&filters)).await
+    }
+
     pub async fn query_tool_calls(
         &self,
         filters: crate::db::ToolCallFilters,

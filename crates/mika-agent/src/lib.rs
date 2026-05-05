@@ -10,6 +10,7 @@ pub(crate) mod github_graphql;
 pub mod kg;
 pub mod mcp;
 pub mod messaging;
+pub mod pricing;
 pub mod prompt;
 pub mod rewind;
 pub mod secret_scrubber;
