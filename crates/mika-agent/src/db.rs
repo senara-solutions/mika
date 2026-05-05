@@ -5122,6 +5122,31 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get all descendant tasks for a given root task (recursive).
+    /// Returns all tasks in the subtree below root_task_id, excluding the root itself.
+    /// No agent_id filter — team task trees have children with different agent_ids.
+    /// Depth guard (depth <= 3) mirrors the CHECK constraint as defense-in-depth.
+    pub fn get_task_descendants(&self, root_task_id: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "WITH RECURSIVE descendant_ids(id) AS (
+                 SELECT id FROM tasks WHERE parent_task_id = ?1
+                 UNION ALL
+                 SELECT t.id FROM tasks t
+                 JOIN descendant_ids d ON t.parent_task_id = d.id
+                 WHERE t.depth <= 3
+             )
+             SELECT {cols} FROM tasks
+             WHERE id IN (SELECT id FROM descendant_ids)
+             ORDER BY created_at ASC",
+            cols = Self::TASK_COLUMNS,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![root_task_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Check if any active callback tasks exist for a task OTHER than the excluded one.
     ///
     /// Returns `Some((parent_task_id, callback_task_id))` if an active callback task exists
@@ -8260,20 +8285,15 @@ impl Database {
         Ok(count as u64)
     }
 
-    /// Get all sessions linked to a task tree (the given task + its direct children).
+    /// Get all sessions linked to a task tree (the given task + all descendants).
     /// Returns sessions where `task_id` (or legacy `json_extract(metadata, '$.task_id')`)
     /// matches any task ID in the tree. Includes message count for display.
     pub fn get_sessions_for_task_tree(&self, root_task_id: &str) -> Result<Vec<TaskSessionRow>> {
-        // Collect all task IDs in the tree: root + direct children
+        // Collect all task IDs in the tree: root + all descendants
         let mut task_ids = vec![root_task_id.to_string()];
         {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM tasks WHERE parent_task_id = ?1")?;
-            let children: Vec<String> = stmt
-                .query_map(params![root_task_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            task_ids.extend(children);
+            let descendants = self.get_task_descendants(root_task_id)?;
+            task_ids.extend(descendants.into_iter().map(|t| t.id));
         }
 
         let placeholders: String = (1..=task_ids.len())
@@ -9985,6 +10005,102 @@ mod tests {
     }
 
     #[test]
+    fn test_get_task_descendants_three_levels() {
+        let db = db();
+        let root_id = db.create_task(&make_task("root")).unwrap();
+
+        let mut child = make_task("child");
+        child.parent_task_id = Some(root_id.clone());
+        child.depth = 1;
+        let child_id = db.create_task(&child).unwrap();
+
+        let mut grandchild = make_task("grandchild");
+        grandchild.parent_task_id = Some(child_id.clone());
+        grandchild.depth = 2;
+        let grandchild_id = db.create_task(&grandchild).unwrap();
+
+        let mut great_grandchild = make_task("great-grandchild");
+        great_grandchild.parent_task_id = Some(grandchild_id.clone());
+        great_grandchild.depth = 3;
+        db.create_task(&great_grandchild).unwrap();
+
+        let descendants = db.get_task_descendants(&root_id).unwrap();
+        assert_eq!(descendants.len(), 3);
+        // Verify all descendants are present (ordering depends on created_at which may be identical)
+        let labels: Vec<&str> = descendants.iter().map(|t| t.label.as_str()).collect();
+        assert!(labels.contains(&"child"));
+        assert!(labels.contains(&"grandchild"));
+        assert!(labels.contains(&"great-grandchild"));
+    }
+
+    #[test]
+    fn test_get_task_descendants_excludes_root() {
+        let db = db();
+        let root_id = db.create_task(&make_task("root")).unwrap();
+
+        let mut child = make_task("child");
+        child.parent_task_id = Some(root_id.clone());
+        child.depth = 1;
+        db.create_task(&child).unwrap();
+
+        let descendants = db.get_task_descendants(&root_id).unwrap();
+        assert_eq!(descendants.len(), 1);
+        assert!(descendants.iter().all(|t| t.id != root_id));
+    }
+
+    #[test]
+    fn test_get_task_descendants_no_children() {
+        let db = db();
+        let root_id = db.create_task(&make_task("root")).unwrap();
+
+        let descendants = db.get_task_descendants(&root_id).unwrap();
+        assert!(descendants.is_empty());
+    }
+
+    #[test]
+    fn test_get_task_descendants_multi_branch() {
+        let db = db();
+        let root_id = db.create_task(&make_task("root")).unwrap();
+
+        // 3 children, each with 2 grandchildren = 9 descendants total
+        for i in 0..3 {
+            let mut child = make_task(&format!("child-{i}"));
+            child.parent_task_id = Some(root_id.clone());
+            child.depth = 1;
+            let child_id = db.create_task(&child).unwrap();
+
+            for j in 0..2 {
+                let mut gc = make_task(&format!("gc-{i}-{j}"));
+                gc.parent_task_id = Some(child_id.clone());
+                gc.depth = 2;
+                db.create_task(&gc).unwrap();
+            }
+        }
+
+        let descendants = db.get_task_descendants(&root_id).unwrap();
+        assert_eq!(descendants.len(), 9);
+    }
+
+    #[test]
+    fn test_get_task_descendants_cross_agent() {
+        let db = Database::open_in_memory().unwrap();
+        db.register_agent("mika", "Mika", "/tmp").unwrap();
+        db.register_agent("other-agent", "Other", "/tmp").unwrap();
+
+        let root_id = db.create_task(&make_task("root")).unwrap();
+
+        let mut child = make_task("child");
+        child.parent_task_id = Some(root_id.clone());
+        child.depth = 1;
+        child.agent_id = "other-agent".to_string();
+        db.create_task(&child).unwrap();
+
+        let descendants = db.get_task_descendants(&root_id).unwrap();
+        assert_eq!(descendants.len(), 1);
+        assert_eq!(descendants[0].agent_id, "other-agent");
+    }
+
+    #[test]
     fn test_count_pending_callback_tasks_by_team_run() {
         let db = Database::open_in_memory().unwrap();
         db.register_agent("mika", "Mika", "/tmp").unwrap();
@@ -11349,6 +11465,48 @@ mod tests {
         let sessions = db.get_sessions_for_task_tree(&task_id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "legacy-sess");
+    }
+
+    #[test]
+    fn test_sessions_for_task_tree_includes_deep_descendants() {
+        let db = db();
+
+        // Create a 3-level tree: root → child → grandchild
+        let root_id = db
+            .create_task(&new_task("mika", "root-task", "manual", "none"))
+            .unwrap();
+        let mut child = new_task("mika", "child-task", "callback", "resume_agent");
+        child.parent_task_id = Some(root_id.clone());
+        child.depth = 1;
+        let child_id = db.create_task(&child).unwrap();
+        let mut grandchild = new_task("mika", "grandchild-task", "callback", "resume_agent");
+        grandchild.parent_task_id = Some(child_id.clone());
+        grandchild.depth = 2;
+        let grandchild_id = db.create_task(&grandchild).unwrap();
+
+        // Sessions at each level
+        db.create_session_with_parent("sess-root", "mika", "cli", None, None, Some(&root_id))
+            .unwrap();
+        db.create_session_with_parent("sess-child", "mika", "system", None, None, Some(&child_id))
+            .unwrap();
+        db.create_session_with_parent(
+            "sess-grandchild",
+            "mika",
+            "system",
+            None,
+            None,
+            Some(&grandchild_id),
+        )
+        .unwrap();
+        // Unrelated session
+        db.create_session("sess-unrelated", "mika", "cli").unwrap();
+
+        let sessions = db.get_sessions_for_task_tree(&root_id).unwrap();
+        assert_eq!(sessions.len(), 3);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"sess-root"));
+        assert!(ids.contains(&"sess-child"));
+        assert!(ids.contains(&"sess-grandchild"));
     }
 
     #[test]

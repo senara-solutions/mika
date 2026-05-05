@@ -529,6 +529,11 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_child_tasks(&p)).await
     }
 
+    pub async fn get_task_descendants(&self, root_task_id: &str) -> Result<Vec<Task>> {
+        let r = root_task_id.to_owned();
+        self.with_db(move |db| db.get_task_descendants(&r)).await
+    }
+
     pub async fn has_active_callback_tasks_excluding(
         &self,
         excluded_parent_id: &str,

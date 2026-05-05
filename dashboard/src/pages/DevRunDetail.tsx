@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useParams, Link } from 'react-router'
 import { useDevRun } from '../api/devRuns.ts'
 import { useGitHubIssue, useGitHubPull, type GitHubReview } from '../api/github.ts'
-import { useTaskSessions, useTaskChildren } from '../api/tasks.ts'
+import { useTaskSessions, useTaskDescendants } from '../api/tasks.ts'
 import { useSessionMessages, type Message } from '../api/sessions.ts'
 import {
   TaskStatusBadge,
@@ -17,6 +17,7 @@ import {
 import { MetadataRow } from '../components/MetadataRow.tsx'
 import { CollapsibleCard } from '../components/CollapsibleCard.tsx'
 import { PipelineTimeline, type PipelineStep } from '../components/PipelineTimeline.tsx'
+import { TaskTree } from '../components/TaskTree.tsx'
 import { parseGitHubUrl } from '../utils/github.ts'
 import {
   Clock,
@@ -279,7 +280,7 @@ export default function DevRunDetail() {
 
   // Fetch sessions and children
   const { data: taskSessions } = useTaskSessions(taskId)
-  const { data: children } = useTaskChildren(taskId)
+  const { data: descendants, isLoading: descendantsLoading } = useTaskDescendants(taskId, run?.status)
 
   if (isLoading) {
     return <LoadingState variant="detail" />
@@ -510,46 +511,18 @@ export default function DevRunDetail() {
         </div>
       )}
 
-      {/* ===== Child Tasks ===== */}
-      {children && children.length > 0 && (
+      {/* ===== Task Tree ===== */}
+      {descendantsLoading && (
+        <div className="bg-bg-card border border-white/[0.05] rounded-2xl p-5 mb-4">
+          <LoadingState variant="list" rows={3} />
+        </div>
+      )}
+      {descendants && descendants.length > 0 && taskId && (
         <div className="bg-bg-card border border-white/[0.05] rounded-2xl p-5 mb-4">
           <h3 className="text-heading text-sm font-medium mb-3">
-            Child Tasks ({children.length})
+            Task Tree ({descendants.length})
           </h3>
-          <div className="space-y-2">
-            {children.map((child) => (
-              <div key={child.id} className="flex items-center gap-3 py-1.5">
-                <TaskStatusBadge status={child.status} />
-                <Link
-                  to={`/tasks/${child.id}`}
-                  className="text-accent text-xs hover:text-accent-light transition-colors"
-                >
-                  {child.label}
-                </Link>
-                <div className="flex items-center gap-2 ml-auto">
-                  {child.created_by_session && (
-                    <Link
-                      to={`/sessions/${child.created_by_session}`}
-                      className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-white/[0.06] text-accent hover:text-accent-light transition-colors"
-                    >
-                      SESSION
-                    </Link>
-                  )}
-                  {child.execution_trace_id && (
-                    <Link
-                      to={`/traces/${child.execution_trace_id}`}
-                      className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-white/[0.06] text-accent hover:text-accent-light transition-colors"
-                    >
-                      TRACE
-                    </Link>
-                  )}
-                  <span className="text-muted/40 text-xs font-mono">
-                    {child.action_type}
-                  </span>
-                </div>
-              </div>
-            ))}
-          </div>
+          <TaskTree tasks={descendants} rootTaskId={taskId} />
         </div>
       )}
 

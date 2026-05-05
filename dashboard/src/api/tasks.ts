@@ -89,6 +89,24 @@ export function useTaskChildren(parentTaskId: string | undefined) {
   })
 }
 
+const TERMINAL_STATUSES = new Set(['completed', 'delivered', 'failed', 'cancelled'])
+
+export function useTaskDescendants(rootTaskId: string | undefined, parentStatus?: string) {
+  return useQuery<TaskItem[]>({
+    queryKey: ['task-descendants', rootTaskId],
+    queryFn: () => apiFetch(`/tasks/${rootTaskId}/descendants`),
+    enabled: !!rootTaskId,
+    refetchInterval: (query) => {
+      const data = query.state.data
+      const parentIsActive = !!parentStatus && !TERMINAL_STATUSES.has(parentStatus)
+      // Keep polling when parent is active even if descendants are empty (children may not exist yet)
+      if (!data || data.length === 0) return parentIsActive ? 15_000 : false
+      const hasActive = data.some((t) => !TERMINAL_STATUSES.has(t.status))
+      return hasActive || parentIsActive ? 15_000 : false
+    },
+  })
+}
+
 /** Session linked to a task tree — returned by GET /api/v1/tasks/:id/sessions. */
 export interface TaskSession {
   id: string
