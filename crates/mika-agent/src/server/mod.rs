@@ -145,6 +145,7 @@ fn build_router(state: AppState) -> Router {
         )
         // Observability: LLM calls and tool calls
         .route("/llm-calls", get(dashboard::handle_llm_calls))
+        .route("/llm-calls/cost-trend", get(dashboard::handle_cost_trend))
         .route("/llm-calls/{id}", get(dashboard::handle_llm_call_detail))
         .route(
             "/llm-calls/{id}/tool-calls",

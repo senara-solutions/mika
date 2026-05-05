@@ -1,10 +1,11 @@
 import { Link, useNavigate } from 'react-router'
-import { useLlmCalls, type LlmCallsFilters } from '../api/llmCalls.ts'
+import { useLlmCalls, useCostTrend, type LlmCallsFilters, type CostTrendFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
 import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, TimeRangeFilter, formatTimestamp } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
+import CostTrendChart, { type ChartVariant } from '../components/CostTrendChart.tsx'
 
 function llmStatusVariant(status: string): { variant: StatusBadgeVariant; label: string } {
   switch (status) {
@@ -40,6 +41,28 @@ export default function LlmCalls() {
 
   const { data, isLoading, error, refetch } = useLlmCalls(filters)
   const { data: agents } = useAgents()
+
+  // Chart variant from URL param (default: total)
+  const chartVariantParam = searchParams.get('chart')
+  const chartVariant: ChartVariant = chartVariantParam === 'agent' ? 'agent' : 'total'
+  const setChartVariant = (v: ChartVariant) => {
+    const next = new URLSearchParams(searchParams)
+    if (v === 'total') {
+      next.delete('chart')
+    } else {
+      next.set('chart', v)
+    }
+    setSearchParams(next)
+  }
+
+  // Cost trend chart: the server defaults to last 24h when no `from` is provided.
+  const costTrendFilters: CostTrendFilters = {
+    agent_id: filters.agent_id,
+    model: filters.model,
+    from: filters.from,
+    to: filters.to,
+  }
+  const { data: costTrend, isLoading: costLoading, error: costError, refetch: costRefetch } = useCostTrend(costTrendFilters)
 
   return (
     <div>
@@ -89,6 +112,19 @@ export default function LlmCalls() {
           )}
         </div>
       </div>
+
+      {/* Cost Trend Chart */}
+      <CostTrendChart
+        data={costTrend?.buckets}
+        variant={chartVariant}
+        onVariantChange={setChartVariant}
+        bucketSize={costTrend?.bucket_size ?? 'hour'}
+        isLoading={costLoading}
+        error={costError}
+        onRetry={() => costRefetch()}
+        hasEstimatedPricing={costTrend?.has_estimated_pricing}
+        defaultRange={!filters.from ? 'last 24 hours' : undefined}
+      />
 
       {/* Table */}
       {isLoading ? (

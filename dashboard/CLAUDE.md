@@ -24,6 +24,8 @@ This Dashboard is currently undergoing the first of three ecosystem-wide design 
 
 Event Timeline, Agents, Sessions, Traces, Tasks (+ detail), Team Runs, LLM Calls (+ detail), Tool Calls (+ detail), Dev Runs (+ detail). Auth via `VITE_MIKA_DASHBOARD_TOKEN` env var. Bearer token. Imports shared components from `@senara-solutions/ui`. All list pages expose `<TimeRangeFilter />` with URL-reflected `?from=...&to=...` state (mika#659).
 
+**LLM Calls page (mika#660):** `<CostTrendChart>` time-series visualization above the table, showing estimated cost over time aggregated from `llm_calls` token counts. Two variants: total (single line) and stacked-by-agent. Uses recharts. Backed by `GET /api/v1/llm-calls/cost-trend` with auto-bucketing (hourly <3d, daily ≥3d). Server defaults to last 24h when no `from` param. Pricing is estimated server-side via `crates/mika-agent/src/pricing.rs`.
+
 **Agent Detail page (mika#656):** Tabbed Core Memory panel with three views — Sections (expandable blocks with `<TokenBudgetBar />` thresholds and per-section timestamps), Facts (paginated structured facts from people/commitments/preferences/events tables), and History (core memory edit audit trail filtered to `update_core_memory` events). Facts served via `GET /api/v1/agents/:id/facts`. Structured content (WORKFLOWS JSON) auto-detected and rendered as definition lists; non-JSON rendered via `<MarkdownContent />`.
 
 ## `packages/ui/`

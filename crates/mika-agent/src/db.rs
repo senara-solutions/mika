@@ -511,6 +511,33 @@ pub struct LlmCallFilters {
     pub to: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CostTrendBucket {
+    pub timestamp: String,
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub call_count: u64,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CostTrendResponse {
+    pub buckets: Vec<CostTrendBucket>,
+    pub bucket_size: String,
+    pub has_estimated_pricing: bool,
+    pub estimated_models: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CostTrendFilters {
+    pub agent_id: Option<String>,
+    pub model: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub bucket: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallFilters {
     pub agent_id: Option<String>,
@@ -5565,6 +5592,158 @@ impl Database {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((rows, total))
+    }
+
+    pub fn query_cost_trend(&self, filters: &CostTrendFilters) -> Result<CostTrendResponse> {
+        use std::collections::BTreeMap;
+
+        // Determine effective from/to.
+        let effective_from = filters
+            .from
+            .clone()
+            .unwrap_or_else(|| timestamp::now_minus(Duration::hours(24)));
+        let effective_to = filters.to.clone().unwrap_or_else(timestamp::now);
+
+        // Determine bucket size.
+        let bucket_size = match filters.bucket.as_deref() {
+            Some("hour") => "hour",
+            Some("day") => "day",
+            Some("auto") | None => {
+                let from_dt = timestamp::parse(&effective_from)
+                    .unwrap_or_else(|_| Utc::now() - Duration::hours(24));
+                let to_dt = timestamp::parse(&effective_to).unwrap_or_else(|_| Utc::now());
+                let span_secs = (to_dt - from_dt).num_seconds();
+                if span_secs < 259_200 { "hour" } else { "day" }
+            }
+            _ => "hour",
+        };
+
+        let bucket_expr = if bucket_size == "hour" {
+            "substr(created_at, 1, 13) || ':00:00Z'"
+        } else {
+            "substr(created_at, 1, 10) || 'T00:00:00Z'"
+        };
+
+        // Build WHERE clause.
+        let mut where_clauses = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        params_vec.push(Box::new(effective_from));
+        where_clauses.push(format!("created_at >= ?{}", params_vec.len()));
+
+        params_vec.push(Box::new(effective_to));
+        where_clauses.push(format!("created_at <= ?{}", params_vec.len()));
+
+        if let Some(ref agent_id) = filters.agent_id {
+            params_vec.push(Box::new(agent_id.clone()));
+            where_clauses.push(format!("agent_id = ?{}", params_vec.len()));
+        }
+        if let Some(ref model) = filters.model {
+            params_vec.push(Box::new(model.clone()));
+            where_clauses.push(format!("model = ?{}", params_vec.len()));
+        }
+
+        let where_sql = format!("WHERE {}", where_clauses.join(" AND "));
+
+        let sql = format!(
+            "SELECT {bucket_expr} as bucket_ts,
+                    agent_id, provider, model,
+                    SUM(input_tokens) as total_input,
+                    SUM(output_tokens) as total_output,
+                    SUM(COALESCE(cache_read_tokens, 0)) as total_cache_read,
+                    SUM(COALESCE(cache_write_tokens, 0)) as total_cache_write,
+                    COUNT(*) as call_count
+             FROM llm_calls
+             {where_sql}
+             GROUP BY bucket_ts, agent_id, provider, model
+             ORDER BY bucket_ts ASC"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params_vec.iter().map(|p| p.as_ref())),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?, // bucket_ts
+                    row.get::<_, String>(1)?, // agent_id
+                    row.get::<_, String>(2)?, // provider
+                    row.get::<_, String>(3)?, // model
+                    row.get::<_, u64>(4)?,    // total_input
+                    row.get::<_, u64>(5)?,    // total_output
+                    row.get::<_, u64>(6)?,    // total_cache_read
+                    row.get::<_, u64>(7)?,    // total_cache_write
+                    row.get::<_, u64>(8)?,    // call_count
+                ))
+            },
+        )?;
+
+        // Aggregate by (bucket_ts, agent_id), applying per-model pricing.
+        let mut has_estimated = false;
+        let mut estimated_models: Vec<String> = Vec::new();
+
+        // Key: (bucket_ts, agent_id) -> (cost_usd, input_tokens, output_tokens, call_count)
+        type BucketKey = (String, Option<String>);
+        type BucketValue = (f64, u64, u64, u64);
+        let mut aggregated: BTreeMap<BucketKey, BucketValue> = BTreeMap::new();
+
+        for row in rows {
+            let (
+                bucket_ts,
+                agent_id,
+                provider,
+                model,
+                input,
+                output,
+                cache_read,
+                cache_write,
+                count,
+            ) = row?;
+            let pricing = crate::pricing::get_pricing(&provider, &model);
+            let cost = crate::pricing::estimate_call_cost(
+                &pricing,
+                input,
+                output,
+                Some(cache_read),
+                Some(cache_write),
+            );
+            if crate::pricing::is_fallback_pricing(&pricing) {
+                has_estimated = true;
+                let model_key = format!("{provider}/{model}");
+                if !estimated_models.contains(&model_key) {
+                    estimated_models.push(model_key);
+                }
+            }
+
+            let agent_key = Some(agent_id);
+            let entry = aggregated.entry((bucket_ts, agent_key)).or_default();
+            entry.0 += cost;
+            entry.1 += input;
+            entry.2 += output;
+            entry.3 += count;
+        }
+
+        let buckets = aggregated
+            .into_iter()
+            .map(
+                |((ts, agent_id), (cost_usd, input_tokens, output_tokens, call_count))| {
+                    CostTrendBucket {
+                        timestamp: ts,
+                        cost_usd,
+                        input_tokens,
+                        output_tokens,
+                        call_count,
+                        agent_id,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(CostTrendResponse {
+            buckets,
+            bucket_size: bucket_size.to_string(),
+            has_estimated_pricing: has_estimated,
+            estimated_models,
+        })
     }
 
     pub fn query_tool_calls(
