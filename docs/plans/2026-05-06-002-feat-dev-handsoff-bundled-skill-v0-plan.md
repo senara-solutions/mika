@@ -135,7 +135,9 @@ This split keeps actor-mapping clean: mika-dev writes content (it knows what hap
    - Set `required_tools` accordingly. If new tool names are needed (not in deployed surface), justify additively in the manifest comment; otherwise reuse.
 
 **Verification:**
-- Phase 0 produces a written record (one paragraph in this plan or a worktree-local note) of: (a) which tool primitives are exposed, (b) which were selected for `required_tools`, (c) whether the prompt-only shape was confirmed or escalated to handler-bearing.
+- Phase 0 produces a written record (one paragraph appended to this plan, after Unit 0's Approach) of: (a) which tool primitives are exposed, (b) which were selected for `required_tools`, (c) whether the prompt-only shape was confirmed or escalated to handler-bearing.
+
+**Note (per architect pass-2 U3):** if Unit 0 triggers the handler-bearing redesign branch (no write-primitive exposed for the prompt-only shape), F4's `required_tools` grep is moot — `required_tools` is re-derived as part of the handler-bearing plan with its own `tools.json` declaration. Unit 0's two gates (F3 tool-surface check + F4 `required_tools` grep) are independent only on the prompt-only happy path; on the redesign branch, F4 is superseded by the handler-bearing redesign's own tooling spec.
 
 - [ ] **Unit 1: Create `mika/skills/bundled/dev-handsoff/` directory with two files**
 
@@ -241,3 +243,17 @@ This split keeps actor-mapping clean: mika-dev writes content (it knows what hap
 - **Memory:** `feedback_work_in_terms_of_mika.md`, `project_keyword_substring_false_positives.md`, `feedback_orthogonality_flag_semantics.md`
 - **Pattern reference:** `mika/skills/bundled/self-dev/` (prompt-only bundled skill structure)
 - **Schema reference:** `mika/crates/mika-agent/src/skills/manifest.rs:13–52`, `mika-skills/CLAUDE.md` lines 79–116
+
+## Grooming history
+
+- **Pass 1** (mika-arch session `5a366431-c8f1-4d31-b151-05f95403c0cc`): Disposition `ITERATE`. Findings: F1 (Sessions omission rationale assumed unspecified v0.2 behavior, BLOCKING), F2 (ticket body §3 heading "Tickets touched" contradicts D2's HANDSOFF-CONTRACT reconciliation, NON-BLOCKING but body-edit required at Phase 5), F3 (prompt-only tool-surface unverified for write primitive, BLOCKING), F4 (required_tools deferral must be pre-flight gate not verification step, NON-BLOCKING but restructuring required), U3 (keyword-conflict grep must be HALT gate), U8 (lifecycle YAGNI rationale absent). All addressed.
+- **Pass 2** (same session): Verdict `GROOMED`. Two new non-blocking Phase 5 obligations: widen F2 body-edit scope to cover full §3 section-list reconciliation (not just rename), update `## Files to create` block (PROMPT.md → system_prompt.md). Plus one-sentence U3 add about F4+F3 interaction (already applied in plan). Resolution: Phase 5 body-edit + edit-notice comment captures both the §3 section-list update and the Files-to-create correction in one body-edit pass, citing this grooming session.
+
+## Phase 5 body-edit checklist (deferred actions)
+
+The following ticket-body updates must land at Phase 5 finalization, in a single `gh issue edit` body-edit pass + edit-notice comment citing this grooming session. Per the issue-as-versioned-contract pattern (mika-platform#80's F3 closure):
+
+1. **Update `## Files to create` block:** replace `PROMPT.md` with `system_prompt.md` per D1 grooming-time verification of deployed bundled-skill convention.
+2. **Update Artifact Contract §3 section-list table:** rename `## Tickets touched` → `## Tickets & PRs touched` AND add `## TL;DR` row (drop-if-empty optional), AND add `## Blocked / carry-forward` row (drop-if-empty optional), AND confirm Sessions omitted with rationale anchored in HANDSOFF-CONTRACT optionality (not v0.2 assumption). Result: §3 table reflects the full D2-reconciled section list (7 sections present in artifact, Sessions optional).
+3. **Update Skill manifest `[skill]` block (if needed):** verify `description` text matches D2 reconciliation (artifact body matches HANDSOFF-CONTRACT, not the original 5-section list).
+4. **Edit-notice comment:** posts after body edit, cites pass-1 + pass-2 session_id, summarizes the §3 + Files-to-create reconciliation.
