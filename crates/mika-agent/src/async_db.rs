@@ -1303,11 +1303,10 @@ impl AsyncDatabase {
 
     pub async fn list_facts_paginated_with_count(
         &self,
-        agent_id: &str,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<crate::db::DashboardFact>, u64)> {
-        let aid = agent_id.to_owned();
+        let aid = self.agent_id.clone();
         self.with_db(move |db| db.list_facts_paginated_with_count(&aid, limit, offset))
             .await
     }

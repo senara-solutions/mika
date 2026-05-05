@@ -302,11 +302,22 @@ pub async fn handle_agent_facts(
     Path(agent_id): Path<String>,
     Query(q): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    let agent_state = match state.resolve_agent(&agent_id) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("agent '{}' not found", agent_id)})),
+            )
+                .into_response();
+        }
+    };
+
     let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
 
-    let (data, total) = match state
-        .dashboard_db
-        .list_facts_paginated_with_count(&agent_id, per_page, offset)
+    let (data, total) = match agent_state
+        .db
+        .list_facts_paginated_with_count(per_page, offset)
         .await
     {
         Ok(result) => result,

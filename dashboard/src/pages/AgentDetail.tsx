@@ -263,14 +263,19 @@ const TAB_LABELS: { key: MemoryTab; label: string }[] = [
 export default function AgentDetail() {
   const { agentId } = useParams<{ agentId: string }>()
   const [sessionsPage, setSessionsPage] = useState(1)
-  const [auditPage] = useState(1)
   const [memoryTab, setMemoryTab] = useState<MemoryTab>('sections')
   const [factsPage, setFactsPage] = useState(1)
   const [historyPage, setHistoryPage] = useState(1)
 
+  const handleTabChange = (tab: MemoryTab) => {
+    setMemoryTab(tab)
+    if (tab === 'facts') setFactsPage(1)
+    if (tab === 'history') setHistoryPage(1)
+  }
+
   const { data: agent, isLoading, error, refetch } = useAgentDetail(agentId ?? '')
   const { data: sessions } = useAgentSessions(agentId ?? '', sessionsPage)
-  const { data: audit } = useAgentAudit(agentId ?? '', auditPage)
+  const { data: audit } = useAgentAudit(agentId ?? '', 1)
   const { data: facts, isLoading: factsLoading } = useAgentFacts(
     agentId ?? '',
     factsPage,
@@ -336,7 +341,7 @@ export default function AgentDetail() {
                 <button
                   key={tab.key}
                   type="button"
-                  onClick={() => setMemoryTab(tab.key)}
+                  onClick={() => handleTabChange(tab.key)}
                   className={`text-sm font-semibold px-2 py-0.5 rounded transition-colors ${
                     memoryTab === tab.key
                       ? 'text-heading bg-white/[0.05]'

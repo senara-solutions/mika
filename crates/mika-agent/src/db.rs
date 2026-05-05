@@ -243,7 +243,7 @@ pub struct CoreMemoryEntry {
 }
 
 /// A structured fact for the dashboard (aggregated from people, commitments, preferences, events).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DashboardFact {
     pub id: i64,
     pub category: String,
@@ -7746,7 +7746,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, category, key, value, updated_at FROM (
                 SELECT id, 'People' AS category, canonical_name AS key,
-                    COALESCE(relationship, '') || COALESCE(': ' || notes, '') AS value,
+                    CASE WHEN relationship IS NOT NULL AND notes IS NOT NULL THEN relationship || ': ' || notes WHEN relationship IS NOT NULL THEN relationship WHEN notes IS NOT NULL THEN notes ELSE '' END AS value,
                     last_mentioned AS updated_at
                 FROM people WHERE agent_id = ?1
                 UNION ALL
