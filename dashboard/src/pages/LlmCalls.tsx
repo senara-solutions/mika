@@ -5,7 +5,7 @@ import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, Statu
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { Search } from 'lucide-react'
-import CostTrendChart from '../components/CostTrendChart.tsx'
+import CostTrendChart, { type ChartVariant } from '../components/CostTrendChart.tsx'
 
 function llmStatusVariant(status: string): { variant: StatusBadgeVariant; label: string } {
   switch (status) {
@@ -41,6 +41,19 @@ export default function LlmCalls() {
 
   const { data, isLoading, error, refetch } = useLlmCalls(filters)
   const { data: agents } = useAgents()
+
+  // Chart variant from URL param (default: total)
+  const chartVariantParam = searchParams.get('chart')
+  const chartVariant: ChartVariant = chartVariantParam === 'agent' ? 'agent' : 'total'
+  const setChartVariant = (v: ChartVariant) => {
+    const next = new URLSearchParams(searchParams)
+    if (v === 'total') {
+      next.delete('chart')
+    } else {
+      next.set('chart', v)
+    }
+    setSearchParams(next)
+  }
 
   // Cost trend chart: the server defaults to last 24h when no `from` is provided.
   const costTrendFilters: CostTrendFilters = {
@@ -103,6 +116,8 @@ export default function LlmCalls() {
       {/* Cost Trend Chart */}
       <CostTrendChart
         data={costTrend?.buckets}
+        variant={chartVariant}
+        onVariantChange={setChartVariant}
         bucketSize={costTrend?.bucket_size ?? 'hour'}
         isLoading={costLoading}
         error={costError}

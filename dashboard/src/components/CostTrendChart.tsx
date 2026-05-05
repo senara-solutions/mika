@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import {
   AreaChart,
   Area,
@@ -19,8 +19,12 @@ export interface CostTrendBucket {
   agent_id: string | null
 }
 
+export type ChartVariant = 'total' | 'agent'
+
 interface CostTrendChartProps {
   data: CostTrendBucket[] | undefined
+  variant: ChartVariant
+  onVariantChange: (variant: ChartVariant) => void
   bucketSize: string
   isLoading: boolean
   error: Error | null
@@ -133,10 +137,10 @@ function CustomTooltip({ active, payload, label, bucketSize }: {
   )
 }
 
-type ChartVariant = 'total' | 'agent'
-
 export default function CostTrendChart({
   data,
+  variant,
+  onVariantChange,
   bucketSize,
   isLoading,
   error,
@@ -144,7 +148,6 @@ export default function CostTrendChart({
   hasEstimatedPricing,
   defaultRange,
 }: CostTrendChartProps) {
-  const [variant, setVariant] = useState<ChartVariant>('total')
 
   // Transform data for recharts
   const { chartData, agentIds } = useMemo(() => {
@@ -216,7 +219,7 @@ export default function CostTrendChart({
         </div>
         <div className="flex items-center gap-1 bg-bg rounded-lg p-0.5">
           <button
-            onClick={() => setVariant('total')}
+            onClick={() => onVariantChange('total')}
             className={`px-3 py-1 rounded-md text-xs transition-colors ${
               variant === 'total'
                 ? 'bg-accent/15 text-accent-light font-medium'
@@ -226,7 +229,7 @@ export default function CostTrendChart({
             Total
           </button>
           <button
-            onClick={() => setVariant('agent')}
+            onClick={() => onVariantChange('agent')}
             className={`px-3 py-1 rounded-md text-xs transition-colors ${
               variant === 'agent'
                 ? 'bg-accent/15 text-accent-light font-medium'
