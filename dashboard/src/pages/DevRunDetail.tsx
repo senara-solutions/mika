@@ -280,7 +280,7 @@ export default function DevRunDetail() {
 
   // Fetch sessions and children
   const { data: taskSessions } = useTaskSessions(taskId)
-  const { data: descendants, isLoading: descendantsLoading } = useTaskDescendants(taskId)
+  const { data: descendants, isLoading: descendantsLoading } = useTaskDescendants(taskId, run?.status)
 
   if (isLoading) {
     return <LoadingState variant="detail" />

@@ -25,7 +25,7 @@ function buildChildrenMap(tasks: TaskItem[]): Map<string, TaskItem[]> {
   return map
 }
 
-/** Compute which nodes to expand by default (direct children of root). */
+/** Mark direct children of root as expanded so their subtrees are visible on first render. */
 function defaultExpanded(tasks: TaskItem[], rootTaskId: string): Set<string> {
   const expanded = new Set<string>()
   for (const task of tasks) {
