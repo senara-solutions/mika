@@ -276,6 +276,11 @@ async fn main() -> Result<()> {
         Some(Commands::Model(args)) => commands::model::run(args, &agent_name).await,
         Some(Commands::Webhook(args)) => commands::webhook::run(args.command, &args.format).await,
         Some(Commands::Kg(args)) => commands::kg::run(args).await,
+        Some(Commands::Logs(ref args)) => {
+            let ah = agent_home
+                .ok_or_else(|| anyhow::anyhow!("Could not resolve agent home directory"))?;
+            commands::logs::run(&agent_name, &ah, &args.format)
+        }
         // Handled by early-exit above — unreachable, but listed for exhaustive match.
         Some(Commands::Token(_) | Commands::CredentialHelper(_)) => unreachable!(),
     }

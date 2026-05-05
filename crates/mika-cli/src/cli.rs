@@ -75,6 +75,8 @@ pub enum Commands {
     Webhook(WebhookArgs),
     /// Manage Knowledge Graph state
     Kg(KgArgs),
+    /// Show resolved log file paths for an agent
+    Logs(LogsArgs),
     /// Git credential helper (used by git, not directly by users)
     #[command(name = "credential-helper")]
     CredentialHelper(CredentialHelperArgs),
@@ -97,6 +99,7 @@ impl Commands {
             Commands::Provider(args) => args.agent_flag.agent.as_deref(),
             Commands::Model(args) => args.agent_flag.agent.as_deref(),
             Commands::Kg(args) => args.agent_override(),
+            Commands::Logs(args) => args.agent_flag.agent.as_deref(),
             // No agent override — listed explicitly so adding a new Commands variant
             // produces a compile error, forcing a conscious scoping decision.
             Commands::Setup { .. }
@@ -132,6 +135,7 @@ impl Commands {
             | Commands::Model(_)
             | Commands::Webhook(_)
             | Commands::Kg(_)
+            | Commands::Logs(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -759,6 +763,16 @@ pub struct ModelArgs {
 
     /// Model name or alias to switch to (omit to list)
     pub name: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct LogsArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
 }
 
 #[derive(clap::Args)]

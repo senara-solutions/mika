@@ -4,7 +4,7 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 ## Subcommands
 
-`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`.
+`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`.
 
 ### Key Commands
 
@@ -79,6 +79,14 @@ Requires `MIKA_GATEWAY_URL` (default: `http://localhost:3001`) and `MIKA_INTERNA
 Exit codes: `status`, `list-agents` always 0. `purge` returns 0 on success, 1 on cancellation or error. `validate` returns 0 iff no Fail checks, 1 otherwise.
 
 See `crates/mika-agent/CLAUDE.md` for KG architecture and schema details.
+
+## Logs CLI
+
+`mika logs` — Show resolved log file paths for an agent. Prints both the server log path (`MIKA_SERVER_LOG_FILE` or `/var/log/mika/server.log` fallback) and the per-agent CLI log path (`~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`). Includes file existence, size, and a ready-to-use `jq` filter command for querying the server log by agent_id.
+
+Supports `--agent <name>` and `--format text|json`.
+
+See `crates/mika-agent/CLAUDE.md` § Log Sinks for the architectural rationale behind the two-sink design.
 
 ## MCP CLI
 
