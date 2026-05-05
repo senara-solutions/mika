@@ -22,11 +22,16 @@ Three layers failed:
 
 Three orthogonal fixes matching the ticket's three investigation surfaces:
 
-### Fix 1: Rust-level required-field validation before spawn (primary fix)
+### Fix 1: Rust-level required-field validation at executor entry point (primary fix)
 
 **File:** `crates/mika-agent/src/skills/executor.rs`
 
-Add a `validate_required_fields()` check at the top of `execute_long_running()`, before task creation. Parse `skill_tool.definition.input_schema` for the `required` array, verify each required field is present and non-null in the input JSON. On failure, return `ToolOutput::error()` with a structured JSON error (same pattern as `task_not_dispatchable`):
+Add a `validate_required_fields()` check at the top of `execute_skill_tool()` — before the long-running/short-lived branch. This provides:
+- **Single policy enforcement** — one place where Rust asserts the JSON Schema contract
+- **Consistent error structure** — `ToolOutput::error { missing_required_field }` for both paths
+- **Easier testing** — one validation unit covers all handlers
+
+On failure, return `ToolOutput::error()` with a structured JSON error (same pattern as `task_not_dispatchable`):
 
 ```json
 {
@@ -40,9 +45,21 @@ Add a `validate_required_fields()` check at the top of `execute_long_running()`,
 
 This prevents the subprocess from ever spawning with invalid input, catches the bug at the cheapest possible point (no task creation, no subprocess, no callback needed), and gives the LLM a clear retry signal in the same turn.
 
-**Why `execute_long_running` specifically:** Only long-running exec handlers have the cascade problem (task creation → subprocess spawn → crash → opaque callback). Short-lived exec handlers fail in the same turn and the error is visible immediately. The cost of schema validation is negligible relative to subprocess spawn + callback lifecycle.
+**Why unified entry-point (per mika-arch first-pass review):** The plan originally scoped to `execute_long_running` only because short-lived handlers fail visibly. The architect correctly identified that the key distinction isn't speed of visibility — it's failure mode consistency. Two different error paths for the same violation is architecturally incomplete. The cost of validation on short-lived handlers is negligible (one array scan of `required` fields per tool call).
 
-**Scope limitation:** Validate only `required` fields (presence + non-null). Do NOT validate `enum` constraints or `type` assertions at this layer — that would duplicate logic better left to the handler. The goal is to prevent the "field entirely missing" class of failures that produce opaque crashes.
+**Defensive schema parsing:** The `input_schema` is not guaranteed to have a well-formed `required` array. Defensive pattern:
+
+```rust
+let required_fields: Vec<&str> = skill_tool.definition.input_schema
+    .get("required")
+    .and_then(Value::as_array)
+    .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+    .unwrap_or_default();
+```
+
+On malformed schema (missing `required` key, non-array, non-string elements): gracefully degrade to empty required list. Emit `warn!` event (`skill_tool_malformed_schema_skipped_validation`) so operators know a tool definition is malformed, but don't crash the dispatcher.
+
+**Scope limitation:** Validate only **top-level** `required` fields (presence + non-null). Do NOT validate `enum` constraints, `type` assertions, or nested `properties` objects with their own `required` arrays. Nested required fields are handler-side concerns. This prevents scope creep while being explicit about coverage boundaries.
 
 ### Fix 2: Structured error in handler validation path (defense-in-depth)
 
@@ -77,7 +94,7 @@ Add a post-condition assertion after `serde_json::to_string(&input)` on line 845
 
 ## Implementation Order
 
-1. Fix 1 (Rust validation) — the primary fix. Prevents the bug class entirely.
+1. Fix 1 (Rust validation at `execute_skill_tool` entry) — the primary fix. Prevents the bug class entirely for both long-running and short-lived handlers.
 2. Fix 2 (structured handler errors) — defense-in-depth. Makes any future bypass of Fix 1 produce actionable errors.
 3. Fix 3 (debug assertion) — development-time safety net.
 
@@ -90,9 +107,10 @@ Add a post-condition assertion after `serde_json::to_string(&input)` on line 845
 
 ## Testing
 
-1. **Unit test:** Add test in `executor.rs` tests module — call `execute_long_running` (or `execute_skill_tool`) with input missing `skill`, verify `ToolOutput::error` contains `missing_required_field`.
-2. **Integration test:** Add eval scenario — mock LLM emits `run_claude_pilot` without `skill` field, verify agent receives structured error and can retry.
-3. **Manual verification:** Confirm the dispatch-readiness guard still rejects appropriately when the validation passes but other guards fail.
+1. **Unit test:** Add test in `executor.rs` tests module — call `execute_skill_tool` with input missing a required field, verify `ToolOutput::error` contains `missing_required_field`.
+2. **Unit test (malformed schema):** Call `execute_skill_tool` with a tool whose `input_schema` has no `required` key or a non-array `required` — verify graceful degradation (no error, passes through to handler).
+3. **Integration test:** Add eval scenario — mock LLM emits `run_claude_pilot` without `skill` field, verify agent receives structured error and can retry.
+4. **Manual verification:** Confirm the dispatch-readiness guard still rejects appropriately when the validation passes but other guards fail.
 
 ## Risk Assessment
 
