@@ -19,6 +19,8 @@ export interface LlmCallRow {
   step: number
   prompt_variant: string | null
   created_at: string
+  response_text: string | null
+  reasoning: string | null
 }
 
 export interface LlmCallsFilters {
@@ -61,5 +63,13 @@ export function useSessionLlmCalls(sessionId: string, page = 1, perPage = 50) {
     queryFn: () =>
       apiFetch(`/sessions/${sessionId}/llm-calls`, { page, per_page: perPage }),
     enabled: !!sessionId,
+  })
+}
+
+export function useLlmCallToolCalls(llmCallId: string | undefined) {
+  return useQuery<import('./toolCalls.ts').ToolCallRow[]>({
+    queryKey: ['llm-call-tool-calls', llmCallId],
+    queryFn: () => apiFetch(`/llm-calls/${llmCallId}/tool-calls`),
+    enabled: !!llmCallId,
   })
 }

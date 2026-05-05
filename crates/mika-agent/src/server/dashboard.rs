@@ -895,6 +895,17 @@ pub async fn handle_llm_call_detail(
     }
 }
 
+/// GET /api/v1/llm-calls/:id/tool-calls — tool calls linked to an LLM call.
+pub async fn handle_llm_call_tool_calls(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.dashboard_db.get_tool_calls_by_llm_call_id(&id).await {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => internal_error(e).into_response(),
+    }
+}
+
 /// GET /api/v1/tool-calls/:id — single tool call detail.
 pub async fn handle_tool_call_detail(
     State(state): State<AppState>,
