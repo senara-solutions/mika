@@ -508,6 +508,13 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Remove a single field from the task's metadata JSON (#959).
+    pub async fn remove_task_metadata_field(&self, task_id: &str, key: &str) -> Result<()> {
+        let (i, k) = (task_id.to_owned(), key.to_owned());
+        self.with_db(move |db| db.remove_task_metadata_field(&i, &k))
+            .await
+    }
+
     pub async fn try_complete_parent_on_sibling_done(
         &self,
         task_id: &str,

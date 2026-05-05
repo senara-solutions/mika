@@ -467,7 +467,7 @@ impl TaskEngine {
                 if has_first_dead_at {
                     let _ = self
                         .db
-                        .set_task_metadata_field(&task.id, "first_dead_at", "null")
+                        .remove_task_metadata_field(&task.id, "first_dead_at")
                         .await;
                 }
                 continue;

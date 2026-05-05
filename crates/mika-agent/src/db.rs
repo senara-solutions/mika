@@ -4948,6 +4948,20 @@ impl Database {
         Ok(())
     }
 
+    /// Remove a single field from the task's metadata JSON (#959).
+    ///
+    /// Uses SQLite's `json_remove()` to delete the key. No-op if the key doesn't exist.
+    pub fn remove_task_metadata_field(&self, task_id: &str, key: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET
+                metadata = json_remove(COALESCE(metadata, '{}'), '$.' || ?1),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?2",
+            params![key, task_id],
+        )?;
+        Ok(())
+    }
+
     /// Get a single metadata field from a task's metadata JSON as a string.
     pub fn get_task_metadata_field(&self, task_id: &str, key: &str) -> Result<Option<String>> {
         let result: Option<String> = self.conn.query_row(
