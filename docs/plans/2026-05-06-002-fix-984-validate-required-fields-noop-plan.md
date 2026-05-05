@@ -22,7 +22,57 @@ Either:
 
 PR #969's existing tests construct `input_schema` fixtures by hand. **No test exercises the production load path** (`skills/bundled/dev-pilot/tools.json` → embedded `BUNDLED_SKILL_MANIFESTS` → `seed_bundled_skills()` → on-disk per-agent skill dir → `load_tools_json()` → `ResolvedSkillTool.definition.input_schema`).
 
-## Root-cause hypotheses (ranked)
+## Verified state (post-architect-pass-1)
+
+The first-pass architect review (session `549b88bb-2436-4e87-94e5-5c67634d5aae`) flagged two blockers: (a) H1 status not updated post-verification, (b) no Phase 0 pin of the call chain. Both addressed below.
+
+### H1 — FALSIFIED (verified 2026-05-06 during pass-1 brief preparation)
+
+```
+$ cat ~/.mika/agents/mika-dev/skills/dev-pilot/tools.json | jq '.[0].input_schema.required'
+["skill","prompt","task_id"]   # ← correct
+
+$ cat skills/bundled/dev-pilot/tools.json | jq '.[0].input_schema.required'
+["skill","prompt","task_id"]   # ← matches
+
+$ cat /proc/8821/environ | tr '\0' '\n' | grep -i bundled
+                               # ← empty: MIKA_DISABLE_BUNDLED_SKILLS not set
+```
+
+The on-disk per-agent file for the dispatching agent (mika-dev) has the post-`06dc9e40` shape. Re-seed env var is unset. **The plan's original Step 2A does not apply.**
+
+### Phase 0 — Call chain pin (architect blocker #2)
+
+`run_claude_pilot` dispatch path from agent loop to subprocess spawn:
+
+| # | Site | Behavior |
+|---|------|----------|
+| 1 | `agent.rs:2650` (`dispatch_to_skill`) | Calls `executor::execute_skill_tool(skill_tool, input, ...)` for ALL skill tools (builtins/MCP routed elsewhere) |
+| 2 | `executor.rs:192` (`execute_skill_tool`) | **PUBLIC, single entry point.** No alternative exists. |
+| 3 | `executor.rs:202` | `validate_required_fields(skill_tool, &input)` — short-circuits with structured error if any required field is missing or null |
+| 4 | `executor.rs:207–223` | Long-running gate: `ToolHandler::Exec { long_running: true }` + `Some(long_running_ctx)` → `execute_long_running(...)` |
+| 5 | `executor.rs:229–247` | `long_running: true` + `None` ctx → returns the "Tool 'X' is declared long_running but cannot run in the current context (callback turn, silent mode, or CLI test)" error (the message we saw in the 22:31 callback retry) |
+| 6 | `executor.rs:844` (`execute_long_running`) | **PRIVATE** (no `pub`). Single internal caller at line 214. Cannot be reached by bypassing line 202's validation. |
+
+**Architect's F3 hypothesis ("long-running dispatch path bypasses `execute_skill_tool` entirely") is structurally invalid.** Verified by `grep -rn "execute_long_running\|skills::executor::execute_" crates/mika-agent/src/` — outside `executor.rs` itself, zero callers. The function is private and reachable only through line 214, which is gated by line 202's validation.
+
+This rules out F3 but **deepens the puzzle**: validation IS in the dispatch path, was reached, and yet did not reject the malformed input. So the failure must be one of:
+
+- **F4 — Schema in-memory mismatches schema on disk.** `load_tools_json` reads from disk at startup; the in-memory `ResolvedSkillTool.definition.input_schema` is what `validate_required_fields` reads. If a registry-assembly step between `load_tools_json` and `execute_skill_tool` mutates `input_schema.required`, validation operates on a different shape than the disk file shows. Candidate sites: `apply_overrides`, `apply_identity_allowlist`, `apply_agent_tool_visibility`, `inject_skills_and_resolve_tools`, `inject_task_id_field`. The plan's verification chain (§ Verification chain) shows `inject_task_id_field` only appends, never removes — but the other layers haven't been audited line-by-line.
+- **F5 — Input mutation between LLM emission and validation.** The `input: serde_json::Value` parameter to `execute_skill_tool` is what validation reads. If something rewrites `input` between the LLM's tool_use block and the call site, validation's view differs from `tool_calls.input` (which is saved later). The saved input shows no `skill` field; validation might have seen one (or vice versa). This is testable by adding a structured-log emission inside `validate_required_fields` capturing both the input keys and the schema's required array — that single-line trace pins the layer.
+- **F6 — Race / non-deterministic schema source.** Multiple agents on the same server share a `SkillRegistry` per-agent (per CLAUDE.md). If a registry rebuild fires concurrently with a dispatch (e.g., `skills_dirty` flag + hot-reload from `handlers.rs`/`a2a.rs`), the schema read could be from a half-rebuilt state. Lower probability — there's no reason to think a rebuild fired today — but worth ruling out via timestamp comparison if F4/F5 don't conclude.
+
+The plan's Steps 2A/2B below are kept intact for audit-trail clarity, but **execution will skip Step 2A** (H1 false) and treat Step 2B as the entry to the F4/F5/F6 trace described in Phase 0.5 below.
+
+### Phase 0.5 — Active investigation surface (replaces former Step 2B)
+
+1. **F5 first** (cheapest): add a single `tracing::warn!` line at the top of `validate_required_fields` emitting `tool_name`, `input_keys = input.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default()`, and `required_fields_observed`. Build, deploy, re-trigger the dispatch (or wait for the next mika#666 retry — the bug is deterministic for that ticket). The log line tells us in one read whether the schema was right and the input was wrong, the schema was wrong and the input was right, or both were unexpected.
+2. **F4 second** (if F5 inconclusive): walk `apply_overrides`, `apply_identity_allowlist`, `apply_agent_tool_visibility`, `inject_skills_and_resolve_tools`, and `inject_task_id_field` line-by-line for any write to `input_schema` or its `required` array. Pin the drop site or rule out registry mutation entirely.
+3. **F6 last** (if F4/F5 both inconclusive): correlate dispatch timestamps against registry-rebuild timestamps in `server.log` (`grep -E "skills.*reloaded|registry.*rebuild" /var/log/mika/server.log`).
+
+The original Step 2B's "compare via `mika skills info dev-pilot --json`" approach is preserved as a complementary check for F4 — diff the on-disk per-agent state against the in-memory registry view at runtime.
+
+## Root-cause hypotheses (ranked, original)
 
 The ticket lists "load-path serialization drops `required`" as the leading hypothesis. Tracing the code (see § Verification chain below) does not support that — every layer preserves `serde_json::Value` and `inject_task_id_field` only appends to `required`, never removes. Two stronger hypotheses survive:
 
@@ -84,7 +134,13 @@ Goal: distinguish H1 from H2/H3 *before* writing any test or fix.
 
 **Output of Step 1:** a one-line verdict in the issue comment ("H1 confirmed: per-agent tools.json predates 06dc9e40, MIKA_DISABLE_BUNDLED_SKILLS=true on PID <n>" or equivalent). This determines which Step 2 branch runs.
 
-### Step 2A — If H1 holds: close the stale-on-disk gap
+### Step 2A — DOES NOT APPLY (H1 falsified, see Verified state above)
+
+The original Step 2A is preserved below for audit-trail clarity. Its operational unblock for mika#666 (Step 2A.1) does not apply because the on-disk file is correct. The structural drift-detection (Step 2A.2) and cross-layer test (Step 2A.3) are still worth shipping as defense-in-depth — they catch the H1-class regression that *would* hit if any operator ran with `MIKA_DISABLE_BUNDLED_SKILLS=true` against a fresh post-#06dc9e40 source. **Steps 2A.2 and 2A.3 ship as part of this PR** even though H1 isn't the active root cause; deletion would just leave the regression vector unguarded.
+
+(original content of Step 2A retained verbatim:)
+
+#### Step 2A — If H1 holds: close the stale-on-disk gap
 
 The fix is operational *and* structural; both, not either. The validate-fields runtime check is correct as-shipped but is rendered useless by stale on-disk state. Three layered actions:
 
