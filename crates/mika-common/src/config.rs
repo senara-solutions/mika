@@ -802,6 +802,17 @@ pub struct Settings {
     #[serde(default)]
     pub kg_batch_budget: Option<u32>,
 
+    /// Callback watchdog grace period in seconds (#959).
+    ///
+    /// After detecting that a callback task's subprocess has exited (PID dead),
+    /// the watchdog waits this many seconds before marking the task `failed`.
+    /// This grace period allows for in-flight callback delivery that may be in
+    /// transit when the subprocess exits cleanly.
+    ///
+    /// Default: [`DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS`] (120s).
+    #[serde(default)]
+    pub callback_watchdog_grace_period_secs: Option<u64>,
+
     /// KG docs root — absolute path to the docs directory the lexical ingestor
     /// reads (#738). Resolution chain: `MIKA_KG_DOCS_ROOT` env > `kg_docs_root`
     /// config field > `<CWD>/docs/solutions` (container-native default).
@@ -824,6 +835,12 @@ pub struct Settings {
 
 /// Default per-batch LLM call budget for KG extraction and resolution (#757).
 pub const DEFAULT_KG_BATCH_BUDGET: u32 = 500;
+
+/// Default grace period (seconds) for the callback watchdog (#959).
+///
+/// After detecting subprocess death, wait this long before marking the callback
+/// task `failed` — allows for in-flight callback delivery that may be in transit.
+pub const DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS: u64 = 120;
 
 fn default_true() -> bool {
     true
@@ -1158,6 +1175,14 @@ impl Settings {
         self.kg_batch_budget.unwrap_or(DEFAULT_KG_BATCH_BUDGET)
     }
 
+    /// Effective callback watchdog grace period in seconds (#959).
+    ///
+    /// Returns the configured value or [`DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS`] (120s).
+    pub fn effective_callback_watchdog_grace_period_secs(&self) -> u64 {
+        self.callback_watchdog_grace_period_secs
+            .unwrap_or(DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS)
+    }
+
     /// Parse a `provider/model` string and create an LLM provider.
     ///
     /// Reusable by `make_kg_extraction_provider` and `make_kg_resolution_provider`.
@@ -1358,6 +1383,7 @@ impl Settings {
             kg_extraction_model: None,
             kg_resolution_model: None,
             kg_batch_budget: None,
+            callback_watchdog_grace_period_secs: None,
             kg_docs_root: None,
             kg_docs_roots: None,
         }
@@ -2203,5 +2229,43 @@ mod tests {
         assert_eq!(roots[3], PathBuf::from("/d"));
 
         unsafe { std::env::remove_var("MIKA_KG_DOCS_ROOTS") };
+    }
+
+    // -- Callback watchdog grace period (#959) --
+
+    #[test]
+    #[serial]
+    fn callback_watchdog_grace_period_defaults_to_120() {
+        clean_env();
+        unsafe { std::env::remove_var("MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.callback_watchdog_grace_period_secs, None);
+        assert_eq!(
+            settings.effective_callback_watchdog_grace_period_secs(),
+            DEFAULT_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS
+        );
+        assert_eq!(
+            settings.effective_callback_watchdog_grace_period_secs(),
+            120
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn callback_watchdog_grace_period_env_override() {
+        clean_env();
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS", "60") };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+
+        assert_eq!(settings.callback_watchdog_grace_period_secs, Some(60));
+        assert_eq!(settings.effective_callback_watchdog_grace_period_secs(), 60);
+
+        unsafe { std::env::remove_var("MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS") };
     }
 }

@@ -948,11 +948,29 @@ fn spawn_long_running_exec(
             }
         };
 
-        // Record PID
-        if let Some(pid) = child.id()
-            && let Err(e) = db.set_task_process_id(&task_id, Some(pid as i64)).await
-        {
-            warn!(task_id = %task_id, error = %e, "failed to record process ID for long-running task");
+        // Record PID and process start time for watchdog (#959)
+        if let Some(pid) = child.id() {
+            if let Err(e) = db.set_task_process_id(&task_id, Some(pid as i64)).await {
+                warn!(task_id = %task_id, error = %e, "failed to record process ID for long-running task");
+            }
+            // Store process start time from /proc/<pid>/stat for PID reuse detection.
+            // On non-Linux this returns None and is silently skipped.
+            if let Some(start_time) =
+                crate::task_engine::process_liveness::read_process_start_time(pid)
+                && let Err(e) = db
+                    .set_task_metadata_field(
+                        &task_id,
+                        "process_start_time",
+                        &start_time.to_string(),
+                    )
+                    .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to store process start time in task metadata"
+                );
+            }
         }
 
         // Write input JSON to stdin

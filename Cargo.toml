@@ -128,6 +128,9 @@ url = "2"
 # JWT
 jsonwebtoken = "9"
 
+# Process management (Linux)
+libc = "0.2"
+
 # Utilities
 rand = "0.9"
 hex = "0.4"
