@@ -4,6 +4,7 @@ type: feat
 status: active
 date: 2026-05-05
 issue: 656
+parent_plan: docs/plans/2026-05-05-006-feat-core-memory-actionable-plan.md
 ---
 
 # feat: Make Agent Detail Core Memory panel actionable
