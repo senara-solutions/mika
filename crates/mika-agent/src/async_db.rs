@@ -1850,8 +1850,10 @@ impl AsyncDatabase {
         error_message: Option<&str>,
         step: u32,
         prompt_variant: Option<&str>,
+        response_text: Option<&str>,
+        reasoning: Option<&str>,
     ) -> Result<()> {
-        let (a, i, sid, tid, p, m, sr, st, em, pv) = (
+        let (a, i, sid, tid, p, m, sr, st, em, pv, rt, rz) = (
             self.agent_id.clone(),
             id.to_owned(),
             session_id.to_owned(),
@@ -1862,6 +1864,8 @@ impl AsyncDatabase {
             status.to_owned(),
             error_message.map(|s| s.to_owned()),
             prompt_variant.map(|s| s.to_owned()),
+            response_text.map(|s| s.to_owned()),
+            reasoning.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
             db.save_llm_call(
@@ -1881,6 +1885,8 @@ impl AsyncDatabase {
                 em.as_deref(),
                 step,
                 pv.as_deref(),
+                rt.as_deref(),
+                rz.as_deref(),
             )
         })
         .await
@@ -2017,6 +2023,15 @@ impl AsyncDatabase {
     pub async fn get_tool_call_by_id(&self, id: &str) -> Result<Option<crate::db::ToolCallRow>> {
         let id = id.to_owned();
         self.with_db(move |db| db.get_tool_call_by_id(&id)).await
+    }
+
+    pub async fn get_tool_calls_by_llm_call_id(
+        &self,
+        llm_call_id: &str,
+    ) -> Result<Vec<crate::db::ToolCallRow>> {
+        let id = llm_call_id.to_owned();
+        self.with_db(move |db| db.get_tool_calls_by_llm_call_id(&id))
+            .await
     }
 
     pub async fn update_session_metadata(&self, session_id: &str, metadata: &str) -> Result<()> {

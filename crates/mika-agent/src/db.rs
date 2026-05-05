@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 30;
+pub const CURRENT_SCHEMA_VERSION: i64 = 31;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -463,6 +463,12 @@ pub struct LlmCallRow {
     /// `None` when no skills contributed prompts to this turn.
     pub prompt_variant: Option<String>,
     pub created_at: String,
+    /// Serialized LLM response text (stripped of internal tags, capped at 50K chars).
+    /// `None` for pre-v31 rows or error calls.
+    pub response_text: Option<String>,
+    /// Extended thinking / reasoning text (Claude-only).
+    /// `None` when the provider does not support reasoning or the call errored.
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1011,6 +1017,11 @@ impl Database {
             info!(version = 30, "database migrated to v30");
         }
 
+        if (3..=30).contains(&version) {
+            self.migrate_v30_to_v31()?;
+            info!(version = 31, "database migrated to v31");
+        }
+
         Ok(())
     }
 
@@ -1065,7 +1076,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (30);
+            INSERT INTO schema_version (version) VALUES (31);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1432,7 +1443,9 @@ impl Database {
                 error_message TEXT,
                 step INTEGER NOT NULL DEFAULT 0,
                 prompt_variant TEXT,
-                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                response_text TEXT,
+                reasoning TEXT
             );
             CREATE INDEX idx_llm_calls_trace ON llm_calls(trace_id);
             CREATE INDEX idx_llm_calls_session ON llm_calls(session_id);
@@ -3639,6 +3652,34 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v30_to_v31(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 31 {
+            return Ok(());
+        }
+
+        // Columns may already exist in clean-slate DBs; check each independently
+        // to handle partial-crash recovery scenarios.
+        let has_response_text = self.column_exists("llm_calls", "response_text")?;
+        let has_reasoning = self.column_exists("llm_calls", "reasoning")?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !has_response_text {
+            tx.execute_batch("ALTER TABLE llm_calls ADD COLUMN response_text TEXT;")?;
+        }
+        if !has_reasoning {
+            tx.execute_batch("ALTER TABLE llm_calls ADD COLUMN reasoning TEXT;")?;
+        }
+        tx.execute("INSERT INTO schema_version (version) VALUES (31)", [])?;
+        tx.commit()?;
+
+        info!("v30→v31: added response_text and reasoning columns to llm_calls (#653)");
+
+        Ok(())
+    }
+
     /// v27 startup guard: refuse to open the database if the coalesce step
     /// from #787 has not run. Pins to `schema_version == 27` — future v28
     /// should carry its own guard, not inherit v27's.
@@ -5247,12 +5288,15 @@ impl Database {
         error_message: Option<&str>,
         step: u32,
         prompt_variant: Option<&str>,
+        response_text: Option<&str>,
+        reasoning: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO llm_calls (id, agent_id, session_id, trace_id, provider, model,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-             latency_ms, stop_reason, status, error_message, step, prompt_variant)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             latency_ms, stop_reason, status, error_message, step, prompt_variant,
+             response_text, reasoning)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 id,
                 agent_id,
@@ -5270,6 +5314,8 @@ impl Database {
                 error_message,
                 step,
                 prompt_variant,
+                response_text,
+                reasoning,
             ],
         )?;
         Ok(())
@@ -5605,13 +5651,28 @@ impl Database {
             .query_row(
                 "SELECT id, agent_id, session_id, trace_id, provider, model,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                        latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at
+                        latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at,
+                        response_text, reasoning
                  FROM llm_calls WHERE id = ?1",
                 params![id],
-                Self::row_to_llm_call,
+                Self::row_to_llm_call_detail,
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn get_tool_calls_by_llm_call_id(&self, llm_call_id: &str) -> Result<Vec<ToolCallRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_id, trace_id, llm_call_id,
+                    step, tool_name, tool_source, skill_name,
+                    input, output, success, non_zero_exit,
+                    latency_ms, error_message, created_at
+             FROM tool_calls WHERE llm_call_id = ?1 ORDER BY created_at ASC, step ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![llm_call_id], Self::row_to_tool_call)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn get_tool_call_by_id(&self, id: &str) -> Result<Option<ToolCallRow>> {
@@ -5648,6 +5709,34 @@ impl Database {
             step: r.get(14)?,
             prompt_variant: r.get(15)?,
             created_at: r.get(16)?,
+            // List queries omit response_text/reasoning for performance
+            response_text: None,
+            reasoning: None,
+        })
+    }
+
+    /// Detail query includes response_text and reasoning columns.
+    fn row_to_llm_call_detail(r: &rusqlite::Row<'_>) -> rusqlite::Result<LlmCallRow> {
+        Ok(LlmCallRow {
+            id: r.get(0)?,
+            agent_id: r.get(1)?,
+            session_id: r.get(2)?,
+            trace_id: r.get(3)?,
+            provider: r.get(4)?,
+            model: r.get(5)?,
+            input_tokens: r.get(6)?,
+            output_tokens: r.get(7)?,
+            cache_read_tokens: r.get(8)?,
+            cache_write_tokens: r.get(9)?,
+            latency_ms: r.get(10)?,
+            stop_reason: r.get(11)?,
+            status: r.get(12)?,
+            error_message: r.get(13)?,
+            step: r.get(14)?,
+            prompt_variant: r.get(15)?,
+            created_at: r.get(16)?,
+            response_text: r.get(17)?,
+            reasoning: r.get(18)?,
         })
     }
 
@@ -12536,6 +12625,7 @@ mod tests {
         db2.migrate_v27_to_v28().unwrap();
         db2.migrate_v28_to_v29().unwrap();
         db2.migrate_v29_to_v30().unwrap();
+        db2.migrate_v30_to_v31().unwrap();
 
         let final_version: i64 = db2
             .conn

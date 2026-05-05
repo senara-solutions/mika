@@ -638,6 +638,8 @@ async fn save_continuation_llm_call(
             error,
             u32::MAX,
             prompt_variant,
+            None,
+            None,
         )
         .await
     {
@@ -913,6 +915,33 @@ async fn run_loop(
             let id = uuid::Uuid::new_v4().to_string();
             match &llm_result {
                 Ok(resp) => {
+                    // Serialize response content: text blocks + tool call summaries
+                    let response_text = {
+                        let mut parts = Vec::new();
+                        for block in &resp.content {
+                            match block {
+                                LlmResponseContent::Text(t) => parts.push(t.clone()),
+                                LlmResponseContent::ToolCall {
+                                    name, arguments, ..
+                                } => {
+                                    let args_str = arguments.to_string();
+                                    let args_truncated = crate::db::truncate_chars(&args_str, 200);
+                                    parts.push(format!("[Tool Call: {name}({args_truncated})]"));
+                                }
+                            }
+                        }
+                        let joined = parts.join("\n");
+                        let stripped = mika_common::llm::strip_internal_tags(&joined);
+                        if stripped.is_empty() {
+                            None
+                        } else {
+                            Some(crate::db::truncate_chars(&stripped, 50_000))
+                        }
+                    };
+                    let reasoning_text = resp
+                        .reasoning
+                        .as_deref()
+                        .map(|r| crate::db::truncate_chars(r, 50_000));
                     if let Err(e) = db
                         .save_llm_call(
                             &id,
@@ -930,6 +959,8 @@ async fn run_loop(
                             None,
                             step as u32,
                             prompt_variant,
+                            response_text.as_deref(),
+                            reasoning_text.as_deref(),
                         )
                         .await
                     {
@@ -954,6 +985,8 @@ async fn run_loop(
                             Some(&e.to_string()),
                             step as u32,
                             prompt_variant,
+                            None,
+                            None,
                         )
                         .await
                     {

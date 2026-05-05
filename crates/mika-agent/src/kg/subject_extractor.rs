@@ -1314,6 +1314,8 @@ Rules:
                 None,
                 0,
                 Some("kg_extraction"),
+                None,
+                None,
             )
             .await
         {

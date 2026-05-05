@@ -1494,6 +1494,8 @@ impl SubjectEntityResolver {
                 None,
                 0,
                 Some("kg_resolution"),
+                None,
+                None,
             )
             .await
         {
