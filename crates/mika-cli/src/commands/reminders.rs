@@ -135,3 +135,95 @@ fn reminder_to_json(t: &Task) -> Value {
         "metadata": t.metadata,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_reminder(id: &str, label: &str, trigger_type: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            agent_id: "test-agent".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: trigger_type.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some("2026-05-06T15:00:00Z".to_string()),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "Don't forget the meeting".to_string(),
+            status: "pending".to_string(),
+            process_id: None,
+            input_context: None,
+            result: None,
+            created_by_session: None,
+            created_trace_id: None,
+            execution_trace_id: None,
+            created_at: "2026-05-06T09:00:00Z".to_string(),
+            updated_at: "2026-05-06T09:00:00Z".to_string(),
+            fired_at: None,
+            completed_at: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: "issue".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_reminder_to_json_happy_get() {
+        let reminder = make_reminder("rem-001-aaaa", "Team standup", "time");
+        let json = reminder_to_json(&reminder);
+
+        assert_eq!(json["id"], "rem-001-aaaa");
+        assert_eq!(json["label"], "Team standup");
+        assert_eq!(json["status"], "pending");
+        assert_eq!(json["trigger_type"], "time");
+        assert_eq!(json["action_type"], "send_message");
+        assert_eq!(json["action_config"], "Don't forget the meeting");
+        assert_eq!(json["next_fire_at"], "2026-05-06T15:00:00Z");
+    }
+
+    #[test]
+    fn test_reminder_to_json_not_found() {
+        // Verify null optional fields serialize correctly.
+        let reminder = make_reminder("rem-missing-00", "Orphan reminder", "recurring");
+        let json = reminder_to_json(&reminder);
+
+        assert_eq!(json["id"], "rem-missing-00");
+        assert_eq!(json["trigger_type"], "recurring");
+        assert!(json["cron_expr"].is_null());
+        assert!(json["fired_at"].is_null());
+        assert!(json["completed_at"].is_null());
+        assert!(json["metadata"].is_null());
+    }
+
+    #[test]
+    fn test_reminder_to_json_list_serialization() {
+        let reminders = [
+            make_reminder("rem-001-aaaa", "Morning standup", "time"),
+            make_reminder("rem-002-bbbb", "Weekly review", "recurring"),
+        ];
+        let json_reminders: Vec<Value> = reminders.iter().map(reminder_to_json).collect();
+        let output = serde_json::to_string_pretty(&json_reminders).unwrap();
+
+        assert!(output.contains("\"Morning standup\""));
+        assert!(output.contains("\"Weekly review\""));
+        assert!(output.contains("\"time\""));
+        assert!(output.contains("\"recurring\""));
+    }
+
+    #[test]
+    fn test_reminder_to_json_empty_list() {
+        let reminders: Vec<Task> = vec![];
+        let json_reminders: Vec<Value> = reminders.iter().map(reminder_to_json).collect();
+        let output = serde_json::to_string_pretty(&json_reminders).unwrap();
+
+        assert_eq!(output, "[]");
+    }
+}

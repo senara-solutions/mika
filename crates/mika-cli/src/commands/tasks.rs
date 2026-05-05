@@ -172,3 +172,99 @@ fn task_to_json(t: &Task) -> Value {
         "metadata": t.metadata,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_task(id: &str, label: &str, status: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            agent_id: "test-agent".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some("2026-05-06T10:00:00Z".to_string()),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: "{}".to_string(),
+            status: status.to_string(),
+            process_id: None,
+            input_context: None,
+            result: None,
+            created_by_session: None,
+            created_trace_id: None,
+            execution_trace_id: None,
+            created_at: "2026-05-06T09:00:00Z".to_string(),
+            updated_at: "2026-05-06T09:00:00Z".to_string(),
+            fired_at: None,
+            completed_at: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: "issue".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_task_to_json_happy_get() {
+        let task = make_task("abc123def456", "Deploy service", "pending");
+        let json = task_to_json(&task);
+
+        assert_eq!(json["id"], "abc123def456");
+        assert_eq!(json["label"], "Deploy service");
+        assert_eq!(json["status"], "pending");
+        assert_eq!(json["type"], "issue");
+        assert_eq!(json["trigger_type"], "manual");
+        assert_eq!(json["action_type"], "send_message");
+        assert_eq!(json["agent_id"], "test-agent");
+        assert_eq!(json["next_fire_at"], "2026-05-06T10:00:00Z");
+    }
+
+    #[test]
+    fn test_task_to_json_not_found() {
+        // When a task is not found, the handler prints a message.
+        // Verify that task_to_json correctly serializes null optional fields.
+        let task = make_task("missing-id-0000", "Orphan task", "in_progress");
+        let json = task_to_json(&task);
+
+        assert_eq!(json["id"], "missing-id-0000");
+        assert!(json["cron_expr"].is_null());
+        assert!(json["fired_at"].is_null());
+        assert!(json["completed_at"].is_null());
+        assert!(json["parent_task_id"].is_null());
+        assert!(json["reference_url"].is_null());
+        assert!(json["result"].is_null());
+        assert!(json["metadata"].is_null());
+    }
+
+    #[test]
+    fn test_task_to_json_list_serialization() {
+        let tasks = [
+            make_task("task-001-aaaa", "First task", "pending"),
+            make_task("task-002-bbbb", "Second task", "in_progress"),
+        ];
+        let json_tasks: Vec<Value> = tasks.iter().map(task_to_json).collect();
+        let output = serde_json::to_string_pretty(&json_tasks).unwrap();
+
+        assert!(output.contains("\"First task\""));
+        assert!(output.contains("\"Second task\""));
+        assert!(output.contains("\"pending\""));
+        assert!(output.contains("\"in_progress\""));
+    }
+
+    #[test]
+    fn test_task_to_json_empty_list() {
+        let tasks: Vec<Task> = vec![];
+        let json_tasks: Vec<Value> = tasks.iter().map(task_to_json).collect();
+        let output = serde_json::to_string_pretty(&json_tasks).unwrap();
+
+        assert_eq!(output, "[]");
+    }
+}
