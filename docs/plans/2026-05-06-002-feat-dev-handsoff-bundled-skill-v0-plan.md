@@ -75,17 +75,18 @@ This split keeps actor-mapping clean: mika-dev writes content (it knows what hap
 - **D2 (reconciliation against HANDSOFF-CONTRACT, mika-platform#80): artifact body sections match HANDSOFF-CONTRACT exactly.** The ticket's "Spec dependency" note explicitly requests this reconciliation during grooming. The ticket's Artifact Contract §3 lists 5 sections (Story so far, Tickets touched, Decisions in flight, Filed today, What to do next session). HANDSOFF-CONTRACT lists 8 (TL;DR, Story so far, Tickets & PRs touched, Blocked / carry-forward, Decisions in flight, Filed today, What to do next session, Sessions).
     - **Reconciled:** the artifact body uses HANDSOFF-CONTRACT's section names exactly. This means:
         - Add `## TL;DR` (drop if no prose summary; YAML `summary` frontmatter is the routing layer, the body TL;DR is the human-readable reproduction).
-        - Rename `## Tickets touched` → `## Tickets & PRs touched` (matches HANDSOFF-CONTRACT verbatim).
+        - Rename `## Tickets touched` → `## Tickets & PRs touched` (matches HANDSOFF-CONTRACT verbatim — see also F2 below: ticket body §3 must be updated to match before merge).
         - Add `## Blocked / carry-forward` (drop if empty).
-        - Omit `## Sessions` from the skill's output (drop-if-empty rule applies; YAML `runs[]` frontmatter is the canonical session-list surface; pickup may inject the body Sessions section if needed for the published log).
+        - Omit `## Sessions` from the skill's output. **Rationale (revised per architect F1, anchored in HANDSOFF-CONTRACT's own optionality, NOT in v0.2 assumptions):** HANDSOFF-CONTRACT marks `## Sessions` as optional (the contract's drop-empty hard rule applies, and PR #82's commit `82eb19d` explicitly marked the Sessions row optional in the merge-rules table). For the v0.1 artifact, `runs[]` frontmatter is the machine-readable session record; the body `## Sessions` section would be redundant and is dropped under the optionality rule. v0.2 pickup, when filed, may choose to synthesize a body `## Sessions` block from `runs[]` for the published log — but that synthesis would not require any v0.1 artifact change. The omission rationale is anchored in the contract's own rules, not in an unspecified v0.2 behavior.
     - **Why:** v0.2 pickup is a transformation step. Identity transformation of body sections (path-rename only) is simpler and less error-prone than mapping. DRY at the contract layer means using HANDSOFF-CONTRACT's section names verbatim.
     - **Append discipline:** unchanged from ticket Artifact Contract §3 — append/update-in-place-by-Ref/wholesale-rewrite per section semantics. The added sections (TL;DR, Blocked / carry-forward) follow the same pattern (TL;DR rewrites wholesale on continuation, since it's the latest-summary; Blocked / carry-forward appends).
+    - **F2 — ticket body §3 update required before merge (per architect):** ticket body §3 currently lists `## Tickets touched`. HANDSOFF-CONTRACT's canonical heading is `## Tickets & PRs touched`. Per the issue-as-versioned-contract pattern (same as mika-platform#80's F3 closure), the ticket body must be updated to use HANDSOFF-CONTRACT's verbatim heading before this plan merges. v0.2 pickup will be written against the ticket body §3 contract; if the body retains the old heading, v0.2's groomer sees a conflict. Resolution: body edit + edit-notice comment at Phase 5 finalization, citing this grooming session.
 
-- **D3: `required_tools` is implementation-discovery, not pre-decided.** Ticket suggests `["bash", "edit", "write"]` but those are Claude Code tool names, not mika-internal builtin tool names. Deployed bundled skills use mika-internal names (`gh_read`, `run_shell`, `run_claude_pilot`, etc.). The implementer must:
-    1. Read mika's tool registry to identify the canonical names for: file-read, file-write, mkdir-p, and read-only git operations.
-    2. Set `required_tools` to the matching mika-internal names.
-    3. Verify by `grep -h "^required_tools" mika/skills/bundled/*/skill.toml | sort -u` — the new value should align with the existing-skills surface or be a justified additive.
-    Plan does NOT pre-commit specific tool names; defer to grooming-time tool-registry consultation. Ticket Verification step #4 codifies this check.
+- **D3 (revised per architect F4): `required_tools` is a pre-flight gate, not a verification step.** Ticket suggests `["bash", "edit", "write"]` but those are Claude Code tool names, not mika-internal builtin names. The implementer must resolve `required_tools` BEFORE writing `skill.toml`, not after — otherwise the build can break on `mika skills validate` with an unhelpful "unknown tool" error. Pre-flight steps (in this exact order):
+    1. **Phase 0 prerequisite (per architect F3):** verify mika-dev's exposed tool surface includes a write-to-arbitrary-path primitive. Read mika's tool registry source (likely `mika/crates/mika-agent/src/tools/`) and/or `~/.mika/agents/mika-dev/tools.json`. Candidate is `run_shell` (multiple deployed skills use it). **If no write-primitive is exposed, the skill must be handler-bearing — flag as a redesign branch and halt before proceeding.** This is a go/no-go gate for the prompt-only shape, not a downstream check.
+    2. Run `grep -h "^required_tools" mika/skills/bundled/*/skill.toml | sort -u` — collect canonical tool names in deployed surface.
+    3. Set `required_tools` to the intersection of (a) what dev-handsoff needs (mkdir + read + write + read-only git) and (b) what is valid in the registry. If the intersection is empty for write, see step 1's redesign branch.
+    4. Plan does NOT pre-commit specific tool names; this is implementation-discovery. But the discovery is BEFORE writing `skill.toml`, not after. Ticket Verification step #4 retains the alignment grep as a post-implementation cross-check.
 
 - **D4: keyword-conflict grep is mandatory before commit.** Ticket Verification step #5 + Pre-dispatch confirmations §2 specify the runnable grep. Plan inherits this gate. The grep must run from cwd `/data/workspace/mika-platform` and must report `CLEAN '<phrase>'` for all six configured phrases. The silent-zero failure mode (grep against non-existent path) is real — the ticket explicitly calls out `mika-platform/.claude/commands/` is wrong (should be `.claude/commands/` since cwd IS mika-platform).
 
@@ -113,13 +114,38 @@ This split keeps actor-mapping clean: mika-dev writes content (it knows what hap
 
 ## Implementation Units
 
+- [ ] **Unit 0 (pre-flight, per architect F3+F4): verify tool surface and resolve `required_tools` BEFORE writing skill files**
+
+**Goal:** Eliminate the prompt-only-vs-handler-bearing branch and pin the canonical `required_tools` value before implementation begins.
+
+**Requirements:** Pre-flight gate; supports R2 (manifest correctness).
+
+**Dependencies:** None (this runs before Unit 1).
+
+**Files:** No file creation. Investigation only.
+
+**Approach:**
+1. **Tool-surface verification (F3 gate, BLOCKING):**
+   - Read mika's tool registry source. Likely candidates: `mika/crates/mika-agent/src/tools/` (Rust source) or `~/.mika/agents/mika-dev/tools.json` (runtime config).
+   - Confirm whether the exposed tool surface includes a write-to-arbitrary-path primitive (e.g., `run_shell` which can shell out to `mkdir`/`cat >`, OR a dedicated `write_file`/`edit_file` primitive).
+   - **HALT on no write primitive:** if neither path exists, the skill cannot be prompt-only. Branch to handler-bearing redesign (modify Unit 1 to add a `handlers/` script and `tools.json` per the dev-pilot/ pattern). Surface this finding immediately; do not proceed to Unit 1.
+2. **`required_tools` resolution (F4 gate, BLOCKING for skill.toml):**
+   - Run `grep -h "^required_tools" mika/skills/bundled/*/skill.toml | sort -u`. Collect canonical names.
+   - Match dev-handsoff's needs (mkdir + read + write + read-only git) against deployed names.
+   - Set `required_tools` accordingly. If new tool names are needed (not in deployed surface), justify additively in the manifest comment; otherwise reuse.
+
+**Verification:**
+- Phase 0 produces a written record (one paragraph in this plan or a worktree-local note) of: (a) which tool primitives are exposed, (b) which were selected for `required_tools`, (c) whether the prompt-only shape was confirmed or escalated to handler-bearing.
+
 - [ ] **Unit 1: Create `mika/skills/bundled/dev-handsoff/` directory with two files**
 
 **Goal:** Land the bundled skill — manifest + prompt — that writes the handsoff artifact per the contract.
 
 **Requirements:** R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11
 
-**Dependencies:** mika-platform#80 (HANDSOFF-CONTRACT.md) — already shipped via PR #82. Section names in D2 reference this.
+**Dependencies:** Unit 0 (pre-flight tool-surface + `required_tools` gates must pass). mika-platform#80 (HANDSOFF-CONTRACT.md) — already shipped via PR #82. Section names in D2 reference this.
+
+**Non-goals (per architect U8):** `[lifecycle].on_session_end` field is intentionally absent from `skill.toml` — v0.1 is manual-keyword-triggered; v0.2 dependency #1 adds the lifecycle hook (Rust change to `SkillManifest` schema) when the lifecycle infrastructure lands. YAGNI for v0.1.
 
 **Files:**
 - Create: `skills/bundled/dev-handsoff/skill.toml`
@@ -159,7 +185,7 @@ This split keeps actor-mapping clean: mika-dev writes content (it knows what hap
 2. **Listing** — `mika skills list` shows `dev-handsoff`.
 3. **Keyword activation positive** — turn with "wrap up the run" activates the skill.
 4. **Required-tools sanity** — `grep -h "^required_tools" mika/skills/bundled/*/skill.toml | sort -u` shows the new tool list aligned with deployed surface (D3).
-5. **Keyword-conflict grep** — run from cwd `/data/workspace/mika-platform`, the script in ticket Pre-dispatch confirmations §2, must report `CLEAN '<phrase>'` for all six phrases. Silent-zero is the failure mode this guards against.
+5. **Keyword-conflict grep (HALT gate, per architect U3)** — run from cwd `/data/workspace/mika-platform`, the script in ticket Pre-dispatch confirmations §2, must report `CLEAN '<phrase>'` for all six phrases. **HALT: if any phrase reports CONFLICT, do not proceed to commit. Investigate and resolve the conflict before continuing.** Silent-zero is the failure mode this guards against (grep against non-existent path looks identical to clean grep against real path).
 6. **End-to-end rule 1 (work-item)** — `<worktree>/.mika/handsoff/<TODAY>-<work-item-slug>.md` created with full frontmatter + body sections.
 7. **End-to-end rule 3 (first-of-day, no work-item)** — `<TODAY>.md` created (no slug suffix).
 8. **End-to-end rule 2 (later-in-day, no work-item)** — `<TODAY>-<sid8>.md` created.
