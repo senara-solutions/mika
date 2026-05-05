@@ -1,4 +1,3 @@
-import { useMemo } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { useLlmCalls, useCostTrend, type LlmCallsFilters, type CostTrendFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
@@ -43,18 +42,11 @@ export default function LlmCalls() {
   const { data, isLoading, error, refetch } = useLlmCalls(filters)
   const { data: agents } = useAgents()
 
-  // Cost trend chart: defaults to last 24h when no time range is set.
-  // Memoize the default "from" to avoid calling Date.now() during render (React purity).
-  const chartDefaultFrom = useMemo(
-    () => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z'),
-    // Re-compute when the user sets/clears the from filter
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [filters.from],
-  )
+  // Cost trend chart: the server defaults to last 24h when no `from` is provided.
   const costTrendFilters: CostTrendFilters = {
     agent_id: filters.agent_id,
     model: filters.model,
-    from: filters.from ?? chartDefaultFrom,
+    from: filters.from,
     to: filters.to,
   }
   const { data: costTrend, isLoading: costLoading, error: costError, refetch: costRefetch } = useCostTrend(costTrendFilters)

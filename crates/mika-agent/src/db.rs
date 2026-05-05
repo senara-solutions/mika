@@ -5714,11 +5714,7 @@ impl Database {
                 }
             }
 
-            let agent_key = if filters.agent_id.is_some() {
-                None
-            } else {
-                Some(agent_id)
-            };
+            let agent_key = Some(agent_id);
             let entry = aggregated.entry((bucket_ts, agent_key)).or_default();
             entry.0 += cost;
             entry.1 += input;
