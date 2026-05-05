@@ -144,7 +144,7 @@ AgentFilter ────(agent_id URL param)────►      │
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add pricing module (Rust)**
+- [x] **Unit 1: Add pricing module (Rust)**
 
 **Goal:** Create a production pricing module that computes estimated LLM call cost from token counts and model identity.
 
@@ -183,7 +183,7 @@ AgentFilter ────(agent_id URL param)────►      │
 
 ---
 
-- [ ] **Unit 2: Add cost-trend aggregation query (Rust DB layer)**
+- [x] **Unit 2: Add cost-trend aggregation query (Rust DB layer)**
 
 **Goal:** Add a SQL aggregation query that returns cost-over-time buckets from the `llm_calls` table, with the pricing module applied per-row.
 
@@ -226,7 +226,7 @@ AgentFilter ────(agent_id URL param)────►      │
 
 ---
 
-- [ ] **Unit 3: Add cost-trend HTTP endpoint (Rust server)**
+- [x] **Unit 3: Add cost-trend HTTP endpoint (Rust server)**
 
 **Goal:** Wire the cost-trend query into an Axum handler at `GET /api/v1/llm-calls/cost-trend`.
 
@@ -258,7 +258,7 @@ AgentFilter ────(agent_id URL param)────►      │
 
 ---
 
-- [ ] **Unit 4: Add recharts dependency and CostTrendChart component (Frontend)**
+- [x] **Unit 4: Add recharts dependency and CostTrendChart component (Frontend)**
 
 **Goal:** Create the `<CostTrendChart>` React component with single-line and stacked-by-agent variants, styled for Midnight Obsidian.
 
@@ -307,7 +307,7 @@ AgentFilter ────(agent_id URL param)────►      │
 
 ---
 
-- [ ] **Unit 5: Add cost-trend API hook and integrate on LLM Calls page (Frontend)**
+- [x] **Unit 5: Add cost-trend API hook and integrate on LLM Calls page (Frontend)**
 
 **Goal:** Wire the chart into the LLM Calls page with data fetching and filter integration.
 
