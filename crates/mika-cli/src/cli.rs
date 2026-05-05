@@ -577,6 +577,18 @@ pub struct ReminderArgs {
 
 #[derive(Subcommand)]
 pub enum ReminderCommand {
+    /// List pending reminders
+    List {
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Show details for a specific reminder
+    Get {
+        /// Reminder ID
+        id: String,
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Cancel a reminder by ID (from `mika reminders`)
     Cancel { id: String },
 }
@@ -592,6 +604,18 @@ pub struct TaskArgs {
 
 #[derive(Subcommand)]
 pub enum TaskCommand {
+    /// List active tasks
+    List {
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Show details for a specific task
+    Get {
+        /// Task ID
+        id: String,
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Cancel a task by ID (from `mika tasks`)
     Cancel { id: String },
 }

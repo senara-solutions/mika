@@ -18,6 +18,12 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 - `mika setup --mode compose` — Generate `.env` for docker-compose in current directory
 - `mika setup --mode oauth` — Authorize Mika with Claude Pro/Max subscription via PKCE
 - `mika teams log <name>` — shows full run UUIDs (copyable for `--run-id`), supports `--format text|json` and `-n/--limit` (default 10)
+- `mika tasks list` — List active tasks (pending, in_progress, recurring_active). Bare `mika tasks` is an alias. Supports `--format text|json`.
+- `mika tasks get <id>` — Show full details for a single task. Supports `--format text|json`.
+- `mika tasks cancel <id>` — Cancel a task and kill its process if running.
+- `mika reminders list` — List pending reminders. Bare `mika reminders` is an alias. Supports `--format text|json`.
+- `mika reminders get <id>` — Show full details for a single reminder. Validates the task is a reminder (trigger_type: time/recurring). Supports `--format text|json`.
+- `mika reminders cancel <id>` — Cancel a reminder by ID.
 
 ### `mika ask`
 
@@ -46,7 +52,7 @@ Scoped flags: `--agent <name>` (override active agent, most subcommands), `--tea
 
 ## Other `--format text|json` Commands
 
-`agents validate`, `teams list`, `teams status`, `teams validate`, `skills list`, `skills validate`, `status`, `config list`, `memory search`, `provider`, `model`, `webhook list-dead`, `webhook replay`, `webhook replay-all`, `kg status`, `kg list-agents`, `kg purge`, `kg validate`.
+`agents validate`, `teams list`, `teams status`, `teams validate`, `skills list`, `skills validate`, `status`, `config list`, `memory search`, `provider`, `model`, `tasks list`, `tasks get`, `reminders list`, `reminders get`, `webhook list-dead`, `webhook replay`, `webhook replay-all`, `kg status`, `kg list-agents`, `kg purge`, `kg validate`.
 
 ## Webhook CLI
 
