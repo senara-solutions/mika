@@ -1865,6 +1865,7 @@ dependencies = [
  "dashmap",
  "http",
  "http-body-util",
+ "libc",
  "mika-a2a",
  "mika-common",
  "regex",

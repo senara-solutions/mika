@@ -220,6 +220,7 @@ impl TaskEngine {
         if self.tick_count.is_multiple_of(DB_SCAN_INTERVAL_TICKS) {
             self.expire_timed_out_tasks().await;
             self.kill_orphan_processes().await;
+            self.check_callback_process_liveness().await;
             self.scan_db_for_new_tasks().await;
             // In CLI mode, the TUI's poll_callback_tasks() handles callback delivery
             // (session-scoped, atomic claim). Skip engine dispatch to prevent a race
@@ -395,6 +396,184 @@ impl TaskEngine {
 
         if stale_skipped > 0 {
             info!(count = stale_skipped, "cleared stale failed callback tasks");
+        }
+    }
+
+    /// Detect dead subprocesses for active callback tasks (#959).
+    ///
+    /// For each `in_progress` callback task with a `process_id`:
+    /// 1. Check if the process is still alive (PID exists AND start time matches)
+    /// 2. If dead, set `first_dead_at` metadata on first detection
+    /// 3. If dead and past grace period, mark the task `failed`
+    /// 4. If alive, clear any stale `first_dead_at` (defensive)
+    ///
+    /// Grace period default: 120s (configurable via `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS`).
+    async fn check_callback_process_liveness(&self) {
+        let tasks = match self.db.get_active_callback_tasks_with_pid().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "callback_watchdog: failed to query active callback tasks");
+                return;
+            }
+        };
+
+        if tasks.is_empty() {
+            return;
+        }
+
+        let grace_period_secs = self
+            .dispatcher
+            .settings
+            .effective_callback_watchdog_grace_period_secs();
+
+        for task in tasks {
+            let pid = match task.process_id {
+                Some(pid) if pid > 0 => pid as u32,
+                _ => continue,
+            };
+
+            // Read stored process_start_time from task metadata
+            let start_time: Option<u64> = task
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| v.get("process_start_time")?.as_str()?.parse().ok());
+
+            let process_alive = match start_time {
+                Some(st) => super::process_liveness::is_same_process_alive(pid, st),
+                // No start time stored (pre-#959 task or non-Linux) — fall back to
+                // basic /proc check. Less reliable but better than nothing.
+                None => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        std::path::Path::new(&format!("/proc/{pid}")).exists()
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        true // Assume alive on non-Linux — existing timeout_at is the fallback
+                    }
+                }
+            };
+
+            if process_alive {
+                // Process is alive — clear any stale first_dead_at (defensive)
+                let has_first_dead_at = task
+                    .metadata
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .and_then(|v| v.get("first_dead_at").cloned())
+                    .is_some();
+
+                if has_first_dead_at {
+                    let _ = self
+                        .db
+                        .remove_task_metadata_field(&task.id, "first_dead_at")
+                        .await;
+                }
+                continue;
+            }
+
+            // Process is dead — check grace period
+            let first_dead_at = task
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| v.get("first_dead_at")?.as_str().map(|s| s.to_string()));
+
+            let now = crate::timestamp::now();
+
+            match first_dead_at {
+                None => {
+                    // First detection — record timestamp
+                    debug!(
+                        task_id = %task.id,
+                        pid = pid,
+                        "callback_watchdog: subprocess PID dead, starting grace period"
+                    );
+                    let _ = self
+                        .db
+                        .set_task_metadata_field(&task.id, "first_dead_at", &now)
+                        .await;
+                }
+                Some(first_dead) => {
+                    // Check if grace period has elapsed
+                    let grace_duration = chrono::Duration::seconds(grace_period_secs as i64);
+                    if !crate::timestamp::is_older_than(&first_dead, grace_duration) {
+                        // Still within grace period — wait
+                        debug!(
+                            task_id = %task.id,
+                            pid = pid,
+                            first_dead_at = %first_dead,
+                            grace_period_secs = grace_period_secs,
+                            "callback_watchdog: still within grace period"
+                        );
+                        continue;
+                    }
+
+                    // Grace period elapsed — re-check task status to guard against
+                    // race with in-flight callback delivery
+                    let current_task = match self.db.get_task(&task.id).await {
+                        Ok(Some(t)) => t,
+                        _ => continue,
+                    };
+
+                    if current_task.status != "in_progress" {
+                        // Task already transitioned (callback delivered during grace)
+                        debug!(
+                            task_id = %task.id,
+                            status = %current_task.status,
+                            "callback_watchdog: task already transitioned, skipping"
+                        );
+                        continue;
+                    }
+
+                    // Mark task as failed
+                    match self
+                        .db
+                        .update_task_failed(&task.id, "subprocess_exited_without_delivery")
+                        .await
+                    {
+                        Ok(true) => {
+                            // Clear timeout_at to prevent double-processing by
+                            // expire_timed_out_tasks
+                            let _ = self
+                                .db
+                                .set_task_metadata_field(
+                                    &task.id,
+                                    "watchdog_cleared_timeout",
+                                    "true",
+                                )
+                                .await;
+
+                            warn!(
+                                task_id = %task.id,
+                                parent_task_id = ?task.parent_task_id,
+                                pid = pid,
+                                process_start_time = ?start_time,
+                                first_dead_at = %first_dead,
+                                grace_period_secs = grace_period_secs,
+                                failure_reason = "subprocess_exited_without_delivery",
+                                "callback_watchdog_detected_process_death: \
+                                 subprocess exited without delivering callback, \
+                                 marking task failed to unblock dispatch queue"
+                            );
+                        }
+                        Ok(false) => {
+                            debug!(
+                                task_id = %task.id,
+                                "callback_watchdog: task already in terminal state"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                task_id = %task.id,
+                                error = %e,
+                                "callback_watchdog: failed to mark task as failed"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

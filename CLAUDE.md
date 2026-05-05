@@ -161,6 +161,9 @@ Optional (startup behavior):
 - `MIKA_DISABLE_BUNDLED_SKILLS` — Skip bundled skill re-sync on startup (default: false). WARNING: do not enable in production — prevents security updates to handler scripts.
 - `MIKA_DISABLE_AGENT_PROVISIONING` — Skip well-known agent auto-creation on startup (default: false). When true, prevents `dev_mode` from creating or updating agent identity files, allowing manual edits to persist across restarts/deploys. Same pattern as `MIKA_DISABLE_BUNDLED_SKILLS`.
 
+Optional (callback watchdog):
+- `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` — Grace period (seconds) after subprocess death detection before marking a callback task `failed` (default: 120). The watchdog runs every 60s in the engine tick loop and detects dead subprocesses via `/proc/<pid>/stat` process start time comparison. Prevents stale long-running callbacks from blocking the dispatch queue indefinitely (#959).
+
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)

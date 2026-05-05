@@ -4913,6 +4913,65 @@ impl Database {
         Ok(())
     }
 
+    /// Get active callback tasks that have a process_id set (#959).
+    ///
+    /// Returns callback tasks in `in_progress` status with a non-null process_id,
+    /// used by the callback watchdog to detect dead subprocesses.
+    pub fn get_active_callback_tasks_with_pid(&self, agent_id: &str) -> Result<Vec<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND status = 'in_progress'
+               AND process_id IS NOT NULL",
+            Self::TASK_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![agent_id], Self::row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Set a single field in the task's metadata JSON (#959).
+    ///
+    /// Uses SQLite's `json_set()` to merge the field into existing metadata,
+    /// initializing with `'{}'` if metadata is currently NULL.
+    pub fn set_task_metadata_field(&self, task_id: &str, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET
+                metadata = json_set(COALESCE(metadata, '{}'), '$.' || ?1, ?2),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?3",
+            params![key, value, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a single field from the task's metadata JSON (#959).
+    ///
+    /// Uses SQLite's `json_remove()` to delete the key. No-op if the key doesn't exist.
+    pub fn remove_task_metadata_field(&self, task_id: &str, key: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET
+                metadata = json_remove(COALESCE(metadata, '{}'), '$.' || ?1),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?2",
+            params![key, task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get a single metadata field from a task's metadata JSON as a string.
+    pub fn get_task_metadata_field(&self, task_id: &str, key: &str) -> Result<Option<String>> {
+        let result: Option<String> = self.conn.query_row(
+            "SELECT json_extract(metadata, '$.' || ?1) FROM tasks WHERE id = ?2",
+            params![key, task_id],
+            |row| row.get(0),
+        )?;
+        Ok(result)
+    }
+
     /// Check if all siblings of a completed task are done. If so, atomically
     /// claim the parent task for dispatch.
     ///
@@ -13212,5 +13271,110 @@ mod tests {
         // Running migration again should be a no-op
         db.migrate_v29_to_v30().unwrap();
         assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    // -- Callback watchdog DB helpers (#959) --
+
+    /// Helper: create a parent task and a callback child task, returning (parent_id, child_id).
+    fn create_callback_task_pair(db: &Database, agent: &str, label: &str) -> (String, String) {
+        let parent = new_task(agent, &format!("{label}-parent"), "manual", "none");
+        let parent_id = db.create_task(&parent).unwrap();
+        let mut child = new_task(agent, label, "callback", "resume_agent");
+        child.parent_task_id = Some(parent_id.clone());
+        let child_id = db.create_task(&child).unwrap();
+        (parent_id, child_id)
+    }
+
+    #[test]
+    fn test_get_active_callback_tasks_with_pid() {
+        let db = db();
+        let (_parent_id, child_id) = create_callback_task_pair(&db, "mika", "callback-task");
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress', process_id = 12345 WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let results = db.get_active_callback_tasks_with_pid("mika").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, child_id);
+        assert_eq!(results[0].process_id, Some(12345));
+    }
+
+    #[test]
+    fn test_get_active_callback_tasks_with_pid_excludes_completed() {
+        let db = db();
+        let (_parent_id, child_id) = create_callback_task_pair(&db, "mika", "done-callback");
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed', process_id = 12345 WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let results = db.get_active_callback_tasks_with_pid("mika").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_active_callback_tasks_with_pid_excludes_no_pid() {
+        let db = db();
+        let (_parent_id, child_id) = create_callback_task_pair(&db, "mika", "no-pid-callback");
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let results = db.get_active_callback_tasks_with_pid("mika").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_set_task_metadata_field_new() {
+        let db = db();
+        let task = new_task("mika", "meta-test", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+
+        db.set_task_metadata_field(&id, "process_start_time", "999888")
+            .unwrap();
+
+        let val = db
+            .get_task_metadata_field(&id, "process_start_time")
+            .unwrap();
+        assert_eq!(val, Some("999888".to_string()));
+    }
+
+    #[test]
+    fn test_set_task_metadata_field_existing_metadata() {
+        let db = db();
+        let task = new_task("mika", "meta-test-2", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+
+        // Set initial metadata
+        db.update_task_metadata(&id, r#"{"existing":"value"}"#)
+            .unwrap();
+
+        // Add a new field
+        db.set_task_metadata_field(&id, "first_dead_at", "2026-05-05T00:00:00Z")
+            .unwrap();
+
+        // Both fields should exist
+        let val = db.get_task_metadata_field(&id, "existing").unwrap();
+        assert_eq!(val, Some("value".to_string()));
+        let val = db.get_task_metadata_field(&id, "first_dead_at").unwrap();
+        assert_eq!(val, Some("2026-05-05T00:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_get_task_metadata_field_missing_key() {
+        let db = db();
+        let task = new_task("mika", "meta-test-3", "manual", "none");
+        let id = db.create_task(&task).unwrap();
+
+        let val = db.get_task_metadata_field(&id, "nonexistent").unwrap();
+        assert_eq!(val, None);
     }
 }

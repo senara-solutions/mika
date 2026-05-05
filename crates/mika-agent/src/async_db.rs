@@ -478,6 +478,43 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Get active callback tasks with a process_id set (#959).
+    pub async fn get_active_callback_tasks_with_pid(&self) -> Result<Vec<crate::db::Task>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.get_active_callback_tasks_with_pid(&a))
+            .await
+    }
+
+    /// Set a single field in the task's metadata JSON (#959).
+    pub async fn set_task_metadata_field(
+        &self,
+        task_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let (i, k, v) = (task_id.to_owned(), key.to_owned(), value.to_owned());
+        self.with_db(move |db| db.set_task_metadata_field(&i, &k, &v))
+            .await
+    }
+
+    /// Get a single metadata field from a task's metadata JSON.
+    pub async fn get_task_metadata_field(
+        &self,
+        task_id: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let (i, k) = (task_id.to_owned(), key.to_owned());
+        self.with_db(move |db| db.get_task_metadata_field(&i, &k))
+            .await
+    }
+
+    /// Remove a single field from the task's metadata JSON (#959).
+    pub async fn remove_task_metadata_field(&self, task_id: &str, key: &str) -> Result<()> {
+        let (i, k) = (task_id.to_owned(), key.to_owned());
+        self.with_db(move |db| db.remove_task_metadata_field(&i, &k))
+            .await
+    }
+
     pub async fn try_complete_parent_on_sibling_done(
         &self,
         task_id: &str,
