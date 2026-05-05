@@ -21,31 +21,60 @@ Add a **process liveness check** to the engine's periodic tick loop that detects
 
 ### Design Decisions
 
-1. **Detect by PID liveness, not by timeout.** The subprocess PID is stored in `tasks.process_id`. If `kill(pid, 0)` fails with ESRCH (no such process), the subprocess is dead. This detects death in ~60s (one engine tick) rather than waiting hours for `timeout_at`.
+1. **Detect by PID liveness, not by timeout.** The subprocess PID is stored in `tasks.process_id`. If `kill(pid, 0)` fails with ESRCH (no such process), the subprocess is dead. This detects death in ~60s (one engine tick) rather than waiting hours for `timeout_at`. Additionally, store `(pid, process_start_time)` at spawn time (Linux `/proc/<pid>/stat` field 22) to detect PID reuse — if a process exists at the PID but started after the task was created, treat it as dead.
 
-2. **Grace period: 2 minutes after PID death.** The subprocess may have exited cleanly and the callback delivery message is in-flight (network delay, queue lag). Wait 2 minutes of confirmed PID-death before declaring abandonment. Track "first seen dead" timestamp in task metadata.
+2. **Grace period: 2 minutes after PID death (configurable).** The subprocess may have exited cleanly and the callback delivery message is in-flight (network delay, queue lag). Wait `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` (default 120) of confirmed PID-death before declaring abandonment. The grace timer starts from `updated_at` (last state transition on the task), not `started_at` — this prevents false positives if the task autonomously retries or the subprocess restarts. Track "first seen dead" timestamp in task metadata.
 
-3. **Transition to `failed`, not `expired`.** The task didn't time out — it crashed. Use `failed` with `error_reason: "subprocess_exited_without_delivery"` for audit clarity. The existing parent-reaper (`reap_orphaned_parent_tasks`) already handles `failed` callbacks correctly.
+3. **Transition to `failed`, not `expired`.** The task didn't time out — it crashed. Use `failed` with `error_reason: "subprocess_exited_without_delivery"` for audit clarity. The existing parent-reaper (`reap_orphaned_parent_tasks`) already handles `failed` callbacks correctly. Clear `timeout_at` when watchdog marks `failed` to avoid double-processing by `expire_timed_out_tasks`.
 
-4. **WARN log entry.** Emit structured log: `callback_id`, `parent_task_id`, `process_id`, `first_dead_at`, `declared_dead_at`. Satisfies acceptance criterion #2.
+4. **Structured event + WARN log.** Emit both a WARN log entry and a structured telemetry event for programmatic consumption:
+   ```json
+   {
+     "event": "callback_watchdog_detected_process_death",
+     "task_id": "<callback_task_id>",
+     "parent_task_id": "<parent_task_id>",
+     "pid": 12345,
+     "process_start_time": 1715000000,
+     "detected_at": "2026-05-05T00:00:00Z",
+     "grace_period_secs": 120,
+     "new_status": "failed",
+     "failure_reason": "subprocess_exited_without_delivery"
+   }
+   ```
+   This enables mika-dev to immediately retry (if idempotent), alert operators with context, and update metrics without log scraping. Pattern follows existing watchdog event emissions in `mika-telemetry`.
 
-5. **Configurable timeout (secondary).** Also reduce the `timeout_at` ceiling for `run_claude_pilot` callbacks to a configurable agent-level default (default 30m). This provides a belt-and-suspenders backstop for edge cases where PID tracking fails (e.g., PID reuse on long-lived systems). The 30m value matches the ticket's acceptance criterion.
+5. **`timeout_at` as panic-fallback only.** Keep `estimated_duration_secs` at 7200 (2h) for `run_claude_pilot`. The watchdog is the primary detection mechanism (~2min). The existing 6h `timeout_at` serves as a panic-fallback for edge cases where PID tracking fails entirely (e.g., container restart where `/proc` state is lost). This avoids operational noise from unnecessary timeout-based restarts.
+
+6. **Platform assumption: Linux only.** Process liveness detection uses `/proc/<pid>/stat` (Linux-specific). This is consistent with existing precedent — the codebase already assumes Linux in other process-management paths (cgroups, namespaces, `kill_orphan_processes`). No macOS/BSD support needed.
 
 ### Implementation Steps
 
-#### Step 1: Add `first_dead_at` to task metadata
+#### Step 1: Store process start time at spawn and add watchdog function
+
+**File:** `crates/mika-agent/src/skills/executor.rs`
+
+When spawning the subprocess in `execute_long_running()`, read `/proc/<pid>/stat` field 22 (starttime) immediately after spawn and store it in the callback task's metadata as `process_start_time`:
+```rust
+let start_time = read_process_start_time(child.id());
+db.set_task_metadata_field(&callback_task_id, "process_start_time", &start_time.to_string()).await?;
+```
 
 **File:** `crates/mika-agent/src/task_engine/engine.rs`
 
 Add a new periodic function `check_callback_process_liveness()` that:
-1. Queries all callback tasks in `pending`/`in_progress` that have a `process_id`
-2. For each, checks if process is alive via `unsafe { libc::kill(pid, 0) }`
+1. Queries all callback tasks in `in_progress` that have a `process_id` (skip `pending` — they haven't spawned yet)
+2. For each, checks if process is alive:
+   - `kill(pid, 0) == -1 && errno == ESRCH` → definitely dead
+   - `kill(pid, 0) == 0` → check `/proc/<pid>/stat` field 22 against stored `process_start_time`. Mismatch → PID reused, treat as dead.
 3. If dead and no `metadata.first_dead_at`:
-   - Set `metadata.first_dead_at = now()` via `db.update_task_metadata()`
-4. If dead and `metadata.first_dead_at` is > 120s ago:
-   - Mark task `failed` with `error_reason = "subprocess_exited_without_delivery"`
-   - Log WARN with callback_id, parent_task_id, freed task info
-5. If alive, clear `metadata.first_dead_at` if set (process recovered — shouldn't happen but defensive)
+   - Set `metadata.first_dead_at = now()` via `db.set_task_metadata_field()`
+4. If dead and `metadata.first_dead_at` is > `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` (default 120) ago:
+   - Re-check task status (guard against race with in-flight callback delivery)
+   - If still `in_progress`: mark task `failed` with `error_reason = "subprocess_exited_without_delivery"`
+   - Clear `timeout_at` on the task to prevent double-processing
+   - Emit structured event `callback_watchdog_detected_process_death`
+   - Log WARN with callback_id, parent_task_id, pid, process_start_time
+5. If alive (confirmed same process), clear `metadata.first_dead_at` if set (defensive)
 
 #### Step 2: Wire into engine tick loop
 
@@ -78,30 +107,55 @@ pub async fn set_task_metadata_field(&self, task_id: &str, key: &str, value: &st
 }
 ```
 
-#### Step 5: Reduce default callback timeout for dev-pilot
-
-**File:** `skills/bundled/dev-pilot/tools.json`
-
-Change the `estimated_duration_secs` for `run_claude_pilot` from 7200 to 600 (10 minutes). This yields a `timeout_at` of 1800s (30 minutes) via the `× 3` multiplier — matching the ticket's acceptance criterion exactly.
-
-#### Step 6: Add process liveness utility
+#### Step 5: Add process liveness utility with PID reuse detection
 
 **File:** `crates/mika-agent/src/task_engine/process.rs` (new or extend existing)
 
 ```rust
-pub fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+use std::fs;
+
+/// Check if a process is alive AND is the same process we spawned.
+/// Returns `true` if alive and same process, `false` if dead or PID reused.
+pub fn is_same_process_alive(pid: u32, expected_start_time: u64) -> bool {
+    // First: is anything running at this PID?
+    let signal_result = unsafe { libc::kill(pid as i32, 0) };
+    if signal_result == -1 {
+        return false; // ESRCH or EPERM — process gone
+    }
+    // Second: is it the SAME process? Check /proc/<pid>/stat field 22
+    match read_process_start_time(pid) {
+        Some(actual_start_time) => actual_start_time == expected_start_time,
+        None => false, // /proc entry gone between kill(0) and read — race, treat as dead
+    }
+}
+
+/// Read process start time from /proc/<pid>/stat (field 22, 0-indexed from after comm).
+/// Returns None if process doesn't exist or /proc is unreadable.
+pub fn read_process_start_time(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Field 22 is starttime (clock ticks since boot). Parse after closing paren of comm field.
+    let after_comm = stat.rfind(')')? + 2; // skip ") "
+    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    // Field 22 is index 19 after the comm closure (fields 3-52 are at indices 0-49)
+    fields.get(19)?.parse().ok()
 }
 ```
+
+#### Step 6: Add configuration support
+
+**File:** `crates/mika-common/src/config.rs`
+
+Add `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` to Settings (default 120). Exposed via `settings.callback_watchdog_grace_period_secs()`.
 
 ### File Changes Summary
 
 | File | Change |
 |------|--------|
 | `crates/mika-agent/src/task_engine/engine.rs` | Add `check_callback_process_liveness()`, wire into tick loop |
+| `crates/mika-agent/src/skills/executor.rs` | Store `process_start_time` in callback task metadata at spawn |
 | `crates/mika-agent/src/db.rs` | Add `get_active_callback_tasks_with_pid()`, `set_task_metadata_field()` |
-| `crates/mika-agent/src/task_engine/process.rs` | Add `is_process_alive()` (may extend existing `process_kill` module) |
-| `skills/bundled/dev-pilot/tools.json` | Reduce `estimated_duration_secs` to 600 |
+| `crates/mika-agent/src/task_engine/process.rs` | Add `is_same_process_alive()`, `read_process_start_time()` |
+| `crates/mika-common/src/config.rs` | Add `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` setting (default 120) |
 
 ### Testing Strategy
 
@@ -113,12 +167,25 @@ pub fn is_process_alive(pid: u32) -> bool {
 
 | Risk | Mitigation |
 |------|-----------|
-| PID reuse (OS assigns same PID to unrelated process) | 2-minute grace period + check that the PID's start time matches. On Linux, `/proc/<pid>/stat` field 22 is start time. If we detect the process is "alive" but started after the task was created, treat as dead. |
-| Race: callback delivers during grace period | Check task status before marking failed — if it transitioned to `delivered` during grace, skip. |
-| Non-Linux platforms | `libc::kill` works on all Unix. Windows not supported (mika runs on Linux). |
+| PID reuse (OS assigns same PID to unrelated process) | Store `process_start_time` at spawn; compare against `/proc/<pid>/stat` field 22 on every liveness check. Mismatch → treat as dead regardless of `kill(pid, 0)` result. |
+| Race: callback delivers during grace period | Re-check task status immediately before marking `failed` — if it transitioned to `delivered` during grace, skip. Atomic CAS-style update: `UPDATE ... WHERE status = 'in_progress'`. |
+| Non-Linux platforms | Acknowledged: `/proc` is Linux-specific. Consistent with existing codebase assumptions (cgroups, namespaces, `kill_orphan_processes`). No macOS/BSD support needed. |
+| Double-processing with `timeout_at` | Clear `timeout_at` on the task when watchdog marks `failed`. `expire_timed_out_tasks` skips tasks without `timeout_at`. |
+| Container restart loses `/proc` state | Panic-fallback: existing `timeout_at` (6h) still fires. Acceptable because container restarts also reset the engine — stale callbacks from previous container lifetime are not carried over (SQLite is fresh or restored from backup with no active callbacks). |
+
+### Interaction with Existing Mechanisms
+
+| Mechanism | Relationship to watchdog |
+|-----------|--------------------------|
+| `expire_timed_out_tasks` | Panic-fallback. Fires at `timeout_at` (6h). Watchdog clears `timeout_at` on detection to prevent double-fire. |
+| `kill_orphan_processes` | Complementary. Fires on already-expired tasks to SIGTERM stragglers. Watchdog detects death *before* expiry. |
+| `reap_orphaned_parent_tasks` | Downstream consumer. After watchdog marks callback `failed`, reaper handles the orphaned parent (marks parent `failed` if no PR URL after grace). |
+| `dispatch_undelivered_callbacks` | No interaction. Only processes tasks that have results to deliver. Watchdog handles the case where no result will ever arrive. |
 
 ## Acceptance Verification
 
-- ✅ Stalled subprocess auto-clears after ~2min (PID watchdog) or 30min (timeout_at backstop)
-- ✅ WARN log names abandoned callback_id and freed task_id
+- ✅ Stalled subprocess auto-clears after ~2min (PID watchdog) — configurable via `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS`
+- ✅ Panic-fallback at existing `timeout_at` (6h) for edge cases where PID tracking fails
+- ✅ WARN log names abandoned callback_id, parent_task_id, pid, and process_start_time
+- ✅ Structured telemetry event `callback_watchdog_detected_process_death` emitted for programmatic consumption
 - ✅ Subsequent dispatches succeed without manual intervention (global guard unblocked by `failed` transition)
