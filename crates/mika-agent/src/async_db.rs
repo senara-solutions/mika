@@ -1301,6 +1301,17 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn list_facts_paginated_with_count(
+        &self,
+        agent_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<crate::db::DashboardFact>, u64)> {
+        let aid = agent_id.to_owned();
+        self.with_db(move |db| db.list_facts_paginated_with_count(&aid, limit, offset))
+            .await
+    }
+
     // -- Team Runs --
 
     pub async fn insert_team_run(
@@ -1611,13 +1622,14 @@ impl AsyncDatabase {
         offset: u32,
     ) -> Result<Vec<AuditEvent>> {
         let aid = agent_id.to_owned();
-        self.with_db(move |db| db.list_audit_events_paginated(&aid, limit, offset))
+        self.with_db(move |db| db.list_audit_events_paginated(&aid, None, None, limit, offset))
             .await
     }
 
     pub async fn count_audit_events(&self, agent_id: &str) -> Result<u64> {
         let aid = agent_id.to_owned();
-        self.with_db(move |db| db.count_audit_events(&aid)).await
+        self.with_db(move |db| db.count_audit_events(&aid, None, None))
+            .await
     }
 
     // -- Combined data+count queries (single channel round-trip) --
@@ -1673,12 +1685,24 @@ impl AsyncDatabase {
     pub async fn list_audit_events_paginated_with_count(
         &self,
         agent_id: &str,
+        tool_name: Option<&str>,
+        target_key: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<AuditEvent>, u64)> {
         let aid = agent_id.to_owned();
-        self.with_db(move |db| db.list_audit_events_paginated_with_count(&aid, limit, offset))
-            .await
+        let tn = tool_name.map(|s| s.to_owned());
+        let tk = target_key.map(|s| s.to_owned());
+        self.with_db(move |db| {
+            db.list_audit_events_paginated_with_count(
+                &aid,
+                tn.as_deref(),
+                tk.as_deref(),
+                limit,
+                offset,
+            )
+        })
+        .await
     }
 
     // -- Dashboard: Tasks --

@@ -255,8 +255,49 @@ pub async fn handle_agent_sessions(
     .into_response()
 }
 
+/// Query parameters for the audit endpoint (pagination + optional filters).
+#[derive(Debug, Deserialize)]
+pub struct AuditQuery {
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+    pub tool_name: Option<String>,
+    pub target_key: Option<String>,
+}
+
 /// GET /api/v1/agents/:id/audit — paginated audit events for an agent.
 pub async fn handle_agent_audit(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(q): Query<AuditQuery>,
+) -> impl IntoResponse {
+    let (page, per_page, offset) = resolve_pagination(q.page, q.per_page);
+
+    let (data, total) = match state
+        .dashboard_db
+        .list_audit_events_paginated_with_count(
+            &agent_id,
+            q.tool_name.as_deref(),
+            q.target_key.as_deref(),
+            per_page,
+            offset,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return internal_error(e).into_response(),
+    };
+
+    Json(PaginatedResponse {
+        data,
+        total,
+        page,
+        per_page,
+    })
+    .into_response()
+}
+
+/// GET /api/v1/agents/:id/facts — paginated structured facts for an agent.
+pub async fn handle_agent_facts(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
     Query(q): Query<PaginationQuery>,
@@ -265,7 +306,7 @@ pub async fn handle_agent_audit(
 
     let (data, total) = match state
         .dashboard_db
-        .list_audit_events_paginated_with_count(&agent_id, per_page, offset)
+        .list_facts_paginated_with_count(&agent_id, per_page, offset)
         .await
     {
         Ok(result) => result,
