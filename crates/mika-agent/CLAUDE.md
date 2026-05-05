@@ -259,7 +259,9 @@ See `tests/eval/grounding_regressions/README.md` for the full vocabulary, capabi
 
 **Failure policy:** Rebuild failures log `warn!` — the server continues to boot. KG queries return stale or empty results until the next successful rebuild. **Staleness contract:** Domain graph reflects registry state as of the last server boot.
 
-**Observability:** Single `trace_id` per rebuild invocation, INFO-level structured logs (`domain_rebuild_start`, `domain_rebuild_entities`, `domain_rebuild_edges`, `domain_rebuild_complete`). No `audit_events` rows (per conventions C3.1).
+**Resolution invalidation on type expansion (#960):** When `rebuild()` adds N≥1 entities of type T, all `kg_resolutions_log` rows with `outcome='no_match'` for subjects where `kg_subject_entities.type = T` are deleted in the same transaction. The next resolver tick re-attempts those subjects against the expanded domain graph. Per-type invalidation counts surface via the `domain_rebuild_invalidated_resolutions` log event. `matched_*` outcomes are NOT invalidated (re-ranking against a better-matched entity is a separate ranking concern). Sub-namespace over-invalidation explicitly accepted: adding one `concept:infra:*` entity invalidates `no_match` rows for all `concept`-typed subjects; cost bounded by `MIKA_KG_BATCH_BUDGET`. First restart after deploy may see elevated `pending_before` on the next resolver tick.
+
+**Observability:** Single `trace_id` per rebuild invocation, INFO-level structured logs (`domain_rebuild_start`, `domain_rebuild_entities`, `domain_rebuild_edges`, `domain_rebuild_invalidated_resolutions`, `domain_rebuild_complete`). No `audit_events` rows (per conventions C3.1).
 
 **Cross-cutting conventions:** See `docs/architecture/kg-implementation-conventions.md` (C1–C3) and `docs/architecture/kg-id-convention.md` for the `<type>:<name>` entity key format.
 

@@ -15,6 +15,11 @@
 //! `agent:*`, `problem_type:*`, and `concept:*` namespaces. No other code path
 //! writes these entity_keys. See `docs/solutions/logic-errors/a2a-dual-write-duplicate-rows.md`.
 //!
+//! Additionally, this module **deletes** `kg_resolutions_log` rows with
+//! `outcome='no_match'` when entity types gain new entities (#960). This is a
+//! consequent of the domain-graph mutation, not an independent concern — same
+//! pattern as `prune_stale_entities`.
+//!
 //! ## Invariants
 //!
 //! - Runs once per server boot, after `SkillRegistry::apply_overrides()`.
@@ -206,6 +211,10 @@ pub struct RebuildStats {
     pub edges_depends_on: usize,
     pub edges_provides: usize,
     pub duration_ms: u128,
+    /// Per-type counts of `outcome='no_match'` resolution log rows invalidated
+    /// this rebuild. Populated when entity types gain new entities; empty when
+    /// no type had `added > 0`. See #960.
+    pub invalidated_no_match: HashMap<String, usize>,
 }
 
 /// Information about an agent to include in the domain graph.
@@ -416,6 +425,38 @@ impl<'a> DomainGraphBuilder<'a> {
                     stmt.raw_execute()?
                 };
 
+                // 2d. Invalidate `no_match` resolution log rows for types that
+                // gained new entities (#960). This lets the next resolver tick
+                // re-attempt those subjects against the expanded domain graph.
+                let mut invalidated_no_match: HashMap<String, usize> = HashMap::new();
+                for (type_name, stats) in &type_stats {
+                    if stats.added == 0 {
+                        continue;
+                    }
+                    if !KG_DOMAIN_ENTITY_TYPES.contains(&type_name.as_str()) {
+                        warn!(
+                            trace_id = %trace_id,
+                            unknown_type = %type_name,
+                            event = "domain_rebuild_invalidation_skipped_unknown_type",
+                            "skipping invalidation for type not in KG_DOMAIN_ENTITY_TYPES — \
+                             review this code path if a new domain type was added",
+                        );
+                        continue;
+                    }
+                    let invalidated = tx.execute(
+                        "DELETE FROM kg_resolutions_log
+                         WHERE outcome = 'no_match'
+                           AND subject_entity_id IN (
+                             SELECT id FROM kg_subject_entities WHERE type = ?1
+                           )",
+                        rusqlite::params![type_name],
+                    )?;
+                    if invalidated > 0 {
+                        invalidated_no_match
+                            .insert(type_name.clone(), invalidated);
+                    }
+                }
+
                 tx.commit()?;
 
                 // Compute aggregate stats
@@ -426,11 +467,12 @@ impl<'a> DomainGraphBuilder<'a> {
                     total_updated += s.updated;
                 }
 
-                Ok((total_added, total_updated, removed, type_stats, edge_stats))
+                Ok((total_added, total_updated, removed, type_stats, edge_stats, invalidated_no_match))
             })
             .await?;
 
-        let (total_added, total_updated, removed, type_stats, edge_stats) = stats;
+        let (total_added, total_updated, removed, type_stats, edge_stats, invalidated_no_match) =
+            stats;
         let duration_ms = start.elapsed().as_millis();
 
         // Log per-type stats
@@ -462,6 +504,15 @@ impl<'a> DomainGraphBuilder<'a> {
                 count,
             );
         }
+        // Log per-type invalidation counts (#960)
+        for (type_name, count) in &invalidated_no_match {
+            info!(
+                trace_id = %self.trace_id,
+                added_type = %type_name,
+                invalidated_no_match = count,
+                event = "domain_rebuild_invalidated_resolutions",
+            );
+        }
         info!(
             trace_id = %self.trace_id,
             event = "domain_rebuild_complete",
@@ -475,6 +526,7 @@ impl<'a> DomainGraphBuilder<'a> {
             edges_depends_on: edge_stats.get("DEPENDS_ON").map_or(0, |s| s.count),
             edges_provides: edge_stats.get("PROVIDES").map_or(0, |s| s.count),
             duration_ms,
+            invalidated_no_match,
         })
     }
 
@@ -1425,5 +1477,179 @@ mod tests {
             .await
             .expect("count concepts");
         assert_eq!(total_concepts, 20);
+    }
+
+    // --- #960: invalidation of no_match resolutions on type expansion ---
+
+    /// Helper: seed an agent, subject entities, and resolution log rows for
+    /// invalidation tests.
+    async fn seed_subjects_with_resolutions(
+        db: &AsyncDatabase,
+        entity_type: &str,
+        count: usize,
+        outcome: &str,
+    ) -> Vec<i64> {
+        let entity_type = entity_type.to_string();
+        let outcome = outcome.to_string();
+        // Use a unique prefix per call to avoid entity_key collisions.
+        let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        db.with_db(move |db| {
+            db.conn.execute(
+                "INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES ('test', 'test', '/tmp')",
+                [],
+            )?;
+            let mut subject_ids = Vec::new();
+            for i in 0..count {
+                db.conn.execute(
+                    "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence)
+                     VALUES ('0000000000000000', '/test', ?1, ?2, ?3, 0.9)",
+                    rusqlite::params![
+                        format!("{entity_type}:{prefix}-{i}"),
+                        entity_type,
+                        format!("{prefix}-{i}"),
+                    ],
+                )?;
+                let subject_id = db.conn.last_insert_rowid();
+                let trace_id = format!("trace{prefix}{i:024}");
+                db.conn.execute(
+                    "INSERT INTO kg_resolutions_log (agent_id, subject_entity_id, outcome, resolution_trace_id)
+                     VALUES ('test', ?1, ?2, ?3)",
+                    rusqlite::params![subject_id, outcome, trace_id],
+                )?;
+                subject_ids.push(subject_id);
+            }
+            Ok(subject_ids)
+        })
+        .await
+        .expect("seed subjects with resolutions")
+    }
+
+    /// Helper: count resolution log rows for given subject ids.
+    async fn count_resolution_log_rows(db: &AsyncDatabase, subject_ids: &[i64]) -> usize {
+        let ids = subject_ids.to_vec();
+        db.with_db(move |db| {
+            let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT COUNT(*) FROM kg_resolutions_log WHERE subject_entity_id IN ({placeholders})"
+            );
+            let mut stmt = db.conn.prepare(&sql)?;
+            for (i, id) in ids.iter().enumerate() {
+                stmt.raw_bind_parameter(i + 1, *id)?;
+            }
+            let mut rows = stmt.raw_query();
+            let count: usize = rows.next()?.unwrap().get(0)?;
+            Ok(count)
+        })
+        .await
+        .expect("count resolution log rows")
+    }
+
+    #[tokio::test]
+    async fn rebuild_invalidates_no_match_when_type_adds_entities() {
+        let db = make_async_db();
+
+        // First rebuild: seeds concept entities into the domain graph.
+        let registry = SkillRegistry::empty();
+        let tool_registry = make_tool_registry(&[]);
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        builder.rebuild().await.expect("first rebuild");
+
+        // Seed 5 concept-typed subjects with outcome='no_match'.
+        let subject_ids = seed_subjects_with_resolutions(&db, "concept", 5, "no_match").await;
+        assert_eq!(count_resolution_log_rows(&db, &subject_ids).await, 5);
+
+        // Now simulate a rebuild that adds a new concept entity by adding a new
+        // skill (which changes `entities_added` for the skill type but not
+        // concept). We need concept to have `added > 0`. The trick: clear all
+        // concept entities so the next rebuild re-adds them.
+        db.with_db(|db| {
+            db.conn
+                .execute("DELETE FROM kg_entities WHERE type = 'concept'", [])?;
+            Ok(())
+        })
+        .await
+        .expect("clear concepts");
+
+        // Rebuild — concepts are re-added (added > 0), triggering invalidation.
+        let builder2 = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        let stats = builder2.rebuild().await.expect("second rebuild");
+
+        // Assert: all 5 no_match rows deleted.
+        assert_eq!(count_resolution_log_rows(&db, &subject_ids).await, 0);
+        assert_eq!(
+            *stats.invalidated_no_match.get("concept").unwrap_or(&0),
+            5,
+            "should invalidate 5 concept no_match rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_does_not_invalidate_when_type_added_zero() {
+        let db = make_async_db();
+
+        // First rebuild: seeds problem_type entities.
+        let registry = SkillRegistry::empty();
+        let tool_registry = make_tool_registry(&[]);
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        builder.rebuild().await.expect("first rebuild");
+
+        // Seed 3 problem_type subjects with outcome='no_match'.
+        let subject_ids = seed_subjects_with_resolutions(&db, "problem_type", 3, "no_match").await;
+        assert_eq!(count_resolution_log_rows(&db, &subject_ids).await, 3);
+
+        // Second rebuild with same sources — problem_type added == 0.
+        let builder2 = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        let stats = builder2.rebuild().await.expect("second rebuild");
+
+        // Assert: no invalidation.
+        assert_eq!(count_resolution_log_rows(&db, &subject_ids).await, 3);
+        assert!(
+            !stats.invalidated_no_match.contains_key("problem_type"),
+            "should not invalidate when no entities added"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_does_not_invalidate_matched_outcomes() {
+        let db = make_async_db();
+
+        // First rebuild: seeds concept entities.
+        let registry = SkillRegistry::empty();
+        let tool_registry = make_tool_registry(&[]);
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        builder.rebuild().await.expect("first rebuild");
+
+        // Seed 2 concept subjects with outcome='matched_llm' and 2 with 'no_match'.
+        let matched_ids = seed_subjects_with_resolutions(&db, "concept", 2, "matched_llm").await;
+        let no_match_ids = seed_subjects_with_resolutions(&db, "concept", 2, "no_match").await;
+
+        // Clear concept entities to force adds on next rebuild.
+        db.with_db(|db| {
+            db.conn
+                .execute("DELETE FROM kg_entities WHERE type = 'concept'", [])?;
+            Ok(())
+        })
+        .await
+        .expect("clear concepts");
+
+        let builder2 = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &[]);
+        let stats = builder2.rebuild().await.expect("second rebuild");
+
+        // Assert: matched_llm rows survive, no_match rows deleted.
+        assert_eq!(
+            count_resolution_log_rows(&db, &matched_ids).await,
+            2,
+            "matched_llm rows should survive"
+        );
+        assert_eq!(
+            count_resolution_log_rows(&db, &no_match_ids).await,
+            0,
+            "no_match rows should be deleted"
+        );
+        assert_eq!(
+            *stats.invalidated_no_match.get("concept").unwrap_or(&0),
+            2,
+            "should only invalidate 2 no_match rows"
+        );
     }
 }
