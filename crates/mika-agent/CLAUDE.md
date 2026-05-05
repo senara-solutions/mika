@@ -431,6 +431,21 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 
 **Session lifecycle:** Silent dispatcher variants call `end_session()` after completion. CLI commands call `end_session()` on all exit paths. `startup_recovery()` prunes old sessions via `prune_old_sessions()`.
 
+### Log Sinks
+
+Two distinct sinks exist for runtime log events. Both emit the same structured JSON with an `agent_id` field on every entry — the difference is the file target and the process that writes to it.
+
+| Sink | Initializer | Process | Path | Rotation |
+|------|-------------|---------|------|----------|
+| **Server log** | `mika_common::logging::init()` (`crates/mika-common/src/logging.rs:208`) | `mika-server` (long-running daemon) | `MIKA_SERVER_LOG_FILE` (e.g. `/var/log/mika/server.log`) | None — single file via `tracing_appender::rolling::never` |
+| **Per-agent CLI log** | `mika_common::logging::init_pretty()` (`crates/mika-common/src/logging.rs:314`) | `mika-cli` (`mika ask`, `mika chat`, `mika team run`, etc.) | `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` (daily) | Daily via `tracing_appender::rolling::daily` |
+
+**Decision tree for operators:** If you want to read the running mika-server's runtime events (skill execution, task engine, callback lifecycle, autonomous-loop wedges), read `MIKA_SERVER_LOG_FILE` filtered by `agent_id`. If you want to read a specific `mika ask` or `mika chat` invocation's events, read `~/.mika/agents/<name>/logs/mika.log.<date>`. Both contain the same `agent_id` field on every entry, so cross-filtering by agent works in either sink.
+
+**Single-sink rationale:** mika-server uses one file with `agent_id`-filtered queries instead of per-agent file appenders because: (a) per-agent appenders would double the disk-write rate per event, (b) they create a sync gap risk if the per-agent appender worker can't keep up, and (c) they duplicate data already correctly addressable via the JSON `agent_id` field. The per-agent CLI sink is correct for its purpose (discrete CLI invocations) and is not a substitute for the server log.
+
+**Common mistake:** Audit tooling that reads `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` for server-mode events will find it nearly empty — only CLI invocations write there. Use `jq 'select(.agent_id == "<name>")' < $MIKA_SERVER_LOG_FILE` for server-mode queries. `mika logs --agent <name>` prints both resolved paths.
+
 ## Audit Log
 
 `audit_events` table tracks all memory mutations per session. All writes include `trace_id`.
