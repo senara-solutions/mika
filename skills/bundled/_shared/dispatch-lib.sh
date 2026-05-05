@@ -110,8 +110,12 @@ _parse_input_json() {
 }
 
 _validate_inputs() {
+    # Structured validation errors (#955): emit parseable JSON to stderr so that
+    # the exit trap delivers an actionable error (not a generic crash string).
+    # Downstream consumers (mika-dev's callback turn) can `jq` the result to
+    # distinguish "LLM forgot a required field" (retry-safe) from "handler bug" (escalate).
     if [ -z "$SKILL" ]; then
-        echo "Error: missing required argument 'skill'; valid values: [\"dev-pilot\", \"dev-groom\"]" >&2
+        printf 'DISPATCH_VALIDATION_ERROR: {"error":"missing_required_field","field":"skill","valid_values":["dev-pilot","dev-groom"],"reason":"The skill field is required but was not provided in the tool call."}\n' >&2
         exit 1
     fi
 
@@ -119,12 +123,12 @@ _validate_inputs() {
     # which derives ENTRY_COMMAND from SKILL. Unknown skills exit 1 there.
 
     if [ -z "$PROMPT" ]; then
-        echo "Error: prompt is required" >&2
+        printf 'DISPATCH_VALIDATION_ERROR: {"error":"missing_required_field","field":"prompt","reason":"The prompt field is required but was not provided in the tool call."}\n' >&2
         exit 1
     fi
 
     if [ -z "$USER_TASK_ID" ]; then
-        echo "Error: task_id is required" >&2
+        printf 'DISPATCH_VALIDATION_ERROR: {"error":"missing_required_field","field":"task_id","reason":"The task_id field is required but was not provided in the tool call."}\n' >&2
         exit 1
     fi
 
