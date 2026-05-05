@@ -10,7 +10,7 @@ import { useTraceLlmCalls, type LlmCallRow } from '../api/llmCalls.ts'
 import { useTraceToolCalls, type ToolCallRow } from '../api/toolCalls.ts'
 import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime } from '@senara-solutions/ui'
 import TraceIdWidget from '../components/TraceIdWidget.tsx'
-import { ChevronDown, ChevronRight, Clock, Cpu, Wrench, Users } from 'lucide-react'
+import { ChevronDown, ChevronRight, Clock, Cpu, Wrench, Users, DollarSign, MessageSquare } from 'lucide-react'
 
 // ===== Helpers =====
 
@@ -35,6 +35,54 @@ function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
   return String(n)
+}
+
+/**
+ * Estimate cost in USD from LLM calls using simplified per-model pricing.
+ * Same approach as DevRunDetail — input_tokens * input_rate + output_tokens * output_rate.
+ * Rates are per million tokens. Conservative estimates for unknown models.
+ */
+function estimateCostUsd(llmCalls: LlmCallRow[]): number {
+  // Rates per million tokens [input, output]
+  const MODEL_RATES: Record<string, [number, number]> = {
+    'claude-sonnet-4-20250514': [3.0, 15.0],
+    'claude-3-5-sonnet-20241022': [3.0, 15.0],
+    'claude-3-5-haiku-20241022': [0.8, 4.0],
+    'claude-3-haiku-20240307': [0.25, 1.25],
+    'claude-opus-4-20250514': [15.0, 75.0],
+    'claude-3-opus-20240229': [15.0, 75.0],
+    'gpt-4o': [2.5, 10.0],
+    'gpt-4o-mini': [0.15, 0.6],
+    'deepseek-chat': [0.14, 0.28],
+    'deepseek/deepseek-chat': [0.14, 0.28],
+  }
+  const DEFAULT_RATES: [number, number] = [3.0, 15.0] // Conservative fallback
+
+  let totalCost = 0
+  for (const call of llmCalls) {
+    const rates = MODEL_RATES[call.model] ?? DEFAULT_RATES
+    const inputCost = (call.input_tokens / 1_000_000) * rates[0]
+    const outputCost = (call.output_tokens / 1_000_000) * rates[1]
+    totalCost += inputCost + outputCost
+  }
+  return totalCost
+}
+
+function formatCost(usd: number): string {
+  if (usd < 0.01) return '<$0.01'
+  return `$${usd.toFixed(2)}`
+}
+
+/**
+ * Compute turn count — number of distinct agent loop turns across all sessions.
+ * A turn is one (session_id, step) pair in the LLM calls data.
+ */
+function computeTurnCount(llmCalls: LlmCallRow[]): number {
+  const turns = new Set<string>()
+  for (const call of llmCalls) {
+    turns.add(`${call.session_id}:${call.step}`)
+  }
+  return turns.size
 }
 
 // ===== Sub-components =====
@@ -73,6 +121,7 @@ interface AgentTelemetry {
   totalOutputTokens: number
   totalCacheReadTokens: number
   totalLatencyMs: number
+  costUsd: number
   toolSuccessCount: number
   models: Map<string, number>
   topTools: Map<string, number>
@@ -94,6 +143,7 @@ function computeAgentTelemetry(
         totalOutputTokens: 0,
         totalCacheReadTokens: 0,
         totalLatencyMs: 0,
+        costUsd: 0,
         toolSuccessCount: 0,
         models: new Map(),
         topTools: new Map(),
@@ -111,6 +161,12 @@ function computeAgentTelemetry(
       agent.totalCacheReadTokens += call.cache_read_tokens ?? 0
       agent.totalLatencyMs += call.latency_ms
       agent.models.set(call.model, (agent.models.get(call.model) ?? 0) + 1)
+    }
+    // Compute per-agent cost after aggregating all calls
+    for (const agent of map.values()) {
+      agent.costUsd = estimateCostUsd(
+        llmCalls.filter((c) => c.agent_id === agent.agentId),
+      )
     }
   }
 
@@ -405,6 +461,8 @@ export default function TeamRunDetail() {
   const totalLlmCalls = llmCalls?.length ?? 0
   const totalToolCalls = toolCalls?.length ?? 0
   const totalTokens = llmCalls?.reduce((sum, c) => sum + c.input_tokens + c.output_tokens, 0) ?? 0
+  const totalCostUsd = llmCalls ? estimateCostUsd(llmCalls) : 0
+  const turnCount = llmCalls ? computeTurnCount(llmCalls) : 0
 
   // Iteration indicator logic
   const capturedIterations = displayIterations.length
@@ -446,7 +504,7 @@ export default function TeamRunDetail() {
         {/* Trace ID Widget */}
         {run.trace_id && (
           <div className="flex items-center gap-4 mt-3 pt-3 border-t border-white/[0.05]">
-            <TraceIdWidget traceId={run.trace_id} callCount={totalLlmCalls} />
+            <TraceIdWidget traceId={run.trace_id} llmCallCount={totalLlmCalls} />
           </div>
         )}
 
@@ -456,11 +514,17 @@ export default function TeamRunDetail() {
             {durationMs !== null && (
               <StatBadge icon={Clock} label="Duration" value={formatDurationMs(durationMs)} />
             )}
+            {totalCostUsd > 0 && (
+              <StatBadge icon={DollarSign} label="Cost" value={formatCost(totalCostUsd)} />
+            )}
             {totalLlmCalls > 0 && (
               <StatBadge icon={Cpu} label="LLM Calls" value={`${totalLlmCalls} calls`} />
             )}
             {totalToolCalls > 0 && (
               <StatBadge icon={Wrench} label="Tool Calls" value={`${totalToolCalls} tools`} />
+            )}
+            {turnCount > 0 && (
+              <StatBadge icon={MessageSquare} label="Turns" value={`${turnCount} turns`} />
             )}
             {agentTelemetry.length > 0 && (
               <StatBadge icon={Users} label="Agents" value={`${agentTelemetry.length} agents`} />
