@@ -242,6 +242,16 @@ pub struct CoreMemoryEntry {
     pub updated_at: String,
 }
 
+/// A structured fact for the dashboard (aggregated from people, commitments, preferences, events).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DashboardFact {
+    pub id: i64,
+    pub category: String,
+    pub key: String,
+    pub value: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Person {
     pub id: i64,
@@ -7716,6 +7726,60 @@ impl Database {
         Ok(results)
     }
 
+    /// Returns paginated structured facts for the dashboard with total count.
+    pub fn list_facts_paginated_with_count(
+        &self,
+        agent_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<DashboardFact>, u64)> {
+        let count: u64 = self.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM people WHERE agent_id = ?1) +
+                (SELECT COUNT(*) FROM commitments WHERE agent_id = ?1) +
+                (SELECT COUNT(*) FROM preferences WHERE agent_id = ?1) +
+                (SELECT COUNT(*) FROM events WHERE agent_id = ?1)",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, category, key, value, updated_at FROM (
+                SELECT id, 'People' AS category, canonical_name AS key,
+                    CASE WHEN relationship IS NOT NULL AND notes IS NOT NULL THEN relationship || ': ' || notes WHEN relationship IS NOT NULL THEN relationship WHEN notes IS NOT NULL THEN notes ELSE '' END AS value,
+                    last_mentioned AS updated_at
+                FROM people WHERE agent_id = ?1
+                UNION ALL
+                SELECT id, 'Commitments' AS category, description AS key,
+                    '[' || status || ']' || COALESCE(' due: ' || due_date, '') AS value,
+                    created_at AS updated_at
+                FROM commitments WHERE agent_id = ?1
+                UNION ALL
+                SELECT rowid AS id, 'Preferences' AS category, category AS key,
+                    value AS value, updated_at AS updated_at
+                FROM preferences WHERE agent_id = ?1
+                UNION ALL
+                SELECT id, 'Events' AS category, description AS key,
+                    COALESCE(context, '') AS value, created_at AS updated_at
+                FROM events WHERE agent_id = ?1
+            ) ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3",
+        )?;
+
+        let data = stmt
+            .query_map(params![agent_id, limit, offset], |r| {
+                Ok(DashboardFact {
+                    id: r.get(0)?,
+                    category: r.get(1)?,
+                    key: r.get(2)?,
+                    value: r.get(3)?,
+                    updated_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok((data, count))
+    }
+
     // ===== Utilities =====
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -8130,32 +8194,39 @@ impl Database {
         Ok(n as u64)
     }
 
-    /// List audit events for an agent with pagination.
+    /// List audit events for an agent with pagination and optional filters.
     pub fn list_audit_events_paginated(
         &self,
         agent_id: &str,
+        tool_name: Option<&str>,
+        target_key: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<AuditEvent>> {
         let sql = format!(
-            "SELECT {} FROM audit_events WHERE agent_id = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+            "SELECT {} FROM audit_events WHERE agent_id = ?1 AND (?2 IS NULL OR tool_name = ?2) AND (?3 IS NULL OR target_key = ?3) ORDER BY created_at DESC LIMIT ?4 OFFSET ?5",
             Self::AUDIT_EVENT_COLS
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
-                params![agent_id, limit as i64, offset as i64],
+                params![agent_id, tool_name, target_key, limit as i64, offset as i64],
                 Self::row_to_audit_event,
             )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
-    /// Count audit events for an agent.
-    pub fn count_audit_events(&self, agent_id: &str) -> Result<u64> {
+    /// Count audit events for an agent with optional filters.
+    pub fn count_audit_events(
+        &self,
+        agent_id: &str,
+        tool_name: Option<&str>,
+        target_key: Option<&str>,
+    ) -> Result<u64> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM audit_events WHERE agent_id = ?1",
-            params![agent_id],
+            "SELECT COUNT(*) FROM audit_events WHERE agent_id = ?1 AND (?2 IS NULL OR tool_name = ?2) AND (?3 IS NULL OR target_key = ?3)",
+            params![agent_id, tool_name, target_key],
             |r| r.get(0),
         )?;
         Ok(n as u64)
@@ -8445,11 +8516,14 @@ impl Database {
     pub fn list_audit_events_paginated_with_count(
         &self,
         agent_id: &str,
+        tool_name: Option<&str>,
+        target_key: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<AuditEvent>, u64)> {
-        let count = self.count_audit_events(agent_id)?;
-        let data = self.list_audit_events_paginated(agent_id, limit, offset)?;
+        let count = self.count_audit_events(agent_id, tool_name, target_key)?;
+        let data =
+            self.list_audit_events_paginated(agent_id, tool_name, target_key, limit, offset)?;
         Ok((data, count))
     }
 

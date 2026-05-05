@@ -19,6 +19,8 @@ export { default as AgentFilter } from './components/AgentFilter.tsx'
 export type { AgentSummary, AgentFilterProps } from './components/AgentFilter.tsx'
 export { default as TimeRangeFilter } from './components/TimeRangeFilter.tsx'
 export type { TimeRange, TimeRangePreset, TimeRangeFilterProps } from './components/TimeRangeFilter.tsx'
+export { default as TokenBudgetBar } from './components/TokenBudgetBar.tsx'
+export type { TokenBudgetBarProps, TokenBudgetTier } from './components/TokenBudgetBar.tsx'
 
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'

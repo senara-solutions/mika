@@ -44,6 +44,14 @@ export interface AuditEvent {
   created_at: string
 }
 
+export interface FactEntry {
+  id: number
+  category: string
+  key: string
+  value: string
+  updated_at: string
+}
+
 export function useAgents() {
   return useQuery<Agent[]>({
     queryKey: ['agents'],
@@ -68,11 +76,36 @@ export function useAgentSessions(agentId: string, page = 1, perPage = 50) {
   })
 }
 
-export function useAgentAudit(agentId: string, page = 1, perPage = 50) {
+export interface AuditFilters {
+  tool_name?: string
+  target_key?: string
+}
+
+export function useAgentAudit(
+  agentId: string,
+  page = 1,
+  perPage = 50,
+  filters?: AuditFilters,
+  enabled = true,
+) {
   return useQuery<PaginatedResponse<AuditEvent>>({
-    queryKey: ['agent-audit', agentId, page, perPage],
+    queryKey: ['agent-audit', agentId, page, perPage, filters?.tool_name, filters?.target_key],
     queryFn: () =>
-      apiFetch(`/agents/${agentId}/audit`, { page, per_page: perPage }),
-    enabled: !!agentId,
+      apiFetch(`/agents/${agentId}/audit`, {
+        page,
+        per_page: perPage,
+        ...(filters?.tool_name ? { tool_name: filters.tool_name } : {}),
+        ...(filters?.target_key ? { target_key: filters.target_key } : {}),
+      }),
+    enabled: !!agentId && enabled,
+  })
+}
+
+export function useAgentFacts(agentId: string, page = 1, perPage = 50, enabled = true) {
+  return useQuery<PaginatedResponse<FactEntry>>({
+    queryKey: ['agent-facts', agentId, page, perPage],
+    queryFn: () =>
+      apiFetch(`/agents/${agentId}/facts`, { page, per_page: perPage }),
+    enabled: !!agentId && enabled,
   })
 }

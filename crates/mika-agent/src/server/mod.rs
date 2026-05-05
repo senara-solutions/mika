@@ -113,6 +113,7 @@ fn build_router(state: AppState) -> Router {
             get(dashboard::handle_agent_sessions),
         )
         .route("/agents/{id}/audit", get(dashboard::handle_agent_audit))
+        .route("/agents/{id}/facts", get(dashboard::handle_agent_facts))
         .route("/sessions", get(dashboard::handle_sessions_list))
         .route("/sessions/{id}", get(dashboard::handle_session_detail))
         .route(
