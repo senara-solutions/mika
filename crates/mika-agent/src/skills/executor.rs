@@ -100,6 +100,90 @@ pub struct LongRunningContext {
     pub dispatch_count: AtomicU32,
 }
 
+/// Validate that all top-level `required` fields declared in the tool's JSON
+/// Schema `input_schema` are present and non-null in the supplied `input`.
+///
+/// Returns `Some(ToolOutput::error(...))` with a structured JSON error on
+/// validation failure, or `None` if all required fields are present.
+///
+/// Scope: top-level `required` only. Does NOT validate `enum` constraints,
+/// `type` assertions, or nested `properties`. Defensively handles malformed
+/// schemas (missing `required` key, non-array, non-string elements) by
+/// degrading to an empty required list with a warning.
+fn validate_required_fields(
+    skill_tool: &ResolvedSkillTool,
+    input: &serde_json::Value,
+) -> Option<ToolOutput> {
+    let required_fields: Vec<&str> = skill_tool
+        .definition
+        .input_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+
+    if required_fields.is_empty() {
+        // Check if `required` exists but isn't an array — indicates malformed schema
+        if skill_tool
+            .definition
+            .input_schema
+            .get("required")
+            .is_some_and(|v| !v.is_array())
+        {
+            warn!(
+                tool = %skill_tool.definition.name,
+                "skill_tool_malformed_schema_skipped_validation: \
+                 'required' field exists but is not a JSON array"
+            );
+        }
+        return None;
+    }
+
+    let input_obj = input.as_object();
+    for field in &required_fields {
+        let is_present = input_obj
+            .and_then(|obj| obj.get(*field))
+            .is_some_and(|v| !v.is_null());
+
+        if !is_present {
+            warn!(
+                tool = %skill_tool.definition.name,
+                field = %field,
+                "skill_tool_missing_required_field: \
+                 required field not provided in tool call input"
+            );
+
+            // Collect valid_values from the field's `enum` constraint, if any
+            let valid_values: Option<Vec<&str>> = skill_tool
+                .definition
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get(*field))
+                .and_then(|f| f.get("enum"))
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect());
+
+            let mut error = serde_json::json!({
+                "error": "missing_required_field",
+                "tool": skill_tool.definition.name,
+                "field": field,
+                "reason": format!(
+                    "The '{}' field is required by the tool schema but was not provided in the tool call.",
+                    field
+                )
+            });
+
+            if let Some(values) = valid_values {
+                error["valid_values"] = serde_json::json!(values);
+            }
+
+            return Some(ToolOutput::error(error.to_string()));
+        }
+    }
+
+    None
+}
+
 /// Execute a skill tool with the appropriate handler.
 ///
 /// Applies a per-skill timeout wrapping the inner execution.
@@ -112,6 +196,13 @@ pub async fn execute_skill_tool(
     long_running_ctx: Option<&LongRunningContext>,
     github_token: Option<&str>,
 ) -> ToolOutput {
+    // Validate required fields from tool schema before any execution (#955).
+    // Catches the bug class where the LLM omits a required field — the subprocess
+    // never spawns, and the LLM gets a structured retry signal in the same turn.
+    if let Some(error) = validate_required_fields(skill_tool, &input) {
+        return error;
+    }
+
     // Check for long-running exec handler
     if let ToolHandler::Exec {
         command,
@@ -842,7 +933,29 @@ async fn execute_long_running(
         ))),
         action_type: action_type::RESUME_AGENT.to_string(),
         action_config: "{}".to_string(),
-        input_context: Some(serde_json::to_string(&input).unwrap_or_default()),
+        input_context: Some({
+            let serialized = serde_json::to_string(&input).unwrap_or_default();
+            // Belt-and-suspenders (#955): validate_required_fields is the runtime
+            // guard, but assert that required fields survived serialization as a
+            // development-time safety net.
+            debug_assert!(
+                {
+                    let required: Vec<&str> = skill_tool
+                        .definition
+                        .input_schema
+                        .get("required")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+                        .unwrap_or_default();
+                    required
+                        .iter()
+                        .all(|f| input.get(f).is_some_and(|v| !v.is_null()))
+                },
+                "dispatch record serialized without required fields — \
+                 validate_required_fields should have caught this"
+            );
+            serialized
+        }),
         created_by_session: Some(ctx.session_id.clone()),
         created_trace_id: Some(ctx.trace_id.clone()),
         reference_url: None,
@@ -1095,6 +1208,221 @@ mod tests {
             },
             skill_dir: skill_dir.to_path_buf(),
         }
+    }
+
+    // --- validate_required_fields tests (#955) ---
+
+    #[test]
+    fn test_validate_required_fields_missing_field_returns_error() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Dispatch claude-pilot".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill", "prompt", "task_id"],
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "enum": ["dev-pilot", "dev-groom"]
+                        },
+                        "prompt": { "type": "string" },
+                        "task_id": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(3600),
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        // Missing `skill` field entirely
+        let input = serde_json::json!({"prompt": "mika#928", "task_id": "abc-123"});
+        let result = validate_required_fields(&tool, &input);
+        assert!(
+            result.is_some(),
+            "expected error for missing required field"
+        );
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("missing_required_field"));
+        assert!(output.content.contains("skill"));
+        assert!(output.content.contains("dev-pilot"));
+        assert!(output.content.contains("dev-groom"));
+    }
+
+    #[test]
+    fn test_validate_required_fields_null_field_returns_error() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Dispatch claude-pilot".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill"],
+                    "properties": {
+                        "skill": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        // `skill` present but null
+        let input = serde_json::json!({"skill": null});
+        let result = validate_required_fields(&tool, &input);
+        assert!(result.is_some(), "expected error for null required field");
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("missing_required_field"));
+    }
+
+    #[test]
+    fn test_validate_required_fields_all_present_passes() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Dispatch claude-pilot".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill", "prompt"],
+                    "properties": {
+                        "skill": { "type": "string" },
+                        "prompt": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        let input = serde_json::json!({"skill": "dev-pilot", "prompt": "mika#928"});
+        let result = validate_required_fields(&tool, &input);
+        assert!(
+            result.is_none(),
+            "expected no error when all required fields present"
+        );
+    }
+
+    #[test]
+    fn test_validate_required_fields_no_required_key_passes() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "test_tool".to_string(),
+                description: "Test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        let input = serde_json::json!({"anything": "goes"});
+        let result = validate_required_fields(&tool, &input);
+        assert!(result.is_none(), "no required fields = no validation error");
+    }
+
+    #[test]
+    fn test_validate_required_fields_malformed_schema_degrades_gracefully() {
+        // `required` is a string, not an array — malformed
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "bad_tool".to_string(),
+                description: "Tool with bad schema".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": "skill"
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        let input = serde_json::json!({});
+        let result = validate_required_fields(&tool, &input);
+        assert!(
+            result.is_none(),
+            "malformed schema should degrade to no validation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_skill_tool_rejects_missing_required_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("handler.sh"),
+            "#!/bin/sh\necho 'should not run'",
+        );
+
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Dispatch claude-pilot".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill", "prompt", "task_id"],
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "enum": ["dev-pilot", "dev-groom"]
+                        },
+                        "prompt": { "type": "string" },
+                        "task_id": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        };
+
+        // Call with missing `skill` — should get rejected before the handler runs
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"prompt": "mika#928", "task_id": "abc-123"}),
+            30,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error, "expected error: {}", output.content);
+        assert!(
+            output.content.contains("missing_required_field"),
+            "expected structured error, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("skill"),
+            "error should name the missing field"
+        );
+        // The handler should NOT have run
+        assert!(
+            !output.content.contains("should not run"),
+            "handler should not execute when required field is missing"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
