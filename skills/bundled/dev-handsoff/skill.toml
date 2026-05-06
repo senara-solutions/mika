@@ -1,0 +1,18 @@
+[skill]
+name = "dev-handsoff"
+version = "0.1.0"
+description = "Write today's autonomous-run handsoff artifact to the agent's handsoff/ directory. Pickup into mika-platform/docs/logs/ is the pipeline's job (v0.2)."
+always_on = false
+
+[triggers]
+keywords = [
+    "wrap up the run",
+    "wrap up the session",
+    "log this run",
+    "write the handsoff log",
+    "session handsoff",
+    "end of run handsoff",
+]
+
+[constraints]
+required_tools = ["write_agent_file"]
