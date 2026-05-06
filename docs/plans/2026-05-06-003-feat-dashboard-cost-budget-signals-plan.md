@@ -83,9 +83,9 @@ This gate explicitly trades wall-clock for design coherence per `feedback_loop_s
 ### Stitch project ID
 - `6562713725762717689` — Mika Observability Dashboard project. Reference for cross-screen consistency checks.
 
-### Dependencies on in-flight work
+### Dependencies on shipped work
 
-- **mika#666** — Dashboard landing page. Currently being implemented by the autonomous loop (claude-pilot active on `feat/666/dashboard-landing-home-overview` worktree as of plan-write time). Phase 3's landing widget MUST coordinate with whatever widget-slot interface mika#666 establishes. If mika#666 ships before this PR, Phase 3 reads its widget contract; if it ships during this PR, Phase 3 may need a one-line revisit to align imports.
+- **mika#666** — Dashboard landing page. **Status updated post-architect-pass-2:** issue CLOSED at 2026-05-06T08:26:03Z; implementing PR #989 MERGED at 2026-05-06T08:26:02Z. Phase 3's binary gate (`gh pr list ... feat/666/dashboard-landing-home-overview ... --state merged`) now returns `true`. **Phase 3 proceeds at implementation time** — read whatever widget-slot pattern PR #989 established at `dashboard/src/pages/Dashboard.tsx` (or the path it shipped under) and integrate. The gate logic itself is unchanged; only the expected return value at implementation time has flipped from "indeterminate" to "true." If implementation is deferred long enough that PR #989 is reverted (unlikely), the gate reverts to `false` and Phase 3 defers — the gate handles either case correctly.
 - **mika#660 / PR #976** — `<CostTrendChart>`. Already merged. No risk of drift.
 
 ## Scope
