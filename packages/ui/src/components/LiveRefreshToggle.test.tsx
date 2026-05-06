@@ -1,5 +1,6 @@
 import { render, screen, fireEvent } from '@testing-library/react'
 import { describe, it, expect, vi } from 'vitest'
+import { axe } from 'jest-axe'
 import LiveRefreshToggle from './LiveRefreshToggle'
 
 describe('LiveRefreshToggle', () => {
@@ -49,5 +50,11 @@ describe('LiveRefreshToggle', () => {
     const toggle = screen.getByRole('switch')
     expect(toggle).toBeInTheDocument()
     expect(toggle).toHaveAttribute('aria-checked')
+  })
+
+  it('has no axe violations', async () => {
+    const { container } = render(<LiveRefreshToggle isLive={true} onToggle={() => {}} />)
+    const results = await axe(container)
+    expect(results).toHaveNoViolations()
   })
 })

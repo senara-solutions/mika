@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import { describe, it, expect } from 'vitest'
+import { axe } from 'jest-axe'
 import CostMeter from './CostMeter'
 
 describe('CostMeter', () => {
@@ -117,5 +118,17 @@ describe('CostMeter', () => {
     const status = screen.getByRole('status')
     expect(status.textContent).not.toContain('Cost')
     expect(status.textContent).toContain('$3.50')
+  })
+
+  it('has no axe violations (full variant)', async () => {
+    const { container } = render(<CostMeter value={10} />)
+    const results = await axe(container)
+    expect(results).toHaveNoViolations()
+  })
+
+  it('has no axe violations (chip variant)', async () => {
+    const { container } = render(<CostMeter value={3} variant="chip" />)
+    const results = await axe(container)
+    expect(results).toHaveNoViolations()
   })
 })
