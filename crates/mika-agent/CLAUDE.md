@@ -247,6 +247,8 @@ docs_root = "/absolute/path"      # optional; falls back to global chain above
 
 **Hard-error policy:** Explicit paths (per-agent or global config/env) that don't exist fail loud. CWD-based default uses warn-and-skip per #738's policy. `enabled=false` does NOT delete existing rows — cleanup via #779's CLI.
 
+**Well-known agent KG topology (#800):** mika-arch is the sole KG consumer among well-known agents. mika-dev and mika-qa are provisioned with `[kg].enabled = false` — they have zero `query_knowledge_graph` usage (retrieval goes through `search_memory` over `memory_facts`). This eliminates the shared-corpus extractor race on the mika-docs corpus where multiple agents redundantly called the LLM for the same doc. Re-enable per-agent with one `identity.toml` edit (`enabled = true`) + restart if a dev/qa flow needs KG-backed retrieval.
+
 For OpenRC hosts where the service starts with CWD ≠ repo root, set `MIKA_KG_DOCS_ROOT=/path/to/mika-repo/docs/solutions` in the service config, or use the existing `--chdir` init-script workaround.
 
 ### Multi-Corpus Support (#798)

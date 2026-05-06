@@ -90,9 +90,21 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
         "dev-groom",
     ],
     config_toml: None,
-    identity_source: None,
+    // KG disabled (#800): mika-dev has zero `query_knowledge_graph` usage —
+    // retrieval goes through `search_memory` (FTS5+vec over memory_facts).
+    // Eliminates shared-corpus extractor race on the mika-docs corpus.
+    // Re-enable with one config edit + restart if a dev flow needs KG.
+    identity_source: Some(IdentitySource::Static(MIKA_DEV_IDENTITY)),
     llm_overrides: &[],
 };
+
+/// mika-dev identity.toml — KG disabled per mika#800.
+const MIKA_DEV_IDENTITY: &str = "\
+name = \"Dev\"\n\
+emoji = \"🛠\"\n\
+\n\
+[kg]\n\
+enabled = false\n";
 
 /// mika-qa agent specification.
 pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
@@ -119,9 +131,21 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
         "dev-groom",
     ],
     config_toml: None,
-    identity_source: None,
+    // KG disabled (#800): mika-qa has zero `query_knowledge_graph` usage —
+    // retrieval goes through `search_memory` (FTS5+vec over memory_facts).
+    // Eliminates shared-corpus extractor race on the mika-docs corpus.
+    // Re-enable with one config edit + restart if a QA flow needs KG.
+    identity_source: Some(IdentitySource::Static(MIKA_QA_IDENTITY)),
     llm_overrides: &[],
 };
+
+/// mika-qa identity.toml — KG disabled per mika#800.
+const MIKA_QA_IDENTITY: &str = "\
+name = \"QA\"\n\
+emoji = \"🔍\"\n\
+\n\
+[kg]\n\
+enabled = false\n";
 
 /// mika-relay agent specification.
 ///
