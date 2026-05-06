@@ -58,6 +58,7 @@ jobs:
           cache-dependency-path: package-lock.json
       - run: npm ci
       - run: npm run build -w packages/ui
+      - run: npm test -w packages/ui
       - run: npm run lint -w dashboard
       - run: npm run build -w dashboard
       - run: npm test -w dashboard
