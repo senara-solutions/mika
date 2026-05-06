@@ -10,6 +10,7 @@ jobs:
   release-pr:
     name: Release PR
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     if: github.repository_owner == 'senara-solutions'
     permissions:
       contents: write
@@ -105,7 +106,14 @@ jobs:
           git-cliff --tag "v${NEXT}" -o CHANGELOG.md
 
           git add Cargo.toml Cargo.lock CHANGELOG.md
-          git commit -m "chore: release v${NEXT}"
+          # Skip the commit when nothing is staged (workflow_dispatch retry on the same main HEAD,
+          # or any case where sed/cargo/git-cliff produced byte-identical output). Without this
+          # guard, `set -e` would halt the step on a "nothing to commit" no-op.
+          if git diff --cached --quiet; then
+            echo "No release-tree changes since the last regeneration — skipping commit."
+          else
+            git commit -m "chore: release v${NEXT}"
+          fi
 
           # Force-push: any prior state on origin (orphan from a failed run, or a stale branch
           # from a closed-without-merge PR) is replaced with the deterministic regeneration.
@@ -113,7 +121,8 @@ jobs:
 
           # Open a PR only if one isn't already open. An existing open PR auto-tracks the
           # force-pushed branch tip, so no separate "update" step is needed.
-          EXISTING_PR=$(gh pr list --state open --head "$BRANCH" --json number --jq '.[0].number')
+          # `// empty` defends against jq emitting the literal "null" on an empty array.
+          EXISTING_PR=$(gh pr list --state open --head "$BRANCH" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING_PR" ]; then
             echo "Release PR #$EXISTING_PR already open — branch updated via force-push"
           else
