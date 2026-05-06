@@ -479,6 +479,12 @@ pub struct LlmCallRow {
     /// Extended thinking / reasoning text (Claude-only).
     /// `None` when the provider does not support reasoning or the call errored.
     pub reasoning: Option<String>,
+    /// Whether `response_text` is present (non-NULL) in the database.
+    /// Set by list queries via `response_text IS NOT NULL`; detail queries derive from presence.
+    pub has_response_text: bool,
+    /// Whether `reasoning` is present (non-NULL) in the database.
+    /// Set by list queries via `reasoning IS NOT NULL`; detail queries derive from presence.
+    pub has_reasoning: bool,
     /// Estimated cost in USD, computed from token counts and provider pricing.
     /// Set to `Some` by `enrich_llm_calls_with_cost()` in dashboard handlers;
     /// `None` only for internal (non-API) use before enrichment.
@@ -5477,7 +5483,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at
+                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at,
+                    response_text IS NOT NULL, reasoning IS NOT NULL
              FROM llm_calls WHERE trace_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -5515,7 +5522,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at
+                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at,
+                    response_text IS NOT NULL, reasoning IS NOT NULL
              FROM llm_calls WHERE session_id = ?1
              ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
         )?;
@@ -5607,7 +5615,8 @@ impl Database {
         let query_sql = format!(
             "SELECT id, agent_id, session_id, trace_id, provider, model,
                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at
+                    latency_ms, stop_reason, status, error_message, step, prompt_variant, created_at,
+                    response_text IS NOT NULL, reasoning IS NOT NULL
              FROM llm_calls {where_sql}
              ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
             params_vec.len() - 1,
@@ -5930,12 +5939,17 @@ impl Database {
             // List queries omit response_text/reasoning for performance
             response_text: None,
             reasoning: None,
+            // Boolean indicators from `response_text IS NOT NULL` / `reasoning IS NOT NULL`
+            has_response_text: r.get(17)?,
+            has_reasoning: r.get(18)?,
             cost_usd: None,
         })
     }
 
     /// Detail query includes response_text and reasoning columns.
     fn row_to_llm_call_detail(r: &rusqlite::Row<'_>) -> rusqlite::Result<LlmCallRow> {
+        let response_text: Option<String> = r.get(17)?;
+        let reasoning: Option<String> = r.get(18)?;
         Ok(LlmCallRow {
             id: r.get(0)?,
             agent_id: r.get(1)?,
@@ -5954,8 +5968,10 @@ impl Database {
             step: r.get(14)?,
             prompt_variant: r.get(15)?,
             created_at: r.get(16)?,
-            response_text: r.get(17)?,
-            reasoning: r.get(18)?,
+            has_response_text: response_text.is_some(),
+            has_reasoning: reasoning.is_some(),
+            response_text,
+            reasoning,
             cost_usd: None,
         })
     }

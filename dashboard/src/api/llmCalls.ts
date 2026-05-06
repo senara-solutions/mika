@@ -21,6 +21,10 @@ export interface LlmCallRow {
   created_at: string
   response_text: string | null
   reasoning: string | null
+  /** Whether response_text is present in the database (set by list queries). */
+  has_response_text: boolean
+  /** Whether reasoning is present in the database (set by list queries). */
+  has_reasoning: boolean
   /** Estimated cost in USD, computed from token counts and provider pricing. */
   cost_usd: number | null
 }
