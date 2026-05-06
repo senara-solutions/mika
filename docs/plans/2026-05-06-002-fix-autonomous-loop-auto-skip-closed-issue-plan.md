@@ -8,6 +8,13 @@ seq: 002
 
 # Plan: auto-skip closed-issue autodispatch (mika#988)
 
+## Verified state (post-architect-pass-1)
+
+- **F1 (Phase 0 Pin) addressed** — explicit line-pinned source locations now appear in the new `## Phase 0 — Pin` section: closed-issue check at lines 191-194, `_deliver_callback()` helper at lines 374-390, EXIT trap re-delivery guard at lines 19-23, init/trap-install at lines 419-425, all anchored to `dispatch-lib.sh` HEAD `48e52c83`.
+- **F2 (duplicate-callback risk) addressed structurally** — Phase 1 now reuses the existing `_deliver_callback()` helper instead of inlining a second callback-send site. There is no second site; the EXIT trap's `CALLBACK_SENT == 1` guard at line 22 is what makes single-delivery safe; the helper sets `CALLBACK_SENT=1` at line 382. Pre-implementation verification step added so a future drift in line numbers surfaces before the edit lands.
+- **F3 (compound-doc principle citation) addressed** — Phase 4 now names the principle ("Handler exit semantics for foreseeable races vs real crashes") and the file path (`mika/docs/solutions/best-practices/handler-exit-semantics-foreseeable-races-2026-05-06.md`). Sibling pattern citations included: review-guide § Orthogonality, mika#955's contrapositive `DISPATCH_VALIDATION_ERROR` shape.
+- **F4 (silent-skip-for-intentional-closes) addressed** — explicit position in `## Scope` section: PR-closes and human-closes are treated identically as "presumed handled," with four-point reasoning. Audit trail is preserved via the structured-JSON callback to the `messages` table; close-reason enrichment is deferred to Phase 5 if operational practice surfaces a need.
+
 ## Why
 
 On 2026-05-06 the autonomous loop stalled for ~7 hours. Concrete sequence:
@@ -25,14 +32,72 @@ Two pathological behaviours collided:
 
 The fix bar is: when an autodispatch fires for a closed issue, the next queued task fires without operator confirmation, and the audit log records the auto-skip with the closed-issue ID.
 
-## Verified state
+## Phase 0 — Pin (verified state, source-anchored)
 
-- Source of the rejection: `mika/skills/bundled/_shared/dispatch-lib.sh:185-194` (lines may shift; the symbol is `if [ "$ISSUE_STATE" = "CLOSED" ]`).
-- Exit-trap behaviour: `_dispatch_lib_exit_trap` in same file, lines ~21-105. On non-zero exit, it constructs `HANDLER CRASH (exit code N)` from stderr tail and delivers via `mika ask --task-id X --task-complete`.
-- Structured-error precedent: `_validate_inputs` (lines ~125-160) emits `DISPATCH_VALIDATION_ERROR: {"error":"...","field":"..."}` to stderr before exit 1, also wrapped as HANDLER CRASH but with parseable JSON tail. mika#955 introduced this pattern. We reuse it.
-- Symptom session for evidence: mika-dev session `callback-476caa1d-ef6d-4bac-a60c-a3c78f9a342d` (the failure callback turn).
-- Drift session: mika-dev session `40a52d43-f186-4175-9c86-b998aafcf4bb` (07:19Z deliberation that I had to nudge to resume at 07:59Z).
-- Acceptance fix shipped recently for a sibling pattern: `webhook_ready_label_dispatch` (mika#847), `webhook_no_unauthorized_dispatch` (mika#910). Both engine-side guards. They are precedent for moving classification out of LLM prompts and into engine-side rules.
+All line numbers verified against `mika/skills/bundled/_shared/dispatch-lib.sh` at HEAD `48e52c83` (main).
+
+**The closed-issue rejection — what we are replacing (lines 191-194):**
+```bash
+if [ "$ISSUE_STATE" = "CLOSED" ]; then
+    echo "Error: Issue #${ISSUE_NUM} in senara-solutions/${REPO} is closed. Reopen first." >&2
+    exit 1
+fi
+```
+
+**The `_deliver_callback()` helper — what we will reuse (lines 374-390):**
+```bash
+_deliver_callback() {
+    set +e
+    if [ -n "$AGENT" ]; then
+        mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"
+    else
+        mika ask --task-id "$TASK_ID" --task-complete -- "$RESULT"
+    fi
+    CALLBACK_EXIT=$?
+    CALLBACK_SENT=1
+    rm -f "$TRACE_FILE"
+    set -e
+
+    if [ "$CALLBACK_EXIT" -ne 0 ]; then
+        echo "ERROR: callback delivery failed (exit $CALLBACK_EXIT) for task $TASK_ID" >&2
+    fi
+}
+```
+
+This helper is the canonical callback-delivery site. It owns the `set +e / mika ask / CALLBACK_SENT=1 / set -e` ordering. The success path uses it. The auto-skip branch in Phase 1 will use it too — single delivery site, single point of ordering, no inline duplication. **This directly resolves architect F2** (the duplicate-callback risk), because there is no second callback-send site introduced by the auto-skip path.
+
+**The EXIT trap's re-delivery guard (lines 19-23):**
+```bash
+_dispatch_lib_exit_trap() {
+    _EXIT_CODE=$?
+    # Guard: skip if already delivered or no task ID
+    [ "$CALLBACK_SENT" -eq 1 ] && { [ -n "$STDOUT_FILE" ] && rm -f "$STDOUT_FILE"; [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; rm -f "$TRACE_FILE"; return; }
+```
+
+The `CALLBACK_SENT == 1` guard at line 22 is what makes single-delivery safe. Once `_deliver_callback` sets `CALLBACK_SENT=1` (line 382), the trap's first conditional bails out — even if the script later exits non-zero from any cause.
+
+**Initialization and trap install (lines 419-425, inside `dispatch_claude_pilot()`):**
+```bash
+# Line 420
+CALLBACK_SENT=0
+
+# Line 425
+trap '_dispatch_lib_exit_trap' EXIT
+```
+
+`CALLBACK_SENT=0` is set BEFORE `_parse_input_json` (line 422), and the trap is installed at line 425. The closed-issue check at line 191 is in a region of the file numerically earlier than 425 but executes AFTER `dispatch_claude_pilot()` runs lines 419-425 — i.e., when the function body reaches the closed-issue branch in execution order, `CALLBACK_SENT=0` is initialized and the trap is armed. This is verified by tracing the function body's control flow: `dispatch_claude_pilot()` defines its body inline, lines 399-onward, with the trap install at 425 happening before the input-parsing branch that leads to the issue-state check.
+
+**Symptom evidence:**
+- mika-dev session `callback-476caa1d-ef6d-4bac-a60c-a3c78f9a342d` — the failure callback turn (00:36:04Z, 2026-05-06).
+- mika-dev session `40a52d43-f186-4175-9c86-b998aafcf4bb` — the drift turn (07:19:08Z, 7 hours later, manual nudge at 07:59Z restored progress).
+
+**Sibling precedents:**
+- `webhook_ready_label_dispatch` (mika#847) — engine-side guard for label-triggered dispatch.
+- `webhook_no_unauthorized_dispatch` (mika#910) — engine-side guard for cross-tenant dispatch.
+- `DISPATCH_VALIDATION_ERROR` pattern (mika#955) — structured JSON in stderr, also wrapped as HANDLER CRASH but with parseable tail. **Different shape from this fix:** mika#955 is for *handler bugs* (missing required field) where exit 1 is the right verdict; this fix is for *expected races* where exit 0 is the right verdict.
+
+**Out-of-pin (deliberately not addressed by this plan):**
+- Pathology B (mika-dev's post-callback conversational turn) lives in mika-dev's system prompt + the post-callback turn's prompt assembly path. Not pinned here because Phase 5 files it separately.
 
 ## Scope
 
@@ -46,13 +111,24 @@ The fix bar is: when an autodispatch fires for a closed issue, the next queued t
 - Generalising "post-callback auto-advance" across all callback outcomes. That is the larger Pathology B — see Phase 5 follow-up note. This plan ships the closed-issue fix and files the broader pattern as a separate ticket so the fix bar stays narrow.
 - Changing mika-engine's task scheduler to fire the next queued task after a callback. That is also Pathology B territory and a Rust change of meaningful surface; not justified by this single failure mode alone.
 
+**Position on intentional human-closes (architect F4):**
+
+The auto-skip branch fires whenever `ISSUE_STATE = "CLOSED"` regardless of whether the close came from a PR merge or from a human pressing "Close issue." Both close-reasons are treated identically as "presumed handled." Reasoning:
+
+1. **Audit trail is preserved either way.** The structured JSON callback (`status: auto_skipped, reason: issue_closed, issue: senara-solutions/REPO#N`) is delivered via `mika ask --task-complete`, which writes a row to the `messages` table with `task_id` and `created_at`. The dashboard's task-history view can filter on `status: auto_skipped` to show every skipped dispatch with its issue ID. Operators see the skip; they just don't see it as a HANDLER CRASH that required intervention.
+2. **Distinguishing close-reason at handler-time is over-engineering.** Determining whether a close was "PR-driven" vs "human-driven" requires querying the issue's `closed_by` and the events log via additional `gh` calls. Each additional call is a new failure mode (rate limit, transient 5xx, auth scope mismatch). The marginal value — slightly more legible audit trail — does not justify this surface.
+3. **The HANDLER CRASH framing wasn't actually surfacing intent.** The 2026-05-06 stall happened on a PR-driven close (mika#985 closed by PR #986 merge). The HANDLER CRASH envelope did not help; it stalled the loop. There is no evidence that "loud HANDLER CRASH" is currently load-bearing for human-close detection.
+4. **Symmetric with how mika-dev's autonomous loop already treats issue state.** Mika-dev's webhook handlers already drop closed-issue webhooks at the gateway level (no task is created if the issue is already closed at webhook time). The auto-skip branch handles only the race window between webhook arrival and handler fire — a small interval where the close happened mid-flight. Treating both close-reasons identically in this narrow window is consistent with how the rest of the system treats them.
+
+If the audit trail proves insufficient in practice (operators want to know "was this a real intent-to-not-ship close vs an automatic close?"), Phase 5's follow-up ticket is the right surface for adding `closed_reason` enrichment, not this PR.
+
 ## Phase 1 — Reclassify closed-issue rejection from crash to structured skip
 
 **Files touched:** `mika/skills/bundled/_shared/dispatch-lib.sh` (single file).
 
 **Change shape:**
 
-Replace the closed-issue branch (currently around line 191-194):
+Replace the closed-issue branch (currently lines 191-194):
 ```bash
 if [ "$ISSUE_STATE" = "CLOSED" ]; then
     echo "Error: Issue #${ISSUE_NUM} in senara-solutions/${REPO} is closed. Reopen first." >&2
@@ -63,27 +139,39 @@ fi
 With:
 ```bash
 if [ "$ISSUE_STATE" = "CLOSED" ]; then
-    # Auto-skip: PR merge auto-closed the issue between webhook enqueue and handler fire.
-    # This is an expected race, not a handler bug — deliver a structured skip result so
-    # mika-dev's callback turn can advance the queue without operator confirmation.
-    # See mika#988 for the failure mode this guards against.
-    RESULT=$(printf '{"status":"auto_skipped","reason":"issue_closed","issue":"senara-solutions/%s#%s","note":"Issue was already closed before dispatch fired. Presumed shipped via earlier PR merge."}' "$REPO" "$ISSUE_NUM")
-    if [ -n "$AGENT" ]; then
-        mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"
-    else
-        mika ask --task-id "$TASK_ID" --task-complete -- "$RESULT"
-    fi
-    CALLBACK_SENT=1
+    # Auto-skip: PR merge (or any other close) raced ahead of the webhook-triggered
+    # dispatch enqueue. This is an expected race, not a handler bug — deliver a
+    # structured skip result via the canonical _deliver_callback() helper so
+    # mika-dev's callback turn can recognise it as a no-op and the audit dashboard
+    # can filter on status: "auto_skipped". See mika#988 for the failure mode.
+    # Position on human-closes vs PR-closes: treated identically — see plan §Scope.
+    RESULT=$(printf '{"status":"auto_skipped","reason":"issue_closed","issue":"senara-solutions/%s#%s","note":"Issue was already closed before dispatch fired. Presumed handled."}' "$REPO" "$ISSUE_NUM")
+    _deliver_callback
     exit 0
 fi
 ```
 
-Why exit 0 (and why not let the EXIT trap handle delivery):
-- Exit 0 with explicit `CALLBACK_SENT=1` mirrors the success path's contract. The EXIT trap's first line guards on `CALLBACK_SENT` and skips redelivery, so we won't double-fire.
-- Inlining the `mika ask --task-complete` call keeps the auto-skip path symmetric with how the success path delivers — same call, same flags, just a structured JSON payload instead of free-form text.
-- A pure exit 0 with no callback would leave the task wedged in_progress until a watchdog reaped it. Worse than the current bug.
+Why this exact shape:
 
-**Result-payload shape:** structured JSON, single line. mika-dev's callback turn already calls `jq` on results that look like JSON (per the existing `DISPATCH_VALIDATION_ERROR` pattern from mika#955). Keying on `status: "auto_skipped"` lets future tooling (the audit dashboard, the autonomous-loop replay) filter these out from real failures.
+- **Reuse `_deliver_callback`, do not inline.** The success path delivers via `_deliver_callback()` (lines 374-390 in the pin). Calling the same helper gives us identical `set +e / mika ask / CALLBACK_SENT=1 / set -e` ordering with zero duplication. **F2 is structurally resolved** — no second callback-send site is introduced.
+- **Exit 0 after the helper.** The helper sets `CALLBACK_SENT=1` (line 382). The EXIT trap's guard at line 22 returns early when `CALLBACK_SENT=1`, so even though `exit 0` triggers the trap, the trap is a no-op and no duplicate callback fires. Exit 0 (not exit 1, not exit 99, not "fall through") is the right verdict because the handler did exactly what was asked: dispatch was attempted and the outcome was a clean structured skip.
+- **No fall-through to the rest of `dispatch_claude_pilot()`.** The `exit 0` ensures the function does not proceed to worktree setup, claude-pilot invocation, or the success-path callback that follows much later in the function body. The auto-skip branch is terminal.
+- **Result-payload shape:** structured JSON, single line. mika-dev's callback turn already handles JSON-looking results (per the existing `DISPATCH_VALIDATION_ERROR` pattern from mika#955). Keying on `status: "auto_skipped"` lets future tooling filter these out from real failures.
+
+**Pre-implementation verification step:**
+
+Before editing the file, run a smoke check to confirm the line numbers match the pin (the file may have shifted since this plan was written):
+
+```bash
+grep -n "if \[ \"\$ISSUE_STATE\" = \"CLOSED\" \]" mika/skills/bundled/_shared/dispatch-lib.sh
+grep -n "^_deliver_callback() {" mika/skills/bundled/_shared/dispatch-lib.sh
+```
+
+Expected output:
+- Closed-issue check at or near line 191.
+- `_deliver_callback()` definition at or near line 374.
+
+If the line numbers have drifted by more than ~10 lines in either direction, treat that as a signal that other dispatch-related changes have landed since this plan was written and re-read the function body to confirm the auto-skip branch will compose correctly with the surrounding control flow before applying the edit.
 
 ## Phase 2 — Make the auto-skip legible at the LLM layer
 
@@ -129,7 +217,16 @@ Approach: a transcript-replay test where we feed mika-dev a synthetic callback e
 
 - Add a `# Auto-skip rationale` comment block to `dispatch-lib.sh` near the closed-issue branch, citing mika#988 and the symptom session IDs. Future readers who try to "tighten" this back to exit 1 should see why the looser shape is correct.
 - Update `mika/CLAUDE.md`'s autonomous-loop section (if it documents callback contracts) with a one-line note: "Closed-issue autodispatch returns `status: auto_skipped`; not a failure."
-- Cross-link from `mika/docs/solutions/best-practices/` if a relevant compound entry exists for "race between webhook enqueue and PR merge"; otherwise file a small compound entry as part of this PR (single page, ~30 lines).
+- File a new compound entry at `mika/docs/solutions/best-practices/handler-exit-semantics-foreseeable-races-2026-05-06.md`. Title: **"Handler exit semantics for foreseeable races vs real crashes."** Single principle stated up front:
+
+  > When a handler can fail for a *foreseeable racy reason* (the target became invalid between enqueue and fire — issue closed, branch deleted, repo archived, etc.), the right shape is `exit 0` + structured-JSON skip result delivered via the canonical callback helper. Reserve `exit 1` + HANDLER CRASH envelope for actual handler bugs (logic errors, missing required fields, unexpected provider responses) where the consumer cannot recover cleanly. The exit code is the load-bearing distinction; downstream consumers (mika-dev's callback turn, the audit dashboard, watchdogs) make decisions based on it.
+
+  Citations from existing best practices the principle aligns with:
+  - `mika/docs/architecture/review-guide.md` § Orthogonality — keeping recovery-class outcomes in the response shape rather than letting them bleed into the exit-code channel.
+  - `mika/docs/solutions/cross-repo-patterns/security-hardening-playbook.md` — analogous shape for fail-closed-vs-fail-open guards (reject-with-structured-error vs. crash).
+  - mika#955's `DISPATCH_VALIDATION_ERROR` pattern is the *contrapositive* of this principle: real handler bugs (missing required field) get exit 1 + structured-JSON-in-stderr. mika#988 is for *foreseeable races* and gets exit 0 + structured-JSON-in-callback. The two patterns share "structured JSON" but differ on exit code by design — that is the load-bearing distinction.
+
+  The compound entry is ~30-60 lines (frontmatter, principle statement, why-this-shape, sibling patterns, anti-patterns to avoid). Keeping it scoped to one principle so future readers can cite it cleanly without absorbing tangentially related material.
 
 ## Phase 5 — Follow-up filed, not shipped
 
@@ -153,10 +250,7 @@ Phase 1 → Phase 2 → Phase 3 → Phase 4 in one PR. Phase 5 is a separate tic
 
 ## Risks and known unknowns
 
-- **Risk: the `gh` shim approach for Test 1 may not match how the existing test harness in `mika-skills/` is structured.** Mitigation: verify at Phase 3 implementation. If the harness uses a different stubbing pattern, follow that pattern. The test must be runnable in CI, not just locally.
-- **Unknown: the exact location of mika-dev's post-callback prompt rules.** It may be in `self-dev/system_prompt.md`, in `mika-dev`'s own agent system prompt (lives in agents-teams or wherever the dev agent is configured), or split across both. Resolve at Phase 2 implementation by grepping for the existing post-callback guidance and adding alongside it.
-- **Unknown: whether the prompt change in Phase 2 actually changes behaviour given known prompt-adherence drift on similar models.** Mitigation: Phase 1's handler change is sufficient on its own to make the result *legible* (no longer HANDLER CRASH). If Phase 2's prompt rule does not stick on the current mika-dev model (kimi-k2.5 per `project_mika_dev_model_switch.md`), the LLM may still occasionally narrate the auto-skip — but this is degraded behaviour, not the original failure mode (the queue still advances on its own normal cadence). Phase 5 is the structural fix if this surfaces.
-
-## Compound learning to write at PR-close
-
-A short compound at `mika/docs/solutions/best-practices/` covering: "Handler exit semantics — distinguishing expected races from real crashes." Pattern: when a handler can fail for a foreseeable racy reason (issue closed mid-flight, target branch deleted, etc.), the right shape is exit 0 + structured JSON skip result, not exit 1 + HANDLER CRASH. Sibling: mika#955's `DISPATCH_VALIDATION_ERROR` pattern.
+- **Risk: the `gh` shim approach for Test 1 may not match how the existing test harness in `mika-skills/` is structured.** Mitigation: at Phase 3 implementation, grep for existing dispatch-lib tests first (`grep -rn "dispatch-lib\|dispatch_claude_pilot" mika/skills/`). Whatever pattern those use is the pattern to follow. If no harness exists, the test belongs in `mika/skills/bundled/_shared/test-dispatch-lib.sh` as a new file, runnable from CI via the existing `make test` or skills test runner.
+- **Unknown: the exact location of mika-dev's post-callback prompt rules.** It may be in `self-dev/system_prompt.md`, in `mika-dev`'s own agent system prompt (lives in agent identity files via `MIKA_DEV_MODE` provisioning per `mika/CLAUDE.md`), or split across both. Resolve at Phase 2 implementation by grepping for the existing post-callback guidance (`grep -rn "callback\|task.complete\|dispatch.*result" mika/skills/bundled/self-dev/system_prompt.md`) and adding alongside it. If the rule lives in agent identity rather than skill prompt, the appropriate change site is `crates/mika-agent/src/dev_mode/` (where well-known agents are provisioned) — verify before editing.
+- **Unknown: whether the prompt change in Phase 2 actually changes behaviour given known prompt-adherence drift on similar models.** Mitigation: Phase 1's handler change is sufficient on its own to make the result *legible* (no longer HANDLER CRASH). If Phase 2's prompt rule does not stick on the current mika-dev model (kimi-k2.5 per `project_mika_dev_model_switch.md`), the LLM may still occasionally narrate the auto-skip — but this is degraded behaviour, not the original failure mode. The queue still advances on its own normal cadence (driven by webhook events and milestone-parent advancement, not by mika-dev's narration). Phase 5 is the structural fix if recurring narration surfaces in audits.
+- **Risk that F2 reintroduces.** Phase 0 pin's reuse of `_deliver_callback()` is the structural answer. The implementation must call the helper as-is; any temptation to "inline a quick callback for the auto-skip case" must be rejected — that path is exactly what F2 warned against. The pre-implementation verification step in Phase 1 ensures the helper exists at expected line numbers; if it has been refactored away, the plan needs revisiting before applying the edit.
