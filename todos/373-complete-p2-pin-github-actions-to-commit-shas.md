@@ -10,7 +10,7 @@ dependencies: []
 
 ## Problem Statement
 
-All GitHub Actions in the three workflow files (ci.yml, release-plz.yml, release.yml) reference actions by mutable version tags (e.g., `actions/checkout@v4`, `dtolnay/rust-toolchain@stable`). A compromised upstream action tag could be force-pushed with malicious code. Pinning to full commit SHAs prevents supply-chain attacks via tag mutation.
+All GitHub Actions in the three workflow files (ci.yml, release-pr.yml, release.yml) reference actions by mutable version tags (e.g., `actions/checkout@v4`, `dtolnay/rust-toolchain@stable`). A compromised upstream action tag could be force-pushed with malicious code. Pinning to full commit SHAs prevents supply-chain attacks via tag mutation.
 
 ## Findings
 
@@ -18,7 +18,7 @@ All GitHub Actions in the three workflow files (ci.yml, release-plz.yml, release
 - **Severity:** MEDIUM — supply-chain risk from mutable action tags
 - **Files affected:**
   - `.github/workflows/ci.yml` — 3 actions (checkout, rust-toolchain, rust-cache)
-  - `.github/workflows/release-plz.yml` — 4 actions (checkout×2, rust-toolchain×2, release-plz×2)
+  - `.github/workflows/release-pr.yml` — 4 actions (checkout×2, rust-toolchain×2, release-plz×2)
   - `.github/workflows/release.yml` — 4 actions (checkout, rust-toolchain, rust-cache, upload-rust-binary, setup-cross-toolchain)
 - **Industry standard:** GitHub's own security hardening guide recommends SHA pinning for third-party actions
 
@@ -38,7 +38,7 @@ All GitHub Actions in the three workflow files (ci.yml, release-plz.yml, release
 
 ## Technical Details
 
-- **Affected files:** `.github/workflows/ci.yml`, `.github/workflows/release-plz.yml`, `.github/workflows/release.yml`
+- **Affected files:** `.github/workflows/ci.yml`, `.github/workflows/release-pr.yml`, `.github/workflows/release.yml`
 
 ## Acceptance Criteria
 

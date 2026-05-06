@@ -12,7 +12,7 @@ tags:
   - institutional-memory
   - rust-workspace
 modules:
-  - .github/workflows/release-plz.yml
+  - .github/workflows/release-pr.yml
   - .github/workflows/release.yml
 related:
   - docs/solutions/ci-cd/rust-workspace-release-plz-github-actions.md
@@ -151,7 +151,7 @@ Failure classes are the primary axis of this doc. Tool chronology is here as sec
 - **Stage 1 — release-plz** (2026-03-01 → 2026-04-03). Setup captured in [`rust-workspace-release-plz-github-actions.md`](./rust-workspace-release-plz-github-actions.md) (now historical). 10+ fixes, all in Classes A, B, D. Migration driven by Class A.
 - **Stage 2 — git-cliff** (2026-04-03 → present). Migration commit `4825e7ae`. Fixes so far in Classes C, D. Current open issue is Class C.
 
-The `release-plz.yml` filename is retained for backward compatibility with workflow references, but the tool is git-cliff. Renaming to `release-pr.yml` is in mika#775's AC.
+The workflow file is `.github/workflows/release-pr.yml` (renamed from `release-plz.yml` in mika#775); the tool is git-cliff.
 
 ## Meta — why release automation drifts chronically
 
