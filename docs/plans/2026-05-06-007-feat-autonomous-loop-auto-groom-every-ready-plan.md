@@ -169,17 +169,17 @@ Description update: the `[skill] description` field also gets a one-line edit to
 
 ### 1.C — Verify no other code path enforces operator-only as a contract
 
-**Pre-implementation verification (mandatory before Phase 1.A's edit):**
+**Pre-implementation verification — explicit search terms (architect NF3, mandatory before Phase 1.A's edit):**
 
 ```bash
-grep -rn "operator-only" mika/
-grep -rn "auto-invoke\|never auto-invoke" mika/
-grep -rn "dev-groom" mika/crates/ mika/skills/
+rg -rn 'operator.only|OperatorOnly' crates/ skills/    # Rust-level enforcement check
+rg -rn 'auto.invoke|never auto.invoke' crates/ skills/  # prompt-level enforcement check
+rg -rn 'dev-groom' crates/ skills/                       # general reference check
 ```
 
-If any code outside `dev-groom/system_prompt.md` references the operator-only restriction as a contract (e.g., a hardcoded check that rejects `dev-groom` invocations from non-operator sources), Phase 1 must address that site too — surface to operator before editing if the surface is wider than expected.
+Expected: zero matches for `dev-groom`-specific enforcement outside `mika/skills/bundled/dev-groom/system_prompt.md`. **Halt and surface to operator if any match exists outside the dev-groom skill prompt itself** — that signals a Rust-level or sibling-skill enforcement site that Phase 1.A's prompt edit alone would not address.
 
-Expected: no other enforcement sites. The restriction was prompt-only, per the May 2 thread documenting that the move into the self-dev family did not add Rust-level enforcement.
+The restriction was prompt-only at the time of mika#841, per the May 2 worker-agent thread documenting that the move of dev-groom into the self-dev family did not add Rust-level enforcement. NF3 makes the verification mechanical rather than confidence-based.
 
 ## Phase 2 — Webhook path: replace rejection with auto-groom dispatch
 
@@ -213,7 +213,8 @@ Stop the turn after `send_message`. The engine guard accepts `send_message` as v
 
   d. Verify the callback indicates `Verdict: GROOMED` (the dev-groom skill posts this in its summary message to the issue and includes it in the callback result text).
 
-  e. **If GROOMED:** Re-enter the Ready-Label Dispatch flow at Step 4 (create_task + run_claude_pilot for `dev-pilot`). The issue body now has the Plan callout because dev-groom added it. The dispatch task uses the canonical `reference_url` (no `?phase=groom` suffix).
+  e. **If GROOMED — re-entry mechanics (architect NF5):** Re-enter the Ready-Label Dispatch atomic handler at its top (line 242 of `self-dev/system_prompt.md`). The handler runs through Steps 1-3 again, including the now-replaced grooming-marker check at lines 256-264; the issue body now contains `Plan: docs/plans/` (per the bypass predicate, NF4) because dev-groom edited it via Phase 5 step 18 of its prompt. The handler advances naturally past the grooming branch and into Step 4 (create_task + run_claude_pilot for `dev-pilot`). The dispatch task uses the canonical `reference_url` (no `?phase=groom` suffix).
+     **Why re-enter the full handler vs. jumping inline to Step 4:** re-entering keeps the dispatch logic in one place (lines 242-278) rather than duplicating Steps 4-5 inline in the auto-groom branch. The implementer must NOT re-implement create_task + run_claude_pilot inline in step (e) — the re-entry mechanism is the contract. If the handler's structure shifts after this PR, the auto-groom path automatically picks up the new shape; if Steps 4-5 were duplicated inline, they would drift.
 
   f. **If ESCALATE:** dev-groom surfaces an architect ESCALATION. Treat as a blocking event: send_message to operator with the ESCALATE reason from the callback, mark the parent task `blocked` if applicable, stop the turn. Do NOT auto-dispatch.
 
@@ -245,9 +246,11 @@ run_gh({
 })
 ```
 
-If the response contains the literal string `> - **Plan:**`, proceed to Step 2 (existing per-issue flow with `dev-pilot`).
+**Bypass predicate (architect NF4) — exact match required:** the bypass condition is `grep -F 'Plan: docs/plans/' <issue-body>` (option B from architect's three-way disambiguation). The substring must include the canonical plan-doc path prefix `docs/plans/` to avoid false positives on the word "Plan:" appearing in prose elsewhere in the issue body. This matches the canonical citation surface established by mika#931's GROOMED plan ("plan-doc-check.sh concatenates PR body + commit bodies; PR-body citation sufficient"). The same predicate applies in Phase 2's webhook-path bypass check.
 
-If the response does NOT contain `> - **Plan:**`, the child is ungroomed. Auto-groom before dispatching:
+If the response contains the literal string `Plan: docs/plans/`, proceed to Step 2 (existing per-issue flow with `dev-pilot`).
+
+If the response does NOT contain `Plan: docs/plans/`, the child is ungroomed. Auto-groom before dispatching:
 
 a. **Update child status to track grooming phase:** `update_task_status(task_id=<child_task_id>, status="in_progress", note="Grooming via dev-groom before dev-pilot dispatch (mika#996)")`. The child task remains the same `task_id` — grooming and dispatch are two phases of the same child task.
 
