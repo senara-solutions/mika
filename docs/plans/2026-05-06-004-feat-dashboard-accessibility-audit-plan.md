@@ -87,6 +87,8 @@ This changes the work shape but not the bound — Phase 1.A is still a contained
 
 **Worktree drift note:** PR #990 (mika#662, merged 2026-05-06 09:00:48Z) added `LiveRefreshToggle.tsx`. My worktree branched at HEAD `48e52c83` before PR #990's merge. At dispatch time, the worktree must `git fetch origin main && git rebase origin/main`, after which the primitive count becomes 13 (LiveRefreshToggle's test file is also a Phase 1.A target if PR #990 didn't already include it — verify at rebase).
 
+**Threshold re-derivation on count drift (architect NF2):** if post-rebase `ls packages/ui/src/components/*.tsx | grep -v .test.` yields **more than 14** primitive files, the implementer MUST re-derive the Phase 2 halt threshold — add 1 baseline assertion per new primitive to the 12-13 baseline figure used in the original derivation, and lift the halt threshold proportionally (e.g., 16 primitives → ~17-20 fix-here median, threshold lifted to 20+). Do not apply the stale 15 threshold to a primitive count it was not derived from.
+
 ### Existing primitives (a11y-relevant per-component notes)
 
 - **`packages/ui/src/components/StatusBadge.tsx`** — used pervasively. A11y baseline unknown; needs audit.
@@ -170,6 +172,7 @@ This is a deliberate scoping decision, not a hedge. The plan commits to it.
 - Verify `jest-axe` is compatible with vitest (it should be; both follow Jest matcher conventions). If not, fall back to `axe-core` direct usage with a custom vitest matcher.
 - Add `jest-axe` (or `axe-core`) to `packages/ui/package.json` devDependencies.
 - Add `@types/jest-axe` if using TypeScript matchers.
+- **`vitest.config.ts` branch characterization (architect NF3):** the pin found no existing `vitest.config.*` file in `packages/ui/`. jest-axe's `toHaveNoViolations` matcher requires registration via `expect.extend(toHaveNoViolations)` in a setup file referenced by `vitest.config.ts`'s `test.setupFiles`. Two branches: **(A)** if a config file appears between plan-time and dispatch-time, append the setup-files entry; **(B)** if still absent at dispatch, **create `vitest.config.ts` as a new file** scoped to test infrastructure (not a primitive). Name the branch explicitly in the PR diff so reviewers see the file is test infrastructure, not a primitive change. The new file is bounded (~10-20 lines: `defineConfig`, `test.environment: 'jsdom'`, `test.setupFiles: ['./src/test-setup.ts']`, optionally `test.globals: true`).
 
 **Deliverable per primitive:**
 ```ts
@@ -331,6 +334,8 @@ packages/ui/src/components/
 
 ## Phase 4 — CI gate
 
+**AC#3 partial satisfaction (architect NF1):** the ticket body's AC#3 is "CI gate runs a11y checks on every dashboard PR." This phase satisfies AC#3 for **primitive-level** regression gates only (`packages/ui/src/components/`). Page-level CI coverage (Playwright + `@axe-core/playwright` against `dashboard/src/pages/`) is deferred to Phase 6's follow-up ticket. AC#3 is **partially satisfied at merge** — the PR body must record this explicitly so reviewers do not assume full closure.
+
 **Tooling decision:** `jest-axe` for vitest unit tests (Phase 1.A's existing infrastructure); skip Playwright E2E this PR.
 
 **CI workflow change:** add a step to `.github/workflows/ci.yml` (verify exact path at implementation) that runs the packages/ui test suite with `--coverage` (already there?) and ensures axe assertions are run alongside. Most existing CI configs already run `npm test` or `vitest run` in the ui package's check job — verify whether the existing job covers the axe assertions or whether a dedicated `a11y-check` job is warranted.
@@ -340,9 +345,12 @@ packages/ui/src/components/
 ```bash
 ls .github/workflows/
 grep -l "packages/ui\|vitest\|test" .github/workflows/*.yml
+grep -l "npm run test --prefix packages/ui\|npm test --prefix packages/ui" .github/workflows/*.yml
 ```
 
-If the existing CI job already runs `npm test --prefix packages/ui`, the axe assertions ride along automatically. No new job needed. If the existing CI doesn't run packages/ui tests, add a job.
+If the existing CI job already runs `npm test --prefix packages/ui`, the axe assertions ride along automatically. No new job needed.
+
+**Halt branch (architect NF4):** if `ls .github/workflows/` yields no workflow running `npm run test --prefix packages/ui` (or equivalent invocation that exercises the packages/ui test suite), **halt and surface to operator**. The jest-axe CI gate cannot be wired without the correct workflow file, and creating a new workflow likely exceeds the 40-line halt threshold below — that compound exceeds this PR's scope. Operator decides whether to file a sibling ticket for "wire packages/ui tests into CI" or to accept that the CI gate ships in a follow-up. Phases 1, 2, 3, 5 still ship in this PR even if Phase 4 halts.
 
 **E2E follow-up:** file an issue for "Add Playwright + @axe-core/playwright for page-level a11y E2E in CI." Out of scope for this PR; the unit-level axe via jest-axe is sufficient as a baseline gate.
 
