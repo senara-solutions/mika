@@ -8,6 +8,13 @@ seq: 003
 
 # Plan: dashboard cost / budget signals (mika#667)
 
+## Verified state (post-architect-pass-1)
+
+- **F1 (TokenBudgetBar pin) addressed** — Phase 0's "Existing primitives" subsection now cites `TokenBudgetBar.tsx` line numbers verbatim: `role="meter"` at line 48, `aria-valuemax={max}` at line 51 (requires known maximum), thresholds at lines 11-12 are **ratios** (`DEFAULT_WARNING = 0.6, DEFAULT_DANGER = 0.85`) applied via `ratio = value/max` at line 35 with `pct = Math.min(100, ...)` at line 36 (bounded by design). The new-primitive decision is no longer asserted; it's source-anchored against an actual file.
+- **F2 (mika#666 binary gate) addressed** — Phase 3's pre-flight is now a binary check: `gh pr list --repo senara-solutions/mika --search "feat/666/dashboard-landing-home-overview in:head" --state merged --json number --jq 'length > 0'`. If `true`, Phase 3 proceeds. If `false`, Phase 3 halts. No subjective "stable contract" assessment.
+- **F3 (Stitch coverage gap) addressed** — new "Stitch coverage gap" callout enumerates pinned screens (Dev Run detail, landing widget, component sheet) vs. missing screens (Agent detail). Implementer files a Stitch coverage gap issue for Vincent before guessing placement.
+- **F4 (variable-backend phase gate) addressed** — Phase 2.B and Phase 2.C now have a hard halt threshold: if a pre-flight grep reveals a backend addition exceeding 50 lines (Rust + SQL), the phase halts and surfaces to operator before any code is written. Sub-50-line additions proceed without halt. Threshold rationale: anything larger crosses the "this is a separable ticket" line and shouldn't bundle.
+
 ## Why
 
 Autonomous runs burn real money per LLM call. Today's observed costs are bounded by luck, not by system: mika#648 was \$12, mika#608's aborted run was \$27, and a poorly-scoped ticket or stuck loop could easily run \$200+ before anyone notices. The cost data exists in the database (the agent already records `cost_usd` on dev runs and individual LLM calls), but it is not surfaced anywhere an operator habitually looks. Today an operator must drill into a run's metadata blob or query the DB directly to see what something cost.
@@ -22,7 +29,22 @@ All paths verified against the worktree at `feat/667/dashboard-cost-budget-signa
 
 ### Existing primitives
 
-- **`packages/ui/src/components/TokenBudgetBar.tsx`** — three-tier color threshold progress bar with ARIA meter semantics. Per `mika/CLAUDE.md`: "TokenBudgetBar (three-tier color threshold progress bar with ARIA meter semantics)". Domain: token usage vs budget (e.g., context window, daily token limit). **Not the right primitive for cost** — token domain, fixed-cap semantics, ARIA `meter` role implies a known maximum. Cost has no fixed cap; thresholds are configurable warning/critical levels, not "100% full." Phase 1 establishes `<CostMeter>` as a sibling primitive, not a TokenBudgetBar wrapper.
+- **`packages/ui/src/components/TokenBudgetBar.tsx`** — three-tier color threshold progress bar with ARIA meter semantics. Source-pinned at the worktree's HEAD `48e52c83`:
+  - Line 1: `export type TokenBudgetTier = 'success' | 'warning' | 'error'`
+  - Lines 3-9: `interface TokenBudgetBarProps { value: number, max: number, thresholds?: { warning: number; danger: number }, label?: string, showFraction?: boolean }`
+  - Lines 11-12: `const DEFAULT_WARNING = 0.6; const DEFAULT_DANGER = 0.85;` — **thresholds are ratios** (0.0-1.0), not absolute values
+  - Line 35: `const ratio = max > 0 ? value / max : 0` — bounded by the supplied `max`
+  - Line 36: `const pct = Math.min(100, Math.round(ratio * 100))` — clamped to 100, bounded by design
+  - Line 48: `role="meter"` — confirmed
+  - Lines 49-51: `aria-valuenow={value} aria-valuemin={0} aria-valuemax={max}` — **requires** a known maximum
+  - From `packages/ui/CLAUDE.md` canonical primitive table: "Token/resource budget progress bar with three-tier color thresholds (green <60%, amber 60-85%, red >85%) and ARIA meter semantics"
+
+  **Not the right primitive for cost** — three pinned reasons:
+  1. **ARIA semantics mismatch.** `role="meter"` per WAI-ARIA requires `aria-valuemax`, which TokenBudgetBar uses at line 51. Cost has no domain maximum (\$0.50, \$5, \$200 are all valid runs). Forcing a `max` for ARIA correctness would require either a synthetic ceiling (which is a lie about the domain) or the meter would be ARIA-invalid.
+  2. **Threshold semantics mismatch.** TokenBudgetBar's thresholds are **ratios** of value/max (lines 11-12, 35). Cost thresholds are **absolute USD amounts** (\$5 warning, \$20 critical). Reusing the prop signature would force consumers to compute synthetic ratios from absolute values — surface-level reuse of a deeply mismatched contract.
+  3. **Behavior mismatch.** TokenBudgetBar clamps display at 100% (line 36). Cost has no "100% full" state — there is no maximum to be 100% of. Clamping cost would lie about the displayed value once thresholds are crossed.
+
+  Phase 1 establishes `<CostMeter>` as a sibling primitive — different ARIA role (`status`), different threshold contract (absolute USD), different visual semantics (no fixed-cap progress bar). Source-anchored, not asserted.
 - **`dashboard/src/components/CostTrendChart.tsx`** — time-series cost chart. Shipped via PR #976 / mika#660 (merged 2026-05-05). Currently used at `dashboard/src/pages/LlmCalls.tsx:118` driven by `useCostTrend(costTrendFilters)` hook. Lives in `dashboard/` not `packages/ui/` — single-consumer component. Phase 3's landing widget will import directly from dashboard/components, no need to publish to packages/ui (publishing would be premature per `feedback_keep_simple.md`).
 - **`packages/ui/src/components/StatusBadge.tsx`** + **`ListRow.tsx`** — used as composition primitives for the LLM Calls list cost-column variant.
 
@@ -42,6 +64,21 @@ Per the ticket body callouts, three Stitch screens anchor the design:
 - `2443ccdf05d44295ade2f7c17574d7c3` — Landing widget placement (Layer 2 surface, depends on mika#666)
 
 These are the canonical source for visual decisions. The plan does not relitigate design choices that the screens have settled — it executes them. If the implementer hits a question the screens don't answer (e.g., "what's the threshold color when cost < \$5?"), surface it as an issue for Vincent rather than guessing.
+
+### Stitch coverage gap (architect F3)
+
+The ticket body pins three screens (above) but does **not** pin Stitch screens for two surfaces this plan integrates:
+
+- **LLM Calls list cost column** — no Stitch screen ID in the ticket. The ticket says "compact chip variant" but does not specify column position, sort affordance, or visual treatment of the chip in a tabular context.
+- **Agent detail today's-cost chip** — no Stitch screen ID in the ticket. The ticket says "today's cost chip" but does not specify placement (header? sidebar? metadata block?), sizing, or whether 7d-rolling is shown alongside.
+
+Implementer obligation before Phase 2.B and Phase 2.C begin:
+
+1. **Search the Stitch project (`6562713725762717689`) for screens covering these surfaces.** If a screen exists but wasn't linked from the ticket, use it.
+2. **If no screen exists, file a Stitch coverage gap issue** with title `"Design gap: <surface> for mika#667 cost integration"`, blocking the affected phase, and ping Vincent. Phase 2.B/2.C wait on the design.
+3. **Do not infer placement by analogy.** "It's like LLM Calls but for cost" is not a Stitch design — it's an inference. The risk is shipping a chip that subtly violates `luminescent-core` and gets flagged in design audit later.
+
+This gate explicitly trades wall-clock for design coherence per `feedback_loop_stability_beats_loop_speed.md` — design correctness is a stability concern (avoiding rework), not a velocity penalty.
 
 ### Stitch project ID
 - `6562713725762717689` — Mika Observability Dashboard project. Reference for cross-screen consistency checks.
@@ -171,6 +208,10 @@ grep -n "input_tokens.*price\|provider.*price\|cost.*calc" crates/mika-agent/src
 
 These greps answer (a) whether the API already exposes per-call cost (no backend work) or doesn't (Phase 2.B grows by ~30 lines of Rust), and (b) where the cost calculation already lives if a backend addition is needed (DRY rather than re-deriving).
 
+**Hard halt threshold (architect F4):**
+
+If the pre-flight reveals that exposing per-call cost requires more than **50 lines** of combined Rust + SQL (i.e., the calculation isn't already done somewhere reusable, the API needs schema changes, or new query patterns must be introduced), Phase 2.B **halts** and surfaces to operator before any code is written. Anything larger than 50 lines crosses the "this is its own ticket" threshold and shouldn't bundle into a UI-integration PR. Sub-50-line additions (e.g., calling an existing cost-calculation helper from the list endpoint, adding one column to the response struct) proceed without halt. The 50-line threshold is a soft signal that the work is no longer "wire up existing data."
+
 ### Phase 2.C — Agent detail today's-cost chip
 
 **Files:**
@@ -191,6 +232,10 @@ grep -n "Agent\|cost" dashboard/src/api/agents.ts
 
 If the agent detail API doesn't expose `cost_today_usd`, this phase grows by a small backend addition (a SQL aggregate over `llm_calls` filtered by `agent_id` + 24h window). Pin the existing aggregate query patterns (e.g., the dev runs page already does similar aggregations) and reuse the SQL idiom.
 
+**Hard halt threshold (architect F4):**
+
+Same 50-line rule as Phase 2.B. If exposing today's cost (and optionally 7-day rolling) on Agent detail requires more than 50 lines of combined Rust + SQL, Phase 2.C halts and surfaces to operator. The expected shape (~10 lines: one SQL aggregate + one response field) is well below the threshold; the gate is a tripwire for unexpected scope, not a prediction.
+
 ## Phase 3 — Landing widget (Layer 2)
 
 **File:** `dashboard/src/pages/Dashboard.tsx` (or the landing-page component mika#666 establishes — verify at implementation; the path may differ depending on mika#666's final shape)
@@ -201,15 +246,26 @@ If the agent detail API doesn't expose `cost_today_usd`, this phase grows by a s
 - Show: total cost today, total cost 7d, the trend chart, leaderboard of top-3 most expensive recent runs (if backend exposes; otherwise defer)
 - Layout per Stitch screen `2443ccdf05d44295ade2f7c17574d7c3`
 
-**Pre-flight (gate Phase 3):**
+**Pre-flight gate (gate Phase 3) — binary criterion (architect F2):**
 
-mika#666 is being implemented in parallel. Before starting Phase 3:
+Phase 3 begins **if and only if** the following binary check returns `true`:
 
-1. Check mika#666 PR status — if merged, read the landing page's widget-slot contract and use it. If still open on a branch, read the in-progress branch's widget-slot interface and use it.
-2. If mika#666 establishes a `<DashboardWidget>` wrapper or grid system, Phase 3 wraps the cost section in it. If mika#666 leaves widget composition unstructured (just a sequence of sections), Phase 3 adds a section at the position the Stitch screen specifies.
-3. If mika#666 hasn't merged or even pushed by Phase 3 implementation time, **Phase 3 halts** and surfaces a coordination question to Vincent. The widget must compose with whatever mika#666 establishes; building it standalone risks a second integration pass.
+```bash
+gh pr list \
+  --repo senara-solutions/mika \
+  --search "feat/666/dashboard-landing-home-overview in:head" \
+  --state merged \
+  --json number \
+  --jq 'length > 0'
+```
 
-This is a real pre-flight gate, not a soft preference. Phase 1 + Phase 2 are independent of mika#666 and ship even if Phase 3 stalls.
+If `true`: read `dashboard/src/pages/Dashboard.tsx` (or whatever path mika#666 established — verify by `git log --diff-filter=A --name-only origin/main..HEAD` after `git fetch origin main`) and integrate using the established widget-slot pattern. If mika#666 chose `<DashboardWidget>` wrapper, wrap. If it chose a flat section sequence, add a section at the position Stitch screen `2443ccdf05d44295ade2f7c17574d7c3` specifies.
+
+If `false`: Phase 3 **halts**. Phase 1 + Phase 2 ship in their own PR (without the landing widget). Phase 3 reactivates as a follow-up mini-PR once mika#666 merges. Surface this halt to operator at the time of the gate check, not as a quiet defer.
+
+There is no third state ("PR open with widget contract decided"). The architect's F2 is satisfied by binary semantics: either mika#666's PR is merged on main, or it isn't, and the gate returns true or false accordingly. No subjective assessment of "stable contract" is needed.
+
+**Why this severity is correct:** Building Phase 3 against an unmerged branch creates a second integration pass when mika#666 lands (its widget-slot shape may evolve in code review). Building Phase 3 against a merged PR is a single-pass integration. The cost of waiting is hours-to-a-day; the cost of building twice is one wasted PR cycle. Trade clearly favors waiting per `feedback_loop_stability_beats_loop_speed.md`.
 
 ## Phase 4 — Tests + docs
 
