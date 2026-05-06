@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from './client.ts'
 
 export interface TimelineRow {
@@ -22,20 +22,12 @@ export interface TimelineFilters {
   per_page?: number
 }
 
-export function useTimeline(filters: TimelineFilters, enabled = true, autoRefresh = true) {
-  const isDefaultView =
-    !filters.agent_id &&
-    !filters.event_type &&
-    !filters.trace_id &&
-    !filters.session_id &&
-    !filters.from &&
-    !filters.to &&
-    (filters.page ?? 1) === 1
-
+export function useTimeline(filters: TimelineFilters, enabled = true, refetchInterval?: number | false) {
   return useQuery<PaginatedResponse<TimelineRow>>({
     queryKey: ['timeline', filters],
     queryFn: () => apiFetch('/timeline', filters as Record<string, string | number | undefined>),
-    refetchInterval: autoRefresh && isDefaultView ? 5000 : false,
+    refetchInterval,
+    placeholderData: keepPreviousData,
     enabled,
   })
 }

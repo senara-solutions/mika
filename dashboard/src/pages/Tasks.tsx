@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, formatRelativeTime, type TimeRange } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, LiveRefreshToggle, formatRelativeTime, type TimeRange } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
+import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 function TaskRow({ task, indent = 0 }: { task: TaskItem; indent?: number }) {
@@ -256,11 +257,11 @@ function Section({
   )
 }
 
-function WorkItemsSection({ timeRange }: { timeRange: TimeRange }) {
+function WorkItemsSection({ timeRange, refetchInterval }: { timeRange: TimeRange; refetchInterval: number | false }) {
   const [page, setPage] = useState(1)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = { trigger_type: 'manual', from: timeRange.from, to: timeRange.to, page, per_page: 20 }
-  const { data, isLoading, error, refetch } = useTasks(filters)
+  const { data, isLoading, error, refetch } = useTasks(filters, refetchInterval)
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -301,7 +302,7 @@ function WorkItemsSection({ timeRange }: { timeRange: TimeRange }) {
   )
 }
 
-function TeamRunTasksSection({ timeRange }: { timeRange: TimeRange }) {
+function TeamRunTasksSection({ timeRange, refetchInterval }: { timeRange: TimeRange; refetchInterval: number | false }) {
   const [page, setPage] = useState(1)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = {
@@ -311,7 +312,7 @@ function TeamRunTasksSection({ timeRange }: { timeRange: TimeRange }) {
     page,
     per_page: 20,
   }
-  const { data, isLoading, error, refetch } = useTasks(filters)
+  const { data, isLoading, error, refetch } = useTasks(filters, refetchInterval)
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -352,7 +353,7 @@ function TeamRunTasksSection({ timeRange }: { timeRange: TimeRange }) {
   )
 }
 
-function StandaloneCallbacksSection({ timeRange }: { timeRange: TimeRange }) {
+function StandaloneCallbacksSection({ timeRange, refetchInterval }: { timeRange: TimeRange; refetchInterval: number | false }) {
   const [page, setPage] = useState(1)
   const filters: TasksFilters = {
     action_type: 'resume_agent,run_skill',
@@ -363,7 +364,7 @@ function StandaloneCallbacksSection({ timeRange }: { timeRange: TimeRange }) {
     page,
     per_page: 20,
   }
-  const { data, isLoading, error, refetch } = useTasks(filters)
+  const { data, isLoading, error, refetch } = useTasks(filters, refetchInterval)
 
   return (
     <Section title="Standalone Callbacks" count={data?.total} defaultOpen={true}>
@@ -389,7 +390,7 @@ function StandaloneCallbacksSection({ timeRange }: { timeRange: TimeRange }) {
   )
 }
 
-function ScheduledSection({ timeRange }: { timeRange: TimeRange }) {
+function ScheduledSection({ timeRange, refetchInterval }: { timeRange: TimeRange; refetchInterval: number | false }) {
   const [page, setPage] = useState(1)
   const filters: TasksFilters = {
     trigger_type: 'cron,one_shot',
@@ -398,7 +399,7 @@ function ScheduledSection({ timeRange }: { timeRange: TimeRange }) {
     page,
     per_page: 20,
   }
-  const { data, isLoading, error, refetch } = useTasks(filters)
+  const { data, isLoading, error, refetch } = useTasks(filters, refetchInterval)
 
   return (
     <Section title="Scheduled Tasks" count={data?.total} defaultOpen={false}>
@@ -464,13 +465,30 @@ export default function Tasks() {
     to: searchParams.get('to') ?? undefined,
   }
 
+  const isDefaultView =
+    !timeRange.from &&
+    !timeRange.to
+
+  const { isLive, isEffectivelyLive, toggle, refetchInterval } = useLiveRefresh({
+    defaultEnabled: false,
+    interval: 15_000,
+    isDefaultView,
+  })
+
   return (
     <div>
-      <div className="mb-5">
-        <h2 className="text-heading text-xl font-semibold">Tasks</h2>
-        <p className="text-sm text-muted/60 mt-1">
-          Monitor work items, team runs, callbacks, and scheduled tasks
-        </p>
+      <div className="flex items-center justify-between mb-5">
+        <div>
+          <h2 className="text-heading text-xl font-semibold">Tasks</h2>
+          <p className="text-sm text-muted/60 mt-1">
+            Monitor work items, team runs, callbacks, and scheduled tasks
+          </p>
+        </div>
+        <LiveRefreshToggle
+          isLive={isEffectivelyLive}
+          onToggle={toggle}
+          disabled={!isDefaultView && isLive}
+        />
       </div>
 
       {/* Time range filter bar */}
@@ -494,10 +512,10 @@ export default function Tasks() {
         </div>
       </div>
 
-      <WorkItemsSection key={`work-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
-      <TeamRunTasksSection key={`team-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
-      <StandaloneCallbacksSection key={`cb-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
-      <ScheduledSection key={`sched-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} />
+      <WorkItemsSection key={`work-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} refetchInterval={refetchInterval} />
+      <TeamRunTasksSection key={`team-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} refetchInterval={refetchInterval} />
+      <StandaloneCallbacksSection key={`cb-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} refetchInterval={refetchInterval} />
+      <ScheduledSection key={`sched-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} refetchInterval={refetchInterval} />
     </div>
   )
 }

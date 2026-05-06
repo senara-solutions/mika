@@ -2,8 +2,9 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatTimestamp, eventTypeBadge } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatTimestamp, eventTypeBadge, LiveRefreshToggle } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
+import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { Search } from 'lucide-react'
 
 const EVENT_TYPE_OPTIONS = [
@@ -16,7 +17,6 @@ const EVENT_TYPE_OPTIONS = [
 export default function Timeline() {
   const { searchParams, setSearchParams, updateFilter, setPage } = useSearchParamsFilter()
   const [traceSearch, setTraceSearch] = useState(searchParams.get('trace_id') ?? '')
-  const [autoRefresh, setAutoRefresh] = useState(true)
 
   const filters: TimelineFilters = {
     agent_id: searchParams.get('agent_id') ?? undefined,
@@ -28,7 +28,22 @@ export default function Timeline() {
     per_page: 50,
   }
 
-  const { data, isLoading, error, refetch } = useTimeline(filters, true, autoRefresh)
+  const isDefaultView =
+    !filters.agent_id &&
+    !filters.event_type &&
+    !filters.trace_id &&
+    !filters.session_id &&
+    !filters.from &&
+    !filters.to &&
+    (filters.page ?? 1) === 1
+
+  const { isEffectivelyLive, toggle, refetchInterval } = useLiveRefresh({
+    defaultEnabled: true,
+    interval: 5_000,
+    isDefaultView,
+  })
+
+  const { data, isLoading, error, refetch } = useTimeline(filters, true, refetchInterval)
   const { data: agents } = useAgents()
 
   function handleTraceSearch() {
@@ -40,35 +55,12 @@ export default function Timeline() {
       {/* Header */}
       <div className="flex items-start justify-between mb-5">
         <div>
-          <div className="flex items-center gap-3">
-            <h2 className="text-heading text-xl font-semibold">Unified Event Timeline</h2>
-            {autoRefresh && (
-              <StatusBadge variant="success" label="Live" dotPulse />
-            )}
-          </div>
+          <h2 className="text-heading text-xl font-semibold">Unified Event Timeline</h2>
           <p className="text-sm text-muted/60 mt-1">
             Monitor live events across Messages, Audit Log, and Tasks
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <label className="flex items-center gap-2 text-xs text-muted cursor-pointer">
-            Auto-refresh
-            <button
-              role="switch"
-              aria-checked={autoRefresh}
-              onClick={() => setAutoRefresh(!autoRefresh)}
-              className={`relative w-9 h-5 rounded-full transition-colors ${
-                autoRefresh ? 'bg-accent' : 'bg-white/[0.1]'
-              }`}
-            >
-              <span
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                  autoRefresh ? 'left-[18px]' : 'left-0.5'
-                }`}
-              />
-            </button>
-          </label>
-        </div>
+        <LiveRefreshToggle isLive={isEffectivelyLive} onToggle={toggle} />
       </div>
 
       {/* Filter bar */}
