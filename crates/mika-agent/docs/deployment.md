@@ -110,7 +110,7 @@ Runs on every PR and push to `main`:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
 
-### Release-plz (`release-plz.yml`)
+### Release PR (`release-pr.yml`)
 
 Runs on push to `main` (after CI passes):
 - Creates a release PR with version bumps and changelog updates (conventional commits)

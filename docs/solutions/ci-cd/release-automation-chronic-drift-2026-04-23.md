@@ -4,7 +4,7 @@ date: 2026-04-23
 category: ci-cd
 problem_type: operational-pattern
 severity: medium
-resolved: false
+resolved: pending-validation
 tags:
   - release-automation
   - ci-cd
@@ -12,7 +12,7 @@ tags:
   - institutional-memory
   - rust-workspace
 modules:
-  - .github/workflows/release-plz.yml
+  - .github/workflows/release-pr.yml
   - .github/workflows/release.yml
 related:
   - docs/solutions/ci-cd/rust-workspace-release-plz-github-actions.md
@@ -117,31 +117,43 @@ Cluster trajectory: **one-off fixes, each distinct**. These are the kind of fixe
 
 **For future fixes:** anything in Class D is a one-off; anything in A/B/C is chronic-drift and needs compound-doc discipline.
 
-## Current failure (Class C, open)
+## Current failure (Class C, fix in validation)
 
-Symptom on every merge to `main` since at least 2026-04-23: `release/v0.6.0` non-fast-forward. Tracked as **mika#775**. Compound doc will get a "Stage 3 — resolution" section when that ticket lands, naming:
+Symptom on every merge to `main` from 2026-04-23 through 2026-05-06: `release/v0.6.0` non-fast-forward. Tracked as **mika#775** — see Stage 3 below for the resolution. Validation gate (10 consecutive clean merges OR 14 days, whichever comes first) is still in flight; the fix is provisional until the gate passes and the frontmatter flips from `resolved: pending-validation` to `resolved: true`.
 
-- Which of the three candidate approaches was chosen
-- Why it survived 10+ consecutive merges without recurrence (validation gate)
-- What it closed and what it didn't (Class A/B vulnerabilities may remain)
+## Stage 3 — Class C resolution (mika#775, 2026-05-06)
 
-## Operational workaround (while Class C remains open)
+**Approach chosen.** Recreate `release/vX.Y.Z` from `main` HEAD on every workflow run, then `git push --force`. The release-pr job no longer probes for an existing branch state before pushing — it builds the branch deterministically from `(main HEAD, NEXT version, git-cliff output)` and overwrites whatever was on origin. After the push, it checks for an open PR and opens one only if none exists; an existing open PR auto-tracks the force-pushed branch tip.
 
-If a release is actually blocked by the non-fast-forward failure:
+**Why this addresses the class, not the instance.** Every prior Class C symptom — including the open one resolved here — arose from "the workflow had an expectation about the prior state of `release/*` and that expectation was wrong." The fix removes the expectation entirely: the workflow no longer cares what state was on origin, because it always replaces it. Future Class C variants (a future tool also targeting `release/*` branches, a manual edit slipping in, a concurrent run) inherit a viable pattern instead of needing to invent a new state-management scheme.
+
+**What this resolution does *not* close.**
+- **Class A (workspace dep resolution with mixed publish-status crates)** — dormant under git-cliff because git-cliff doesn't `cargo package` workspace members, but would resurface immediately under any future tool migration that does. The 7+ historical fixes documented in this doc remain the canonical cautionary trail.
+- **Class B (comparison mode)** — dormant because git-cliff uses tag-based comparison and the workflow's `LATEST_TAG = git describe --tags --abbrev=0` resolution is straightforward. Same future-tool-migration risk as Class A.
+- **Class D (packaging / build / identity)** — by definition unbounded; future one-offs will land as one-off fixes per this doc's Class D guidance.
+
+**What this resolution does close (incidentally).**
+- The "PR never auto-updates" complaint from the original problem statement: under approach 3, every workflow run force-pushes the regenerated branch, and GitHub's PR view auto-tracks the branch tip. The PR now reflects current `main` after every merge. Documented as a side benefit, not the fix's primary objective.
+
+**Post-merge orphan branches** (`release/v0.5.0`, `release/v0.5.1`, `release/v0.6.0` after their respective releases ship) remain a related but distinct gap — a follow-up ticket will add automatic cleanup when a `chore: release vX.Y.Z` commit lands on `main`. Manual reset via `git push origin :release/vX.Y.Z` still works as documented in the operational-workaround section below.
+
+## Operational workaround (still applicable during validation)
+
+If a release is blocked by a non-fast-forward failure during the validation period (or by a Class C variant the Stage 3 resolution doesn't cover):
 
 ```bash
 # 1. Inspect what's on release/v0.6.0 that shouldn't be
 git fetch origin release/v0.6.0
 git log --oneline origin/main..origin/release/v0.6.0
 
-# 2. Delete the remote branch — the tool recreates it on next run
+# 2. Delete the remote branch — the workflow recreates it on next run
 git push origin :release/v0.6.0
 
 # 3. Trigger the Release workflow manually via workflow_dispatch,
 #    or wait for the next merge to main
 ```
 
-Until mika#775 lands, this is the reset.
+Until the validation gate passes (10 consecutive clean merges OR 14 days, zero Release-workflow failures) and `resolved: pending-validation` flips to `resolved: true`, this remains the reset path for any recurrence.
 
 ## Tool evolution (appendix — chronological index)
 
@@ -151,7 +163,7 @@ Failure classes are the primary axis of this doc. Tool chronology is here as sec
 - **Stage 1 — release-plz** (2026-03-01 → 2026-04-03). Setup captured in [`rust-workspace-release-plz-github-actions.md`](./rust-workspace-release-plz-github-actions.md) (now historical). 10+ fixes, all in Classes A, B, D. Migration driven by Class A.
 - **Stage 2 — git-cliff** (2026-04-03 → present). Migration commit `4825e7ae`. Fixes so far in Classes C, D. Current open issue is Class C.
 
-The `release-plz.yml` filename is retained for backward compatibility with workflow references, but the tool is git-cliff. Renaming to `release-pr.yml` is in mika#775's AC.
+The workflow file is `.github/workflows/release-pr.yml` (renamed from `release-plz.yml` in mika#775); the tool is git-cliff.
 
 ## Meta — why release automation drifts chronically
 

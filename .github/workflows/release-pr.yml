@@ -10,6 +10,7 @@ jobs:
   release-pr:
     name: Release PR
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     if: github.repository_owner == 'senara-solutions'
     permissions:
       contents: write
@@ -77,22 +78,8 @@ jobs:
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "next=$NEXT" >> "$GITHUB_OUTPUT"
 
-      - name: Check for existing release PR
+      - name: Create or update release branch and PR
         if: steps.check.outputs.has_changes == 'true'
-        id: existing
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-        run: |
-          PR=$(gh pr list --head "release/v${{ steps.version.outputs.next }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
-          if [ -n "$PR" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Release PR #$PR already exists"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create release branch and PR
-        if: steps.check.outputs.has_changes == 'true' && steps.existing.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         run: |
@@ -103,7 +90,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git checkout -b "$BRANCH"
+          # Recreate the release branch from main HEAD on every run. The branch is tool-owned
+          # and has no history worth preserving — every commit is regenerated from
+          # main + version bump + git-cliff output. Approach 3 (Class C resolution) in
+          # docs/solutions/ci-cd/release-automation-chronic-drift-2026-04-23.md.
+          git checkout -B "$BRANCH" main
 
           # Bump workspace version
           sed -i "s/^version = \"${CURRENT}\"/version = \"${NEXT}\"/" Cargo.toml
@@ -115,22 +106,38 @@ jobs:
           git-cliff --tag "v${NEXT}" -o CHANGELOG.md
 
           git add Cargo.toml Cargo.lock CHANGELOG.md
-          git commit -m "chore: release v${NEXT}"
-          git push origin "$BRANCH"
+          # Skip the commit when nothing is staged (workflow_dispatch retry on the same main HEAD,
+          # or any case where sed/cargo/git-cliff produced byte-identical output). Without this
+          # guard, `set -e` would halt the step on a "nothing to commit" no-op.
+          if git diff --cached --quiet; then
+            echo "No release-tree changes since the last regeneration — skipping commit."
+          else
+            git commit -m "chore: release v${NEXT}"
+          fi
 
-          # Generate PR body
-          CHANGELOG_BODY=$(git-cliff --tag "v${NEXT}" --unreleased --strip header)
+          # Force-push: any prior state on origin (orphan from a failed run, or a stale branch
+          # from a closed-without-merge PR) is replaced with the deterministic regeneration.
+          git push --force origin "$BRANCH"
 
-          gh pr create \
-            --title "chore: release v${NEXT}" \
-            --body "## Release v${NEXT}
+          # Open a PR only if one isn't already open. An existing open PR auto-tracks the
+          # force-pushed branch tip, so no separate "update" step is needed.
+          # `// empty` defends against jq emitting the literal "null" on an empty array.
+          EXISTING_PR=$(gh pr list --state open --head "$BRANCH" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Release PR #$EXISTING_PR already open — branch updated via force-push"
+          else
+            CHANGELOG_BODY=$(git-cliff --tag "v${NEXT}" --unreleased --strip header)
+            gh pr create \
+              --title "chore: release v${NEXT}" \
+              --body "## Release v${NEXT}
           ${CHANGELOG_BODY}
 
           ---
           Merging this PR will trigger tag creation and GitHub release." \
-            --label "release" \
-            --base main \
-            --head "$BRANCH"
+              --label "release" \
+              --base main \
+              --head "$BRANCH"
+          fi
 
   release-tag:
     name: Tag & Release
