@@ -56,7 +56,7 @@ Session detail page tabs (Messages, LLM Calls, Tool Calls, Skills) currently use
 
 ## Implementation Units
 
-- [ ] **Unit 1: Route definition and tab state from path params**
+- [x] **Unit 1: Route definition and tab state from path params**
 
 **Goal:** Change routing from `sessions/:sessionId` to `sessions/:sessionId/:tab?` and switch tab state from `useSearchParams` to `useParams`.
 
@@ -92,7 +92,7 @@ Session detail page tabs (Messages, LLM Calls, Tool Calls, Skills) currently use
 - Browser back/forward navigates between tabs correctly (with `replace: true`, back should leave the page)
 - All four tabs render their content when accessed via direct URL
 
-- [ ] **Unit 2: Update inbound links and documentation**
+- [x] **Unit 2: Update inbound links and documentation**
 
 **Goal:** Ensure session list links work with the new routing and update documentation.
 
