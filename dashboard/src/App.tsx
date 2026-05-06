@@ -32,7 +32,7 @@ export default function App() {
         <Route path="agents" element={<Agents />} />
         <Route path="agents/:agentId" element={<AgentDetail />} />
         <Route path="sessions" element={<Sessions />} />
-        <Route path="sessions/:sessionId" element={<SessionDetail />} />
+        <Route path="sessions/:sessionId/:tab?" element={<SessionDetail />} />
         <Route path="tasks" element={<Tasks />} />
         <Route path="tasks/:taskId" element={<TaskDetail />} />
         <Route path="llm-calls" element={<LlmCalls />} />

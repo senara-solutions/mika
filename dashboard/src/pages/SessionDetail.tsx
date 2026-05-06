@@ -1,5 +1,5 @@
 import { useState, Fragment, useMemo } from 'react'
-import { useParams, Link, useSearchParams } from 'react-router'
+import { useParams, Link, useNavigate } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import { useSessionLlmCalls } from '../api/llmCalls.ts'
@@ -392,20 +392,14 @@ function roleConfig(role: string) {
 }
 
 export default function SessionDetail() {
-  const { sessionId } = useParams<{ sessionId: string }>()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const { sessionId, tab: tabParam } = useParams<{ sessionId: string; tab?: string }>()
+  const navigate = useNavigate()
   const [page, setPage] = useState(1)
 
-  const rawTab = searchParams.get('tab')
-  const activeTab: SessionTab = isSessionTab(rawTab) ? rawTab : 'messages'
+  const activeTab: SessionTab = isSessionTab(tabParam ?? null) ? (tabParam as SessionTab) : 'messages'
   const setActiveTab = (tab: SessionTab) => {
-    const next = new URLSearchParams(searchParams)
-    if (tab === 'messages') {
-      next.delete('tab')
-    } else {
-      next.set('tab', tab)
-    }
-    setSearchParams(next)
+    const path = tab === 'messages' ? `/sessions/${sessionId}` : `/sessions/${sessionId}/${tab}`
+    navigate(path, { replace: true })
     // Reset sub-tab pagination on tab switch (consistent with AgentDetail.handleTabChange)
     if (tab === 'messages') setPage(1)
     if (tab === 'llm-calls') setLlmCallsPage(1)
