@@ -90,9 +90,21 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
         "dev-groom",
     ],
     config_toml: None,
-    identity_source: None,
+    // KG disabled (#800): mika-dev has zero `query_knowledge_graph` usage —
+    // retrieval goes through `search_memory` (FTS5+vec over memory_facts).
+    // Eliminates shared-corpus extractor race on the mika-docs corpus.
+    // Re-enable with one config edit + restart if a dev flow needs KG.
+    identity_source: Some(IdentitySource::Static(MIKA_DEV_IDENTITY)),
     llm_overrides: &[],
 };
+
+/// mika-dev identity.toml — KG disabled per mika#800.
+const MIKA_DEV_IDENTITY: &str = "\
+name = \"Dev\"\n\
+emoji = \"🛠\"\n\
+\n\
+[kg]\n\
+enabled = false\n";
 
 /// mika-qa agent specification.
 pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
@@ -119,9 +131,21 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
         "dev-groom",
     ],
     config_toml: None,
-    identity_source: None,
+    // KG disabled (#800): mika-qa has zero `query_knowledge_graph` usage —
+    // retrieval goes through `search_memory` (FTS5+vec over memory_facts).
+    // Eliminates shared-corpus extractor race on the mika-docs corpus.
+    // Re-enable with one config edit + restart if a QA flow needs KG.
+    identity_source: Some(IdentitySource::Static(MIKA_QA_IDENTITY)),
     llm_overrides: &[],
 };
+
+/// mika-qa identity.toml — KG disabled per mika#800.
+const MIKA_QA_IDENTITY: &str = "\
+name = \"QA\"\n\
+emoji = \"🔍\"\n\
+\n\
+[kg]\n\
+enabled = false\n";
 
 /// mika-relay agent specification.
 ///
@@ -920,6 +944,15 @@ mod tests {
         .unwrap();
         assert!(dev_identity.contains("name = \"Dev\""));
         assert!(dev_identity.contains("emoji = \"🛠\""));
+        // #800: mika-dev must be provisioned with KG disabled
+        assert!(
+            dev_identity.contains("[kg]"),
+            "mika-dev identity must contain [kg] section"
+        );
+        assert!(
+            dev_identity.contains("enabled = false"),
+            "mika-dev must have KG disabled (#800)"
+        );
 
         let qa_identity = fs::read_to_string(
             mika_common::agent::agent_dir(home, "mika-qa").join("identity.toml"),
@@ -927,6 +960,15 @@ mod tests {
         .unwrap();
         assert!(qa_identity.contains("name = \"QA\""));
         assert!(qa_identity.contains("emoji = \"🔍\""));
+        // #800: mika-qa must be provisioned with KG disabled
+        assert!(
+            qa_identity.contains("[kg]"),
+            "mika-qa identity must contain [kg] section"
+        );
+        assert!(
+            qa_identity.contains("enabled = false"),
+            "mika-qa must have KG disabled (#800)"
+        );
 
         let relay_identity = fs::read_to_string(
             mika_common::agent::agent_dir(home, "mika-relay").join("identity.toml"),
