@@ -22,4 +22,17 @@ describe('ErrorState', () => {
     const results = await axe(container)
     expect(results).toHaveNoViolations()
   })
+
+  it('renders detail-section variant with alert role', () => {
+    render(<ErrorState message="Section error" variant="detail-section" />)
+    expect(screen.getByRole('alert')).toBeInTheDocument()
+  })
+
+  it('has no axe violations (detail-section variant)', async () => {
+    const { container } = render(
+      <ErrorState message="Section error" variant="detail-section" retry={() => {}} />
+    )
+    const results = await axe(container)
+    expect(results).toHaveNoViolations()
+  })
 })

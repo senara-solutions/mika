@@ -168,7 +168,7 @@ Calculated using relative luminance formula: `L = 0.2126 * R + 0.7152 * G + 0.07
 | F-08 | Minor | CopyButton | Hardcoded `text-emerald-400` instead of design token | `packages/ui/src/components/CopyButton.tsx` | **fix-here, applied** |
 | F-09 | Moderate | Dashboard pages (15/21) | No ARIA landmarks beyond implicit layout semantics | `dashboard/src/pages/` | file-follow-up |
 | F-10 | Serious | theme.css | `--color-accent` (#7c6af7) on `--color-bg-card` fails AA for normal text (3.7:1) | `packages/ui/src/theme.css` | file-follow-up |
-| F-11 | Moderate | Multiple components + theme.css | No `prefers-reduced-motion` guard on any animation/transition | `packages/ui/src/components/` + `packages/ui/src/theme.css` | **fix-here** (primitives) / file-follow-up (dashboard pages, theme.css) |
+| F-11 | Moderate | Multiple components + theme.css | No `prefers-reduced-motion` guard on any animation/transition | `packages/ui/src/components/` + `packages/ui/src/theme.css` | file-follow-up |
 
 ### Disposition Rationale
 

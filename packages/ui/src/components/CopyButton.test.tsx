@@ -1,9 +1,20 @@
-import { render, screen } from '@testing-library/react'
-import { describe, it, expect } from 'vitest'
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { axe } from 'jest-axe'
 import CopyButton from './CopyButton'
 
 describe('CopyButton', () => {
+  beforeEach(() => {
+    // Mock clipboard API for dynamic state tests
+    Object.assign(navigator, {
+      clipboard: { writeText: vi.fn().mockResolvedValue(undefined) },
+    })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('renders a button with aria-label', () => {
     render(<CopyButton text="hello" />)
     const button = screen.getByRole('button')
@@ -11,9 +22,34 @@ describe('CopyButton', () => {
     expect(button).toHaveAttribute('aria-label', 'Copy to clipboard')
   })
 
-  it('has a live region for copy confirmation', () => {
+  it('updates aria-label to "Copied to clipboard" after copy', async () => {
     render(<CopyButton text="hello" />)
-    expect(screen.getByRole('status')).toBeInTheDocument()
+    const button = screen.getByRole('button')
+
+    await act(async () => {
+      fireEvent.click(button)
+    })
+
+    await waitFor(() => {
+      expect(button).toHaveAttribute('aria-label', 'Copied to clipboard')
+    })
+  })
+
+  it('live region announces "Copied" after copy action', async () => {
+    render(<CopyButton text="hello" />)
+    const button = screen.getByRole('button')
+    const liveRegion = screen.getByRole('status')
+
+    // Initially empty
+    expect(liveRegion).toHaveTextContent('')
+
+    await act(async () => {
+      fireEvent.click(button)
+    })
+
+    await waitFor(() => {
+      expect(liveRegion).toHaveTextContent('Copied')
+    })
   })
 
   it('icons are hidden from screen readers', () => {
@@ -41,5 +77,18 @@ describe('CopyButton', () => {
     const { container } = render(<CopyButton text="hello" />)
     const results = await axe(container)
     expect(results).toHaveNoViolations()
+  })
+
+  it('has no axe violations in copied state', async () => {
+    const { container } = render(<CopyButton text="hello" />)
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button'))
+    })
+
+    await waitFor(async () => {
+      const results = await axe(container)
+      expect(results).toHaveNoViolations()
+    })
   })
 })
