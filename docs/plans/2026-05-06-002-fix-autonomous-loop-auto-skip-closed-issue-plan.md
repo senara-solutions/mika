@@ -183,6 +183,21 @@ If the line numbers have drifted by more than ~10 lines in either direction, tre
 - `mika/skills/bundled/self-dev/system_prompt.md` (or wherever the post-callback turn rules live — verify at implementation; the planned location may have moved since this plan was written).
 - Possibly `mika/skills/bundled/self-dev-webhook-ci/system_prompt.md` and sibling webhook callback handlers if they share the post-callback behaviour.
 
+**Pre-flight gate (architect U1, second-pass tightening):**
+
+Before writing the Phase 2 prompt change, the implementer MUST run the following greps and identify the exact insertion site. This is a gate, not an in-progress check — Phase 2 does not begin until the insertion site is named:
+
+```bash
+grep -rn "callback\|task.complete\|dispatch.*result\|HANDLER CRASH" \
+    mika/skills/bundled/self-dev/system_prompt.md \
+    mika/skills/bundled/self-dev-webhook-ci/system_prompt.md \
+    mika/skills/bundled/self-dev-webhook-qa/system_prompt.md
+grep -rn "post-callback\|callback turn\|auto.skip" \
+    mika/skills/bundled/
+```
+
+The implementer's first deliverable for Phase 2 is a one-line answer to the question "where does the post-callback turn rule live?" If the answer is "no existing rule, this would be a new stanza," that is acceptable but must be a **deliberate** choice — confirmed by reading the surrounding prompt structure, not by defaulting to "well, there's no obvious place, so I'll make one." The intent is to prevent implementation-discovery-by-default; the rule lives next to whatever existing post-callback guidance the prompts already have, or in a new clearly-labelled stanza if none exists.
+
 **Change shape (prompt addition):**
 
 Add a single rule to the post-callback handling section:
