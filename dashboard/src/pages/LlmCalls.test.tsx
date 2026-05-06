@@ -89,7 +89,7 @@ const mockLlmCallsWithBodies = {
 }
 
 // Mutable mock data so tests can switch between empty and populated
-let currentMockData = mockLlmCallsEmpty
+let currentMockData: typeof mockLlmCallsWithBodies | typeof mockLlmCallsEmpty = mockLlmCallsEmpty
 let mockDetailData: Record<string, unknown> | null = null
 
 // Track which query keys were used
