@@ -1,5 +1,8 @@
 import { useSearchParams } from 'react-router'
 
+/** All page-related URL params. Filter changes clear all of these to reset pagination. */
+export const ALL_PAGE_PARAMS = ['page', 'wi_page', 'trt_page', 'cb_page', 'sched_page'] as const
+
 export function useSearchParamsFilter() {
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -10,7 +13,7 @@ export function useSearchParamsFilter() {
     } else {
       next.delete(key)
     }
-    next.delete('page')
+    ALL_PAGE_PARAMS.forEach((k) => next.delete(k))
     setSearchParams(next)
   }
 
@@ -20,5 +23,11 @@ export function useSearchParamsFilter() {
     setSearchParams(next)
   }
 
-  return { searchParams, setSearchParams, updateFilter, setPage }
+  function setSectionPage(key: string, page: number) {
+    const next = new URLSearchParams(searchParams)
+    next.set(key, String(page))
+    setSearchParams(next)
+  }
+
+  return { searchParams, setSearchParams, updateFilter, setPage, setSectionPage }
 }

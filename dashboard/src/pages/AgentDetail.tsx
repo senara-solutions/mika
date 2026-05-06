@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useParams, Link } from 'react-router'
+import { useParams, Link, useSearchParams } from 'react-router'
 import { useAgentDetail, useAgentSessions, useAgentAudit, useAgentFacts, type CoreMemory, type FactEntry, type AuditEvent } from '../api/agents.ts'
 import { StatusBadge, Pagination, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime, CopyButton, TokenBudgetBar } from '@senara-solutions/ui'
 import { ArrowLeft, User, Brain, Target, Users, GitBranch, ChevronDown } from 'lucide-react'
@@ -262,13 +262,23 @@ const TAB_LABELS: { key: MemoryTab; label: string }[] = [
 
 export default function AgentDetail() {
   const { agentId } = useParams<{ agentId: string }>()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [sessionsPage, setSessionsPage] = useState(1)
-  const [memoryTab, setMemoryTab] = useState<MemoryTab>('sections')
   const [factsPage, setFactsPage] = useState(1)
   const [historyPage, setHistoryPage] = useState(1)
 
+  const VALID_MEMORY_TABS: MemoryTab[] = ['sections', 'facts', 'history']
+  const rawTab = searchParams.get('tab')
+  const memoryTab: MemoryTab = VALID_MEMORY_TABS.includes(rawTab as MemoryTab) ? (rawTab as MemoryTab) : 'sections'
+
   const handleTabChange = (tab: MemoryTab) => {
-    setMemoryTab(tab)
+    const next = new URLSearchParams(searchParams)
+    if (tab === 'sections') {
+      next.delete('tab')
+    } else {
+      next.set('tab', tab)
+    }
+    setSearchParams(next)
     if (tab === 'facts') setFactsPage(1)
     if (tab === 'history') setHistoryPage(1)
   }

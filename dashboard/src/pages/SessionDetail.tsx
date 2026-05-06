@@ -1,5 +1,5 @@
 import { useState, Fragment, useMemo } from 'react'
-import { useParams, Link } from 'react-router'
+import { useParams, Link, useSearchParams } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import { useSessionLlmCalls } from '../api/llmCalls.ts'
@@ -387,8 +387,21 @@ function roleConfig(role: string) {
 
 export default function SessionDetail() {
   const { sessionId } = useParams<{ sessionId: string }>()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [page, setPage] = useState(1)
-  const [activeTab, setActiveTab] = useState<SessionTab>('messages')
+
+  const VALID_SESSION_TABS: SessionTab[] = ['messages', 'llm-calls', 'tool-calls', 'skills']
+  const rawTab = searchParams.get('tab')
+  const activeTab: SessionTab = VALID_SESSION_TABS.includes(rawTab as SessionTab) ? (rawTab as SessionTab) : 'messages'
+  const setActiveTab = (tab: SessionTab) => {
+    const next = new URLSearchParams(searchParams)
+    if (tab === 'messages') {
+      next.delete('tab')
+    } else {
+      next.set('tab', tab)
+    }
+    setSearchParams(next)
+  }
   const [llmCallsPage, setLlmCallsPage] = useState(1)
   const [toolCallsPage, setToolCallsPage] = useState(1)
   const [expandedToolCallIds, setExpandedToolCallIds] = useState<Set<string>>(new Set())

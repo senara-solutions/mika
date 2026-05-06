@@ -1,16 +1,19 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useAgents } from '../api/agents.ts'
+import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { StatusBadge, EmptyState, LoadingState, ErrorState, formatApiError, formatRelativeTime } from '@senara-solutions/ui'
 import { MessageSquare, Search } from 'lucide-react'
 
 export default function Agents() {
   const { data: agents, isLoading, error, refetch } = useAgents()
-  const [search, setSearch] = useState('')
+  const { searchParams, updateFilter } = useSearchParamsFilter()
+  const committedSearch = searchParams.get('search') ?? ''
+  const [search, setSearch] = useState(committedSearch)
 
   const filtered = agents?.filter(
     (a) =>
-      !search || a.name.toLowerCase().includes(search.toLowerCase()) || a.id.includes(search),
+      !committedSearch || a.name.toLowerCase().includes(committedSearch.toLowerCase()) || a.id.includes(committedSearch),
   )
 
   return (
@@ -29,6 +32,7 @@ export default function Agents() {
             placeholder="Search agents..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && updateFilter('search', search)}
             className="bg-bg-card border border-white/[0.06] rounded-lg pl-9 pr-3 py-2 text-sm text-muted placeholder:text-muted/30 focus:outline-none focus:border-accent/40 w-56"
           />
         </div>
@@ -39,7 +43,7 @@ export default function Agents() {
       ) : error ? (
         <ErrorState message={formatApiError(error)} retry={() => refetch()} />
       ) : !filtered || filtered.length === 0 ? (
-        <EmptyState message="No agents found" action={search ? { label: 'Clear search', onClick: () => setSearch('') } : undefined} />
+        <EmptyState message="No agents found" action={committedSearch ? { label: 'Clear search', onClick: () => { setSearch(''); updateFilter('search', '') } } : undefined} />
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filtered.map((agent) => (
