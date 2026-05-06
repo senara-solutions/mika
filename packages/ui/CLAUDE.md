@@ -98,7 +98,23 @@ return (
 
 The component emits ISO 8601 UTC strings; backends compare TEXT columns lexicographically (chronological-equivalent for ISO 8601). Filter typings declare `from?: string; to?: string` — never `number`.
 
+## Accessibility Standards
+
+Every primitive in this library is CI-gated for accessibility via `jest-axe` (axe-core). The following standards apply to all new and modified components:
+
+- **axe assertion required.** Every primitive must have `expect(await axe(container)).toHaveNoViolations()` in its test file. CI enforces this.
+- **Keyboard handlers on interactive elements.** Non-button interactive elements (e.g., clickable rows) must have `onKeyDown` for Enter/Space and `tabIndex={0}`.
+- **aria-label on icon-only buttons.** Buttons without visible text must have `aria-label`. Decorative icons must have `aria-hidden="true"`.
+- **Live regions for async state changes.** State changes triggered by user action (e.g., "Copied!") must use `role="status"` with `aria-live="polite"`.
+- **Design tokens over hardcoded colors.** Use `text-success`, `text-error`, etc. — never `text-emerald-400`, `text-red-400`, or similar Tailwind color utilities.
+- **Focus indicators.** All interactive elements must have visible `focus-visible:ring` or equivalent focus styles.
+
+**Review-fail criteria for new primitives:** missing axe test, no keyboard handler on interactive element, hardcoded color, missing aria-label on icon-only button, missing focus indicator.
+
+**Audit history:** See `docs/audits/2026-05-06-dashboard-a11y-audit.md` for the initial audit and finding catalog.
+
 ## Commands
 
 - `npm run build --prefix packages/ui` — Build the library
+- `npm test --prefix packages/ui` — Run tests (includes axe-core a11y assertions)
 - `npm run dev:dashboard` — Dev server (builds ui first, requires mika-server on :8080)

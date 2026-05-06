@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import { describe, it, expect } from 'vitest'
+import { axe } from 'jest-axe'
 import TokenBudgetBar from './TokenBudgetBar'
 
 describe('TokenBudgetBar', () => {
@@ -90,5 +91,11 @@ describe('TokenBudgetBar', () => {
     expect(meter).toHaveAttribute('aria-valuemin', '0')
     expect(meter).toHaveAttribute('aria-valuemax', '500')
     expect(meter).toHaveAttribute('aria-label', 'Tokens: 300 of 500')
+  })
+
+  it('has no axe violations', async () => {
+    const { container } = render(<TokenBudgetBar value={250} max={500} />)
+    const results = await axe(container)
+    expect(results).toHaveNoViolations()
   })
 })

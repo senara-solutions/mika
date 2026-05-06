@@ -13,7 +13,7 @@ export default function Pagination({ page, perPage, total, onPageChange }: Pagin
 
   return (
     <div className="flex items-center justify-between mt-4 text-sm text-muted">
-      <span>
+      <span aria-live="polite" aria-atomic="true">
         {total} total · page {page} of {totalPages}
       </span>
       <div className="flex gap-1">
