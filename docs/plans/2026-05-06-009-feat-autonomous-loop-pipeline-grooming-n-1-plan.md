@@ -8,6 +8,15 @@ seq: 009
 
 # Plan: pipeline grooming N+1 concurrently with dispatch N (mika#1001)
 
+## Verified state (post-architect-pass-1)
+
+- **Option A confirmed by architect.** Per-class slot split. mika-arch session `c7eeca33-094b-47a6-b80c-181e6216fc2b`. Options B (dedicated mika-groomer) and C (worker pool) explicitly rejected on YAGNI grounds.
+- **F1 (Phase 0 Pin source bodies + caller list) addressed.** Pinned at `db.rs:5165-5185` (SQL body of `has_active_callback_tasks_excluding`) and `executor.rs:704` (function signature) + `executor.rs:913, 3217, 3233, 3249` (caller list). Detail in Phase 0 below.
+- **F2 (mika#996 task-reuse interaction) addressed.** Plan commits to **option (a)**: flip `dispatch_class` on the existing task as it transitions from grooming to dispatch. Option (b) (sibling task) eliminated at plan time per cross-ticket sequencing rule — option (b) would require revising mika#996's already-GROOMED plan-on-branch. Phase 2.E now states this commitment.
+- **NF1 (migration COALESCE in SQL not application-layer) addressed.** Phase 2.A's SQL now uses `COALESCE(dispatch_class, 'implement')` for backward compat with pre-v32 NULL rows. No application-layer NULL coercion.
+- **NF2 (forensic audit `task_id` partitioning) addressed.** One-sentence note in Phase 2 documenting that interleaved session messages from concurrent dispatches are partitioned via `task_id` for forensic analysis.
+- **NF3 (Phase 3 test coexistence with mika#991 AC#3) addressed.** Phase 3 Test 3 explicitly notes coexistence with mika#991's 3-dispatch chained-advance test — the fixtures overlap but assertions differ (mika#991 = sequential advance; mika#1001 = pipelined concurrency). Both must pass independently.
+
 ## Why
 
 mika#996 (auto-groom on dispatch, groomed and ready) ships A+B serial: when an ungroomed `ready`-labelled or milestone-cascade ticket reaches mika-dev, the engine fires `dev-groom` via `run_claude_pilot` first, waits for `Verdict: GROOMED`, then dispatches `dev-pilot`. The grooming + dispatch run sequentially in mika-dev's single session. Per the mika#996 grooming pass, this adds ~15-25 minutes per ungroomed ticket to the cadence.
@@ -62,11 +71,51 @@ Per `crates/mika-agent/CLAUDE.md` § "Long-running":
 
 **Why the guard exists (mika#583 rationale):** prevents two `run_claude_pilot` callbacks from racing on the same agent's session memory, message channel, and DB writes. Removing or weakening the guard requires preserving these state-coherence invariants by some other mechanism.
 
-### What the guard's existing call sites actually check
+### What the guard's existing call sites actually check (architect F1 — pinned)
 
-**`mika/crates/mika-agent/src/db.rs`** — `has_active_callback_tasks_excluding(task_id)` returns the first active callback task whose parent is NOT `task_id`. The query is implicitly scoped to the calling DB connection's agent_id (single-tenant DB-per-agent).
+**`crates/mika-agent/src/db.rs:5165-5185`** — `has_active_callback_tasks_excluding(excluded_parent_id, agent_id)` SQL body verbatim:
 
-The `task_id` exclusion is so the same parent can re-dispatch on retry without false-positive blocking itself. The guard does NOT differentiate between dispatch classes (grooming vs implementation).
+```rust
+pub fn has_active_callback_tasks_excluding(
+    &self,
+    excluded_parent_id: &str,
+    agent_id: &str,
+) -> Result<Option<(String, String)>> {
+    let mut stmt = self.conn.prepare(
+        "SELECT parent_task_id, id FROM tasks
+         WHERE trigger_type = 'callback'
+           AND status IN ('pending', 'in_progress')
+           AND parent_task_id IS NOT NULL
+           AND parent_task_id != ?1
+           AND agent_id = ?2
+         LIMIT 1",
+    )?;
+    ...
+}
+```
+
+The signature **already takes `agent_id` as a parameter** (corrects an earlier ambiguity in this plan). The query has 5 WHERE clauses; adding a per-class predicate means appending one more (`AND COALESCE(dispatch_class, 'implement') = ?3`) and bumping the parameter list.
+
+**`crates/mika-agent/src/skills/executor.rs:704`** — `validate_dispatch_readiness` signature:
+
+```rust
+async fn validate_dispatch_readiness(
+    db: &AsyncDatabase,
+    task_id: &str,
+    github_token: Option<&str>,
+) -> Result<String, String>
+```
+
+**Caller list (verified by `grep -rn "validate_dispatch_readiness" crates/mika-agent/src/`):**
+
+- **Production (1 call site):** `executor.rs:913` — `let wi_status = match validate_dispatch_readiness(&ctx.db, task_id, github_token).await { ... }`. This is the dispatch wrapper inside `run_claude_pilot`.
+- **Tests (3 call sites):** `executor.rs:3217, 3233, 3249` — each is a test scenario asserting guard behavior.
+
+Adding a `dispatch_class: &str` parameter to `validate_dispatch_readiness` requires updating one production caller (which knows the skill name and can derive the class via the mapping in Phase 2.D) and three test callers (each gets a synthetic class arg matching the test's expected behavior). **Not a 1-line change** — it's a 4-call-site update plus the function body internal call to `has_active_callback_tasks_excluding`.
+
+**Revised line estimate from F1's pin:** ~80-120 lines of Rust + SQL (originally estimated 50-100 — the test-caller updates + COALESCE + caller-side class derivation push the upper bound). Still well below the threshold for "this is a different ticket."
+
+The `task_id` exclusion is so the same parent can re-dispatch on retry without false-positive blocking itself. The guard does NOT differentiate between dispatch classes (grooming vs implementation) today; that's the change Phase 2 makes.
 
 ### Existing dispatch classes (currently undifferentiated)
 
@@ -181,21 +230,22 @@ Migration is additive-nullable; pre-v32 rows have `dispatch_class IS NULL` and a
 
 ### 2.B — Update `has_active_callback_tasks_excluding`
 
-Add a `class: &str` parameter. Query becomes:
+Add a `class: &str` parameter. Per the Phase 0 pin, the existing function already takes `excluded_parent_id` + `agent_id`; the new param is the third positional arg. The query revision (against the actual SQL pinned in Phase 0):
 
 ```sql
-SELECT parent.id AS parent_id, child.id AS child_id
-  FROM tasks parent
-  INNER JOIN tasks child ON child.parent_task_id = parent.id
-  WHERE parent.agent_id = ?
-    AND parent.id != ?
-    AND parent.dispatch_class = ?
-    AND child.trigger_type = 'callback'
-    AND child.status IN ('pending', 'in_progress')
+SELECT parent_task_id, id FROM tasks
+  WHERE trigger_type = 'callback'
+    AND status IN ('pending', 'in_progress')
+    AND parent_task_id IS NOT NULL
+    AND parent_task_id != ?1
+    AND agent_id = ?2
+    AND COALESCE(dispatch_class, 'implement') = ?3
   LIMIT 1
 ```
 
-Pre-v32 rows with `dispatch_class IS NULL` still match `'implement'` queries via a `COALESCE(dispatch_class, 'implement')` shim during transition.
+**SQL-layer COALESCE (architect NF1):** the `COALESCE(dispatch_class, 'implement')` clause handles pre-v32 rows whose `dispatch_class IS NULL`. Treats them as `'implement'` directly in the SQL, NOT in application-layer Rust code. This ensures direct DB queries, debugging sessions, and any future tooling all see consistent semantics — application-layer NULL coercion would be a maintenance hazard for a column that can have NULL rows in production indefinitely (no backfill).
+
+The `task_id` exclusion + agent_id scope from the existing query are unchanged. Adding the class predicate makes the query class-specific without affecting the pre-existing scope semantics.
 
 ### 2.C — Update `validate_dispatch_readiness`
 
@@ -217,14 +267,40 @@ match db.has_active_callback_tasks_excluding(task_id, class).await {
 
 Long-running task creation site (in `executor.rs`) sets `dispatch_class` from the skill mapping above. Pre-existing tasks remain NULL; new tasks always have a class.
 
-### 2.E — Compose with mika#996 task-reuse pattern
+### 2.E — Compose with mika#996 task-reuse pattern (architect F2 — committed)
 
-mika#996's M4 grooming pre-flight reuses the milestone child's `task_id` across grooming and dispatch phases. With Option A:
-- When dev-groom fires for the child, the task's `dispatch_class` is `'groom'` for that lifecycle.
-- After dev-groom completes (Verdict: GROOMED), the task's `dispatch_class` flips to `'implement'` for the dev-pilot dispatch.
-- `update_task_status` accepts an optional `dispatch_class` field for this transition.
+**Decision: option (a) — flip `dispatch_class` on the existing task.** This commits the plan to the only viable shape; option (b) (sibling task) is eliminated at plan time.
 
-Alternative: keep the task `task_id` constant but track grooming as a sibling task with `parent_task_id = milestone_child_id`. Cleaner separation, slightly more rows in the tasks table. **Architect ratifies which shape.**
+mika#996's M4 grooming pre-flight reuses the milestone child's `task_id` across grooming and dispatch phases. mika#996 is already GROOMED with this task-reuse contract baked into its plan. Per cross-ticket sequencing rule (`feedback_dont_decorate_forced_decisions` + the issue-as-versioned-contract pattern): a downstream ticket cannot adopt a shape that requires revising an upstream GROOMED plan. Option (b) (sibling task with `parent_task_id = milestone_child_id`) would do exactly that — it would invalidate mika#996's task-reuse assumption.
+
+**Implementation shape (committed):**
+
+- When dev-groom fires for the milestone child, the task's `dispatch_class` is set to `'groom'` for that lifecycle. The same `task_id` is what mika-dev's auto-groom path passes to `run_claude_pilot`.
+- When the dev-groom callback returns `Verdict: GROOMED` (per mika#996's pinned output contract), mika-dev's auto-groom callback handler flips the task's `dispatch_class` to `'implement'` BEFORE issuing the dev-pilot dispatch:
+
+  ```rust
+  // After dev-groom GROOMED callback, before dev-pilot dispatch:
+  db.update_task_dispatch_class(child_task_id, "implement").await?;
+  // Then dispatch dev-pilot per mika#996's existing flow:
+  run_claude_pilot({"skill": "dev-pilot", "task_id": child_task_id, ...})
+  ```
+
+- `update_task_dispatch_class` is a new (or extended) DB method. Atomically updates the column. Idempotent.
+
+**State sequence verified compatible with mika#996:**
+
+| Phase | Task state | dispatch_class |
+|---|---|---|
+| M4 child created | status=pending, no callback children | NULL (initial) |
+| Auto-groom dispatched (mika#996 Phase 3) | status=in_progress, callback child for dev-groom | `'groom'` (set on dispatch) |
+| dev-groom callback returns GROOMED | status=in_progress, callback child terminal | `'groom'` → flip to `'implement'` |
+| dev-pilot dispatched (mika#996 Phase 3 step e) | status=in_progress, callback child for dev-pilot | `'implement'` |
+| dev-pilot callback returns | status=in_progress | `'implement'` (unchanged) |
+| Milestone child closes (mika#991 advance) | status=completed | `'implement'` (frozen) |
+
+**The flip is a single atomic update** — no race because dev-groom's callback delivery is serialized via the engine's callback delivery path (per `crates/mika-agent/CLAUDE.md` § "Callback/resume lifecycle"), which guarantees the callback turn completes before the next `run_claude_pilot` is permitted.
+
+**Forensic audit (architect NF2):** when concurrent dispatches on the same agent (one `'implement'` + one `'groom'`) write interleaved messages to mika-dev's session, the `task_id` field on each message partitions the timeline. A query like `SELECT * FROM messages WHERE session_id = ? ORDER BY created_at` produces the chronological sequence; partitioning by `task_id` yields per-dispatch causal ordering. The async DB serialization (per `crates/mika-agent/CLAUDE.md` § "Async DB") guarantees no within-dispatch reordering. Cross-dispatch interleaving is acceptable for steady-state operation; per-dispatch causality is the load-bearing invariant.
 
 ## Phase 3 — Tests
 
@@ -232,7 +308,9 @@ Alternative: keep the task `task_id` constant but track grooming as a sibling ta
 
 **Test 2 — same-class rejection still fires:** simulate two `implement`-class dispatches on the same agent. Assert second one rejects with `global_dispatch_active`.
 
-**Test 3 — milestone cascade integration with mika#996+#991:** enqueue 3 milestone children. Simulate child 1 dispatching (`dev-pilot`) AND child 2 grooming (`dev-groom`) concurrently. Assert both complete; assert child 2's Plan callout is committed before child 1 callback returns; assert child 3 grooming starts as soon as child 2 grooming completes (pipelining works steady-state).
+**Test 3 — milestone cascade integration with mika#996+#991 (architect NF3 — coexists with mika#991 AC#3 test):** enqueue 3 milestone children. Simulate child 1 dispatching (`dev-pilot`) AND child 2 grooming (`dev-groom`) concurrently. Assert both complete; assert child 2's Plan callout is committed before child 1 callback returns; assert child 3 grooming starts as soon as child 2 grooming completes (pipelining works steady-state).
+
+**Coexistence with mika#991 AC#3 test (Test 7 in mika#991's plan):** mika#991's 3-dispatch chained-advance test exercises sequential advance without LLM turn between callbacks (asserts `callback_milestone_advance` guard + `PostCallbackAdvance` trigger fire correctly). mika#1001's Test 3 exercises pipelined concurrency (asserts the per-class slot split allows dispatch N + groom N+1 simultaneously). The fixtures overlap (3 milestone children, terminal-status simulations) but the assertions differ — mika#991 asserts sequential causality of advance; mika#1001 asserts pipelined wall-clock overlap. **Both tests must pass independently in the eval harness.** If a fixture conflict surfaces (e.g., shared mock LLM sequence), the implementer surfaces to operator before splitting the fixtures.
 
 **Test 4 — pre-v32 task compatibility:** seed task rows with `dispatch_class IS NULL` (simulating pre-migration tasks). Assert the guard treats them as `'implement'` correctly.
 
@@ -251,7 +329,7 @@ Alternative: keep the task `task_id` constant but track grooming as a sibling ta
 
 ## Acceptance criteria (from the ticket)
 
-- [x] Steady-state autonomous-loop cadence: grooming for the next ungroomed ticket completes by the time the current ticket's dispatch completes (no per-ticket sequential blocking on the architect roundtrip). **Phase 2.B-2.E** (per-class slot) — assuming Option A. If architect picks B or C, the equivalent capability ships under that shape.
+- [x] Steady-state autonomous-loop cadence: grooming for the next ungroomed ticket completes by the time the current ticket's dispatch completes (no per-ticket sequential blocking on the architect roundtrip). **Phase 2.B-2.E** (Option A per-class slot, architect-confirmed).
 - [x] Agent state coherence: no observable race between concurrent grooming and dispatch. **Phase 0 pin** confirms async DB serialization and per-task-id state isolation; **Phase 3 Test 1** verifies empirically.
 - [x] Test coverage: milestone-cascade test enqueuing 5 ungroomed tickets with steady-state pipelining verified. **Phase 3 Test 3.**
 - [x] If chosen option introduces new failure modes, each has a named recovery path. **Phase 1 per-option state-coherence concerns enumerated.**
@@ -260,7 +338,7 @@ Alternative: keep the task `task_id` constant but track grooming as a sibling ta
 
 - **Risk: Option A's binary slot ceiling.** Two-class limit. If a third concurrent dispatch class becomes a need, the model breaks. Mitigation: Phase 4 follow-up #1 escalates to Option C if needed.
 - **Risk: cross-callback session message ordering.** Two callbacks writing to mika-dev's session messages table — no race per AsyncDatabase serialization, but the perceived ordering (which message appears first in the session log) may interleave across dispatches. Mitigation: existing `created_at` timestamps are ISO 8601 strings with second precision; if higher precision needed for forensic analysis, separate ticket. Acceptable for steady-state operation.
-- **Unknown: how Option A composes with mika#996's task-reuse pattern.** Phase 2.E names two alternatives (flip class on existing task vs. spawn sibling task); the architect's grooming pass picks. Either works structurally.
+- **Resolved at plan time (was the mika#996 task-reuse interaction unknown):** committed to option (a) — flip `dispatch_class` on the existing task — per architect F2 + cross-ticket sequencing rule. Phase 2.E states the implementation shape with a state-sequence table verifying compatibility with mika#996's task-reuse contract.
 - **Unknown: existing pre-v32 task rows with `dispatch_class IS NULL` and active callbacks at migration time.** Phase 2.A backward-compat shim treats them as `'implement'`; if a pre-v32 in-flight `dev-groom` task is mid-dispatch at migration time, it gets classed as `implement` retroactively. Mild edge case; surfaces only during the deploy window.
 
 ## Compound learning to write at PR-close
