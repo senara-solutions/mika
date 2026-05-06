@@ -128,6 +128,10 @@ When you receive a callback result from a completed background task (`run_claude
 >
 > **When no milestone/project context:** Proceed with normal callback handling below.
 
+**Auto-skip recognition (MANDATORY — run before all other classification):**
+
+When a dispatch callback delivers a result whose first line parses as JSON with `"status": "auto_skipped"`, treat the task as a no-op completion. The dispatch handler detected that the target issue was already closed before claude-pilot launched (e.g., PR merge raced ahead of a queued autodispatch). This is an expected race, not a failure. Do not post a status message to the session. Do not ask the operator whether to proceed. Call `update_task_status(task_id, "completed")` with metadata `{"auto_skipped": true, "skip_reason": "issue_closed"}` and proceed to Step 6 close-out silently. Continue normal idle/listen behaviour — the engine schedules the next pending task on its own normal cadence. See mika#988.
+
 **Pipeline result classification (MANDATORY — run before generic failure handling):**
 
 Before applying the generic pipeline-failure path, classify the callback result to detect recoverable work:

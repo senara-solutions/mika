@@ -189,8 +189,24 @@ _set_up_worktree() {
 
         ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state')
         if [ "$ISSUE_STATE" = "CLOSED" ]; then
-            echo "Error: Issue #${ISSUE_NUM} in senara-solutions/${REPO} is closed. Reopen first." >&2
-            exit 1
+            # Auto-skip: PR merge (or any other close) raced ahead of the webhook-triggered
+            # dispatch enqueue. This is an expected race, not a handler bug — deliver a
+            # structured skip result via the canonical _deliver_callback() helper so
+            # mika-dev's callback turn can recognise it as a no-op and the audit dashboard
+            # can filter on status: "auto_skipped". See mika#988 for the failure mode.
+            # Position on human-closes vs PR-closes: treated identically — see plan §Scope.
+            #
+            # Auto-skip rationale (mika#988):
+            # On 2026-05-06 the autonomous loop stalled ~7h because this branch previously
+            # did `exit 1`, causing the EXIT trap to wrap the error as HANDLER CRASH.
+            # mika-dev read the crash envelope, posted a confirmation question, and idled.
+            # The correct exit semantics for foreseeable races: exit 0 + structured JSON
+            # delivered via _deliver_callback(). Reserve exit 1 for actual handler bugs.
+            # Symptom sessions: callback-476caa1d-ef6d-4bac-a60c-a3c78f9a342d (failure),
+            # 40a52d43-f186-4175-9c86-b998aafcf4bb (drift).
+            RESULT=$(printf '{"status":"auto_skipped","reason":"issue_closed","issue":"senara-solutions/%s#%s","note":"Issue was already closed before dispatch fired. Presumed handled."}' "$REPO" "$ISSUE_NUM")
+            _deliver_callback
+            exit 0
         fi
 
         # Branch-name derivation is centralized in mika-platform/scripts/derive-branch-name.
