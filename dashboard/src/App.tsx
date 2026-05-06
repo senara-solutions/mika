@@ -1,5 +1,6 @@
 import { Routes, Route } from 'react-router'
 import Layout from './components/Layout.tsx'
+import Home from './pages/Home.tsx'
 import Timeline from './pages/Timeline.tsx'
 import TraceDetail from './pages/TraceDetail.tsx'
 import Traces from './pages/Traces.tsx'
@@ -24,7 +25,8 @@ export default function App() {
   return (
     <Routes>
       <Route element={<Layout />}>
-        <Route index element={<Timeline />} />
+        <Route index element={<Home />} />
+        <Route path="timeline" element={<Timeline />} />
         <Route path="traces" element={<Traces />} />
         <Route path="traces/:traceId" element={<TraceDetail />} />
         <Route path="agents" element={<Agents />} />
