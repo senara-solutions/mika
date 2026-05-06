@@ -1,6 +1,7 @@
 ---
 title: "Post-restart KG audit — extraction-and-resolution health (sibling to entity-orphan audit)"
 date: 2026-04-29
+last_updated: 2026-05-06
 category: best-practices
 module: mika-agent/kg, mika-arch
 problem_type: best_practice
@@ -37,6 +38,17 @@ On 2026-04-29, post-merge of mika#872 (which makes mika-arch's grooming depend o
 - Recent extraction batches across all four agents producing `entities=0, relationships=0, docs_failed=0` (failure path is log-and-skip, not error).
 
 Running only Signals A/B/C/D + the entity-orphan audit would have **passed clean** while the KG was effectively broken: extraction was running (A), budget was occasionally exhausted but not on every batch (B), resolver had drained some backlog (C), no skill renames so no orphans. The defects (mika#874–877, collected under milestone#19) are observable only when you query content tables and scan extraction-and-resolution log events directly.
+
+## Status update — 2026-05-06
+
+Audited again 11 days post the v27 deploy (server up since 2026-05-05T20:03). What's changed since the originating event above:
+
+- **Audit 4 defect resolved.** mika#798 ("multi-corpus aggregation for mika-arch") closed 2026-04-25. `mika kg status --agent mika-arch` now lists all 4 corpora; the CLI parity check (Audit 4) currently passes.
+- **Audit 3 budget-exhaustion clear.** Zero `kg_budget_exhausted` events since the 2026-05-05 restart, vs. the dense cluster of `aborted_budget=true` warnings the originating audit observed. Audit 3's red flag for that defect still applies as a procedure; the live failure mode is no longer this.
+- **Audit 1 numbers improving but slow.** mika-arch primary corpus resolution rate moved 4.8% → 7.4% across 7 days under the #906 periodic resolver tick. The two-restart-cycle drain expectation in Audit 1 still holds.
+- **Counter contract documented.** A 2026-05-06 audit initially misread `kg_resolver_tick.complete` `pending_before: 0` as a regression (filed and closed as mika#997). The actual contract: `count_pending()` is scoped to the 5 domain-resolvable subject types (`skill`, `tool`, `agent`, `problem_type`, `concept`) — see `crates/mika-agent/src/kg/entity_resolver.rs:891-906`. `mika kg status` "pending" includes the 3 subject-graph-only types (`pattern`, `failure_mode`, `solution_path`) that the resolver intentionally never touches. The two counters are designed to disagree by the size of the subject-graph-only inventory. Reference: `docs/solutions/best-practices/kg-resolver-tick-visibility-audit-2026-05-06.md`. The CLI-clarity follow-up is mika#999.
+
+The procedure (Audits 1–4, including the "passes clean while broken" framing) remains the canonical post-restart reference. Treat the originating-event examples below as historical — what they document is the bug class, not the current incident.
 
 ## Guidance
 
@@ -192,6 +204,7 @@ docs_root_path                                   chunks  subjects  resolved
 
 ## Related
 
+- **Counter contract reference (added 2026-05-06):** `docs/solutions/best-practices/kg-resolver-tick-visibility-audit-2026-05-06.md` — explains why `count_pending()` (and therefore `kg_resolver_tick.complete` `pending_before`) disagrees with `mika kg status` "pending" by the size of the subject-graph-only inventory. Read before writing custom backlog-estimation queries against `kg_subject_entities`.
 - Sibling audit: `docs/solutions/best-practices/post-deploy-kg-entity-audit-2026-04-28.md` — orphan detection after skill renames or removals. Same SQLite + post-deploy slot; different table family + bug class.
 - Discipline source: `docs/solutions/best-practices/verification-claims-with-expected-output-shape-2026-04-28.md` — every signal in this doc lists `Run:` + `Expected:` (healthy) + red flags per its requirement.
 - Canonical signals: `mika/CLAUDE.md` § "Post-restart safety check (#757)" — Signals A/B/C/D this audit composes alongside.

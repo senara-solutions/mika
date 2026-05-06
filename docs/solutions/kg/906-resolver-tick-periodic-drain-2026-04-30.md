@@ -63,3 +63,7 @@ Mirrors `server::checkpoint::spawn_dashboard_checkpoint_task()` — interval-bas
 1. **Cadence vs burst** — When a budget-bounded operation needs higher throughput, prefer increasing execution cadence over raising the per-execution budget. Cadence is self-limiting (bounded by interval); budget increases compound across agents.
 2. **Deferred runs need a mechanism** — mika#757's AC said "leave remaining work for subsequent deferred runs" but didn't build the deferred-run mechanism. Design documents that reference future deferred execution should either build the mechanism or explicitly log a follow-up ticket.
 3. **Pattern precedent** — The `checkpoint_task` pattern (interval + fail-open + runtime-drop lifecycle) is reusable for any periodic background work in mika-server. New periodic tasks should follow this pattern.
+
+## Counter contract (added 2026-05-06)
+
+`pending_before` (this tick's `count_pending()` result) is scoped to the 5 domain-resolvable subject types — see `crates/mika-agent/src/kg/entity_resolver.rs:891-906`. It will not match `mika kg status` "pending", which includes the 3 subject-graph-only types (`pattern`, `failure_mode`, `solution_path`) that the resolver intentionally never touches. Steady-state `pending_before: 0` means the resolver has drained everything it's supposed to drain — not that the subject graph is empty. Full type-allowlist contract: `docs/solutions/best-practices/kg-resolver-tick-visibility-audit-2026-05-06.md`.
