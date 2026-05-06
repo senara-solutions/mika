@@ -432,6 +432,12 @@ impl TaskDispatcher {
             if let Err(e) = self.db.mark_task_delivered(&task.id).await {
                 warn!(task_id = %task.id, error = %e, "failed to mark callback task as delivered");
             }
+
+            // #991 — Post-callback advance backstop. After a milestone/project-context
+            // callback turn completes, check whether the queue was advanced. If not,
+            // fire a PostCallbackAdvance trigger to give the agent one more turn with
+            // explicit advance instructions.
+            self.maybe_fire_post_callback_advance(task).await;
         }
 
         if let Err(e) = self.db.end_session(&session_id).await {
@@ -902,6 +908,192 @@ impl TaskDispatcher {
         }
 
         true
+    }
+
+    /// #991 — Post-callback advance backstop. After a milestone/project-context
+    /// callback turn completes, checks whether the queue was advanced. If not,
+    /// fires a `PostCallbackAdvance` trigger to give the agent one more explicit
+    /// advance turn. If that also fails, marks the milestone `blocked` automatically.
+    ///
+    /// Detection logic (DB-state based, not tool-summary based):
+    /// - Queue advanced: parent has a new `in_progress`/`pending` callback child,
+    ///   or parent is now `blocked`/`completed`/`cancelled`.
+    /// - Queue NOT advanced: parent is still `in_progress` with no new active child.
+    async fn maybe_fire_post_callback_advance(&self, callback_task: &Task) {
+        // Only applies to callbacks with a parent task.
+        let parent_id = match &callback_task.parent_task_id {
+            Some(id) => id.clone(),
+            None => return,
+        };
+
+        // Look up parent task — must be manual and milestone/project type.
+        let parent = match self.db.get_task_unscoped(&parent_id).await {
+            Ok(Some(t)) if t.trigger_type == "manual" => t,
+            _ => return,
+        };
+
+        if parent.r#type != "milestone" && parent.r#type != "project" {
+            return;
+        }
+
+        // If parent is already terminal or blocked, the queue was handled.
+        if parent.status == "completed"
+            || parent.status == "cancelled"
+            || parent.status == "blocked"
+        {
+            return;
+        }
+
+        // Check if the callback turn created a new active callback child
+        // (indicating advancement to the next issue).
+        let has_active_child = match self.db.get_child_tasks(&parent_id).await {
+            Ok(children) => children.iter().any(|c| {
+                c.trigger_type == "callback"
+                    && (c.status == "pending" || c.status == "in_progress")
+                    && c.id != callback_task.id
+            }),
+            Err(e) => {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "post_callback_advance: failed to query child tasks, skipping"
+                );
+                return;
+            }
+        };
+
+        if has_active_child {
+            // Queue was advanced — no backstop needed.
+            return;
+        }
+
+        // Queue was NOT advanced. Fire PostCallbackAdvance.
+        let child_outcome = if callback_task.status == "failed" {
+            "failed"
+        } else {
+            "completed"
+        };
+
+        info!(
+            parent_task_id = %parent_id,
+            callback_task_id = %callback_task.id,
+            parent_kind = %parent.r#type,
+            child_outcome,
+            "post_callback_advance: milestone queue not advanced, firing backstop trigger"
+        );
+
+        let advance_trigger = SilentTrigger::PostCallbackAdvance {
+            parent_task_id: parent_id.clone(),
+            parent_kind: parent.r#type.clone(),
+            last_child_outcome: child_outcome.to_string(),
+        };
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let session_id = format!("advance-{}", &trace_id[..8]);
+
+        if let Err(e) = self
+            .db
+            .create_session_with_parent(
+                &session_id,
+                &callback_task.agent_id,
+                "system",
+                Some(r#"{"trigger": "post_callback_advance"}"#),
+                None,
+                None,
+            )
+            .await
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "post_callback_advance: failed to create session"
+            );
+        }
+
+        let params = SilentAgentParams {
+            db: &self.db,
+            llm: self.llm.as_ref(),
+            tools: &self.tools,
+            skills: &self.skills,
+            trigger: advance_trigger,
+            home_dir: &self.home_dir,
+            session_id: &session_id,
+            message_sender: self.message_sender.clone(),
+            embedding_client: self.embedding_client.as_ref(),
+            brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
+            github_app: self.github_app.as_deref(),
+            skills_dirty: &self.skills_dirty,
+            settings: Some(&self.settings),
+            trace_id: Some(trace_id.clone()),
+        };
+
+        if let Err(e) = run_silent_agent(&params).await {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "post_callback_advance: advance turn failed"
+            );
+
+            // Last resort: if the advance turn also failed, mark the milestone
+            // blocked automatically so it doesn't sit idle indefinitely.
+            let note = format!(
+                "auto-blocked: mika-dev failed to advance after callback + advance turn (mika#991). \
+                 Original callback: {} (outcome: {})",
+                callback_task.id, child_outcome
+            );
+            if let Err(e) = self.db.update_task_failed(&parent_id, &note).await {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "post_callback_advance: failed to auto-block milestone"
+                );
+            }
+        } else {
+            // Check again after the advance turn — if still not advanced,
+            // auto-block the milestone.
+            let still_stuck = match self.db.get_task_unscoped(&parent_id).await {
+                Ok(Some(t)) => {
+                    t.status == "in_progress"
+                        && !matches!(
+                            self.db.get_child_tasks(&parent_id).await,
+                            Ok(ref children) if children.iter().any(|c| {
+                                c.trigger_type == "callback"
+                                    && (c.status == "pending" || c.status == "in_progress")
+                                    && c.id != callback_task.id
+                            })
+                        )
+                }
+                _ => false,
+            };
+
+            if still_stuck {
+                let note = format!(
+                    "auto-blocked: mika-dev failed to advance after callback + advance turn (mika#991). \
+                     Original callback: {} (outcome: {})",
+                    callback_task.id, child_outcome
+                );
+                warn!(
+                    parent_task_id = %parent_id,
+                    "post_callback_advance: advance turn completed but milestone still not advanced, auto-blocking"
+                );
+                if let Err(e) = self.db.update_task_failed(&parent_id, &note).await {
+                    warn!(
+                        parent_task_id = %parent_id,
+                        error = %e,
+                        "post_callback_advance: failed to auto-block milestone"
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = self.db.end_session(&session_id).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "post_callback_advance: failed to end session"
+            );
+        }
     }
 }
 
