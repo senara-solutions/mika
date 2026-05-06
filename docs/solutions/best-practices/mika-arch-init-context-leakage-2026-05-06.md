@@ -2,7 +2,7 @@
 title: "mika-arch session-init context-channel leakage: core_memory and summary are system-prompt, not message-history — semantic misinterpretation, not structural misplacement"
 date: 2026-05-06
 category: best-practices
-module: agent-core
+module: mika-arch
 problem_type: semantic-leakage
 component: prompt-assembly
 severity: high
@@ -200,14 +200,14 @@ mika-arch operates in fresh-session mode (each grooming invocation is a new sess
 
 | Document | Relationship |
 |---|---|
-| `mika-arch-pass-1-degenerate-recovery-2026-05-06.md` | Documents the same degenerate symptom. The retry-with-fresh-session workaround succeeds because the new session has an empty messages table, reducing Factor 3's ratio. This finding explains WHY the workaround works. |
-| `mika-arch-persistence-meta-hallucination-2026-05-02-resolved.md` | Hypothesis 3 ("orchestration-shell-to-skill context handoff may inject memory-skill-adjacent state") is confirmed as directionally correct. The "memory-skill-adjacent state" is the conversation summary in the system prompt. |
-| `citation-fabrication-prompt-anchoring-2026-05-02.md` | Cross-session parametric memory bleed is the same failure class. This finding identifies the specific channel (summary injection) and proposes structural fixes beyond prompt-level anchoring. |
-| `deterministic-skill-context-injection.md` | The pattern of moving LLM-dependent behavior to the engine layer applies here. The summary injection is engine-controlled but its content is LLM-generated (by the compaction summarizer). Reforming the content format (Axis 2) applies the same philosophy. |
+| `docs/solutions/best-practices/mika-arch-pass-1-degenerate-recovery-2026-05-06.md` | Documents the same degenerate symptom. The retry-with-fresh-session workaround succeeds because the new session has an empty messages table, reducing Factor 3's ratio. This finding explains WHY the workaround works. |
+| `docs/solutions/agent-quirks/mika-arch-persistence-meta-hallucination-2026-05-02-resolved.md` | Hypothesis 3 ("orchestration-shell-to-skill context handoff may inject memory-skill-adjacent state") is confirmed as directionally correct. The "memory-skill-adjacent state" is the conversation summary in the system prompt. |
+| `docs/solutions/best-practices/citation-fabrication-prompt-anchoring-2026-05-02.md` | Cross-session parametric memory bleed is the same failure class. This finding identifies the specific channel (summary injection) and proposes structural fixes beyond prompt-level anchoring. |
+| `docs/solutions/architecture-patterns/deterministic-skill-context-injection.md` | The pattern of moving LLM-dependent behavior to the engine layer applies here. The summary injection is engine-controlled but its content is LLM-generated (by the compaction summarizer). Reforming the content format (Axis 2) applies the same philosophy. |
 
 ## Related
 
 - Issue: mika#1008
 - Operationally blocked: senara-solutions/mika-platform#86 (grooming arc halted at architect first-pass)
-- Sibling: `mika-arch-pass-1-degenerate-recovery-2026-05-06.md` (same symptom, operational workaround)
-- Sibling: `mika-arch-persistence-meta-hallucination-2026-05-02-resolved.md` (same failure class, different trigger)
+- Sibling: `docs/solutions/best-practices/mika-arch-pass-1-degenerate-recovery-2026-05-06.md` (same symptom, operational workaround)
+- Sibling: `docs/solutions/agent-quirks/mika-arch-persistence-meta-hallucination-2026-05-02-resolved.md` (same failure class, different trigger)
