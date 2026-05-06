@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from './client.ts'
 import type { SessionItem } from './agents.ts'
 
@@ -33,11 +33,13 @@ export interface SessionsFilters {
   per_page?: number
 }
 
-export function useSessions(filters: SessionsFilters) {
+export function useSessions(filters: SessionsFilters, refetchInterval?: number | false) {
   return useQuery<PaginatedResponse<SessionItem>>({
     queryKey: ['sessions', filters],
     queryFn: () =>
       apiFetch('/sessions', filters as Record<string, string | number | undefined>),
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
 

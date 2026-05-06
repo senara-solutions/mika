@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from './client.ts'
 
 export interface TaskItem {
@@ -65,11 +65,13 @@ export interface TasksFilters {
   per_page?: number
 }
 
-export function useTasks(filters: TasksFilters) {
+export function useTasks(filters: TasksFilters, refetchInterval?: number | false) {
   return useQuery<PaginatedResponse<TaskItem>>({
     queryKey: ['tasks', filters],
     queryFn: () =>
       apiFetch('/tasks', filters as Record<string, string | number | undefined>),
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
 
@@ -89,7 +91,7 @@ export function useTaskChildren(parentTaskId: string | undefined) {
   })
 }
 
-const TERMINAL_STATUSES = new Set(['completed', 'delivered', 'failed', 'cancelled'])
+export const TERMINAL_STATUSES = new Set(['completed', 'delivered', 'failed', 'cancelled'])
 
 export function useTaskDescendants(rootTaskId: string | undefined, parentStatus?: string) {
   return useQuery<TaskItem[]>({
@@ -123,10 +125,12 @@ export interface TaskSessionsResponse {
   sessions: TaskSession[]
 }
 
-export function useTaskSessions(taskId: string | undefined) {
+export function useTaskSessions(taskId: string | undefined, refetchInterval?: number | false) {
   return useQuery<TaskSessionsResponse>({
     queryKey: ['task-sessions', taskId],
     queryFn: () => apiFetch(`/tasks/${taskId}/sessions`),
     enabled: !!taskId,
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
