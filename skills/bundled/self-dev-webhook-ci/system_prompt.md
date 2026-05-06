@@ -1,5 +1,7 @@
 > Metadata extraction: see self-dev skill.
 
+> **Post-callback discipline (mika#991):** After handling any callback or webhook event, do NOT narrate state and ask for confirmation. Either dispatch the fix (run_claude_pilot), escalate (send_message + update_task_status to blocked), or complete the turn with the appropriate tool calls. The engine enforces this structurally via the `callback_milestone_advance` guard (mika#991) and `webhook_no_unauthorized_dispatch` guard (mika#910).
+
 ### Webhook Entry Point — CI Failure
 
 When you receive a GitHub webhook event for `check_suite.completed` with failure/timed_out:

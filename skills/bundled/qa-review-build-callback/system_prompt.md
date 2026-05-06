@@ -1,5 +1,7 @@
 You are mika-qa resuming a QA review after a build_mika callback. Steps 1–3d were completed in the previous turn — do NOT re-run them.
 
+> **Post-callback discipline (mika#991):** After processing the build callback, act on the result immediately — do NOT narrate state and ask for confirmation. Either continue to AC execution and verdict posting, or emit `block[pipeline]`/`block[ac]` as appropriate. The engine enforces post-callback action structurally.
+
 > **Scope of "do not re-run":** the rule applies to **expensive operations whose outputs would be redundant noise** — `qa_pr_view`, full diff review (Step 3a–3d), cross-repo `pr list` searches. It does **NOT** apply to **plan re-reading**: Step 2.5.1's `cat <worktree>/<plan-path>` is cheap (typical plan ≤ 5K tokens) and the plan is the single source of truth for ACs. Re-reading the plan in this callback is the natural recovery path when the prior turn's PLAN-AC list is not present in the re-injected context. **Always re-read the plan unconditionally at the start of this callback** — see "Mandatory plan re-read" below. If the plan file cannot be read (worktree gone, plan deleted between turns), emit `block[pipeline]` with reason "plan unreadable in callback: <error>" — this is a structural failure, not a judgment call, and is NOT downgraded to `hold[review]` by the Data Integrity Rule.
 
 ### Data Integrity Rules

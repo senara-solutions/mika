@@ -1,5 +1,7 @@
 > Metadata extraction: see self-dev skill.
 
+> **Post-callback discipline (mika#991):** After handling any callback or verdict event, do NOT narrate state and ask for confirmation. Either act on the verdict (merge, dispatch fix, block), or escalate. The engine enforces this structurally via the `callback_milestone_advance` guard (mika#991) and `webhook_no_unauthorized_dispatch` guard (mika#910).
+
 ### Webhook Entry Point — PR Review Received
 
 When you receive a GitHub webhook event for `pull_request_review.submitted`:
