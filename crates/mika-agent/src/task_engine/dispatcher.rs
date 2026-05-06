@@ -432,6 +432,12 @@ impl TaskDispatcher {
             if let Err(e) = self.db.mark_task_delivered(&task.id).await {
                 warn!(task_id = %task.id, error = %e, "failed to mark callback task as delivered");
             }
+
+            // #991 — Post-callback advance backstop. After a milestone/project-context
+            // callback turn completes, check whether the queue was advanced. If not,
+            // fire a PostCallbackAdvance trigger to give the agent one more turn with
+            // explicit advance instructions.
+            self.maybe_fire_post_callback_advance(task).await;
         }
 
         if let Err(e) = self.db.end_session(&session_id).await {
@@ -902,6 +908,192 @@ impl TaskDispatcher {
         }
 
         true
+    }
+
+    /// #991 — Post-callback advance backstop. After a milestone/project-context
+    /// callback turn completes, checks whether the queue was advanced. If not,
+    /// fires a `PostCallbackAdvance` trigger to give the agent one more explicit
+    /// advance turn. If that also fails, marks the milestone `blocked` automatically.
+    ///
+    /// Detection logic (DB-state based, not tool-summary based):
+    /// - Queue advanced: parent has a new `in_progress`/`pending` callback child,
+    ///   or parent is now `blocked`/`completed`/`cancelled`.
+    /// - Queue NOT advanced: parent is still `in_progress` with no new active child.
+    async fn maybe_fire_post_callback_advance(&self, callback_task: &Task) {
+        // Only applies to callbacks with a parent task.
+        let parent_id = match &callback_task.parent_task_id {
+            Some(id) => id.clone(),
+            None => return,
+        };
+
+        // Look up parent task — must be manual and milestone/project type.
+        let parent = match self.db.get_task_unscoped(&parent_id).await {
+            Ok(Some(t)) if t.trigger_type == "manual" => t,
+            _ => return,
+        };
+
+        if parent.r#type != "milestone" && parent.r#type != "project" {
+            return;
+        }
+
+        // If parent is already terminal or blocked, the queue was handled.
+        if parent.status == "completed"
+            || parent.status == "cancelled"
+            || parent.status == "blocked"
+        {
+            return;
+        }
+
+        // Check if the callback turn created a new active callback child
+        // (indicating advancement to the next issue).
+        let has_active_child = match self.db.get_child_tasks(&parent_id).await {
+            Ok(children) => children.iter().any(|c| {
+                c.trigger_type == "callback"
+                    && (c.status == "pending" || c.status == "in_progress")
+                    && c.id != callback_task.id
+            }),
+            Err(e) => {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "post_callback_advance: failed to query child tasks, skipping"
+                );
+                return;
+            }
+        };
+
+        if has_active_child {
+            // Queue was advanced — no backstop needed.
+            return;
+        }
+
+        // Queue was NOT advanced. Fire PostCallbackAdvance.
+        let child_outcome = if callback_task.status == "failed" {
+            "failed"
+        } else {
+            "completed"
+        };
+
+        info!(
+            parent_task_id = %parent_id,
+            callback_task_id = %callback_task.id,
+            parent_kind = %parent.r#type,
+            child_outcome,
+            "post_callback_advance: milestone queue not advanced, firing backstop trigger"
+        );
+
+        let advance_trigger = SilentTrigger::PostCallbackAdvance {
+            parent_task_id: parent_id.clone(),
+            parent_kind: parent.r#type.clone(),
+            last_child_outcome: child_outcome.to_string(),
+        };
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let session_id = format!("advance-{}", &trace_id[..8]);
+
+        if let Err(e) = self
+            .db
+            .create_session_with_parent(
+                &session_id,
+                &callback_task.agent_id,
+                "system",
+                Some(r#"{"trigger": "post_callback_advance"}"#),
+                None,
+                None,
+            )
+            .await
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "post_callback_advance: failed to create session"
+            );
+        }
+
+        let params = SilentAgentParams {
+            db: &self.db,
+            llm: self.llm.as_ref(),
+            tools: &self.tools,
+            skills: &self.skills,
+            trigger: advance_trigger,
+            home_dir: &self.home_dir,
+            session_id: &session_id,
+            message_sender: self.message_sender.clone(),
+            embedding_client: self.embedding_client.as_ref(),
+            brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
+            github_app: self.github_app.as_deref(),
+            skills_dirty: &self.skills_dirty,
+            settings: Some(&self.settings),
+            trace_id: Some(trace_id.clone()),
+        };
+
+        if let Err(e) = run_silent_agent(&params).await {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "post_callback_advance: advance turn failed"
+            );
+
+            // Last resort: if the advance turn also failed, mark the milestone
+            // blocked automatically so it doesn't sit idle indefinitely.
+            let note = format!(
+                "auto-blocked: mika-dev failed to advance after callback + advance turn (mika#991). \
+                 Original callback: {} (outcome: {})",
+                callback_task.id, child_outcome
+            );
+            if let Err(e) = self.db.update_task_failed(&parent_id, &note).await {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "post_callback_advance: failed to auto-block milestone"
+                );
+            }
+        } else {
+            // Check again after the advance turn — if still not advanced,
+            // auto-block the milestone.
+            let still_stuck = match self.db.get_task_unscoped(&parent_id).await {
+                Ok(Some(t)) => {
+                    t.status == "in_progress"
+                        && !matches!(
+                            self.db.get_child_tasks(&parent_id).await,
+                            Ok(ref children) if children.iter().any(|c| {
+                                c.trigger_type == "callback"
+                                    && (c.status == "pending" || c.status == "in_progress")
+                                    && c.id != callback_task.id
+                            })
+                        )
+                }
+                _ => false,
+            };
+
+            if still_stuck {
+                let note = format!(
+                    "auto-blocked: mika-dev failed to advance after callback + advance turn (mika#991). \
+                     Original callback: {} (outcome: {})",
+                    callback_task.id, child_outcome
+                );
+                warn!(
+                    parent_task_id = %parent_id,
+                    "post_callback_advance: advance turn completed but milestone still not advanced, auto-blocking"
+                );
+                if let Err(e) = self.db.update_task_failed(&parent_id, &note).await {
+                    warn!(
+                        parent_task_id = %parent_id,
+                        error = %e,
+                        "post_callback_advance: failed to auto-block milestone"
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = self.db.end_session(&session_id).await {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "post_callback_advance: failed to end session"
+            );
+        }
     }
 }
 
@@ -1660,5 +1852,320 @@ mod tests {
         let val = extract_callback_fields(input);
         let pr_url = val.get("claude_pilot").and_then(|cp| cp.get("pr_url"));
         assert!(pr_url.is_none(), "mid-line PR: should not match");
+    }
+
+    // ── maybe_fire_post_callback_advance unit tests (#991) ──
+
+    /// Helper: create a parent milestone task and a callback child task.
+    /// Returns `(parent_id, child_id)`.
+    async fn create_milestone_with_callback_child(
+        db: &AsyncDatabase,
+        parent_status: &str,
+        child_status: &str,
+    ) -> (String, String) {
+        let parent_id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "Milestone #19".to_string(),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: Some("milestone".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Transition parent to the desired status
+        if parent_status != "pending" {
+            db.update_task_status(&parent_id, "in_progress")
+                .await
+                .unwrap();
+            if parent_status == "blocked" {
+                db.update_task_status(&parent_id, "blocked").await.unwrap();
+            } else if parent_status == "completed" {
+                db.update_task_status(&parent_id, "completed")
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let child_id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: Some(parent_id.clone()),
+                depth: 1,
+                label: "Child issue #200".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: r#"{"text": "callback result"}"#.to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: Some("issue".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Transition child to desired status
+        if child_status != "pending" {
+            db.update_task_status(&child_id, "in_progress")
+                .await
+                .unwrap();
+            if child_status == "completed" {
+                db.update_task_status(&child_id, "completed").await.unwrap();
+            } else if child_status == "delivered" {
+                db.update_task_status(&child_id, "completed").await.unwrap();
+                db.mark_task_delivered(&child_id).await.unwrap();
+            } else if child_status == "failed" {
+                db.update_task_failed(&child_id, "subprocess crashed")
+                    .await
+                    .unwrap();
+            }
+        }
+
+        (parent_id, child_id)
+    }
+
+    /// #991: maybe_fire_post_callback_advance skips when callback has no parent.
+    #[tokio::test]
+    async fn test_post_callback_advance_skips_no_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        // Create a standalone callback task (no parent)
+        let child_id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "Standalone callback".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: r#"{"text": "result"}"#.to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+            })
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&child_id).await.unwrap().unwrap();
+
+        // Should return early — no parent means no milestone advance needed.
+        // The function returns () so we just verify it doesn't panic.
+        dispatcher.maybe_fire_post_callback_advance(&task).await;
+    }
+
+    /// #991: maybe_fire_post_callback_advance skips when parent is not a milestone/project.
+    #[tokio::test]
+    async fn test_post_callback_advance_skips_non_milestone_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        // Create a regular issue parent (not milestone/project)
+        let parent_id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "Regular issue".to_string(),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: Some("issue".to_string()),
+            })
+            .await
+            .unwrap();
+
+        db.update_task_status(&parent_id, "in_progress")
+            .await
+            .unwrap();
+
+        let child_id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: Some(parent_id.clone()),
+                depth: 1,
+                label: "Callback child".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: r#"{"text": "result"}"#.to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: Some("issue".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&child_id).await.unwrap().unwrap();
+
+        // Should skip — parent is type=issue, not milestone/project
+        dispatcher.maybe_fire_post_callback_advance(&task).await;
+
+        // Parent should still be in_progress (not auto-blocked)
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "in_progress");
+    }
+
+    /// #991: maybe_fire_post_callback_advance skips when parent is already terminal.
+    #[tokio::test]
+    async fn test_post_callback_advance_skips_terminal_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let (parent_id, child_id) = create_milestone_with_callback_child(
+            &db,
+            "completed", // Parent already completed
+            "completed",
+        )
+        .await;
+
+        let task = db.get_task_unscoped(&child_id).await.unwrap().unwrap();
+
+        // Should skip — parent is already terminal
+        dispatcher.maybe_fire_post_callback_advance(&task).await;
+
+        // Parent should remain completed
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "completed");
+    }
+
+    /// #991: maybe_fire_post_callback_advance skips when an active callback child exists
+    /// (queue was already advanced).
+    #[tokio::test]
+    async fn test_post_callback_advance_skips_when_active_child_exists() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let (parent_id, child_id) =
+            create_milestone_with_callback_child(&db, "in_progress", "completed").await;
+
+        // Create a SECOND active callback child — simulates that the agent
+        // already dispatched the next child via run_claude_pilot.
+        let _next_child_id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: Some(parent_id.clone()),
+                depth: 1,
+                label: "Next child issue #201".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: r#"{"text": "pending"}"#.to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: Some("issue".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&child_id).await.unwrap().unwrap();
+
+        // Should skip — the next child is already pending (queue was advanced)
+        dispatcher.maybe_fire_post_callback_advance(&task).await;
+
+        // Parent should still be in_progress (not auto-blocked)
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "in_progress");
+    }
+
+    /// #991: maybe_fire_post_callback_advance fires and auto-blocks when no
+    /// active child exists and the dummy LLM fails (simulating advance failure).
+    #[tokio::test]
+    async fn test_post_callback_advance_auto_blocks_on_failure() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let (parent_id, child_id) =
+            create_milestone_with_callback_child(&db, "in_progress", "completed").await;
+
+        // Create the required session for the callback task
+        db.create_session_with_parent("test-session", "mika", "system", None, None, None)
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&child_id).await.unwrap().unwrap();
+
+        // The dummy LLM provider will fail, causing the advance turn to error.
+        // The function should then auto-block the milestone.
+        dispatcher.maybe_fire_post_callback_advance(&task).await;
+
+        // Parent should be auto-blocked (failed status) because the dummy
+        // LLM can't actually run the advance turn.
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "parent milestone should be auto-blocked when advance turn fails"
+        );
     }
 }

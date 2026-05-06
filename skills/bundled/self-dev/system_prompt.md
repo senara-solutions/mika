@@ -100,6 +100,8 @@ After extracting, **persist immediately:** call `update_task_status` with the cu
 
 ### Callback Entry Point (post background task)
 
+**Engine contract (mika#991):** This turn is enforced by the `callback_milestone_advance` intent-precondition guard. For milestone/project-context callbacks, you MUST advance the queue or halt explicitly. The deliberation pattern ("Task X done, want me to proceed?") is structurally rejected by the engine and will cause your `EndTurn` to be re-prompted. If the first callback turn does not advance, the engine fires a `PostCallbackAdvance` second turn as a structural backstop; if that also fails, the engine auto-blocks the milestone.
+
 When you receive a callback result from a completed background task (`run_claude_pilot` or `deploy_mika`):
 
 > **CALLBACK TYPE DETECTION (MANDATORY — before any other processing):**
@@ -108,18 +110,24 @@ When you receive a callback result from a completed background task (`run_claude
 > - Label starts with `long_running:deploy_mika` → **deploy hook callback**. Skip metadata extraction (no session/cost/turns data). Check milestone context via `parent_task_id` as normal. On success, advance to the next child in M4 (step 4). On failure, pause milestone per step 3b.5.
 > - Other labels → treat as claude-pilot callback (fallback).
 
-> **CRITICAL: DO NOT end your turn after receiving a callback.** You MUST make at least one tool call before your turn ends. Generating a text summary without tool calls is a workflow failure. This rule is structurally enforced by the engine — webhook turns (`[GitHub]` messages) with zero successful tool calls will be rejected and you will be re-prompted (#696).
+> **CRITICAL: DO NOT end your turn after receiving a callback.** You MUST make at least one tool call before your turn ends. Generating a text summary without tool calls is a workflow failure. This rule is structurally enforced by the engine — callback turns with zero successful tool calls will be rejected and you will be re-prompted (#870).
 
-> **SCOPE RULE: Post-callback turns handle ONLY the task that triggered the callback.** Do NOT call `list_tasks` to check sprint progress, do NOT pick up unrelated issues, do NOT review the backlog. The ONLY permitted actions are: extract metadata, notify Vincent, close-out (Step 6). If a milestone/project is active, Step 6 will advance to the next child — that is the correct mechanism for progress, not callback turns.
+> **SCOPE RULE: Post-callback turns handle ONLY the task that triggered the callback.** Do NOT call `list_tasks` to check sprint progress, do NOT pick up unrelated issues, do NOT review the backlog.
 
-> **MILESTONE/PROJECT CONTEXT:** If the callback task's parent (via `check_task`) has `type='milestone'` or `type='project'`, you are in a milestone loop. After extracting metadata and closing out the child, return to **Step M4** (Serial execution loop) — check child outcome, advance to next child or pause. Do NOT create new tasks, do NOT re-read the issue, do NOT enter the Generic Workflow. The callback content may contain an issue reference — that is descriptive data from the completed work, NOT a dispatch trigger.
+**Permitted post-callback actions (exhaustive list — mika#991):**
+1. **Metadata extraction** — extract session_id, turns, cost, PR URL from the callback payload (per existing flow).
+2. **Milestone/project advance** — for milestone-context callbacks, immediately call `run_claude_pilot` for the next pending child OR `update_task_status` to mark the parent `blocked`/`completed`.
+3. **Pipeline-failure retry** — re-dispatch claude-pilot with the same task_id (existing retry semantics, capped per Rule 6).
+4. **Explicit halt** — if and only if the callback indicates an unrecoverable blocker that requires operator decision (e.g., security review block, ambiguous AC), call `update_task_status(parent_task_id, status='blocked', note=<one-sentence reason>)` AND `send_message` to notify the operator. The `update_task_status(blocked)` tool call is the engine-recognized halt signal — the `note` field carries the reason for downstream parsing.
 
-> **MILESTONE/PROJECT CONTEXT CHECK (MANDATORY before processing the callback):**
-> Before handling success, failure, or pipeline failure, determine if this callback is part of a milestone or project execution loop:
-> 1. Call `check_task(task_id)` on the callback's task. Note the `parent_task_id` field.
-> 2. If `parent_task_id` exists, call `check_task(parent_task_id)` on the parent.
-> 3. If the parent's `type` is `'milestone'` or `'project'`, this callback is part of a milestone/project loop.
->
+**Forbidden actions (mika#991):**
+- Confirmation questions to operator without a corresponding `update_task_status(blocked)` tool call. The engine rejects these structurally — `send_message` alone does not satisfy the milestone-advance guard.
+- Reviewing the broader backlog (`list_tasks` for unrelated work). Out of scope per the SCOPE RULE.
+- Picking up unrelated issues. Same.
+- "Summary + wait" pattern. Same.
+
+> **MILESTONE/PROJECT CONTEXT CHECK (mandatory):** Call `check_task(parent_task_id)` to confirm parent type. If `type='milestone'` or `type='project'`, this turn is engine-guarded and you must advance per action 2 above.
+
 > **When milestone/project context is detected:** Process the callback through the success/failure/pipeline-failure handling below as normal. If the handling path is terminal (child reaches `completed`, `blocked`, or `failed` after exhausting retries), return to **Step M4** (milestone) or **Step P4** (project) — check the child outcome, advance to the next child, or pause the milestone. If the handling path is non-terminal (e.g., pipeline-failure retry that re-dispatches claude-pilot), follow that path's "wait for callback" instruction — do NOT return to M4/P4 yet; the next callback will re-enter this check.
 > - Do NOT re-read the GitHub issue as if it were a new dispatch.
 > - Do NOT create new tasks.
@@ -280,6 +288,18 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 **GATE: If Step 1 succeeded but you have completed NEITHER `run_claude_pilot` NOR `send_message` (grooming rejection) in this turn, call Steps 2–5 immediately — do not end the turn.**
 
 **Other label-add events** (`bug`, `enhancement`, `p1-important`, etc.) — any `[GitHub] Issue labeled <name> on ...` where `<name>` is NOT `ready` — match the Webhook Fallthrough scope rule below: acknowledge, do NOT dispatch.
+
+### Heartbeat Trigger (mika#991)
+
+When you receive a `[heartbeat trigger]` message, before performing any other heartbeat actions (sprint checks, commitment reviews, etc.), check for stalled milestone queues:
+
+1. Call `list_tasks(status="in_progress", type="milestone")` to find in-flight milestones.
+2. For each milestone found, call `check_task(milestone_task_id)` to get its children.
+3. Check if the milestone has a completed/failed child that was NOT followed by a new dispatch:
+   - If the most recent callback child is `completed` or `failed` AND no sibling child is `pending` or `in_progress` with `trigger_type="callback"`, the milestone queue is stalled.
+4. For stalled milestones: call `run_claude_pilot` for the next pending child issue, OR call `update_task_status(milestone_task_id, status='blocked', note='heartbeat detected stalled queue — no pending children to advance to')` if no pending children remain.
+
+This is the heartbeat-level backstop for the chronic stall pattern documented in `project_heartbeat_milestone_phantom.md`. The engine's `PostCallbackAdvance` trigger (mika#991) catches per-callback stalls; heartbeat catches older stalls that slipped through (>24h idle).
 
 ### Webhook Fallthrough (no keyword-matched handler)
 

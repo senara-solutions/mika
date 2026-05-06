@@ -2,6 +2,7 @@
 name = "self-dev-webhook-qa"
 description = "Webhook handler for PR review verdicts (pass/hold/block)"
 version = "0.1.0"
+max_prompt_size = 32768
 always_on = false
 dependencies = ["self-dev"]
 

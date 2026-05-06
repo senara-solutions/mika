@@ -1325,6 +1325,44 @@ async fn run_loop(
                         }
                     }
 
+                    // #991 — Callback milestone advance guard. For milestone/project-
+                    // context callbacks, requires the agent to either advance the
+                    // queue (run_claude_pilot) or explicitly halt/finish the milestone
+                    // (update_task_status on parent with blocked/completed). Inline
+                    // rather than in INTENT_GUARDS because the satisfied predicate
+                    // needs the parent_task_id extracted from the user message.
+                    // Composes with callback_terminal_action (entry e): a milestone-
+                    // context callback must satisfy BOTH guards.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(CALLBACK_MILESTONE_ADVANCE_LABEL)
+                        && callback_milestone_advance_trigger(&user_input_text)
+                        && let Some(parent_id) = extract_milestone_parent_id(&user_input_text)
+                        && !callback_milestone_advance_satisfied(parent_id, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(CALLBACK_MILESTONE_ADVANCE_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            parent_task_id = parent_id,
+                            intent_guard = CALLBACK_MILESTONE_ADVANCE_LABEL,
+                            "Callback milestone advance guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                CALLBACK_MILESTONE_ADVANCE_CORRECTION.to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
                     // #862 — Asserted-unavailability guard. Catches assistant text
                     // claiming a tool is unavailable ("X is not callable", "I don't
                     // have access to X", "X is skill-scoped") when X is in the
@@ -1573,6 +1611,37 @@ async fn run_loop(
                             role: LlmRole::User,
                             content: LlmContent::Text(
                                 CALLBACK_TERMINAL_ACTION_CORRECTION.to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // #991 — Callback milestone advance guard for empty-text exits.
+                    // Mirror of the inline guard in the non-empty text path.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(CALLBACK_MILESTONE_ADVANCE_LABEL)
+                        && callback_milestone_advance_trigger(&user_input_text)
+                        && let Some(parent_id) = extract_milestone_parent_id(&user_input_text)
+                        && !callback_milestone_advance_satisfied(parent_id, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(CALLBACK_MILESTONE_ADVANCE_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            parent_task_id = parent_id,
+                            intent_guard = CALLBACK_MILESTONE_ADVANCE_LABEL,
+                            "Callback milestone advance guard fired on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                CALLBACK_MILESTONE_ADVANCE_CORRECTION.to_string(),
                             ),
                         });
                         continue;
@@ -2694,6 +2763,19 @@ pub enum SilentTrigger {
         task_id: String,
         message: String,
     },
+    /// #991 — Engine-side structural backstop for milestone/project queue advancement.
+    /// Fired by the dispatcher after a callback turn completes when the callback had
+    /// a milestone/project parent AND the callback turn did NOT advance to the next
+    /// child or halt the milestone. The agent gets one more turn with explicit advance
+    /// instructions; if it still doesn't advance, the engine marks the milestone
+    /// `blocked` automatically.
+    PostCallbackAdvance {
+        parent_task_id: String,
+        /// "milestone" or "project"
+        parent_kind: String,
+        /// The outcome of the last child: "completed", "failed", "blocked", "cancelled"
+        last_child_outcome: String,
+    },
 }
 
 impl SilentTrigger {
@@ -2704,7 +2786,9 @@ impl SilentTrigger {
     /// independent adjustment if needed in the future. See #375, #386, #397.
     fn max_steps(&self) -> usize {
         match self {
-            Self::Callback { .. } | Self::Reminder { .. } => MAX_CALLBACK_TOOL_STEPS,
+            Self::Callback { .. } | Self::Reminder { .. } | Self::PostCallbackAdvance { .. } => {
+                MAX_CALLBACK_TOOL_STEPS
+            }
             Self::Heartbeat | Self::Reflection | Self::SkillRun { .. } => MAX_TOOL_STEPS,
         }
     }
@@ -2747,6 +2831,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         SilentTrigger::Callback { .. } => "callback",
         SilentTrigger::SkillRun { .. } => "skill_run",
         SilentTrigger::Reminder { .. } => "reminder",
+        SilentTrigger::PostCallbackAdvance { .. } => "post_callback_advance",
     };
 
     let silent_span = info_span!(
@@ -2898,11 +2983,34 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                  with the results. If the action fails, still notify the user with what happened."
             )
         }
+        SilentTrigger::PostCallbackAdvance {
+            parent_task_id,
+            parent_kind,
+            last_child_outcome,
+        } => {
+            format!(
+                "ENGINE-DRIVEN ADVANCE (mika#991). The previous callback turn for a \
+                 {parent_kind} child task (outcome: {last_child_outcome}) completed but \
+                 did NOT advance the queue. This is a structural backstop — the engine \
+                 is firing this turn unconditionally.\n\n\
+                 Parent task: {parent_task_id} (type: {parent_kind})\n\n\
+                 You MUST either:\n\
+                 1. Dispatch the next pending child via run_claude_pilot, OR\n\
+                 2. Mark the {parent_kind} parent as `blocked` (with a reason in the note \
+                    field) or `completed` via update_task_status.\n\n\
+                 Do NOT narrate, summarize, or ask for confirmation. The engine enforces \
+                 this structurally — EndTurn without one of the above actions will be \
+                 rejected by the callback_milestone_advance guard."
+            )
+        }
     };
 
     let (task_health, stored_preferences) = if matches!(
         &params.trigger,
-        SilentTrigger::Heartbeat | SilentTrigger::Callback { .. } | SilentTrigger::Reminder { .. }
+        SilentTrigger::Heartbeat
+            | SilentTrigger::Callback { .. }
+            | SilentTrigger::Reminder { .. }
+            | SilentTrigger::PostCallbackAdvance { .. }
     ) {
         (
             db.get_task_health_summary().await.ok(),
@@ -2949,7 +3057,11 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     // Both paths return only AlwaysOn entries, and resolve_skill_llm_override filters
     // to Keyword only — no per-skill LLM override in silent mode (#463).
     let matched = match &params.trigger {
-        SilentTrigger::Callback { .. } => params.skills.callback_safe_skills(),
+        // Callback + PostCallbackAdvance share the same skill set — both are
+        // continuations of a tool call authorized in conversation mode (#567, #991).
+        SilentTrigger::Callback { .. } | SilentTrigger::PostCallbackAdvance { .. } => {
+            params.skills.callback_safe_skills()
+        }
         SilentTrigger::Heartbeat
         | SilentTrigger::Reflection
         | SilentTrigger::Reminder { .. }
@@ -2971,13 +3083,37 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
 
-    // For silent mode, provide a brief "trigger" as the user message
+    // For silent mode, provide a brief "trigger" as the user message.
+    // #991 — Milestone-context callbacks encode the parent task ID in the
+    // user message so the `callback_milestone_advance` inline guard can
+    // detect and enforce queue advancement without a DB lookup in the guard.
     let user_msg = match &params.trigger {
         SilentTrigger::Heartbeat => "[heartbeat trigger]".to_string(),
         SilentTrigger::Reflection => "[reflection trigger]".to_string(),
-        SilentTrigger::Callback { label, .. } => format!("[callback: {label}]"),
+        SilentTrigger::Callback {
+            label,
+            parent_task_id,
+            ..
+        } => {
+            let mut msg = format!("[callback: {label}]");
+            if let Some(pid) = parent_task_id
+                // Look up parent type to detect milestone/project context.
+                // Fail-open: if the lookup fails, the guard doesn't fire and
+                // the existing callback_terminal_action guard still applies.
+                && let Ok(Some(parent)) = params.db.get_task_unscoped(pid).await
+                && (parent.r#type == "milestone" || parent.r#type == "project")
+            {
+                msg.push_str(&format!(" [milestone-parent: {pid}]"));
+            }
+            msg
+        }
         SilentTrigger::SkillRun { skill_name } => format!("[skill_run: {skill_name}]"),
         SilentTrigger::Reminder { message, .. } => format!("[reminder: {message}]"),
+        SilentTrigger::PostCallbackAdvance { parent_task_id, .. } => {
+            // PostCallbackAdvance always targets a milestone/project parent,
+            // so the milestone-parent marker is unconditional.
+            format!("[advance: {parent_task_id}] [milestone-parent: {parent_task_id}]")
+        }
     };
 
     let messages = vec![LlmMessage {
@@ -3020,7 +3156,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         // (`long_running: None` blocks long-running task spawning, `is_task_context: true`
         // blocks top-level task creation). Propagating this flag lets future
         // per-tool defense-in-depth hardening gate exec handlers on callback context (#567).
-        is_callback_turn: matches!(params.trigger, SilentTrigger::Callback { .. }),
+        is_callback_turn: matches!(
+            params.trigger,
+            SilentTrigger::Callback { .. } | SilentTrigger::PostCallbackAdvance { .. }
+        ),
         provider_name: provider,
         model_name: model,
         active_skill_paths: &[], // Silent mode: no context-redundancy checks needed
@@ -3076,6 +3215,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         SilentTrigger::Callback { .. } => "callback",
         SilentTrigger::SkillRun { .. } => "skill_run",
         SilentTrigger::Reminder { .. } => "reminder",
+        SilentTrigger::PostCallbackAdvance { .. } => "post_callback_advance",
     };
 
     // Prelude deadline check (mika#848 F3b) — see run_agent_inner for rationale.
@@ -4513,6 +4653,81 @@ fn callback_terminal_action_satisfied(summaries: &[ToolCallSummary]) -> bool {
     let has_send = summaries.iter().any(|s| s.name == "send_message");
     has_update && has_send
 }
+
+// ---------------------------------------------------------------------------
+// #991 — Callback milestone advance guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the callback milestone
+/// advance guard (#991). Inline guard (not in `INTENT_GUARDS` const array)
+/// because the satisfied predicate needs the parent_task_id from the user
+/// message to distinguish parent-targeting `update_task_status` calls from
+/// child-targeting ones.
+const CALLBACK_MILESTONE_ADVANCE_LABEL: &str = "callback_milestone_advance";
+
+/// Marker prefix in the user message that signals a milestone/project-context
+/// callback. Emitted by `run_silent_agent` when the callback's parent task
+/// has `type='milestone'` or `type='project'`. Format:
+/// `[callback: {label}] [milestone-parent: {parent_task_id}]`
+const MILESTONE_PARENT_MARKER: &str = "[milestone-parent: ";
+
+/// #991 — Returns `true` when the user message indicates a milestone/project-context
+/// callback turn. Checks for both the callback prefix and the milestone-parent marker.
+fn callback_milestone_advance_trigger(msg: &str) -> bool {
+    msg.starts_with("[callback:") && msg.contains(MILESTONE_PARENT_MARKER)
+}
+
+/// #991 — Extracts the parent task ID from the milestone-parent marker in the
+/// user message. Returns `None` if the marker is absent or malformed.
+fn extract_milestone_parent_id(msg: &str) -> Option<&str> {
+    let start = msg.find(MILESTONE_PARENT_MARKER)?;
+    let rest = &msg[start + MILESTONE_PARENT_MARKER.len()..];
+    let end = rest.find(']')?;
+    let id = rest[..end].trim();
+    if id.is_empty() { None } else { Some(id) }
+}
+
+/// #991 — Returns `true` when the milestone advance obligation is satisfied.
+/// Two valid paths:
+/// - **Path A (advance):** `run_claude_pilot` was called (any attempt, success or failure).
+/// - **Path B (halt or finish):** `update_task_status` was called with the parent
+///   task ID in the input AND a terminal status (`blocked` or `completed`).
+///
+/// The `parent_task_id` parameter is extracted from the user message's
+/// `[milestone-parent: ...]` marker. This is why the guard is inline rather
+/// than in the `INTENT_GUARDS` const array — the satisfied predicate needs
+/// dynamic context from the user message.
+fn callback_milestone_advance_satisfied(
+    parent_task_id: &str,
+    summaries: &[ToolCallSummary],
+) -> bool {
+    // Path A: any run_claude_pilot call (advance to next child)
+    let has_advance = summaries.iter().any(|s| s.name == "run_claude_pilot");
+
+    if has_advance {
+        return true;
+    }
+
+    // Path B: update_task_status targeting the parent with blocked/completed.
+    // Check input_summary for the parent task ID AND a terminal status.
+    // The input_summary contains the JSON tool input, e.g.:
+    // {"task_id": "<uuid>", "status": "blocked", "note": "..."}
+    summaries.iter().any(|s| {
+        s.name == "update_task_status"
+            && s.input_summary.contains(parent_task_id)
+            && (s.input_summary.contains("blocked") || s.input_summary.contains("completed"))
+    })
+}
+
+/// #991 — Correction message for the callback milestone advance guard.
+const CALLBACK_MILESTONE_ADVANCE_CORRECTION: &str = "[Your response was rejected. This is a \
+     callback turn for a milestone/project child task. Per mika#991 you MUST either: \
+     (1) dispatch the next pending child via run_claude_pilot, OR \
+     (2) mark the milestone/project parent as `blocked` (with a reason in the note field) \
+     or `completed` via update_task_status. Posting a confirmation question or summary \
+     without one of these two tool calls is the deliberation-stall pattern documented \
+     in mika#991. Re-read the callback result and either advance the queue or halt \
+     the milestone explicitly via update_task_status.]";
 
 // ---------------------------------------------------------------------------
 // #862 — Asserted-unavailability guard
