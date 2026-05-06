@@ -8,6 +8,13 @@ seq: 008
 
 # Plan: post-callback turn advances queue autonomously (mika#991)
 
+## Verified state (post-architect-pass-1)
+
+- **F1 (INTENT_GUARDS evaluation mode) addressed.** Pinned at `agent.rs:1283-1322`: linear iteration over the const array, per-guard `trigger(input) AND NOT satisfied(tools)` rejection check, single-retry tracking via `intent_guard_retries: HashSet<&'static str>` keyed by label. Guards compose **independently** — each guard fires on its own trigger/satisfaction predicate; multiple guards can fire on the same turn (each gets its own retry slot). The new `callback_milestone_advance` guard composes with existing `callback_terminal_action` (entry e) by adding a second independent constraint: a milestone-context callback turn must satisfy BOTH guards' predicates. Compositional satisfaction analysis below in Phase 1.
+- **F2 (halt-token removed, structural-only) addressed.** The `[halt-reason: ...]` text-pattern detection in send_message has been removed. Per mika#862's structural-tool-call invariant (`docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-04-28.md`), text-pattern detection as a satisfaction path is exactly the failure class that compound warns against. The halt path is now **`update_task_status(parent, status='blocked', note=<reason>)`** — a tool call, not a text token. The reason carries in the `note` field. Phase 1's satisfaction predicate becomes two paths instead of three: (a) `run_claude_pilot` for next child (advance), or (b) `update_task_status(parent, blocked|completed)` (halt or finish).
+- **F3 (Phase 2 rationale reframe) addressed.** The `PostCallbackAdvance` trigger is reframed from "give the LLM another chance" (which is the framing `feedback_prompt_enforcement_fragile.md` warns against) to "engine-side structural backstop that fires regardless of LLM behavior." Two-turn separation is justified on **engine-side guarantee** grounds, not LLM-cooperation grounds. The trigger does NOT depend on the prior turn's prompt drift; it fires unconditionally when the engine observes that no advance happened. The prompt is informed of the trigger via the `[advance: ...]` prefix but cannot suppress it.
+- **F4 (heartbeat trigger location) addressed.** Pinned: heartbeat is `SilentTrigger::Heartbeat` enum variant in `crates/mika-agent/src/agent.rs:2839+`, fired from `crates/mika-agent/src/task_engine/dispatcher.rs:667`. The trigger produces `[heartbeat trigger]` user-message prefix at `agent.rs:2976`. **There is no separate heartbeat skill prompt** — heartbeat behavior is handled inline in `self-dev/system_prompt.md` via the always-on self-dev skill. The "doesn't resume milestones" gap from `project_heartbeat_milestone_phantom.md` is therefore a self-dev prompt-level gap. Phase 5's fix adds a heartbeat-trigger section to `self-dev/system_prompt.md` (specific insertion point pinned in Phase 5 below).
+
 ## Why
 
 mika-dev's post-callback turn deliberates instead of advancing the queue. After three documented incidents on 2026-05-06 (closed-issue stall #985, milestone wedge cancellation #666, heartbeat-doesn't-resume gap), the chronic shape is clear: *the engine has a queue ready to advance, the LLM is the only thing standing between the queue and progress, and the LLM elects to deliberate instead of trust.* mika#988 fixed the closed-issue path by changing handler exit semantics so the callback delivers a clean `auto_skipped` result. mika#991 fixes the broader pattern: even with a clean callback, mika-dev posts confirmation questions and waits.
@@ -94,32 +101,47 @@ IntentPrecondition {
     satisfied: callback_milestone_advance_satisfied,
     correction_message: "[Your response was rejected. This is a callback turn for a \
          milestone/project child task. Per mika#991 you MUST either: (1) dispatch the \
-         next pending child via run_claude_pilot, (2) mark the milestone/project as \
-         `blocked` or `completed` via update_task_status with a structured note, or \
-         (3) call send_message with a halt reason citing the specific blocker. \
-         Posting a confirmation question without one of these three actions is the \
-         deliberation-stall pattern documented in mika#991. Re-read the callback \
-         result, advance the queue or halt explicitly.]",
+         next pending child via run_claude_pilot, OR (2) mark the milestone/project \
+         parent as `blocked` (with a reason in the note field) or `completed` via \
+         update_task_status. Posting a confirmation question or summary without one \
+         of these two tool calls is the deliberation-stall pattern documented in \
+         mika#991. Re-read the callback result and either advance the queue or halt \
+         the milestone explicitly via update_task_status.]",
 },
 ```
 
 **`callback_milestone_advance_trigger` predicate:**
 - Triggers ONLY on `SilentTrigger::Callback` turns (matches existing `callback_terminal_action` trigger shape — parsed from `[callback:` prefix in user message).
-- AND the callback's parent task has `type='milestone'` OR `type='project'` (looked up via `check_task` data already available in the trigger context, OR via DB query if not).
+- AND the callback's parent task has `type='milestone'` OR `type='project'` (looked up via `check_task` data available in the trigger context, OR via DB query if not).
 
-**`callback_milestone_advance_satisfied` predicate:**
-- Returns true if any of the following tool summaries appear in `all_tool_summaries`:
-  - Successful `run_claude_pilot` call (any skill — `dev-pilot`, `dev-groom`, `deploy_mika`).
-  - `update_task_status` call with `task_id` matching the parent milestone/project task AND `status` in `{"blocked", "completed"}`.
-  - `send_message` call AND the agent's text contains a structured halt token (e.g., `next_action: halt` literal, OR explicit "milestone <ref> blocked: <reason>" pattern).
-- The third option is the most fragile (text-pattern detection on send_message). To make it structural: define a `[halt-reason: <reason>]` literal token that mika-dev must include in its send_message text when explicitly halting. The guard greps for the literal token. Defense-in-depth: prompts in Phase 3 instruct mika-dev to use the token.
+**`callback_milestone_advance_satisfied` predicate (structural-only, F2 reframe):**
 
-**Composes with existing `callback_terminal_action`:**
-- `callback_terminal_action` requires `update_task_status` AND `send_message`.
-- `callback_milestone_advance` requires (run_claude_pilot OR milestone status update OR halt-token send_message).
-- A milestone-callback turn must satisfy BOTH. The `update_task_status` of the existing guard can be the milestone-status update of the new guard (both satisfied by one call).
+Returns true if any of the following appears in `all_tool_summaries`:
 
-**Why guard, not just prompt:** the existing prompt rules already say to advance; they fail under load. The guard enforces structurally. mika#988 (now shipped) used the same pattern for handler exits.
+- **Path A (advance):** successful `run_claude_pilot` call (any skill — `dev-pilot`, `dev-groom`, `deploy_mika`). Indicates next child or deploy hook is dispatching.
+- **Path B (halt or finish):** `update_task_status` call with `task_id` matching the parent milestone/project task AND `status` in `{"blocked", "completed"}`. The `note` field carries the halt reason or completion summary.
+
+**No third path.** The earlier `[halt-reason: ...]` text-pattern detection on `send_message` content has been removed (architect F2). Per mika#862's structural-tool-call invariant from `docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-04-28.md`: text-pattern detection as a satisfaction path drifts under LLM load and is exactly the failure class the compound warns against. The halt path is now a tool call (`update_task_status(parent, status='blocked', note=<reason>)`), not a text token.
+
+**Compositional satisfaction with existing `callback_terminal_action` (F1 analysis):**
+
+Per `agent.rs:1283-1322`, INTENT_GUARDS evaluates linearly with each guard firing independently on its own predicate. Multiple guards can fire on the same turn (each tracked separately in `intent_guard_retries`).
+
+A milestone-context callback turn must satisfy BOTH:
+- `callback_terminal_action`: requires `update_task_status` AND `send_message` (AND-shape, both must appear).
+- `callback_milestone_advance`: requires Path A OR Path B (OR-shape).
+
+**Reachable satisfaction sets:**
+
+| Scenario | Tools called | `terminal_action` | `milestone_advance` |
+|---|---|---|---|
+| Advance to next child | `update_task_status(child, completed)` + `send_message` + `run_claude_pilot(skill=dev-pilot, prompt=<next>)` | ✓ (both required) | ✓ (Path A) |
+| Halt milestone | `update_task_status(parent, blocked, note=<reason>)` + `send_message` | ✓ (both required) | ✓ (Path B) |
+| Finish milestone | `update_task_status(parent, completed)` + `send_message` | ✓ (both required) | ✓ (Path B) |
+
+The `update_task_status` of the existing guard can serve as the milestone status update of the new guard when it targets the parent (Path B). When it targets the child (advance scenario), the new guard's Path A satisfies via the `run_claude_pilot` for the next child. Either way, the satisfaction sets compose without bloat.
+
+**Why guard, not just prompt:** the existing prompt rules at lines 113-129 already say to advance; they fail under load (verified empirically on 2026-05-06). The guard enforces structurally. mika#988 (now shipped via PR #993) used the same pattern for handler exits. mika#996 (groomed, ready) uses the same pattern for output contracts via `required_suffix_lines`. mika#991 extends the pattern to LLM-loop-cooperation invariants.
 
 ## Phase 2 — Post-callback advance trigger (`SilentTrigger::PostCallbackAdvance`)
 
@@ -148,7 +170,9 @@ PostCallbackAdvance {
 - The same `callback_milestone_advance` guard fires on this turn type, ensuring the advance happens.
 - If mika-dev still doesn't advance (third deliberation attempt), the engine marks the milestone `blocked` itself with note "auto-blocked: mika-dev failed to advance after callback + advance turn (mika#991)" and notifies operator.
 
-**Why a second turn vs. forcing in one turn:** the callback turn legitimately needs metadata extraction, deploy-hook checks, etc. Compressing all of that PLUS advance into one turn risks mika-dev dropping advance under load. Two-turn separation gives advance a dedicated context.
+**Why two-turn separation (architect F3 reframe):** the trigger is an **engine-side structural backstop**, not a "give the LLM another chance" mechanism. Per `feedback_prompt_enforcement_fragile.md`, LLM-cooperation framings drift under load — that's exactly what mika#991 fixes for the first callback turn. The second turn is unconditional: the engine decides whether to fire it based on observed tool calls in the prior turn, not based on prompt-level signals. mika-dev's prompt cannot suppress the trigger.
+
+The first callback turn legitimately needs metadata extraction, deploy-hook checks, child outcome interpretation. The second turn handles the orthogonal "advance the queue" obligation — making them separate phases of an engine-driven sequence, not one turn that the LLM can confuse. If mika-dev's first turn happened to advance (called `run_claude_pilot`), the engine observes this and skips the second turn. If it didn't advance (called only `update_task_status` for the child), the engine fires the second turn unconditionally. Either way, the queue advances structurally — engine-driven, not LLM-cooperation-driven.
 
 **Cost concern:** PostCallbackAdvance fires every milestone-context callback. If the first turn DID advance, no second turn fires (engine-side check). Worst case: every other callback in a milestone fires a second turn at ~0.1-0.2K tokens per turn (tiny prompt — just the advance instruction). Cumulative cost is negligible vs. the chronic-stall cost.
 
@@ -169,10 +193,10 @@ PostCallbackAdvance {
 1. **Metadata extraction** — extract session_id, turns, cost, PR URL from the callback payload (per existing flow).
 2. **Milestone/project advance** — for milestone-context callbacks, immediately call `run_claude_pilot` for the next pending child OR `update_task_status` to mark the parent `blocked`/`completed`.
 3. **Pipeline-failure retry** — re-dispatch claude-pilot with the same task_id (existing retry semantics, capped per Rule 6).
-4. **Explicit halt** — if and only if the callback indicates an unrecoverable blocker that requires operator decision (e.g., security review block, ambiguous AC), call `send_message` with the structured token `[halt-reason: <one-sentence explanation>]` AND mark the parent `blocked`. The halt token is engine-recognized.
+4. **Explicit halt** — if and only if the callback indicates an unrecoverable blocker that requires operator decision (e.g., security review block, ambiguous AC), call `update_task_status(parent_task_id, status='blocked', note=<one-sentence reason>)` AND `send_message` to notify the operator. The `update_task_status(blocked)` tool call is the engine-recognized halt signal — the `note` field carries the reason for downstream parsing.
 
 **Forbidden actions:**
-- Confirmation questions to operator without a halt-reason token. The engine rejects these.
+- Confirmation questions to operator without a corresponding `update_task_status(blocked)` tool call. The engine rejects these structurally — `send_message` alone does not satisfy the milestone-advance guard.
 - Reviewing the broader backlog (`list_tasks` for unrelated work). Out of scope per the SCOPE RULE.
 - Picking up unrelated issues. Same.
 - "Summary + wait" pattern. Same.
@@ -204,19 +228,19 @@ If any of these files do NOT have a callback-turn section, the implementer adds 
 
 ## Phase 5 — Heartbeat milestone-resume fix
 
-**File touched:** `mika/skills/bundled/self-dev/system_prompt.md`, heartbeat trigger handling section (location TBD — pre-flight grep `grep -n "heartbeat\|Heartbeat" self-dev/system_prompt.md`).
+**File touched (architect F4 — pinned):** `mika/skills/bundled/self-dev/system_prompt.md`. The heartbeat trigger has no dedicated section in self-dev today — the only existing references at lines 99 and 181 cite heartbeat as the owner of "sprint progress checks" and "delivery retry on failed sends," both passive observations rather than a heartbeat-handling block. Phase 5 ADDS a new `### Heartbeat Trigger` section to self-dev's system prompt, inserted directly after the existing `### Ready-Label Dispatch` section (lines 242-278 per the Phase 0 pin in mika#996's plan, post-mika#996 deployment) so the heartbeat handler sits alongside the other engine-trigger handlers as a peer.
 
-**Change shape:** add an explicit milestone-resume step to the heartbeat trigger flow. When heartbeat fires, before doing anything else, mika-dev queries `list_tasks(status="in_progress", type="milestone")` to find any in-flight milestones. For each, queries the most recent callback child's status. If the callback-completed child has not been advanced (i.e., milestone `in_progress` with completed child but no `in_progress` next child and pending children remain), heartbeat MUST advance.
+**Change shape:** the new `### Heartbeat Trigger` section adds an explicit milestone-resume step to the heartbeat trigger flow. When heartbeat fires (user message prefix `[heartbeat trigger]`), before doing anything else, mika-dev queries `list_tasks(status="in_progress", type="milestone")` to find any in-flight milestones. For each, queries the most recent callback child's status. If the callback-completed child has not been advanced (i.e., milestone `in_progress` with completed child but no `in_progress` next child and pending children remain), heartbeat MUST advance via `run_claude_pilot` for the next pending child OR mark the milestone `blocked` if the situation requires operator decision.
 
 **This is the heartbeat-doesn't-resume gap from `project_heartbeat_milestone_phantom.md`.** The plan acknowledges the prompt-only nature of this fix (no engine guard for heartbeat — out of scope here). The risk is the same drift class. Mitigation: heartbeat fires daily; even if it drifts, the `PostCallbackAdvance` from Phase 2 catches the per-callback path. Heartbeat only catches the older-than-one-day stalls.
 
-**If Phase 5's heartbeat scope creeps:** halt and surface. The heartbeat task lives in `agents-teams` skill or `self-dev` heartbeat handling — verify location at implementation. If it's a separate skill that needs its own touch, file as a sub-PR.
+**If Phase 5's heartbeat scope creeps:** halt and surface. The Phase 0 pin confirms heartbeat handling is self-dev-prompt-only (no separate skill, no engine-side heartbeat handler beyond the trigger fire); if implementation discovers a hidden surface (e.g., a sibling reflection skill that also needs the milestone-resume logic), file as a sub-PR rather than expanding this PR's scope.
 
 ## Phase 6 — Tests
 
 **Test 1 (Phase 1 guard fires):** eval-harness scenario where mika-dev receives a milestone-context callback and ends the turn with only `update_task_status` (no advance, no halt-token). Assert: engine rejects EndTurn, correction message fires, mika-dev's retry advances.
 
-**Test 2 (Phase 1 guard accepts halt-token):** mika-dev receives a milestone-context callback and ends with `update_task_status(blocked)` + `send_message("[halt-reason: blocked by external dep]")`. Assert: engine accepts EndTurn, no retry.
+**Test 2 (Phase 1 guard accepts structural halt):** mika-dev receives a milestone-context callback and ends with `update_task_status(parent, blocked, note="blocked by external dep")` + `send_message(...)`. Assert: engine accepts EndTurn (Path B satisfied), no retry.
 
 **Test 3 (Phase 2 trigger fires):** mika-dev satisfies Phase 1 guard via metadata-only `update_task_status` (no actual milestone advance). Engine fires `PostCallbackAdvance`. Assert: second turn re-prompts mika-dev with advance instruction.
 
@@ -237,14 +261,14 @@ If any of these files do NOT have a callback-turn section, the implementer adds 
 
 **Follow-ups filed at PR-merge time:**
 1. **Full engine bypass (Option A from ticket).** If the hybrid proves insufficient under post-PR audit (i.e., a fourth chronic-stall incident occurs despite the guard + advance trigger), file as a follow-up to migrate metadata extraction and milestone-loop logic into engine Rust code. Hard-line ticket: don't open speculatively.
-2. **Halt-reason taxonomy.** Phase 1's `[halt-reason: ...]` token is free-form. A future ticket could enforce a structured taxonomy (e.g., `blocked-external-dep`, `blocked-security`, `blocked-ambiguous-ac`) for dashboard analytics. Defer until operator workflow demands it.
+2. **Halt-reason taxonomy.** Phase 1's halt path uses `update_task_status(blocked, note=<reason>)`. The `note` field is free-form prose. A future ticket could enforce a structured taxonomy (e.g., `blocked-external-dep`, `blocked-security`, `blocked-ambiguous-ac`) on the note via a `reason_class` field on the task or a structured-JSON note format, for dashboard analytics. Defer until operator workflow demands it.
 3. **Companion mika-platform PR.** None needed — this fix is mika-internal.
 4. **Apply the engine guard pattern to other "queue advance" surfaces.** E.g., team-engine's child callback returns. Audit at PR-merge time; file separately if surfaces exist.
 
 ## Acceptance criteria (from the ticket)
 
 - [x] After ANY terminal callback (success, structured skip including `auto_skipped`, structured failure, or HANDLER CRASH), the next pending task in the agent's queue fires within ≤60s without operator intervention. **Phase 1 guard + Phase 2 trigger together** — guard rejects deliberation; trigger forces second-turn advance if the first slipped through.
-- [x] mika-dev does not post a confirmation question to its session after a callback unless the callback's `next_action` field explicitly requests operator input. **Phase 1 guard via the `[halt-reason: ...]` token** — confirmation questions WITHOUT the token are rejected; the token is the structural opt-out.
+- [x] mika-dev does not post a confirmation question to its session after a callback unless the callback explicitly requests operator input. **Phase 1 guard requires `run_claude_pilot` (advance) OR `update_task_status(parent, blocked|completed)` (halt or finish)** — `send_message` confirmation questions WITHOUT a parent-status update are rejected. The structural opt-out is the `update_task_status(blocked)` tool call, not a text token.
 - [x] Test coverage at the team-engine integration level. **Phase 6 Tests 1–6.**
 - [x] If Option A: a Rust unit test for the scheduler's post-callback advancement logic. **Phase 6 Test 3 (PostCallbackAdvance trigger).**
 - [x] If Option B: transcript-replay tests for each affected skill prompt. **Phase 6 Test 5.**
@@ -252,9 +276,9 @@ If any of these files do NOT have a callback-turn section, the implementer adds 
 ## Risks and known unknowns
 
 - **Risk: the `parent_task_id` lookup in Phase 1's trigger predicate adds a per-turn DB query.** Mitigation: the existing `callback_terminal_action` guard already does similar lookups; reuse the pattern. If lookup latency becomes a concern, cache the parent kind in the `SilentTrigger::Callback` envelope itself.
-- **Risk: `[halt-reason: ...]` text-pattern detection is fragile.** Acknowledged; that's why the engine guard prefers run_claude_pilot + update_task_status as the structural-strong satisfaction path. The halt-token is the legitimate-deliberation escape hatch, kept narrow on purpose. If the token detection drifts, mika-dev gets a re-prompt — degraded but not broken.
+- **Resolved at plan time (was the halt-token risk):** removed per architect F2. The halt path is now structural (`update_task_status(parent, blocked, note=<reason>)`) — no text-pattern detection in the satisfaction predicate. Reason field is free-form prose but doesn't gate guard satisfaction.
 - **Risk: `PostCallbackAdvance` trigger fires recursively.** If the second turn ALSO fails to advance, the engine fires a third? Mitigation: cap at one retry. If second turn also fails, engine marks milestone `blocked` itself with a structured note. The cap is engine-side; not mika-dev's responsibility.
-- **Unknown: heartbeat trigger's exact location.** Phase 5 has a pre-flight grep to find it. If heartbeat lives in a separate skill or in agent-teams territory, scope may shift. Halt-and-surface threshold defined.
+- **Resolved at plan time (was the heartbeat-location unknown):** pinned per architect F4. Heartbeat is `SilentTrigger::Heartbeat` (engine variant), handled inline in self-dev/system_prompt.md. Phase 5 adds a new `### Heartbeat Trigger` section after `### Ready-Label Dispatch`. No separate skill needed.
 - **Unknown: whether project-context callbacks (vs. milestone-context) need separate handling.** The ticket says both are affected. Phase 1's trigger handles BOTH (`type='milestone' OR type='project'`). Verify at implementation that Step P4 (project) loop has the same shape as M4 (milestone).
 - **Unknown: interaction with mika#996's auto-groom flow.** When mika#996 ships, the auto-groom callback (returning `Verdict: GROOMED`) is itself a callback that needs to advance to dispatch. Phase 1's guard treats this correctly because the auto-groom callback's `parent_task_id` is the milestone child (not a separate groom task — per mika#996's M4 reuse pattern). The advance action in this case is `run_claude_pilot(skill="dev-pilot")`. Verified compatible at plan time; no special-case logic needed.
 
