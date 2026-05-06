@@ -59,6 +59,8 @@ Actionable backlog (5-type filter per `entity_resolver.rs:891-906`): **0** for e
 
 The ~200-entity divergence in `resolved` counts across siblings on the same corpus reflects per-agent Stage-2 LLM judgment non-determinism. Per-agent resolution log is by design (`docs/solutions/best-practices/kg-entity-resolution-two-stage-pipeline.md`).
 
+**Authoritative-log invariant post-disable (NF2 informational, architect first-pass):** After Option C disables mika / mika-dev / mika-qa, **mika-arch's resolution log becomes the sole authoritative log for the mika-docs corpus**. Nothing in the current codebase aggregates across multiple agents' resolution logs (verified: `query_knowledge_graph` is per-agent; mika#798's shipped multi-corpus design has no multi-agent-merge query path). The divergence concern collapses into irrelevance under Option C — there is one consumer, one log.
+
 ### mika-arch's secondary corpora (where shared-corpus race does not apply)
 
 Single-consumer corpora — mika-arch alone holds them. No race to resolve here.
@@ -138,17 +140,42 @@ Server maintains `HashMap<docs_root_hash, ExtractorHandle>`. Per-agent `tokio::s
 
 The recommendation flips to A or B if any of these resolve in the direction marked.
 
+**Halt-and-escalate branch (NF1, architect first-pass):** If U1 resolves affirmatively before implementation begins — i.e., a near-term mika-dev or mika-qa flow on the milestone backlog wants doc-grounded retrieval — **halt this plan and escalate to Vincent before any identity.toml edit lands.** Do not implement C in that case; file a pre-condition ticket for Option A or B, sequence Option C after that ticket ships (or abandon C entirely).
+
 1. **Latent mika-dev / mika-qa value.** Is there a near-term flow on the milestone backlog that wants doc-grounded retrieval (vs. memory_facts retrieval)? If yes — particularly for mika-dev's PR / dispatch / lineage workflows — the coordination primitive (A or B) is the right move because read-path parity is already on the roadmap, and Option C foreclosing that path would produce config-flip churn the moment the flow ships. Architect may have line-of-sight to milestone work this plan does not.
+
+   **Architect first-pass response:** No current GROOMED or active ticket uses `query_knowledge_graph` for dev/qa flows. Autonomous-loop tickets (mika#988, #996, #991, #1001) all use `search_memory`. Dispatch path skills (`dev-pilot`, `qa-review`) reference `search_memory`, not `query_knowledge_graph`. Architect cannot close the question authoritatively for ungroomed backlog items; the halt-and-escalate branch above is the explicit handle.
 
 2. **77% no_match interpretation.** Resolution outcomes since 2026-05-01: 874 no_match / 234 matched_llm / 17 matched_exact. Is 77% no_match the expected long-tail of mentions with no domain projection (in which case Option C is fine) or a domain-graph coverage gap that would worsen if mika-dev/mika-qa demand-side pressure is removed (in which case the right move is to expand the domain graph, separate from this ticket, with KG kept enabled meanwhile via Option A/B)?
 
+   **Architect first-pass response:** Long-tail of mentions with no domain projection (agent-specific terms, PR numbers, code symbols that aren't KG entities). Removing mika/mika-dev/mika-qa as extractors does not reduce domain-graph coverage — mika-arch extracts the same docs, so the unique-extraction set is unchanged. The 77% rate is a read-path characteristic, not an extraction-count characteristic. **Option C does not worsen the no_match rate.**
+
 3. **Per-agent resolution divergence load-bearing?** ~200-entity spread across siblings on the same corpus. Today nothing reads multiple agents' resolution logs in aggregate. If a future cross-agent grooming flow does, Option C's collapse to single-agent resolution may matter. Mika-arch should know whether such a flow exists.
 
+   **Architect first-pass response:** Not load-bearing. mika#798's shipped design is per-agent; no multi-agent-merge query path exists. After Option C, mika-arch's log becomes the sole authoritative log on the mika-docs corpus (see Phase 0 invariant note above).
+
 4. **odds-engine corpus.** mika#800 references the odds-engine 14% over-count. Option C does not touch odds-engine — the three odds-engine agents stay enabled. Do they actually read the KG? If yes, the odds-engine corpus's race remains and is in scope for a separate ticket on `senara-solutions/odds-engine`. If no, this is a parallel topology fix in that repo. Either way, the mika#800 resolution path is mika-platform/mika-side; odds-engine is downstream.
+
+   **Architect first-pass response:** Not resolved by this ticket. Their `query_knowledge_graph` usage is unknown from the current session's tool history — that audit becomes part of the follow-up ticket's filing. Forward-reference added to the out-of-scope section below.
 
 ## Phase 2 — Implementation (assumes Option C selected)
 
 If architect ratifies C, the implementation is:
+
+### Pre-restart purge (F1, architect first-pass — BLOCKING)
+
+mika#802 documents a SIGTERM race: during the OLD binary's shutdown window (~3s), background resolver/extractor tasks can flush in-flight rows under the OLD config. The race is verbatim cited as triggered by config changes "that affect per-agent KG routing (`docs_root`, **enabled flag**)" — exactly Option C's surface. mika#802 is OPEN with no plan, no branch, no milestone — sequencing Option C after #802 ships is open-ended.
+
+Adopt mika#802's documented manual workaround: clear the per-agent resolution logs **before** triggering the restart, so any race-window write hits an empty target and post-restart state is clean. Today's audit shows resolver `pending_before: 0` for these agents (the race window is currently empty), but the purge is the mika#802-canonical defensive step.
+
+```bash
+# Step 1 — purge per-agent resolution logs for the agents being disabled.
+mika kg purge --agent mika --yes
+mika kg purge --agent mika-dev --yes
+mika kg purge --agent mika-qa --yes
+```
+
+`mika kg purge --agent <name> --yes` (without `--include-orphaned-corpus`) clears `kg_subject_resolutions` and `kg_resolutions_log` for that agent only. Per-corpus state (`kg_chunks`, `kg_subject_entities`, `kg_extractions` markers) is preserved — mika-arch keeps reading from those tables unchanged.
 
 ### File edits
 
@@ -170,9 +197,9 @@ OpenRC `supervise-daemon` per `/etc/init.d/mika-server` (chdir `/data/workspace/
 
 No `MIKA_KG_BATCH_BUDGET` adjustment needed — disabled agents skip extraction/resolution at startup; mika-arch's pending backlog is already 0.
 
-### No purge in scope
+### Out-of-scope corpus state
 
-Resolution logs for the three disabled agents become orphaned but stay on disk. `mika kg purge --agent <name>` would clear `kg_subject_resolutions` and `kg_resolutions_log` for the agent but is not required for the fix; cleanup is a follow-up if disk cost matters (~6,800 total rows across three agents, negligible).
+The pre-restart purge above clears the per-agent resolution layer (`kg_subject_resolutions`, `kg_resolutions_log`) for the three disabled agents. The shared-corpus layer is untouched: `kg_chunks`, `kg_subject_entities`, `kg_subject_relationships`, `kg_extractions` markers remain alive under mika-arch's continued ownership. `mika kg purge --agent <name> --include-orphaned-corpus` is **not** invoked — that flag would attempt corpus-layer deletion and the CLI's shared-corpus guard would refuse it (mika-arch still references the same `docs_root_hash`).
 
 ### Documentation updates
 
@@ -227,28 +254,41 @@ Post-restart checks. All read-only.
    ```bash
    mika kg validate
    ```
-   Expected: 8/8 OK. Orphaned per-agent resolution logs are not FK violations — `kg_resolutions_log.agent_id` and `kg_resolutions_log.subject_entity_id` both reference still-alive parents (CASCADE on `agents` and `kg_subject_entities`).
+   Expected: 8/8 OK. After the pre-restart purge, the three disabled agents have empty resolution logs — not FK violations either way.
+
+   Confirm purge applied:
+   ```bash
+   sqlite3 ~/.mika/data/mika.db "SELECT agent_id, COUNT(*) FROM kg_resolutions_log WHERE agent_id IN ('mika','mika-dev','mika-qa') GROUP BY agent_id;"
+   ```
+   Expected: zero rows returned (all three counts are 0).
 
 7. **mika#800 closure.** PR description references `Closes #800`. Manual cross-check after merge: comment on mika#800 noting "resolved by single-agent KG topology — see PR #<n>."
 
 ## Phase 4 — Rollback
 
-If verification fails or a regression surfaces:
+If verification fails or a regression surfaces, the rollback is **purge → re-enable → restart** (per architect F1):
 
 ```bash
-# Re-enable on the affected agent(s)
+# Step 1 — purge any in-flight residue first (defensive against the symmetric SIGTERM race
+# on re-enable, and against silently inheriting any race-window writes from the disable cycle).
+mika kg purge --agent <agent> --yes
+
+# Step 2 — re-enable the [kg] block.
 sed -i 's/^enabled = false$/enabled = true/' ~/.mika/agents/<agent>/identity.toml
+
+# Step 3 — restart.
 sudo rc-service mika-server restart
 ```
 
-The agent's per-agent resolution log was preserved (no purge), so on restart it picks up where it left off. Extraction layer was preserved by mika-arch's continued ownership of the markers, so re-extraction on the re-enabled agent rebuilds only the per-agent resolution log — no LLM cost on the extraction side.
+Re-enabling against a purged log forces a fresh Stage-1 + Stage-2 resolution pass. The extraction layer was preserved by mika-arch's continued ownership of the corpus markers, so re-extraction does not re-run LLM calls — only the per-agent resolution log rebuilds, which is the cheap path. Doing this without the purge step risks inheriting stale resolution rows from any race-window writes (the failure class mika#802 documents).
 
 ## Out of scope (explicitly)
 
 - **mika#962** (extractor low-yield on mika-arch's secondary corpora — mika-cloud 10/199, mika-platform 23/464). Separate ticket. May benefit mechanically from siblings being detached on the mika-docs corpus (no shared-corpus race remaining), but this plan is not gated on or coupled to mika#962.
 - **mika#999** (CLI `pending` counter conflation). Documentation/CLI clarity. Separate ticket.
 - **Read-path expansion to dev/qa skills.** Explicitly deferred per peer review. The trigger condition for re-enable is documented but not in code: if a concrete mika-dev or mika-qa flow surfaces that wants doc-grounded retrieval, re-enable KG for that flow specifically rather than re-enabling broadly.
-- **odds-engine corpus race.** Parallel concern in a different repo. Not in scope for mika#800's resolution.
+- **odds-engine corpus race (NF3, architect first-pass).** mika#800's originating 14% over-count was observed on the odds-engine 3-agent corpus. This plan does NOT touch odds-engine — those three agents stay enabled. The same topology analysis applies in `senara-solutions/odds-engine`: if a `query_knowledge_graph` usage audit on those agents shows read-dormancy (parallel to the mika-side read-path audit), apply the same Option C topology fix there in a follow-up ticket. If they DO query the graph, the odds-engine corpus race is a real concern needing Option A or B (or its odds-engine-side analog) and remains for mika#802 to resolve. Either way, closing mika#800 with this PR does not address the odds-engine corpus's race; that audit is a follow-up.
+- **mika#802 root-cause fix.** Graceful KG-task SIGTERM handling. This plan adopts mika#802's documented manual workaround (pre-restart purge) but does not implement the engine-side `CancellationToken` plumbing #802 proposes. mika#802 stays open after this PR ships.
 
 ## Related
 
