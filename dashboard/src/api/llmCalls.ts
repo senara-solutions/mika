@@ -21,6 +21,8 @@ export interface LlmCallRow {
   created_at: string
   response_text: string | null
   reasoning: string | null
+  /** Estimated cost in USD, computed from token counts and provider pricing. */
+  cost_usd: number | null
 }
 
 export interface LlmCallsFilters {

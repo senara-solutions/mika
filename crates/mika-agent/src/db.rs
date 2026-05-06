@@ -479,6 +479,10 @@ pub struct LlmCallRow {
     /// Extended thinking / reasoning text (Claude-only).
     /// `None` when the provider does not support reasoning or the call errored.
     pub reasoning: Option<String>,
+    /// Estimated cost in USD, computed from token counts and provider pricing.
+    /// `None` when not yet computed (set by dashboard handler post-query).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5926,6 +5930,7 @@ impl Database {
             // List queries omit response_text/reasoning for performance
             response_text: None,
             reasoning: None,
+            cost_usd: None,
         })
     }
 
@@ -5951,6 +5956,7 @@ impl Database {
             created_at: r.get(16)?,
             response_text: r.get(17)?,
             reasoning: r.get(18)?,
+            cost_usd: None,
         })
     }
 
