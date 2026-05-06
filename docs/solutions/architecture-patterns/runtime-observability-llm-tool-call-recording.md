@@ -37,7 +37,7 @@ Both tables added as UNION ALL legs in `unified_timeline` VIEW — automatically
 
 - `store_llm_calls` (default: true) — gate SQLite writes
 - `store_tool_calls` (default: true) — gate SQLite writes
-- `log_llm_bodies` (default: false) — dev-only full request/response dump via `mika::llm_debug` tracing target
+- `log_llm_bodies` (default: false) — dual-purpose: (1) dev-only full request/response dump via `mika::llm_debug` tracing target to log files, (2) when telemetry is also enabled, attaches `gen_ai.prompt` / `gen_ai.completion` span attributes to `llm_call` spans for Langfuse Generation input/output (#671)
 
 ### Agent loop integration
 
@@ -58,7 +58,7 @@ Both tables added as UNION ALL legs in `unified_timeline` VIEW — automatically
 - **50KB output cap**: Covers 99% of tool outputs while preventing storage blowup. UTF-8 safe truncation via `is_char_boundary()`.
 - **Fire-and-forget writes with `warn!`**: Observability should never break the agent loop. Errors are logged, not propagated.
 - **Config on by default**: The whole point is visibility. Users who don't want the overhead can opt out.
-- **`log_llm_bodies` via separate tracing target**: Uses `mika::llm_debug` (not `mika::otel`) to avoid sending sensitive content to Langfuse. The config option auto-adds the filter directive so users don't fiddle with `RUST_LOG`.
+- **`log_llm_bodies` via separate tracing target**: Uses `mika::llm_debug` (not `mika::otel`) for local log file output. The config option auto-adds the filter directive so users don't fiddle with `RUST_LOG`. Since #671, `log_llm_bodies` also gates OTLP body attributes when the `telemetry` feature is enabled — request bodies as `gen_ai.prompt` and response bodies as `gen_ai.completion` on `llm_call` spans. Both paths (log file and OTLP) are independently useful: log files work offline, OTLP correlates bodies with Langfuse traces.
 
 ## Bugs Found and Fixed
 

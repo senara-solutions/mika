@@ -141,6 +141,10 @@ pub struct OpenAiCompatibleProvider {
     model: String,
     max_tokens: u32,
     provider_kind: ProviderKind,
+    /// When true AND the `telemetry` feature is enabled, attach request/response
+    /// bodies as `gen_ai.prompt` / `gen_ai.completion` span attributes. See #671.
+    #[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
+    log_llm_bodies: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -150,6 +154,7 @@ impl OpenAiCompatibleProvider {
         model: String,
         max_tokens: u32,
         provider_kind: ProviderKind,
+        log_llm_bodies: bool,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
@@ -166,6 +171,7 @@ impl OpenAiCompatibleProvider {
             model,
             max_tokens,
             provider_kind,
+            log_llm_bodies,
         }
     }
 
@@ -347,6 +353,17 @@ impl LlmProvider for OpenAiCompatibleProvider {
             span.set_attribute("gen_ai.provider.name", self.provider_kind.to_string());
             span.set_attribute("gen_ai.request.model", request.model.clone());
             span.set_attribute("gen_ai.request.max_tokens", request.max_tokens as i64);
+
+            // Attach request body for Langfuse Generation "Input" (#671)
+            if self.log_llm_bodies {
+                let openai_req = to_openai_request(request);
+                if let Ok(body_json) = serde_json::to_string(&openai_req) {
+                    span.set_attribute(
+                        "gen_ai.prompt",
+                        super::truncate_chars(&body_json, super::MAX_RESPONSE_TEXT_CHARS),
+                    );
+                }
+            }
         }
 
         let response = self
@@ -370,6 +387,16 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 "gen_ai.response.finish_reasons",
                 format!("{:?}", response.stop_reason),
             );
+
+            // Attach response body for Langfuse Generation "Output" (#671)
+            if self.log_llm_bodies
+                && let Some(text) = super::serialize_response_text(
+                    &response.content,
+                    super::MAX_RESPONSE_TEXT_CHARS,
+                )
+            {
+                span.set_attribute("gen_ai.completion", text);
+            }
         }
 
         Ok(response)

@@ -916,32 +916,16 @@ async fn run_loop(
             match &llm_result {
                 Ok(resp) => {
                     // Serialize response content: text blocks + tool call summaries
-                    let response_text = {
-                        let mut parts = Vec::new();
-                        for block in &resp.content {
-                            match block {
-                                LlmResponseContent::Text(t) => parts.push(t.clone()),
-                                LlmResponseContent::ToolCall {
-                                    name, arguments, ..
-                                } => {
-                                    let args_str = arguments.to_string();
-                                    let args_truncated = crate::db::truncate_chars(&args_str, 200);
-                                    parts.push(format!("[Tool Call: {name}({args_truncated})]"));
-                                }
-                            }
-                        }
-                        let joined = parts.join("\n");
-                        let stripped = mika_common::llm::strip_internal_tags(&joined);
-                        if stripped.is_empty() {
-                            None
-                        } else {
-                            Some(crate::db::truncate_chars(&stripped, 50_000))
-                        }
-                    };
-                    let reasoning_text = resp
-                        .reasoning
-                        .as_deref()
-                        .map(|r| crate::db::truncate_chars(r, 50_000));
+                    let response_text = mika_common::llm::serialize_response_text(
+                        &resp.content,
+                        mika_common::llm::MAX_RESPONSE_TEXT_CHARS,
+                    );
+                    let reasoning_text = resp.reasoning.as_deref().map(|r| {
+                        mika_common::llm::truncate_chars(
+                            r,
+                            mika_common::llm::MAX_RESPONSE_TEXT_CHARS,
+                        )
+                    });
                     if let Err(e) = db
                         .save_llm_call(
                             &id,
