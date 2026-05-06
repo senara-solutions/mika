@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
 import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, LiveRefreshToggle, formatRelativeTime, type TimeRange } from '@senara-solutions/ui'
-import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
+import { useSearchParamsFilter, type SectionPageKey } from '../hooks/useSearchParamsFilter.ts'
 import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
@@ -257,8 +257,15 @@ function Section({
   )
 }
 
-function WorkItemsSection({ timeRange, refetchInterval }: { timeRange: TimeRange; refetchInterval: number | false }) {
-  const [page, setPage] = useState(1)
+interface SectionProps {
+  timeRange: TimeRange
+  refetchInterval: number | false
+  searchParams: URLSearchParams
+  setSectionPage: (key: SectionPageKey, page: number) => void
+}
+
+function WorkItemsSection({ timeRange, refetchInterval, searchParams, setSectionPage }: SectionProps) {
+  const page = Number(searchParams.get('wi_page')) || 1
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = { trigger_type: 'manual', from: timeRange.from, to: timeRange.to, page, per_page: 20 }
   const { data, isLoading, error, refetch } = useTasks(filters, refetchInterval)
@@ -295,15 +302,15 @@ function WorkItemsSection({ timeRange, refetchInterval }: { timeRange: TimeRange
               />
             ))}
           </TaskTable>
-          <Pagination page={page} perPage={20} total={data.total} onPageChange={setPage} />
+          <Pagination page={page} perPage={20} total={data.total} onPageChange={(p) => setSectionPage('wi_page', p)} />
         </>
       )}
     </Section>
   )
 }
 
-function TeamRunTasksSection({ timeRange, refetchInterval }: { timeRange: TimeRange; refetchInterval: number | false }) {
-  const [page, setPage] = useState(1)
+function TeamRunTasksSection({ timeRange, refetchInterval, searchParams, setSectionPage }: SectionProps) {
+  const page = Number(searchParams.get('trt_page')) || 1
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const filters: TasksFilters = {
     team_run_id: 'notnull',
@@ -346,15 +353,15 @@ function TeamRunTasksSection({ timeRange, refetchInterval }: { timeRange: TimeRa
               />
             ))}
           </TaskTable>
-          <Pagination page={page} perPage={20} total={data.total} onPageChange={setPage} />
+          <Pagination page={page} perPage={20} total={data.total} onPageChange={(p) => setSectionPage('trt_page', p)} />
         </>
       )}
     </Section>
   )
 }
 
-function StandaloneCallbacksSection({ timeRange, refetchInterval }: { timeRange: TimeRange; refetchInterval: number | false }) {
-  const [page, setPage] = useState(1)
+function StandaloneCallbacksSection({ timeRange, refetchInterval, searchParams, setSectionPage }: SectionProps) {
+  const page = Number(searchParams.get('cb_page')) || 1
   const filters: TasksFilters = {
     action_type: 'resume_agent,run_skill',
     team_run_id: 'null',
@@ -383,15 +390,15 @@ function StandaloneCallbacksSection({ timeRange, refetchInterval }: { timeRange:
               <TaskRow key={t.id} task={t} />
             ))}
           </TaskTable>
-          <Pagination page={page} perPage={20} total={data.total} onPageChange={setPage} />
+          <Pagination page={page} perPage={20} total={data.total} onPageChange={(p) => setSectionPage('cb_page', p)} />
         </>
       )}
     </Section>
   )
 }
 
-function ScheduledSection({ timeRange, refetchInterval }: { timeRange: TimeRange; refetchInterval: number | false }) {
-  const [page, setPage] = useState(1)
+function ScheduledSection({ timeRange, refetchInterval, searchParams, setSectionPage }: SectionProps) {
+  const page = Number(searchParams.get('sched_page')) || 1
   const filters: TasksFilters = {
     trigger_type: 'cron,one_shot',
     from: timeRange.from,
@@ -450,7 +457,7 @@ function ScheduledSection({ timeRange, refetchInterval }: { timeRange: TimeRange
               </ListRow>
             ))}
           </TaskTable>
-          <Pagination page={page} perPage={20} total={data.total} onPageChange={setPage} />
+          <Pagination page={page} perPage={20} total={data.total} onPageChange={(p) => setSectionPage('sched_page', p)} />
         </>
       )}
     </Section>
@@ -458,7 +465,7 @@ function ScheduledSection({ timeRange, refetchInterval }: { timeRange: TimeRange
 }
 
 export default function Tasks() {
-  const { searchParams, setSearchParams, updateFilter } = useSearchParamsFilter()
+  const { searchParams, setSearchParams, updateFilter, setSectionPage } = useSearchParamsFilter()
 
   const timeRange: TimeRange = {
     from: searchParams.get('from') ?? undefined,
@@ -467,7 +474,11 @@ export default function Tasks() {
 
   const isDefaultView =
     !timeRange.from &&
-    !timeRange.to
+    !timeRange.to &&
+    (Number(searchParams.get('wi_page')) || 1) === 1 &&
+    (Number(searchParams.get('trt_page')) || 1) === 1 &&
+    (Number(searchParams.get('cb_page')) || 1) === 1 &&
+    (Number(searchParams.get('sched_page')) || 1) === 1
 
   const { isLive, isEffectivelyLive, toggle, refetchInterval } = useLiveRefresh({
     defaultEnabled: false,
@@ -512,10 +523,10 @@ export default function Tasks() {
         </div>
       </div>
 
-      <WorkItemsSection key={`work-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} refetchInterval={refetchInterval} />
-      <TeamRunTasksSection key={`team-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} refetchInterval={refetchInterval} />
-      <StandaloneCallbacksSection key={`cb-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} refetchInterval={refetchInterval} />
-      <ScheduledSection key={`sched-${timeRange.from}-${timeRange.to}`} timeRange={timeRange} refetchInterval={refetchInterval} />
+      <WorkItemsSection timeRange={timeRange} refetchInterval={refetchInterval} searchParams={searchParams} setSectionPage={setSectionPage} />
+      <TeamRunTasksSection timeRange={timeRange} refetchInterval={refetchInterval} searchParams={searchParams} setSectionPage={setSectionPage} />
+      <StandaloneCallbacksSection timeRange={timeRange} refetchInterval={refetchInterval} searchParams={searchParams} setSectionPage={setSectionPage} />
+      <ScheduledSection timeRange={timeRange} refetchInterval={refetchInterval} searchParams={searchParams} setSectionPage={setSectionPage} />
     </div>
   )
 }

@@ -1,5 +1,5 @@
 import { useState, Fragment, useMemo } from 'react'
-import { useParams, Link } from 'react-router'
+import { useParams, Link, useSearchParams } from 'react-router'
 import { useSessionDetail, useSessionMessages, type Message } from '../api/sessions.ts'
 import { useTeamRun, useTeamWorkspace, type TeamWorkspaceEntry } from '../api/teams.ts'
 import { useSessionLlmCalls } from '../api/llmCalls.ts'
@@ -311,6 +311,12 @@ function toolSourceBadge(source: string) {
 
 type SessionTab = 'messages' | 'llm-calls' | 'tool-calls' | 'skills'
 
+const VALID_SESSION_TABS: readonly SessionTab[] = ['messages', 'llm-calls', 'tool-calls', 'skills']
+
+function isSessionTab(value: string | null): value is SessionTab {
+  return VALID_SESSION_TABS.includes(value as SessionTab)
+}
+
 function AgentAvatar({ name }: { name: string }) {
   const color = getAgentColor(name)
   return (
@@ -387,8 +393,24 @@ function roleConfig(role: string) {
 
 export default function SessionDetail() {
   const { sessionId } = useParams<{ sessionId: string }>()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [page, setPage] = useState(1)
-  const [activeTab, setActiveTab] = useState<SessionTab>('messages')
+
+  const rawTab = searchParams.get('tab')
+  const activeTab: SessionTab = isSessionTab(rawTab) ? rawTab : 'messages'
+  const setActiveTab = (tab: SessionTab) => {
+    const next = new URLSearchParams(searchParams)
+    if (tab === 'messages') {
+      next.delete('tab')
+    } else {
+      next.set('tab', tab)
+    }
+    setSearchParams(next)
+    // Reset sub-tab pagination on tab switch (consistent with AgentDetail.handleTabChange)
+    if (tab === 'messages') setPage(1)
+    if (tab === 'llm-calls') setLlmCallsPage(1)
+    if (tab === 'tool-calls') setToolCallsPage(1)
+  }
   const [llmCallsPage, setLlmCallsPage] = useState(1)
   const [toolCallsPage, setToolCallsPage] = useState(1)
   const [expandedToolCallIds, setExpandedToolCallIds] = useState<Set<string>>(new Set())
