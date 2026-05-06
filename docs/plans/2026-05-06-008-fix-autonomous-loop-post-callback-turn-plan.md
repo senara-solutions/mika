@@ -92,7 +92,9 @@ The ticket explicitly delegates this pick to the architect. Recommended pick: **
 
 **File touched:** `mika/crates/mika-agent/src/agent.rs`, `INTENT_GUARDS` const array (around lines 4307–4380).
 
-**New `IntentPrecondition` entry shape (append to `INTENT_GUARDS`):**
+**Registration position (architect NF2):** `callback_milestone_advance` must be registered in `INTENT_GUARDS` **immediately after `callback_terminal_action`** (entry e per the existing registry order). Per `agent.rs:1283-1322`'s linear iteration, multiple guards can fire on the same turn and produce correction messages in registration order. Registering the new guard after `callback_terminal_action` means the broader contract (terminal action: update_task_status + send_message) appears in the LLM's correction stream first, with the narrower additional milestone-advance requirement second. Reverse ordering would surface the narrower requirement before the broader one, producing confused correction-message semantics.
+
+**New `IntentPrecondition` entry shape (append to `INTENT_GUARDS` immediately after `callback_terminal_action`):**
 
 ```rust
 IntentPrecondition {
@@ -176,6 +178,14 @@ The first callback turn legitimately needs metadata extraction, deploy-hook chec
 
 **Cost concern:** PostCallbackAdvance fires every milestone-context callback. If the first turn DID advance, no second turn fires (engine-side check). Worst case: every other callback in a milestone fires a second turn at ~0.1-0.2K tokens per turn (tiny prompt — just the advance instruction). Cumulative cost is negligible vs. the chronic-stall cost.
 
+**Exhaustive match sites (architect NF3 — pre-flight, mandatory before Phase 2 commit):**
+
+```bash
+rg -n 'match.*SilentTrigger\b|SilentTrigger::(Heartbeat|Reflection|Callback|SkillRun|Reminder)' crates/
+```
+
+The `SilentTrigger` enum is defined in `crates/mika-agent/src/agent.rs:2839+`. Adding the `PostCallbackAdvance` variant requires updating every exhaustive `match` site over the enum. Expected sites (per the Phase 0 pin's grep at the same file): `agent.rs:2745, 2839, 2905, 2952, 2976, 3074, 4659, 6092, 6095` (multiple matches inside agent.rs alone), plus `task_engine/dispatcher.rs:667` and any other crate that imports the enum. The pre-flight grep above enumerates ALL sites; the implementer must update each. **Halt and surface** if the match-site count exceeds **15** sites — that's the soft signal that the enum is wider-used than expected and the variant addition crosses into a re-architecture rather than an incremental extension.
+
 ## Phase 3 — Prompt hardening (`self-dev/system_prompt.md`)
 
 **File touched:** `mika/skills/bundled/self-dev/system_prompt.md`, lines 101–129 (Callback Entry Point section).
@@ -249,6 +259,13 @@ If any of these files do NOT have a callback-turn section, the implementer adds 
 **Test 5 (Phase 4 sibling skills):** for each of self-dev-webhook-ci/qa, qa-review-build-callback, simulate the deliberation pattern. Assert: prompt-level rejection (or test-skip if those skills don't have engine-guard coverage in this PR).
 
 **Test 6 (Phase 5 heartbeat):** simulate heartbeat fire with an in-progress milestone whose latest child is completed-but-not-advanced. Assert: heartbeat advances the milestone (calls `run_claude_pilot` for next child).
+
+**Test 7 — 3-task chained advance integration (architect NF1, AC#3):** the end-to-end queue-sequencing test mandated by the ticket body's AC#3. Enqueue 3 milestone children. Run three sub-runs of the test, simulating child 1 returning each terminal status in turn:
+- **Sub-run 7a (success):** child 1 callback returns clean success → assert child 2 dispatch fires within engine cadence (`PostCallbackAdvance` trigger or first-turn advance) without operator intervention → child 2 callback returns clean success → assert child 3 fires.
+- **Sub-run 7b (auto_skipped):** child 1 callback returns `auto_skipped` (mika#988's structured skip path) → same chained-advance assertions.
+- **Sub-run 7c (failure):** child 1 callback returns terminal failure (after exhausted retries) → assert milestone advances to child 2 OR is marked `blocked` per Phase 1 Path B (test accepts either outcome — AC#3 says "fire in sequence" which implies advance, but failure-class outcomes legitimately block).
+
+Test 7 covers the integration of Phase 1 guard + Phase 2 advance trigger + Phase 5 heartbeat fallback (if heartbeat fires during the test window). It is the closure proof for AC#3 — a single-callback test (Tests 1-4) is insufficient.
 
 **Halt threshold (sibling of mika#988 Phase 3, mika#996 Phase 4):** if any test requires more than **80 lines** of harness setup beyond existing patterns, halt and surface. The eval harness should support these tests — guards are tested in the existing `tests/eval/grounding_regressions/` style.
 
