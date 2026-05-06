@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useParams, Link } from 'react-router'
 import { useDevRun } from '../api/devRuns.ts'
 import { useGitHubIssue, useGitHubPull, type GitHubReview } from '../api/github.ts'
-import { useTaskSessions, useTaskDescendants } from '../api/tasks.ts'
+import { useTaskSessions, useTaskDescendants, TERMINAL_STATUSES } from '../api/tasks.ts'
 import { useSessionMessages, type Message } from '../api/sessions.ts'
+import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import {
   TaskStatusBadge,
   CopyButton,
@@ -11,6 +12,7 @@ import {
   EmptyState,
   LoadingState,
   ErrorState,
+  LiveRefreshToggle,
   formatApiError,
   formatRelativeTime,
 } from '@senara-solutions/ui'
@@ -256,7 +258,24 @@ function SessionMessages({ sessionId }: { sessionId: string }) {
 
 export default function DevRunDetail() {
   const { taskId } = useParams<{ taskId: string }>()
-  const { data: run, isLoading, error, refetch } = useDevRun(taskId)
+
+  // Live-refresh: poll when the run is active (non-terminal).
+  // pollInterval is synced from useLiveRefresh via useEffect (one render behind)
+  // so that useDevRun receives the resolved interval on re-render.
+  const [pollInterval, setPollInterval] = useState<number | false>(false)
+  const { data: run, isLoading, error, refetch } = useDevRun(taskId, pollInterval)
+
+  const isActive = !!run && !TERMINAL_STATUSES.has(run.status)
+  const { isEffectivelyLive, toggle, refetchInterval } = useLiveRefresh({
+    defaultEnabled: true,
+    interval: 5_000,
+    isDefaultView: isActive,
+  })
+
+  // Sync computed refetchInterval → pollInterval state for useDevRun.
+  // One render behind: data loads → isActive changes → refetchInterval updates →
+  // effect fires → setPollInterval → re-render → useDevRun picks up new interval.
+  useEffect(() => { setPollInterval(refetchInterval) }, [refetchInterval])
 
   // Parse GitHub references from the run data
   const issueRef = run?.reference_url ? parseGitHubUrl(run.reference_url) : null
@@ -266,7 +285,7 @@ export default function DevRunDetail() {
       ? { owner: run.repo.split('/')[0], repo: run.repo.split('/')[1], number: run.pr_number, type: 'pull' as const }
       : null
 
-  // Fetch GitHub data (conditional on refs existing)
+  // Fetch GitHub data (conditional on refs existing) — excluded from live-refresh polling
   const { data: issue, error: issueError, isLoading: issueLoading, refetch: refetchIssue } = useGitHubIssue(
     issueRef?.owner ?? null,
     issueRef?.repo ?? null,
@@ -278,8 +297,8 @@ export default function DevRunDetail() {
     prRef?.number ?? null,
   )
 
-  // Fetch sessions and children
-  const { data: taskSessions } = useTaskSessions(taskId)
+  // Fetch sessions and children — sessions poll with live-refresh; descendants have own status-gated polling
+  const { data: taskSessions } = useTaskSessions(taskId, refetchInterval)
   const { data: descendants, isLoading: descendantsLoading } = useTaskDescendants(taskId, run?.status)
 
   if (isLoading) {
@@ -321,6 +340,7 @@ export default function DevRunDetail() {
             <CopyButton text={run.id} title="Copy ID" />
           </div>
         </div>
+        <LiveRefreshToggle isLive={isEffectivelyLive} onToggle={toggle} />
       </div>
 
       {/* Stats row */}

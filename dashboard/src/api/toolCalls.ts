@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from './client.ts'
 
 export interface ToolCallRow {
@@ -52,11 +52,13 @@ export function useToolCall(id: string | undefined) {
   })
 }
 
-export function useTraceToolCalls(traceId: string) {
+export function useTraceToolCalls(traceId: string, refetchInterval?: number | false) {
   return useQuery<ToolCallRow[]>({
     queryKey: ['trace-tool-calls', traceId],
     queryFn: () => apiFetch(`/traces/${traceId}/tool-calls`),
     enabled: !!traceId,
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
 

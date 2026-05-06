@@ -2,8 +2,9 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useSessions, type SessionsFilters } from '../api/sessions.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatRelativeTime } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, LiveRefreshToggle, formatRelativeTime } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
+import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { Search, Terminal, MessageSquare, Users, Settings, ArrowRightLeft } from 'lucide-react'
 
 const CHANNEL_OPTIONS = [
@@ -45,9 +46,23 @@ export default function Sessions() {
     per_page: 50,
   }
 
+  const isDefaultView =
+    !filters.agent_id &&
+    !filters.channel_type &&
+    !filters.session_id &&
+    !filters.from &&
+    !filters.to &&
+    (filters.page ?? 1) === 1
+
+  const { isLive, isEffectivelyLive, toggle, refetchInterval } = useLiveRefresh({
+    defaultEnabled: false,
+    interval: 15_000,
+    isDefaultView,
+  })
+
   const [sessionSearch, setSessionSearch] = useState(filters.session_id ?? '')
 
-  const { data, isLoading, error, refetch } = useSessions(filters)
+  const { data, isLoading, error, refetch } = useSessions(filters, refetchInterval)
   const { data: agents } = useAgents()
 
   return (
@@ -59,6 +74,11 @@ export default function Sessions() {
             {data ? `${data.total} session${data.total !== 1 ? 's' : ''} found` : 'Loading sessions...'}
           </p>
         </div>
+        <LiveRefreshToggle
+          isLive={isEffectivelyLive}
+          onToggle={toggle}
+          disabled={!isDefaultView && isLive}
+        />
       </div>
 
       {/* Filters */}

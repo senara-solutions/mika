@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from './client.ts'
 
 export interface LlmCallRow {
@@ -33,11 +33,13 @@ export interface LlmCallsFilters {
   per_page?: number
 }
 
-export function useLlmCalls(filters: LlmCallsFilters) {
+export function useLlmCalls(filters: LlmCallsFilters, refetchInterval?: number | false) {
   return useQuery<PaginatedResponse<LlmCallRow>>({
     queryKey: ['llm-calls', filters],
     queryFn: () =>
       apiFetch('/llm-calls', filters as Record<string, string | number | undefined>),
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
 
@@ -49,11 +51,13 @@ export function useLlmCall(id: string | undefined) {
   })
 }
 
-export function useTraceLlmCalls(traceId: string) {
+export function useTraceLlmCalls(traceId: string, refetchInterval?: number | false) {
   return useQuery<LlmCallRow[]>({
     queryKey: ['trace-llm-calls', traceId],
     queryFn: () => apiFetch(`/traces/${traceId}/llm-calls`),
     enabled: !!traceId,
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
 
@@ -100,10 +104,12 @@ export interface CostTrendFilters {
   bucket?: string
 }
 
-export function useCostTrend(filters: CostTrendFilters) {
+export function useCostTrend(filters: CostTrendFilters, refetchInterval?: number | false) {
   return useQuery<CostTrendResponse>({
     queryKey: ['cost-trend', filters],
     queryFn: () =>
       apiFetch('/llm-calls/cost-trend', filters as Record<string, string | undefined>),
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }

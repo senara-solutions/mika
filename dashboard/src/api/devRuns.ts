@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from './client.ts'
 
 export interface DevRun {
@@ -38,11 +38,13 @@ export function useDevRuns(filters: DevRunsFilters) {
   })
 }
 
-export function useDevRun(taskId: string | undefined) {
+export function useDevRun(taskId: string | undefined, refetchInterval?: number | false) {
   return useQuery<DevRun>({
     queryKey: ['dev-run', taskId],
     queryFn: () => apiFetch(`/dev-runs/${taskId}`),
     enabled: !!taskId,
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
 

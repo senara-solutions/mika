@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useParams, Link } from 'react-router'
 import {
   useTeamRun,
@@ -8,7 +8,9 @@ import {
 } from '../api/teams.ts'
 import { useTraceLlmCalls, type LlmCallRow } from '../api/llmCalls.ts'
 import { useTraceToolCalls, type ToolCallRow } from '../api/toolCalls.ts'
-import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime } from '@senara-solutions/ui'
+import { TERMINAL_STATUSES } from '../api/tasks.ts'
+import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
+import { TaskStatusBadge, CopyButton, EmptyState, LoadingState, ErrorState, formatApiError, MarkdownContent, formatRelativeTime, LiveRefreshToggle } from '@senara-solutions/ui'
 import TraceIdWidget from '../components/TraceIdWidget.tsx'
 import { ChevronDown, ChevronRight, Clock, Cpu, Wrench, Users, DollarSign, MessageSquare } from 'lucide-react'
 
@@ -420,14 +422,29 @@ function IterationSection({
 
 export default function TeamRunDetail() {
   const { runId } = useParams()
-  const { data: run, isLoading: runLoading, error: runError, refetch } = useTeamRun(runId)
-  const { data: summary } = useTeamRunSummary(runId)
-  const { data: workspace } = useTeamWorkspace(runId)
+
+  // Live-refresh: poll when the run is active (non-terminal).
+  // pollInterval is synced from useLiveRefresh via useEffect (one render behind)
+  // so that useTeamRun receives the resolved interval on re-render.
+  const [pollInterval, setPollInterval] = useState<number | false>(false)
+  const { data: run, isLoading: runLoading, error: runError, refetch } = useTeamRun(runId, pollInterval)
+
+  const isActive = !!run && !TERMINAL_STATUSES.has(run.status)
+  const { isEffectivelyLive, toggle, refetchInterval } = useLiveRefresh({
+    defaultEnabled: true,
+    interval: 5_000,
+    isDefaultView: isActive,
+  })
+
+  useEffect(() => { setPollInterval(refetchInterval) }, [refetchInterval])
+
+  const { data: summary } = useTeamRunSummary(runId, refetchInterval)
+  const { data: workspace } = useTeamWorkspace(runId, refetchInterval)
 
   // Fetch telemetry when trace_id is available
   const traceId = run?.trace_id ?? ''
-  const { data: llmCalls } = useTraceLlmCalls(traceId)
-  const { data: toolCalls } = useTraceToolCalls(traceId)
+  const { data: llmCalls } = useTraceLlmCalls(traceId, refetchInterval)
+  const { data: toolCalls } = useTraceToolCalls(traceId, refetchInterval)
 
   if (runLoading) {
     return <LoadingState variant="detail" />
@@ -494,10 +511,13 @@ export default function TeamRunDetail() {
               <TaskStatusBadge status={run.status} />
             </div>
           </div>
-          <div className="text-right text-xs text-muted/60 space-y-1">
-            <div>Started {formatRelativeTime(run.started_at)}</div>
-            {run.ended_at && <div>Ended {formatRelativeTime(run.ended_at)}</div>}
-            <div>{iterationLabel}</div>
+          <div className="flex items-start gap-4">
+            <LiveRefreshToggle isLive={isEffectivelyLive} onToggle={toggle} />
+            <div className="text-right text-xs text-muted/60 space-y-1">
+              <div>Started {formatRelativeTime(run.started_at)}</div>
+              {run.ended_at && <div>Ended {formatRelativeTime(run.ended_at)}</div>}
+              <div>{iterationLabel}</div>
+            </div>
           </div>
         </div>
 

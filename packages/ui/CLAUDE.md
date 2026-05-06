@@ -26,6 +26,7 @@ All components implement the [luminescent-core](../../docs/design/luminescent-co
 | `<AgentFilter>` | All agent-selection filters — thin adapter delegating to `<SelectFilter />` via consumer-injected `agents` prop | `{ agents, value, onChange, emptyLabel? }` | Audited clean (mika#655) |
 | `<TimeRangeFilter>` | All time-range filtering on dashboard list surfaces (presets + custom picker, ISO 8601 emission, server-side enforcement) | `{ value: { from?, to? }, onChange: (range) => void }` | Audited clean (mika#659) |
 | `<TokenBudgetBar>` | Token/resource budget progress bar with three-tier color thresholds (green <60%, amber 60-85%, red >85%) and ARIA meter semantics | `{ value, max, thresholds?: { warning, danger }, label?, showFraction? }` | New (mika#656) |
+| `<LiveRefreshToggle>` | Auto-refresh toggle with LIVE badge — canonical affordance for all dashboard live-refresh surfaces | `{ isLive, onToggle, disabled?, className? }` | New (mika#662) |
 
 ## Enforcement Rules
 
@@ -36,6 +37,7 @@ All components implement the [luminescent-core](../../docs/design/luminescent-co
 - **Hand-rolled categorical filters are forbidden.** Any dashboard list page rendering `<select>` for categorical filtering (agent, channel, status, event type, etc.) outside `<SelectFilter />` or `<AgentFilter />` is a review fail. See `luminescent-core.md` §5.3 for the filter affordance grammar.
 - **Hand-rolled lifecycle states are forbidden.** Any dashboard page rendering raw `Loading...` text, `text-red-400` error divs, or inline loading/error ternaries outside `<LoadingState />`, `<ErrorState />`, and `<EmptyState />` is a review fail. Error messages must use `formatApiError(error)` — never raw `error.message`. See `luminescent-core.md` §5.5 for the state catalog grammar.
 - **Hand-rolled time-range filters are forbidden.** Any dashboard list page rendering relative-time presets or `<input type="datetime-local">` for time filtering outside `<TimeRangeFilter />` is a review fail. See `luminescent-core.md` §5.4 for the time-range affordance grammar.
+- **Hand-rolled auto-refresh toggles are forbidden.** Any dashboard page rendering its own toggle switch + LIVE badge for auto-refresh outside `<LiveRefreshToggle />` is a review fail. Use `<LiveRefreshToggle isLive={...} onToggle={...} />`.
 
 ### `<AgentFilter />` callsite pattern
 

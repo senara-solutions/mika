@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { apiFetch, type PaginatedResponse } from './client.ts'
 
 export interface TeamRun {
@@ -63,26 +63,32 @@ export function useTeamRuns(filters: TeamRunsFilters) {
   })
 }
 
-export function useTeamRun(runId: string | undefined) {
+export function useTeamRun(runId: string | undefined, refetchInterval?: number | false) {
   return useQuery<TeamRun>({
     queryKey: ['team-run', runId],
     queryFn: () => apiFetch(`/team-runs/${runId}`),
     enabled: !!runId,
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
 
-export function useTeamRunSummary(runId: string | undefined) {
+export function useTeamRunSummary(runId: string | undefined, refetchInterval?: number | false) {
   return useQuery<TeamRunSummary>({
     queryKey: ['team-run-summary', runId],
     queryFn: () => apiFetch(`/team-runs/${runId}/summary`),
     enabled: !!runId,
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }
 
-export function useTeamWorkspace(runId: string | undefined) {
+export function useTeamWorkspace(runId: string | undefined, refetchInterval?: number | false) {
   return useQuery<TeamWorkspaceEntry[]>({
     queryKey: ['team-workspace', runId],
     queryFn: () => apiFetch(`/team-runs/${runId}/workspace`),
     enabled: !!runId,
+    refetchInterval,
+    placeholderData: keepPreviousData,
   })
 }

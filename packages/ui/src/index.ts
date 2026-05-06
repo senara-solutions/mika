@@ -21,6 +21,8 @@ export { default as TimeRangeFilter } from './components/TimeRangeFilter.tsx'
 export type { TimeRange, TimeRangePreset, TimeRangeFilterProps } from './components/TimeRangeFilter.tsx'
 export { default as TokenBudgetBar } from './components/TokenBudgetBar.tsx'
 export type { TokenBudgetBarProps, TokenBudgetTier } from './components/TokenBudgetBar.tsx'
+export { default as LiveRefreshToggle } from './components/LiveRefreshToggle.tsx'
+export type { LiveRefreshToggleProps } from './components/LiveRefreshToggle.tsx'
 
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'

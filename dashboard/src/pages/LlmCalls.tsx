@@ -1,9 +1,10 @@
 import { Link, useNavigate } from 'react-router'
 import { useLlmCalls, useCostTrend, type LlmCallsFilters, type CostTrendFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, TimeRangeFilter, formatTimestamp } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, TimeRangeFilter, LiveRefreshToggle, formatTimestamp } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
+import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { Search } from 'lucide-react'
 import CostTrendChart, { type ChartVariant } from '../components/CostTrendChart.tsx'
 
@@ -39,7 +40,20 @@ export default function LlmCalls() {
     per_page: 50,
   }
 
-  const { data, isLoading, error, refetch } = useLlmCalls(filters)
+  const isDefaultView =
+    !filters.agent_id &&
+    !filters.model &&
+    !filters.from &&
+    !filters.to &&
+    (filters.page ?? 1) === 1
+
+  const { isLive, isEffectivelyLive, toggle, refetchInterval } = useLiveRefresh({
+    defaultEnabled: false,
+    interval: 15_000,
+    isDefaultView,
+  })
+
+  const { data, isLoading, error, refetch } = useLlmCalls(filters, refetchInterval)
   const { data: agents } = useAgents()
 
   // Chart variant from URL param (default: total)
@@ -62,7 +76,7 @@ export default function LlmCalls() {
     from: filters.from,
     to: filters.to,
   }
-  const { data: costTrend, isLoading: costLoading, error: costError, refetch: costRefetch } = useCostTrend(costTrendFilters)
+  const { data: costTrend, isLoading: costLoading, error: costError, refetch: costRefetch } = useCostTrend(costTrendFilters, refetchInterval)
 
   return (
     <div>
@@ -74,6 +88,11 @@ export default function LlmCalls() {
             {data ? `${data.total} LLM call${data.total !== 1 ? 's' : ''} recorded` : 'Loading LLM calls...'}
           </p>
         </div>
+        <LiveRefreshToggle
+          isLive={isEffectivelyLive}
+          onToggle={toggle}
+          disabled={!isDefaultView && isLive}
+        />
       </div>
 
       {/* Filter bar */}
