@@ -252,7 +252,6 @@ skills/bundled/
 ├── deploy-mika/           # Deployment
 ├── agents-teams/          # Agent/team management
 ├── skill-review/          # Skill review handler
-├── mika-arch-groom-ticket/  # First-pass plan review (Sonnet 4.6) — produces READY/ITERATE/ESCALATE
 ├── dev-handsoff/            # End-of-run handsoff artifact writer (v0.1, artifact-only — keyword-triggered, prompt-only)
 ├── mika-arch-groom-ticket/  # First-pass plan review (Sonnet 4.6) — produces READY/ITERATE/ESCALATE
 ├── mika-arch-groom-milestone/ # Milestone-level plan review (Sonnet 4.6) — per-sub-issue + sequencing + cross-cutting
