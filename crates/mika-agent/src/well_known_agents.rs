@@ -944,6 +944,15 @@ mod tests {
         .unwrap();
         assert!(dev_identity.contains("name = \"Dev\""));
         assert!(dev_identity.contains("emoji = \"🛠\""));
+        // #800: mika-dev must be provisioned with KG disabled
+        assert!(
+            dev_identity.contains("[kg]"),
+            "mika-dev identity must contain [kg] section"
+        );
+        assert!(
+            dev_identity.contains("enabled = false"),
+            "mika-dev must have KG disabled (#800)"
+        );
 
         let qa_identity = fs::read_to_string(
             mika_common::agent::agent_dir(home, "mika-qa").join("identity.toml"),
@@ -951,6 +960,15 @@ mod tests {
         .unwrap();
         assert!(qa_identity.contains("name = \"QA\""));
         assert!(qa_identity.contains("emoji = \"🔍\""));
+        // #800: mika-qa must be provisioned with KG disabled
+        assert!(
+            qa_identity.contains("[kg]"),
+            "mika-qa identity must contain [kg] section"
+        );
+        assert!(
+            qa_identity.contains("enabled = false"),
+            "mika-qa must have KG disabled (#800)"
+        );
 
         let relay_identity = fs::read_to_string(
             mika_common::agent::agent_dir(home, "mika-relay").join("identity.toml"),
