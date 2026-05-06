@@ -22,7 +22,9 @@ This Dashboard is currently undergoing the first of three ecosystem-wide design 
 
 ## Pages
 
-Event Timeline, Agents, Sessions, Traces, Tasks (+ detail), Team Runs, LLM Calls (+ detail), Tool Calls (+ detail), Dev Runs (+ detail). Auth via `VITE_MIKA_DASHBOARD_TOKEN` env var. Bearer token. Imports shared components from `@senara-solutions/ui`. All list pages expose `<TimeRangeFilter />` with URL-reflected `?from=...&to=...` state (mika#659).
+**Overview / Home (mika#666):** Landing page at `/` (index route). Shows "state of the world" — stacked widget sections for Agents, Work Items, Dev Runs, Team Runs, Cost (24h), and Recent Activity. Composes existing API hooks on the frontend (no dedicated backend endpoint). Auto-refreshes all widgets at 15s shared interval with LIVE badge. Fresh-install gate: shows cohesive empty state when no agents are provisioned. Event Timeline moved to `/timeline`.
+
+Event Timeline (`/timeline`), Agents, Sessions, Traces, Tasks (+ detail), Team Runs, LLM Calls (+ detail), Tool Calls (+ detail), Dev Runs (+ detail). Auth via `VITE_MIKA_DASHBOARD_TOKEN` env var. Bearer token. Imports shared components from `@senara-solutions/ui`. All list pages expose `<TimeRangeFilter />` with URL-reflected `?from=...&to=...` state (mika#659).
 
 **LLM Calls page (mika#660):** `<CostTrendChart>` time-series visualization above the table, showing estimated cost over time aggregated from `llm_calls` token counts. Two variants: total (single line) and stacked-by-agent. Uses recharts. Backed by `GET /api/v1/llm-calls/cost-trend` with auto-bucketing (hourly <3d, daily ≥3d). Server defaults to last 24h when no `from` param. Pricing is estimated server-side via `crates/mika-agent/src/pricing.rs`.
 
