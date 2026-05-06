@@ -77,7 +77,7 @@ pub fn create_real_provider(kind: ProviderKind) -> Option<Arc<dyn LlmProvider>> 
         api_key,
     };
 
-    match create_provider(&spec, kind.max_output_tokens()) {
+    match create_provider(&spec, kind.max_output_tokens(), false) {
         Ok(provider) => Some(provider),
         Err(e) => {
             eprintln!(

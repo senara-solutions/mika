@@ -206,7 +206,7 @@ pub fn create_kg_provider(spec: &KgProviderSpec) -> Option<Arc<dyn LlmProvider>>
     };
 
     // 4096 max tokens is plenty for JSON extraction/resolution output.
-    match create_provider(&model_spec, 4096) {
+    match create_provider(&model_spec, 4096, false) {
         Ok(provider) => Some(provider),
         Err(e) => {
             eprintln!(

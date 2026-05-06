@@ -67,7 +67,7 @@ The `send_message` method was split into `send_message` (span + telemetry wrappe
 
 - **Filter applied inside `build_otel_layer()`**, not in `logging.rs` match arms — avoids type-level explosion (see `docs/solutions/architecture-patterns/log-format-selection-tracing-subscriber.md`).
 - **`set_attribute()` over tracing field names** — gen_ai attribute keys have dots (`gen_ai.operation.name`) which work as tracing field names but `set_attribute()` is cleaner and naturally feature-gated.
-- **No prompt/response content in spans** — only metadata (model, tokens, stop reason). Sensitive data stays out of Langfuse.
+- **~~No prompt/response content in spans~~ — Reversed by #671.** When `MIKA_LOG_LLM_BODIES=true` AND telemetry is enabled, request bodies are attached as `gen_ai.prompt` and response bodies as `gen_ai.completion` span attributes. This populates Langfuse's Generation "Input"/"Output" fields. Gated behind the existing `log_llm_bodies` toggle — the operator explicitly opts in. When `log_llm_bodies=false` (default), only metadata (model, tokens, stop reason) is sent, preserving the original behavior.
 - **`use<>` precise capturing** — required in Rust 2024 edition for `impl Trait` return types that take `&Settings` but don't capture the lifetime.
 
 ## Prevention

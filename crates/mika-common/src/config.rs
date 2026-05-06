@@ -1104,7 +1104,7 @@ impl Settings {
             base_url: config.base_url,
             api_key: config.api_key,
         };
-        crate::llm::create_provider(&spec, self.llm_max_tokens)
+        crate::llm::create_provider(&spec, self.llm_max_tokens, self.log_llm_bodies)
     }
 
     /// Create an LLM provider for a specific provider kind with an optional model override.
@@ -1131,7 +1131,7 @@ impl Settings {
             base_url: base_url.map(String::from),
             api_key: api_key.map(String::from),
         };
-        crate::llm::create_provider(&spec, self.llm_max_tokens)
+        crate::llm::create_provider(&spec, self.llm_max_tokens, self.log_llm_bodies)
     }
 
     /// Create an LLM provider for KG extraction (NER + fact triples).

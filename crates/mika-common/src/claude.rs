@@ -334,10 +334,20 @@ pub struct ClaudeClient {
     auth: AnthropicAuth,
     pub model: String,
     pub max_tokens: u32,
+    /// When true AND the `telemetry` feature is enabled, attach request/response
+    /// bodies as `gen_ai.prompt` / `gen_ai.completion` span attributes on `llm_call`
+    /// spans for Langfuse generation input/output. See #671.
+    #[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
+    pub log_llm_bodies: bool,
 }
 
 impl ClaudeClient {
-    pub fn new(api_key: Option<String>, model: String, max_tokens: u32) -> Result<Self> {
+    pub fn new(
+        api_key: Option<String>,
+        model: String,
+        max_tokens: u32,
+        log_llm_bodies: bool,
+    ) -> Result<Self> {
         let credential = api_key
             .map(|k| k.trim().to_string())
             .filter(|k| !k.is_empty())
@@ -366,6 +376,7 @@ impl ClaudeClient {
             auth,
             model,
             max_tokens,
+            log_llm_bodies,
         })
     }
 
@@ -377,6 +388,7 @@ impl ClaudeClient {
             auth: AnthropicAuth::ApiKey(String::new()),
             model: String::new(),
             max_tokens: 0,
+            log_llm_bodies: false,
         }
     }
 
@@ -410,6 +422,16 @@ impl ClaudeClient {
             span.set_attribute("gen_ai.provider.name", "anthropic");
             span.set_attribute("gen_ai.request.model", request.model.clone());
             span.set_attribute("gen_ai.request.max_tokens", request.max_tokens as i64);
+
+            // Attach request body for Langfuse Generation "Input" (#671)
+            if self.log_llm_bodies
+                && let Ok(body_json) = serde_json::to_string(request)
+            {
+                span.set_attribute(
+                    "gen_ai.prompt",
+                    crate::llm::truncate_chars(&body_json, crate::llm::MAX_RESPONSE_TEXT_CHARS),
+                );
+            }
         }
 
         let response = self
@@ -433,6 +455,34 @@ impl ClaudeClient {
                 "gen_ai.response.finish_reasons",
                 format!("{:?}", response.stop_reason),
             );
+
+            // Attach response body for Langfuse Generation "Output" (#671)
+            if self.log_llm_bodies {
+                let content: Vec<crate::llm::LlmResponseContent> = response
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => {
+                            Some(crate::llm::LlmResponseContent::Text(text.clone()))
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            Some(crate::llm::LlmResponseContent::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: input.clone(),
+                            })
+                        }
+                        ContentBlock::Thinking { .. } | ContentBlock::Image { .. } => None,
+                        ContentBlock::ToolResult { .. } => None,
+                    })
+                    .collect();
+                if let Some(text) = crate::llm::serialize_response_text(
+                    &content,
+                    crate::llm::MAX_RESPONSE_TEXT_CHARS,
+                ) {
+                    span.set_attribute("gen_ai.completion", text);
+                }
+            }
         }
 
         Ok(response)
@@ -749,13 +799,13 @@ mod tests {
     #[test]
     fn test_new_trims_api_key_whitespace() {
         let client =
-            ClaudeClient::new(Some("  sk-ant-test  ".into()), "model".into(), 100).unwrap();
+            ClaudeClient::new(Some("  sk-ant-test  ".into()), "model".into(), 100, false).unwrap();
         assert!(matches!(client.auth, AnthropicAuth::ApiKey(ref k) if k == "sk-ant-test"));
     }
 
     #[test]
     fn test_new_rejects_whitespace_only_key() {
-        let result = ClaudeClient::new(Some("   ".into()), "model".into(), 100);
+        let result = ClaudeClient::new(Some("   ".into()), "model".into(), 100, false);
         let Err(e) = result else {
             panic!("should reject whitespace-only key");
         };
@@ -764,7 +814,7 @@ mod tests {
 
     #[test]
     fn test_new_rejects_none_key() {
-        let result = ClaudeClient::new(None, "model".into(), 100);
+        let result = ClaudeClient::new(None, "model".into(), 100, false);
         let Err(e) = result else {
             panic!("should reject None key");
         };
@@ -782,16 +832,26 @@ mod tests {
 
     #[test]
     fn test_new_with_oauth_token() {
-        let client =
-            ClaudeClient::new(Some("sk-ant-oat01-test-token".into()), "model".into(), 100).unwrap();
+        let client = ClaudeClient::new(
+            Some("sk-ant-oat01-test-token".into()),
+            "model".into(),
+            100,
+            false,
+        )
+        .unwrap();
         assert!(client.auth.is_oauth());
         assert!(matches!(client.auth, AnthropicAuth::OAuthManaged(_)));
     }
 
     #[test]
     fn test_new_with_api_key() {
-        let client =
-            ClaudeClient::new(Some("sk-ant-api03-test-key".into()), "model".into(), 100).unwrap();
+        let client = ClaudeClient::new(
+            Some("sk-ant-api03-test-key".into()),
+            "model".into(),
+            100,
+            false,
+        )
+        .unwrap();
         assert!(!client.auth.is_oauth());
         assert!(matches!(client.auth, AnthropicAuth::ApiKey(_)));
     }

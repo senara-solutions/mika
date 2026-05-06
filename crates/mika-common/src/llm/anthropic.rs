@@ -20,8 +20,13 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: Option<String>, model: String, max_tokens: u32) -> Result<Self> {
-        let client = ClaudeClient::new(api_key, model, max_tokens)?;
+    pub fn new(
+        api_key: Option<String>,
+        model: String,
+        max_tokens: u32,
+        log_llm_bodies: bool,
+    ) -> Result<Self> {
+        let client = ClaudeClient::new(api_key, model, max_tokens, log_llm_bodies)?;
         Ok(Self { client })
     }
 

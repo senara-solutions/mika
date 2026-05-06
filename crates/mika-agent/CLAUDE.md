@@ -427,7 +427,7 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 
 **Span filtering:** Per-layer `filter::Targets` on the OTel layer exports only `target: "mika::otel"` spans (LLM calls, agent turns, server requests).
 
-**LLM observability:** `llm_call` spans with `gen_ai.*` semantic convention attributes, feature-gated behind `#[cfg(feature = "telemetry")]`. Team engine emits `TeamEvent` variants for live dashboard updates.
+**LLM observability:** `llm_call` spans with `gen_ai.*` semantic convention attributes, feature-gated behind `#[cfg(feature = "telemetry")]`. When `log_llm_bodies=true`, request/response bodies are attached as `gen_ai.prompt`/`gen_ai.completion` span attributes for Langfuse Generation input/output (#671). Response bodies use `serialize_response_text()` from `mika-common::llm` (same format as `llm_calls.response_text`). Team engine emits `TeamEvent` variants for live dashboard updates.
 
 **Session lifecycle:** Silent dispatcher variants call `end_session()` after completion. CLI commands call `end_session()` on all exit paths. `startup_recovery()` prunes old sessions via `prune_old_sessions()`.
 

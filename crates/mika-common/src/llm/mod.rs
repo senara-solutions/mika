@@ -85,6 +85,57 @@ pub fn strip_internal_tags(text: &str) -> String {
     collapsed.trim().to_string()
 }
 
+/// Maximum characters for serialized response text in both the `llm_calls` table
+/// and telemetry span attributes. Shared constant to keep both stores consistent.
+pub const MAX_RESPONSE_TEXT_CHARS: usize = 50_000;
+
+/// Maximum characters for truncated tool call arguments in response text summaries.
+const MAX_TOOL_ARGS_CHARS: usize = 200;
+
+/// Serialize LLM response content blocks into a human-readable text representation.
+///
+/// Joins text blocks with newlines, formats tool calls as `[Tool Call: name(args)]`
+/// with truncated arguments, strips internal tags, and truncates to `max_chars`.
+/// Returns `None` if the result is empty after stripping.
+///
+/// This is the canonical serialization used by both:
+/// - `llm_calls.response_text` column (schema v31, #653)
+/// - `gen_ai.completion` OTLP span attribute (#671)
+pub fn serialize_response_text(content: &[LlmResponseContent], max_chars: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    for block in content {
+        match block {
+            LlmResponseContent::Text(t) => parts.push(t.clone()),
+            LlmResponseContent::ToolCall {
+                name, arguments, ..
+            } => {
+                let args_str = arguments.to_string();
+                let args_truncated = truncate_chars(&args_str, MAX_TOOL_ARGS_CHARS);
+                parts.push(format!("[Tool Call: {name}({args_truncated})]"));
+            }
+        }
+    }
+    let joined = parts.join("\n");
+    let stripped = strip_internal_tags(&joined);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&stripped, max_chars))
+    }
+}
+
+/// Truncate a string to `max_chars` characters, appending "..." if truncated.
+///
+/// UTF-8 safe — counts characters, not bytes.
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{truncated}...")
+    }
+}
+
 /// Provider-agnostic trait for LLM chat completions.
 ///
 /// Each provider (Anthropic, OpenAI-compatible, etc.) implements this trait
@@ -326,13 +377,18 @@ impl FromStr for ProviderKind {
 ///
 /// For Anthropic, uses the native Anthropic API client.
 /// For all others, uses the OpenAI-compatible provider.
-pub fn create_provider(spec: &ModelSpec, max_tokens: u32) -> Result<Arc<dyn LlmProvider>> {
+pub fn create_provider(
+    spec: &ModelSpec,
+    max_tokens: u32,
+    log_llm_bodies: bool,
+) -> Result<Arc<dyn LlmProvider>> {
     match spec.provider {
         ProviderKind::Anthropic => {
             let provider = anthropic::AnthropicProvider::new(
                 spec.api_key.clone(),
                 spec.model.clone(),
                 max_tokens,
+                log_llm_bodies,
             )
             .context("failed to create Anthropic provider")?;
             Ok(Arc::new(provider))
@@ -351,6 +407,7 @@ pub fn create_provider(spec: &ModelSpec, max_tokens: u32) -> Result<Arc<dyn LlmP
                 spec.model.clone(),
                 max_tokens,
                 spec.provider,
+                log_llm_bodies,
             );
             Ok(Arc::new(provider))
         }
@@ -637,6 +694,94 @@ Bye."#;
         let input =
             r#"Hi <context type="x">data</context> and <context type="y">more data context > end"#;
         assert_eq!(strip_internal_tags(input), "Hi  and  end");
+    }
+
+    // -- truncate_chars tests --
+
+    #[test]
+    fn test_truncate_chars_short_string() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_chars_exact_length() {
+        assert_eq!(truncate_chars("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_chars_long_string() {
+        assert_eq!(truncate_chars("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_chars_multibyte_utf8() {
+        // Ensure it counts chars, not bytes — "é" is 2 bytes but 1 char
+        let input = "café latte";
+        assert_eq!(truncate_chars(input, 4), "café...");
+    }
+
+    // -- serialize_response_text tests --
+
+    #[test]
+    fn test_serialize_response_text_text_only() {
+        let content = vec![LlmResponseContent::Text("Hello world".into())];
+        let result = serialize_response_text(&content, 50_000);
+        assert_eq!(result, Some("Hello world".into()));
+    }
+
+    #[test]
+    fn test_serialize_response_text_mixed_content() {
+        let content = vec![
+            LlmResponseContent::Text("Let me search.".into()),
+            LlmResponseContent::ToolCall {
+                id: "tc_1".into(),
+                name: "search_memory".into(),
+                arguments: serde_json::json!({"query": "test"}),
+            },
+        ];
+        let result = serialize_response_text(&content, 50_000).unwrap();
+        assert!(result.contains("Let me search."));
+        assert!(result.contains("[Tool Call: search_memory("));
+        assert!(result.contains("\"query\":\"test\""));
+    }
+
+    #[test]
+    fn test_serialize_response_text_empty() {
+        let content: Vec<LlmResponseContent> = vec![];
+        assert_eq!(serialize_response_text(&content, 50_000), None);
+    }
+
+    #[test]
+    fn test_serialize_response_text_truncates() {
+        let content = vec![LlmResponseContent::Text("a".repeat(60_000))];
+        let result = serialize_response_text(&content, 50_000).unwrap();
+        // 50000 chars + "..."
+        assert!(result.len() <= 50_003 + 10); // char count, not byte count
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_serialize_response_text_tool_args_truncated() {
+        let long_args = serde_json::json!({"key": "x".repeat(300)});
+        let content = vec![LlmResponseContent::ToolCall {
+            id: "tc_1".into(),
+            name: "my_tool".into(),
+            arguments: long_args,
+        }];
+        let result = serialize_response_text(&content, 50_000).unwrap();
+        assert!(result.contains("[Tool Call: my_tool("));
+        // The args should be truncated to 200 chars with "..."
+        assert!(result.contains("..."));
+    }
+
+    #[test]
+    fn test_serialize_response_text_strips_internal_tags() {
+        let content = vec![LlmResponseContent::Text(
+            "Hello <context type=\"tool_history\" trust=\"metadata\">hidden</context> world".into(),
+        )];
+        let result = serialize_response_text(&content, 50_000).unwrap();
+        assert_eq!(result, "Hello  world");
+        assert!(!result.contains("hidden"));
     }
 
     // -- send_message_with_deadline default implementation tests --
