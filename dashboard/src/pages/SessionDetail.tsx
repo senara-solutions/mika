@@ -313,8 +313,8 @@ type SessionTab = 'messages' | 'llm-calls' | 'tool-calls' | 'skills'
 
 const VALID_SESSION_TABS: readonly SessionTab[] = ['messages', 'llm-calls', 'tool-calls', 'skills']
 
-function isSessionTab(value: string | null): value is SessionTab {
-  return VALID_SESSION_TABS.includes(value as SessionTab)
+function isSessionTab(value: string | null | undefined): value is SessionTab {
+  return value != null && VALID_SESSION_TABS.includes(value as SessionTab)
 }
 
 function AgentAvatar({ name }: { name: string }) {
@@ -396,7 +396,7 @@ export default function SessionDetail() {
   const navigate = useNavigate()
   const [page, setPage] = useState(1)
 
-  const activeTab: SessionTab = isSessionTab(tabParam ?? null) ? (tabParam as SessionTab) : 'messages'
+  const activeTab: SessionTab = isSessionTab(tabParam) ? tabParam : 'messages'
   const setActiveTab = (tab: SessionTab) => {
     const path = tab === 'messages' ? `/sessions/${sessionId}` : `/sessions/${sessionId}/${tab}`
     navigate(path, { replace: true })
