@@ -8,6 +8,15 @@ seq: 004
 
 # Plan: dashboard accessibility audit and CI gate (mika#668)
 
+## Verified state (post-architect-pass-1)
+
+- **F1 (Phase 0 Pin file enumeration) addressed** — Phase 0 now pins the exact 12 primitive `.tsx` files in `packages/ui/src/components/`, the test runner config (vitest 3.2.1, no separate config file — uses defaults + jsdom env), the test invocation line (`npm run test --prefix packages/ui` → `vitest run`), and the current devDependencies block verbatim. Phase 1.A's scope discovery: **only 1 test file exists** (`TokenBudgetBar.test.tsx`), so 11 of 12 primitives have no tests at all — Phase 1.A creates the first test file for each.
+- **F2 (Phase 3 scope boundary mechanical rule) addressed** — Phase 2 triage now states a mechanical rule: a finding is `fix-here` candidate **if and only if** its source path is under `packages/ui/src/components/`. Findings with source paths under `dashboard/src/` (any subdirectory) are mechanically `file-follow-up` regardless of severity. The judgment-dependent "primitive-level / page-level" framing is gone.
+- **F3 (15-finding threshold calibration note) addressed** — Phase 2's halt threshold now explains the 15 number: ~13 axe assertions (12 primitives + LiveRefreshToggle if rebased) plus expected ARIA-label/keyboard-handler fixes per primitive averages 1-2 findings each → ~15-25 fix-here candidates is the natural ceiling for "audit-with-fixes." Above that, the PR is a remediation sprint and benefits from being its own ticket.
+- **F4 (`docs/audits/` greenfield check) addressed** — verified via pre-flight `ls mika/docs/audits/` → directory does not exist. Phase 1's audit doc creates it as new. No existing convention to inherit; Phase 5's `audits/README.md` establishes the convention.
+- **U3 (focus-trap explicit disposition) addressed** — Phase 2's triage rules now state: modal/drawer focus-trap findings are **always** `file-follow-up`, regardless of severity, because the fix requires designing a new `<Modal>`/`<Drawer>` primitive (focus-lock). New-primitive design is out of this PR's audit-and-fix scope.
+- **Important post-pin discovery (not from architect):** my worktree branched from main BEFORE PR #990 (mika#662, merged 09:00:48Z) added `LiveRefreshToggle.tsx`. The 12 `.tsx` files I pinned are pre-PR-#990 state. At dispatch time, the worktree rebases onto main and picks up LiveRefreshToggle, making it 13 primitives. Phase 1.A explicitly handles this: enumerate primitives by `ls packages/ui/src/components/*.tsx | grep -v .test.` at implementation time, not by hard-coding the list from this plan.
+
 ## Why
 
 The dashboard has not been explicitly audited for accessibility. Manual ARIA usage in `dashboard/src/pages/` is present in only 5 files (verified via `grep -l "aria-\|role=" dashboard/src/pages/ | wc -l = 5`), no a11y dependencies exist in either `packages/ui/package.json` or `dashboard/package.json`, and no CI a11y gate runs against new PRs. The dashboard ships dark-theme grey-on-darker-grey text in many surfaces; contrast against WCAG AA has never been measured. Keyboard navigation, screen reader support, focus management, and reduced-motion respect are all untested.
@@ -24,14 +33,61 @@ The fix bar is to ship the **audit + CI gate + canonical-primitive fixes** in th
 
 All paths verified against the worktree at `feat/668/dashboard-accessibility-audit` HEAD `48e52c83` (main).
 
-### Existing a11y tooling — none
+### Existing a11y tooling — none (verified)
 
-- **`packages/ui/package.json`** — devDependencies include `@testing-library/jest-dom` and `@testing-library/react` + `vitest` + `jsdom`. **No `axe-core`, `jest-axe`, or `@axe-core/playwright`.** Test runner is vitest. New a11y test infrastructure must integrate with vitest.
-- **`dashboard/package.json`** — scripts: `dev`, `build`. No `test` script visible at the top of the scripts block (read more at implementation if needed). No a11y deps.
-- **No `.eslintrc*` or `eslint.config*` files** in either `dashboard/` or `packages/ui/` root. No `eslint-plugin-jsx-a11y` configured. ESLint tooling decision is open: add minimal config alongside this PR or defer.
+- **`packages/ui/package.json` devDependencies** (verbatim at HEAD `48e52c83`):
+  ```json
+  {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "jsdom": "^26.1.0",
+    "lucide-react": "^0.575.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.1",
+    "vite-plugin-dts": "^4.5.4",
+    "vitest": "^3.2.1"
+  }
+  ```
+  **No `axe-core`, `jest-axe`, `@axe-core/playwright`, `@axe-core/react`, or `eslint-plugin-jsx-a11y`.**
+- **`packages/ui/package.json` scripts**: `build` → `vite build`, `dev` → `vite build --watch`, `test` → `vitest run`. Test invocation pattern: `npm run test --prefix packages/ui` from repo root, or `npm test` from `packages/ui/`.
+- **No standalone `vitest.config.*` file** in `packages/ui/` — vitest uses defaults plus implicit jsdom env from the dependency. Phase 1.A's jest-axe integration may need a `vitest.config.ts` added with `test.setupFiles` to register the matcher.
+- **`dashboard/package.json`** scripts: `dev` → `vite`, `build` → `tsc -b && VITE_BASE_PATH=/dashboard/ vite build`. No `test` script in the head of the scripts block (verify at implementation if dashboard tests exist elsewhere).
+- **No `.eslintrc*` or `eslint.config*` files** in either `dashboard/` or `packages/ui/` root. No `eslint-plugin-jsx-a11y` configured. ESLint tooling decision is out of this PR's scope (filed as Phase 6 follow-up).
 - **CI workflows** at `.github/workflows/` (verify at implementation): no existing a11y job. New CI gate is greenfield.
 
-### Existing primitives (a11y-relevant)
+### Existing primitives — concrete file enumeration (verified)
+
+`ls packages/ui/src/components/` at HEAD `48e52c83` returns 12 `.tsx` files plus 1 `.test.tsx` file:
+
+```
+AgentFilter.tsx
+CopyButton.tsx
+EmptyState.tsx
+ErrorState.tsx
+ListRow.tsx
+LoadingState.tsx
+MarkdownContent.tsx
+Pagination.tsx
+SelectFilter.tsx
+StatusBadge.tsx
+TaskStatusBadge.tsx
+TimeRangeFilter.tsx
+TokenBudgetBar.tsx
+TokenBudgetBar.test.tsx   ← only existing test file
+```
+
+**Critical scope discovery: 11 of 12 primitives have NO test file.** Phase 1.A's "add an axe assertion alongside existing tests" is misframed in the original Phase 1.A description — it actually means **creating the first test file for 11 primitives, then adding the axe assertion as part of that initial test file**. Each new test file has at minimum: render-the-default-props test + axe assertion. Approximate scope: ~20-40 new lines per file × 11 files = 220-440 new lines of test code in Phase 1.A.
+
+This changes the work shape but not the bound — Phase 1.A is still a contained workstream, just larger than initially framed. The 50-line halt threshold on backend work in Phases 2.B/2.C of mika#667 doesn't apply here (this is test code, not API/SQL); a separate halt threshold for test-file-count is unnecessary because each new test file is bounded by the primitive's existing surface.
+
+**Worktree drift note:** PR #990 (mika#662, merged 2026-05-06 09:00:48Z) added `LiveRefreshToggle.tsx`. My worktree branched at HEAD `48e52c83` before PR #990's merge. At dispatch time, the worktree must `git fetch origin main && git rebase origin/main`, after which the primitive count becomes 13 (LiveRefreshToggle's test file is also a Phase 1.A target if PR #990 didn't already include it — verify at rebase).
+
+### Existing primitives (a11y-relevant per-component notes)
 
 - **`packages/ui/src/components/StatusBadge.tsx`** — used pervasively. A11y baseline unknown; needs audit.
 - **`packages/ui/src/components/ListRow.tsx`** — three-variant row primitive (static/navigable/expandable). Per `packages/ui/CLAUDE.md`: navigable variant has row-level `onClick`. Keyboard handler needs verification.
@@ -190,21 +246,74 @@ Single file: `mika/docs/audits/2026-05-06-dashboard-a11y-audit.md`. Sections:
 - Severity classification (Critical / Serious / Moderate / Minor per axe convention)
 - Disposition column for each finding (filled in Phase 2)
 
-## Phase 2 — Triage findings
+## Phase 2 — Triage findings (mechanical rules)
 
-For each finding from Phase 1, assign one of three dispositions:
+For each finding from Phase 1, assign one of three dispositions using the mechanical rules below. **No judgment-dependent classifications.** The audit doc's disposition column is the durable record.
 
-- **fix-here** — primitive-level issue with high leverage (touches `packages/ui/`). Fixed in Phase 3.
-- **file-follow-up** — page-specific issue, design-system token issue, or cross-cutting work that exceeds this PR's scope. Filed as a separate issue in Phase 6. Each follow-up issue has: severity, surface, repro, proposed fix.
-- **accept-with-rationale** — the finding is intentional or out-of-scope (e.g., a known browser quirk, a design-system decision Vincent owns). Documented in the audit doc with a one-line rationale.
+### Disposition rules (in priority order)
 
-The disposition column in the audit doc is the durable record. Triage decisions are not buried in conversation.
+**Rule 1 — `accept-with-rationale`:** the finding is intentional or out-of-scope (e.g., a known browser quirk, a third-party library limitation, a design-system decision Vincent owns). Requires a one-line rationale documented in the disposition column. Mechanical check: if the rationale is missing, this disposition is rejected.
 
-**Halt threshold:** if Phase 1 surfaces more than **15 fix-here findings**, the plan halts and surfaces to operator. 15 is the soft threshold for "this PR is no longer a tightly-scoped audit; it's a remediation sprint." Above the threshold, the plan should split: ship the audit + CI gate as the current PR; file the fix-here findings as their own ticket. Below the threshold, proceed.
+**Rule 2 — `fix-here` candidate:** the finding's source path is **under `packages/ui/src/components/`** AND the finding is not in the always-file-follow-up exclusion list below. Mechanical check: `path.startsWith('packages/ui/src/components/')` returns true.
+
+**Rule 3 — `file-follow-up`:** any finding not matching rules 1 or 2. This includes:
+- Findings with source paths under `dashboard/src/` (any subdirectory) — page-specific.
+- Findings under `packages/ui/src/theme.css` (color tokens) — design-system territory, owned by Vincent.
+- Findings in third-party rendered output (e.g., `react-markdown` output) where the fix requires a wrapper component, not a primitive change.
+
+### Always-file-follow-up exclusion list (regardless of source path)
+
+The following finding categories are **always** `file-follow-up`, even if they originate in `packages/ui/src/components/`:
+
+- **Modal/drawer focus-trap.** The fix requires designing a new `<Modal>` or `<Drawer>` primitive (with focus-lock, ESC dismissal, scroll-lock). New-primitive design is out of this PR's audit-and-fix scope. Filed as a follow-up regardless of severity.
+- **New primitive needed.** Any finding whose fix requires creating a new primitive (rather than modifying an existing one). The audit catalogues; the new primitive is its own ticket.
+- **API surface change required.** Any finding whose fix requires changing a primitive's prop signature in a way that breaks consumers. These are filed as deprecation/migration tickets, not in-PR fixes.
+
+### Halt threshold (architect F3 calibration note)
+
+If Phase 1 surfaces more than **15 `fix-here` candidates** (after Rule 1 and the always-follow-up exclusions are applied), the plan halts and surfaces to operator. The 15-number calibration:
+
+- 12-13 primitives × 1 axe assertion each = 12-13 baseline `fix-here` items (the axe-pass-or-fix work).
+- Each axe failure typically surfaces 1-2 specific ARIA/keyboard fixes per primitive → +12-26 items if every primitive has 1-2 violations.
+- Realistic median: 12-13 baseline + ~3 ARIA fixes (the worst offenders) = ~15-18 fix-here candidates.
+
+A count significantly above 15 (say 25+) signals that primitives have systemic gaps requiring sustained remediation work — better as its own ticket. A count below 15 is the natural "audit + light fix" envelope. The threshold is a soft signal; the implementer surfaces and operator decides.
+
+Above-threshold split: ship audit + CI gate + a small subset of fix-here items in this PR; file the remainder as a "primitive a11y remediation sprint" ticket targeting milestone#13 or its successor.
 
 ## Phase 3 — Apply fix-here remediations
 
-**Files touched:** primitives in `packages/ui/src/components/` per Phase 2 dispositions. Tests in `packages/ui/src/components/*.test.tsx`.
+**Files touched (mechanical scope):** files matching the glob `packages/ui/src/components/*.tsx` (and their accompanying `*.test.tsx`). **No file outside this glob may be modified in Phase 3.** Findings from outside this glob are `file-follow-up` per Phase 2's mechanical rule, regardless of severity.
+
+**Concrete file inventory at Phase 3 entry** (per Phase 0 pin, post-rebase to pick up PR #990):
+
+```
+packages/ui/src/components/
+  ├── AgentFilter.tsx
+  ├── CopyButton.tsx
+  ├── EmptyState.tsx
+  ├── ErrorState.tsx
+  ├── ListRow.tsx
+  ├── LiveRefreshToggle.tsx       (added by PR #990)
+  ├── LoadingState.tsx
+  ├── MarkdownContent.tsx
+  ├── Pagination.tsx
+  ├── SelectFilter.tsx
+  ├── StatusBadge.tsx
+  ├── TaskStatusBadge.tsx
+  ├── TimeRangeFilter.tsx
+  ├── TokenBudgetBar.tsx
+  └── (test files alongside, one per primitive after Phase 1.A creates them)
+```
+
+**Files explicitly out of bounds for Phase 3:**
+
+- `packages/ui/src/index.ts` — re-exports only, no a11y surface.
+- `packages/ui/src/theme.css` — design system tokens, Vincent-owned.
+- `packages/ui/src/utils/` — utility functions, not a11y-relevant.
+- Any file under `dashboard/src/`.
+- Any file under `crates/`.
+- `.github/workflows/` — CI is Phase 4's surface, not Phase 3's.
 
 **Common likely fixes (predicted, not pinned — the audit determines which actually apply):**
 
