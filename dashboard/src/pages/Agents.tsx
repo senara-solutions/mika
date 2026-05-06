@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Link } from 'react-router'
 import { useAgents } from '../api/agents.ts'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
@@ -10,6 +10,9 @@ export default function Agents() {
   const { searchParams, updateFilter } = useSearchParamsFilter()
   const committedSearch = searchParams.get('search') ?? ''
   const [search, setSearch] = useState(committedSearch)
+
+  // Sync local input state when URL changes (browser back/forward)
+  useEffect(() => { setSearch(committedSearch) }, [committedSearch])
 
   const filtered = agents?.filter(
     (a) =>

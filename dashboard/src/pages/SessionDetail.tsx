@@ -311,6 +311,12 @@ function toolSourceBadge(source: string) {
 
 type SessionTab = 'messages' | 'llm-calls' | 'tool-calls' | 'skills'
 
+const VALID_SESSION_TABS: readonly SessionTab[] = ['messages', 'llm-calls', 'tool-calls', 'skills']
+
+function isSessionTab(value: string | null): value is SessionTab {
+  return VALID_SESSION_TABS.includes(value as SessionTab)
+}
+
 function AgentAvatar({ name }: { name: string }) {
   const color = getAgentColor(name)
   return (
@@ -390,9 +396,8 @@ export default function SessionDetail() {
   const [searchParams, setSearchParams] = useSearchParams()
   const [page, setPage] = useState(1)
 
-  const VALID_SESSION_TABS: SessionTab[] = ['messages', 'llm-calls', 'tool-calls', 'skills']
   const rawTab = searchParams.get('tab')
-  const activeTab: SessionTab = VALID_SESSION_TABS.includes(rawTab as SessionTab) ? (rawTab as SessionTab) : 'messages'
+  const activeTab: SessionTab = isSessionTab(rawTab) ? rawTab : 'messages'
   const setActiveTab = (tab: SessionTab) => {
     const next = new URLSearchParams(searchParams)
     if (tab === 'messages') {
@@ -401,6 +406,10 @@ export default function SessionDetail() {
       next.set('tab', tab)
     }
     setSearchParams(next)
+    // Reset sub-tab pagination on tab switch (consistent with AgentDetail.handleTabChange)
+    if (tab === 'messages') setPage(1)
+    if (tab === 'llm-calls') setLlmCallsPage(1)
+    if (tab === 'tool-calls') setToolCallsPage(1)
   }
   const [llmCallsPage, setLlmCallsPage] = useState(1)
   const [toolCallsPage, setToolCallsPage] = useState(1)

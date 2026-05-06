@@ -260,6 +260,12 @@ const TAB_LABELS: { key: MemoryTab; label: string }[] = [
   { key: 'history', label: 'History' },
 ]
 
+const VALID_MEMORY_TABS: readonly MemoryTab[] = TAB_LABELS.map((t) => t.key)
+
+function isMemoryTab(value: string | null): value is MemoryTab {
+  return VALID_MEMORY_TABS.includes(value as MemoryTab)
+}
+
 export default function AgentDetail() {
   const { agentId } = useParams<{ agentId: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -267,9 +273,8 @@ export default function AgentDetail() {
   const [factsPage, setFactsPage] = useState(1)
   const [historyPage, setHistoryPage] = useState(1)
 
-  const VALID_MEMORY_TABS: MemoryTab[] = ['sections', 'facts', 'history']
   const rawTab = searchParams.get('tab')
-  const memoryTab: MemoryTab = VALID_MEMORY_TABS.includes(rawTab as MemoryTab) ? (rawTab as MemoryTab) : 'sections'
+  const memoryTab: MemoryTab = isMemoryTab(rawTab) ? rawTab : 'sections'
 
   const handleTabChange = (tab: MemoryTab) => {
     const next = new URLSearchParams(searchParams)

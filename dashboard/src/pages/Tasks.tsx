@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTasks, useTaskChildren, type TasksFilters, type TaskItem } from '../api/tasks.ts'
 import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, TaskStatusBadge, ListRow, TimeRangeFilter, LiveRefreshToggle, formatRelativeTime, type TimeRange } from '@senara-solutions/ui'
-import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
+import { useSearchParamsFilter, type SectionPageKey } from '../hooks/useSearchParamsFilter.ts'
 import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
@@ -261,7 +261,7 @@ interface SectionProps {
   timeRange: TimeRange
   refetchInterval: number | false
   searchParams: URLSearchParams
-  setSectionPage: (key: string, page: number) => void
+  setSectionPage: (key: SectionPageKey, page: number) => void
 }
 
 function WorkItemsSection({ timeRange, refetchInterval, searchParams, setSectionPage }: SectionProps) {
