@@ -16,8 +16,8 @@ use tracing::error;
 use utoipa::ToSchema;
 
 use crate::db::{
-    self, CoreMemoryEntry, SessionMessage, Task, TaskFilters, TeamRunFilters, TeamRunIdFilter,
-    TimelineFilters,
+    self, CoreMemoryEntry, LlmCallRow, SessionMessage, Task, TaskFilters, TeamRunFilters,
+    TeamRunIdFilter, TimelineFilters,
 };
 
 use super::state::AppState;
@@ -136,6 +136,8 @@ pub struct AgentDetailResponse {
     pub core_memory: Vec<CoreMemoryEntry>,
     pub core_memory_edits_this_session: i64,
     pub soul_md: String,
+    /// Estimated total cost for the last 24 hours in USD.
+    pub cost_today_usd: Option<f64>,
 }
 
 /// GET /api/v1/agents — list all agents with stats.
@@ -198,6 +200,31 @@ pub async fn handle_agent_detail(
         .await
         .unwrap_or_default();
 
+    // Compute today's cost from LLM calls in the last 24 hours.
+    // TODO(perf): Replace with a SQL aggregate query when call volume grows.
+    // Current approach fetches rows and computes cost in Rust, reusing the
+    // pricing module. Acceptable for <1K calls/day/agent; a SUM-based query
+    // would avoid deserialization overhead at higher volumes.
+    let cost_today_usd = {
+        let since = crate::timestamp::now_minus(chrono::TimeDelta::hours(24));
+        let filters = db::LlmCallFilters {
+            agent_id: Some(agent_id.clone()),
+            from: Some(since),
+            ..Default::default()
+        };
+        match state.dashboard_db.query_llm_calls(filters, 1, 10_000).await {
+            Ok((rows, _)) => {
+                let enriched = enrich_llm_calls_with_cost(rows);
+                let total: f64 = enriched.iter().filter_map(|r| r.cost_usd).sum();
+                Some(total)
+            }
+            Err(e) => {
+                error!(error = %e, "failed to compute agent cost");
+                None
+            }
+        }
+    };
+
     Json(AgentDetailResponse {
         id: agent.id,
         name: agent.name,
@@ -208,6 +235,7 @@ pub async fn handle_agent_detail(
         core_memory,
         core_memory_edits_this_session,
         soul_md,
+        cost_today_usd,
     })
     .into_response()
 }
@@ -865,6 +893,21 @@ pub struct LlmCallsQuery {
     pub per_page: Option<u32>,
 }
 
+/// Enrich LLM call rows with estimated cost derived from token counts and provider pricing.
+fn enrich_llm_calls_with_cost(mut rows: Vec<LlmCallRow>) -> Vec<LlmCallRow> {
+    for row in &mut rows {
+        let pricing = crate::pricing::get_pricing(&row.provider, &row.model);
+        row.cost_usd = Some(crate::pricing::estimate_call_cost(
+            &pricing,
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
+        ));
+    }
+    rows
+}
+
 /// GET /api/v1/llm-calls — paginated LLM call list with filters.
 pub async fn handle_llm_calls(
     State(state): State<AppState>,
@@ -890,7 +933,7 @@ pub async fn handle_llm_calls(
     };
 
     Json(PaginatedResponse {
-        data,
+        data: enrich_llm_calls_with_cost(data),
         total,
         page,
         per_page,
@@ -984,7 +1027,10 @@ pub async fn handle_llm_call_detail(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.dashboard_db.get_llm_call_by_id(&id).await {
-        Ok(Some(row)) => Json(row).into_response(),
+        Ok(Some(row)) => {
+            let enriched = enrich_llm_calls_with_cost(vec![row]);
+            Json(enriched.into_iter().next().unwrap()).into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("LLM call '{}' not found", id)})),
@@ -1029,7 +1075,7 @@ pub async fn handle_trace_llm_calls(
     Path(trace_id): Path<String>,
 ) -> impl IntoResponse {
     match state.dashboard_db.query_llm_calls_by_trace(&trace_id).await {
-        Ok(data) => Json(data).into_response(),
+        Ok(data) => Json(enrich_llm_calls_with_cost(data)).into_response(),
         Err(e) => internal_error(e).into_response(),
     }
 }
@@ -1074,7 +1120,7 @@ pub async fn handle_session_llm_calls(
     };
 
     Json(PaginatedResponse {
-        data,
+        data: enrich_llm_calls_with_cost(data),
         total,
         page,
         per_page,

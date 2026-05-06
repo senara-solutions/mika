@@ -13,6 +13,7 @@ import {
   LoadingState,
   ErrorState,
   LiveRefreshToggle,
+  CostMeter,
   formatApiError,
   formatRelativeTime,
 } from '@senara-solutions/ui'
@@ -23,7 +24,6 @@ import { TaskTree } from '../components/TaskTree.tsx'
 import { parseGitHubUrl } from '../utils/github.ts'
 import {
   Clock,
-  DollarSign,
   GitPullRequest,
   MessageSquare,
   ChevronDown,
@@ -345,7 +345,7 @@ export default function DevRunDetail() {
 
       {/* Stats row */}
       <div className="flex items-center gap-5 mb-5">
-        <StatBadge icon={DollarSign} label="Cost" value={formatCost(run.cost_usd)} />
+        <CostMeter value={run.cost_usd} label="Cost" />
         <StatBadge icon={Clock} label="Duration" value={formatDuration(run.duration_ms)} />
         <StatBadge icon={MessageSquare} label="Turns" value={String(run.turns ?? '--')} />
         {pull && (

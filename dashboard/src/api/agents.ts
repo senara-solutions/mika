@@ -21,6 +21,8 @@ export interface AgentDetail extends Agent {
   core_memory: CoreMemory[]
   core_memory_edits_this_session: number
   soul_md: string
+  /** Estimated total cost for the last 24 hours in USD. */
+  cost_today_usd: number | null
 }
 
 export interface SessionItem {

@@ -25,7 +25,8 @@ All components implement the [luminescent-core](../../docs/design/luminescent-co
 | `<SelectFilter>` | All categorical filters in dashboard list pages (channel, event type, status, success, etc.) | `{ ariaLabel, value, onChange, options }` | Audited clean (mika#655) |
 | `<AgentFilter>` | All agent-selection filters — thin adapter delegating to `<SelectFilter />` via consumer-injected `agents` prop | `{ agents, value, onChange, emptyLabel? }` | Audited clean (mika#655) |
 | `<TimeRangeFilter>` | All time-range filtering on dashboard list surfaces (presets + custom picker, ISO 8601 emission, server-side enforcement) | `{ value: { from?, to? }, onChange: (range) => void }` | Audited clean (mika#659) |
-| `<TokenBudgetBar>` | Token/resource budget progress bar with three-tier color thresholds (green <60%, amber 60-85%, red >85%) and ARIA meter semantics | `{ value, max, thresholds?: { warning, danger }, label?, showFraction? }` | New (mika#656) |
+| `<TokenBudgetBar>` | Token/resource budget progress bar with three-tier color thresholds (green <60%, amber 60-85%, red >85%) and ARIA meter semantics. Use for bounded token/resource usage. | `{ value, max, thresholds?: { warning, danger }, label?, showFraction? }` | New (mika#656) |
+| `<CostMeter>` | Unbounded threshold-based cost display with three-tier colors (neutral/warning/critical) and ARIA status semantics. Use for USD cost surfaces; use `<TokenBudgetBar>` for bounded token usage. Two variants: `full` (label + value) and `chip` (compact inline). | `{ value, warningAt?, criticalAt?, variant?, label?, ariaLabel? }` | New (mika#667) |
 | `<LiveRefreshToggle>` | Auto-refresh toggle with LIVE badge — canonical affordance for all dashboard live-refresh surfaces | `{ isLive, onToggle, disabled?, className? }` | New (mika#662) |
 
 ## Enforcement Rules

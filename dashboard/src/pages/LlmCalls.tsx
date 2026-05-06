@@ -1,7 +1,7 @@
 import { Link, useNavigate } from 'react-router'
 import { useLlmCalls, useCostTrend, type LlmCallsFilters, type CostTrendFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, TimeRangeFilter, LiveRefreshToggle, formatTimestamp } from '@senara-solutions/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, TimeRangeFilter, LiveRefreshToggle, CostMeter, formatTimestamp } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
@@ -170,6 +170,7 @@ export default function LlmCalls() {
                   <th className="text-right px-4 py-3 font-medium">Input</th>
                   <th className="text-right px-4 py-3 font-medium">Output</th>
                   <th className="text-right px-4 py-3 font-medium">Cache R</th>
+                  <th className="text-right px-4 py-3 font-medium">Cost</th>
                   <th className="text-right px-4 py-3 font-medium">Latency</th>
                   <th className="text-left px-4 py-3 font-medium">Status</th>
                   <th className="text-left px-4 py-3 font-medium">Trace</th>
@@ -200,6 +201,9 @@ export default function LlmCalls() {
                     </td>
                     <td className="px-4 py-3 text-xs text-muted/40 font-mono text-right">
                       {formatTokens(row.cache_read_tokens)}
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <CostMeter value={row.cost_usd} variant="chip" />
                     </td>
                     <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
                       {formatLatency(row.latency_ms)}

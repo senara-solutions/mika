@@ -23,6 +23,8 @@ export { default as TokenBudgetBar } from './components/TokenBudgetBar.tsx'
 export type { TokenBudgetBarProps, TokenBudgetTier } from './components/TokenBudgetBar.tsx'
 export { default as LiveRefreshToggle } from './components/LiveRefreshToggle.tsx'
 export type { LiveRefreshToggleProps } from './components/LiveRefreshToggle.tsx'
+export { default as CostMeter } from './components/CostMeter.tsx'
+export type { CostMeterProps, CostMeterVariant, CostMeterTier } from './components/CostMeter.tsx'
 
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'
