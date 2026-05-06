@@ -200,7 +200,11 @@ pub async fn handle_agent_detail(
         .await
         .unwrap_or_default();
 
-    // Compute today's cost from LLM calls in the last 24 hours
+    // Compute today's cost from LLM calls in the last 24 hours.
+    // TODO(perf): Replace with a SQL aggregate query when call volume grows.
+    // Current approach fetches rows and computes cost in Rust, reusing the
+    // pricing module. Acceptable for <1K calls/day/agent; a SUM-based query
+    // would avoid deserialization overhead at higher volumes.
     let cost_today_usd = {
         let since = crate::timestamp::now_minus(chrono::TimeDelta::hours(24));
         let filters = db::LlmCallFilters {
@@ -208,7 +212,6 @@ pub async fn handle_agent_detail(
             from: Some(since),
             ..Default::default()
         };
-        // Use a large page to get all calls for the last 24h
         match state.dashboard_db.query_llm_calls(filters, 1, 10_000).await {
             Ok((rows, _)) => {
                 let enriched = enrich_llm_calls_with_cost(rows);

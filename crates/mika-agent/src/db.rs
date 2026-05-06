@@ -480,8 +480,8 @@ pub struct LlmCallRow {
     /// `None` when the provider does not support reasoning or the call errored.
     pub reasoning: Option<String>,
     /// Estimated cost in USD, computed from token counts and provider pricing.
-    /// `None` when not yet computed (set by dashboard handler post-query).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Set to `Some` by `enrich_llm_calls_with_cost()` in dashboard handlers;
+    /// `None` only for internal (non-API) use before enrichment.
     pub cost_usd: Option<f64>,
 }
 

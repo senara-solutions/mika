@@ -203,7 +203,7 @@ export default function LlmCalls() {
                       {formatTokens(row.cache_read_tokens)}
                     </td>
                     <td className="px-4 py-3 text-right">
-                      <CostMeter value={row.cost_usd ?? null} variant="chip" />
+                      <CostMeter value={row.cost_usd} variant="chip" />
                     </td>
                     <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
                       {formatLatency(row.latency_ms)}
