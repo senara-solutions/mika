@@ -168,7 +168,7 @@ Optional (callback watchdog):
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)
-- `MIKA_LOG_LLM_BODIES` — Log full LLM request/response bodies at debug level to log file (default: false, dev-only)
+- `MIKA_LOG_LLM_BODIES` — Log full LLM request/response bodies at debug level to log file AND, when telemetry is enabled, attach as `gen_ai.prompt`/`gen_ai.completion` span attributes for Langfuse Generation input/output (default: false, dev-only)
 
 Optional (telemetry — requires `--features telemetry` build):
 - `MIKA_TELEMETRY_ENABLED` — Enable OpenTelemetry trace export (default: false)
