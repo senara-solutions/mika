@@ -1,5 +1,6 @@
-import { Link, useNavigate } from 'react-router'
-import { useLlmCalls, useCostTrend, type LlmCallsFilters, type CostTrendFilters } from '../api/llmCalls.ts'
+import { useState } from 'react'
+import { Link } from 'react-router'
+import { useLlmCalls, useLlmCall, useCostTrend, type LlmCallsFilters, type CostTrendFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
 import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, TimeRangeFilter, LiveRefreshToggle, CostMeter, formatTimestamp } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
@@ -7,6 +8,7 @@ import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { Search } from 'lucide-react'
 import CostTrendChart, { type ChartVariant } from '../components/CostTrendChart.tsx'
+import LlmBodyViewer from '../components/LlmBodyViewer.tsx'
 
 function llmStatusVariant(status: string): { variant: StatusBadgeVariant; label: string } {
   switch (status) {
@@ -27,8 +29,49 @@ function formatLatency(ms: number): string {
   return `${ms}ms`
 }
 
+const COL_COUNT = 11
+
+/** Inline detail panel shown when a row is expanded. */
+function ExpandedBody({ llmCallId }: { llmCallId: string }) {
+  const { data: call, isLoading, error, refetch } = useLlmCall(llmCallId)
+
+  if (isLoading) {
+    return (
+      <tr>
+        <td colSpan={COL_COUNT} className="px-4 py-4">
+          <LoadingState variant="detail" />
+        </td>
+      </tr>
+    )
+  }
+
+  if (error) {
+    return (
+      <tr>
+        <td colSpan={COL_COUNT} className="px-4 py-4">
+          <ErrorState message={formatApiError(error)} retry={() => refetch()} variant="detail-section" />
+        </td>
+      </tr>
+    )
+  }
+
+  if (!call) return null
+
+  return (
+    <tr className="bg-white/[0.01]">
+      <td colSpan={COL_COUNT} className="px-6 py-2">
+        <LlmBodyViewer
+          responseText={call.response_text}
+          reasoning={call.reasoning}
+          llmCallId={llmCallId}
+        />
+      </td>
+    </tr>
+  )
+}
+
 export default function LlmCalls() {
-  const navigate = useNavigate()
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const { searchParams, setSearchParams, updateFilter, setPage } = useSearchParamsFilter()
 
   const filters: LlmCallsFilters = {
@@ -177,54 +220,21 @@ export default function LlmCalls() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/[0.03]">
-                {data.data.map((row) => (
-                  <ListRow
-                    key={row.id}
-                    variant="navigable"
-                    onClick={() => navigate(`/llm-calls/${row.id}`)}
-                    ariaLabel={`View details for LLM call ${row.id}`}
-                  >
-                    <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
-                      {formatTimestamp(row.created_at)}
-                    </td>
-                    <td className="px-4 py-3 text-xs text-heading font-medium">
-                      {row.provider}
-                    </td>
-                    <td className="px-4 py-3 text-xs text-muted font-mono max-w-[200px] truncate">
-                      {row.model}
-                    </td>
-                    <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">
-                      {formatTokens(row.input_tokens)}
-                    </td>
-                    <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">
-                      {formatTokens(row.output_tokens)}
-                    </td>
-                    <td className="px-4 py-3 text-xs text-muted/40 font-mono text-right">
-                      {formatTokens(row.cache_read_tokens)}
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <CostMeter value={row.cost_usd} variant="chip" />
-                    </td>
-                    <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
-                      {formatLatency(row.latency_ms)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge {...llmStatusVariant(row.status)} />
-                    </td>
-                    <td className="px-4 py-3">
-                      {row.trace_id ? (
-                        <Link
-                          to={`/traces/${row.trace_id}`}
-                          className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
-                        >
-                          {row.trace_id.slice(0, 8)}...
-                        </Link>
-                      ) : (
-                        <span className="text-muted/30 text-xs">-</span>
-                      )}
-                    </td>
-                  </ListRow>
-                ))}
+                {data.data.map((row) => {
+                  const hasBody = row.has_response_text || row.has_reasoning
+                  const isExpanded = expandedId === row.id
+
+                  return hasBody ? (
+                    <ExpandableRow
+                      key={row.id}
+                      row={row}
+                      isExpanded={isExpanded}
+                      onToggle={() => setExpandedId(isExpanded ? null : row.id)}
+                    />
+                  ) : (
+                    <StaticRow key={row.id} row={row} />
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -239,5 +249,82 @@ export default function LlmCalls() {
         </>
       )}
     </div>
+  )
+}
+
+/** Shared row cells for both expandable and static rows. */
+function RowCells({ row }: { row: ReturnType<typeof useLlmCalls>['data'] extends { data: (infer T)[] } | undefined ? T : never }) {
+  return (
+    <>
+      <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
+        {formatTimestamp(row.created_at)}
+      </td>
+      <td className="px-4 py-3 text-xs text-heading font-medium">
+        {row.provider}
+      </td>
+      <td className="px-4 py-3 text-xs text-muted font-mono max-w-[200px] truncate">
+        {row.model}
+      </td>
+      <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">
+        {formatTokens(row.input_tokens)}
+      </td>
+      <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right">
+        {formatTokens(row.output_tokens)}
+      </td>
+      <td className="px-4 py-3 text-xs text-muted/40 font-mono text-right">
+        {formatTokens(row.cache_read_tokens)}
+      </td>
+      <td className="px-4 py-3 text-right">
+        <CostMeter value={row.cost_usd} variant="chip" />
+      </td>
+      <td className="px-4 py-3 text-xs text-muted/70 font-mono text-right whitespace-nowrap">
+        {formatLatency(row.latency_ms)}
+      </td>
+      <td className="px-4 py-3">
+        <StatusBadge {...llmStatusVariant(row.status)} />
+      </td>
+      <td className="px-4 py-3">
+        {row.trace_id ? (
+          <Link
+            to={`/traces/${row.trace_id}`}
+            className="text-accent text-xs font-mono hover:text-accent-light transition-colors"
+          >
+            {row.trace_id.slice(0, 8)}...
+          </Link>
+        ) : (
+          <span className="text-muted/30 text-xs">-</span>
+        )}
+      </td>
+    </>
+  )
+}
+
+type LlmCallRowData = ReturnType<typeof useLlmCalls>['data'] extends { data: (infer T)[] } | undefined ? T : never
+
+/** Row with expand/collapse for calls that have body content. */
+function ExpandableRow({ row, isExpanded, onToggle }: { row: LlmCallRowData; isExpanded: boolean; onToggle: () => void }) {
+  return (
+    <>
+      <ListRow
+        variant="expandable"
+        isExpanded={isExpanded}
+        onToggle={onToggle}
+        ariaLabel={`${isExpanded ? 'Collapse' : 'Expand'} LLM call ${row.model} response`}
+      >
+        <RowCells row={row} />
+      </ListRow>
+      {isExpanded && <ExpandedBody llmCallId={row.id} />}
+    </>
+  )
+}
+
+/** Static row for calls without body content (no expand affordance). */
+function StaticRow({ row }: { row: LlmCallRowData }) {
+  return (
+    <ListRow
+      variant="static"
+    >
+      <RowCells row={row} />
+    </ListRow>
   )
 }
