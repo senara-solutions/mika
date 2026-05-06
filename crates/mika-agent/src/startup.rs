@@ -31,15 +31,28 @@ pub fn seed_core_memory_if_empty(db: &Database, home_dir: &Path, agent_name: &st
 /// directories don't already exist (never overwrites user customizations).
 /// When `disabled` is true, skips seeding entirely (useful for debugging handlers).
 pub fn seed_bundled_skills_if_needed(home_dir: &Path, disabled: bool) {
+    let skills_dir = home_dir.join("skills");
     if disabled {
         tracing::warn!(
             "bundled skill seeding disabled by config \
              (MIKA_DISABLE_BUNDLED_SKILLS=true) — handler script security updates \
              will not be applied; set to false or remove to re-enable"
         );
+        // Drift detection (#984): check on-disk state against build-time hashes
+        // to surface stale schemas that would cause validate_required_fields no-ops.
+        if skills_dir.is_dir() {
+            let drift_count = crate::bundled_skills::check_bundled_skill_drift(&skills_dir);
+            if drift_count > 0 {
+                tracing::error!(
+                    drift_count,
+                    "bundled_skill_drift_summary: {drift_count} bundled skill(s) have \
+                     stale on-disk content. Tool schema validation may silently no-op. \
+                     Remove MIKA_DISABLE_BUNDLED_SKILLS or re-deploy to fix."
+                );
+            }
+        }
         return;
     }
-    let skills_dir = home_dir.join("skills");
     if skills_dir.is_dir() {
         crate::bundled_skills::seed_bundled_skills(&skills_dir);
     }

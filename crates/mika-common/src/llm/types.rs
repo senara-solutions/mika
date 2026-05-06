@@ -349,4 +349,68 @@ mod tests {
         assert!(resp.has_tool_calls());
         assert_eq!(resp.tool_calls().len(), 1);
     }
+
+    /// AC #4 (#984): Assert the Rust → provider tool-definition conversion
+    /// preserves the `required` field in `input_schema`/`parameters`.
+    ///
+    /// The conversion is a direct copy (`parameters: td.input_schema`), but this
+    /// test guards against a future refactor that might strip or transform the schema.
+    #[test]
+    fn test_tool_definition_conversion_preserves_required_field() {
+        let claude_td = crate::claude::ToolDefinition {
+            name: "run_claude_pilot".into(),
+            description: "Dispatch claude-pilot session".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill": { "type": "string", "enum": ["dev-pilot", "dev-groom"] },
+                    "prompt": { "type": "string" },
+                    "task_id": { "type": "string" }
+                },
+                "required": ["skill", "prompt", "task_id"]
+            }),
+        };
+
+        // Convert to provider-agnostic LlmToolDefinition
+        let llm_td: LlmToolDefinition = claude_td.clone().into();
+
+        // Assert `required` is preserved in the `parameters` field
+        let required = llm_td
+            .parameters
+            .get("required")
+            .expect("'required' field missing after conversion to LlmToolDefinition");
+        let required_arr = required
+            .as_array()
+            .expect("'required' is not an array after conversion");
+        let required_strs: Vec<&str> = required_arr.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            required_strs,
+            vec!["skill", "prompt", "task_id"],
+            "required field values changed during conversion"
+        );
+
+        // Also test serialization round-trip (serde_json::to_value → from_value)
+        let serialized = serde_json::to_value(&llm_td).unwrap();
+        let params = serialized.get("parameters").unwrap();
+        let ser_required = params
+            .get("required")
+            .expect("'required' missing from serialized LlmToolDefinition");
+        assert_eq!(
+            ser_required,
+            &serde_json::json!(["skill", "prompt", "task_id"]),
+            "required field lost during serialization"
+        );
+
+        // Round-trip back to ToolDefinition
+        let back: crate::claude::ToolDefinition = llm_td.into();
+        let back_required = back
+            .input_schema
+            .get("required")
+            .expect("'required' missing after roundtrip back to ToolDefinition");
+        assert_eq!(
+            back_required,
+            &serde_json::json!(["skill", "prompt", "task_id"]),
+            "required field lost during roundtrip"
+        );
+    }
 }

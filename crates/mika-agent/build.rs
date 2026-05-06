@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 // Shared discovery logic for `skills/bundled/`. Lives outside `src/` so both
@@ -177,9 +179,20 @@ fn generate_bundled_skills_table(manifest_dir: &str, out_dir: &str) {
 
         out.push_str("static ENTRIES: &[BundledSkill] = &[\n");
         for (idx, entry) in entries.iter().enumerate() {
+            // Compute content hash over all file contents in sorted order.
+            // Used for drift detection when MIKA_DISABLE_BUNDLED_SKILLS prevents re-seeding (#984).
+            let mut hasher = DefaultHasher::new();
+            for file in &entry.files {
+                let content = fs::read_to_string(&file.abs_path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.abs_path.display()));
+                file.rel_path.hash(&mut hasher);
+                content.hash(&mut hasher);
+            }
+            let hash = format!("{:016x}", hasher.finish());
             out.push_str(&format!(
-                "    BundledSkill {{ name: {name:?}, files: SKILL_{idx}_ENTRY_FILES }},\n",
+                "    BundledSkill {{ name: {name:?}, files: SKILL_{idx}_ENTRY_FILES, content_hash: {hash:?} }},\n",
                 name = entry.name,
+                hash = hash,
             ));
         }
         out.push_str("];\n");

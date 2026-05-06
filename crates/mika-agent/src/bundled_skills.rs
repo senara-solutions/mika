@@ -21,10 +21,16 @@ struct SkillFile {
 struct BundledSkill {
     name: &'static str,
     files: &'static [SkillFile],
+    /// SHA-256 content hash (first 16 hex chars) computed at build time over the
+    /// concatenation of all file contents in sorted order. Used for drift detection
+    /// when `MIKA_DISABLE_BUNDLED_SKILLS=true` prevents re-seeding (#984).
+    content_hash: &'static str,
 }
 
 /// Declare a bundled skill with its files.
 /// Use `+x` suffix to mark a file as executable (handler scripts).
+/// Legacy skills get an empty content_hash (drift detection scoped to engine-coupled
+/// skills in `skills/bundled/` which are hashed at build time by `build.rs`).
 macro_rules! skill {
     ($name:expr, [ $( $entry:tt ),+ $(,)? ]) => {
         BundledSkill {
@@ -32,6 +38,7 @@ macro_rules! skill {
             files: &[
                 $( skill!(@file $entry), )+
             ],
+            content_hash: "",
         }
     };
     (@file ($path:expr => $template:expr, +x)) => {
@@ -303,6 +310,82 @@ fn write_skill(skill_dir: &Path, skill: &BundledSkill) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Check on-disk bundled skills for content drift against the build-time embedded
+/// hashes. Called when `MIKA_DISABLE_BUNDLED_SKILLS=true` to surface stale state.
+///
+/// Only checks directory-sourced skills (engine-coupled, from `skills/bundled/`)
+/// since those carry build-time content hashes. Legacy community skills have
+/// empty hashes and are skipped.
+///
+/// Emits one `ERROR` log per drifted skill and returns the count of drifts detected.
+pub fn check_bundled_skill_drift(skills_dir: &Path) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut drift_count = 0;
+
+    for skill in all_bundled_skills() {
+        // Skip skills without a build-time hash (legacy community skills)
+        if skill.content_hash.is_empty() {
+            continue;
+        }
+
+        let skill_dir = skills_dir.join(skill.name);
+        if !skill_dir.exists() {
+            // Skill not seeded at all — definitely drifted
+            tracing::error!(
+                skill = skill.name,
+                expected_hash = skill.content_hash,
+                "bundled_skill_drift: skill directory missing on disk \
+                 (MIKA_DISABLE_BUNDLED_SKILLS=true prevented seeding)"
+            );
+            drift_count += 1;
+            continue;
+        }
+
+        // Compute on-disk hash using the same algorithm as build.rs
+        let mut hasher = DefaultHasher::new();
+        let mut all_readable = true;
+        for file in skill.files {
+            let file_path = skill_dir.join(file.path);
+            match std::fs::read_to_string(&file_path) {
+                Ok(content) => {
+                    file.path.hash(&mut hasher);
+                    content.hash(&mut hasher);
+                }
+                Err(_) => {
+                    all_readable = false;
+                    break;
+                }
+            }
+        }
+
+        if !all_readable {
+            tracing::error!(
+                skill = skill.name,
+                expected_hash = skill.content_hash,
+                "bundled_skill_drift: one or more skill files unreadable on disk"
+            );
+            drift_count += 1;
+            continue;
+        }
+
+        let on_disk_hash = format!("{:016x}", hasher.finish());
+        if on_disk_hash != skill.content_hash {
+            tracing::error!(
+                skill = skill.name,
+                expected_hash = %&skill.content_hash[..12.min(skill.content_hash.len())],
+                actual_hash = %&on_disk_hash[..12],
+                "bundled_skill_drift: on-disk content differs from build-time embed \
+                 (MIKA_DISABLE_BUNDLED_SKILLS=true prevented update)"
+            );
+            drift_count += 1;
+        }
+    }
+
+    drift_count
 }
 
 #[cfg(test)]
@@ -589,10 +672,12 @@ mod tests {
     static MERGE_TEST_LEGACY_ALPHA: BundledSkill = BundledSkill {
         name: "alpha",
         files: MERGE_TEST_LEGACY_FILES,
+        content_hash: "",
     };
     static MERGE_TEST_LEGACY_GAMMA: BundledSkill = BundledSkill {
         name: "gamma",
         files: MERGE_TEST_LEGACY_FILES,
+        content_hash: "",
     };
     static MERGE_TEST_LEGACY_SLICE: &[&BundledSkill] =
         &[&MERGE_TEST_LEGACY_ALPHA, &MERGE_TEST_LEGACY_GAMMA];
@@ -614,10 +699,12 @@ mod tests {
             BundledSkill {
                 name: "ALPHA", // case-insensitive collision with MERGE_TEST_LEGACY_ALPHA
                 files: MERGE_TEST_OVERRIDE_FILES,
+                content_hash: "",
             },
             BundledSkill {
                 name: "beta", // new addition
                 files: MERGE_TEST_FRESH_FILES,
+                content_hash: "",
             },
         ];
 
@@ -651,10 +738,12 @@ mod tests {
             BundledSkill {
                 name: "alpha",
                 files: MERGE_TEST_OVERRIDE_FILES,
+                content_hash: "",
             },
             BundledSkill {
                 name: "gamma",
                 files: MERGE_TEST_OVERRIDE_FILES,
+                content_hash: "",
             },
         ];
         let merged = merge_skill_lists(MERGE_TEST_LEGACY_SLICE, ENTRIES_FIXTURE);
@@ -686,6 +775,7 @@ mod tests {
         static ENTRIES_ONLY: &[BundledSkill] = &[BundledSkill {
             name: "entries-only-skill",
             files: MERGE_TEST_FRESH_FILES,
+            content_hash: "",
         }];
 
         let has_entries_arm = BUNDLED_SKILLS
