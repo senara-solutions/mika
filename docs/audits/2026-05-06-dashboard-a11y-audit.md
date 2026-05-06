@@ -158,14 +158,14 @@ Calculated using relative luminance formula: `L = 0.2126 * R + 0.7152 * G + 0.07
 
 | ID | Severity | Component/Page | Description | Source Path | Disposition |
 |:---:|:---:|---|---|---|:---:|
-| F-01 | Serious | CopyButton | No visible focus indicator (opacity-40 base, no `:focus-visible` style) | `packages/ui/src/components/CopyButton.tsx` | **fix-here** |
+| F-01 | Serious | CopyButton | No visible focus indicator (opacity-40 base, no `:focus-visible` style) | `packages/ui/src/components/CopyButton.tsx` | **fix-here, applied** |
 | F-02 | Moderate | Home (Dashboard.tsx) | Widget cards not keyboard-navigable; chart lacks text alternative | `dashboard/src/pages/Home.tsx` | file-follow-up |
 | F-03 | Moderate | SessionDetail | Tab switching keyboard behavior needs verification | `dashboard/src/pages/SessionDetail.tsx` | file-follow-up |
 | F-04 | Minor | SkillVariants | Table display may lack proper `<table>` semantics | `dashboard/src/pages/SkillVariants.tsx` | file-follow-up |
-| F-05 | Serious | CopyButton | Missing `aria-label` on icon-only button; no copy-success announcement | `packages/ui/src/components/CopyButton.tsx` | **fix-here** |
-| F-06 | Moderate | Pagination | No `aria-live` region for page-change announcements | `packages/ui/src/components/Pagination.tsx` | **fix-here** |
+| F-05 | Serious | CopyButton | Missing `aria-label` on icon-only button; no copy-success announcement | `packages/ui/src/components/CopyButton.tsx` | **fix-here, applied** |
+| F-06 | Moderate | Pagination | No `aria-live` region for page-change announcements | `packages/ui/src/components/Pagination.tsx` | **fix-here, applied** |
 | F-07 | Minor | StatusBadge | No semantic status role on status indicator | `packages/ui/src/components/StatusBadge.tsx` | accept-with-rationale |
-| F-08 | Minor | CopyButton | Hardcoded `text-emerald-400` instead of design token | `packages/ui/src/components/CopyButton.tsx` | **fix-here** |
+| F-08 | Minor | CopyButton | Hardcoded `text-emerald-400` instead of design token | `packages/ui/src/components/CopyButton.tsx` | **fix-here, applied** |
 | F-09 | Moderate | Dashboard pages (15/21) | No ARIA landmarks beyond implicit layout semantics | `dashboard/src/pages/` | file-follow-up |
 | F-10 | Serious | theme.css | `--color-accent` (#7c6af7) on `--color-bg-card` fails AA for normal text (3.7:1) | `packages/ui/src/theme.css` | file-follow-up |
 | F-11 | Moderate | Multiple components + theme.css | No `prefers-reduced-motion` guard on any animation/transition | `packages/ui/src/components/` + `packages/ui/src/theme.css` | **fix-here** (primitives) / file-follow-up (dashboard pages, theme.css) |
