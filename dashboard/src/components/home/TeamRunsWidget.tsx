@@ -56,4 +56,3 @@ export default function TeamRunsWidget({ refetchInterval }: TeamRunsWidgetProps)
   )
 }
 
-export type { TeamRunsWidgetProps }

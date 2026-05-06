@@ -72,4 +72,3 @@ export default function DevRunsWidget({ refetchInterval }: DevRunsWidgetProps) {
   )
 }
 
-export type { DevRunsWidgetProps }

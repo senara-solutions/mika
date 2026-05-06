@@ -79,4 +79,3 @@ export default function RecentActivityWidget({ refetchInterval }: RecentActivity
   )
 }
 
-export type { RecentActivityWidgetProps }

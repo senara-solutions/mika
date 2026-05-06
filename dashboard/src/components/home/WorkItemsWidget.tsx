@@ -56,4 +56,3 @@ export default function WorkItemsWidget({ refetchInterval }: WorkItemsWidgetProp
   )
 }
 
-export type { WorkItemsWidgetProps }
