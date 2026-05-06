@@ -255,7 +255,7 @@ After claude-pilot creates a PR, proceed directly to Step 6 with `in_progress`.
 
 When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the operator has set the `ready` label on the ticket — the canonical positive-consent signal for autonomous dispatch.
 
-> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846, #907).** The guard accepts EITHER a `run_claude_pilot` attempt (dispatch path) OR a `send_message` call (grooming-rejection path). Ending the turn without either will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
+> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846, #907).** The guard accepts EITHER a `run_claude_pilot` attempt (dispatch or auto-groom path) OR a `send_message` call (escalation path). Ending the turn without either will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
 
 **Atomic handler (label removal first, then grooming check, then dispatch — per mika#841, #907):**
 
@@ -265,15 +265,33 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
 2. **Second**, call `run_gh` with args `issue view <n> --json title,body --repo <repo>` to fetch the issue title and body — required input for the grooming check and `create_task`.
 
-3. **Third (GROOMING PRE-FLIGHT — mika#907)**, scan the fetched issue body for the grooming marker: `> - **Plan:**`. This callout is written by the architect grooming pipeline (`/mika-groom-ticket`) and its presence confirms the ticket has been groomed.
+3. **Third (GROOMING PRE-FLIGHT — mika#907, mika#996)**, scan the fetched issue body for the grooming marker. The bypass predicate is `Plan: docs/plans/` — the substring must include the canonical plan-doc path prefix `docs/plans/` to avoid false positives on the word "Plan:" appearing in prose elsewhere in the issue body.
 
-   **If the marker is NOT found in the issue body:** Do NOT call `create_task` or `run_claude_pilot`. Call `send_message` to notify the operator:
+   **If the marker IS found:** Proceed to Step 4 (dispatch via `dev-pilot`).
 
-   > "Ready-label dispatch blocked on `<repo>#<n>`: issue body lacks the grooming marker (`> - **Plan:**`). The ticket must be groomed before dispatch. Run `/mika-groom-ticket <repo>#<n>` to produce the plan, then re-add the `ready` label."
+   **If the marker is NOT found in the issue body (auto-groom path — mika#996):** The ticket is ungroomed. Auto-groom via `dev-groom` skill before dispatching.
 
-   Stop the turn after `send_message`. The engine guard accepts `send_message` as valid completion for this path.
+   a. Call `create_task` with `reference_url: "https://github.com/<repo>/issues/<n>?phase=groom"`, `label: "groom <repo>#<n>"`, `description: <issue body>`, `source: "self_dev"`. Capture the returned `task_id` as `groom_task_id`. The `?phase=groom` discriminator distinguishes the grooming task from the eventual dispatch task (which uses the canonical URL without the suffix).
 
-   **If the marker IS found:** Proceed to Step 4.
+   b. **IMMEDIATELY** call `run_claude_pilot` with:
+      ```json
+      {"skill": "dev-groom", "prompt": "<repo> issue#<n>", "task_id": "<groom_task_id>"}
+      ```
+
+   c. Stop the turn. The grooming task runs in the background; its callback re-enters this session's task loop with the grooming result. **Do not call `send_message` to notify the operator** — auto-grooming is the new default behavior, not an exception.
+
+   **On the dev-groom callback (received as a regular post-callback turn):**
+
+   d. Parse the callback result text for the verdict line. The dev-groom skill emits `Verdict: GROOMED` or `Verdict: ESCALATE` as its final line (enforced by the engine's required-suffix-line guard).
+
+   e. **If `Verdict: GROOMED` — re-entry:** Re-enter the Ready-Label Dispatch atomic handler at its top (Step 1 of this section). The handler runs through Steps 1-3 again; the issue body now contains `Plan: docs/plans/` because dev-groom edited it via Phase 5 step 18 of its prompt. The handler advances naturally past the grooming branch and into Step 4 (create_task + run_claude_pilot for `dev-pilot`). The dispatch task uses the canonical `reference_url` (no `?phase=groom` suffix). **Do NOT re-implement create_task + run_claude_pilot inline** — the re-entry mechanism keeps dispatch logic in one place.
+
+   f. **If `Verdict: ESCALATE`:** dev-groom surfaces an architect ESCALATION. Treat as a blocking event: `send_message` to operator with the ESCALATE reason from the callback, mark the groom task `blocked` if applicable, stop the turn. Do NOT auto-dispatch.
+
+   g. **If callback indicates failure (HANDLER CRASH, timeout, etc.) — terminal-semantics rule:**
+      - **Retry policy:** retry once, **reusing the same `groom_task_id`** (do NOT call `create_task` again). The retry is `run_claude_pilot({"skill": "dev-groom", "prompt": "<repo> issue#<n>", "task_id": "<existing groom_task_id>"})`.
+      - **Second-crash terminal:** on the second consecutive HANDLER CRASH for the same `groom_task_id`, treat as ESCALATE. `send_message` to operator with both failure reasons concatenated; stop the turn. Do NOT retry a third time.
+      - **Tracking:** the failure-count is tracked in the `groom_task_id` task's metadata (`metadata.groom_crash_count`, incremented by the callback handler on each HANDLER CRASH). The check `groom_crash_count >= 2` triggers the terminal path.
 
 4. **Fourth**, call `create_task` with `reference_url: "https://github.com/<repo>/issues/<n>"`, `label: <issue title>`, `description: <issue body>`, and `source: "self_dev"`. `create_task` is idempotent on `reference_url`, so a duplicate webhook reuses an existing `task_id`. Capture the returned `task_id` (UUID).
 
@@ -285,7 +303,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
    If `run_claude_pilot` returns a terminal error (`global_dispatch_active`, `task_not_dispatchable`, `dispatch_blocked_by`, `dispatch_limit_exceeded`), do NOT retry. Send the operator a `send_message` naming the rejection cause and stop — the engine guard accepts the attempt as satisfying the dispatch contract.
 
-**GATE: If Step 1 succeeded but you have completed NEITHER `run_claude_pilot` NOR `send_message` (grooming rejection) in this turn, call Steps 2–5 immediately — do not end the turn.**
+**GATE: If Step 1 succeeded but you have completed NEITHER `run_claude_pilot` NOR `send_message` (escalation) in this turn, call Steps 2–5 immediately — do not end the turn.**
 
 **Other label-add events** (`bug`, `enhancement`, `p1-important`, etc.) — any `[GitHub] Issue labeled <name> on ...` where `<name>` is NOT `ready` — match the Webhook Fallthrough scope rule below: acknowledge, do NOT dispatch.
 
@@ -649,6 +667,32 @@ For each `child_task_id` in `child_wis` (in order):
    ```
    update_task_status(task_id=<child_task_id>, status="in_progress")
    ```
+
+1.5. **Grooming pre-flight (mika#996):** Before launching `dev-pilot` for the child, verify the child's issue body has the Plan callout. Run:
+
+   ```json
+   run_gh({"command": ["issue", "view", "<issue_number>", "--json", "body", "--jq", ".body"], "repo": "senara-solutions/<repo>"})
+   ```
+
+   **Bypass predicate:** the bypass condition is that the response contains the literal substring `Plan: docs/plans/`. This matches the canonical citation surface. The same predicate is used in the webhook path (Ready-Label Dispatch Step 3).
+
+   **If the response contains `Plan: docs/plans/`:** proceed to Step 2 (existing per-issue flow with `dev-pilot`).
+
+   **If the response does NOT contain `Plan: docs/plans/`:** the child is ungroomed. Auto-groom before dispatching:
+
+   a. **Update child status to track grooming phase:** `update_task_status(task_id=<child_task_id>, status="in_progress", note="Grooming via dev-groom before dev-pilot dispatch (mika#996)")`. The child task remains the same `task_id` — grooming and dispatch are two phases of the same child task.
+
+   b. **Launch dev-groom:**
+      ```json
+      run_claude_pilot({"skill": "dev-groom", "prompt": "<repo> issue#<issue_number>", "task_id": "<child_task_id>"})
+      ```
+
+   c. **Wait for the dev-groom callback.** This is a normal post-callback turn. Handle per the existing callback flow but recognize the `dev-groom` skill output:
+      - If callback indicates `Verdict: GROOMED`, the issue body now has the Plan callout. **Re-enter M4 Step 2** for the same child (now the dev-pilot dispatch).
+      - If callback indicates `Verdict: ESCALATE`, treat as `blocked` per M4 Step 3 (PAUSE milestone, notify Vincent).
+      - **If callback indicates failure (HANDLER CRASH, timeout, etc.) — terminal-semantics rule:** same shape as the webhook path (Ready-Label Dispatch Step 3g). Retry once with the **same `child_task_id`** (no new `create_task`); on second consecutive HANDLER CRASH for the same `child_task_id`, treat as `blocked` per M4 Step 3 (PAUSE milestone, notify operator, stop). Do NOT retry a third time. The `groom_crash_count` metadata is tracked on the child task itself (the milestone child, NOT a separate groom task — milestone-cascade reuses the child task across grooming + dispatch phases per step a).
+
+   d. **Engine-guard implications:** the milestone-cascade path does not flow through `webhook_ready_label_dispatch`. No new guard is needed; M4's existing dispatch-readiness checks already accept `dev-groom` as a valid `run_claude_pilot` skill.
 
 2. **Execute per-issue flow (Steps 1-6 from main workflow):**
    - Read GitHub issue

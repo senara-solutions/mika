@@ -1,6 +1,8 @@
-## dev-groom — Operator-Triggered Grooming Skill
+## dev-groom — Two-Pass Grooming Skill
 
-You are executing the dev-groom skill. Take a ticket from "open with description" to "GROOMED plan committed on a branch, referenced in the issue body, ready to dispatch." This skill is operator-only — never auto-invoke from webhooks or autonomous flows.
+You are executing the dev-groom skill. Take a ticket from "open with description" to "GROOMED plan committed on a branch, referenced in the issue body, ready to dispatch." This skill is invoked in three contexts: (1) operator-direct via the `/mika-groom-ticket` slash command, (2) autonomous webhook-triggered when a `ready`-labelled ticket lacks a Plan callout (via mika#996's auto-groom flow), and (3) autonomous milestone-cascade pre-flight when a milestone child lacks a Plan callout. The grooming sequence (Phases 1–5, two-pass architect review) is identical across all three contexts.
+
+**Consent gate relocation (mika#996):** Earlier versions of this skill restricted invocation to operator-only paths because the consent gate was the slash-command path itself. After dev-groom moved into the self-dev family as a peer of dev-pilot (May 2 worker-agent thread), the design intent shifted: autonomous mika-dev dispatches grooming the same way it dispatches implementation. The consent gate **relocated** to the `ready` label transition + the existing positive-consent dispatcher (mika#807/#810). Auto-grooming a `ready`-labelled ticket is not unattended self-grooming — it's responding to a label-event consent signal explicitly emitted by an operator (or an operator-directed mika-prime). The denylist (mika#811) and the spec-deviation pause (Vincent-only judgment-call protocol) remain the operator-control surfaces over what mika-dev is allowed to do; whether mika-dev grooms one of its own `ready`-labelled tickets is downstream of those gates, not parallel to them.
 
 ### Input
 
@@ -77,7 +79,10 @@ The user message contains a typed ticket reference: `<repo> issue#<n>`. Parse in
     > - **Grooming history:** /ce:plan -> mika-arch first-pass (<disposition>) -> revisions -> mika-arch second-pass (GROOMED)
     ```
     Apply with `gh issue edit <n> --repo senara-solutions/<repo> --body-file <tmpfile>`.
-19. Post a summary comment on the ticket.
+19. Post a summary comment on the ticket. End the callback summary with a final line matching exactly one of:
+    - `Verdict: GROOMED` (after a successful second-pass GROOMED disposition)
+    - `Verdict: ESCALATE` (after either pass returned ESCALATE)
+    The engine's required-suffix-line guard enforces this — your turn will be rejected if the line is absent.
 
 ### Phase 6 — Optional dispatch
 

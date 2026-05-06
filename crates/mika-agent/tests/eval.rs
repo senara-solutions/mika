@@ -36,6 +36,7 @@ mod eval {
     // v26->v27 KG migration invariant tests: coalesce per-agent data (#787)
     mod kg_v27_migration;
 
+    mod test_auto_groom_dispatch;
     mod test_basic_conversation;
     mod test_callback_milestone_advance;
     mod test_callback_terminal_action;
