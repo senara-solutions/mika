@@ -100,43 +100,92 @@ pub struct LongRunningContext {
     pub dispatch_count: AtomicU32,
 }
 
-/// Validate that all top-level `required` fields declared in the tool's JSON
-/// Schema `input_schema` are present and non-null in the supplied `input`.
+/// Validate that all required fields declared in a skill tool's input schema are
+/// present and non-null in the supplied input.
 ///
-/// Returns `Some(ToolOutput::error(...))` with a structured JSON error on
-/// validation failure, or `None` if all required fields are present.
+/// Returns `Some(ToolOutput::error(...))` if validation fails, `None` if all
+/// required fields are present (or the schema has no `required` key at all).
 ///
 /// Scope: top-level `required` only. Does NOT validate `enum` constraints,
-/// `type` assertions, or nested `properties`. Defensively handles malformed
-/// schemas (missing `required` key, non-array, non-string elements) by
-/// degrading to an empty required list with a warning.
-fn validate_required_fields(
+/// `type` assertions, or nested `properties`.
+///
+/// Post-#984: if `required` exists but is not a JSON array (malformed schema),
+/// returns a structured `malformed_required_schema` error instead of silently passing.
+pub fn validate_required_fields(
     skill_tool: &ResolvedSkillTool,
     input: &serde_json::Value,
 ) -> Option<ToolOutput> {
-    let required_fields: Vec<&str> = skill_tool
-        .definition
-        .input_schema
-        .get("required")
+    let tool_name = &skill_tool.definition.name;
+    let required_raw = skill_tool.definition.input_schema.get("required").cloned();
+    let input_keys: Vec<&str> = input
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    let required_fields: Vec<&str> = required_raw
+        .as_ref()
         .and_then(serde_json::Value::as_array)
         .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
         .unwrap_or_default();
 
     if required_fields.is_empty() {
-        // Check if `required` exists but isn't an array — indicates malformed schema
-        if skill_tool
-            .definition
-            .input_schema
-            .get("required")
-            .is_some_and(|v| !v.is_array())
+        // Check if `required` exists but isn't an array — indicates malformed schema.
+        // Step 3.5 (#984): return a structured error instead of silently passing.
+        if let Some(raw) = &required_raw
+            && !raw.is_array()
         {
             warn!(
-                tool = %skill_tool.definition.name,
-                "skill_tool_malformed_schema_skipped_validation: \
-                 'required' field exists but is not a JSON array"
+                tool = %tool_name,
+                required_raw = ?raw,
+                ?input_keys,
+                "skill_tool_malformed_required_schema: \
+                 'required' field exists but is not a JSON array — rejecting dispatch"
             );
+            let error = serde_json::json!({
+                "error": "malformed_required_schema",
+                "tool": tool_name,
+                "reason": "The tool's 'required' field in input_schema is not a JSON array. \
+                           This indicates a schema configuration error. The dispatch cannot \
+                           be validated and is rejected as a safety measure.",
+                "required_raw_type": format!("{}", raw)
+            });
+            return Some(ToolOutput::error(error.to_string()));
         }
+        // No `required` key at all — schema intentionally has no required fields.
+        tracing::debug!(
+            tool = %tool_name,
+            ?input_keys,
+            "validate_required_fields: no required fields declared in schema"
+        );
         return None;
+    }
+
+    // F5 instrumentation (#984): log the schema and input state for diagnostics.
+    // DEBUG on happy path (silent in production), WARN on any missing field (rare, surfaces immediately).
+    let all_present = {
+        let input_obj = input.as_object();
+        required_fields.iter().all(|field| {
+            input_obj
+                .and_then(|obj| obj.get(*field))
+                .is_some_and(|v| !v.is_null())
+        })
+    };
+
+    if all_present {
+        tracing::debug!(
+            tool = %tool_name,
+            ?input_keys,
+            ?required_fields,
+            "validate_required_fields: all required fields present"
+        );
+    } else {
+        warn!(
+            tool = %tool_name,
+            ?input_keys,
+            ?required_fields,
+            required_raw = ?required_raw,
+            "validate_required_fields: one or more required fields missing — will reject"
+        );
     }
 
     let input_obj = input.as_object();
@@ -147,7 +196,7 @@ fn validate_required_fields(
 
         if !is_present {
             warn!(
-                tool = %skill_tool.definition.name,
+                tool = %tool_name,
                 field = %field,
                 "skill_tool_missing_required_field: \
                  required field not provided in tool call input"
@@ -1338,8 +1387,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_required_fields_malformed_schema_degrades_gracefully() {
-        // `required` is a string, not an array — malformed
+    fn test_validate_required_fields_malformed_schema_returns_error() {
+        // `required` is a string, not an array — malformed.
+        // Post-#984: this must return an error, not silently pass.
         let tool = ResolvedSkillTool {
             definition: ToolDefinition {
                 name: "bad_tool".to_string(),
@@ -1360,9 +1410,44 @@ mod tests {
         let input = serde_json::json!({});
         let result = validate_required_fields(&tool, &input);
         assert!(
-            result.is_none(),
-            "malformed schema should degrade to no validation"
+            result.is_some(),
+            "malformed schema must return an error, not silently pass"
         );
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("malformed_required_schema"));
+    }
+
+    #[test]
+    fn test_validate_required_fields_malformed_schema_null_returns_error() {
+        // `required` is null — malformed
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "bad_tool".to_string(),
+                description: "Tool with bad schema".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": null
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        let input = serde_json::json!({});
+        let result = validate_required_fields(&tool, &input);
+        // null is not an array — should reject
+        assert!(
+            result.is_some(),
+            "null 'required' must return an error, not silently pass"
+        );
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("malformed_required_schema"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
