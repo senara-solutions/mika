@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
-import { useLlmCalls, useLlmCall, useCostTrend, type LlmCallsFilters, type CostTrendFilters } from '../api/llmCalls.ts'
+import { useLlmCalls, useLlmCall, useCostTrend, type LlmCallRow, type LlmCallsFilters, type CostTrendFilters } from '../api/llmCalls.ts'
 import { useAgents } from '../api/agents.ts'
 import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, StatusBadge, ListRow, AgentFilter, TimeRangeFilter, LiveRefreshToggle, CostMeter, formatTimestamp } from '@senara-solutions/ui'
 import type { StatusBadgeVariant } from '@senara-solutions/ui'
@@ -253,7 +253,7 @@ export default function LlmCalls() {
 }
 
 /** Shared row cells for both expandable and static rows. */
-function RowCells({ row }: { row: ReturnType<typeof useLlmCalls>['data'] extends { data: (infer T)[] } | undefined ? T : never }) {
+function RowCells({ row }: { row: LlmCallRow }) {
   return (
     <>
       <td className="px-4 py-3 text-muted/70 whitespace-nowrap font-mono text-xs">
@@ -299,10 +299,8 @@ function RowCells({ row }: { row: ReturnType<typeof useLlmCalls>['data'] extends
   )
 }
 
-type LlmCallRowData = ReturnType<typeof useLlmCalls>['data'] extends { data: (infer T)[] } | undefined ? T : never
-
 /** Row with expand/collapse for calls that have body content. */
-function ExpandableRow({ row, isExpanded, onToggle }: { row: LlmCallRowData; isExpanded: boolean; onToggle: () => void }) {
+function ExpandableRow({ row, isExpanded, onToggle }: { row: LlmCallRow; isExpanded: boolean; onToggle: () => void }) {
   return (
     <>
       <ListRow
@@ -319,7 +317,7 @@ function ExpandableRow({ row, isExpanded, onToggle }: { row: LlmCallRowData; isE
 }
 
 /** Static row for calls without body content (no expand affordance). */
-function StaticRow({ row }: { row: LlmCallRowData }) {
+function StaticRow({ row }: { row: LlmCallRow }) {
   return (
     <ListRow
       variant="static"
