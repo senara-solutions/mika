@@ -386,6 +386,9 @@ impl TaskDispatcher {
         // are captured even if the agent exhausts its step budget.
         if is_callback {
             try_extract_callback_metadata(&self.db, task).await;
+            // #958: If the callback carries a pr_url (success indicator) and the
+            // parent was reaped to `failed`, promote it back to `completed`.
+            try_promote_parent_on_retry_success(&self.db, task).await;
         }
 
         // Suppress user-facing notifications for team-child callbacks.
@@ -1161,6 +1164,94 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
             error = %e,
             "engine: failed to persist callback metadata"
         ),
+    }
+}
+
+/// Promote the parent task from `failed` → `completed` when a retry callback
+/// succeeds (#958).
+///
+/// A retry child may deliver a successful result (with `pr_url`) after the
+/// orphaned-parent reaper already marked the parent `failed`. This function
+/// detects that case and promotes the parent status, keeping the engine's
+/// state consistent with the actual outcome.
+///
+/// Best-effort, fire-and-forget — same pattern as `try_extract_callback_metadata`.
+async fn try_promote_parent_on_retry_success(db: &AsyncDatabase, task: &Task) {
+    // 1. Need a parent to promote.
+    let parent_id = match &task.parent_task_id {
+        Some(id) => id.clone(),
+        None => return,
+    };
+
+    // 2. Read the parent — only promote manual tasks in `failed` state.
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t)) if t.trigger_type == "manual" && t.status == "failed" => t,
+        _ => return,
+    };
+
+    // 3. Check whether the callback result contains a pr_url (success indicator).
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let extracted = extract_callback_fields(result);
+    let pr_url = extracted
+        .get("claude_pilot")
+        .and_then(|cp| cp.get("pr_url"))
+        .and_then(|v| v.as_str());
+
+    let pr_url = match pr_url {
+        Some(url) if !url.is_empty() => url.to_string(),
+        _ => return,
+    };
+
+    // 4. Promote: failed → completed.
+    let reason = format!("retry_success (pr_url: {pr_url})");
+    match db.promote_task_completed(&parent_id, &reason).await {
+        Ok(true) => {
+            // Emit audit event for traceability.
+            let system_session = format!("system-{}", parent.agent_id);
+            let trace_id = mika_common::trace::generate_trace_id();
+            if let Err(e) = db
+                .log_audit_event(
+                    &system_session,
+                    "task_engine_retry_promoter",
+                    &parent_id,
+                    Some("failed"),
+                    Some("completed"),
+                    Some(&reason),
+                    Some(&trace_id),
+                )
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "engine: failed to write retry-promoter audit event"
+                );
+            }
+            info!(
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                pr_url = %pr_url,
+                "engine: promoted parent task from failed to completed (retry success)"
+            );
+        }
+        Ok(false) => {
+            // Parent already left `failed` state (concurrent action) — skip.
+            debug!(
+                parent_task_id = %parent_id,
+                "engine: parent no longer in failed state, skipping retry promotion"
+            );
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: failed to promote parent task on retry success"
+            );
+        }
     }
 }
 

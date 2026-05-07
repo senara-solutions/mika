@@ -294,6 +294,15 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Promote a task from `failed` → `completed` (#958).
+    pub async fn promote_task_completed(&self, id: &str, reason: &str) -> Result<bool> {
+        let id = id.to_string();
+        let reason = reason.to_string();
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.promote_task_completed(&id, &a, &reason))
+            .await
+    }
+
     pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
         let (i, nf) = (id.to_owned(), next_fire_at.to_owned());
         self.with_db(move |db| db.update_task_next_fire_at(&i, &nf))
