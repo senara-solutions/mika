@@ -299,7 +299,11 @@ fn fail_closed_identity() -> Identity {
                 .map(|s| s.to_string())
                 .collect(),
         },
-        context: ContextIdentityConfig::default(),
+        // Fail-closed must enforce inject=false so a malformed identity.toml
+        // cannot re-enable summary injection (mika#1009 leak protection).
+        context: ContextIdentityConfig {
+            summary: ContextSummaryConfig { inject: false },
+        },
     }
 }
 
