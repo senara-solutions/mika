@@ -140,6 +140,7 @@ async fn tick_body(
                 matched_exact = stats.matched_exact,
                 matched_llm = stats.matched_llm,
                 no_match = stats.no_match,
+                reattempted_no_match = stats.reattempted_no_match,
                 duration_ms = stats.duration_ms,
                 per_corpus_attempted = %per_corpus_attempted,
                 event = "kg_resolver_tick.complete",

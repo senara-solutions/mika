@@ -198,6 +198,47 @@ pub fn format_entity_key(kind: &str, name: &str) -> String {
     format!("{kind}:{name}")
 }
 
+// ---------------------------------------------------------------------------
+// Invalidation marker helpers (#961)
+// ---------------------------------------------------------------------------
+
+/// Record subject entity IDs whose `no_match` resolution log rows were
+/// deleted by domain-graph rebuild invalidation (#960). Uses `INSERT OR
+/// IGNORE` so duplicate markers from crash-restart-crash-restart are safe.
+///
+/// Called by `domain_builder::rebuild()` inside its transaction, after
+/// deleting the `kg_resolutions_log` rows.
+pub fn record_invalidated_no_match(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    subject_entity_ids: &[i64],
+) -> rusqlite::Result<usize> {
+    let mut total = 0usize;
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO kg_invalidated_no_match (subject_entity_id, agent_id) VALUES (?1, ?2)",
+    )?;
+    for &id in subject_entity_ids {
+        total += stmt.execute(rusqlite::params![id, agent_id])?;
+    }
+    Ok(total)
+}
+
+/// Remove a single invalidation marker after the entity has been re-resolved.
+/// No-op if the marker does not exist (idempotent).
+///
+/// Called by `entity_resolver::write_log()` after writing the new resolution
+/// log row, ensuring cleanup from all code paths (startup, compound-hook, tick).
+pub fn clear_invalidated_no_match(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    subject_entity_id: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM kg_invalidated_no_match WHERE subject_entity_id = ?1 AND agent_id = ?2",
+        rusqlite::params![subject_entity_id, agent_id],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +277,134 @@ mod tests {
     #[test]
     fn kg_chunk_source_type_value() {
         assert_eq!(KG_CHUNK_SOURCE_TYPE, "kg_chunk");
+    }
+
+    // --- #961: invalidation marker helpers ---
+
+    /// Helper: open an in-memory DB for marker tests.
+    fn marker_test_db() -> rusqlite::Connection {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.register_agent("test-agent", "test-agent", "/tmp/test")
+            .unwrap();
+        db.conn
+    }
+
+    #[test]
+    fn record_invalidated_inserts_markers() {
+        let conn = marker_test_db();
+        let inserted = record_invalidated_no_match(&conn, "test-agent", &[1, 2, 3]).unwrap();
+        assert_eq!(inserted, 3);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_invalidated_no_match WHERE agent_id = 'test-agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn record_invalidated_insert_or_ignore_idempotent() {
+        let conn = marker_test_db();
+        let first = record_invalidated_no_match(&conn, "test-agent", &[42]).unwrap();
+        assert_eq!(first, 1);
+
+        // Second call with same (subject_entity_id, agent_id) is a no-op.
+        let second = record_invalidated_no_match(&conn, "test-agent", &[42]).unwrap();
+        assert_eq!(second, 0, "INSERT OR IGNORE should return 0 on duplicate");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_invalidated_no_match WHERE agent_id = 'test-agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "still only one row");
+    }
+
+    #[test]
+    fn record_invalidated_empty_slice() {
+        let conn = marker_test_db();
+        let inserted = record_invalidated_no_match(&conn, "test-agent", &[]).unwrap();
+        assert_eq!(inserted, 0);
+    }
+
+    #[test]
+    fn clear_invalidated_removes_marker() {
+        let conn = marker_test_db();
+        record_invalidated_no_match(&conn, "test-agent", &[10]).unwrap();
+
+        let removed = clear_invalidated_no_match(&conn, "test-agent", 10).unwrap();
+        assert_eq!(removed, 1);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_invalidated_no_match WHERE agent_id = 'test-agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn clear_invalidated_noop_on_missing() {
+        let conn = marker_test_db();
+        // No marker exists — DELETE is a no-op.
+        let removed = clear_invalidated_no_match(&conn, "test-agent", 999).unwrap();
+        assert_eq!(removed, 0, "should be no-op when marker does not exist");
+    }
+
+    #[test]
+    fn markers_scoped_by_agent() {
+        let conn = marker_test_db();
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES ('other-agent', 'other', '/tmp/other')",
+            [],
+        )
+        .unwrap();
+
+        record_invalidated_no_match(&conn, "test-agent", &[1, 2]).unwrap();
+        record_invalidated_no_match(&conn, "other-agent", &[1, 3]).unwrap();
+
+        // Each agent sees only their markers.
+        let test_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_invalidated_no_match WHERE agent_id = 'test-agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let other_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_invalidated_no_match WHERE agent_id = 'other-agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(test_count, 2);
+        assert_eq!(other_count, 2);
+
+        // Clear for one agent doesn't affect the other.
+        clear_invalidated_no_match(&conn, "test-agent", 1).unwrap();
+        let test_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_invalidated_no_match WHERE agent_id = 'test-agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let other_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_invalidated_no_match WHERE agent_id = 'other-agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(test_after, 1, "test-agent lost one marker");
+        assert_eq!(other_after, 2, "other-agent unchanged");
     }
 }

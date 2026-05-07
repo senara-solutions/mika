@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 31;
+pub const CURRENT_SCHEMA_VERSION: i64 = 32;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1069,6 +1069,11 @@ impl Database {
             info!(version = 31, "database migrated to v31");
         }
 
+        if (3..=31).contains(&version) {
+            self.migrate_v31_to_v32()?;
+            info!(version = 32, "database migrated to v32");
+        }
+
         Ok(())
     }
 
@@ -1123,7 +1128,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (31);
+            INSERT INTO schema_version (version) VALUES (32);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1670,6 +1675,16 @@ impl Database {
                 UNIQUE (agent_id, subject_entity_id)
             );
             CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
+
+            -- KG invalidation markers (#961): ephemeral sidecar for tracking
+            -- entities whose no_match resolution log rows were deleted by
+            -- domain-graph rebuild invalidation (#960).
+            CREATE TABLE kg_invalidated_no_match (
+                subject_entity_id INTEGER NOT NULL,
+                agent_id TEXT NOT NULL,
+                invalidated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (subject_entity_id, agent_id)
+            );
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -3723,6 +3738,36 @@ impl Database {
         tx.commit()?;
 
         info!("v30→v31: added response_text and reasoning columns to llm_calls (#653)");
+
+        Ok(())
+    }
+
+    /// v31→v32: Add `kg_invalidated_no_match` sidecar table (#961).
+    ///
+    /// Ephemeral marker table for tracking entities whose `no_match` resolution
+    /// log rows were deleted by domain-graph rebuild invalidation (#960).
+    /// The resolver reads and cleans up these markers during resolution.
+    fn migrate_v31_to_v32(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 32 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS kg_invalidated_no_match (
+                subject_entity_id INTEGER NOT NULL,
+                agent_id TEXT NOT NULL,
+                invalidated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                PRIMARY KEY (subject_entity_id, agent_id)
+            );",
+        )?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (32)", [])?;
+        tx.commit()?;
+
+        info!("v31→v32: added kg_invalidated_no_match sidecar table (#961)");
 
         Ok(())
     }
@@ -13209,6 +13254,7 @@ mod tests {
         db2.migrate_v28_to_v29().unwrap();
         db2.migrate_v29_to_v30().unwrap();
         db2.migrate_v30_to_v31().unwrap();
+        db2.migrate_v31_to_v32().unwrap();
 
         let final_version: i64 = db2
             .conn
