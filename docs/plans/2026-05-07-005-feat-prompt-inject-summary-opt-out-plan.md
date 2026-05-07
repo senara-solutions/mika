@@ -235,6 +235,17 @@ inject = false
 | `crates/mika-agent/src/prompt.rs` (tests) | Config parsing tests (4 scenarios: default, partial, explicit-true, explicit-false) |
 | `crates/mika-agent/tests/eval/` | Conversation-mode load-prevention + default eval scenarios; silent-mode coverage note |
 | `crates/mika-agent/CLAUDE.md` | New § Context Injection Configuration; § Three-Layer Memory Model annotation |
+| Root `CLAUDE.md` (verify in Phase 0) | If a § Three-Layer Memory Model or equivalent context-priority section exists at the repo root, mirror the per-agent override annotation. If absent, document the no-op explicitly in the PR description. (Architect NF6: pre-commit discovery via `grep -rn "Three-Layer Memory Model" CLAUDE.md`.) |
+
+## Issue-body sync (PR-time, NF5)
+
+The mika#1016 issue body's AC text (AC#1–AC#4) uses the pre-pass-1 flat-section schema (`[context].inject_summary`) because the ticket was filed before grooming. The plan reframes that with sound architectural reasoning (F1: nested `[context.summary] inject`). Per the issue-as-versioned-contract discipline, the implementing PR must:
+
+1. Update the issue body's AC text in-place to match the implemented schema (`[context.summary].inject`), preserving the original AC numbering.
+2. Carry an edit-notice comment on the issue: *"AC text updated 2026-05-07 to match the post-grooming nested-section schema (mika-arch F1). Plan + commit history is the authoritative trail."*
+3. Cross-reference this plan's commit SHA in the closure annotation when the PR lands.
+
+This is a PR-author / operator action, not an architect or implementer ambiguity. Named here so it does not get lost.
 
 ## Risks
 
