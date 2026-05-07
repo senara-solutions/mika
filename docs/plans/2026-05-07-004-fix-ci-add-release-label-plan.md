@@ -1,7 +1,7 @@
 ---
 title: "fix(ci): add release label so release-pr workflow succeeds"
 type: fix
-status: active
+status: complete
 date: 2026-05-07
 ---
 
@@ -46,7 +46,7 @@ After mika#1003 merged, the force-push succeeds but `gh pr create` exits non-zer
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add `release` label to `.github/labels.yml`**
+- [x] **Unit 1: Add `release` label to `.github/labels.yml`**
 
 **Goal:** Make `gh pr create --label "release"` succeed by ensuring the label exists.
 
@@ -73,7 +73,7 @@ After mika#1003 merged, the force-push succeeds but `gh pr create` exits non-zer
 - Label-sync workflow applies the label to the repo
 - Release-pr workflow no longer fails on the `gh pr create` step
 
-- [ ] **Unit 2: Update chronic-drift doc with Class D entry**
+- [x] **Unit 2: Update chronic-drift doc with Class D entry**
 
 **Goal:** Document this fix in the institutional memory per the compound-doc discipline rule.
 

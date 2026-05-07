@@ -98,5 +98,5 @@
 
 # ── Automation ───────────────────────────────────────────────────────────────
 - name: release
-  color: "e99695"
+  color: "6e40c9"
   description: Release PR created by CI (release-pr workflow)
