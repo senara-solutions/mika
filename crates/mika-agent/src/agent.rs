@@ -2015,12 +2015,18 @@ async fn run_agent_inner(
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
-    // Inject conversation summary into system prompt if one exists
-    if let Some(summary) = db.load_conversation_summary().await? {
-        system.push_str("\n## Conversation Summary\n");
-        system.push_str("<context type=\"summary\" trust=\"data\">\n");
-        system.push_str(&summary.content);
-        system.push_str("\n</context>\n");
+    // Load-prevention gate: when [context.summary].inject is false, skip the
+    // db.load_conversation_summary() call entirely so the summary is never
+    // deserialized into this turn's scope (mika#1009 leak protection).
+    // The nested if is intentional — collapsing would obscure the load-prevention contract.
+    #[allow(clippy::collapsible_if)]
+    if ctx.identity.context.summary.inject {
+        if let Some(summary) = db.load_conversation_summary().await? {
+            system.push_str("\n## Conversation Summary\n");
+            system.push_str("<context type=\"summary\" trust=\"data\">\n");
+            system.push_str(&summary.content);
+            system.push_str("\n</context>\n");
+        }
     }
 
     // Resolve GitHub token once: prefer GitHub App installation token, fall back to PAT.
@@ -3074,12 +3080,18 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
-    // Inject conversation summary so heartbeat/reminder agents have recent context
-    if let Some(summary) = db.load_conversation_summary().await? {
-        system.push_str("\n## Conversation Summary\n");
-        system.push_str("<context type=\"summary\" trust=\"data\">\n");
-        system.push_str(&summary.content);
-        system.push_str("\n</context>\n");
+    // Load-prevention gate: when [context.summary].inject is false, skip the
+    // db.load_conversation_summary() call entirely so the summary is never
+    // deserialized into this turn's scope (mika#1009 leak protection).
+    // The nested if is intentional — collapsing would obscure the load-prevention contract.
+    #[allow(clippy::collapsible_if)]
+    if ctx.identity.context.summary.inject {
+        if let Some(summary) = db.load_conversation_summary().await? {
+            system.push_str("\n## Conversation Summary\n");
+            system.push_str("<context type=\"summary\" trust=\"data\">\n");
+            system.push_str(&summary.content);
+            system.push_str("\n</context>\n");
+        }
     }
 
     // Match skills based on trigger type:

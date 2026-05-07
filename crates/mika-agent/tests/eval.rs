@@ -41,6 +41,7 @@ mod eval {
     mod test_callback_terminal_action;
     mod test_callback_turn;
     mod test_completion_claim_guard;
+    mod test_context_summary_inject;
     mod test_deadline_in_flight_llm_call;
     mod test_di_builders;
     mod test_error_handling;

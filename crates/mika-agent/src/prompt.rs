@@ -126,6 +126,48 @@ pub struct ToolsIdentityConfig {
     pub disabled: Vec<String>,
 }
 
+/// Per-agent context-injection config from `[context]` section of `identity.toml`.
+///
+/// Top-level holder for prompt-assembly toggles. Each context block (summary,
+/// future: tools, system, memory) gets its own nested section.
+///
+/// Use case: well-known agents (mika-arch) where a specific context block is
+/// a known leak source (mika#1009). Operator opts the agent out via
+/// `identity.toml`; production behavior changes on next mika-server restart.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ContextIdentityConfig {
+    #[serde(default)]
+    pub summary: ContextSummaryConfig,
+}
+
+/// `[context.summary]` subsection — controls injection of the conversational
+/// summary block into the system prompt at prompt-assembly time.
+///
+/// `inject = false` is a load-prevention gate, not injection-prevention:
+/// `db.load_conversation_summary()` is not called, the summary is not
+/// deserialized, and the result is not available to any downstream code path
+/// in the same turn. This is the correct shape for mika#1009's leak class.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContextSummaryConfig {
+    /// Whether to load and inject the conversational summary into the system prompt.
+    /// Default: `true` (preserves current behavior for all existing agents).
+    /// Set to `false` for agents where summary leakage is a known problem.
+    #[serde(default = "default_inject_summary")]
+    pub inject: bool,
+}
+
+fn default_inject_summary() -> bool {
+    true
+}
+
+impl Default for ContextSummaryConfig {
+    fn default() -> Self {
+        Self {
+            inject: default_inject_summary(),
+        }
+    }
+}
+
 /// Agent identity loaded from ~/.mika/identity.toml.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Identity {
@@ -141,6 +183,8 @@ pub struct Identity {
     pub skills: SkillsIdentityConfig,
     #[serde(default)]
     pub tools: ToolsIdentityConfig,
+    #[serde(default)]
+    pub context: ContextIdentityConfig,
 }
 
 fn default_name() -> String {
@@ -160,6 +204,7 @@ impl Default for Identity {
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
+            context: ContextIdentityConfig::default(),
         }
     }
 }
@@ -253,6 +298,11 @@ fn fail_closed_identity() -> Identity {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+        },
+        // Fail-closed must enforce inject=false so a malformed identity.toml
+        // cannot re-enable summary injection (mika#1009 leak protection).
+        context: ContextIdentityConfig {
+            summary: ContextSummaryConfig { inject: false },
         },
     }
 }
@@ -904,6 +954,7 @@ mod tests {
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
+            context: ContextIdentityConfig::default(),
         }
     }
 
@@ -984,6 +1035,7 @@ mod tests {
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
+            context: ContextIdentityConfig::default(),
         };
         let ctx = PromptContext {
             soul_content: "",
@@ -2306,5 +2358,58 @@ allowlist = []
         )
         .unwrap();
         assert_eq!(identity.skills.allowlist.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_context_summary_inject_explicit_false() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Architect"
+
+[context.summary]
+inject = false
+"#,
+        )
+        .unwrap();
+        assert!(!identity.context.summary.inject);
+    }
+
+    #[test]
+    fn test_context_summary_inject_default_no_context_section() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Dev"
+"#,
+        )
+        .unwrap();
+        assert!(identity.context.summary.inject);
+    }
+
+    #[test]
+    fn test_context_summary_inject_default_context_no_summary() {
+        // [context] present but no [context.summary] — inject should default true
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Dev"
+
+[context]
+"#,
+        )
+        .unwrap();
+        assert!(identity.context.summary.inject);
+    }
+
+    #[test]
+    fn test_context_summary_inject_explicit_true() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Dev"
+
+[context.summary]
+inject = true
+"#,
+        )
+        .unwrap();
+        assert!(identity.context.summary.inject);
     }
 }
