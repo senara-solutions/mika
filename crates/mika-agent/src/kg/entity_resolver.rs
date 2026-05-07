@@ -380,8 +380,9 @@ impl SubjectEntityResolver {
             )
             .await;
 
-            // Track reattempted no_match entities (#961). Only count when a
-            // log row was written (all outcomes except SkippedBudget).
+            // Track reattempted no_match entities (#961). SkippedBudget
+            // entities never reach here (the `continue` above skips them);
+            // all remaining outcomes wrote a log row via apply_result.
             if entity.was_invalidated {
                 stats.reattempted_no_match += 1;
             }
