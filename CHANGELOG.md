@@ -1,6 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.7.0](https://github.com/senara-solutions/mika/releases/tag/v0.7.0) — 2026-05-07
+
+### Added
+
+- *(prompt)* per-agent [context.summary].inject opt-out flag (#1016) (#1019)
 ## [v0.6.0](https://github.com/senara-solutions/mika/releases/tag/v0.6.0) — 2026-05-07
 
 ### Added
