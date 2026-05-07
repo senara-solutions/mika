@@ -95,14 +95,24 @@ Not applicable — codebase has strong local patterns for both layers.
 - **Q: Does `resolve_skill_llm_override()` get called on autonomous-loop turns?** Yes — at `agent.rs:2057` (conversation mode), which is the path webhook events take.
 - **Q: Why didn't the 2026-04-26 architect dogfood catch this?** The mika-arch override is on `mika-arch-groom-ticket` skill, which is keyword-matched (`groom`, `groom ticket`). mika-arch's primary use cases trigger keyword match; mika-dev's primary use case (webhook events) does not.
 
-### Resolved on first-pass review (mika-arch session `8a315f0a-...`, ITERATE)
+### Resolved through architect first + second pass (sessions `8a315f0a-...`)
 
-All questions previously deferred to architect are now pinned in Phase 0 and Key Technical Decisions:
-- Layer 1 sub-option (b) chosen (Phase 0.1, §0.4 carve-out scope).
+**First-pass ITERATE (F1/F2/F3 + NF1-NF4):** all addressed in Phase 0 and Key Technical Decisions.
+- Layer 1 sub-option (b) chosen (Phase 0.1 #463 verbatim quote, §0.4 carve-out scope).
 - Race window: single transaction with `BEGIN IMMEDIATE` (Key Technical Decisions).
 - Silent variant: new `SilentTrigger::DeferredDispatch` with required-action set `{run_claude_pilot}` (Key Technical Decisions).
 - Composition (α/β/γ): γ chosen (Key Technical Decisions).
 - Reaper/watchdog regression: verified in Phase 0.5 (no inference).
+- Test surface: tabulated in Phase 0.3 with new sibling-test specification.
+
+**Second-pass GROOMED (conditional on 4 changes, all applied):**
+- U1 (`from_db_override` field placement): bool ratified (YAGNI on enum). No change.
+- U2 (immediate-promote in_progress + null-PID transient window): accepted, watchdog skips correctly. No change.
+- U3 (#265 audit scope): split to separate cleanup ticket. Phase 0.2 + Unit 3 updated.
+- U4 (flood cap default): 10 ratified; cap-exceeded behavior named (REJECT not evict, new error variant `deferred_dispatch_cap_exceeded`). Risks table + Unit 2 updated.
+- U5 (cascade location): Phase 0.7 added — there is NO existing cascade; this plan ADDS one to `cancel_task()` for `trigger_type='callback'` children. Risks + Unit 2 updated.
+- U6 (reaper grace-clock interaction): named in Risks table. Acceptable, bounded by flood cap.
+- NF5 (storage table): Phase 0.8 added — deferred callbacks live in existing `tasks` table with `label='long_running:run_claude_pilot:deferred'` discriminator. No new table.
 
 ### Deferred to Implementation
 
@@ -180,7 +190,7 @@ mika#265 verbatim (closed 2026-03-26): about `mika ask` vs TUI claude-pilot exec
 
 `crates/mika-agent/CLAUDE.md` § Skills System cites `#265` for "Match-reason conditioning." `crates/mika-agent/src/agent.rs:3768` cites `(#265, #463)` as the precedent. **Both citations appear stale or miscited** — the actual mika#265 issue does not establish the `MatchReason::Keyword`-only filter for `collect_required_tools()`. Possible explanations: a private/earlier issue tracker, a re-numbered issue, or a documentation drift.
 
-**Decision:** This does not change the architectural call (the #463 rationale stands on its own). Note in Unit 3 (doc updates) that the stale `#265` citation in `crates/mika-agent/CLAUDE.md` and `agent.rs:3768` should be removed or corrected to "match-reason filter pattern" without a specific issue reference.
+**Decision (architect-ratified):** This does not change the architectural call (the #463 rationale stands on its own). Per architect second-pass ruling on U3, the broader `#265` audit (grep across the entire repo for stale references) is **split out as a separate cleanup ticket** to keep this PR scoped. This plan only updates the comment at `agent.rs:3766-3768` directly modified by Layer 1's filter relaxation; the rest of the audit ships separately. Implementer files the follow-up ticket as part of Unit 3, but does not perform the audit in this PR.
 
 ### 0.3 — Existing test surface for `resolve_skill_llm_override`
 
@@ -261,6 +271,61 @@ if ov.llm_provider.is_some() || ov.llm_model.is_some() {
 
 `entry.has_override` is a generic flag set on ANY DB override (always_on, llm, enabled). Not specific enough to distinguish DB-LLM-sourced vs other DB overrides. Hence the new `LlmOverride::from_db_override` field per § 0.4.
 
+### 0.7 — Task-cancellation cascade (architect ratification U5)
+
+Read `crates/mika-agent/src/db.rs:4350-4357` (`cancel_task`):
+```rust
+pub fn cancel_task(&self, id: &str, agent_id: &str) -> Result<bool> {
+    let n = self.conn.execute(
+        "UPDATE tasks SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE id = ?1 AND agent_id = ?2 AND status NOT IN ('completed','failed','cancelled','expired','delivered')",
+        params![id, agent_id],
+    )?;
+    Ok(n > 0)
+}
+```
+
+**There is NO existing parent→child cancel cascade.** `cancel_task()` updates only the single task row. The `tasks` table FK `parent_task_id REFERENCES "tasks"(id) ON DELETE SET NULL` only fires on DELETE, not on status updates. Cancelled parents leave child callbacks (`pending` or `in_progress`) untouched.
+
+**Decision: add cascade as part of this plan.** Extend `cancel_task()` to ALSO cancel child tasks where `trigger_type = 'callback'` AND `status IN ('pending', 'in_progress')`. The new cascade is scoped to callback children only — manual children (e.g., a sub-task created via `create_task` with parent linkage) are out of scope and stay uncancelled per existing semantics.
+
+Pseudocode (directional):
+```rust
+pub fn cancel_task(&self, id: &str, agent_id: &str) -> Result<bool> {
+    // existing single-task UPDATE
+    let n = self.conn.execute(/* ... existing ... */)?;
+    if n > 0 {
+        // NEW: cascade to active callback children
+        self.conn.execute(
+            "UPDATE tasks SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE parent_task_id = ?1 AND agent_id = ?2
+               AND trigger_type = 'callback'
+               AND status IN ('pending', 'in_progress')",
+            params![id, agent_id],
+        )?;
+    }
+    Ok(n > 0)
+}
+```
+
+This is an additive cascade that benefits the deferred-callback case AND closes a latent gap in the orphaned-callback class generally (callbacks of cancelled parents previously sat `pending` until reaper grace expired). The change is small enough to ship with mika#1011 but adds a regression test surface beyond Layer 1/2. Implementer must:
+- Add a test in `db.rs` test module: `cancel_task_cascades_to_active_callback_children`.
+- Verify no regression on existing callback flows by reading `dispatcher.rs::handle_task_complete` to confirm it doesn't assume callbacks remain `in_progress` after their parent is cancelled.
+
+### 0.8 — Deferred-callback storage table (architect ratification NF5)
+
+**Decision: deferred callbacks live in the existing `tasks` table.** No new table introduced. Distinguishing markers:
+- `trigger_type = 'callback'` (existing)
+- `action_type = 'resume_agent'` (existing)
+- `label = 'long_running:run_claude_pilot:deferred'` (new label value, distinct from `'long_running:run_claude_pilot'` used by the existing immediate-dispatch callback)
+- `parent_task_id` = the requesting (rejected) task (NOT the blocking task — this is the inverted parent linkage that distinguishes deferred from immediate callbacks)
+- `process_id IS NULL` until promoted-and-dispatched
+- `action_config` JSON encodes `{"trigger_kind": "deferred_dispatch", "original_call": {prompt, skill, task_id}}`
+
+**Why no new table:** the existing `tasks` table already supports the lifecycle (`pending → in_progress → delivered → completed`), parent linkage, and indexed queries. A new table would duplicate the schema and require new dispatch / watchdog / reaper code paths. The label field is the discriminator.
+
+**Index implications:** existing `idx_tasks_agent_status ON tasks(agent_id, status)` and `idx_tasks_parent ON tasks(parent_task_id, agent_id)` cover the FIFO drain query (`ORDER BY created_at ASC WHERE label = '…:deferred' AND status = 'pending'`). If query plan analysis (after first deploy) shows a sequential scan, add a partial index `idx_tasks_deferred_pending ON tasks(created_at) WHERE label = 'long_running:run_claude_pilot:deferred' AND status = 'pending'`. Defer to implementation; do not add pre-emptively.
+
 ## Implementation Units
 
 ### Unit 1: Layer 1 — relax `resolve_skill_llm_override()` for AlwaysOn + DB-sourced overrides (sub-option b)
@@ -333,7 +398,9 @@ The deduplication / conflict-detection / same-provider short-circuit logic at `a
 **Dependencies:** None in code (independent of Unit 1).
 
 **Files:**
-- Modify: `crates/mika-agent/src/skills/executor.rs:785-814` — `global_dispatch_active` rejection path inserts a deferred callback inside a `BEGIN IMMEDIATE` transaction that also re-checks blocking-task status and immediate-promotes if drained
+- Modify: `crates/mika-agent/src/skills/executor.rs:785-814` — `global_dispatch_active` rejection path: BEFORE inserting, check the per-agent deferred-pending count (cap = 10). If at cap, return `{"error":"deferred_dispatch_cap_exceeded", ...}` rejection JSON without inserting (γ composition routes the operator notification through the LLM's `send_message`). If under cap, insert a deferred callback inside a `BEGIN IMMEDIATE` transaction that also re-checks blocking-task status and immediate-promotes if drained
+- Modify: `crates/mika-agent/src/db.rs:4350-4357` — extend `cancel_task()` to cascade: after the existing single-task UPDATE succeeds, UPDATE child tasks where `trigger_type='callback'` AND `status IN ('pending','in_progress')` to `'cancelled'` (Phase 0.7)
+- Add: `crates/mika-agent/src/db.rs` — new helper `count_pending_deferred_callbacks(agent_id) -> i64` for the cap check at the executor.rs site
 - Modify: `crates/mika-agent/src/task_engine/dispatcher.rs` — `handle_task_complete()` Ok-path: after firing blocking task's existing callback, drain next pending deferred callback (FIFO via `created_at ASC`) under same transaction discipline
 - Modify: `crates/mika-agent/src/task_engine/mod.rs` (or wherever `SilentTrigger` enum lives) — add `DeferredDispatch` variant. Wire it through `run_silent_agent` framing logic so `[callback:deferred-dispatch]` prefix is injected
 - Modify: `crates/mika-agent/src/agent.rs` `INTENT_GUARDS` array (~line 4405-4513) — add `deferred_dispatch_action` entry per Key Technical Decisions (required-action set: `{run_claude_pilot}`)
@@ -343,6 +410,8 @@ The deduplication / conflict-detection / same-provider short-circuit logic at `a
 - Test: `crates/mika-agent/src/task_engine/dispatcher.rs` test module — add `deferred_callback_fires_on_blocking_completion` (FIFO drain)
 - Test: `crates/mika-agent/src/task_engine/dispatcher.rs` test module — add `mika583_invariant_preserved_with_deferred_queue` (never two `in_progress` callbacks at once)
 - Test: `crates/mika-agent/src/agent.rs` test module — add `intent_guard_deferred_dispatch_requires_run_claude_pilot` (NF1 verification)
+- Test: `crates/mika-agent/src/db.rs` test module — add `cancel_task_cascades_to_active_callback_children` (Phase 0.7 verification)
+- Test: `crates/mika-agent/src/skills/executor.rs` test module — add `deferred_dispatch_cap_exceeded_rejects_without_insert` (cap behavior verification)
 - Test: `crates/mika-agent/tests/eval/` — end-to-end scenario covering "two ready-label webhooks fire; first dispatches, second is deferred; deferred resumes after first completes; both produce PRs"
 
 **Approach:**
@@ -462,11 +531,12 @@ The agent's only required action on a deferred-dispatch turn is `run_claude_pilo
 **Dependencies:** Unit 1 + Unit 2.
 
 **Files:**
-- Modify: `crates/mika-agent/CLAUDE.md` § Skills System — update the "Per-skill LLM override" paragraph to flag the carve-out behavior (`AlwaysOn` skills with DB-sourced overrides via `from_db_override` flag also qualify; original #463 protection against `skill.toml [llm]` hijacks preserved); also fix the stale `#265` reference per Phase 0.2 (remove or correct to a non-issue-number citation like "match-reason filter pattern")
-- Modify: `crates/mika-agent/CLAUDE.md` § Unified Task Engine — add a paragraph on deferred-dispatch callback semantics: registration on `global_dispatch_active`, FIFO drain in `handle_task_complete`, `SilentTrigger::DeferredDispatch` framing, γ composition with operator-notification path
-- Modify: `crates/mika-agent/src/agent.rs:3766-3768` — update the `(#265, #463)` comment per Phase 0.2 (remove stale `#265` reference; re-state the precedent as "AlwaysOn skills with developer-time `[llm]` sections do not impose LLM override; AlwaysOn skills with operator-time DB overrides DO impose")
+- Modify: `crates/mika-agent/CLAUDE.md` § Skills System — update the "Per-skill LLM override" paragraph to flag the carve-out behavior (`AlwaysOn` skills with DB-sourced overrides via `from_db_override` flag also qualify; original #463 protection against `skill.toml [llm]` hijacks preserved). Cite mika#1011 for the new behavior. **Do NOT do the broader `#265` audit here** — split as a separate cleanup ticket per architect second-pass U3 ratification.
+- Modify: `crates/mika-agent/CLAUDE.md` § Unified Task Engine — add a paragraph on deferred-dispatch callback semantics: registration on `global_dispatch_active`, FIFO drain in `handle_task_complete`, `SilentTrigger::DeferredDispatch` framing, γ composition with operator-notification path. Reference Phase 0.8 marker convention.
+- Modify: `crates/mika-agent/src/agent.rs:3766-3768` — update ONLY this comment per Phase 0.2's scoped fix. Remove `#265` from this specific citation; re-state the precedent as "AlwaysOn skills with developer-time `[llm]` sections do not impose LLM override; AlwaysOn skills with operator-time DB overrides DO impose (mika#1011)." Other `#265` references in the repo are out of scope for this PR.
 - Modify: `crates/mika-agent/src/agent.rs:4427-4430, 4548-4551` — update inline comments to reflect the γ composition: `global_dispatch_active` STILL surfaces to the LLM (which may call `send_message`) AND has an engine-side deferred-callback auto-recovery path; the two paths are independent and `validate_dispatch_readiness()` arbitrates any race. Other terminal errors unchanged.
-- Test expectation: none — pure documentation.
+- File a follow-up ticket: `chore(docs): audit and correct stale `#265` references across mika-agent CLAUDE.md and source comments` — body lists known sites (`agent.rs:3768` already fixed by this PR; `crates/mika-agent/CLAUDE.md § Skills System` Match-reason conditioning paragraph; any others surfaced by `grep -rn "#265" crates/mika-agent/`). Title prefix `chore(docs)`, label `documentation`, no priority. Implementer creates this in Unit 3 but does not implement.
+- Test expectation: none — pure documentation + ticket filing.
 
 **Patterns to follow:**
 - Existing `crates/mika-agent/CLAUDE.md` paragraph style — concise, version-pinned, file:line cited.
@@ -494,8 +564,9 @@ The agent's only required action on a deferred-dispatch turn is `run_claude_pilo
 | Risk | Mitigation |
 |---|---|
 | Layer 1 carve-out for `AlwaysOn` + `from_db_override` may surface unexpected behavior in mika-arch's existing flows | mika-arch's overrides are on keyword-matched skills (`mika-arch-groom-ticket`, `mika-arch-second-review`); sub-option (b) doesn't change behavior for keyword-matched paths. Affects only AlwaysOn-only matched skills with explicit DB overrides — today only self-dev on mika-dev qualifies. Add explicit test coverage that mika-arch's groom-ticket flow continues to use sonnet on keyword-match (regression unchanged). |
-| Layer 2 deferred-callback flood: malicious or buggy agent fires many `run_claude_pilot` calls; queue grows unbounded | Add a per-agent cap on pending deferred callbacks (e.g., 10). Existing `max_agent_tasks_per_session` (`db.rs`) is the precedent. Implementer settles the exact cap based on operational signals; default 10 is a safe starting point. |
-| Layer 2 stale deferred callbacks: parent task is cancelled but deferred callback orphans | Cascade delete or status-cascade — mark deferred callback `cancelled` when parent is `cancelled`/`failed`. Add to the existing `update_task_status` cascade logic in `db.rs`. |
+| Layer 2 deferred-callback flood: malicious or buggy agent fires many `run_claude_pilot` calls; queue grows unbounded | Per-agent cap of **10 pending deferred callbacks** (architect-ratified). `executor.rs::validate_dispatch_readiness()`'s `global_dispatch_active` path checks pending-deferred count for the requesting agent BEFORE inserting a new row. **Cap-exceeded behavior: REJECT (do NOT evict).** When count >= 10, return the rejection JSON without registering a new deferred callback. The existing LLM-handles-via-`send_message` path takes over (γ composition). This preserves FIFO order — older deferred callbacks always drain first. New error variant in the rejection JSON: `{"error": "deferred_dispatch_cap_exceeded", "agent_id": "...", "pending_deferred_count": 10}` (parallel to existing `dispatch_check_failed`). |
+| Layer 2 stale deferred callbacks: parent task is cancelled but deferred callback orphans | Phase 0.7 pinned: there is NO existing parent→child cancel cascade in `db.rs::cancel_task()`. This plan ADDS a scoped cascade — when `cancel_task()` succeeds on a parent, it also UPDATEs all child tasks where `trigger_type='callback'` AND `status IN ('pending','in_progress')` to `'cancelled'`. Includes a regression test (`cancel_task_cascades_to_active_callback_children`). Side benefit: closes a latent gap in callback-orphan handling for non-deferred callbacks too. |
+| Reaper grace-clock interaction with long-pending deferred callbacks (architect U6) | The reaper's `NOT EXISTS sibling pending-or-in_progress` clause defers reaping a parent that has both a `delivered` claude-pilot child AND a `pending` deferred-dispatch sibling. Most cases this is correct (don't reap an actively-queued task). The flood-cap (10 pending deferred per agent) bounds the worst case — a buggy parent can't accumulate more than 10 deferred-pending siblings. Behavior change is acceptable; named here for operator awareness. |
 | Layer 2 immediate-promote path (TOCTOU close) needs operator visibility: when `global_dispatch_active` rejection IMMEDIATELY promotes the just-inserted deferred callback, the rejection JSON still surfaces to the LLM, which may call `send_message` saying the dispatch was rejected — even though the engine already auto-recovered. Operator could see a misleading notification | Acceptable under γ — the LLM's message is informational; the deferred callback's actual dispatch result will land on its own callback turn, providing the authoritative outcome. Optional: add a one-line annotation to the rejection JSON when immediate-promote fires (`"deferred_dispatched_immediately": true`) so the LLM can phrase the notification appropriately. Implementer judgment. |
 | Phase 0.2's stale `#265` citation indicates documentation drift: the actual mika#265 GitHub issue is unrelated to skill matching. Other code/doc references to `#265` for "match-reason precedent" may exist that this plan doesn't catch | Implementer must `grep -rn "#265" crates/mika-agent/src crates/mika-agent/CLAUDE.md` during Unit 3 doc updates. Each occurrence: verify it cites the actual issue or remove/replace per Phase 0.2's correction. Out of scope: tracking down the original issue tracker reference (if any). |
 
