@@ -705,6 +705,7 @@ async fn validate_dispatch_readiness(
     db: &AsyncDatabase,
     task_id: &str,
     github_token: Option<&str>,
+    tool_input: Option<&serde_json::Value>,
 ) -> Result<String, String> {
     // Re-fetch the task to get the full struct (validate_task confirmed existence)
     let task = match db.get_task(task_id).await {
@@ -786,7 +787,18 @@ async fn validate_dispatch_readiness(
     // callback child. Enforces single-session-at-a-time across all tasks.
     match db.has_active_callback_tasks_excluding(task_id).await {
         Ok(Some((blocking_parent_id, blocking_callback_id))) => {
-            return Err(serde_json::json!({
+            // mika#1011 — Register a deferred-dispatch callback so the engine
+            // auto-retries when the blocking dispatch completes. The LLM still
+            // sees the rejection (γ composition) and may call send_message;
+            // both paths are independent and validate_dispatch_readiness()
+            // arbitrates any race on the next dispatch attempt.
+            let deferred_registered = if let Some(input) = tool_input {
+                register_deferred_callback(db, task_id, input).await
+            } else {
+                false
+            };
+
+            let mut rejection = serde_json::json!({
                 "error": "global_dispatch_active",
                 "task_id": task_id,
                 "blocking_task_id": blocking_parent_id,
@@ -798,8 +810,11 @@ async fn validate_dispatch_readiness(
                      dispatching again.",
                     blocking_parent_id, blocking_callback_id
                 )
-            })
-            .to_string());
+            });
+            if deferred_registered {
+                rejection["deferred_dispatch_registered"] = serde_json::json!(true);
+            }
+            return Err(rejection.to_string());
         }
         Ok(None) => { /* No conflicting dispatch — proceed */ }
         Err(e) => {
@@ -865,6 +880,86 @@ async fn validate_dispatch_readiness(
     Ok(task.status.clone())
 }
 
+/// Maximum number of pending deferred-dispatch callbacks per agent (mika#1011).
+/// Prevents unbounded queue growth from buggy or malicious dispatch loops.
+const MAX_PENDING_DEFERRED_CALLBACKS: i64 = 10;
+
+/// Register a deferred-dispatch callback when `global_dispatch_active` fires (mika#1011).
+///
+/// Creates a `pending` callback task with `label = "long_running:run_claude_pilot:deferred"`
+/// linked to the requesting parent task. When the blocking dispatch completes, the
+/// dispatcher promotes this to `in_progress` and fires a `SilentTrigger::DeferredDispatch`
+/// turn. Returns `true` if registered, `false` if cap exceeded or DB error (fail-open).
+async fn register_deferred_callback(
+    db: &AsyncDatabase,
+    task_id: &str,
+    input: &serde_json::Value,
+) -> bool {
+    // Flood-cap check: reject without insert if at capacity
+    match db.count_pending_deferred_callbacks().await {
+        Ok(count) if count >= MAX_PENDING_DEFERRED_CALLBACKS => {
+            warn!(
+                task_id,
+                pending_count = count,
+                cap = MAX_PENDING_DEFERRED_CALLBACKS,
+                "deferred_dispatch_cap_exceeded — not registering deferred callback"
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!(task_id, error = %e, "failed to count deferred callbacks — skipping registration");
+            return false;
+        }
+        _ => {}
+    }
+
+    // Encode the original dispatch arguments so the deferred turn can replay them.
+    let action_config = serde_json::json!({
+        "trigger_kind": "deferred_dispatch",
+        "original_call": input,
+    })
+    .to_string();
+
+    let task = NewTask {
+        agent_id: db.agent_id().to_string(),
+        team_run_id: None,
+        parent_task_id: Some(task_id.to_string()),
+        depth: 0,
+        label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+        trigger_type: trigger_type::CALLBACK.to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: None,
+        action_type: action_type::RESUME_AGENT.to_string(),
+        action_config,
+        input_context: None,
+        created_by_session: None,
+        created_trace_id: None,
+        reference_url: None,
+        source: Some("deferred_dispatch".to_string()),
+        metadata: None,
+        r#type: None,
+    };
+
+    match db.create_task(task).await {
+        Ok(deferred_id) => {
+            info!(
+                task_id,
+                deferred_id = %deferred_id,
+                "deferred_dispatch_registered — pending callback created for auto-retry"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(task_id, error = %e, "failed to register deferred callback — LLM fallback only");
+            false
+        }
+    }
+}
+
 /// Extract `pr_url` from a task's metadata JSON.
 ///
 /// Looks for `claude_pilot.pr_url` (nested) or `pr_url` (top-level).
@@ -910,10 +1005,11 @@ async fn execute_long_running(
     // allows `blocked` (needed by delegate_task). Long-running dispatch only permits
     // `pending` and `in_progress`. Returns the current status on success to avoid
     // a redundant DB read in the auto-transition below.
-    let wi_status = match validate_dispatch_readiness(&ctx.db, task_id, github_token).await {
-        Ok(status) => status,
-        Err(err) => return ToolOutput::error(err),
-    };
+    let wi_status =
+        match validate_dispatch_readiness(&ctx.db, task_id, github_token, Some(&input)).await {
+            Ok(status) => status,
+            Err(err) => return ToolOutput::error(err),
+        };
 
     // Per-turn dispatch cap (#583): only one long-running dispatch per agent turn.
     // Check first without incrementing — the actual increment happens right before
@@ -3214,7 +3310,7 @@ mod tests {
         let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
 
         // No reference_url → blocked-by check skipped, dispatch proceeds
-        let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token")).await;
+        let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None).await;
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 
@@ -3230,7 +3326,7 @@ mod tests {
         .await;
 
         // PR reference → blocked-by check skipped (only issues have blockedBy)
-        let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token")).await;
+        let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None).await;
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 
@@ -3246,7 +3342,7 @@ mod tests {
         .await;
 
         // No token → blocked-by check skipped (fail-open), dispatch proceeds
-        let result = validate_dispatch_readiness(&async_db, &wi_id, None).await;
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, None).await;
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 }
