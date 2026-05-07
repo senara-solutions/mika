@@ -1077,7 +1077,17 @@ async fn execute_long_running(
             timeout_secs as i64,
         ))),
         action_type: action_type::RESUME_AGENT.to_string(),
-        action_config: "{}".to_string(),
+        action_config: {
+            // Populate action_config.input with dispatch fields so child tasks
+            // are self-describing without a parent join (#958).
+            let mut ac_input = serde_json::Map::new();
+            for key in &["prompt", "skill", "task_id", "branch"] {
+                if let Some(val) = input.get(*key).filter(|v| !v.is_null()) {
+                    ac_input.insert((*key).to_string(), val.clone());
+                }
+            }
+            serde_json::json!({ "input": ac_input }).to_string()
+        },
         input_context: Some({
             let serialized = serde_json::to_string(&input).unwrap_or_default();
             // Belt-and-suspenders (#955): validate_required_fields is the runtime

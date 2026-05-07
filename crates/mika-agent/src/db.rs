@@ -4329,6 +4329,22 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Promote a task from `failed` → `completed` (#958).
+    ///
+    /// Symmetric to `update_task_failed()`. Only transitions tasks currently
+    /// in `failed` status — guarded WHERE clause prevents promotion from any
+    /// other state. Returns `true` if the transition happened.
+    pub fn promote_task_completed(&self, id: &str, agent_id: &str, reason: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = 'completed', result = ?1,
+             completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?2 AND agent_id = ?3
+             AND status = 'failed'",
+            params![reason, id, agent_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET next_fire_at = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
@@ -10885,6 +10901,82 @@ mod tests {
         let task = db.get_task(&id, "mika").unwrap().unwrap();
         assert_eq!(task.status, "completed");
         assert_eq!(task.result.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn test_promote_task_completed_from_failed() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+
+        // First fail the task
+        assert!(
+            db.update_task_failed(&id, "mika", "initial_failure")
+                .unwrap()
+        );
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+
+        // Promote from failed → completed
+        let promoted = db
+            .promote_task_completed(&id, "mika", "retry_success (pr_url: https://example.com)")
+            .unwrap();
+        assert!(promoted);
+
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "completed");
+        assert_eq!(
+            task.result.as_deref(),
+            Some("retry_success (pr_url: https://example.com)")
+        );
+        assert!(task.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_promote_task_completed_noop_for_non_failed() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+
+        // Task starts in pending — promote should be a no-op
+        let promoted = db
+            .promote_task_completed(&id, "mika", "should not fire")
+            .unwrap();
+        assert!(!promoted);
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "pending");
+
+        // Complete the task — promote should still be a no-op
+        assert!(db.update_task_completed(&id, "mika", Some("done")).unwrap());
+        let promoted = db
+            .promote_task_completed(&id, "mika", "should not fire")
+            .unwrap();
+        assert!(!promoted);
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.result.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn test_promote_task_completed_wrong_agent() {
+        let db = db();
+        let id = db.create_task(&callback_task("mika")).unwrap();
+        assert!(db.update_task_failed(&id, "mika", "failure").unwrap());
+
+        // Wrong agent_id — should return false
+        let promoted = db
+            .promote_task_completed(&id, "wrong-agent", "retry_success")
+            .unwrap();
+        assert!(!promoted);
+        let task = db.get_task(&id, "mika").unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+    }
+
+    #[test]
+    fn test_promote_task_completed_nonexistent() {
+        let db = db();
+        let promoted = db
+            .promote_task_completed("nonexistent-id", "mika", "retry_success")
+            .unwrap();
+        assert!(!promoted);
     }
 
     #[test]
