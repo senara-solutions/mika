@@ -1,26 +1,314 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
-
-## [Unreleased]
+## [v0.6.0](https://github.com/senara-solutions/mika/releases/tag/v0.6.0) — 2026-05-07
 
 ### Added
 
-- *(agent)* Engine now enforces skill-declared output suffix lines via a manifest-driven EndTurn guard (`[output] required_suffix_lines` in `skill.toml`). Prevents verdict-ghosting under cognitive load. (#864)
+- *(skills)* move enabled state from .disabled markers to DB with eviction (#634)
+- *(agent)* auto-create well-known agents (mika-dev, mika-qa) in dev mode (#254) (#642)
+- *(agent)* tool-boundary UUID existence validation (#596) (#643)
+- add persistence evaluation guard to EndTurn chain (#648) (#649)
+- *(config)* migrate all API key fields to SecretString (#673)
+- pre-tool context-redundancy check for read tools (#647) (#674)
+- *(cli)* add --skill-always-on flag to mika ask; default self-dev to always_on=false (#670) (#675)
+- rename --skill-always-on to --enable-skill/--disable-skill (#683)
+- raise per-session task creation limit to 25 and make configurable (#685)
+- enforce PR review idempotency via tool-call history (#695) (#698)
+- *(agent)* reject EndTurn on webhook turns with zero tool calls (#699)
+- add calibration rules for issue number verification and UUID hygiene (#701)
+- *(server)* structural check_suite.completed(failure) handler (#594) (#703)
+- *(gateway)* dead-letter queue + replay CLI for exhausted webhook retries (#704)
+- generalize intent-precondition guard (#696 expansion) + add resume keywords (#702) (#706)
+- *(gateway)* route pull_request.review_requested to mika-qa (#506) (#707)
+- *(skills)* variant management tooling (CLI + server API + dashboard) (#708)
+- *(git-ops)* add pull, checkout, and worktree operations (#709)
+- *(dispatch)* add blocked-by guard to validate_dispatch_readiness (#713) (#715)
+- *(self-dev)* milestone resolver + deploy hooks + topo-sort (#714) (#717)
+- KG SQLite schema v25 — entities, relationships, chunks, subject tables (#722)
+- domain graph builder — deterministic import from skill manifests and tool registry (#687) (#726)
+- *(kg)* lexical graph ingestion — chunk solution docs, embed, link (#689) (#728)
+- *(kg)* subject graph extraction — LLM-based NER + fact triples (#690) (#729)
+- *(kg)* entity resolution — connect extracted entities to domain graph nodes (#691) (#730)
+- *(kg)* query_knowledge_graph — graph traversal tool for agent self-knowledge (#731)
+- *(self-knowledge)* upgrade skill with KG-backed agent self-awareness (#692) (#733)
+- dedicated mika-relay agent for claude-pilot permission decisions (#721) (#735)
+- *(eval)* add optional DI, Settings::test_defaults, callback tests, health_error (#745)
+- eval harness Phase 2 — multi-provider matrix and real API calibration (#746)
+- *(eval)* golden dataset — 25 end-to-end quality scenarios (#339) (#751)
+- KG-backed self-knowledge eval scenarios (#758)
+- *(eval)* add KG provider comparison matrix harness (#762) (#780)
+- add add_team_member and remove_team_member tools (#283) (#785)
+- *(kg)* add MIKA_KG_DOCS_ROOT env var and kg_docs_root config field (#738) (#790)
+- *(kg)* schema v27 — docs_root_hash as shared-corpus primary key (#791)
+- *(kg)* data migration v26→v27 — coalesce per-agent rows (#787) (#792)
+- *(kg)* per-agent docs_root config — stops context pollution from wrong corpus (#778) (#795)
+- *(cli)* KG management subcommands — mika kg status / purge / validate (#779) (#796)
+- *(kg)* per-agent multi-corpus aggregation (#798) (#808)
+- *(mika-arch)* structural read-only enforcement at tool, skill, and identity layers (closes #811) (#813)
+- *(gh_read)* add file_view op — read repo files by path (#819)
+- *(ask)* add --verbose flag with session_id metadata trailer (#824)
+- *(ask)* make --verbose orthogonal to --format (emit metadata in JSON) (#830)
+- *(ui+dashboard)* generalize StatusBadge to six-variant API, migrate hand-rolled status pills (#831)
+- *(ui+dashboard)* extract <ListRow /> primitive, migrate all list pages (#654) (#832)
+- *(ui+dashboard)* extract SelectFilter + AgentFilter, unify agent selection (#655) (#833)
+- *(ui+dashboard)* extract state catalog primitives, migrate all pages (#658) (#834)
+- *(ui)* dashboard copy feedback — visual confirmation on copy-to-clipboard actions (#835)
+- *(ui+dashboard)* add <TimeRangeFilter /> primitive across observability surfaces (#659) (#839)
+- *(skills)* add dev-groom bundled skill encoding the two-pass grooming flow (#857)
+- *(arch)* core-memory promotion-protocol reflection-pass spec (#872)
+- *(engine)* quoted-resource pre-fetch guard (#863) (#882)
+- *(skills/mika-arch)* add milestone-grooming capability (#879) (#888)
+- *(kg/domain-graph)* expand with concept:cross-repo + concept:infra namespaces (#956)
+- *(dashboard)* surface telemetry on Team Runs detail page (#970)
+- *(dashboard)* add response content, linked tool calls, and error state to LLM Call detail (#971)
+- *(dashboard)* make Core Memory panel actionable (#656) (#972)
+- *(dashboard)* add CostTrendChart time-series visualization (#976)
+- *(dashboard)* task tree visualization on Dev Runs detail (#661) (#982)
+- *(dashboard)* landing/home overview page (#666) (#989)
+- *(dashboard)* live-refresh consistency across time-sensitive pages (#662) (#990)
+- *(dashboard)* URL-reflect all filter, pagination, and tab state for shareable links (#664) (#992)
+- *(dashboard)* cost visibility across surfaces (#667) (#994)
+- *(ui)* dashboard accessibility audit with axe-core CI gate (#995)
+- attach LLM request/response bodies to Langfuse generation spans (#671) (#998)
+- *(dashboard)* expandable LLM response body viewer on LLM Calls page (#672) (#1000)
+- *(dashboard)* sync session detail tabs with URL path segments (#676) (#1002)
+- *(kg)* emit reattempted_no_match field on kg_resolver_tick.complete (#961) (#1015)
+
+### Changed
+
+- hard-skip oversized skills, split startup log, delete match-time filter (#635)
+- *(agent)* rename work_item tools to task vocabulary (#608) (#644)
+- *(skills)* rename claude-pilot skill to dev-pilot (#853)
+- *(dev-pilot)* delegate branch + worktree derivation to platform scripts (#858)
+- *(skills)* factorize dev-groom and dev-pilot into shared dispatch lib (#893) (#898)
+
+### Documentation
+
+- compound audit findings — qa-review on mika-dev + CLI log noise
+- compound — engine guards vs prompt rules for agent behavioral invariants
+- *(solutions)* Socratic multi-ticket milestone planning pattern (#710)
+- KG milestone #14 retrospective + cross-links across per-ticket docs
+- *(solutions)* compound — correlation-vs-ownership validator bug class
+- institutionalize infra-fix compounding rule (#776) (#777)
+- *(solutions)* compound — autonomous-agent operational discipline (2026-04-23)
+- *(solutions)* compound — intent signal is not completion signal
+- *(solutions)* prompt-vs-tool contract mismatch bug class
+- *(operations)* add kg-cross-corpus-drift-recovery runbook
+- *(solutions)* grooming-branch callout in issue body required for /mika
+- *(architecture)* add review-guide.md (mika-arch v1 Unit 1)
+- *(design)* add north-star + luminescent-core rulebook
+- *(design)* Dashboard ↔ Stitch reconciliation map (closes #669)
+- *(solutions)* mika-arch first dogfood findings (Unit 5 verification)
+- *(solutions)* comment events fire autonomous claude-pilot dispatch
+- *(architecture)* add agent self-state vs platform side-effects principle
+- *(solutions)* compound 4 findings from 2026-04-26 session
+- *(ui)* audit Pagination usage, document canonical-primitive enforcement (#663) (#836)
+- *(solutions)* post-deploy KG entity audit ritual (#859 evidence)
+- *(solutions)* compound two architect-discovered patterns from 2026-04-28 grooming (#860)
+- *(solutions)* compound script-drift CI investigation lesson from mika#860 (#865)
+- *(solutions)* add Example 6 — author-side cheap-impulse during doc composition (#873)
+- *(solutions)* compound dev-pilot handler silent exit-0 pattern (#884)
+- *(solutions)* compound post-restart KG extraction-and-resolution audit ritual (#885)
+- *(solutions)* compound set -x secret-leak class from mika#903
+- *(solutions)* compound operator-side findings recovery from store_fact when mika-arch emits thin
+- *(review-guide)* sharpen §7 recursive-self-review carve-out — causation test + memory-shared axis (#921)
+- refresh README for accuracy (test count, providers, crates, KG) (#930)
+- compound from mika#927 grooming halt — Mode 3 compound doc name emission heuristic
+- refresh required-tools-gate-evasion-patterns with Mode 3 adjacent reference
+- *(brainstorm)* session continuity across scope types — Option C decided (#973)
+- *(947)* preserve mika-arch persistence-meta hallucination as resolved knowledge (#978)
+- *(plans)* grooming plan for mika#974 — task_messages parallel narrative table (#977)
+- *(solutions)* add two compound learnings from 2026-05-05 session (#979)
+- *(kg)* document resolver type-allowlist contract
+- *(solutions)* mika-arch pass-1 degenerate recovery via retry-with-fresh-session
+- *(audits)* layer 2 vs mempalace temporal triples — reject migration
 
 ### Fixed
 
-- *(agent)* Callback turns now require both `update_task_status` AND `send_message` before EndTurn; missing terminal actions are rejected and re-prompted via the intent-precondition registry (#870)
+- *(deploy-mika)* replace cp with install for atomic binary replacement (#621)
+- *(self-dev)* add milestone routing, callback awareness, build+deploy close-out (#609) (#626)
+- *(self-dev)* milestone callback routing + missing parent_task_id in child creation (#627)
+- *(self-dev)* bump max_prompt_size to 49152 — unblock agent loading (#628) (#631)
+- *(self-dev)* sort milestone/project issues ascending by number (#633)
+- *(agent)* allow metadata-only writes on terminal-state tasks (#637)
+- *(skills)* reconcile hot-patched self-dev and qa-review prompts (#638) (#639)
+- *(skills)* restore lost prompt hot-patches — run_gh schema discipline + M2/M3/P3 pre-flight (#641)
+- *(agent)* structural guard against core_memory mis-access via read_agent_file (#645) (#646)
+- required_tools gate recognizes terminal tool failures (#516) (#678)
+- *(agent)* detect prose-style tool-call leaks in EndTurn output (#569) (#680)
+- *(self-dev)* retry update_task_status via list_tasks on task_not_found (#693) (#694)
+- *(agent)* handle chat_id == 0 as structured NoChannel outcome in send_message (#650) (#700)
+- *(skills)* remove keyword triggers from skill-review to prevent false positives (#705)
+- deduplicate task_id in required array for long-running tool schemas
+- use correct GraphQL field `blockedBy` instead of `blockedByIssues` (#719) (#720)
+- /mika command reads branch name from issue body callout before deriving
+- run_claude_pilot handler reads branch name from issue body callout
+- self-heal stale-base + CONFLICTING PRs (#747) (#748)
+- ask.rs correlation branch uses unscoped task lookup (#756)
+- *(kg)* extraction idempotency + budget guard + fan-out advisories (#757) (#759)
+- *(kg)* prevent UTF-8 byte-slice panics — KG resolution fully broken (#764) (#769)
+- *(dashboard)* fetch tool calls from API instead of truncated metadata (#744) (#770)
+- *(teams)* consolidate team-run callbacks into single user notification (#781)
+- *(teams)* orchestrator coverage check for full team distribution (#286) (#782)
+- *(config)* MIKA_KG_DOCS_ROOTS env var fails to parse as Vec<PathBuf> (#816)
+- *(mika-arch)* drop memory-write tools from MIKA_ARCH_DISABLED_TOOLS (#820)
+- *(mika-qa)* session-scope pr_review_posted to prevent duplicate reviews (#822)
+- *(mika)* make plan-on-branch load-bearing in implementation + QA (#825)
+- *(skills)* unblock bundled skills + add CI gate for oversized prompts (#828)
+- *(server)* dashboard reads stale SQLite WAL snapshot — sessions invisible until restart (#636) (#837)
+- *(self-dev)* recognize error_max_turns as recover-work verdict, not retry (#840)
+- *(self-dev+gateway)* gate dispatch on ready label or direct prompt only (#842)
+- *(self-dev+agent)* structural ready-label dispatch guard (#846) (#847)
+- *(agent)* replace tokio::time::timeout outer wrapper with Instant deadline (mika#848) (#849)
+- *(mika-arch)* apply /ce:review findings (broken citation, missing test, naming, citations) (#867)
+- *(agent)* callback turns require terminal actions before EndTurn (#870) (#878)
+- *(task-engine)* add reaper for parent self_dev tasks orphaned by failed callbacks (#880)
+- *(agent)* required-tools-gate retry produces self-contained final response (#891)
+- *(dev-pilot)* inject BASH_XTRACEFD trace for silent-exit-0 diagnosis (#895)
+- *(agent)* extend structural verdict handler to cover block[*]/hold[*] dispatch (#889) (#896)
+- *(skills/qa-review)* VERDICT-on-top in review body to survive gateway truncation (mika#909, mika#898 incident)
+- *(kg/resolver)* add periodic resolver tick to drain Stage-2 backlog (#906) (#909)
+- *(self-dev+agent)* require grooming marker before dispatch on ready label (#913)
+- *(agent)* add webhook_no_unauthorized_dispatch intent guard (#910) (#914)
+- *(gateway)* raise PR-review truncation cap to 16k + reconcile QA verdict contract (#911) (#916)
+- *(agent/tool_calls)* redact secret-shaped values before persistence (#908) (#915)
+- *(kg/resolver)* accept valid LLM matches via DB-fallback (#874) (#924)
+- *(kg/subject_extractor)* brace-matching parser + prompt reinforcement for parse failures (#876) (#925)
+- *(kg/cli)* surface all corpora per agent in mika kg status (#877) (#926)
+- *(skills)* dev-groom unreachable due to run_claude_pilot tool-name collision (#934)
+- *(skills/permission-policy)* allow intra-platform mika ask + grooming gh issue edit/comment (#936)
+- *(server)* structural pre-classifier for intra-platform agent dispatch (#937)
+- *(mika-arch)* move groom skills to Sonnet 4.6 + deadline-aware retry abort (#941)
+- *(server)* pre-classifier parser gap — denies markdown briefs in agent dispatch (#938) (#945)
+- *(skills/dev-groom)* replace in-prompt branch slug derivation with canonical script (#950)
+- PR-writer must cite plan-doc path in PR body (#951)
+- *(kg/resolver)* per-corpus fairness in get_pending_entities (#927) (#954)
+- *(mika-arch)* citation-fabrication prompt anchoring (#952) (#957)
+- *(task-engine)* add callback watchdog for stale subprocess detection (#959) (#968)
+- *(executor)* validate required fields before skill tool execution (#955) (#969)
+- *(skills)* harden validate_required_fields against malformed/stale schemas (#987)
+- *(dispatch)* auto-skip closed-issue autodispatch instead of stalling loop (#993)
+- *(ci)* release-pr workflow idempotency — Class C resolution (#1003)
+- *(autonomous-loop)* engine-enforced queue advance for post-callback turns (#991) (#1007)
+- *(kg)* single-consumer topology eliminates shared-corpus extractor race (#800) (#1010)
+- *(autonomous-loop)* per-skill LLM override fires on webhook turns + deferred-dispatch auto-recovery (#1013)
+- *(task-engine)* dispatch retry hygiene — status promotion, action_config, UUID validation (#958) (#1014)
+- *(ci)* add release label so release-pr workflow succeeds (#1017)
 
-## [v0.5.0](https://github.com/senara-solutions/mika/releases/tag/v0.5.0) — 2026-04-03
+### Engine
+
+- asserted-unavailability EndTurn guard (#862) (#881)
+- required-suffix-line EndTurn guard for skill-declared output contracts (#864) (#883)
+
+### Eval
+
+- grounding + fabrication regression scenarios (#741) (#774)
+
+### Investigate
+
+- *(arch)* mika-arch session-init context-channel leakage (#1009)
+
+### Obs
+
+- *(logging)* document log sink architecture and add `mika logs` command (#986)
+## [v0.5.0](https://github.com/senara-solutions/mika/releases/tag/v0.5.0) — 2026-04-17
 
 ### Added
 
 - *(tui)* skill visibility and /clear cleanup (#415)
+- GitHub App identity and agent infrastructure (#423) (#426)
+- *(gateway)* multi-tenant GitHub webhook routing with agent_mapping (#433)
+- *(cli)* add --format flag to mika agents list (#435)
+- *(dashboard)* link sessions to tasks with bidirectional navigation (#437)
+- *(dashboard)* rebuild Dev Run detail page with narrative content (#439)
+- add compound doc check to verify-pipeline.sh (#440)
+- *(cli)* add mika agents validate and mika teams validate commands (#443)
+- [#446] add mika provider and mika model CLI subcommands (#450)
+- add --format text|json flag to 9 CLI commands (#448)
+- *(skills)* built-in skill-review skill for model-tuned prompt variants (#455)
+- *(skills)* add GitHub App auth to skill install git clone (#461)
+- *(skills)* per-agent LLM override via DB + unblock linked skill review (#475)
+- *(observability)* record resolved prompt variant on llm_calls (#481) (#503)
+- *(skills)* skill system quality — remove [llm] from skill.toml, forbid name in keywords, validate markdown (#522)
+- *(tui)* silence internal dev questions in TUI inbox mode (#494) (#552)
+- *(agent)* structural pull_request_review verdict handler (#524) (#555)
+- add dispatch-readiness guard on execute_long_running (#525) (#556)
+- *(skills)* validate skills at agent startup, not just on explicit validate command (#530) (#559)
+- *(tools)* validate UUID-typed arguments at tool boundary (#563)
+- *(gateway)* route pull_request.closed webhook to mika-dev (#564)
+- *(server)* add webhook deferral queue for callback sequencing (#528) (#565)
+- *(skills)* prevent reviewed skill from being triggered during its own review (#513) (#573)
+- *(tools)* report skipped skill count in list_skills output (#334) (#575)
+- *(tools)* list_work_items returns status-count summary + filter guidance (#585)
+- *(server)* structural check_suite.completed(success) handler (#571) (#587)
+- *(agent)* add tasks.type column and create_work_item support (#595) (#597)
+- bundle 11 engine-coupled skills + fix run_claude_pilot task_id fabrication (#601)
+- *(self-dev)* add milestone and project workflow branches (#603)
+- *(skills)* migrate 3 more engine-coupled skills into skills/bundled/ (#604)
+- *(skills)* migrate resolve-pr-conflicts and self-check (completes #604 scope) (#605)
+
+### Changed
+
+- split CLAUDE.md into hierarchical per-crate context files (#544)
+- *(agent)* source bundled skills from skills/bundled/ at build time (#600)
+
+### Documentation
+
+- relocate skill-review rename plan + cross-repo drift solution from mika-skills#102
+- *(adr)* add ADR-008 — GitHub identity separation (#521)
+- plan and compound for webhook QA pass entry point (#553) (#554)
+- compound — lazy PG pool in tests blocks 30s on CI but RST-fails fast locally (#599)
 
 ### Fixed
 
 - *(ci)* add git identity for release tag creation
+- add method and path to request error/warn logs (#417)
+- surface method/path as top-level JSON log fields, add /version endpoint (#421)
+- load per-agent .env for token and credential-helper commands (#427) (#428)
+- *(tui)* stop polling /api/v1/dashboard/status every 5s (#429)
+- load per-agent .env before constructing Settings (#430) (#432)
+- *(tui)* add background task running indicator to footer (#431) (#434)
+- /provider and /model commands leave broken config state (#444)
+- extract XML tool calls from text responses (#447) (#449)
+- provider switch propagates to agent worker with provider prefix (#451) (#452)
+- tolerate malformed closing tags in strip_internal_tags (#453) (#454)
+- gitignore dashboard/dist to prevent dirty repo after deploy (#456)
+- *(tui)* prevent cleared messages from reappearing after /clear
+- *(cli)* normalize MODEL_ALIASES to include provider prefix (#460)
+- *(skills)* filter resolve_skill_llm_override by MatchReason::Keyword only (#465)
+- *(skills)* harden review_skill / write_skill_variant (#470)
+- *(skills)* merge write_skill_variant into review_skill (#477) (#478)
+- *(skills)* block review_skill from reviewing built-in skills (#482)
+- *(agent)* enforce work-item state transition on completion claims (#483) (#484)
+- *(work-items)* shallow-merge metadata one level deep (#489) (#491)
+- *(tools)* add pr_merge_with_gate CI gate tool (#490) (#493)
+- *(tools)* accept 'reason' as alias for 'reasoning' in update_core_memory (#495)
+- *(mika-gateway)* add webhook observability and QA verdict contract (#487) (#498)
+- *(skills)* fix skill-review tool registration and add trust-critical tier (#499) (#500)
+- *(llm)* parse cache token usage from OpenAI-compatible provider responses (#479) (#502)
+- *(skills)* check for [skill] section before flagging as legacy format (#508)
+- *(server)* generate embeddings during startup backfill (#389) (#509)
+- *(skills)* harden skill-review prompt to enforce full inspect→persist→verify cycle (#518)
+- *(skills)* inject GH_TOKEN into exec handler child processes (#515 #517) (#520)
+- *(agent)* filter required_tools gate against available tool registry (#523)
+- *(config)* prefer machine user PAT over GitHub App installation token
+- *(openapi)* register handle_task_complete in OpenAPI spec paths (#328) (#538)
+- *(agent)* add fabricated action-claim guard (#308) (#543)
+- *(skills)* refuse long-running tools when no long_running_ctx available (#537) (#551)
+- *(investigate)* handle empty LLM response and fix lock race (#558)
+- remove redundant skill names from trigger keywords in builtins
+- *(skills)* canonicalize both paths in handler symlink containment check (#560)
+- *(skills)* suppress required_tools warning for dependency-provided tools
+- *(server)* use per-agent token in verdict handler (#561) (#562)
+- *(agent)* allow exec/http skills in callback silent turns (#568)
+- *(tui)* tag mika-ask relay messages as internal (#557) (#570)
+- *(skills)* prevent webhook handlers from dispatching unrelated backlog work (#583) (#586)
+- *(tools)* reject retry metadata writes during active dispatch (#579) (#588)
+- resolve skill dependencies in callback_safe_skills (#578) (#591)
+- *(agent)* dedup identical tool_use blocks within a single turn (#582) (#607)
+- *(agent)* surface gateway non-2xx responses as send_message tool errors (#581) (#612)
+- *(gateway)* prevent GitHub webhook from poisoning Telegram chat_id (#580) (#618)
 ## [v0.4.0](https://github.com/senara-solutions/mika/releases/tag/v0.4.0) — 2026-04-03
 
 ### Added
