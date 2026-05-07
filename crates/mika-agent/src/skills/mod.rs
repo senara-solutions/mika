@@ -485,6 +485,11 @@ impl SkillRegistry {
                 if let Some(m) = &ov.llm_model {
                     entry.manifest.llm.model = Some(m.clone());
                 }
+                // Mark as DB-sourced so resolve_skill_llm_override() can
+                // distinguish operator intent from developer-time [llm] sections.
+                // AlwaysOn skills with this flag qualify for override resolution
+                // on autonomous-loop turns (mika#1011).
+                entry.manifest.llm.from_db_override = true;
                 entry.has_override = true;
             }
         }
@@ -1496,6 +1501,7 @@ mod tests {
         entry.manifest.llm = LlmOverride {
             provider: Some("deepseek".to_string()),
             model: Some("deepseek-chat".to_string()),
+            ..Default::default()
         };
         let mut registry = SkillRegistry {
             skipped: Vec::new(),

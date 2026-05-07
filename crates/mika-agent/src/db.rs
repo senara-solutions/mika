@@ -4353,6 +4353,19 @@ impl Database {
              WHERE id = ?1 AND agent_id = ?2 AND status NOT IN ('completed','failed','cancelled','expired','delivered')",
             params![id, agent_id],
         )?;
+        if n > 0 {
+            // Cascade: cancel active callback children (mika#1011 Phase 0.7).
+            // Prevents orphan-pending deferred-dispatch callbacks (and closes a
+            // latent gap for immediate callbacks too). Non-callback children
+            // (e.g., manual sub-tasks) are intentionally left untouched.
+            self.conn.execute(
+                "UPDATE tasks SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE parent_task_id = ?1 AND agent_id = ?2
+                   AND trigger_type = 'callback'
+                   AND status IN ('pending', 'in_progress')",
+                params![id, agent_id],
+            )?;
+        }
         Ok(n > 0)
     }
 
@@ -5197,6 +5210,51 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Count pending deferred-dispatch callback tasks for this agent (mika#1011).
+    /// Used by the executor flood-cap check before registering a new deferred callback.
+    pub fn count_pending_deferred_callbacks(&self, agent_id: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND status = 'pending'
+               AND label = 'long_running:run_claude_pilot:deferred'",
+            params![agent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Promote the next pending deferred-dispatch callback for dispatch (FIFO).
+    ///
+    /// Sets `next_fire_at` to now and marks with a synthetic result so the task
+    /// engine's periodic scan picks it up and routes through `dispatch_resume_agent`
+    /// within one tick (~1 second). Returns `true` if a task was promoted.
+    /// Called by the dispatcher after a blocking callback completes (mika#1011).
+    pub fn promote_next_deferred_callback(&self, agent_id: &str) -> Result<bool> {
+        let now = crate::timestamp::now();
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'completed',
+                 result = 'deferred dispatch slot freed',
+                 completed_at = ?3,
+                 next_fire_at = ?3,
+                 updated_at = ?3
+             WHERE id = (
+                 SELECT id FROM tasks
+                 WHERE agent_id = ?1
+                   AND trigger_type = 'callback'
+                   AND status = 'pending'
+                   AND label = 'long_running:run_claude_pilot:deferred'
+                 ORDER BY created_at ASC
+                 LIMIT 1
+             )
+             AND agent_id = ?2",
+            params![agent_id, agent_id, now],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
@@ -13899,5 +13957,208 @@ mod tests {
 
         let val = db.get_task_metadata_field(&id, "nonexistent").unwrap();
         assert_eq!(val, None);
+    }
+
+    // -- mika#1011: cancel_task cascade tests --
+
+    #[test]
+    fn test_cancel_task_cascades_to_active_callback_children() {
+        let db = db();
+        // Create parent task
+        let parent = new_task("mika", "parent-work-item", "manual", "none");
+        let parent_id = db.create_task(&parent).unwrap();
+
+        // Create callback child (pending)
+        let mut child = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        child.parent_task_id = Some(parent_id.clone());
+        let child_id = db.create_task(&child).unwrap();
+
+        // Create deferred callback child (pending)
+        let mut deferred = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        deferred.parent_task_id = Some(parent_id.clone());
+        let deferred_id = db.create_task(&deferred).unwrap();
+
+        // Create a non-callback child (manual sub-task) — should NOT be cancelled
+        let mut manual_child = new_task("mika", "sub-task", "manual", "none");
+        manual_child.parent_task_id = Some(parent_id.clone());
+        let manual_child_id = db.create_task(&manual_child).unwrap();
+
+        // Cancel parent
+        assert!(db.cancel_task(&parent_id, "mika").unwrap());
+
+        // Callback children should be cancelled
+        let child_task = db.get_task_unscoped(&child_id).unwrap().unwrap();
+        assert_eq!(
+            child_task.status, "cancelled",
+            "callback child should be cascaded"
+        );
+
+        let deferred_task = db.get_task_unscoped(&deferred_id).unwrap().unwrap();
+        assert_eq!(
+            deferred_task.status, "cancelled",
+            "deferred callback should be cascaded"
+        );
+
+        // Non-callback child should NOT be cancelled
+        let manual_task = db.get_task_unscoped(&manual_child_id).unwrap().unwrap();
+        assert_eq!(
+            manual_task.status, "pending",
+            "manual child should not be affected"
+        );
+    }
+
+    #[test]
+    fn test_cancel_task_does_not_cascade_to_completed_callback() {
+        let db = db();
+        let parent = new_task("mika", "parent", "manual", "none");
+        let parent_id = db.create_task(&parent).unwrap();
+
+        let mut child = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        child.parent_task_id = Some(parent_id.clone());
+        let child_id = db.create_task(&child).unwrap();
+        // Mark child as completed
+        db.update_task_completed(&child_id, "mika", Some("done"))
+            .unwrap();
+
+        // Cancel parent
+        assert!(db.cancel_task(&parent_id, "mika").unwrap());
+
+        // Completed child should NOT be affected
+        let child_task = db.get_task_unscoped(&child_id).unwrap().unwrap();
+        assert_eq!(
+            child_task.status, "completed",
+            "completed callback should not be cancelled"
+        );
+    }
+
+    // -- mika#1011: deferred callback DB helper tests --
+
+    #[test]
+    fn test_count_pending_deferred_callbacks() {
+        let db = db();
+        // No deferred callbacks initially
+        assert_eq!(db.count_pending_deferred_callbacks("mika").unwrap(), 0);
+
+        // Create parent tasks (FK requirement)
+        let p1_id = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+        let p2_id = db
+            .create_task(&new_task("mika", "p2", "manual", "none"))
+            .unwrap();
+        let p3_id = db
+            .create_task(&new_task("mika", "p3", "manual", "none"))
+            .unwrap();
+
+        // Create a deferred callback
+        let mut task = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        task.parent_task_id = Some(p1_id.clone());
+        db.create_task(&task).unwrap();
+
+        assert_eq!(db.count_pending_deferred_callbacks("mika").unwrap(), 1);
+
+        // Create another
+        let mut task2 = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        task2.parent_task_id = Some(p2_id.clone());
+        db.create_task(&task2).unwrap();
+
+        assert_eq!(db.count_pending_deferred_callbacks("mika").unwrap(), 2);
+
+        // Non-deferred callback should not count
+        let mut regular = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        regular.parent_task_id = Some(p3_id.clone());
+        db.create_task(&regular).unwrap();
+
+        assert_eq!(db.count_pending_deferred_callbacks("mika").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_promote_next_deferred_callback_fifo() {
+        let db = db();
+
+        // No deferred callbacks → returns false
+        assert!(!db.promote_next_deferred_callback("mika").unwrap());
+
+        // Create parent tasks (FK requirement)
+        let p1_id = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+        let p2_id = db
+            .create_task(&new_task("mika", "p2", "manual", "none"))
+            .unwrap();
+
+        // Create two deferred callbacks
+        let mut task1 = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        task1.parent_task_id = Some(p1_id.clone());
+        let id1 = db.create_task(&task1).unwrap();
+
+        let mut task2 = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        task2.parent_task_id = Some(p2_id.clone());
+        let id2 = db.create_task(&task2).unwrap();
+
+        // Promote first (FIFO)
+        assert!(db.promote_next_deferred_callback("mika").unwrap());
+
+        // First should be completed, second still pending
+        let t1 = db.get_task_unscoped(&id1).unwrap().unwrap();
+        assert_eq!(
+            t1.status, "completed",
+            "first deferred should be promoted to completed"
+        );
+        assert!(t1.result.is_some(), "promoted task should have a result");
+
+        let t2 = db.get_task_unscoped(&id2).unwrap().unwrap();
+        assert_eq!(
+            t2.status, "pending",
+            "second deferred should still be pending"
+        );
+
+        // Promote second
+        assert!(db.promote_next_deferred_callback("mika").unwrap());
+        let t2 = db.get_task_unscoped(&id2).unwrap().unwrap();
+        assert_eq!(t2.status, "completed");
+
+        // No more → returns false
+        assert!(!db.promote_next_deferred_callback("mika").unwrap());
     }
 }

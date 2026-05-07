@@ -302,7 +302,26 @@ impl TaskDispatcher {
         let is_callback = task.trigger_type == "callback";
 
         // Determine context and trigger based on entry path
-        let (trigger, session_prefix, session_trigger_meta) = if is_callback {
+        let is_deferred_dispatch =
+            is_callback && task.label == crate::agent::DEFERRED_DISPATCH_LABEL;
+
+        let (trigger, session_prefix, session_trigger_meta) = if is_deferred_dispatch {
+            // mika#1011 — Deferred-dispatch retry path: the dispatch slot is free,
+            // the agent's only job is to re-invoke run_claude_pilot.
+            let parent_task_id = task
+                .parent_task_id
+                .clone()
+                .unwrap_or_else(|| task.id.clone());
+            (
+                SilentTrigger::DeferredDispatch {
+                    task_id: task.id.clone(),
+                    parent_task_id,
+                    action_config: task.action_config.clone(),
+                },
+                "deferred-dispatch",
+                r#"{"trigger": "deferred_dispatch"}"#,
+            )
+        } else if is_callback {
             // Callback path: read from task.result
             let is_failed = task.status == "failed";
             let result = match task.result.clone() {
@@ -438,6 +457,18 @@ impl TaskDispatcher {
             // fire a PostCallbackAdvance trigger to give the agent one more turn with
             // explicit advance instructions.
             self.maybe_fire_post_callback_advance(task).await;
+
+            // mika#1011 — Drain next pending deferred-dispatch callback (FIFO).
+            // The blocking dispatch just completed, so the slot is free. Promote
+            // the oldest pending deferred callback and dispatch it immediately.
+            // This must run AFTER mark_task_delivered to ensure the blocking
+            // callback is fully processed before the next dispatch fires.
+            if task.label != crate::agent::DEFERRED_DISPATCH_LABEL {
+                // Only drain from non-deferred callback completions to prevent
+                // cascading deferred dispatches from draining the whole queue
+                // in a single call stack (each deferred turn drains one more).
+                self.dispatch_next_deferred_callback().await;
+            }
         }
 
         if let Err(e) = self.db.end_session(&session_id).await {
@@ -908,6 +939,29 @@ impl TaskDispatcher {
         }
 
         true
+    }
+
+    /// mika#1011 — Promote the next pending deferred-dispatch callback to `in_progress`.
+    ///
+    /// Called after a blocking callback completes (mark_task_delivered succeeded).
+    /// Promotes the oldest pending deferred callback to `in_progress` (FIFO).
+    /// The task engine's periodic scan picks up `in_progress` resume_agent tasks
+    /// and dispatches them via `dispatch_resume_agent`, which constructs a
+    /// `SilentTrigger::DeferredDispatch` turn for tasks with the deferred label.
+    async fn dispatch_next_deferred_callback(&self) {
+        match self.db.promote_next_deferred_callback().await {
+            Ok(true) => {
+                info!("deferred_dispatch_promoted — task marked completed for engine dispatch");
+                // The task engine's periodic scan will pick up the completed
+                // resume_agent callback task and dispatch it through
+                // dispatch_resume_agent, which detects DEFERRED_DISPATCH_LABEL
+                // and creates SilentTrigger::DeferredDispatch.
+            }
+            Ok(false) => {} // No pending deferred callbacks
+            Err(e) => {
+                warn!(error = %e, "failed to promote deferred callback — will retry on next tick");
+            }
+        }
     }
 
     /// #991 — Post-callback advance backstop. After a milestone/project-context

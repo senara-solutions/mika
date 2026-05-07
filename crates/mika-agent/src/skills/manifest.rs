@@ -69,6 +69,14 @@ pub struct LlmOverride {
     pub provider: Option<String>,
     /// Model identifier to use (e.g., "gpt-4o-mini", "claude-sonnet-4-6").
     pub model: Option<String>,
+    /// Whether these values were populated from the `skill_overrides` DB table
+    /// (operator intent) rather than a `skill.toml` `[llm]` section (developer
+    /// hardcode). Used by `resolve_skill_llm_override()` to allow `AlwaysOn`
+    /// skills with DB-sourced overrides to impose their LLM override, while
+    /// still filtering out developer-time `[llm]` hijacks per #463.
+    /// See mika#1011 for the carve-out rationale.
+    #[serde(default, skip_serializing)]
+    pub from_db_override: bool,
 }
 
 impl LlmOverride {
@@ -576,16 +584,19 @@ mod tests {
         let a = LlmOverride {
             provider: Some("openai".to_string()),
             model: Some("gpt-4o".to_string()),
+            ..Default::default()
         };
         let b = LlmOverride {
             provider: Some("openai".to_string()),
             model: Some("gpt-4o".to_string()),
+            ..Default::default()
         };
         assert_eq!(a, b);
 
         let c = LlmOverride {
             provider: Some("anthropic".to_string()),
             model: None,
+            ..Default::default()
         };
         assert_ne!(a, c);
     }
@@ -603,6 +614,7 @@ mod tests {
         manifest.llm = LlmOverride {
             provider: Some("groq".to_string()),
             model: Some("llama3-8b".to_string()),
+            ..Default::default()
         };
         let serialized = toml::to_string_pretty(&manifest).unwrap();
         assert!(

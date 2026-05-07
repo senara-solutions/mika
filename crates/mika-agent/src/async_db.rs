@@ -550,6 +550,20 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Count pending deferred-dispatch callbacks for this agent (mika#1011).
+    pub async fn count_pending_deferred_callbacks(&self) -> Result<i64> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.count_pending_deferred_callbacks(&a))
+            .await
+    }
+
+    /// Promote the next pending deferred-dispatch callback for dispatch (mika#1011).
+    pub async fn promote_next_deferred_callback(&self) -> Result<bool> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.promote_next_deferred_callback(&a))
+            .await
+    }
+
     pub async fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
         self.with_db(move |db| db.prune_completed_tasks(older_than_secs))
             .await
