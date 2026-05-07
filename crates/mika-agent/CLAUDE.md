@@ -44,6 +44,23 @@ Skills with `[context.*]` sections have their data pre-fetched by the engine bef
 - **Layer 2:** Structured facts (People, Commitments, Preferences, Events — plaintext). Managed via `store_fact`, `update_fact`, `search_memory` tools.
 - **Layer 3:** Hybrid search (FTS5 full-text + sqlite-vec cosine similarity via Reciprocal Rank Fusion). Optional OpenAI embeddings (text-embedding-3-small, 512 dims). Graceful degradation: hybrid -> FTS5-only -> LIKE fallback. Indexed on store_fact/update_fact, backfilled on startup.
 
+**Per-agent override:** mika-arch sets `[context.summary] inject = false`, removing the *conversation summary* layer from its system prompt entirely (mika#1009 leak protection). New agents that disable summary injection should be listed here.
+
+## Context Injection Configuration
+
+`[context]` section in `identity.toml` controls prompt-assembly behavior for context blocks. Each context block has its own nested subsection.
+
+### `[context.summary].inject` (bool, default: `true`)
+
+When `true`, the conversational summary (from compaction) is loaded from the DB and injected into the system prompt as `<context type="summary" trust="data">`. When `false`, the summary is **load-prevented** — `db.load_conversation_summary()` is not called, the summary is not deserialized, and is not available to any downstream code path in the turn. This is strictly stronger than injection-prevention and is the correct shape for context-leakage protection.
+
+Use case: agents where the conversational summary is a known context-channel leak source (mika#1009). mika-arch is provisioned with `[context.summary] inject = false` by default.
+
+```toml
+[context.summary]
+inject = false
+```
+
 ## Tools
 
 Each tool validates inputs. Control fields capped at `MAX_INPUT_LEN = 10_000` chars; payload fields capped at `MAX_PAYLOAD_BYTES = 200 * 1024` bytes (200 KB).

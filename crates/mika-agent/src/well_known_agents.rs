@@ -340,6 +340,9 @@ enabled = true
 docs_roots = [
 {roots_block}]
 
+[context.summary]
+inject = false
+
 [skills]
 allowlist = ["mika-arch-groom-ticket", "mika-arch-groom-milestone", "mika-arch-second-review"]
 
@@ -835,6 +838,17 @@ mod tests {
             !MIKA_ARCH_DISABLED_TOOLS.contains(&"send_message"),
             "send_message must remain visible to mika-arch — it writes to the agent's own \
              session history (constitutive), not platform state"
+        );
+    }
+
+    #[test]
+    fn test_mika_arch_identity_load_prevents_summary() {
+        let toml_str = build_mika_arch_identity(&test_settings_with_kg_roots()).unwrap();
+        let identity: crate::prompt::Identity =
+            toml::from_str(&toml_str).expect("mika-arch identity must parse as valid Identity");
+        assert!(
+            !identity.context.summary.inject,
+            "mika-arch must have [context.summary] inject = false (mika#1009 leak protection)"
         );
     }
 
