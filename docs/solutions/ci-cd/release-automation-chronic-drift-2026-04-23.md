@@ -112,6 +112,7 @@ Historical fixes against Class D:
 | `0c649c4f` | commit dashboard dist for embedded serving and release-plz |
 | `47374b9b` | fix YAML syntax in release workflow (git-cliff era) |
 | `e89dc7a3` | add git identity for release tag creation (git-cliff era) |
+| mika#1006 | add `release` label to `.github/labels.yml` so `gh pr create --label "release"` succeeds (git-cliff era, unmasked by Class C fix in mika#1003) |
 
 Cluster trajectory: **one-off fixes, each distinct**. These are the kind of fixes that legitimately don't need root-cause analysis — the problem space is unbounded (every new tool has its own packaging/identity quirks) and each fix stands alone.
 
@@ -134,6 +135,8 @@ Symptom on every merge to `main` from 2026-04-23 through 2026-05-06: `release/v0
 
 **What this resolution does close (incidentally).**
 - The "PR never auto-updates" complaint from the original problem statement: under approach 3, every workflow run force-pushes the regenerated branch, and GitHub's PR view auto-tracks the branch tip. The PR now reflects current `main` after every merge. Documented as a side benefit, not the fix's primary objective.
+
+**Validation gate clock reset (mika#1006, 2026-05-07).** The Class C validation gate (10 consecutive clean merges OR 14 days) effectively resets at this fix's first clean post-merge run. The Class C fix (mika#1003) unmasked a Class D issue: `gh pr create --label "release"` failed because the `release` label did not exist. mika#1006 adds it to `.github/labels.yml`. The gate's count starts from the first merge that produces a successful release-pr workflow run end-to-end (force-push + PR creation).
 
 **Post-merge orphan branches** (`release/v0.5.0`, `release/v0.5.1`, `release/v0.6.0` after their respective releases ship) remain a related but distinct gap — a follow-up ticket will add automatic cleanup when a `chore: release vX.Y.Z` commit lands on `main`. Manual reset via `git push origin :release/vX.Y.Z` still works as documented in the operational-workaround section below.
 
@@ -181,4 +184,5 @@ Combined effect: it's psychologically easier to apply a point-fix than to unders
 - [`rust-workspace-release-plz-github-actions.md`](./rust-workspace-release-plz-github-actions.md) — original release-plz setup (2026-03-01, now historical)
 - Commit `4825e7ae` — tool migration (release-plz → git-cliff)
 - Ticket mika#775 — fix Class C (`release/v0.6.0` non-fast-forward)
+- Ticket mika#1006 — fix Class D (`release` label missing, unmasked by mika#1003)
 - MEMORY: `feedback_compound_infra_fixes.md` — institutional rule about infra-fix evaporation

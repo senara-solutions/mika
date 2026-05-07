@@ -95,3 +95,8 @@
 - name: needs-deploy
   color: "d97706"
   description: "Run make deploy after merge, before next ticket in milestone/sprint"
+
+# ── Automation ───────────────────────────────────────────────────────────────
+- name: release
+  color: "6e40c9"
+  description: Release PR created by CI (release-pr workflow)
