@@ -133,6 +133,22 @@ Helper signature (lives in `prompt.rs` next to `ContextSummaryConfig`):
 /// to inject. Caller is responsible for the surrounding `<context>` tag wrap
 /// + section header.
 ///
+/// **NF3 — `Ok(None)` conflation (intentional KISS).** Callers cannot
+/// distinguish "load-prevented by `inject = false`" from "no summary in DB"
+/// from "Axis 3 sentinel fired" via the return value alone. This conflation
+/// is acceptable because the caller's response (skip injection) is the same
+/// in all three cases. To audit Axis 4's load-prevention guarantee
+/// specifically, inspect `summary_config.inject` directly — do NOT infer
+/// from the return value. A typed enum return
+/// (`LoadPrevented`/`NoSummary`/`Injected`) is not needed today.
+///
+/// **NF4 — invariant: Axis 4 check MUST precede Axis 3 check.** The
+/// `if !summary_config.inject` short-circuit MUST be the first operation in
+/// this function. Reversing the order would call `db.load_conversation_summary()`
+/// before the `inject` gate fires, breaking Axis 4's load-prevention
+/// guarantee (mika#1016 F2). Any future refactor that reorders these checks
+/// must preserve this invariant or it ceases to be a load-prevention helper.
+///
 /// The "gated" name signals: this is the policy-aware load path. Any direct
 /// `db.load_conversation_summary()` callers (e.g., debugging, migration)
 /// bypass the gates intentionally.
@@ -141,7 +157,7 @@ async fn load_gated_summary(
     summary_config: &ContextSummaryConfig,
     silent_trigger: Option<&SilentTrigger>,
 ) -> Result<Option<String>> {
-    // Axis 4: hard load-prevention.
+    // Axis 4: hard load-prevention. MUST be first — see NF4 invariant above.
     if !summary_config.inject {
         return Ok(None);
     }
