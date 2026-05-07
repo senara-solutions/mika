@@ -198,6 +198,47 @@ pub fn format_entity_key(kind: &str, name: &str) -> String {
     format!("{kind}:{name}")
 }
 
+// ---------------------------------------------------------------------------
+// Invalidation marker helpers (#961)
+// ---------------------------------------------------------------------------
+
+/// Record subject entity IDs whose `no_match` resolution log rows were
+/// deleted by domain-graph rebuild invalidation (#960). Uses `INSERT OR
+/// IGNORE` so duplicate markers from crash-restart-crash-restart are safe.
+///
+/// Called by `domain_builder::rebuild()` inside its transaction, after
+/// deleting the `kg_resolutions_log` rows.
+pub fn record_invalidated_no_match(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    subject_entity_ids: &[i64],
+) -> rusqlite::Result<usize> {
+    let mut total = 0usize;
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO kg_invalidated_no_match (subject_entity_id, agent_id) VALUES (?1, ?2)",
+    )?;
+    for &id in subject_entity_ids {
+        total += stmt.execute(rusqlite::params![id, agent_id])?;
+    }
+    Ok(total)
+}
+
+/// Remove a single invalidation marker after the entity has been re-resolved.
+/// No-op if the marker does not exist (idempotent).
+///
+/// Called by `entity_resolver::write_log()` after writing the new resolution
+/// log row, ensuring cleanup from all code paths (startup, compound-hook, tick).
+pub fn clear_invalidated_no_match(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    subject_entity_id: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM kg_invalidated_no_match WHERE subject_entity_id = ?1 AND agent_id = ?2",
+        rusqlite::params![subject_entity_id, agent_id],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

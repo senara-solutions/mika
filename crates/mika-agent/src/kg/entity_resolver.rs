@@ -9,6 +9,10 @@
 //! This module is the sole writer of `kg_subject_resolutions` and
 //! `kg_resolutions_log` rows. No other code path writes these tables.
 //!
+//! This module also reads and deletes from `kg_invalidated_no_match` (#961)
+//! to track reattempted entities whose prior `no_match` log rows were
+//! invalidated by domain-graph rebuild (#960).
+//!
 //! ## Resolution Pipeline
 //!
 //! For each subject entity with a well-known type (skill, tool, agent, problem_type, concept):
@@ -75,6 +79,10 @@ struct PendingEntity {
     confidence: f64,
     /// The corpus this entity belongs to (shared-layer key from v27).
     docs_root_hash: String,
+    /// True when this entity has a marker in `kg_invalidated_no_match` (#961),
+    /// meaning its prior `no_match` resolution log row was deleted by
+    /// domain-graph rebuild invalidation (#960).
+    was_invalidated: bool,
 }
 
 /// A domain entity candidate for disambiguation.
@@ -144,6 +152,11 @@ pub struct ResolutionStats {
     pub llm_calls: u32,
     /// Per-corpus entity attempt counts for fairness observability (#927).
     pub per_corpus_attempted: HashMap<String, u32>,
+    /// Count of entities this batch that were re-attempts from prior `no_match`
+    /// outcomes invalidated by domain-graph rebuild (#961). Zero when no
+    /// invalidation occurred; non-zero on the first resolution pass after a
+    /// rebuild that invalidated rows for an extant type.
+    pub reattempted_no_match: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +380,12 @@ impl SubjectEntityResolver {
             )
             .await;
 
+            // Track reattempted no_match entities (#961). Only count when a
+            // log row was written (all outcomes except SkippedBudget).
+            if entity.was_invalidated {
+                stats.reattempted_no_match += 1;
+            }
+
             if let ResolutionResult::Error(msg) = &result {
                 warn!(
                     trace_id = %self.trace_id,
@@ -391,6 +410,7 @@ impl SubjectEntityResolver {
             errors = stats.errors,
             llm_calls = stats.llm_calls,
             aborted_budget = stats.aborted_budget,
+            reattempted_no_match = stats.reattempted_no_match,
             event = %completion_event,
         );
 
@@ -859,6 +879,9 @@ impl SubjectEntityResolver {
                             name: row.get(3)?,
                             confidence: row.get(4)?,
                             docs_root_hash: row.get(5)?,
+                            // Compound-hook path resolves freshly extracted
+                            // entities, not invalidation reattempts (#961).
+                            was_invalidated: false,
                         })
                     })?
                     .filter_map(|r| r.ok())
@@ -1024,10 +1047,13 @@ impl SubjectEntityResolver {
         self.db
             .with_db(move |db| {
                 let sql =
-                    "SELECT e.id, e.entity_key, e.type, e.name, e.confidence, e.docs_root_hash
+                    "SELECT e.id, e.entity_key, e.type, e.name, e.confidence, e.docs_root_hash,
+                            (inv.subject_entity_id IS NOT NULL) AS was_invalidated
                      FROM kg_subject_entities e
                      LEFT JOIN kg_resolutions_log r
                          ON r.subject_entity_id = e.id AND r.agent_id = ?1
+                     LEFT JOIN kg_invalidated_no_match inv
+                         ON inv.subject_entity_id = e.id AND inv.agent_id = ?1
                      WHERE e.docs_root_hash = ?2
                        AND e.type IN ('skill', 'tool', 'agent', 'problem_type', 'concept')
                        AND (
@@ -1051,6 +1077,7 @@ impl SubjectEntityResolver {
                             name: row.get(3)?,
                             confidence: row.get(4)?,
                             docs_root_hash: row.get(5)?,
+                            was_invalidated: row.get::<_, i64>(6)? != 0,
                         })
                     })?
                     .filter_map(|r| r.ok())
@@ -1355,6 +1382,13 @@ impl SubjectEntityResolver {
                         model,
                         duration_ms,
                     ],
+                )?;
+                // Clean up invalidation marker if present (#961). Defensive
+                // DELETE from all code paths (startup, compound-hook, tick).
+                crate::db::kg_schema::clear_invalidated_no_match(
+                    &db.conn,
+                    &agent_id,
+                    subject_entity_id,
                 )?;
                 Ok(())
             })
@@ -1741,6 +1775,7 @@ mod tests {
             name: "self_dev".to_string(),
             confidence: 0.85,
             docs_root_hash: "0000000000000000".to_string(),
+            was_invalidated: false,
         };
 
         let candidates = vec![
@@ -2113,6 +2148,185 @@ mod tests {
         assert!(
             resolution.is_none(),
             "no resolution row should be written for DB miss"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #961: reattempted_no_match counter tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: seed invalidation markers into `kg_invalidated_no_match`.
+    async fn seed_invalidation_markers(
+        db: &crate::async_db::AsyncDatabase,
+        subject_entity_ids: &[i64],
+    ) {
+        let ids = subject_entity_ids.to_vec();
+        let agent_id = db.agent_id.clone();
+        db.with_db(move |db| {
+            crate::db::kg_schema::record_invalidated_no_match(&db.conn, &agent_id, &ids)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Helper: count rows in `kg_invalidated_no_match` for this agent.
+    async fn count_invalidation_markers(db: &crate::async_db::AsyncDatabase) -> usize {
+        let agent_id = db.agent_id.clone();
+        db.with_db(move |db| {
+            let count: i64 = db.conn.query_row(
+                "SELECT COUNT(*) FROM kg_invalidated_no_match WHERE agent_id = ?1",
+                rusqlite::params![agent_id],
+                |row| row.get(0),
+            )?;
+            Ok(count as usize)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Non-zero path: entities with invalidation markers are counted in
+    /// `reattempted_no_match`. Markers are cleaned up after resolution.
+    #[tokio::test]
+    async fn reattempted_no_match_nonzero_with_markers() {
+        let db = f3_test_db();
+
+        // Seed a domain entity for exact match.
+        f3_seed_domain_entity(&db, "concept", "cross-repo:worktree-isolation").await;
+
+        // Seed 3 concept-typed subject entities (no log rows → pending via
+        // r.id IS NULL). Two match the domain entity, one does not.
+        let s1 =
+            f3_seed_subject_entity(&db, "concept", "cross-repo:worktree-isolation", 0.95).await;
+        let s2 = f3_seed_subject_entity(&db, "concept", "unmatched-concept-a", 0.95).await;
+        let s3 = f3_seed_subject_entity(&db, "concept", "unmatched-concept-b", 0.95).await;
+
+        // Mark all 3 as invalidated (simulates #960 rebuild).
+        seed_invalidation_markers(&db, &[s1, s2, s3]).await;
+        assert_eq!(count_invalidation_markers(&db).await, 3);
+
+        // Resolve without LLM (exact-match only). s1 matches, s2/s3 get
+        // skipped_no_llm (no LLM configured).
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            None, // no LLM → exact-match only
+            vec!["0000000000000000".to_string()],
+            Some("test-reattempt-nonzero"),
+        );
+
+        let stats = resolver.resolve_pending(100).await.unwrap();
+
+        // All 3 were invalidated and resolved (wrote log rows).
+        assert_eq!(
+            stats.reattempted_no_match, 3,
+            "all 3 invalidated entities should be counted"
+        );
+        assert_eq!(stats.matched_exact, 1, "s1 should exact-match");
+        assert_eq!(stats.skipped_no_llm, 2, "s2/s3 have no LLM → skipped");
+
+        // Markers should be cleaned up.
+        assert_eq!(
+            count_invalidation_markers(&db).await,
+            0,
+            "all markers should be cleaned up after resolution"
+        );
+    }
+
+    /// Zero path: entities without invalidation markers produce
+    /// `reattempted_no_match=0`.
+    #[tokio::test]
+    async fn reattempted_no_match_zero_without_markers() {
+        let db = f3_test_db();
+
+        // Seed a domain entity and subject entities but NO markers.
+        f3_seed_domain_entity(&db, "concept", "infra:helm-values").await;
+        f3_seed_subject_entity(&db, "concept", "infra:helm-values", 0.95).await;
+        f3_seed_subject_entity(&db, "concept", "some-other-concept", 0.95).await;
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            None,
+            vec!["0000000000000000".to_string()],
+            Some("test-reattempt-zero"),
+        );
+
+        let stats = resolver.resolve_pending(100).await.unwrap();
+
+        assert_eq!(
+            stats.reattempted_no_match, 0,
+            "no markers → reattempted_no_match should be 0"
+        );
+        assert!(stats.total > 0, "should have resolved some entities");
+    }
+
+    /// Mixed path: only invalidated entities increment the counter.
+    #[tokio::test]
+    async fn reattempted_no_match_mixed_invalidated_and_fresh() {
+        let db = f3_test_db();
+
+        f3_seed_domain_entity(&db, "concept", "cross-repo:branch-naming").await;
+
+        // s1: invalidated (marker present).
+        let s1 = f3_seed_subject_entity(&db, "concept", "cross-repo:branch-naming", 0.95).await;
+        // s2: fresh (no marker).
+        let _s2 = f3_seed_subject_entity(&db, "concept", "fresh-concept", 0.95).await;
+
+        seed_invalidation_markers(&db, &[s1]).await;
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            None,
+            vec!["0000000000000000".to_string()],
+            Some("test-reattempt-mixed"),
+        );
+
+        let stats = resolver.resolve_pending(100).await.unwrap();
+
+        assert_eq!(
+            stats.reattempted_no_match, 1,
+            "only s1 (invalidated) should be counted"
+        );
+        assert_eq!(stats.total, 2, "both entities should be processed");
+    }
+
+    /// Edge case: invalidated entity that resolves as `no_match` again
+    /// (no domain match available) — still counted in `reattempted_no_match`,
+    /// marker cleaned up, new `no_match` log row written.
+    #[tokio::test]
+    async fn reattempted_no_match_resolves_as_no_match_again() {
+        let db = f3_test_db();
+
+        // No domain entity for this type → will resolve as skipped_no_llm
+        // (no LLM configured) which still writes a log row.
+        let s1 = f3_seed_subject_entity(&db, "concept", "orphaned-concept", 0.95).await;
+
+        seed_invalidation_markers(&db, &[s1]).await;
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            None,
+            vec!["0000000000000000".to_string()],
+            Some("test-reattempt-no-match-again"),
+        );
+
+        let stats = resolver.resolve_pending(100).await.unwrap();
+
+        assert_eq!(
+            stats.reattempted_no_match, 1,
+            "invalidated entity should be counted even if it resolves as skipped_no_llm"
+        );
+        assert_eq!(
+            count_invalidation_markers(&db).await,
+            0,
+            "marker should be cleaned up"
+        );
+
+        // Verify a log row was written.
+        let outcome = f3_get_outcome(&db, s1).await;
+        assert_eq!(
+            outcome.as_deref(),
+            Some(outcome::SKIPPED_NO_LLM),
+            "should write skipped_no_llm log row"
         );
     }
 }
