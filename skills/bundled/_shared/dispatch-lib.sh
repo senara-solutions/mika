@@ -134,7 +134,9 @@ _validate_inputs() {
 
     # Reject non-UUID task_id at the handler boundary (#958)
     if ! printf '%s' "$USER_TASK_ID" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-        printf 'DISPATCH_VALIDATION_ERROR: {"error":"invalid_uuid","field":"task_id","value":"%s","reason":"task_id must be a valid UUID (36-char format like 15383984-a3e7-41bf-ac6f-630ba9a89d63). Got a non-UUID string — this is likely an unsubstituted template placeholder."}\n' "$USER_TASK_ID" >&2
+        # Sanitize value for JSON safety: escape backslashes and double-quotes.
+        _sanitized_tid=$(printf '%s' "$USER_TASK_ID" | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 200)
+        printf 'DISPATCH_VALIDATION_ERROR: {"error":"invalid_uuid","field":"task_id","value":"%s","reason":"task_id must be a valid UUID (36-char format like 15383984-a3e7-41bf-ac6f-630ba9a89d63). Got a non-UUID string — this is likely an unsubstituted template placeholder."}\n' "$_sanitized_tid" >&2
         exit 1
     fi
 }

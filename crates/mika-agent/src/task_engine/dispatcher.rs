@@ -1183,9 +1183,16 @@ async fn try_promote_parent_on_retry_success(db: &AsyncDatabase, task: &Task) {
         None => return,
     };
 
-    // 2. Read the parent — only promote manual tasks in `failed` state.
+    // 2. Read the parent — only promote self_dev manual tasks in `failed` state.
+    //    The source='self_dev' guard mirrors the reaper's scope (#958 review).
     let parent = match db.get_task_unscoped(&parent_id).await {
-        Ok(Some(t)) if t.trigger_type == "manual" && t.status == "failed" => t,
+        Ok(Some(t))
+            if t.trigger_type == "manual"
+                && t.status == "failed"
+                && t.source.as_deref() == Some("self_dev") =>
+        {
+            t
+        }
         _ => return,
     };
 
