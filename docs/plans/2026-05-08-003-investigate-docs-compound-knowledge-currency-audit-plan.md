@@ -81,18 +81,36 @@ done | sort | uniq -c | sort -rn | head -20
 
 ```bash
 # A2: derive entry date via 3-source fallback
+# NOTE per architect NF2: TWO git-log dates exist; we record both.
+#   - introduction_date: first-commit (--diff-filter=A) — when the doc was added
+#   - last_modified:     most-recent commit — when the doc was last touched
+# For age-distribution histograms, use introduction_date (the canonical "creation" date).
+# last_modified is recorded separately for the policy-options analysis (Axis 7) where
+# "old + recently modified" tells a different story than "old + untouched".
+# Rename caveat: `git log --follow` tracks renames; without it, a renamed file's
+# introduction_date is the rename, not the original creation. The script uses --follow.
 for f in "$(find <corpus> -name '*.md')"; do
   # Source 1: filename YYYY-MM-DD prefix
   DATE=$(basename "$f" | grep -oE '^20[0-9]{2}-[01][0-9]-[0-3][0-9]')
   # Source 2: frontmatter `date:` field
   [[ -z "$DATE" ]] && DATE=$(awk '/^date:/{print $2; exit}' "$f" | grep -oE '20[0-9]{2}-[01][0-9]-[0-3][0-9]')
-  # Source 3: git log first-commit date (introduction)
-  [[ -z "$DATE" ]] && DATE=$(git -C "<repo>" log --diff-filter=A --format=%aI -- "$f" | head -1 | cut -dT -f1)
-  echo "$DATE"
-done | cut -dT -f1 | grep -oE '^20[0-9]{2}-[01][0-9]' | sort | uniq -c
+  # Source 3: git log INTRODUCTION date (first-commit, with rename tracking)
+  [[ -z "$DATE" ]] && DATE=$(git -C "<repo>" log --follow --diff-filter=A --format=%aI -- "$f" | tail -1 | cut -dT -f1)
+  # Always record last_modified for Axis 7 inputs
+  LAST_MOD=$(git -C "<repo>" log --follow --format=%aI -- "$f" | head -1 | cut -dT -f1)
+  echo "$DATE $LAST_MOD $f"
+done | tee /tmp/a2-raw.tsv \
+     | awk '{print $1}' | grep -oE '^20[0-9]{2}-[01][0-9]' | sort | uniq -c
 ```
 
-**Output:** entries-per-quarter histogram per repo. Identify entries ≥ 6 months old (PRE-2025-11-01 as of today's run).
+**Output:** entries-per-quarter histogram per repo (using introduction_date). Per-doc raw output preserved at `/tmp/a2-raw.tsv` with `<introduction_date> <last_modified> <path>` columns for Axis 7 inputs.
+
+**Per architect NF2 — date semantics:**
+- `introduction_date` is the canonical "when did this enter the corpus" date.
+- `last_modified` is the canonical "when was this last touched" date.
+- A doc with `introduction_date = 2025-04-01, last_modified = 2026-04-01` is **old-but-maintained**; a doc with both at `2025-04-01` is **old-and-untouched**. The two are policy-relevant in Axis 7 (an auto-sunset policy that ignores `last_modified` would falsely flag actively-maintained-old docs).
+
+Identify entries ≥ 6 months old by introduction_date (pre-2025-11-01 as of today's run); cross-reference last_modified for "untouched-old" subset.
 
 #### Axis 3 — Supersession analysis
 
@@ -108,18 +126,65 @@ For each marker hit, the script extracts the source doc + target doc reference a
 **PASS shape:** every marker has a valid target; chains terminate at a current entry.
 **FAIL shape:** orphan markers (target doc missing → broken supersession chain).
 
-#### Axis 4 — Contradiction analysis
+#### Axis 4 — Topic-cluster overlap (replaces LLM contradiction analysis per architect F1)
+
+**Methodology change rationale:** the original Axis 4 (25-pair LLM contradiction verdict) was unsound at corpus scale — 25 pairs from 551 entries is a 0.018% sample, and "contradiction" is too fuzzy for verdict-class LLM classification. **Replaced with KG topic-cluster overlap analysis** (architect-proposed Option A): use existing `kg_subject_resolutions` to find docs that share the same domain entities, surface high-overlap pairs as topic-related (a topic cluster), and let the human-readable finding-doc author identify which clusters contain genuine contradictions. **Zero new LLM cost; uses already-extracted KG data.**
 
 ```sql
--- A4: same problem_type tag, different best-practices recommendations
--- (Heuristic; hand-validated sample.)
+-- A4: topic clusters from kg_subject_resolutions (mika-arch agent only, all four corpora)
+-- For each pair of docs that share at least N domain entities, surface the pair.
+-- N = 3 (heuristic; tuned by Axis 7 thresholds — operator can re-run with different N).
+WITH doc_entities AS (
+  SELECT
+    c.source_doc_path,
+    c.docs_root_hash,
+    rl.domain_entity_id
+  FROM kg_chunks c
+  JOIN kg_chunk_subjects cs
+    ON cs.chunk_id = c.id
+   AND cs.docs_root_hash = c.source_doc_hash
+  JOIN kg_resolutions_log rl
+    ON rl.subject_entity_id = cs.subject_entity_id
+   AND rl.agent_id = 'mika-arch'
+   AND rl.outcome IN ('exact_match', 'matched_llm', 'matched_llm_db_fallback')
+  WHERE rl.domain_entity_id IS NOT NULL
+  GROUP BY c.source_doc_path, c.docs_root_hash, rl.domain_entity_id
+)
+SELECT
+  a.source_doc_path AS doc_a,
+  b.source_doc_path AS doc_b,
+  a.docs_root_hash  AS corpus_a,
+  b.docs_root_hash  AS corpus_b,
+  COUNT(*) AS shared_entities
+FROM doc_entities a
+JOIN doc_entities b
+  ON a.domain_entity_id = b.domain_entity_id
+ AND a.source_doc_path < b.source_doc_path  -- triangular (no self-pairs, no dupes)
+GROUP BY a.source_doc_path, b.source_doc_path
+HAVING shared_entities >= 3
+ORDER BY shared_entities DESC
+LIMIT 50;
 ```
 
-Approach: for each `problem_type` tag with ≥ 2 entries, sample 5 pairs and run a heuristic mini-LLM check (or operator-reviewed pairs list — groom decides which) to flag conflicting guidance. **Sample size cap:** 25 pairs total (5 per problem-type, top 5 problem-types by frequency). The 25-pair budget keeps the LLM cost bounded.
+| Output column | Meaning |
+|---|---|
+| `doc_a`, `doc_b` | the two docs in the pair |
+| `corpus_a`, `corpus_b` | which corpus each lives in (cross-corpus pairs surface as different hashes) |
+| `shared_entities` | count of distinct domain entities both docs reference |
 
-**Output:** flagged contradiction pairs + verdict (real / false-positive). Real contradictions named in finding doc.
+**PASS shape:** topic clusters surfaced; finding-doc author manually inspects the top 10 highest-overlap pairs for genuine contradictions vs. legitimate topic adjacency. Most pairs will be **adjacent-topic** (e.g., two docs about the same skill = legitimately related, not contradictory). A subset may be **stale-vs-current** (an old doc and a new doc on the same topic — a candidate for supersession). A smaller subset may be **genuine contradiction** (two docs giving conflicting guidance).
+
+**FAIL shape:** zero pairs returned (would indicate KG resolutions are absent — already covered by Axis 5 KG-resolution-drift; Axis 4 wouldn't independently fail).
+
+**Hand-validation in finding doc:** for the top 10 clusters, the finding doc author categorizes each pair as `adjacent` / `supersession-candidate` / `genuine-contradiction`. No LLM verdict; human judgment with cited evidence (the shared entity list).
+
+**Per architect F1 Option B fallback:** if the KG resolutions table is sparse (low coverage, e.g., < 100 resolutions cross-corpus), fall back to a 10-pair LLM spot-check that ONLY flags "this pair shares topic, look at it" with NO verdict classification. The 10-pair spot-check is informational, not decisional. Cost: ~$0.01 sonnet, ~$0.001 cheap-tier — negligible.
+
+**Sample size note:** the LIMIT 50 keeps the script output bounded. The top 10 are hand-validated. Zero LLM cost in the primary path.
 
 #### Axis 5 — KG-resolution drift (per-corpus, mika-arch)
+
+**Drift definition (per architect NF1):** "drift" here means **resolution-rate drift** — the fraction of subject entities returning `outcome = 'no_match'` against the domain graph, computed per age-quartile. NOT temporal drift (days/weeks since last update). Resolution-rate drift is the right metric because it directly measures "is this doc still pointing at things that exist in the current domain graph?" — a structural staleness signal that age alone doesn't capture (a 3-year-old doc that still resolves cleanly is fresh-by-resolution; a 1-week-old doc whose entities all `no_match` is stale-by-resolution).
 
 Per-corpus query against `kg_resolutions_log` for entries of varying ages:
 
@@ -168,53 +233,116 @@ ORDER BY age_quartile;
 **FAIL shape (Outcome B):** `no_match` rate rises by ≥ 25 percentage points fresh→old. Means: real drift; older docs are losing KG resolution. Curation needed.
 **MIXED (Outcome C):** rise in 10–25 percentage points range. Operator judgment call.
 
-#### Axis 6 — mika-arch consumption signal
+#### Axis 6 — mika-arch consumption signal (verbatim, per architect F2)
+
+The schema linkage from `query_knowledge_graph` tool output back to specific `kg_chunks.id` is NOT directly traceable in the current schema (verified pre-grooming: `tool_calls.output` is an opaque JSON blob; chunk IDs may appear in it but require parsing). Two approaches, in priority order:
+
+**A6 primary — substring scan on `tool_calls.output`:**
 
 ```sql
--- A6: from mika-arch's last 30 days of query_knowledge_graph calls,
--- what fraction surface entries >= 6 months old?
-SELECT
-  CASE
-    WHEN c.created_at < '2025-11-01' THEN '01-old (>=6mo)'
-    ELSE '02-recent (<6mo)'
-  END AS doc_age,
-  COUNT(DISTINCT tc.id) AS distinct_calls
-FROM tool_calls tc
-JOIN llm_calls lc ON lc.id = tc.llm_call_id  -- linkage TBD; check schema
-JOIN kg_chunks c ON ...  -- linkage TBD
-WHERE tc.agent_id = 'mika-arch'
-  AND tc.tool_name = 'query_knowledge_graph'
-  AND tc.created_at >= datetime('now', '-30 days')
-GROUP BY doc_age;
+-- A6.1: count query_knowledge_graph calls in the last 30 days, mika-arch only
+SELECT COUNT(*) AS total_kg_queries
+FROM tool_calls
+WHERE agent_id = 'mika-arch'
+  AND tool_name = 'query_knowledge_graph'
+  AND created_at >= datetime('now', '-30 days');
 ```
 
-**Caveat:** this query requires schema introspection at /ce:work time — the linkage from `query_knowledge_graph` results back to specific `kg_chunks` may not be directly traceable in the current schema. If unavailable, this axis becomes a **proxy via `query_tool_history`** — search for KG queries returning content from old docs by sampling their output text. If neither path is feasible, axis is reported as `unavailable; needs schema enrichment` and noted in the finding.
+```sql
+-- A6.2: dump the OUTPUT (tool_calls.output) for those calls; parse offline.
+SELECT
+  id,
+  created_at,
+  substr(output, 1, 50000) AS output_text
+FROM tool_calls
+WHERE agent_id = 'mika-arch'
+  AND tool_name = 'query_knowledge_graph'
+  AND created_at >= datetime('now', '-30 days')
+ORDER BY created_at DESC;
+```
 
-**Hypothesis:** if old docs are rarely surfaced in real queries, sunset is low-risk. If old docs ARE surfaced often, they're load-bearing — curation must preserve them carefully.
+The script then post-processes the dumped output: for each tool-call's `output_text`, regex-extract `source_doc_path` strings (the KG query tool returns chunk excerpts with their source paths). For each surfaced path, look up the doc's introduction date (Axis 2 derivation), classify as ≥6mo / <6mo, count.
 
-#### Axis 7 — Curation-policy options
+```bash
+# A6.3: post-process — extract source_doc_path mentions, classify by age
+sqlite3 ~/.mika/data/mika.db "<A6.2 query>" \
+  | grep -oE 'docs/solutions/[^"]+\.md' \
+  | sort | uniq -c | sort -rn \
+  | while read -r count path; do
+      # Use Axis 2's date-derivation chain on $path
+      DATE=$(...)
+      echo "$count $DATE $path"
+    done
+```
 
-After Axes 1–6, synthesize 3–5 candidate policies. Examples (groom may revise):
+| Output | Meaning |
+|---|---|
+| `total_kg_queries` | denominator |
+| `count` per path | how many distinct KG queries surfaced this doc |
+| `DATE` per path | derived via Axis 2 fallback chain |
 
-1. **No curation** (status quo) — write-only-grow, no maintenance.
-2. **Quarterly retention sweep** — operator-driven; flag docs > 12 months old with low query frequency for review.
-3. **Supersession-marker convention** — mandate `> Superseded-By: <path>` callout when authoring a doc that replaces another; CI lint + KG metadata.
-4. **Auto-sunset on KG resolution decay** — if a doc's subject entities have `no_match` rate > 80% AND last-queried > 6 months, auto-tag with `currency: stale` frontmatter; operator triages.
+**Aggregate:** fraction of distinct surfaced paths that are ≥6 months old.
+
+**A6 fallback (if `tool_calls.output` is too short to contain useful chunk paths, e.g., truncated by 50KB cap or path not present):** use `query_tool_history` from agent perspective — sample 20 mika-arch sessions, eyeball whether KG content surfaced is from old docs. Report as `unavailable; needs schema enrichment` if even sampling fails. **Pre-flight check** in the script:
+
+```sql
+-- A6.0: verify A6 primary path is feasible (paths visible in output)
+SELECT
+  SUM(CASE WHEN output LIKE '%source_doc_path%' OR output LIKE '%docs/solutions/%' THEN 1 ELSE 0 END) AS with_path_hint,
+  COUNT(*) AS total
+FROM tool_calls
+WHERE agent_id = 'mika-arch'
+  AND tool_name = 'query_knowledge_graph'
+  AND created_at >= datetime('now', '-30 days');
+```
+
+If `with_path_hint / total < 0.5`, primary path is unreliable → use fallback. If `total = 0`, mika-arch hasn't queried KG in 30 days → axis reported as `insufficient data` (separate from `unavailable`).
+
+**PASS shape:** old-doc fraction is < 30% (most queries surface recent docs; old docs rarely load-bearing → curation/sunset is lower-risk).
+**FAIL shape:** old-doc fraction is > 60% (old docs heavily load-bearing → curation must be conservative).
+**MIXED:** 30-60% (old docs partially load-bearing; nuanced policy needed).
+
+#### Axis 7 — Curation-policy options (synthesis from Axes 1–6 outputs)
+
+Axis 7 is synthesis, not a query — but its inputs are the verbatim outputs of Axes 1–6. The script does not produce Axis 7 output directly; the **finding-doc author** does, with the structured Axes-1–6 outputs in hand.
+
+**Recipe for the finding-doc author:**
+
+1. **Read Axes 1–6 outputs.** Specifically: total entry count (A1), per-quarter age distribution (A2), supersession chains (A3), topic-clusters with hand-validation verdicts (A4), KG-resolution-rate drift per quartile (A5), mika-arch old-doc consumption fraction (A6).
+2. **Compute three signal levels:** `Aging` (Axis 2: how old is the corpus?), `Drift` (Axis 5: are old docs losing KG resolution?), `Load-bearing` (Axis 6: do old docs surface in real queries?). Each scored as Low/Medium/High based on Axes-1–6 PASS/FAIL/MIXED verdicts.
+3. **Map signal triple to recommendation:** the table below names the pre-decided mapping. Operator can override; the audit recommends.
+
+| Aging | Drift | Load-bearing | Recommended policy | Rationale |
+|---|---|---|---|---|
+| Low | Low | any | **Policy 1 (no curation)** | Corpus is current; no decay to fix. |
+| Medium | Low | Low | **Policy 1 (no curation)** | Old docs exist but don't matter. |
+| Medium | Low | Medium/High | **Policy 6 (keyword supersession)** | Old docs are load-bearing; lightweight tagging gives authors a way to mark obsolescence without forcing a heavy process. |
+| Medium | Medium | any | **Policy 5 (age-tagged frontmatter)** | Drift suggests review needed; age-tags are lighter than auto-sunset. |
+| Medium/High | High | any | **Policy 4 (auto-sunset on KG decay)** | Drift is the dominant signal; auto-flagging by KG resolution rate scales without operator overhead. |
+| High | any | High | **Policy 2 (quarterly sweep)** | Load-bearing old corpus needs operator-gated review to avoid false-sunsetting. |
+| High | any | Low | **Policy 3 (supersession-marker convention)** | Author-driven supersession; safer than auto-sunset for high-aging-low-load corpus. |
+
+**Candidate policies in scope (groom-validated cardinality of 6):**
+
+1. **No curation** (status quo) — write-only-grow.
+2. **Quarterly retention sweep** — operator flags docs >12mo old with low query frequency for review.
+3. **Supersession-marker convention** — `> Superseded-By: <path>` callout mandate; CI lint + KG metadata.
+4. **Auto-sunset on KG resolution decay** — `no_match` > 80% AND last-queried > 6mo → auto-tag `currency: stale`.
 5. **Age-tagged frontmatter** — `currency: fresh|aging|stale` reviewed quarterly; KG ingestion weights by currency.
-6. **Tag-based supersession (keyword-only)** — non-structural; lightweight.
+6. **Keyword supersession** — non-structural; lightweight tag-based "see X instead" hints.
 
-**Trade-off table per policy:**
+**Trade-off table:**
 
 | Policy | Effort | False-sunset risk | Author overhead | Automation |
 |---|---|---|---|---|
 | 1 (none) | 0 | 0 | 0 | n/a |
-| 2 (sweep) | High (manual review) | Low (operator-gated) | Low | None |
-| 3 (markers) | Medium (CI + convention) | None | Medium (per-PR) | Partial |
-| 4 (auto-sunset) | High (engine work) | Medium (heuristic-driven) | None | Full |
-| 5 (age-tags) | Medium (review cadence) | Low | Medium | Partial |
+| 2 (sweep) | High | Low | Low | None |
+| 3 (markers) | Medium | None | Medium | Partial |
+| 4 (auto-sunset) | High | Medium | None | Full |
+| 5 (age-tags) | Medium | Low | Medium | Partial |
 | 6 (keyword) | Low | Low | Low | None |
 
-The audit recommends a policy based on Axes 2–6 evidence; recommends does not commit (operator decides).
+**Output (per architect Q4):** finding doc presents **single recommendation with named runner-up** (not a ranked list of all 6). Runner-up is the policy in the row above or below in the signal-triple table — i.e., the closest alternative if Aging/Drift/Load-bearing categorization is borderline. Operator can override the recommendation; the audit's job is to make the recommendation actionable.
 
 ### Outcome path declaration
 
@@ -231,13 +359,17 @@ Finding doc TL;DR ends with one of:
 **File:** `mika/scripts/investigate-docs-currency-1029.sh` (per architect-NF2 pattern from mika#1027 — per-ticket one-shot, not canonical).
 
 Bash script that:
-1. Sources `MIKA_SERVER_LOG_FILE` (env or argv).
-2. Resolves the four corpus paths from `/data/workspace/mika-platform/<repo>/docs/solutions/`.
+1. **Resolves environment variables** (per architect NF3):
+   - `MIKA_PLATFORM_ROOT=${MIKA_PLATFORM_ROOT:-/data/workspace/mika-platform}` — workspace root holding the four sub-repos
+   - `MIKA_SERVER_LOG_FILE=${MIKA_SERVER_LOG_FILE:-/var/log/mika/server.log}` — server log
+   - `MIKA_DB=${MIKA_DB:-$HOME/.mika/data/mika.db}` — agent DB
+   The script names these explicitly at the top with comments and uses them throughout — no hardcoded paths beyond the env defaults. Future portability without script edits.
+2. Resolves the four corpus paths from `$MIKA_PLATFORM_ROOT/<repo>/docs/solutions/` for `<repo>` in `mika`, `mika-platform`, `mika-cloud`, `mika-skills`. Skips silently with a WARN if a corpus path doesn't exist.
 3. Runs Axes 1–6 in order, producing structured stdout (markdown tables per axis).
 4. Writes findings to a buffer; finding-doc author (Step 3) cites verbatim where load-bearing.
 5. Pre-flight schema-version assertion (`SELECT MAX(version) FROM schema_version` ≥ 27) before SQL runs.
 
-Idempotent (read-only). The Axis 4 contradiction LLM check (sample of 25 pairs) is the only paid step; if `MIKA_KG_INGESTION_MODEL` (or equivalent) is unset, Axis 4 produces an "unavailable; LLM model unset" report and continues.
+Idempotent (read-only). **Zero LLM cost in the primary path** (Axis 4 replaced by KG topic-clustering per architect F1; LLM fallback only fires if KG resolutions are sparse). If the script's primary path runs cleanly, no API keys are required.
 
 ### Step 2: Run the script + capture output
 
@@ -278,12 +410,12 @@ The LLM-driven Axis 4 (contradiction analysis) is the only stochastic step; the 
 - **AC#2**: Inventory tables per axis: per-repo + per-category + per-problem-type counts.
 - **AC#3**: Age distribution per repo with three-source date derivation (filename prefix + frontmatter + git log fallback). Per-quarter histogram.
 - **AC#4**: Supersession analysis: every marker chain identified; orphan markers flagged.
-- **AC#5**: Contradiction analysis: 25 pair-sample verdicts (real vs false-positive) listed inline. Real contradictions named in finding.
-- **AC#6**: KG-resolution drift summary: `no_match` rate per age-quartile (4 quartiles), per-corpus.
+- **AC#5**: Topic-cluster overlap analysis (per architect F1 — replaces the 25-pair LLM contradiction scheme): top 10 highest-overlap pairs identified via KG `kg_subject_resolutions` join (zero LLM cost in primary path). Each pair hand-classified in finding doc as `adjacent` / `supersession-candidate` / `genuine-contradiction`. Genuine contradictions named explicitly. LLM 10-pair fallback fires only if `kg_resolutions_log` rows are sparse (< 100 cross-corpus); if invoked, used for "look at this pair" flagging only, NO verdict claim.
+- **AC#6**: KG **resolution-rate drift** (per architect NF1 — explicitly resolution-rate, not temporal): `no_match` rate per age-quartile (4 quartiles), per-corpus. Thresholds: PASS < 10pp fresh→old, FAIL ≥ 25pp, MIXED 10–25pp.
 - **AC#7**: mika-arch consumption signal — fraction of last-30-days `query_knowledge_graph` calls surfacing docs ≥ 6 months old. If schema linkage unavailable, axis reported as `unavailable` with note + ticket reference for schema enrichment.
-- **AC#8**: Curation-policy options (3–5) with trade-off table; recommendation OR no-recommendation declaration.
+- **AC#8**: Curation-policy options (6 candidates per groom) with trade-off table; **single recommendation with named runner-up** per architect Q4 ratification. Recommendation derived via the signal-triple → policy mapping table (Axis 7). Operator override is supported.
 - **AC#9**: Outcome path declared (A/B/C); follow-up ticket(s) filed if Path B.
-- **AC#10**: Investigation script committed at `mika/scripts/investigate-docs-currency-1029.sh`. Idempotent. Pre-flight schema-version assertion. Per-ticket one-shot per mika#1027 NF2.
+- **AC#10**: Investigation script committed at `mika/scripts/investigate-docs-currency-1029.sh`. Idempotent. Pre-flight schema-version assertion. Per-ticket one-shot per mika#1027 NF2. Sources `MIKA_PLATFORM_ROOT` / `MIKA_SERVER_LOG_FILE` / `MIKA_DB` env vars with documented defaults (per architect NF3). Zero LLM cost in primary path.
 
 ## Risks & Open Questions
 
@@ -293,6 +425,17 @@ The LLM-driven Axis 4 (contradiction analysis) is the only stochastic step; the 
 - **R4 (low):** Three filename conventions risk under-counting. The age-distribution axis uses filename → frontmatter → git-log fallback chain (Axis 2); plain-named entries fall through to git log. If git log is unavailable for a file (e.g., uncommitted), report as `undated`. Don't infer from neighboring files.
 - **R5 (low):** Cross-repo scope. The investigation reads four repos. The script must NOT assume repo-local CWD — paths resolved from `/data/workspace/mika-platform/<repo>/`. Hard-coded for the operator's workstation; document the path as a script-input variable for future portability (out of scope).
 - **R6 (low):** Currency vs Quality conflation. Old docs may still be high-quality; new docs may be wrong. The audit measures **currency proxies** (age + KG drift + consumption), NOT quality. Don't recommend sunset based on age alone — the policy options must specify how to combine signals.
+
+**Resolved by architect first-pass:**
+- F1 (BLOCKING) Axis 4 methodology: 25-pair LLM verdicts replaced with KG topic-clustering (Option A). LLM 10-pair fallback as conditional only if KG resolutions sparse.
+- F2 (BLOCKING) verbatim queries: all seven axes now have verbatim SQL/bash with PASS/FAIL criteria.
+- NF1 drift: explicitly defined as **resolution-rate drift** (not temporal); thresholds 10pp/25pp ratified.
+- NF2 git-log dates: introduction_date (with `--follow` rename tracking) AND last_modified both recorded. Distinction named in plan text.
+- NF3 env vars: `MIKA_PLATFORM_ROOT` / `MIKA_SERVER_LOG_FILE` / `MIKA_DB` with documented defaults; no hardcoded paths beyond defaults.
+- Q3 (one-shot vs canonical): one-shot ratified.
+- Q4 (single vs ranked): single recommendation with named runner-up ratified; signal-triple → policy mapping table added in Axis 7.
+
+No open questions remain.
 
 ## Sources
 
