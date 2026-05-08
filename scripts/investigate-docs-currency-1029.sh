@@ -318,8 +318,9 @@ if [ "$MARKER_COUNT" -gt 0 ]; then
   CHAIN_COUNT=0
   ORPHAN_COUNT=0
   while IFS=$'\t' read -r repo match_file; do
-    # Extract target references
-    grep -i -E "$PATTERNS" "$match_file" 2>/dev/null | while read -r line; do
+    # Extract target references — use process substitution to avoid subshell
+    # (piped `while` loses variable mutations; process substitution keeps them)
+    while read -r line; do
       # Try to extract a filename or path reference from the marker line
       TARGET=$(echo "$line" | grep -oE '[a-zA-Z0-9_-]+\.md' | head -1 || true)
       if [ -n "$TARGET" ]; then
@@ -342,7 +343,7 @@ if [ "$MARKER_COUNT" -gt 0 ]; then
           ORPHAN_COUNT=$((ORPHAN_COUNT + 1))
         fi
       fi
-    done
+    done < <(grep -i -E "$PATTERNS" "$match_file" 2>/dev/null || true)
   done < "$MARKER_FILES"
 
   echo ""
