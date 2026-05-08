@@ -321,6 +321,7 @@ Axis 7 is synthesis, not a query — but its inputs are the verbatim outputs of 
 | Medium/High | High | any | **Policy 4 (auto-sunset on KG decay)** | Drift is the dominant signal; auto-flagging by KG resolution rate scales without operator overhead. |
 | High | any | High | **Policy 2 (quarterly sweep)** | Load-bearing old corpus needs operator-gated review to avoid false-sunsetting. |
 | High | any | Low | **Policy 3 (supersession-marker convention)** | Author-driven supersession; safer than auto-sunset for high-aging-low-load corpus. |
+| Medium/High | any | **unavailable** (Axis 6 = unavailable per architect NF4) | **Policy 2 (quarterly sweep)** as conservative default, OR Policy 3 (supersession-marker) | When Load-bearing is unknown (consumption signal unavailable), default to operator-gated policies (2 or 3). Policy 4 (auto-sunset) is too aggressive without consumption-signal validation; Policy 1 (no curation) is too passive when Aging/Drift signals are non-low. The audit names which of {2, 3} based on Drift signal: Drift Medium/High → Policy 2 (review); Drift Low → Policy 3 (markers). |
 
 **Candidate policies in scope (groom-validated cardinality of 6):**
 
@@ -393,6 +394,16 @@ Structure:
 ### Step 4: If Outcome B, file follow-up implementation ticket(s)
 
 The ticket implements the chosen policy. Linked back to mika#1029 + the finding doc.
+
+### Step 4b: Update mika#1029 issue body AC#4 (per architect NF5)
+
+The issue body was written before architect F1 changed Axis 4 from "25-pair LLM contradiction analysis" to "KG topic-clustering" (zero-LLM primary path). AC#4 in the issue body still says: *"Contradiction analysis: every flagged contradiction listed with citations + hand-validation verdict (real contradiction vs. false-positive)."*
+
+The implementer MUST add an edit-notice comment to mika#1029 updating AC#4 to reflect the actual implementation:
+
+> **Edit-notice 2026-05-08:** AC#4 was reframed during grooming (architect F1) from "LLM-pair contradiction analysis" to "**KG topic-cluster overlap analysis** with hand-classified pairs (`adjacent` / `supersession-candidate` / `genuine-contradiction`)". The plan-on-branch is the authoritative shape; this comment supersedes the original AC#4 wording in the issue body. Per mika#1024 NF5 precedent — issue-as-versioned-contract discipline: post the edit-notice as a comment, do not silently rewrite the AC text.
+
+Same convention as mika#1024's edit-notice for the flat→nested schema reframe. Operator (mika-dev) wakes up to a coherent AC list with provenance.
 
 ### Step 5: Close mika#1029
 
