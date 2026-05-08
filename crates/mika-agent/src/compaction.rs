@@ -12,11 +12,26 @@ const MAX_SUMMARY_CHARS: usize = 4000;
 const MAX_COMPACTION_INPUT_CHARS: usize = 50_000;
 
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
-You are summarizing a conversation between an AI executive assistant and their user.
-Preserve: key decisions, action items, commitments, user preferences, important facts about people.
-Discard: pleasantries, small talk, repeated information.
-Keep the summary concise (under 500 tokens). Use bullet points.
-If there is an existing summary, merge it with the new information.";
+You are producing a factual record of what HAPPENED in a session, for a future session to read as history.
+The output is a record FOR a future agent, NOT a record OF a conversation. Future readers did not participate in this session.
+
+Format every bullet as a state assertion with one of these prefixes:
+- `Fact:` for objective state (entities, references, timestamps, quantities)
+- `Decision:` for choices made and disposition
+- `Outcome:` for results and state transitions
+- `Open:` for unresolved questions or pending work
+
+Do NOT use:
+- First-person language (we, our, I) or second-person (you, your)
+- Conversational verbs that imply participation (discussed, agreed, decided together, wanted, asked)
+- Process narration (then we, after that, next)
+
+Do:
+- Preserve key decisions, action items, commitments, user preferences, important facts about people
+- Discard pleasantries, small talk, repeated information
+- Keep the record concise (under 500 tokens) and use bullet points
+
+If there is an existing record, merge new factual state into it; do not preserve conversational shape from the prior record.";
 
 /// Check if compaction is needed and perform it if so.
 /// Called after each agent turn completes.
@@ -334,6 +349,51 @@ mod tests {
         assert_eq!(
             extract_tool_names(&Some(meta.to_string())),
             " [used: search_memory, search_memory(err)]"
+        );
+    }
+
+    #[test]
+    fn summarization_prompt_enforces_factual_shape() {
+        // Load-bearing: forcing-function prefix vocabulary (architectural commitment)
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("`Fact:`"),
+            "load-bearing invariant: Fact: prefix must be in the prompt"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("`Decision:`"),
+            "load-bearing invariant: Decision: prefix must be in the prompt"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("`Outcome:`"),
+            "load-bearing invariant: Outcome: prefix must be in the prompt"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("`Open:`"),
+            "load-bearing invariant: Open: prefix must be in the prompt"
+        );
+
+        // Load-bearing: anti-conversational framing (meta-task + audience)
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("NOT a record OF a conversation"),
+            "load-bearing invariant: meta-task reframe must be present"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("did not participate"),
+            "load-bearing invariant: audience-non-participation framing must be present"
+        );
+
+        // Load-bearing: negative list (header + two of three categories)
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("Do NOT use"),
+            "load-bearing invariant: explicit negative list header must be present"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("First-person"),
+            "load-bearing invariant: first-person prohibition must be present"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("Conversational verbs"),
+            "load-bearing invariant: conversational-verbs prohibition must be present"
         );
     }
 }

@@ -433,6 +433,8 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 **Compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt. `replace_with_summary` uses RAII `rusqlite::Transaction` (DEFERRED) — auto-rollback on error prevents stuck transactions that pin the WAL snapshot (#636).
 
+**Summarizer output contract (#1024):** The compaction summarizer produces *factual state assertions*, not conversational summaries. Output bullets use one of four prefixes: `Fact:` (objective state), `Decision:` (choices and disposition), `Outcome:` (results and state transitions), `Open:` (unresolved questions). The prompt explicitly forbids first-person language, conversational verbs (discussed/agreed/decided), and process narration. This shape is per mika#1009 finding (Axis 2 — content reform): the summary block is consumed by the next session as system-prompt context, and conversational shape there causes the LLM to misread it as prior turns it participated in. The prompt is a single `const &str` at `compaction.rs:14`; tests at `compaction.rs` (`summarization_prompt_enforces_factual_shape`) assert prompt invariants.
+
 **Rewind:** `rewind.rs` — two-phase flow: `preview_rewind()` then `execute_rewind()` with automatic reversal of memory/fact mutations via audit log. TUI: `/undo` (1 exchange), `/rewind [N | to <message_id>]`. Server: `POST /api/v1/rewind/{resolve,preview,execute}`.
 
 ## Unified Task Engine
