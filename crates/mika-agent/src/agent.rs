@@ -2015,18 +2015,13 @@ async fn run_agent_inner(
     };
     let mut system = prompt::build_system_prompt(&prompt_ctx);
 
-    // Load-prevention gate: when [context.summary].inject is false, skip the
-    // db.load_conversation_summary() call entirely so the summary is never
-    // deserialized into this turn's scope (mika#1009 leak protection).
-    // The nested if is intentional — collapsing would obscure the load-prevention contract.
-    #[allow(clippy::collapsible_if)]
-    if ctx.identity.context.summary.inject {
-        if let Some(summary) = db.load_conversation_summary().await? {
-            system.push_str("\n## Conversation Summary\n");
-            system.push_str("<context type=\"summary\" trust=\"data\">\n");
-            system.push_str(&summary.content);
-            system.push_str("\n</context>\n");
-        }
+    // Axis 4 + Axis 3 summary gate (mika#1019, mika#1021).
+    // Conversation mode: silent_trigger is None — Axis 3 cap does not fire.
+    if let Some(content) = load_gated_summary(db, &ctx.identity.context.summary, None).await? {
+        system.push_str("\n## Conversation Summary\n");
+        system.push_str("<context type=\"summary\" trust=\"data\">\n");
+        system.push_str(&content);
+        system.push_str("\n</context>\n");
     }
 
     // Resolve GitHub token once: prefer GitHub App installation token, fall back to PAT.
@@ -2740,6 +2735,51 @@ async fn execute_tool(
     ToolOutput::error(format!("Unknown tool: {name}"))
 }
 
+// -- Summary Gating (Axis 4 + Axis 3) --
+
+/// Load the conversational summary for injection into the system prompt,
+/// applying Axis 4 (load-prevention) and Axis 3 (mode-conditional cap)
+/// gates in sequence.
+///
+/// Returns `Ok(None)` when the summary should not be injected. Three reasons:
+///   - `inject = false` (Axis 4 short-circuit; no DB call made)
+///   - no summary stored in the DB
+///   - silent mode + `max_tokens = Some(0)` (Axis 3 load-omit sentinel)
+///
+/// Returns `Ok(Some(content))` with the (possibly truncated) summary content
+/// to inject. Caller is responsible for the surrounding `<context>` tag wrap
+/// + section header.
+///
+/// **Invariant: Axis 4 check MUST precede Axis 3 check.** The
+/// `if !summary_config.inject` short-circuit MUST be the first operation in
+/// this function. Reversing the order would call `db.load_conversation_summary()`
+/// before the `inject` gate fires, breaking Axis 4's load-prevention
+/// guarantee (mika#1016 F2). Any future refactor that reorders these checks
+/// must preserve this invariant or it ceases to be a load-prevention helper.
+async fn load_gated_summary(
+    db: &AsyncDatabase,
+    summary_config: &prompt::ContextSummaryConfig,
+    silent_trigger: Option<&SilentTrigger>,
+) -> Result<Option<String>> {
+    // Axis 4: hard load-prevention. MUST be first — see invariant above.
+    if !summary_config.inject {
+        return Ok(None);
+    }
+
+    // Load the summary; absence is not an error.
+    let Some(summary) = db.load_conversation_summary().await? else {
+        return Ok(None);
+    };
+
+    // Axis 3: mode-conditional cap. The mode gate is `silent_trigger.is_some()`;
+    // the field name (`max_tokens`) is mode-agnostic.
+    match (silent_trigger, summary_config.max_tokens) {
+        (Some(_), Some(0)) => Ok(None), // Silent + load-omit sentinel.
+        (Some(_), Some(n)) => Ok(Some(prompt::truncate_to_token_budget(&summary.content, n))),
+        _ => Ok(Some(summary.content)), // Non-silent or no cap → full summary.
+    }
+}
+
 // -- Silent Mode Agent Loop --
 
 /// What triggered a silent-mode agent run.
@@ -3080,18 +3120,15 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
-    // Load-prevention gate: when [context.summary].inject is false, skip the
-    // db.load_conversation_summary() call entirely so the summary is never
-    // deserialized into this turn's scope (mika#1009 leak protection).
-    // The nested if is intentional — collapsing would obscure the load-prevention contract.
-    #[allow(clippy::collapsible_if)]
-    if ctx.identity.context.summary.inject {
-        if let Some(summary) = db.load_conversation_summary().await? {
-            system.push_str("\n## Conversation Summary\n");
-            system.push_str("<context type=\"summary\" trust=\"data\">\n");
-            system.push_str(&summary.content);
-            system.push_str("\n</context>\n");
-        }
+    // Axis 4 + Axis 3 summary gate (mika#1019, mika#1021).
+    // Silent mode: pass the trigger so Axis 3's mode-conditional cap can fire.
+    if let Some(content) =
+        load_gated_summary(db, &ctx.identity.context.summary, Some(&params.trigger)).await?
+    {
+        system.push_str("\n## Conversation Summary\n");
+        system.push_str("<context type=\"summary\" trust=\"data\">\n");
+        system.push_str(&content);
+        system.push_str("\n</context>\n");
     }
 
     // Match skills based on trigger type:
@@ -8564,5 +8601,150 @@ mod tests {
             "Tool in enabled set with failed call = satisfied (attempt was made, \
              real failure surfaced — not a fabrication)"
         );
+    }
+
+    // -- load_gated_summary tests (Axis 3 — mika#1021) --
+
+    /// Seed a summary into the async DB by saving enough messages and compacting.
+    async fn seed_summary(db: &AsyncDatabase, content: &str) {
+        // Save enough messages so replace_with_summary has something to compact.
+        for i in 0..5 {
+            db.save_message("test-session", "user", &format!("msg {i}"), None)
+                .await
+                .unwrap();
+        }
+        let old = db.load_messages_before_window(3).await.unwrap();
+        let highest_id = old.last().unwrap().id;
+        db.replace_with_summary(content, highest_id).await.unwrap();
+    }
+
+    fn make_callback_trigger() -> SilentTrigger {
+        SilentTrigger::Callback {
+            task_id: "test-task".to_string(),
+            label: "test".to_string(),
+            result: "done".to_string(),
+            failed: false,
+            parent_task_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn gated_summary_no_cap_silent_returns_full() {
+        // max_tokens = None, silent turn, summary present → returns full summary (regression).
+        let db = test_async_db();
+        seed_summary(&db, "Full summary content here").await;
+
+        let config = prompt::ContextSummaryConfig {
+            inject: true,
+            max_tokens: None,
+        };
+        let trigger = make_callback_trigger();
+        let result = load_gated_summary(&db, &config, Some(&trigger))
+            .await
+            .unwrap();
+        assert_eq!(result, Some("Full summary content here".to_string()));
+    }
+
+    #[tokio::test]
+    async fn gated_summary_zero_sentinel_silent_returns_none() {
+        // max_tokens = Some(0), silent turn → returns None (load-omit sentinel).
+        let db = test_async_db();
+        seed_summary(&db, "Should be omitted").await;
+
+        let config = prompt::ContextSummaryConfig {
+            inject: true,
+            max_tokens: Some(0),
+        };
+        let trigger = make_callback_trigger();
+        let result = load_gated_summary(&db, &config, Some(&trigger))
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn gated_summary_zero_sentinel_non_silent_returns_full() {
+        // max_tokens = Some(0), non-silent turn → returns full (cap gated by mode).
+        let db = test_async_db();
+        seed_summary(&db, "Full content non-silent").await;
+
+        let config = prompt::ContextSummaryConfig {
+            inject: true,
+            max_tokens: Some(0),
+        };
+        let result = load_gated_summary(&db, &config, None).await.unwrap();
+        assert_eq!(result, Some("Full content non-silent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn gated_summary_cap_truncates_in_silent() {
+        // max_tokens = Some(n), silent turn, summary > n tokens → truncated.
+        let db = test_async_db();
+        let long_summary = "word ".repeat(500); // 2500 chars, way over budget
+        seed_summary(&db, &long_summary).await;
+
+        let config = prompt::ContextSummaryConfig {
+            inject: true,
+            max_tokens: Some(100), // 400 char budget
+        };
+        let trigger = make_callback_trigger();
+        let result = load_gated_summary(&db, &config, Some(&trigger))
+            .await
+            .unwrap();
+        let content = result.unwrap();
+        assert!(content.contains("[… summary truncated to fit silent-mode budget …]"));
+        // Total truncated content (before marker) should be ≤ 400 chars
+        let before_marker = content
+            .strip_suffix("\n[… summary truncated to fit silent-mode budget …]")
+            .unwrap();
+        assert!(before_marker.len() <= 400);
+    }
+
+    #[tokio::test]
+    async fn gated_summary_cap_under_budget_returns_full() {
+        // max_tokens = Some(n), silent turn, summary < n tokens → full summary.
+        let db = test_async_db();
+        seed_summary(&db, "Short summary").await;
+
+        let config = prompt::ContextSummaryConfig {
+            inject: true,
+            max_tokens: Some(1000), // 4000 char budget, summary is tiny
+        };
+        let trigger = make_callback_trigger();
+        let result = load_gated_summary(&db, &config, Some(&trigger))
+            .await
+            .unwrap();
+        assert_eq!(result, Some("Short summary".to_string()));
+    }
+
+    #[tokio::test]
+    async fn gated_summary_axis4_wins_over_axis3() {
+        // Axis 4 inject = false + any max_tokens → returns None without DB call.
+        let db = test_async_db();
+        // Don't even seed a summary — Axis 4 should short-circuit before DB call.
+
+        let config = prompt::ContextSummaryConfig {
+            inject: false,
+            max_tokens: Some(500),
+        };
+        let trigger = make_callback_trigger();
+        let result = load_gated_summary(&db, &config, Some(&trigger))
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn gated_summary_no_summary_stored() {
+        // inject = true, max_tokens = None, no summary in DB → returns None.
+        let db = test_async_db();
+        // No summary seeded.
+
+        let config = prompt::ContextSummaryConfig {
+            inject: true,
+            max_tokens: None,
+        };
+        let result = load_gated_summary(&db, &config, None).await.unwrap();
+        assert_eq!(result, None);
     }
 }

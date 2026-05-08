@@ -61,6 +61,32 @@ Use case: agents where the conversational summary is a known context-channel lea
 inject = false
 ```
 
+### `[context.summary].max_tokens` (usize, optional, default: `None`)
+
+Mode-conditional token budget for summary injection (Axis 3 — mika#1021). The field name is mode-agnostic; the gate condition (`SilentTrigger.is_some()`) lives in code. Orthogonal with `inject`: when `inject = false` (Axis 4), Axis 4 wins — `load_gated_summary()` short-circuits before evaluating `max_tokens`.
+
+When set and the in-code gate fires (currently: silent-mode turns — callback, webhook, heartbeat, etc.):
+
+- `Some(0)` → **load-omit sentinel**: summary omitted entirely on silent-mode turns. NOT interpreted as "zero-token cap."
+- `Some(n)` for n > 0 → summary truncated to approximately `n × CHARS_PER_TOKEN_ESTIMATE` (= 4) characters before injection. A truncation marker `[… summary truncated to fit silent-mode budget …]` is appended so the model knows content was elided.
+- `None` → no cap (default; current behavior).
+
+Non-silent turns (conversation mode, CLI) are never affected by `max_tokens` regardless of its value.
+
+Token approximation uses `CHARS_PER_TOKEN_ESTIMATE = 4` (heuristic, conservative for English). Truncation cuts at a word boundary via `truncate_to_token_budget()` in `prompt.rs`.
+
+```toml
+# Cap summary to ~1000 tokens on silent-mode turns, keep full on interactive turns
+[context.summary]
+inject = true
+max_tokens = 1000
+
+# Omit summary entirely on silent-mode turns
+[context.summary]
+inject = true
+max_tokens = 0
+```
+
 ## Tools
 
 Each tool validates inputs. Control fields capped at `MAX_INPUT_LEN = 10_000` chars; payload fields capped at `MAX_PAYLOAD_BYTES = 200 * 1024` bytes (200 KB).
