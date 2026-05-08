@@ -214,26 +214,13 @@ pub fn truncate_to_token_budget(summary: &str, max_tokens: usize) -> String {
     }
     // Cut at the last word boundary at or before `max_chars`.
     // floor_char_boundary ensures we don't slice mid-codepoint.
-    let safe_boundary = floor_char_boundary(summary, max_chars);
+    let safe_boundary = summary.floor_char_boundary(max_chars);
     let cut = summary[..safe_boundary]
         .rfind(char::is_whitespace)
         .unwrap_or(safe_boundary);
     let mut truncated = summary[..cut].to_string();
     truncated.push_str("\n[… summary truncated to fit silent-mode budget …]");
     truncated
-}
-
-/// Returns the largest byte index ≤ `index` that is a valid char boundary.
-/// Equivalent to `str::floor_char_boundary` (nightly-only as of Rust 1.86).
-fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    let mut i = index;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
 }
 
 /// Agent identity loaded from ~/.mika/identity.toml.
@@ -2513,13 +2500,12 @@ inject = true
         // 2 tokens * 4 chars = 8 chars budget
         let summary = "The quick brown fox jumps over the lazy dog";
         let result = truncate_to_token_budget(summary, 2);
-        // Should cut at ~8 chars, finding last whitespace before position 8
-        assert!(result.contains("[… summary truncated to fit silent-mode budget …]"));
-        // "The" + space is at position 3, "quick" at position 4-8
-        // Last whitespace at or before 8 is position 3 (after "The")
-        assert!(result.starts_with("The"));
-        // Must be shorter than original
-        assert!(result.len() < summary.len() + 60); // +60 for marker
+        // Budget is 8 chars. Last whitespace at or before position 8 is position 3
+        // (space after "The"). So the pre-marker content should be exactly "The".
+        assert_eq!(
+            result,
+            "The\n[… summary truncated to fit silent-mode budget …]"
+        );
     }
 
     #[test]
