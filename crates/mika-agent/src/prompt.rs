@@ -7,6 +7,15 @@ use serde::Deserialize;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+/// Heuristic conversion ratio for character-count to token-count approximation.
+///
+/// Used by [`truncate_to_token_budget()`] (and any other code path that needs to
+/// cap summary content by approximate token count without invoking a real
+/// tokenizer). The 4:1 ratio is acceptable for English and is conservative
+/// enough for cap-enforcement; exact tokenization is not required because the
+/// cap is a soft policy, not a hard limit, and tokenizers vary by provider.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
 /// Configuration for periodic memory reflection.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ReflectionConfig {
@@ -152,8 +161,30 @@ pub struct ContextSummaryConfig {
     /// Whether to load and inject the conversational summary into the system prompt.
     /// Default: `true` (preserves current behavior for all existing agents).
     /// Set to `false` for agents where summary leakage is a known problem.
+    /// (Axis 4 — mika#1019)
     #[serde(default = "default_inject_summary")]
     pub inject: bool,
+
+    /// Optional token cap applied to the summary by the gated injection path.
+    ///
+    /// The cap is mode-agnostic at the schema level. Today the only caller
+    /// applying it gates on silent-mode detection — see [`load_gated_summary()`]
+    /// in `agent.rs`. Tomorrow another gate could reuse the same field
+    /// without a rename.
+    ///
+    /// When set:
+    ///   - `Some(0)` → load-omit sentinel: summary is not injected. Same code
+    ///     path as Axis 4's `inject = false` short-circuit, but conditional on
+    ///     the in-code gate firing (e.g., silent-mode only). NOT interpreted as
+    ///     "zero-token cap"; treated as a structural omit signal.
+    ///   - `Some(n)` for n > 0 → summary truncated to approximately
+    ///     `n * CHARS_PER_TOKEN_ESTIMATE` characters before injection.
+    ///   - `None` → no cap (default; current behavior).
+    ///
+    /// Token approximation is heuristic via [`CHARS_PER_TOKEN_ESTIMATE`] (= 4).
+    /// (Axis 3 — mika#1021)
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
 }
 
 fn default_inject_summary() -> bool {
@@ -164,8 +195,32 @@ impl Default for ContextSummaryConfig {
     fn default() -> Self {
         Self {
             inject: default_inject_summary(),
+            max_tokens: None,
         }
     }
+}
+
+/// Truncate a summary string to approximately `max_tokens`, using
+/// [`CHARS_PER_TOKEN_ESTIMATE`] for the conversion. Cuts at a word boundary
+/// near the budget to avoid mid-word truncation in the LLM's view. Appends
+/// a truncation marker so the model knows content was elided.
+///
+/// Heuristic: not exact tokenization. Acceptable because the cap is a soft
+/// policy, not a hard limit, and tokenizers vary by provider.
+pub fn truncate_to_token_budget(summary: &str, max_tokens: usize) -> String {
+    let max_chars = max_tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
+    if summary.len() <= max_chars {
+        return summary.to_string();
+    }
+    // Cut at the last word boundary at or before `max_chars`.
+    // floor_char_boundary ensures we don't slice mid-codepoint.
+    let safe_boundary = summary.floor_char_boundary(max_chars);
+    let cut = summary[..safe_boundary]
+        .rfind(char::is_whitespace)
+        .unwrap_or(safe_boundary);
+    let mut truncated = summary[..cut].to_string();
+    truncated.push_str("\n[… summary truncated to fit silent-mode budget …]");
+    truncated
 }
 
 /// Agent identity loaded from ~/.mika/identity.toml.
@@ -302,7 +357,10 @@ fn fail_closed_identity() -> Identity {
         // Fail-closed must enforce inject=false so a malformed identity.toml
         // cannot re-enable summary injection (mika#1009 leak protection).
         context: ContextIdentityConfig {
-            summary: ContextSummaryConfig { inject: false },
+            summary: ContextSummaryConfig {
+                inject: false,
+                max_tokens: None,
+            },
         },
     }
 }
@@ -2411,5 +2469,128 @@ inject = true
         )
         .unwrap();
         assert!(identity.context.summary.inject);
+    }
+
+    // -- truncate_to_token_budget tests (Axis 3 — mika#1021) --
+
+    #[test]
+    fn truncate_empty_string() {
+        let result = truncate_to_token_budget("", 100);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn truncate_short_string_under_budget() {
+        let summary = "This is a short summary.";
+        let result = truncate_to_token_budget(summary, 100);
+        assert_eq!(result, summary);
+    }
+
+    #[test]
+    fn truncate_exactly_at_budget() {
+        // 6 tokens * 4 chars = 24 chars budget
+        let summary = "This is exactly 24 char!"; // 24 chars
+        assert_eq!(summary.len(), 24);
+        let result = truncate_to_token_budget(summary, 6);
+        assert_eq!(result, summary);
+    }
+
+    #[test]
+    fn truncate_over_budget_cuts_at_word_boundary() {
+        // 2 tokens * 4 chars = 8 chars budget
+        let summary = "The quick brown fox jumps over the lazy dog";
+        let result = truncate_to_token_budget(summary, 2);
+        // Budget is 8 chars. Last whitespace at or before position 8 is position 3
+        // (space after "The"). So the pre-marker content should be exactly "The".
+        assert_eq!(
+            result,
+            "The\n[… summary truncated to fit silent-mode budget …]"
+        );
+    }
+
+    #[test]
+    fn truncate_over_budget_no_whitespace() {
+        // 2 tokens * 4 chars = 8 chars budget; no whitespace → cuts at max_chars
+        let summary = "abcdefghijklmnop";
+        let result = truncate_to_token_budget(summary, 2);
+        assert!(result.starts_with("abcdefgh"));
+        assert!(result.contains("[… summary truncated to fit silent-mode budget …]"));
+    }
+
+    #[test]
+    fn truncate_long_summary_preserves_marker() {
+        let summary = "word ".repeat(500); // 2500 chars
+        let result = truncate_to_token_budget(&summary, 100); // 400 char budget
+        assert!(result.ends_with("[… summary truncated to fit silent-mode budget …]"));
+        // Truncated content (before marker) should be ≤ budget chars
+        let content_before_marker = result
+            .strip_suffix("\n[… summary truncated to fit silent-mode budget …]")
+            .unwrap();
+        assert!(content_before_marker.len() <= 400);
+    }
+
+    #[test]
+    fn truncate_multibyte_unicode_safe() {
+        // Ensure we don't panic on multi-byte UTF-8 characters near the cut point
+        let summary = "日本語のテスト文字列です。これは長いテスト文字列です。";
+        // Each CJK char is 3 bytes; with budget of 5 tokens (20 chars / ~6-7 CJK chars)
+        let result = truncate_to_token_budget(summary, 5);
+        assert!(result.contains("[… summary truncated to fit silent-mode budget …]"));
+        // Should not panic — that's the main assertion
+    }
+
+    // -- ContextSummaryConfig deserialization tests (Axis 3 — mika#1021) --
+
+    #[test]
+    fn summary_config_default_max_tokens_is_none() {
+        let config = ContextSummaryConfig::default();
+        assert!(config.inject);
+        assert!(config.max_tokens.is_none());
+    }
+
+    #[test]
+    fn summary_config_deserializes_max_tokens() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Test"
+
+[context.summary]
+inject = true
+max_tokens = 500
+"#,
+        )
+        .unwrap();
+        assert!(identity.context.summary.inject);
+        assert_eq!(identity.context.summary.max_tokens, Some(500));
+    }
+
+    #[test]
+    fn summary_config_deserializes_max_tokens_zero_sentinel() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Test"
+
+[context.summary]
+inject = true
+max_tokens = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(identity.context.summary.max_tokens, Some(0));
+    }
+
+    #[test]
+    fn summary_config_without_max_tokens_defaults_to_none() {
+        let identity: Identity = toml::from_str(
+            r#"
+name = "Test"
+
+[context.summary]
+inject = false
+"#,
+        )
+        .unwrap();
+        assert!(!identity.context.summary.inject);
+        assert!(identity.context.summary.max_tokens.is_none());
     }
 }
