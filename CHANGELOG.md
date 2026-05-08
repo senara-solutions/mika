@@ -1,6 +1,16 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.9.1](https://github.com/senara-solutions/mika/releases/tag/v0.9.1) — 2026-05-08
+
+### Fixed
+
+- *(kg/extraction)* per-corpus fair budget allocation (#962) (#1034)
+
+### Investigate
+
+- *(kg)* post-axis-deploy KG sync verification (#1028)
+- *(docs)* compound knowledge currency audit (#1029) (#1030)
 ## [v0.9.0](https://github.com/senara-solutions/mika/releases/tag/v0.9.0) — 2026-05-08
 
 ### Added
