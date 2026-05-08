@@ -980,7 +980,11 @@ impl Settings {
                 Ok(token) => return Some(token),
                 Err(e) => {
                     tracing::warn!(
-                        "GitHub App token exchange failed: {e}. No PAT configured for fallback."
+                        target: "mika::github_auth",
+                        event = "gh_app_token_exchange_failed",
+                        error = %e,
+                        has_pat_fallback = false,
+                        "GitHub App token exchange failed; no PAT configured for fallback"
                     );
                 }
             }

@@ -205,6 +205,17 @@ GitHub App is configured (see above), the App's installation token takes precede
    MIKA_GITHUB_TOKEN=ghp_your_token_here
    ```
 
+**Clock-skew tolerance (JWT):** The GitHub App JWT generator uses a 9-minute lifetime
+(60s under GitHub's 10-minute hard ceiling) to tolerate positive host-clock skew up to
+~120s. If your host's clock drifts further than that, you will see
+`gh_app_token_exchange_failed` events in the server log. Keep host NTP healthy; sustained
+drift beyond ~1 minute warrants investigation.
+
+**Per-agent PAT:** To give a specific agent its own GitHub identity (e.g., mika-relay),
+create `~/.mika/agents/<name>/.env` and set `MIKA_GITHUB_TOKEN=<pat>`. Restart
+mika-server. `resolve_github_token` checks the PAT first; the GitHub App installation
+token is the fallback. Agents without a PAT rely entirely on the App path.
+
 ### GitHub token for `gh` CLI in Claude Code sessions
 
 `GH_TOKEN` is used by the `gh` CLI in Claude Code sessions spawned via claude-pilot.
