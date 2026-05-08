@@ -1,6 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.10.0](https://github.com/senara-solutions/mika/releases/tag/v0.10.0) — 2026-05-08
+
+### Added
+
+- *(self-dev)* auto-groom ungroomed tickets before dispatch (#996) (#1004)
 ## [v0.9.1](https://github.com/senara-solutions/mika/releases/tag/v0.9.1) — 2026-05-08
 
 ### Fixed
