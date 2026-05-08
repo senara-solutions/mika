@@ -191,7 +191,7 @@ let pending_counts: Vec<u32> = corpus_counts.iter().map(|(_, count)| *count).col
 let assigned = allocate_fair_budget(&pending_counts, budget);
 ```
 
-This is a pure refactor — no behavioral change to resolution.
+This is a pure refactor — no behavioral change to resolution. **Verification gate:** all existing resolver tests must pass unchanged after refactoring to use `allocate_fair_budget()`. If any fail, the shared function's behavior diverges from the inline original — stop and reconcile before proceeding to Step 4.
 
 ### Step 3: Add `count_pending_docs()` to `SubjectExtractor`
 
