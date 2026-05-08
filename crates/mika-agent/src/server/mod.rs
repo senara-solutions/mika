@@ -936,7 +936,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                         continue;
                     };
 
-                    // Shared per-agent budget drained left-to-right across corpora (#798).
+                    // Per-corpus fair budget allocation (#962) — sibling of resolver fairness (#927).
                     let db = agent_state.db.clone();
                     let llm = extraction_llm.clone();
                     let agent_name_clone = agent_name.clone();
@@ -947,49 +947,74 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
                     let extraction_agent = agent_name_clone.clone();
                     let handle = tokio::spawn(async move {
-                        let mut remaining_budget = budget;
-                        for (corpus_idx, docs_root) in corpora_clone.into_iter().enumerate() {
-                            if remaining_budget == 0 {
-                                warn!(
-                                    event = "kg_budget_exhausted",
-                                    scope = "extraction",
-                                    agent_id = %agent_name_clone,
-                                    roots_remaining = corpus_count - corpus_idx,
-                                    "extraction budget exhausted; remaining corpora skipped this restart"
-                                );
-                                break;
-                            }
+                        // Phase 1: Count pending docs per corpus.
+                        let mut corpus_pending: Vec<u32> = Vec::new();
+                        let mut extractors: Vec<crate::kg::subject_extractor::SubjectExtractor> =
+                            Vec::new();
+                        for docs_root in &corpora_clone {
                             let extractor = crate::kg::subject_extractor::SubjectExtractor::new(
                                 db.clone(),
                                 llm.clone(),
-                                docs_root,
+                                docs_root.clone(),
                                 None,
                             );
-                            match extractor.extract_pending(remaining_budget).await {
+                            let count = extractor.count_pending_docs().await.unwrap_or(0);
+                            corpus_pending.push(count);
+                            extractors.push(extractor);
+                        }
+
+                        // Phase 2: Fair budget allocation via shared function.
+                        let allocated =
+                            crate::kg::budget::allocate_fair_budget(&corpus_pending, budget);
+
+                        // Phase 3: Execute extractors with per-corpus budgets.
+                        let mut per_corpus_extracted: std::collections::BTreeMap<String, u32> =
+                            std::collections::BTreeMap::new();
+                        let mut total_extracted: usize = 0;
+                        let mut total_entities: usize = 0;
+                        let mut total_relationships: usize = 0;
+                        let mut total_failed: usize = 0;
+                        let mut total_duration_ms: u64 = 0;
+
+                        for (idx, (extractor, per_budget)) in
+                            extractors.into_iter().zip(allocated.iter()).enumerate()
+                        {
+                            if *per_budget == 0 {
+                                continue;
+                            }
+                            match extractor.extract_pending(*per_budget).await {
                                 Ok(stats) => {
-                                    if stats.docs_extracted > 0 || stats.docs_failed > 0 {
-                                        info!(
-                                            event = "subject_extraction_ready",
-                                            agent_id = %agent_name_clone,
-                                            corpus_index = corpus_idx,
-                                            corpus_count = corpus_count,
-                                            docs_extracted = stats.docs_extracted,
-                                            docs_failed = stats.docs_failed,
-                                            entities = stats.total_entities,
-                                            relationships = stats.total_relationships,
-                                            duration_ms = stats.duration_ms,
-                                            "subject extraction complete"
-                                        );
-                                    }
-                                    remaining_budget =
-                                        remaining_budget.saturating_sub(stats.llm_calls);
+                                    let corpus_key = corpora_clone[idx].display().to_string();
+                                    per_corpus_extracted
+                                        .insert(corpus_key, stats.docs_extracted as u32);
+                                    total_extracted += stats.docs_extracted;
+                                    total_entities += stats.total_entities;
+                                    total_relationships += stats.total_relationships;
+                                    total_failed += stats.docs_failed;
+                                    total_duration_ms += stats.duration_ms;
                                 }
                                 Err(e) => warn!(
                                     error = %e,
                                     agent_id = %agent_name_clone,
-                                    "subject extraction failed; entities may be stale until next restart"
+                                    corpus_index = idx,
+                                    "subject extraction failed for corpus; entities may be stale until next restart"
                                 ),
                             }
+                        }
+
+                        if total_extracted > 0 || total_failed > 0 {
+                            info!(
+                                event = "subject_extraction_ready",
+                                agent_id = %agent_name_clone,
+                                corpus_count = corpus_count,
+                                per_corpus_extracted = %serde_json::to_string(&per_corpus_extracted).unwrap_or_default(),
+                                total_docs_extracted = total_extracted,
+                                total_docs_failed = total_failed,
+                                total_entities = total_entities,
+                                total_relationships = total_relationships,
+                                total_duration_ms = total_duration_ms,
+                                "subject extraction complete"
+                            );
                         }
                     });
                     tokio::spawn(async move {
