@@ -1,6 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.12.0](https://github.com/senara-solutions/mika/releases/tag/v0.12.0) — 2026-05-08
+
+### Added
+
+- expose process_id in check_task and list_tasks tool output (#1043)
 ## [v0.11.0](https://github.com/senara-solutions/mika/releases/tag/v0.11.0) — 2026-05-08
 
 ### Added
