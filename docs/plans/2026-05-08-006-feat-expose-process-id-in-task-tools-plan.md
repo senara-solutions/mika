@@ -27,6 +27,7 @@ The `process_id` column already exists on the `tasks` table (since before v31), 
 - No changes to the spawn-time write or exit-time clear paths (already working)
 - Dashboard API `TaskResponse` parity is a separate concern (out of scope)
 - `list_scheduled_tasks` tool is out of scope (scheduled tasks don't spawn subprocesses)
+- This ticket is part of milestone#18 (Task lifecycle improvements); cancel-by-PID and revert-cleanup tickets are siblings that build on this exposure.
 
 ## Context & Research
 
@@ -69,9 +70,44 @@ The `process_id` column already exists on the `tasks` table (since before v31), 
   - `check_task.rs:229-231` — Source field conditional display
   - `check_task.rs:239-241` — Completed field conditional display
 
+  **Pinned insertion point** (verbatim from branch state at `feat/854/store-process-id-when-a-task-triggers-a` HEAD; lines may shift if main is rebased — re-grep `// GitHub enrichment` to relocate):
+
+  ```rust
+  // crates/mika-agent/src/tools/check_task.rs:243-251
+          if let Some(ref metadata) = task.metadata
+              && metadata != "{}"
+          {
+              writeln!(output, "Metadata: {metadata}").unwrap();
+          }
+
+          // GitHub enrichment
+          if let Some(ref url) = task.reference_url {
+              writeln!(output).unwrap();
+  ```
+
+  Insert the new block on the blank line between `}` (line 247) and `// GitHub enrichment` (line 249), so the resulting structure is:
+
+  ```rust
+          if let Some(ref metadata) = task.metadata
+              && metadata != "{}"
+          {
+              writeln!(output, "Metadata: {metadata}").unwrap();
+          }
+
+          if let Some(pid) = task.process_id {
+              writeln!(output, "Process ID: {pid}").unwrap();
+          }
+
+          // GitHub enrichment
+  ```
+
+  Note: `task.process_id` is `Option<i64>` (a `Copy` type) — use `if let Some(pid)` not `if let Some(ref pid)`.
+
   **Test scenarios:**
   - Happy path: task with `process_id = Some(12345)` → output contains `Process ID: 12345`
   - Happy path: task with `process_id = None` → output does NOT contain `Process ID`
+
+  **Test setup mechanism:** Tests should set `process_id` via `db.set_task_process_id(&task_id, Some(12345)).await` (the production write path), not via raw SQL. This composes the production write path with the new read path so column-name regressions surface.
 
   **Verification:**
   - `cargo test -p mika-agent check_task` passes
@@ -96,10 +132,49 @@ The `process_id` column already exists on the `tasks` table (since before v31), 
   - `list_tasks.rs:134-138` — `ref_url` annotation pattern
   - `list_tasks.rs:139-143` — `src` annotation pattern
 
+  **Pinned insertion point** (verbatim from branch state at `feat/854/store-process-id-when-a-task-triggers-a` HEAD; re-grep `format!(\n` inside the for-each task loop to relocate if shifted):
+
+  ```rust
+  // crates/mika-agent/src/tools/list_tasks.rs:151-160
+              let children = child_count
+                  .map(|c| format!(" children:{c}"))
+                  .unwrap_or_default();
+
+              lines.push(format!(
+                  "- [{status}] {id} {label} (created:{created}{ref_url}{src}{task_type}{children})",
+                  status = task.status,
+                  id = task.id,
+                  label = task.label,
+              ));
+  ```
+
+  Add the new `pid` binding immediately after the `children` binding, then append `{pid}` at the END of the parenthesised annotation list inside the format string (after `{children}`). Result:
+
+  ```rust
+              let children = child_count
+                  .map(|c| format!(" children:{c}"))
+                  .unwrap_or_default();
+              let pid = task
+                  .process_id
+                  .map(|p| format!(" pid:{p}"))
+                  .unwrap_or_default();
+
+              lines.push(format!(
+                  "- [{status}] {id} {label} (created:{created}{ref_url}{src}{task_type}{children}{pid})",
+                  status = task.status,
+                  id = task.id,
+                  label = task.label,
+              ));
+  ```
+
+  Placement rationale: `pid` appended after `children` puts the rarest annotation last — most tasks have neither, so the common case (no annotations) stays compact. `process_id` is `Option<i64>` (a `Copy` type) — `.map(|p| ...)` works directly without `as_deref()` (unlike `ref_url`/`src` which are `Option<String>`).
+
   **Test scenarios:**
   - Happy path: task with `process_id = Some(42)` in `list_tasks` output → line contains `pid:42`
   - Happy path: task with `process_id = None` → line does NOT contain `pid:`
-  - Integration: create a task, set its `process_id` via DB, call `list_tasks`, verify annotation appears
+  - Integration: create a task, call `db.set_task_process_id(&task_id, Some(42)).await` (the production write path, not raw SQL), call `list_tasks`, verify annotation appears.
+
+  **Test setup mechanism:** Tests should set `process_id` via `db.set_task_process_id(&task_id, Some(42)).await`, not via raw SQL. This composes the production write path with the new read path so column-name regressions surface.
 
   **Verification:**
   - `cargo test -p mika-agent list_tasks` passes
