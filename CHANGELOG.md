@@ -1,6 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.9.0](https://github.com/senara-solutions/mika/releases/tag/v0.9.0) — 2026-05-08
+
+### Added
+
+- *(prompt)* summarizer content reform — factual assertions (#1024) (#1025)
 ## [v0.8.0](https://github.com/senara-solutions/mika/releases/tag/v0.8.0) — 2026-05-08
 
 ### Added
