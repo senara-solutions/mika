@@ -974,47 +974,9 @@ impl SubjectEntityResolver {
             corpus_counts.push((hash.clone(), count));
         }
 
-        let n = corpus_counts.len() as u32;
-        let budget = effective_budget;
-
-        // 2. First pass: assign each corpus min(pending_count, budget / N).
-        let base_share = budget / n;
-        let mut assigned: Vec<u32> = corpus_counts
-            .iter()
-            .map(|(_, count)| (*count).min(base_share))
-            .collect();
-
-        // 3. Compute remaining budget.
-        let used: u32 = assigned.iter().sum();
-        let mut remaining = budget.saturating_sub(used);
-
-        // 4. Second pass: distribute remaining to corpora with surplus pending.
-        if remaining > 0 {
-            let mut hungry: Vec<usize> = corpus_counts
-                .iter()
-                .enumerate()
-                .filter(|(i, (_, count))| *count > assigned[*i])
-                .map(|(i, _)| i)
-                .collect();
-
-            while remaining > 0 && !hungry.is_empty() {
-                let share = (remaining / hungry.len() as u32).max(1);
-                let mut next_hungry = Vec::new();
-                for &idx in &hungry {
-                    if remaining == 0 {
-                        break;
-                    }
-                    let can_take = corpus_counts[idx].1.saturating_sub(assigned[idx]);
-                    let give = share.min(can_take).min(remaining);
-                    assigned[idx] += give;
-                    remaining -= give;
-                    if assigned[idx] < corpus_counts[idx].1 {
-                        next_hungry.push(idx);
-                    }
-                }
-                hungry = next_hungry;
-            }
-        }
+        // 2-4. Fair budget allocation via shared function (#927, #962).
+        let pending_counts: Vec<u32> = corpus_counts.iter().map(|(_, count)| *count).collect();
+        let assigned = super::budget::allocate_fair_budget(&pending_counts, effective_budget);
 
         // 5. Per-corpus limit = max(2 * per_corpus_budget, 50) — KTD-2 oversupply.
         // 6. Fetch entities per corpus.

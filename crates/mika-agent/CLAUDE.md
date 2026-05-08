@@ -327,7 +327,7 @@ docs_roots = [
 | `docs_root` (singular) | Hard-error if explicit; warn-and-skip if CWD default | Skips ingestion with distinct warn |
 | `docs_roots` (plural) | Each path validated independently; missing paths logged as WARN and skipped; agent starts if at least one path is valid | Empty array treated as "not set" (falls back to singular chain) |
 
-**b. Array order matters under budget pressure.** When `MIKA_KG_BATCH_BUDGET` is constrained, corpora are ingested in array order. If the budget is exhausted mid-array, remaining corpora are deferred to the next restart. Place the most important corpus first.
+**b. Array order no longer starves secondary corpora (#962).** Budget is distributed fairly across corpora using two-pass allocation (`kg::budget::allocate_fair_budget`) for both extraction and resolution. Each corpus with pending work receives a proportional share. Array order only affects tiebreaking when the budget cannot be evenly divided — not a starvation vector.
 
 **c. Resolution chain priority (seven tiers, first match wins):**
 

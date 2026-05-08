@@ -545,6 +545,32 @@ impl SubjectExtractor {
         })
     }
 
+    /// Count pending docs for this extractor's corpus without fetching them.
+    ///
+    /// Used by the fair budget allocation caller to determine per-corpus
+    /// pending counts before distributing the budget (#962).
+    pub async fn count_pending_docs(&self) -> Result<u32> {
+        let docs_root_hash = self.docs_root_hash.clone();
+        self.db
+            .with_db(move |db| {
+                let count: u32 = db.conn.query_row(
+                    "SELECT COUNT(DISTINCT c.source_doc_path)
+                     FROM kg_chunks c
+                     WHERE c.docs_root_hash = ?1
+                       AND NOT EXISTS (
+                         SELECT 1 FROM kg_extractions e
+                         WHERE e.docs_root_hash  = c.docs_root_hash
+                           AND e.source_doc_path = c.source_doc_path
+                           AND e.source_doc_hash = c.source_doc_hash
+                       )",
+                    rusqlite::params![docs_root_hash],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .await
+    }
+
     /// Enumerate and extract all pending docs for the agent (D7), capped by
     /// `budget` LLM calls.
     ///

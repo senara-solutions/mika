@@ -65,7 +65,7 @@ Both fall back to a shared `MIKA_KG_INGESTION_MODEL` if only that is set, so ope
 
 ### C2.5 Per-batch LLM call budget (#757)
 
-`MIKA_KG_BATCH_BUDGET` (default 500) caps the number of LLM calls per extraction batch and per resolution batch. Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next restart. `0` disables the phase entirely. Worst-case per-startup cost is `2 × N_agents × budget` — extraction batch plus resolution batch, one of each per agent.
+`MIKA_KG_BATCH_BUDGET` (default 500) caps the number of LLM calls per extraction batch and per resolution batch. Budget is distributed fairly across corpora using two-pass allocation (`kg::budget::allocate_fair_budget`, #962) for both extraction and resolution (#927), so array order no longer starves secondary corpora. Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next restart. `0` disables the phase entirely. Worst-case per-startup cost is `2 × N_agents × budget` — extraction batch plus resolution batch, one of each per agent.
 
 Stage-1 exact-match resolutions do not debit the budget (they cost no LLM calls), so entities that resolve via exact match still make progress even when the budget is exhausted. The budget guard is a structural caller-side counter, not a prompt-level instruction — LLMs rationalize crossing prompt-level budgets; structural constraints don't.
 
