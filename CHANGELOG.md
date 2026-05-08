@@ -1,6 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.11.0](https://github.com/senara-solutions/mika/releases/tag/v0.11.0) — 2026-05-08
+
+### Added
+
+- *(skills)* add dev-handsoff bundled skill v0.1 (artifact-only) (#1005)
 ## [v0.10.0](https://github.com/senara-solutions/mika/releases/tag/v0.10.0) — 2026-05-08
 
 ### Added
