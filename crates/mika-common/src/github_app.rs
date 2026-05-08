@@ -21,8 +21,12 @@ const EXPIRY_BUFFER: Duration = Duration::from_secs(5 * 60);
 /// Clock skew backdating for `iat` claim (GitHub recommendation: 60 seconds).
 const IAT_BACKDATE: Duration = Duration::from_secs(60);
 
-/// JWT lifetime (GitHub maximum: 10 minutes).
-const JWT_LIFETIME: Duration = Duration::from_secs(600);
+/// JWT lifetime — 9 minutes (60s under GitHub's 10-minute hard ceiling).
+/// The headroom tolerates positive host-clock skew up to ~120s before
+/// GitHub's `exp ≤ iat + 600s` validator rejects the token. A single-use
+/// JWT has no caching value, so shortening the lifetime has no
+/// operational cost. See mika#1042.
+const JWT_LIFETIME: Duration = Duration::from_secs(540);
 
 /// Cached installation token with expiry (in-memory).
 struct CachedToken {
@@ -496,10 +500,13 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
         // iss should be the app_id as a string
         assert_eq!(payload["iss"], "12345");
 
-        // exp - iat should equal JWT_LIFETIME (600 seconds)
+        // exp - iat should equal JWT_LIFETIME (540 seconds).
+        // Pinned at 540s to tolerate ~120s of positive host-clock skew
+        // below GitHub's hard 600s ceiling. See mika#1042.
         let iat = payload["iat"].as_u64().unwrap();
         let exp = payload["exp"].as_u64().unwrap();
         assert_eq!(exp - iat, JWT_LIFETIME.as_secs());
+        assert_eq!(JWT_LIFETIME.as_secs(), 540);
 
         // iat should be backdated (roughly current_time - 60s)
         let now = SystemTime::now()
