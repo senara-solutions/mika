@@ -151,9 +151,13 @@ impl Tool for ListTasksTool {
             let children = child_count
                 .map(|c| format!(" children:{c}"))
                 .unwrap_or_default();
+            let pid = task
+                .process_id
+                .map(|p| format!(" pid:{p}"))
+                .unwrap_or_default();
 
             lines.push(format!(
-                "- [{status}] {id} {label} (created:{created}{ref_url}{src}{task_type}{children})",
+                "- [{status}] {id} {label} (created:{created}{ref_url}{src}{task_type}{children}{pid})",
                 status = task.status,
                 id = task.id,
                 label = task.label,
@@ -582,6 +586,39 @@ mod tests {
         assert!(result.content.contains("type:milestone"));
         assert!(result.content.contains("type:project"));
         assert!(!result.content.contains("type:issue"));
+    }
+
+    #[tokio::test]
+    async fn test_list_shows_pid_when_set() {
+        let harness = TestHarness::new();
+        let id = create_test_task(&harness, "Running task", Some("user_request"), None).await;
+        harness.db.set_task_process_id(&id, Some(42)).await.unwrap();
+        let ctx = harness.ctx();
+        let tool = ListTasksTool;
+
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            result.content.contains("pid:42"),
+            "should contain pid annotation: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_hides_pid_when_none() {
+        let harness = TestHarness::new();
+        create_test_task(&harness, "Normal task", Some("user_request"), None).await;
+        let ctx = harness.ctx();
+        let tool = ListTasksTool;
+
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            !result.content.contains("pid:"),
+            "should not contain pid when None: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
