@@ -397,7 +397,7 @@ defaults to `~/.mika/`.
 
 ## identity.toml
 
-Defines the assistant's display identity and per-agent Knowledge Graph configuration.
+Defines the assistant's display identity, per-agent Knowledge Graph configuration, and context injection controls.
 
 **Default content:**
 
@@ -409,6 +409,10 @@ emoji = "✦"
 # enabled = true                    # default: true — set false to skip KG for this agent
 # docs_root = "/path/to/docs"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions
 # docs_roots = ["/path/a", "/path/b"]  # optional; multi-corpus (overrides docs_root when set)
+
+# [context.summary]
+# inject = true                     # default: true — set false to disable summary injection entirely (Axis 4)
+# max_tokens = 1000                 # optional — cap summary to ~1000 tokens on silent-mode turns (Axis 3)
 ```
 
 | Field | Description |
@@ -418,8 +422,12 @@ emoji = "✦"
 | `[kg].enabled` | Whether KG ingestion/extraction/resolution runs for this agent. Default: `true`. |
 | `[kg].docs_root` | Absolute path to the docs root this agent's KG reads from. Optional; falls back to the global resolver chain (`MIKA_KG_DOCS_ROOT` env > `kg_docs_root` config > `<CWD>/docs/solutions`). |
 | `[kg].docs_roots` | Array of absolute paths for multi-corpus agents (#798). Overrides `docs_root` (singular) and `MIKA_KG_DOCS_ROOTS` when set. Each path is validated independently; missing paths are warned and skipped. |
+| `[context.summary].inject` | Whether to load and inject the conversational summary into the system prompt. Default: `true`. Set `false` for agents where summary leakage is a known problem (#1019). |
+| `[context.summary].max_tokens` | Optional token cap applied to the summary on silent-mode turns (callback, webhook, heartbeat). `0` = omit summary on silent turns; `n > 0` = truncate to ~n tokens (4 chars/token heuristic). Non-silent turns are never affected. Default: none (#1021). |
 
 **`[kg]` behavior:** When `enabled = false`, no KG subsystem components are constructed for the agent. Existing shared-corpus rows are preserved (cleanup via `mika kg purge`). When `docs_root` is set to an explicit path that doesn't exist, the agent fails to start with a clear error. Agents with matching `docs_root` share extraction via `docs_root_hash` (v27 schema).
+
+**`[context.summary]` behavior:** `inject = false` (Axis 4) is a load-prevention gate — `db.load_conversation_summary()` is never called and the summary is not available to any downstream code path. `max_tokens` (Axis 3) is mode-conditional — it only fires on silent-mode turns (when `SilentTrigger` is present). Axis 4 always wins: when `inject = false`, the `max_tokens` field is never evaluated. See `crates/mika-agent/CLAUDE.md` for implementation details.
 
 To customize, edit `~/.mika/identity.toml`:
 

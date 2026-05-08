@@ -31,7 +31,7 @@ These run automatically on every agent turn. The engine handles them in `prompt.
 | Skill prompt injection | `agent.rs` `inject_skills_and_resolve_tools()` | Every turn | Matched skills' prompts injected based on keyword triggers; `always_on` skills injected unconditionally |
 | Context resolution | `skills/context.rs` `resolve_contexts()` | Every turn (when skills have `[context.*]`) | Deterministic data pre-fetch (e.g., `gh_pr_diff`) before LLM sees the query |
 | Conversation history loading | `agent.rs` `load_recent_messages()` | Every turn | Full message history for the session loaded into the conversation |
-| Conversation summary injection | `agent.rs` (post `build_system_prompt`) | Every turn (when summary exists) | Compaction summary injected as `<context type="summary" trust="data">` |
+| Conversation summary injection | `agent.rs` `load_gated_summary()` | Every turn (gated by `[context.summary]` config) | Compaction summary injected as `<context type="summary" trust="data">`. Gated by Axis 4 (`inject = false` prevents load) and Axis 3 (`max_tokens` caps or omits on silent-mode turns). |
 | Compaction summarization | `compaction.rs` `maybe_compact()` | Post-turn, when message count > 50 | Older messages summarized via LLM, summary stored, originals deleted |
 | Tool call recording | `agent.rs` via `save_tool_call()` | After each tool execution | Full input/output (50KB cap) persisted to `tool_calls` table |
 | LLM call recording | `agent.rs` via `save_llm_call()` | After each LLM API call | Model, tokens, latency, stop reason persisted to `llm_calls` table |
