@@ -40,3 +40,4 @@ pub mod quoted_resource_pre_fetch;
 pub mod required_suffix_line_caught;
 pub mod required_suffix_line_unconstrained;
 pub mod required_tools_retry_thin_final_turn;
+pub mod summary_conversational_recall;
