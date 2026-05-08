@@ -10,6 +10,64 @@ branch: bug/1041/agent-required-suffix-line-guard-864
 
 PR #864's `Required-suffix-line guard` fires on **mika-relay's permission-decision turns** despite mika-relay's spec at `crates/mika-agent/src/well_known_agents.rs:161-194` denylisting `dev-groom`, `mika-arch-groom-ticket`, `mika-arch-second-review`, and `mika-arch-groom-milestone`. Result: every dev-groom dispatch on v0.10.0 hits a re-prompt loop on relay turns, claude-pilot's relay parser sees prose instead of permission JSON, every tool call auto-denies, the subprocess produces zero commits.
 
+## Pinned API shapes (Phase 0 — pre-implementation verification)
+
+Verbatim from `crates/mika-agent/src/db.rs`:
+
+**`SkillOverride` struct (db.rs:441-451):**
+
+```rust
+/// A user override for a skill property (persists across bundled skill re-sync).
+#[derive(Debug, Clone, Default)]
+pub struct SkillOverride {
+    pub skill_name: String,
+    pub always_on: Option<bool>,
+    pub llm_provider: Option<String>,
+    pub llm_model: Option<String>,
+    /// Tri-state: `None` = default (enabled), `Some(false)` = disabled,
+    /// `Some(true)` = explicitly enabled.
+    pub enabled: Option<bool>,
+}
+```
+
+**`get_skill_overrides` signature (db.rs:3915):**
+
+```rust
+pub fn get_skill_overrides(&self, agent_id: &str) -> Result<Vec<SkillOverride>>
+```
+
+**`set_skill_enabled` signature (db.rs:3975-3980):**
+
+```rust
+pub fn set_skill_enabled(
+    &mut self,
+    agent_id: &str,
+    skill_name: &str,
+    enabled: bool,
+) -> Result<()>
+```
+
+The reconciliation block uses these shapes verbatim. Comparison against `Some(false)` is well-typed: `enabled` is `Option<bool>`. `set_skill_enabled` takes a plain `bool` (it converts internally via `if enabled { None } else { Some(false) }` so `false` writes the disabled marker). The existing `llm_overrides` reconciliation block at `well_known_agents.rs:514-555` uses these same shapes — the `disabled_skills` reconciliation we add inherits identical typing.
+
+**Pinned dev-groom manifest content** (`skills/bundled/dev-groom/skill.toml`):
+
+```toml
+[skill]
+name = "dev-groom"
+always_on = false
+timeout_secs = 600
+
+[triggers]
+keywords = ["groom", "groom ticket", "/mika-groom-ticket", "groom issue"]
+
+[output]
+required_suffix_lines = ["Verdict: GROOMED", "Verdict: ESCALATE"]
+```
+
+Confirms the load-bearing element of the causal chain: dev-groom **does** declare `[output] required_suffix_lines`. When `match_skills` keyword-matches `"groom"` in mika-relay's payload, `collect_required_suffix_lines` (`agent.rs:4041-4048`) collects this list into the guard's accept-set. The plan's narrative is accurate.
+
+For symmetry, the other two skills in `MIKA_RELAY.disabled_skills` that declare suffix lines also contribute when they match: `mika-arch-groom-ticket` declares `["Disposition: READY", "Disposition: ITERATE", "Disposition: ESCALATE"]` and `mika-arch-second-review` declares `["Verdict: GROOMED", "Verdict: ESCALATE"]`. Both have keyword sets less likely to substring-match permission payloads (e.g., `"groom-ticket"`, `"architect-review"`, `"second-review"`), but the seeding-drift fix removes the leak risk for all three uniformly.
+
 ## Root cause
 
 The leak is **not** in the guard itself (`crates/mika-agent/src/agent.rs:1472-1530`) and **not** in `collect_required_suffix_lines` (`crates/mika-agent/src/agent.rs:4035-4048`) — both are correctly skill-scoped to `Keyword`/`AlwaysOn` matched skills.
@@ -79,6 +137,15 @@ Insert a `disabled_skills` reconciliation block immediately before the `for llm_
 // seeding-once path skipped it. We compare spec.disabled_skills against
 // the existing rows and write the delta. See mika#1041 for the dev-groom
 // leak that motivated this.
+//
+// Reverse direction (spec removes a skill from denylist while the DB still
+// has enabled=false) is intentionally NOT reconciled here. Operator manual
+// disables (via `mika skills disable <name>`) take precedence over spec
+// changes — re-enabling on deploy could turn a manually-disabled skill back
+// on. Operators can re-enable with `mika skills enable <name>`. This is the
+// correct asymmetry: positive-direction drift is unintended drift (skill
+// added to spec, not yet seeded); negative-direction drift may be intentional
+// operator state. See mika#1041 § "Out of scope" for the full reasoning.
 let mut disabled_reconciled = 0u32;
 for skill_name in spec.disabled_skills {
     let needs_disable = !overrides.iter().any(|existing| {
@@ -162,6 +229,50 @@ fn test_seed_reconciles_disabled_skills_drift() {
 The existing first-creation tests (`test_seed_skill_overrides_mika_relay`, etc.) cover the empty-table path; this new test covers the drift path.
 
 Run with: `cargo test -p mika-agent well_known_agents -- --nocapture`.
+
+### Negative-direction eval regression (`tests/eval/grounding_regressions/required_suffix_line_relay_no_fire.rs`)
+
+The unit test above verifies the reconciliation logic in isolation (DB state shape). It does not verify the end-to-end behavior: that a mika-relay permission turn does not trigger the guard post-fix. Without this paired negative test, a future regression that re-enables a verdict-suffix-declaring skill on mika-relay could ship undetected — the same $2.80 burn shape as today.
+
+Add a new scenario to `tests/eval/grounding_regressions/` paralleling the existing `required_suffix_line_*` positive scenarios:
+
+```rust
+// tests/eval/grounding_regressions/required_suffix_line_relay_no_fire.rs
+//
+// Negative-direction regression for mika#1041. Asserts that a mika-relay
+// permission turn does NOT fire the Required-suffix-line guard, even when
+// the user message contains the substring "groom" (which would keyword-match
+// dev-groom if dev-groom were enabled on relay).
+//
+// Counterpart to required_suffix_line_caught.rs / required_suffix_line_unconstrained.rs.
+
+use crate::eval::EvalHarness;
+use crate::eval::grounding_assertions::*;
+
+#[tokio::test]
+async fn required_suffix_line_relay_no_fire() {
+    let harness = EvalHarness::builder()
+        .agent("mika-relay")  // exercises the well-known-agent denylist
+        .seed_well_known_overrides(true)  // applies disabled_skills + reconciliation
+        .build();
+
+    let user_message = r#"[claude-pilot] {"event_type":"permission_request","tool_name":"Bash","tool_input":{"command":"gh issue view 854","cwd":"/tmp"},"session_id":"abc","decision_reason_so_far":"Groom mika#854 task started"}"#;
+
+    let response = harness.run_silent_turn(user_message).await;
+
+    // Assertion: assistant's response is permission JSON, not a verdict-shaped suffix.
+    assert_response_forbids(&response, "Verdict: GROOMED");
+    assert_response_forbids(&response, "Verdict: ESCALATE");
+    assert_response_forbids(&response, "Disposition:");
+
+    // Assertion: no "Required-suffix-line guard" warn was emitted in the harness's log buffer.
+    assert_no_log_event(&response, "Required-suffix-line guard");
+}
+```
+
+Register the scenario in `tests/eval/grounding_regressions/mod.rs` alongside the existing `required_suffix_line_*` modules. Tag with `grounding:relay-isolation` (new sub-tag in the `grounding:*` namespace).
+
+The test depends on `EvalHarness` exposing a `seed_well_known_overrides()` builder method. If that method does not exist today, the test scaffolding is added as part of this PR (a small additive method on the builder; mirrors the existing `embedding_client()`, `brave_api_key()`, etc.). If the implementer finds that adding the harness method substantially expands the diff, the test can be filed as a follow-up sibling ticket — the unit test alone suffices to gate the merge, but the eval test is required for full positive/negative symmetry coverage.
 
 ## Acceptance criteria
 
