@@ -246,6 +246,10 @@ impl Tool for CheckTaskTool {
             writeln!(output, "Metadata: {metadata}").unwrap();
         }
 
+        if let Some(pid) = task.process_id {
+            writeln!(output, "Process ID: {pid}").unwrap();
+        }
+
         // GitHub enrichment
         if let Some(ref url) = task.reference_url {
             writeln!(output).unwrap();
@@ -678,6 +682,49 @@ mod tests {
         assert!(
             result.content.contains("Type: milestone"),
             "milestone type should be visible: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_shows_process_id_when_set() {
+        let harness = TestHarness::new();
+        let id = create_test_task(&harness, "Running task", None, Some("user_request")).await;
+        harness
+            .db
+            .set_task_process_id(&id, Some(12345))
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
+        let tool = CheckTaskTool;
+
+        let result = tool
+            .execute(serde_json::json!({"task_id": id}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            result.content.contains("Process ID: 12345"),
+            "should contain process_id: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_hides_process_id_when_none() {
+        let harness = TestHarness::new();
+        let id = create_test_task(&harness, "Normal task", None, Some("user_request")).await;
+        let ctx = harness.ctx();
+        let tool = CheckTaskTool;
+
+        let result = tool
+            .execute(serde_json::json!({"task_id": id}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(
+            !result.content.contains("Process ID"),
+            "should not contain Process ID when None: {}",
             result.content
         );
     }
