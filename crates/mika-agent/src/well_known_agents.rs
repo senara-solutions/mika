@@ -179,6 +179,7 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
         "mika-arch-groom-milestone",
         "mika-arch-second-review",
         "dev-groom",
+        "dev-handsoff",
         // Community (hardcoded BUNDLED_SKILLS):
         "tmux",
         "shell-exec",
