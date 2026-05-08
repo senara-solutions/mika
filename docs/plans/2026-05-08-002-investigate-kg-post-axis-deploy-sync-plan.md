@@ -47,84 +47,190 @@ Alternatives rejected:
 - **Rust integration test:** overkill for a one-shot investigation; would also miss the log-grep portion.
 - **Skip the script, write the finding doc directly:** loses the reusability win for the runbook.
 
-### What the script checks (six layers)
+### What the script checks (six layers — verbatim queries)
 
-For each of the three target docs (`source_doc_path`):
+Per architect first-pass F1: the SQL/jq queries below are the implementation. Each is shown with its full table set, join path, output columns, expected shape, and PASS/FAIL criterion. Per architect NF3: L5/L6 use **jq selectors against structured log fields**, not text grep — the server emits JSON with `.event` field as canonical event name.
 
-**Layer 1 — Chunking** (`kg_chunks`):
+For each of the three target docs (`source_doc_path` LIKE %target-substring%):
+
+#### Layer 1 — Chunking (`kg_chunks`)
+
 ```sql
-SELECT source_doc_path, COUNT(*) AS chunks, source_doc_hash, MAX(created_at) AS last_chunked
+-- L1: chunk presence per doc
+SELECT
+  source_doc_path,
+  COUNT(*)              AS chunks,
+  source_doc_hash,
+  MAX(created_at)       AS last_chunked
 FROM kg_chunks
 WHERE source_doc_path LIKE '%silent-mode-summary-budget-cap%'
    OR source_doc_path LIKE '%summarizer-factual-assertion%'
    OR source_doc_path LIKE '%verify-on-write-citation%'
 GROUP BY source_doc_path;
 ```
-Expected: ≥1 chunk per doc, valid `source_doc_hash`. Already verified pre-investigation (see Reconnaissance § above) — script confirms current state.
 
-**Layer 2 — Subject extraction** (`kg_subject_entities` + `kg_chunk_subjects`):
+| Column | Meaning |
+|---|---|
+| `chunks` | count of `kg_chunks` rows per doc |
+| `source_doc_hash` | content-hash for #757 idempotency |
+| `last_chunked` | most recent ingest timestamp |
+
+**PASS:** all 3 docs return ≥1 chunk row, non-NULL `source_doc_hash`.
+**FAIL:** any doc missing or `chunks=0` → Path B (chunking layer drop).
+**Reconnaissance result:** PASS — verified 2026-05-08T08:50Z (see § Reconnaissance above).
+
+#### Layer 2 — Subject extraction (`kg_chunk_subjects` × `kg_subject_entities`)
+
 ```sql
-SELECT c.source_doc_path,
-       COUNT(DISTINCT cs.subject_entity_id) AS entities,
-       COUNT(*) AS provenance_rows
+-- L2: entity count per doc via chunk → subject_entity provenance
+SELECT
+  c.source_doc_path,
+  COUNT(DISTINCT cs.subject_entity_id) AS entities,
+  COUNT(*)                              AS provenance_rows
 FROM kg_chunks c
-JOIN kg_chunk_subjects cs ON cs.chunk_id = c.id
+JOIN kg_chunk_subjects cs
+  ON cs.chunk_id = c.id
+ AND cs.docs_root_hash = c.source_doc_hash  -- v27 shared-corpus join
 WHERE c.source_doc_path LIKE '%silent-mode-summary-budget-cap%'
    OR c.source_doc_path LIKE '%summarizer-factual-assertion%'
    OR c.source_doc_path LIKE '%verify-on-write-citation%'
 GROUP BY c.source_doc_path;
 ```
-Expected: entity count > 0 per doc. Zero count = extraction layer drop (Path B finding).
 
-**Layer 3 — Subject relationships** (`kg_subject_relationships` + `kg_chunk_subject_relationships`):
+| Column | Meaning |
+|---|---|
+| `entities` | distinct `subject_entity_id` count per doc |
+| `provenance_rows` | row count in `kg_chunk_subjects` (>= entities; one entity may appear across multiple chunks) |
+
+**PASS:** each doc has `entities > 0`. Typical: 4–15 entities per doc depending on length.
+**FAIL:** any doc with `entities = 0` while L1 chunks present → Path B (subject extractor drop). Possible causes: `kg_extractions` row exists without write to provenance tables (idempotency-marker bug); LLM extraction returned empty result (parse-tolerance regression — see mika#876); `MIKA_KG_EXTRACTION_MODEL` unset.
+
+#### Layer 3 — Subject relationships (`kg_chunk_subject_relationships`)
+
 ```sql
-SELECT c.source_doc_path,
-       COUNT(DISTINCT csr.subject_relationship_id) AS triples
+-- L3: fact-triple count per doc via chunk → subject_relationship provenance
+SELECT
+  c.source_doc_path,
+  COUNT(DISTINCT csr.subject_relationship_id) AS triples,
+  COUNT(*)                                     AS provenance_rows
 FROM kg_chunks c
-JOIN kg_chunk_subject_relationships csr ON csr.chunk_id = c.id
+JOIN kg_chunk_subject_relationships csr
+  ON csr.chunk_id = c.id
+ AND csr.docs_root_hash = c.source_doc_hash  -- v27 shared-corpus join
 WHERE c.source_doc_path LIKE '%silent-mode-summary-budget-cap%'
    OR c.source_doc_path LIKE '%summarizer-factual-assertion%'
    OR c.source_doc_path LIKE '%verify-on-write-citation%'
 GROUP BY c.source_doc_path;
 ```
-Expected: triple count ≥ 1 per doc.
 
-**Layer 4 — Resolution** (`kg_resolutions_log` joined back through chunks):
+**PASS:** each doc has `triples > 0`. Best-practices docs typically yield 3–12 triples (USES, SOLVED_BY, MENTIONS, etc.).
+**FAIL:** any doc with `triples = 0` while `entities > 0` → Path B (relationship extractor drop while entity extractor succeeded — possible LLM partial-output bug or schema-validation reject).
+
+#### Layer 4 — Resolution (`kg_resolutions_log`, agent-scoped)
+
 ```sql
-SELECT c.source_doc_path,
-       rl.outcome,
-       COUNT(*) AS rows
+-- L4: resolution outcomes per doc, scoped to mika-arch (sole KG consumer per mika#800)
+SELECT
+  c.source_doc_path,
+  rl.outcome,
+  COUNT(*) AS rows
 FROM kg_chunks c
-JOIN kg_chunk_subjects cs ON cs.chunk_id = c.id
-JOIN kg_resolutions_log rl ON rl.subject_entity_id = cs.subject_entity_id
+JOIN kg_chunk_subjects cs
+  ON cs.chunk_id = c.id
+ AND cs.docs_root_hash = c.source_doc_hash
+JOIN kg_resolutions_log rl
+  ON rl.subject_entity_id = cs.subject_entity_id
+ AND rl.agent_id = 'mika-arch'  -- per-agent scoping (kg_resolutions_log is agent-keyed)
 WHERE c.source_doc_path LIKE '%silent-mode-summary-budget-cap%'
    OR c.source_doc_path LIKE '%summarizer-factual-assertion%'
    OR c.source_doc_path LIKE '%verify-on-write-citation%'
 GROUP BY c.source_doc_path, rl.outcome;
 ```
-Expected per doc: each subject entity has at least one `kg_resolutions_log` row. Outcomes break down into:
-- `exact_match`, `matched_llm`, `matched_llm_db_fallback` — successful resolutions
-- `no_match` — entity not in domain graph (acceptable for novel subject-only concepts like "Axis 3", "load-omit sentinel")
-- `skipped_no_llm` — resolution model not configured (acceptable degraded mode; flag in finding)
 
-Missing rows entirely (no log entry for an entity) = resolution layer drop (Path B finding).
+| Outcome | Meaning | Verdict |
+|---|---|---|
+| `exact_match` | Subject ↔ domain entity, case-insensitive name match | PASS |
+| `matched_llm` | LLM disambiguator picked a domain candidate | PASS |
+| `matched_llm_db_fallback` | LLM match outside in-prompt window, accepted via DB fallback (mika#874) | PASS |
+| `no_match` | No domain candidate (acceptable for novel subject-only concepts: "Axis 3", "load-omit sentinel", "Mode 5") | PASS (acceptable degraded) |
+| `skipped_no_llm` | `MIKA_KG_RESOLUTION_MODEL` unset | FAIL with note (degraded mode; flag in finding) |
+| (no row at all) | Subject entity has zero `kg_resolutions_log` rows | FAIL → Path B (resolution layer drop or pending-resolution stuck in queue) |
 
-**Layer 5 — Resolver tick health** (server log grep, post-deploy onward):
-```bash
-grep 'kg_resolver_tick' "$MIKA_SERVER_LOG_FILE" | jq -c 'select(.timestamp > "2026-05-07T16:00:00Z") | {ts: .timestamp, event: .event, agent_id, pending_after, llm_calls, aborted_budget, per_corpus_attempted}'
-```
-Expected: `kg_resolver_tick.complete` events on a ~30-min cadence per agent; `aborted_budget=false` on every tick; `pending_after` trends to 0 across ticks (per Signal E in `crates/mika-agent/CLAUDE.md`); `per_corpus_attempted` JSON shows non-zero attempts on every tick if pending > 0 per corpus (per Signal F, mika#927).
+**PASS:** every entity from L2 has at least one row in L4 (count ≥ L2 entities). Outcome distribution is informational, not pass/fail.
+**FAIL:** L2 entities > L4 row count → unresolved entities pending or dropped.
 
-**Layer 6 — Domain graph health**:
-```bash
-grep 'domain_rebuild' "$MIKA_SERVER_LOG_FILE" | jq -c 'select(.timestamp > "2026-05-08T08:00:00Z") | {ts: .timestamp, event: .event, entities, edges}'
-```
+Cross-check query (count subject entities WITHOUT any resolution log row):
+
 ```sql
-SELECT COUNT(*) FROM kg_entities;
-SELECT COUNT(*) FROM kg_relationships;
-SELECT entity_type, COUNT(*) FROM kg_entities GROUP BY entity_type;
+-- L4 cross-check: subject entities with zero resolution log rows (per agent)
+SELECT
+  c.source_doc_path,
+  COUNT(DISTINCT cs.subject_entity_id) AS unresolved_pending
+FROM kg_chunks c
+JOIN kg_chunk_subjects cs
+  ON cs.chunk_id = c.id
+ AND cs.docs_root_hash = c.source_doc_hash
+WHERE NOT EXISTS (
+  SELECT 1 FROM kg_resolutions_log rl
+  WHERE rl.subject_entity_id = cs.subject_entity_id
+    AND rl.agent_id = 'mika-arch'
+)
+  AND (c.source_doc_path LIKE '%silent-mode-summary-budget-cap%'
+    OR c.source_doc_path LIKE '%summarizer-factual-assertion%'
+    OR c.source_doc_path LIKE '%verify-on-write-citation%')
+GROUP BY c.source_doc_path;
 ```
-Expected: `domain_rebuild_complete` event present in server log after each post-deploy server start; `kg_entities` count > 0 with sane breakdown across types (skill/tool/agent/problem_type/concept). Zero count = domain rebuild silently failed (high-severity Path B finding).
+
+PASS: zero `unresolved_pending` per doc OR pending count is monotonically draining (compare against the resolver-tick `pending_after` from L5).
+
+#### Layer 5 — Resolver tick health (jq on structured server log)
+
+Per architect NF3: server logs are structured JSON; use jq selectors against `.event` field.
+
+```bash
+# L5: resolver tick events from 2026-05-07T16:00Z onward, mika-arch only
+jq -c '
+  select(.event == "kg_resolver_tick.complete" or .event == "kg_resolver_tick.error" or .event == "kg_resolver_tick.start")
+  | select(.timestamp > "2026-05-07T16:00:00Z")
+  | select(.agent_id == "mika-arch")
+  | {ts: .timestamp, event, agent_id, pending_after, llm_calls, aborted_budget, per_corpus_attempted}
+' "$MIKA_SERVER_LOG_FILE"
+```
+
+| Field | Source | PASS | FAIL |
+|---|---|---|---|
+| `aborted_budget` | tick.complete | `false` on every tick | `true` on any tick → resolver drowning (Signal D check; raise `MIKA_KG_BATCH_BUDGET` or investigate) |
+| `pending_after` | tick.complete | trending to 0 across ticks (Signal E) | flat or growing across multiple ticks → resolver stalled |
+| `per_corpus_attempted` JSON | tick.complete (mika#927) | non-zero attempts on every tick for every corpus that has pending entities | corpus with pending > 0 and zero attempts → fairness violation |
+| `event == "kg_resolver_tick.error"` | error event | absent | present → log error message, classify as Path B |
+
+#### Layer 6 — Domain graph health
+
+Two probes — the rebuild log event and the entity-count snapshot:
+
+```bash
+# L6a: domain rebuild events post-deploy (2026-05-08T08:00Z onward)
+jq -c '
+  select(.event == "domain_rebuild_start" or .event == "domain_rebuild_complete" or .event == "domain_rebuild_entities" or .event == "domain_rebuild_edges")
+  | select(.timestamp > "2026-05-08T08:00:00Z")
+  | {ts: .timestamp, event, trace_id}
+' "$MIKA_SERVER_LOG_FILE"
+```
+
+```sql
+-- L6b: entity-count snapshot
+SELECT COUNT(*) AS total_entities FROM kg_entities;
+SELECT COUNT(*) AS total_relationships FROM kg_relationships;
+SELECT entity_type, COUNT(*) AS n
+FROM kg_entities
+GROUP BY entity_type
+ORDER BY n DESC;
+```
+
+| Probe | PASS | FAIL |
+|---|---|---|
+| L6a: `domain_rebuild_complete` log event present after each post-deploy server start | event present, paired with `domain_rebuild_start` (matching `trace_id`) | event missing → rebuild silently failed (the module's failure policy is log-and-continue per `domain_builder.rs`) |
+| L6b: `total_entities > 0` | sane breakdown — `skill: ~30+`, `tool: ~10+`, `agent: ~5`, `problem_type: 5`, `concept: 20` | zero total entities → catastrophic rebuild failure (high-severity Path B) |
 
 ### Per-doc rollup
 
@@ -150,54 +256,64 @@ The finding doc's TL;DR ends with one of:
 
 ### Step 1: Write the investigation script
 
-**File:** `scripts/investigate-kg-1027.sh`
+**File:** `mika/scripts/investigate-kg-1027.sh` (per architect F2 — repo-local, not workspace-level; the queries cite mika-internal schema and event names, so the script lives with the repo whose state it inspects).
 
 Bash script that:
 
 1. Sources `MIKA_SERVER_LOG_FILE` from environment or argv (default `/var/log/mika/server.log`).
-2. Runs the six-layer queries against `~/.mika/data/mika.db` (via `sqlite3`).
-3. Greps the server log for `kg_resolver_tick` and `domain_rebuild` events with timestamp filtering.
+2. Runs the six-layer queries from §"What the script checks" verbatim against `~/.mika/data/mika.db` (via `sqlite3`).
+3. Filters the server log for KG events using **jq selectors against `.event` field** (per architect NF3), not text grep — the server emits structured JSON.
 4. Produces a structured stdout report (markdown table per layer).
-5. Captures the session ID + timestamp for the finding doc.
+5. Captures a timestamp for the finding doc.
 
 The script is idempotent (read-only) — safe to re-run. Uses `MIKA_SERVER_LOG_FILE` env var resolution: if unset, falls back to `/var/log/mika/server.log` and emits a WARN if read access fails.
 
+**Per architect NF2: scope of reusability.** The script `investigate-kg-1027.sh` is a **per-ticket one-shot** — its filename is bound to mika#1027 and it queries this specific moment in the KG state. The **methodology** it embodies (six-layer post-deploy KG verification) IS reusable, but the script itself is not the reusable artifact. Future post-deploy verifications either (a) copy this script and rename per-ticket, or (b) consume the methodology distilled into a `solutions/best-practices/` doc per Step 6 below. Do not market this script as "the canonical post-deploy KG verification script" in CLAUDE.md.
+
 ### Step 2: Run the script + capture output
 
-Run from the worktree:
+Run from the mika worktree:
 
 ```bash
-bash scripts/investigate-kg-1027.sh > /tmp/kg-1027-output.md
+bash mika/scripts/investigate-kg-1027.sh > /tmp/kg-1027-output.md
 ```
 
 Output goes to `/tmp/`. The finding doc (Step 3) cites this output verbatim where load-bearing.
 
 ### Step 3: Author the finding doc
 
-**File:** `mika/docs/audits/2026-05-08-001-investigate-kg-post-axis-deploy-sync.md` (or `mika/docs/solutions/best-practices/post-deploy-kg-verification-2026-05-08.md` if the methodology generalizes).
+**File:** `mika/docs/audits/2026-05-08-001-investigate-kg-post-axis-deploy-sync.md` (per architect NF1 — `audits/` **unconditionally**, regardless of outcome path).
 
-Path choice rationale: if Outcome A (healthy), the methodology IS the deliverable — file it under `solutions/best-practices/` so the next post-deploy verification can reuse the script + finding shape. If Outcome B (specific bug), the finding is the deliverable — file under `audits/` as a one-shot investigation record. Decide at write-time.
+Rationale: an investigation produces an audit record. The audit is one-shot by definition — it documents what was checked at this moment in time. If the methodology turns out to be reusable, that's a separate artifact (Step 6, methodology follow-up) extracted to `solutions/best-practices/`. Writing the audit speculatively under `solutions/` (in case it's "reusable") collapses the audit-vs-pattern distinction the docs structure deliberately preserves.
 
 The doc structure:
 
 - **Frontmatter:** `module: agent-core`, `tags: [kg, post-deploy-verification, lexical-ingest, subject-extraction, resolution]`, `problem_type: post-deploy-verification` (Outcome A) or `problem_type: kg-bug-{specific}` (Outcome B).
-- **TL;DR:** verdict per doc + outcome path declaration.
+- **TL;DR:** verdict per doc + outcome path declaration (A/B/C).
 - **Reconnaissance:** the L1 chunk counts already established (above).
 - **L2/L3/L4 results:** verbatim query outputs.
-- **L5/L6 results:** verbatim log greps + counts.
+- **L5/L6 results:** verbatim log queries + counts.
 - **Per-doc rollup matrix.**
-- **Outcome path verdict + follow-up tickets.**
-- **Methodology section** (Outcome A path): how a future operator runs the same verification post-deploy.
+- **Outcome path verdict + follow-up tickets** (named inline if Path B).
 
 ### Step 4: If Outcome B, file follow-up ticket(s)
 
 Each named bug in the finding doc gets its own follow-up `mika#` issue. Link from the finding doc + from the follow-up ticket back to mika#1027.
 
-### Step 5: Update CLAUDE.md (Outcome A only)
+### Step 5: Close mika#1027
 
-If Outcome A, add one sentence to `crates/mika-agent/CLAUDE.md` § Knowledge Graph (post-restart safety check section) referencing the verification script + finding doc as the canonical post-deploy KG check. This wires the script into the runbook §3 KG-deploy smoke probe.
+Path A: finding doc declares healthy; close ticket; no further follow-up.
+Path B: finding doc declares specific bugs; close ticket once follow-up tickets are filed (the investigation IS done).
+Path C: finding doc declares unclear; close ticket once escalation is delivered to operator (the investigation IS done; subsequent action is operator-driven).
 
-If Outcome B, do NOT update CLAUDE.md — wait for the fix ticket(s) to land first.
+### Step 6: Methodology extraction (separate follow-up — out of mika#1027 scope)
+
+Per architect NF1 + NF2: if the methodology turns out to be useful, file a **separate** follow-up ticket "feat(docs): post-deploy KG verification methodology" that extracts the reusable pattern from this audit into `mika/docs/solutions/best-practices/post-deploy-kg-verification.md` (no per-ticket suffix). That doc would (a) describe the six-layer check, (b) provide a template script (without ticket-numbered filename), and (c) wire into the deploy-protocol runbook §3 KG-deploy smoke probe.
+
+This step is **out of mika#1027 scope**. mika#1027 produces the audit record. The methodology extraction is a separate decision after the audit's results inform whether the methodology is sound enough to canonize.
+
+If Outcome A (healthy + methodology proven): file the follow-up ticket as a normal Tier 1 work item.
+If Outcome B/C: file the follow-up ticket only if the methodology itself was sound (i.e., the bugs surfaced were specific to data, not to the method).
 
 ## Test Strategy
 
@@ -217,12 +333,12 @@ Running the script on the same DB twice produces identical output (idempotent). 
 
 Mirroring the ticket body for traceability:
 
-- **AC#1**: Finding doc produced at the appropriate path (`docs/audits/` or `docs/solutions/best-practices/`), naming this ticket and the three compound docs investigated.
-- **AC#2**: Per-doc verdict for each of the three compound docs across the four KG SQL layers (chunking, subject extraction, subject relationships, resolution). Each verdict is one of: `present`, `partial-bug-flagged`, `absent-bug-flagged`. Verdicts derived from the queries in §"What the script checks" above.
-- **AC#3**: Resolver tick health summary: number of ticks since 2026-05-07T16:00Z (per agent, per corpus), number with `aborted_budget=true`, current `pending_after` value (per agent).
-- **AC#4**: Per-corpus fairness summary: any corpus with pending entities and zero attempts on recent ticks (mika#927 violation indicator). Cite the `per_corpus_attempted` JSON field directly.
-- **AC#5**: Outcome path declared (A/B/C) in the finding doc's TL;DR; follow-up ticket(s) filed if path B; CLAUDE.md updated if path A.
-- **AC#6**: Investigation script committed at `scripts/investigate-kg-1027.sh`. Idempotent. Sources `MIKA_SERVER_LOG_FILE`.
+- **AC#1**: Finding doc produced at `mika/docs/audits/2026-05-08-001-investigate-kg-post-axis-deploy-sync.md` (per architect NF1 — `audits/` unconditionally), naming this ticket and the three compound docs investigated.
+- **AC#2**: Per-doc verdict for each of the three compound docs across the four KG SQL layers (L1 chunking, L2 extraction, L3 relationships, L4 resolution). Each verdict is one of: `present`, `partial-bug-flagged`, `absent-bug-flagged`. Verdicts derived from the **verbatim queries** in §"What the script checks" above (per architect F1).
+- **AC#3**: Resolver tick health summary: number of ticks since 2026-05-07T16:00Z, number with `aborted_budget=true`, current `pending_after` value (per agent — mika-arch is the only KG consumer per mika#800). Derived from the L5 jq queries (per architect NF3 — jq selectors, not grep).
+- **AC#4**: Per-corpus fairness summary: any corpus with pending entities and zero attempts on recent ticks (mika#927 violation indicator). Cite the `per_corpus_attempted` JSON field from `kg_resolver_tick.complete` events directly.
+- **AC#5**: Outcome path declared (A/B/C) in the finding doc's TL;DR; follow-up fix ticket(s) filed if Path B (separate from the methodology-extraction follow-up).
+- **AC#6**: Investigation script committed at `mika/scripts/investigate-kg-1027.sh` (per architect F2 — repo-local, not workspace-level). Idempotent (read-only). Sources `MIKA_SERVER_LOG_FILE` from env or argv. Per architect NF2: this is a **per-ticket one-shot**, not a canonical reusable script; methodology extraction (if pursued) is a separate follow-up ticket per Step 6.
 
 ## Risks & Open Questions
 
@@ -234,10 +350,12 @@ Mirroring the ticket body for traceability:
 **Resolved by reconnaissance (no longer open):**
 - Q1 (was: are L1 chunks present?): yes — see Reconnaissance § above. Verified pre-grooming.
 
-**Open questions for architect:**
-- OQ1: should the investigation script be a Bash script + sqlite3 + jq, or a Rust binary with structured output? Plan currently says Bash for reproducibility + low ceremony; architect: confirm or counter-propose.
-- OQ2: Outcome A path file location — `docs/solutions/best-practices/` (methodology + reusable) vs `docs/audits/` (one-shot). Plan defers to write-time; architect: prefer one over the other?
-- OQ3: should AC#6 require the script to live under `scripts/` (workspace-level reusable) or `mika/scripts/` (mika-only)? Plan currently leaves at top-level `scripts/`. Architect: which?
+**Resolved by architect first-pass:**
+- OQ1 (Bash vs Rust): Bash + sqlite3 + jq confirmed. Rust binary is overkill for read-only one-shot work.
+- OQ2 (finding doc path): `audits/` **unconditionally**, regardless of outcome. Methodology extraction is a separate follow-up if pursued.
+- OQ3 (script location): `mika/scripts/` (repo-local), not workspace-level — the queries cite mika-internal schema and event names.
+
+No open questions remain.
 
 ## Sources
 
