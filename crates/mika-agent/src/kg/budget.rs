@@ -12,10 +12,11 @@
 ///
 /// Postconditions:
 /// - `sum(allocated) == min(total_budget, sum(pending))`
-/// - Every corpus with `pending > 0` gets `allocated > 0` (when budget > 0 and N_active > 0)
+/// - When `budget >= N_active`: every corpus with `pending > 0` gets `allocated > 0`
+/// - When `budget < N_active`: at least `budget` corpora get `allocated > 0` (first-come in pass 2)
 ///
 /// Returns a Vec of allocated budgets parallel to the input `pending_counts`.
-pub fn allocate_fair_budget(pending_counts: &[u32], total_budget: u32) -> Vec<u32> {
+pub(crate) fn allocate_fair_budget(pending_counts: &[u32], total_budget: u32) -> Vec<u32> {
     let n = pending_counts.iter().filter(|&&c| c > 0).count() as u32;
     if n == 0 || total_budget == 0 {
         return vec![0; pending_counts.len()];
@@ -148,16 +149,34 @@ mod tests {
     }
 
     #[test]
-    fn postcondition_every_active_corpus_gets_nonzero() {
+    fn budget_less_than_active_serves_first_hungry() {
+        // budget=2 < N_active=4: only first 2 hungry corpora get allocation
         let pending = &[1, 1, 1, 0, 1];
         let budget = 2;
         let result = allocate_fair_budget(pending, budget);
-        // With 4 active and budget=2, base_share=0, but pass 2 distributes
-        // Actually base_share = 2/4 = 0, so pass 1 gives [0,0,0,0,0]
-        // Pass 2: remaining=2, hungry=[0,1,2,4], share=1
-        // idx=0 gets 1 (remaining=1), idx=1 gets 1 (remaining=0), stop
         let sum: u32 = result.iter().sum();
         assert_eq!(sum, 2);
         assert_eq!(result[3], 0); // zero-pending corpus gets nothing
+        // First two hungry corpora get 1 each; remaining two get 0
+        assert_eq!(result[0], 1);
+        assert_eq!(result[1], 1);
+        assert_eq!(result[2], 0);
+        assert_eq!(result[4], 0);
+    }
+
+    #[test]
+    fn budget_ge_active_every_corpus_gets_nonzero() {
+        // budget=4 >= N_active=4: every active corpus gets at least 1
+        let pending = &[1, 1, 1, 0, 1];
+        let budget = 4;
+        let result = allocate_fair_budget(pending, budget);
+        let sum: u32 = result.iter().sum();
+        assert_eq!(sum, 4);
+        assert_eq!(result[3], 0); // zero-pending corpus gets nothing
+        for (i, &alloc) in result.iter().enumerate() {
+            if pending[i] > 0 {
+                assert!(alloc > 0, "corpus {i} has pending={} but got 0", pending[i]);
+            }
+        }
     }
 }

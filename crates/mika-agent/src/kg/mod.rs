@@ -24,7 +24,7 @@
 //!   Two-stage pipeline: exact match + LLM disambiguation. Writes `SAME_AS` edges
 //!   in `kg_subject_resolutions` with confidence scores.
 
-pub mod budget;
+pub(crate) mod budget;
 pub mod chunker;
 pub mod config;
 pub mod domain_builder;
