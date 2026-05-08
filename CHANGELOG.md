@@ -1,6 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.12.1](https://github.com/senara-solutions/mika/releases/tag/v0.12.1) — 2026-05-08
+
+### Fixed
+
+- *(github-app)* shrink JWT lifetime for clock-skew tolerance (#1045)
 ## [v0.12.0](https://github.com/senara-solutions/mika/releases/tag/v0.12.0) — 2026-05-08
 
 ### Added
