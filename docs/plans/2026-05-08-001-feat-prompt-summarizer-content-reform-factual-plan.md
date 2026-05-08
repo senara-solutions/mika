@@ -87,9 +87,61 @@ If there is an existing record, merge new factual state into it; do not preserve
 
 **File:** `crates/mika-agent/src/compaction.rs`
 
-Replace the existing 5-line constant at line 14 with the reformed prompt above. No other code changes — the constant is consumed by `summarize_messages()` at `compaction.rs:127` and threads through `LlmRequest.system` unchanged.
+Per architect first-pass F1: this section now contains the verbatim before/after prompt text. The const IS the implementation; the plan must pin it before and after.
 
-**Rationale:** Single point of edit. The function signature, message formatting (`## Existing Summary` / `## Messages to Summarize` headers in the user prompt), and `MAX_SUMMARY_CHARS` truncation are all preserved.
+#### Current const (pre-reform, lines 14–19)
+
+```rust
+const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
+You are summarizing a conversation between an AI executive assistant and their user.
+Preserve: key decisions, action items, commitments, user preferences, important facts about people.
+Discard: pleasantries, small talk, repeated information.
+Keep the summary concise (under 500 tokens). Use bullet points.
+If there is an existing summary, merge it with the new information.";
+```
+
+#### Reformed const (post-reform, drop-in replacement)
+
+```rust
+const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
+You are producing a factual record of what HAPPENED in a session, for a future session to read as history.
+The output is a record FOR a future agent, NOT a record OF a conversation. Future readers did not participate in this session.
+
+Format every bullet as a state assertion with one of these prefixes:
+- `Fact:` for objective state (entities, references, timestamps, quantities)
+- `Decision:` for choices made and disposition
+- `Outcome:` for results and state transitions
+- `Open:` for unresolved questions or pending work
+
+Do NOT use:
+- First-person language (we, our, I) or second-person (you, your)
+- Conversational verbs that imply participation (discussed, agreed, decided together, wanted, asked)
+- Process narration (then we, after that, next)
+
+Do:
+- Preserve key decisions, action items, commitments, user preferences, important facts about people
+- Discard pleasantries, small talk, repeated information
+- Keep the record concise (under 500 tokens) and use bullet points
+
+If there is an existing record, merge new factual state into it; do not preserve conversational shape from the prior record.";
+```
+
+#### Side-by-side delta (architect verification)
+
+| Element | Pre-reform | Post-reform | Status |
+|---|---|---|---|
+| Opening meta-task | "summarizing a conversation between..." | "producing a factual record of what HAPPENED..." | Reframed (load-bearing) |
+| Anti-conversational anchor | absent | "NOT a record OF a conversation. Future readers did not participate" | Added (load-bearing) |
+| Forcing function | absent | Four named prefixes (`Fact:`/`Decision:`/`Outcome:`/`Open:`) with semantic | Added (load-bearing) |
+| Negative list | absent | "Do NOT use:" with three categories (first-person, conversational verbs, process narration) | Added (load-bearing) |
+| Preserve guidance | "Preserve: key decisions, action items, commitments, user preferences, important facts about people" | "Preserve key decisions, action items, commitments, user preferences, important facts about people" | Carried forward (verbatim except colon→leading-bullet) |
+| Discard guidance | "Discard: pleasantries, small talk, repeated information" | "Discard pleasantries, small talk, repeated information" | Carried forward (verbatim) |
+| Token budget | "Keep the summary concise (under 500 tokens). Use bullet points." | "Keep the record concise (under 500 tokens) and use bullet points" | Carried forward; "summary" → "record" for shape consistency |
+| Merge directive | "If there is an existing summary, merge it with the new information." | "If there is an existing record, merge new factual state into it; do not preserve conversational shape from the prior record." | Strengthened (closes prior-record-leakage gap; "summary" → "record" for consistency) |
+
+**Rationale:** Single point of edit. Function signature unchanged; message formatting (`## Existing Summary` / `## Messages to Summarize` headers in the user prompt at `compaction.rs:88,93`) unchanged; `MAX_SUMMARY_CHARS` truncation unchanged. The reformed text is structurally similar to the pre-reform text (paragraph + lists + closing directive); the LLM's parsing path is the same.
+
+No other code changes — the constant is consumed by `summarize_messages()` at `compaction.rs:127` and threads through `LlmRequest.system` unchanged.
 
 ### Step 2: Update existing test fixtures
 
@@ -101,29 +153,68 @@ The existing tests at `compaction.rs:242` and `:281` exercise the compaction pat
 
 **File:** `crates/mika-agent/src/compaction.rs` (test module)
 
-Add a unit test asserting the `SUMMARIZATION_SYSTEM_PROMPT` constant contains the load-bearing forcing-function strings:
+Per architect first-pass F2: this section names which substrings are **load-bearing invariants** (changing them requires a plan update) vs. **copy-editable prose** (the test does not assert on these). The contract between this plan and future maintainers is explicit.
+
+#### Load-bearing invariants (assertions REQUIRED in the test)
+
+These substrings encode the architectural commitments. A test asserting their presence catches regression to the conversational shape. Changing any of these in the const requires a follow-up ticket and plan update:
+
+| Invariant | Substring asserted | Why load-bearing |
+|---|---|---|
+| Forcing-function prefix `Fact` | `` `Fact:` `` | Names the objective-state class; without it, narrative bullets re-emerge |
+| Forcing-function prefix `Decision` | `` `Decision:` `` | Names the choice/disposition class |
+| Forcing-function prefix `Outcome` | `` `Outcome:` `` | Names the result/state-transition class |
+| Forcing-function prefix `Open` | `` `Open:` `` | Names the pending-question class (per #991 milestone-callback work) |
+| Anti-conversational anchor (meta-task) | `NOT a record OF a conversation` | Reframes the meta-task; without it, the LLM's prior pulls toward conversational shape |
+| Anti-conversational anchor (audience) | `did not participate` | Directly contradicts the leak's mechanism (LLM treating summary as participated history) |
+| Negative list header | `Do NOT use` | Forbids the three categories below; without explicit prohibition, conversational verbs leak through |
+| Negative category 1 | `First-person` | Closes the "we/I" narration channel |
+| Negative category 2 | `Conversational verbs` | Closes the "discussed/agreed" channel |
+
+#### Copy-editable prose (test does NOT assert on these)
+
+These are stylistic choices that future maintainers may update without re-grooming:
+
+- The exact wording of the meta-task reframe ("producing a factual record of what HAPPENED" — alternates like "writing a state record" are acceptable)
+- The exact examples in the negative list ("we, our, I" — alternates like "we, our, my" are acceptable)
+- Process-narration examples ("then we, after that, next" — any concrete examples acceptable)
+- The opening sentence's exact framing of "for a future session"
+- Punctuation, spacing, line-break style
+
+#### Test code
 
 ```rust
 #[test]
 fn summarization_prompt_enforces_factual_shape() {
-    // Forcing function: prefix vocabulary
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("`Fact:`"));
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("`Decision:`"));
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("`Outcome:`"));
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("`Open:`"));
+    // Load-bearing: forcing-function prefix vocabulary (architectural commitment)
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("`Fact:`"),
+        "load-bearing invariant: Fact: prefix must be in the prompt");
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("`Decision:`"),
+        "load-bearing invariant: Decision: prefix must be in the prompt");
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("`Outcome:`"),
+        "load-bearing invariant: Outcome: prefix must be in the prompt");
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("`Open:`"),
+        "load-bearing invariant: Open: prefix must be in the prompt");
 
-    // Anti-conversational framing
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("NOT a record OF a conversation"));
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("did not participate"));
+    // Load-bearing: anti-conversational framing (meta-task + audience)
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("NOT a record OF a conversation"),
+        "load-bearing invariant: meta-task reframe must be present");
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("did not participate"),
+        "load-bearing invariant: audience-non-participation framing must be present");
 
-    // Negative list
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("Do NOT use"));
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("First-person"));
-    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("Conversational verbs"));
+    // Load-bearing: negative list (header + two of three categories)
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("Do NOT use"),
+        "load-bearing invariant: explicit negative list header must be present");
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("First-person"),
+        "load-bearing invariant: first-person prohibition must be present");
+    assert!(SUMMARIZATION_SYSTEM_PROMPT.contains("Conversational verbs"),
+        "load-bearing invariant: conversational-verbs prohibition must be present");
 }
 ```
 
-**Why this test:** the prompt is the deliverable. Future maintainers refactoring `compaction.rs` could regress the prompt back toward its current shape; this test catches that. Asserting on key strings (not exact-match) keeps the test stable across copy edits.
+The third negative-list category ("Process narration") is intentionally not asserted — its concrete examples are copy-editable, and the first two categories carry the architectural weight. If future operators see narrative-shape regressions despite the first two categories firing, that's the signal to file a follow-up to add the third assertion.
+
+**Why this test:** the prompt is the deliverable. Future maintainers refactoring `compaction.rs` could regress the prompt back toward its current shape; this test catches that. Each assertion has a `panic` message naming the invariant, so a failing test tells the maintainer not just "the test failed" but "you removed an architectural commitment — re-groom or add to the plan."
 
 ### Step 4: Document the contract
 
@@ -175,7 +266,7 @@ Mirroring the ticket body for traceability:
 - **R1 (low):** Behavior under non-Anthropic providers. Different LLMs respond differently to "Do NOT use" lists. Anthropic Sonnet handles negative-list prompts well; some open-source models (kimi-k2.5, deepseek-v3) sometimes invert them. Mitigation: the prompt's positive forcing function (named prefixes) does most of the work; the negative list is reinforcement. If a specific provider regresses post-deploy, surface in the deploy smoke per runbook §3 and consider per-provider variants. Out of scope for this PR.
 - **R2 (low):** Existing summaries in the DB are conversational-shape. They will gradually be replaced by reformed-shape summaries via natural compaction (each agent that crosses the 50-message threshold rewrites its summary, the merge step flows new content into the existing). No migration is needed — the leak protection compounds over time. **Operator option:** if an agent has a particularly conversational summary causing observable degeneracy, manual `DELETE FROM messages WHERE role = 'system' AND content_type = 'summary' AND agent_id = ?` will force a fresh summarization on next compaction. Out of scope for this PR.
 - **R3 (low):** The prompt's "under 500 tokens" budget is a soft bound the LLM can ignore; `MAX_SUMMARY_CHARS = 4000` (compaction.rs:11) is the structural cap. The reformed prompt with prefix vocabulary is slightly longer per bullet (prefix + content vs. content only), so summaries may approach the 4000-char cap more often. Monitoring: if `truncating oversized summary` warnings increase post-deploy, that's the signal to revisit. The truncation already cuts at a multi-byte char boundary safely.
-- **R4 (low):** Composability with Axis 3's silent-mode truncation. Axis 3's `truncate_to_token_budget` cuts mid-content with a marker. If the cut happens between a `Fact:` prefix and its content, the result is `... Fact:` followed by the truncation marker — slightly awkward but readable. Acceptable; the alternative (boundary-aware truncation) is YAGNI for the silent-mode policy whose typical budget (1000 tokens, ~4000 chars) is at the structural cap anyway.
+- **R4 (low):** Composability with Axis 3's silent-mode truncation. Axis 3's `truncate_to_token_budget` cuts mid-content with a marker. If the cut happens between a `Fact:` prefix and its content, the result is `... Fact:` followed by the truncation marker — slightly awkward but readable. Acceptable; the alternative (boundary-aware truncation) is YAGNI for the silent-mode policy whose typical budget (1000 tokens, ~4000 chars) is at the structural cap anyway. **Per architect first-pass NF2:** the `truncate_to_token_budget()` helper from mika#1021 cuts at word boundaries, so the degenerate case (cut between prefix and content) does not arise — `Fact:` is a single word-token, and a word-boundary cut keeps the entire `Fact: <content>` bullet or cuts before it. R4 is even lower risk than originally stated.
 - **OQ1 (groom):** Should the prefix vocabulary be `Fact:`/`Decision:`/`Outcome:`/`Open:` (proposed, four options) or a shorter set? Two-option (`Fact:`/`Decision:`) is simpler but may force the LLM to file `Outcome` content under one of the others, regressing toward narrative. Architect: confirm or counter-propose.
 - **OQ2 (groom):** Should the prompt be wrapped in `<context type="summary_prompt" trust="system">` tags or similar to signal "this is a system-level instruction, not user content"? Probably not (the prompt is in the `system` role, which already carries that signal), but flagging.
 
