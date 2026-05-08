@@ -1,6 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.8.0](https://github.com/senara-solutions/mika/releases/tag/v0.8.0) — 2026-05-08
+
+### Added
+
+- *(prompt)* silent-mode summary budget cap (mika#1009 Axis 3) (#1022)
 ## [v0.7.0](https://github.com/senara-solutions/mika/releases/tag/v0.7.0) — 2026-05-07
 
 ### Added
