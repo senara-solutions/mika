@@ -207,6 +207,8 @@ Local clones of agent platforms to study for patterns and inspiration. Read free
 
 This repo is part of the [mika-platform](../CLAUDE.md) workspace. For cross-repo navigation, development workflow, and the autonomous development loop, see `../CLAUDE.md`.
 
+**Auto-groom on dispatch (mika#996):** The autonomous loop now auto-grooms ungroomed `ready`-labelled or milestone-child tickets before dispatching them to `dev-pilot`. When a ticket reaches dispatch (via `ready` label webhook or milestone-cascade M4) without a `Plan: docs/plans/` callout in its issue body, mika-dev dispatches `dev-groom` first (two-pass architect review via `mika-arch-groom-ticket`). On `Verdict: GROOMED`, the handler re-enters the dispatch flow and fires `dev-pilot`. On `Verdict: ESCALATE`, dispatch halts and surfaces to operator. Grooming and dispatch run serially as two phases of the same child task. Orchestrator-manual `/mika-groom-ticket` remains available for free-text dispatch and human-driven grooming.
+
 Cross-repo documentation:
 - `../docs/solutions/cross-repo-patterns/` — Security hardening playbook, reference architecture patterns
 
@@ -239,7 +241,7 @@ skills/bundled/
 ├── self-dev-webhook-qa/   # QA webhook handler for self-dev
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
 ├── dev-pilot/             # Claude Code implementation dispatch (thin wrapper → _shared/dispatch-lib.sh, entry: /mika)
-├── dev-groom/             # Operator-triggered grooming dispatch (prompt-only sibling — host: dev-pilot via run_claude_pilot, entry: /mika-groom-ticket)
+├── dev-groom/             # Two-pass grooming dispatch — operator or autonomous (prompt-only sibling — host: dev-pilot via run_claude_pilot, entry: /mika-groom-ticket)
 ├── qa-review/             # PR review skill
 ├── qa-review-build-callback/ # Build callback handler for QA review
 ├── permission-policy/     # Permission handler for claude-pilot sessions

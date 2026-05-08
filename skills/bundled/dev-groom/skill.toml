@@ -1,6 +1,6 @@
 [skill]
 name = "dev-groom"
-description = "Operator-triggered two-pass grooming flow — takes a ticket from open to GROOMED plan-on-branch via /ce:plan and mika-arch architect review"
+description = "Two-pass grooming flow (operator or autonomous) — takes a ticket from open to GROOMED plan-on-branch via /ce:plan and mika-arch architect review"
 version = "0.1.0"
 always_on = false
 timeout_secs = 600
@@ -11,4 +11,10 @@ keywords = [
     "groom ticket",
     "/mika-groom-ticket",
     "groom issue",
+]
+
+[output]
+required_suffix_lines = [
+    "Verdict: GROOMED",
+    "Verdict: ESCALATE",
 ]
