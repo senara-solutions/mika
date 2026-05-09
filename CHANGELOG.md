@@ -1,6 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [v0.12.2](https://github.com/senara-solutions/mika/releases/tag/v0.12.2) — 2026-05-09
+
+### Fixed
+
+- *(agent)* reconcile disabled_skills drift on well-known agent startup (#1041) (#1047)
 ## [v0.12.1](https://github.com/senara-solutions/mika/releases/tag/v0.12.1) — 2026-05-08
 
 ### Fixed

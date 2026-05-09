@@ -1837,7 +1837,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mika-a2a"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -1853,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "mika-agent"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "mika-cli"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "mika-common"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "mika-gateway"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "anyhow",
  "axum",
