@@ -906,9 +906,26 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         // previously-ingested chunks (#690). Runs asynchronously in the
         // background after lexical ingestion — does not block server readiness.
         // Per D2: startup extraction spawns one background task per agent.
+        //
+        // The extraction LLM is also passed to the periodic tick (#1052) so
+        // corpora that don't fully drain at startup get 48 more extraction
+        // opportunities per day.
         let kg_batch_budget = settings.effective_kg_batch_budget();
-        match settings.make_kg_extraction_provider() {
-            Some(Ok(extraction_llm)) => {
+        let extraction_llm_for_tick: Option<Arc<dyn mika_common::llm::LlmProvider>> =
+            match settings.make_kg_extraction_provider() {
+                Some(Ok(llm)) => Some(llm),
+                Some(Err(e)) => {
+                    warn!(
+                        error = %e,
+                        event = "extraction_llm_disabled",
+                        "failed to create KG extraction provider — extraction disabled"
+                    );
+                    None
+                }
+                None => None,
+            };
+        match extraction_llm_for_tick.clone() {
+            Some(extraction_llm) => {
                 // #757 R4: advise operators when KG extraction resolves to
                 // Anthropic (expensive for bulk NER). Fires once per startup.
                 if extraction_llm
@@ -1051,13 +1068,6 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     });
                 }
             }
-            Some(Err(e)) => {
-                warn!(
-                    error = %e,
-                    event = "extraction_disabled",
-                    "failed to create KG extraction provider — subject extraction disabled"
-                );
-            }
             None => {
                 info!(
                     event = "extraction_disabled",
@@ -1184,13 +1194,15 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     }
                 });
 
-                // Periodic resolver tick (#906): drains Stage-2 backlog every
-                // 30 min at the existing budget, decoupling drain rate from
-                // restart cadence. The startup spawn above handles the immediate
+                // Periodic extraction + resolution tick (#906, #1052): drains
+                // both extraction and Stage-2 resolution backlogs every 30 min
+                // at the existing budget, decoupling drain rate from restart
+                // cadence. The startup spawn above handles the immediate
                 // post-restart drain; this tick handles steady-state.
                 crate::kg::resolver_tick::spawn_resolver_tick_task(
                     agent_name.clone(),
                     agent_state.db.clone(),
+                    extraction_llm_for_tick.clone(),
                     resolution_llm.clone(),
                     &agent_state.kg_config,
                     kg_batch_budget,

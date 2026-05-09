@@ -1,14 +1,26 @@
-//! Periodic resolver tick for draining the Stage-2 entity resolution backlog.
+//! Periodic extraction + resolution tick for draining KG backlogs.
 //!
-//! Decouples resolver drain rate from restart cadence (#906). Runs
-//! `resolve_pending(budget)` every 30 minutes per KG-enabled agent at the
-//! existing `MIKA_KG_BATCH_BUDGET` (default 500), preserving the
-//! "no silent multi-thousand-call bursts" invariant from #757.
+//! Decouples extraction and resolution drain rates from restart cadence
+//! (#906, #1052). Runs every 30 minutes per KG-enabled agent:
+//!
+//! 1. **Extraction phase** (#1052): counts pending docs per corpus, allocates
+//!    budget fairly via `allocate_fair_budget`, runs `extract_pending` for each
+//!    corpus. This ensures corpora that don't fully drain at startup get 48
+//!    more extraction opportunities per day.
+//!
+//! 2. **Resolution phase** (#906): runs `resolve_pending(budget)` to bridge
+//!    newly-extracted and previously-pending subject entities to domain graph.
+//!
+//! Both phases use the same `MIKA_KG_BATCH_BUDGET` (default 500), preserving
+//! the "no silent multi-thousand-call bursts" invariant from #757.
 //!
 //! The tick joins the startup background spawn and compound-hook synchronous
-//! spawn as the third execution context for `resolve_pending`. All three use
-//! `kg_resolutions_log UNIQUE(agent_id, subject_entity_id)` as the
-//! deduplication mechanism, so races result in one fast no-op.
+//! spawn as the third execution context for both extraction and resolution.
+//! `kg_extractions UNIQUE(docs_root_hash, source_doc_path)` and
+//! `kg_resolutions_log UNIQUE(agent_id, subject_entity_id)` serve as
+//! deduplication mechanisms. Concurrent writes are serialized by SQLite
+//! WAL; both writes are functionally idempotent (last-writer-wins on the
+//! hash field for extraction, first-writer-wins for resolution).
 //!
 //! Pattern follows `server::checkpoint::spawn_dashboard_checkpoint_task()`:
 //! interval + fail-open (log-and-skip) + lifecycle tied to tokio runtime drop.
@@ -16,7 +28,9 @@
 use crate::async_db::AsyncDatabase;
 use crate::kg::config::KgAgentConfig;
 use crate::kg::entity_resolver::SubjectEntityResolver;
+use crate::kg::subject_extractor::SubjectExtractor;
 use mika_common::llm::LlmProvider;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -25,36 +39,40 @@ use tracing::{info, warn};
 /// Future tunable: `MIKA_KG_RESOLVER_TICK_INTERVAL_SECS`.
 const RESOLVER_TICK_INTERVAL_SECS: u64 = 30 * 60;
 
-/// Spawns a background tokio task that runs `resolve_pending(budget)` every
+/// Spawns a background tokio task that runs extraction + resolution every
 /// [`RESOLVER_TICK_INTERVAL_SECS`] for a single KG-enabled agent.
 ///
-/// The first immediate fire is skipped so the startup background resolver
-/// handles the immediate post-restart drain. Subsequent ticks fire on the
+/// The first immediate fire is skipped so the startup background tasks
+/// handle the immediate post-restart drain. Subsequent ticks fire on the
 /// 30-min cadence.
 ///
 /// # Arguments
 ///
 /// * `agent_id` — Agent name (for logging and DB scoping).
 /// * `db` — Async database handle carrying the agent_id.
-/// * `llm` — Optional resolution LLM provider. `None` = exact-match-only.
+/// * `extraction_llm` — Optional extraction LLM provider. `None` = skip
+///   extraction phase (resolution-only tick, pre-#1052 behavior).
+/// * `resolution_llm` — Optional resolution LLM provider. `None` = exact-match-only.
 /// * `kg_config` — Agent's KG configuration. If `Disabled`, the task exits
 ///   immediately.
-/// * `budget` — Per-batch Stage-2 LLM call cap (from `MIKA_KG_BATCH_BUDGET`).
+/// * `budget` — Per-batch LLM call cap (from `MIKA_KG_BATCH_BUDGET`).
 /// * `interval_secs` — Tick interval override (for testing). Pass `None` to
 ///   use the default 30-minute interval.
 pub fn spawn_resolver_tick_task(
     agent_id: String,
     db: AsyncDatabase,
-    llm: Option<Arc<dyn LlmProvider>>,
+    extraction_llm: Option<Arc<dyn LlmProvider>>,
+    resolution_llm: Option<Arc<dyn LlmProvider>>,
     kg_config: &KgAgentConfig,
     budget: u32,
     interval_secs: Option<u64>,
 ) -> tokio::task::JoinHandle<()> {
-    let docs_root_hashes = match kg_config {
-        KgAgentConfig::Enabled { corpora } => {
-            corpora.iter().map(|c| c.docs_root_hash.clone()).collect()
-        }
-        KgAgentConfig::Disabled { .. } => Vec::new(),
+    let (docs_root_hashes, corpora_roots): (Vec<String>, Vec<PathBuf>) = match kg_config {
+        KgAgentConfig::Enabled { corpora } => (
+            corpora.iter().map(|c| c.docs_root_hash.clone()).collect(),
+            corpora.iter().map(|c| c.docs_root.clone()).collect(),
+        ),
+        KgAgentConfig::Disabled { .. } => (Vec::new(), Vec::new()),
     };
 
     tokio::spawn(async move {
@@ -70,7 +88,16 @@ pub fn spawn_resolver_tick_task(
 
         loop {
             interval.tick().await;
-            tick_body(&agent_id, &db, &llm, &docs_root_hashes, budget).await;
+            tick_body(
+                &agent_id,
+                &db,
+                &extraction_llm,
+                &resolution_llm,
+                &corpora_roots,
+                &docs_root_hashes,
+                budget,
+            )
+            .await;
         }
     })
 }
@@ -78,17 +105,159 @@ pub fn spawn_resolver_tick_task(
 async fn tick_body(
     agent_id: &str,
     db: &AsyncDatabase,
-    llm: &Option<Arc<dyn LlmProvider>>,
+    extraction_llm: &Option<Arc<dyn LlmProvider>>,
+    resolution_llm: &Option<Arc<dyn LlmProvider>>,
+    corpora_roots: &[PathBuf],
     docs_root_hashes: &[String],
     budget: u32,
 ) {
     let trace_id = mika_common::trace::generate_trace_id();
 
+    // --- Phase 1: Extraction (#1052) ---
+    // Run extraction before resolution so newly-extracted entities are
+    // immediately available for resolution in the same tick.
+    if let Some(ext_llm) = extraction_llm {
+        tick_extraction(agent_id, db, ext_llm, corpora_roots, budget, &trace_id).await;
+    }
+
+    // --- Phase 2: Resolution (#906) ---
+    tick_resolution(
+        agent_id,
+        db,
+        resolution_llm,
+        docs_root_hashes,
+        budget,
+        &trace_id,
+    )
+    .await;
+
+    // --- Phase 3: Coverage report (#1052) ---
+    // Log per-corpus extraction coverage after both phases complete.
+    // Only runs when extraction LLM is configured (otherwise no extractors
+    // to query coverage from).
+    if let Some(ext_llm) = extraction_llm {
+        tick_coverage(agent_id, db, ext_llm, corpora_roots, &trace_id).await;
+    }
+}
+
+/// Extraction phase of the periodic tick (#1052).
+///
+/// Counts pending docs per corpus, allocates budget fairly, then runs
+/// `extract_pending` for each corpus. Structurally identical to startup
+/// extraction in `server/mod.rs` — same `SubjectExtractor::extract_pending()`
+/// call, same fair budget allocation via `allocate_fair_budget()`.
+async fn tick_extraction(
+    agent_id: &str,
+    db: &AsyncDatabase,
+    llm: &Arc<dyn LlmProvider>,
+    corpora_roots: &[PathBuf],
+    budget: u32,
+    trace_id: &str,
+) {
+    // Phase 1: Count pending docs per corpus.
+    let mut corpus_pending: Vec<u32> = Vec::new();
+    let mut extractors: Vec<SubjectExtractor> = Vec::new();
+    for docs_root in corpora_roots {
+        let extractor =
+            SubjectExtractor::new(db.clone(), llm.clone(), docs_root.clone(), Some(trace_id));
+        let count = match extractor.count_pending_docs().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %trace_id,
+                    agent_id = %agent_id,
+                    docs_root = %docs_root.display(),
+                    error = %e,
+                    event = "kg_extraction_tick.count_error",
+                    "failed to count pending docs for corpus — treating as 0 pending"
+                );
+                0
+            }
+        };
+        corpus_pending.push(count);
+        extractors.push(extractor);
+    }
+
+    let total_pending: u32 = corpus_pending.iter().sum();
+    if total_pending == 0 {
+        info!(
+            target: "mika::otel",
+            trace_id = %trace_id,
+            agent_id = %agent_id,
+            total_pending = 0,
+            event = "kg_extraction_tick.complete",
+            "no pending docs — extraction tick is a no-op"
+        );
+        return;
+    }
+
+    // Phase 2: Fair budget allocation via shared function.
+    let allocated = crate::kg::budget::allocate_fair_budget(&corpus_pending, budget);
+
+    // Phase 3: Execute extractors with per-corpus budgets.
+    let mut per_corpus_extracted: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    let mut total_extracted: usize = 0;
+    let mut total_entities: usize = 0;
+    let mut total_relationships: usize = 0;
+    let mut total_failed: usize = 0;
+
+    for (idx, (extractor, per_budget)) in extractors.into_iter().zip(allocated.iter()).enumerate() {
+        if *per_budget == 0 {
+            continue;
+        }
+        match extractor.extract_pending(*per_budget).await {
+            Ok(stats) => {
+                let corpus_key = corpora_roots[idx].display().to_string();
+                per_corpus_extracted.insert(corpus_key, stats.docs_extracted as u32);
+                total_extracted += stats.docs_extracted;
+                total_entities += stats.total_entities;
+                total_relationships += stats.total_relationships;
+                total_failed += stats.docs_failed;
+            }
+            Err(e) => warn!(
+                target: "mika::otel",
+                trace_id = %trace_id,
+                error = %e,
+                agent_id = %agent_id,
+                corpus_index = idx,
+                event = "kg_extraction_tick.error",
+                "extraction failed for corpus in tick"
+            ),
+        }
+    }
+
+    let per_corpus_extracted_json =
+        serde_json::to_string(&per_corpus_extracted).unwrap_or_default();
+    info!(
+        target: "mika::otel",
+        trace_id = %trace_id,
+        agent_id = %agent_id,
+        total_pending = total_pending,
+        total_docs_extracted = total_extracted,
+        total_docs_failed = total_failed,
+        total_entities = total_entities,
+        total_relationships = total_relationships,
+        per_corpus_extracted = %per_corpus_extracted_json,
+        event = "kg_extraction_tick.complete",
+    );
+}
+
+/// Resolution phase of the periodic tick (#906).
+async fn tick_resolution(
+    agent_id: &str,
+    db: &AsyncDatabase,
+    llm: &Option<Arc<dyn LlmProvider>>,
+    docs_root_hashes: &[String],
+    budget: u32,
+    trace_id: &str,
+) {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         llm.clone(),
         docs_root_hashes.to_vec(),
-        Some(&trace_id),
+        Some(trace_id),
     );
 
     // Count pending before resolution for observability.
@@ -158,6 +327,61 @@ async fn tick_body(
     }
 }
 
+/// Coverage reporting phase (#1052).
+///
+/// Queries per-corpus extraction coverage and emits structured log events
+/// so operators can monitor convergence without manual SQL queries.
+async fn tick_coverage(
+    agent_id: &str,
+    db: &AsyncDatabase,
+    llm: &Arc<dyn LlmProvider>,
+    corpora_roots: &[PathBuf],
+    trace_id: &str,
+) {
+    let mut coverage_map: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+
+    for docs_root in corpora_roots {
+        let extractor =
+            SubjectExtractor::new(db.clone(), llm.clone(), docs_root.clone(), Some(trace_id));
+        match extractor.coverage_report().await {
+            Ok(cov) => {
+                coverage_map.insert(
+                    cov.docs_root_hash.clone(),
+                    serde_json::json!({
+                        "total": cov.total_docs,
+                        "extracted": cov.extracted_docs,
+                        "null_hash": cov.null_hash_docs,
+                        "pct": (cov.coverage_pct * 10.0).round() / 10.0,
+                    }),
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %trace_id,
+                    agent_id = %agent_id,
+                    docs_root = %docs_root.display(),
+                    error = %e,
+                    event = "kg_extraction_coverage.error",
+                    "failed to compute extraction coverage"
+                );
+            }
+        }
+    }
+
+    if !coverage_map.is_empty() {
+        let coverage_json = serde_json::to_string(&coverage_map).unwrap_or_default();
+        info!(
+            target: "mika::otel",
+            trace_id = %trace_id,
+            agent_id = %agent_id,
+            per_corpus_coverage = %coverage_json,
+            event = "kg_extraction_coverage",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,7 +403,8 @@ mod tests {
         let handle = spawn_resolver_tick_task(
             "test-agent".to_string(),
             async_db,
-            None,
+            None, // extraction_llm
+            None, // resolution_llm
             &kg_config,
             500,
             Some(1), // 1-second interval (won't fire since task exits)
@@ -197,7 +422,6 @@ mod tests {
     #[tokio::test]
     async fn test_abort_cancels_cleanly() {
         use crate::kg::config::CorpusConfig;
-        use std::path::PathBuf;
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::Database::open(tmp.path()).unwrap();
@@ -213,7 +437,8 @@ mod tests {
         let handle = spawn_resolver_tick_task(
             "test-agent".to_string(),
             async_db,
-            None,
+            None, // extraction_llm
+            None, // resolution_llm
             &kg_config,
             500,
             Some(3600), // long interval so we can abort before it fires

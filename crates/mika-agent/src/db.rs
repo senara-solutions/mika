@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 32;
+pub const CURRENT_SCHEMA_VERSION: i64 = 33;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1074,6 +1074,11 @@ impl Database {
             info!(version = 32, "database migrated to v32");
         }
 
+        if (3..=32).contains(&version) {
+            self.migrate_v32_to_v33()?;
+            info!(version = 33, "database migrated to v33");
+        }
+
         Ok(())
     }
 
@@ -1128,7 +1133,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (32);
+            INSERT INTO schema_version (version) VALUES (33);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -3768,6 +3773,41 @@ impl Database {
         tx.commit()?;
 
         info!("v31→v32: added kg_invalidated_no_match sidecar table (#961)");
+
+        Ok(())
+    }
+
+    fn migrate_v32_to_v33(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 33 {
+            return Ok(());
+        }
+
+        // #1052: Delete kg_extractions rows with NULL source_doc_hash.
+        // These are pre-v26 rows that escaped the v27 backfill due to
+        // NULL = NULL being falsy in SQL. They create a deadlock: the
+        // pending query says "extract me" but INSERT OR IGNORE (now
+        // replaced with upsert in #1052) would skip them. Deleting makes
+        // them cleanly pending for re-extraction with the new upsert.
+        // Safe because kg_extractions is an idempotency marker, not data.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted: usize = tx.execute(
+            "DELETE FROM kg_extractions WHERE source_doc_hash IS NULL",
+            [],
+        )?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (33)", [])?;
+        tx.commit()?;
+
+        if deleted > 0 {
+            info!(
+                deleted = deleted,
+                "v32→v33: deleted {deleted} NULL-hash kg_extractions rows (#1052)"
+            );
+        } else {
+            info!("v32→v33: no NULL-hash kg_extractions rows to clean up (#1052)");
+        }
 
         Ok(())
     }
@@ -13255,6 +13295,7 @@ mod tests {
         db2.migrate_v29_to_v30().unwrap();
         db2.migrate_v30_to_v31().unwrap();
         db2.migrate_v31_to_v32().unwrap();
+        db2.migrate_v32_to_v33().unwrap();
 
         let final_version: i64 = db2
             .conn
