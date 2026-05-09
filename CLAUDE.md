@@ -40,7 +40,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docs/solutions/` — Documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when debugging or implementing in documented areas.
 - `skills/bundled/` — Source tree for engine-coupled bundled skills discovered at build time via `crates/mika-agent/build.rs`. See `crates/mika-agent/CLAUDE.md` Skills System for details.
 - `scripts/` — Utility scripts (sync-agent-docs.sh for crates.io publish prep)
-- `Makefile` — Development workflow targets: `make build`, `make deploy` (dashboard+build+stop+install), `make test`, `make lint`, `make fmt`, `make check`
+- `Makefile` — Development workflow targets: `make build`, `make deploy` (dashboard+build+install+restart), `make test`, `make lint`, `make fmt`, `make check`
 - `todos/` — Code review findings (tracked as markdown files)
 - `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit, `/mika-issue` — create a single GitHub issue, `/mika-issues` — batch-create GitHub issues)
 
@@ -80,7 +80,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@senara-solutions/ui` first, requires mika-server on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
-- `make deploy` — Build dashboard + release binaries with telemetry, stop running mika-server/mika-gateway, install to `~/.local/bin/`
+- `make deploy` — Full deploy: build dashboard + release binaries with telemetry, install to `~/.local/bin/`, restart services
 - `cargo clippy` — Lint
 - `cargo fmt` — Format
 - `docker build -f Dockerfile.agent -t mika-agent:dev .` — Build agent container image
