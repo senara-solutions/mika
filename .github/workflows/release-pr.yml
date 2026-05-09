@@ -31,12 +31,17 @@ jobs:
   update-lockfile:
     name: Update Cargo.lock
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: release-please
+    # GitHub Actions outputs are always strings — prs_created is 'true'/'false', not boolean.
+    # prs_created == 'true': a new PR was just created. pr != '': an existing PR was updated.
     if: needs.release-please.outputs.prs_created == 'true' || needs.release-please.outputs.pr != ''
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
-          ref: release-please--branches--main
+          # Branch name format: release-please--branches--<base>--components--<component>
+          # Derived from component "mika" in release-please-config.json + target branch "main".
+          ref: release-please--branches--main--components--mika
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Install Rust toolchain

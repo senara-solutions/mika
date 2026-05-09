@@ -152,23 +152,27 @@ Symptom on every merge to `main` from 2026-04-23 through 2026-05-06: `release/v0
 - **Class C (branch state):** Eliminated. release-please manages branch lifecycle internally.
 - **Class D (packaging/identity):** Only risk is action-version-specific quirks. Mitigated by SHA-pinning.
 
-## Operational workaround (still applicable during validation)
+## Operational workaround
 
-If a release is blocked by a non-fast-forward failure during the validation period (or by a Class C variant the Stage 3 resolution doesn't cover):
+### Stage 4 (release-please) reset procedure
+
+If release-please gets stuck or produces an incorrect Release PR:
 
 ```bash
-# 1. Inspect what's on release/v0.6.0 that shouldn't be
-git fetch origin release/v0.6.0
-git log --oneline origin/main..origin/release/v0.6.0
+# 1. Delete the release-please managed branch — the action recreates it on next push to main
+git push origin :release-please--branches--main--components--mika
 
-# 2. Delete the remote branch — the workflow recreates it on next run
-git push origin :release/v0.6.0
-
-# 3. Trigger the Release workflow manually via workflow_dispatch,
+# 2. Trigger the Release workflow manually via workflow_dispatch,
 #    or wait for the next merge to main
 ```
 
-Until the validation gate passes (10 consecutive clean merges OR 14 days, zero Release-workflow failures) and `resolved: pending-validation` flips to `resolved: true`, this remains the reset path for any recurrence.
+### Legacy (Stage 2–3, git-cliff) reset procedure
+
+No longer applicable — retained for reference if rollback is ever needed:
+
+```bash
+git push origin :release/v0.6.0
+```
 
 ## Tool evolution (appendix — chronological index)
 
