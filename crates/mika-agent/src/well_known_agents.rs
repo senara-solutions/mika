@@ -98,6 +98,18 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
     llm_overrides: &[],
 };
 
+/// Allowlist of GitHub usernames permitted to trigger autonomous dispatch
+/// via dispatch-triggering labels (currently: `ready`).
+///
+/// Consumed by: (future) Rec 3 gate logic — either as an engine-side intent
+/// guard in `agent.rs` or as prompt-level validation in the self-dev skill.
+///
+/// Storage decision: Rust constant per mika#1053 / lifecycle-redesign Rec 4.
+/// Churn is rare; rebuild + deploy-at-quiescent-boundary is the operational
+/// model. If churn rate rises, promote the value to core memory seeding in
+/// `provision_well_known_agents()`.
+pub const DISPATCH_TRIGGER_ALLOWLIST: &[&str] = &["samidarko", "mika-platform-dev"];
+
 /// mika-dev identity.toml — KG disabled per mika#800.
 const MIKA_DEV_IDENTITY: &str = "\
 name = \"Dev\"\n\
@@ -1635,6 +1647,22 @@ mod tests {
         assert!(
             WELL_KNOWN_AGENTS.iter().any(|a| a.name == "mika-arch"),
             "WELL_KNOWN_AGENTS should include mika-arch"
+        );
+    }
+
+    #[test]
+    fn dispatch_trigger_allowlist_has_required_defaults() {
+        assert!(
+            DISPATCH_TRIGGER_ALLOWLIST.contains(&"samidarko"),
+            "Vincent must be in the dispatch trigger allowlist"
+        );
+        assert!(
+            DISPATCH_TRIGGER_ALLOWLIST.contains(&"mika-platform-dev"),
+            "mika-platform-dev machine user must be in the dispatch trigger allowlist"
+        );
+        assert!(
+            !DISPATCH_TRIGGER_ALLOWLIST.is_empty(),
+            "dispatch trigger allowlist must not be empty"
         );
     }
 }
