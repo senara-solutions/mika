@@ -24,9 +24,12 @@ modules:
 severity: medium
 resolved: true
 resolution_time: "1 day"
+superseded_by: release-please
 ---
 
 # Automated Release System for Rust Workspace with Cross-Platform Binaries
+
+> **Historical document.** This describes the release-plz setup (Stage 1, 2026-03-01 → 2026-04-03). The current release automation uses `googleapis/release-please-action` — see `release-please-config.json` at repo root. Retained for institutional memory per the chronic-drift compound doc.
 
 ## Problem Statement
 

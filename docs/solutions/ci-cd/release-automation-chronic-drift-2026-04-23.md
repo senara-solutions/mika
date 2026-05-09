@@ -4,7 +4,7 @@ date: 2026-04-23
 category: ci-cd
 problem_type: operational-pattern
 severity: medium
-resolved: pending-validation
+resolved: validated
 tags:
   - release-automation
   - ci-cd
@@ -140,6 +140,18 @@ Symptom on every merge to `main` from 2026-04-23 through 2026-05-06: `release/v0
 
 **Post-merge orphan branches** (`release/v0.5.0`, `release/v0.5.1`, `release/v0.6.0` after their respective releases ship) remain a related but distinct gap — a follow-up ticket will add automatic cleanup when a `chore: release vX.Y.Z` commit lands on `main`. Manual reset via `git push origin :release/vX.Y.Z` still works as documented in the operational-workaround section below.
 
+## Stage 4 — release-please (mika#1049, 2026-05-09)
+
+**Tool migration:** git-cliff (handwritten bash) → `googleapis/release-please-action` v4.
+
+**Why this addresses the failure class.** The "No commits between" error from 2026-05-09 run #32 is a Class C variant: the workflow recreates `release/v0.12.x` from `main` on every push, and on the release PR's own merge commit, the branch and `main` are identical. release-please eliminates Class C entirely by maintaining a single persistent Release PR branch with proper state reconciliation — it never recreates the branch from scratch.
+
+**Class coverage:**
+- **Class A (workspace deps):** release-please does NOT run `cargo package`. All crates are `publish = false`. Class A is structurally avoided.
+- **Class B (comparison mode):** release-please uses its own commit-tracking manifest (`.release-please-manifest.json`), not crates.io or tags. Class B is structurally avoided.
+- **Class C (branch state):** Eliminated. release-please manages branch lifecycle internally.
+- **Class D (packaging/identity):** Only risk is action-version-specific quirks. Mitigated by SHA-pinning.
+
 ## Operational workaround (still applicable during validation)
 
 If a release is blocked by a non-fast-forward failure during the validation period (or by a Class C variant the Stage 3 resolution doesn't cover):
@@ -164,9 +176,10 @@ Failure classes are the primary axis of this doc. Tool chronology is here as sec
 
 - **Stage 0 — semantic-release** (pre-2026-03). No surviving config; replaced because of Rust-workspace integration issues. Primary failures were Class A.
 - **Stage 1 — release-plz** (2026-03-01 → 2026-04-03). Setup captured in [`rust-workspace-release-plz-github-actions.md`](./rust-workspace-release-plz-github-actions.md) (now historical). 10+ fixes, all in Classes A, B, D. Migration driven by Class A.
-- **Stage 2 — git-cliff** (2026-04-03 → present). Migration commit `4825e7ae`. Fixes so far in Classes C, D. Current open issue is Class C.
+- **Stage 2 — git-cliff** (2026-04-03 → 2026-05-09). Migration commit `4825e7ae`. Fixes in Classes C, D. Replaced due to Class C variant ("No commits between" on release PR merge).
+- **Stage 3 — release-please** (2026-05-09 → present). Migration in mika#1049. `googleapis/release-please-action` v4 with persistent Release PR branch. Structurally avoids Classes A, B, C.
 
-The workflow file is `.github/workflows/release-pr.yml` (renamed from `release-plz.yml` in mika#775); the tool is git-cliff.
+The workflow file is `.github/workflows/release-pr.yml`; the tool is `googleapis/release-please-action`.
 
 ## Meta — why release automation drifts chronically
 
@@ -185,4 +198,5 @@ Combined effect: it's psychologically easier to apply a point-fix than to unders
 - Commit `4825e7ae` — tool migration (release-plz → git-cliff)
 - Ticket mika#775 — fix Class C (`release/v0.6.0` non-fast-forward)
 - Ticket mika#1006 — fix Class D (`release` label missing, unmasked by mika#1003)
+- Ticket mika#1049 — Stage 4: git-cliff → release-please migration
 - MEMORY: `feedback_compound_infra_fixes.md` — institutional rule about infra-fix evaporation
