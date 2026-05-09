@@ -558,6 +558,8 @@ pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
             // Reconcile LLM overrides that have drifted from the source spec
             // (e.g., model downgrade from Opus to Sonnet).
             // This is idempotent: matching rows are no-ops at the DB level.
+            // Note: uses the pre-reconciliation `overrides` snapshot — safe because
+            // no well-known agent has overlapping disabled_skills and llm_overrides.
             let mut reconciled = 0u32;
             for llm_ov in spec.llm_overrides {
                 let needs_update = overrides.iter().any(|existing| {
