@@ -113,8 +113,9 @@ Runs on every PR and push to `main`:
 ### Release PR (`release-pr.yml`)
 
 Runs on push to `main` (after CI passes):
-- Creates a release PR with version bumps and changelog updates (conventional commits)
-- On merge of the release PR: creates a git tag (`v{version}`) and GitHub Release (no crates.io publishing — all crates are `publish = false`)
+- Uses `googleapis/release-please-action` to maintain a persistent Release PR with version bumps and changelog
+- On merge of the Release PR: creates a git tag (`v{version}`) and GitHub Release
+- No crates.io publishing — all crates are `publish = false`
 - Requires `RELEASE_PLZ_TOKEN` (PAT with `contents: write` and `pull-requests: write`)
 
 **Important:** Uses a PAT (`RELEASE_PLZ_TOKEN`) instead of `GITHUB_TOKEN` so that the tag push triggers the release binary workflow.

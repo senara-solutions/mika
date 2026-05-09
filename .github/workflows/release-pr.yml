@@ -6,185 +6,56 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  release-pr:
-    name: Release PR
+  release-please:
+    name: Release Please
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     if: github.repository_owner == 'senara-solutions'
-    permissions:
-      contents: write
-      pull-requests: write
-    concurrency:
-      group: release-pr
-      cancel-in-progress: false
+    outputs:
+      pr: ${{ steps.release.outputs.pr }}
+      prs_created: ${{ steps.release.outputs.prs_created }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071  # v4.4.1
+        id: release
         with:
-          fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-      - name: Install git-cliff
-        uses: taiki-e/install-action@90b40388b8931b1c39e248959515e295e02e9066  # v2
-        with:
-          tool: git-cliff
-
-      - name: Check for unreleased changes
-        id: check
-        run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No tags found, skipping"
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          FEAT_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^feat" | wc -l)
-          FIX_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^fix" | wc -l)
-          REFACTOR_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^refactor" | wc -l)
-          PERF_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^perf" | wc -l)
-          DOC_COUNT=$(git log "${LATEST_TAG}..HEAD" --oneline --no-merges --grep="^doc" | wc -l)
-          TOTAL=$((FEAT_COUNT + FIX_COUNT + REFACTOR_COUNT + PERF_COUNT + DOC_COUNT))
-
-          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          echo "feat_count=$FEAT_COUNT" >> "$GITHUB_OUTPUT"
-          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
-
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Determine next version
-        if: steps.check.outputs.has_changes == 'true'
-        id: version
-        run: |
-          CURRENT="${{ steps.check.outputs.latest_tag }}"
-          CURRENT="${CURRENT#v}"
-
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-
-          BREAKING=$(git log "v${CURRENT}..HEAD" --oneline --no-merges --grep="BREAKING" | wc -l)
-
-          if [ "$BREAKING" -gt 0 ] && [ "$MAJOR" -gt 0 ]; then
-            NEXT="$((MAJOR + 1)).0.0"
-          elif [ "${{ steps.check.outputs.feat_count }}" -gt 0 ]; then
-            NEXT="${MAJOR}.$((MINOR + 1)).0"
-          else
-            NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
-          fi
-
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
-
-      - name: Create or update release branch and PR
-        if: steps.check.outputs.has_changes == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-        run: |
-          NEXT="${{ steps.version.outputs.next }}"
-          CURRENT="${{ steps.version.outputs.current }}"
-          BRANCH="release/v${NEXT}"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Recreate the release branch from main HEAD on every run. The branch is tool-owned
-          # and has no history worth preserving — every commit is regenerated from
-          # main + version bump + git-cliff output. Approach 3 (Class C resolution) in
-          # docs/solutions/ci-cd/release-automation-chronic-drift-2026-04-23.md.
-          git checkout -B "$BRANCH" main
-
-          # Bump workspace version
-          sed -i "s/^version = \"${CURRENT}\"/version = \"${NEXT}\"/" Cargo.toml
-
-          # Update Cargo.lock
-          cargo update --workspace
-
-          # Generate changelog
-          git-cliff --tag "v${NEXT}" -o CHANGELOG.md
-
-          git add Cargo.toml Cargo.lock CHANGELOG.md
-          # Skip the commit when nothing is staged (workflow_dispatch retry on the same main HEAD,
-          # or any case where sed/cargo/git-cliff produced byte-identical output). Without this
-          # guard, `set -e` would halt the step on a "nothing to commit" no-op.
-          if git diff --cached --quiet; then
-            echo "No release-tree changes since the last regeneration — skipping commit."
-          else
-            git commit -m "chore: release v${NEXT}"
-          fi
-
-          # Force-push: any prior state on origin (orphan from a failed run, or a stale branch
-          # from a closed-without-merge PR) is replaced with the deterministic regeneration.
-          git push --force origin "$BRANCH"
-
-          # Open a PR only if one isn't already open. An existing open PR auto-tracks the
-          # force-pushed branch tip, so no separate "update" step is needed.
-          # `// empty` defends against jq emitting the literal "null" on an empty array.
-          EXISTING_PR=$(gh pr list --state open --head "$BRANCH" --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING_PR" ]; then
-            echo "Release PR #$EXISTING_PR already open — branch updated via force-push"
-          else
-            CHANGELOG_BODY=$(git-cliff --tag "v${NEXT}" --unreleased --strip header)
-            gh pr create \
-              --title "chore: release v${NEXT}" \
-              --body "## Release v${NEXT}
-          ${CHANGELOG_BODY}
-
-          ---
-          Merging this PR will trigger tag creation and GitHub release." \
-              --label "release" \
-              --base main \
-              --head "$BRANCH"
-          fi
-
-  release-tag:
-    name: Tag & Release
+  # release-please does NOT run `cargo update --workspace` — its CargoLock updater
+  # does string replacement only. This job regenerates Cargo.lock on the release PR
+  # branch after release-please creates/updates it.
+  update-lockfile:
+    name: Update Cargo.lock
     runs-on: ubuntu-22.04
-    if: >-
-      github.repository_owner == 'senara-solutions' &&
-      startsWith(github.event.head_commit.message, 'chore: release v')
-    permissions:
-      contents: write
-    concurrency:
-      group: release-tag
-      cancel-in-progress: false
+    timeout-minutes: 10
+    needs: release-please
+    # GitHub Actions outputs are always strings — prs_created is 'true'/'false', not boolean.
+    # prs_created == 'true': a new PR was just created. pr != '': an existing PR was updated.
+    if: needs.release-please.outputs.prs_created == 'true' || needs.release-please.outputs.pr != ''
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
-          fetch-depth: 0
+          # Branch name format: release-please--branches--<base>--components--<component>
+          # Derived from component "mika" in release-please-config.json + target branch "main".
+          ref: release-please--branches--main--components--mika
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-      - name: Install git-cliff
-        uses: taiki-e/install-action@90b40388b8931b1c39e248959515e295e02e9066  # v2
-        with:
-          tool: git-cliff
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
-      - name: Extract version and create tag
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Regenerate Cargo.lock
         run: |
-          git config user.name "mika-platform[bot]"
-          git config user.email "mika@getmika.ai"
-
-          VERSION=$(echo "${{ github.event.head_commit.message }}" | grep -oP 'v\d+\.\d+\.\d+' | head -1)
-          if [ -z "$VERSION" ]; then
-            echo "No version found in commit message, skipping"
-            exit 0
+          cargo update --workspace
+          if git diff --quiet Cargo.lock; then
+            echo "Cargo.lock already up to date"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "chore: regenerate Cargo.lock after version bump"
+            git push
           fi
-
-          if git rev-parse "$VERSION" >/dev/null 2>&1; then
-            echo "Tag $VERSION already exists, skipping"
-            exit 0
-          fi
-
-          NOTES=$(git-cliff --tag "$VERSION" --unreleased --strip header 2>/dev/null || echo "Release $VERSION")
-
-          git tag -a "$VERSION" -m "Release $VERSION"
-          git push origin "$VERSION"
-
-          gh release create "$VERSION" \
-            --title "$VERSION" \
-            --notes "$NOTES" \
-            --verify-tag
