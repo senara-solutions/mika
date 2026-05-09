@@ -29,19 +29,20 @@ restart: ## Restart mika-server and mika-gateway (via OpenRC)
 		sudo rc-service "$$bin" restart || true; \
 	done
 
-install: ## Copy release binaries to INSTALL_DIR
+install: ## Copy release binaries to INSTALL_DIR (safe while services run)
 	@mkdir -p $(INSTALL_DIR)
 	@for bin in $(BINARIES); do \
 		if [ ! -f target/release/$$bin ]; then \
 			echo "ERROR: target/release/$$bin not found. Run 'make build' first." >&2; \
 			exit 1; \
 		fi; \
-		cp target/release/$$bin $(INSTALL_DIR)/$$bin; \
+		cp target/release/$$bin $(INSTALL_DIR)/$$bin.tmp; \
+		mv $(INSTALL_DIR)/$$bin.tmp $(INSTALL_DIR)/$$bin; \
 		if [ "$$(uname)" = "Darwin" ]; then codesign -s - $(INSTALL_DIR)/$$bin; fi; \
 		echo "Installed $$bin -> $(INSTALL_DIR)/$$bin"; \
 	done
 
-deploy: build-dashboard build stop install restart check-ngrok ## Build dashboard + binaries, stop, install, and restart
+deploy: build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
 
 check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
 	@if ! curl -sf http://localhost:4040/api/tunnels > /dev/null 2>&1; then \
