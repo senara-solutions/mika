@@ -492,14 +492,18 @@ pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disable
     }
 }
 
-/// Seed skill overrides for a well-known agent if none exist yet.
+/// Seed skill overrides for a well-known agent, with drift reconciliation.
 ///
 /// Seeds skill overrides for a well-known agent. On first creation (no
 /// existing rows), writes `set_skill_enabled(false)` for disabled skills
-/// and seeds LLM overrides. On subsequent runs, reconciles any LLM
-/// overrides that have drifted from the source spec (e.g., model
-/// downgrade from Opus to Sonnet) while preserving non-LLM
-/// customizations.
+/// and seeds LLM overrides. On subsequent runs, reconciles both disabled
+/// skills and LLM overrides that have drifted from the source spec.
+///
+/// Disabled-skills reconciliation (mika#1041): when a new skill is added
+/// to the well-known denylist after the agent was first provisioned, the
+/// reconciliation detects the missing `enabled=false` row and writes it.
+/// Reverse direction (skill removed from denylist) is NOT reconciled —
+/// operator manual disables take precedence.
 pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
     let spec = match find_well_known_agent(agent_name) {
         Some(s) => s,
@@ -509,9 +513,53 @@ pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
     // Check if any overrides already exist
     match db.get_skill_overrides(agent_name) {
         Ok(overrides) if !overrides.is_empty() => {
-            // Overrides exist — reconcile LLM overrides that have drifted from
-            // the source spec (e.g., model downgrade from Opus to Sonnet).
+            // Reconcile disabled_skills drift: when a new skill is added to the
+            // well-known denylist after the agent was first provisioned, the original
+            // seeding-once path skipped it. We compare spec.disabled_skills against
+            // the existing rows and write the delta. See mika#1041 for the dev-groom
+            // leak that motivated this.
+            //
+            // Reverse direction (spec removes a skill from denylist while the DB still
+            // has enabled=false) is intentionally NOT reconciled here. Operator manual
+            // disables (via `mika skills disable <name>`) take precedence over spec
+            // changes — re-enabling on deploy could turn a manually-disabled skill back
+            // on. Operators can re-enable with `mika skills enable <name>`.
+            let mut disabled_reconciled = 0u32;
+            for skill_name in spec.disabled_skills {
+                let needs_disable = !overrides.iter().any(|existing| {
+                    existing.skill_name == *skill_name && existing.enabled == Some(false)
+                });
+                if needs_disable {
+                    if let Err(e) = db.set_skill_enabled(agent_name, skill_name, false) {
+                        warn!(
+                            agent = agent_name,
+                            skill = skill_name,
+                            error = %e,
+                            "failed to reconcile disabled_skills drift for well-known agent"
+                        );
+                    } else {
+                        info!(
+                            agent = agent_name,
+                            skill = skill_name,
+                            "reconciled drifted disabled_skills entry for well-known agent"
+                        );
+                        disabled_reconciled += 1;
+                    }
+                }
+            }
+            if disabled_reconciled > 0 {
+                info!(
+                    agent = agent_name,
+                    reconciled_count = disabled_reconciled,
+                    "reconciled drifted disabled_skills for well-known agent"
+                );
+            }
+
+            // Reconcile LLM overrides that have drifted from the source spec
+            // (e.g., model downgrade from Opus to Sonnet).
             // This is idempotent: matching rows are no-ops at the DB level.
+            // Note: uses the pre-reconciliation `overrides` snapshot — safe because
+            // no well-known agent has overlapping disabled_skills and llm_overrides.
             let mut reconciled = 0u32;
             for llm_ov in spec.llm_overrides {
                 let needs_update = overrides.iter().any(|existing| {
@@ -1147,24 +1195,38 @@ mod tests {
     }
 
     #[test]
-    fn test_seed_skill_overrides_skips_existing() {
+    fn test_seed_skill_overrides_reconciles_existing() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
         let mut db = Database::open(&db_path).unwrap();
         db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
             .unwrap();
 
-        // Set a custom override first
+        // Set a custom override first (simulates a pre-existing agent)
         db.set_skill_enabled("mika-dev", "some-custom-skill", false)
             .unwrap();
 
-        // Now seed — should not add anything since overrides exist
+        // Now seed — should reconcile disabled_skills from spec
         seed_well_known_skill_overrides(&mut db, "mika-dev");
 
         let overrides = db.get_skill_overrides("mika-dev").unwrap();
-        // Should only have the one custom override, not the well-known ones
-        assert_eq!(overrides.len(), 1);
-        assert_eq!(overrides[0].skill_name, "some-custom-skill");
+        // Should have the custom override PLUS all well-known disabled skills
+        assert_eq!(overrides.len(), 1 + MIKA_DEV.disabled_skills.len());
+        // Custom override preserved
+        assert!(
+            overrides
+                .iter()
+                .any(|o| o.skill_name == "some-custom-skill")
+        );
+        // All spec disabled_skills reconciled
+        for skill_name in MIKA_DEV.disabled_skills {
+            let row = overrides.iter().find(|o| o.skill_name == *skill_name);
+            assert!(
+                row.is_some(),
+                "expected disabled-row for {skill_name}, found none"
+            );
+            assert_eq!(row.unwrap().enabled, Some(false));
+        }
     }
 
     #[test]
@@ -1239,6 +1301,51 @@ mod tests {
             config.get("llm_max_tokens").and_then(|v| v.as_integer()),
             Some(1024)
         );
+    }
+
+    #[test]
+    fn test_seed_reconciles_disabled_skills_drift() {
+        // Simulate a pre-#845 mika-relay: existing rows for the *original*
+        // denylist (e.g. self-dev) but not for dev-groom which was added later.
+        // This is the exact scenario that caused mika#1041.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let mut db = Database::open(&db_path).unwrap();
+        db.register_agent("mika-relay", "Relay", "/tmp/mika-relay")
+            .unwrap();
+
+        // Seed only a subset of the denylist, simulating an outdated provisioning
+        // that predates the addition of dev-groom et al.
+        db.set_skill_enabled("mika-relay", "self-dev", false)
+            .unwrap();
+        db.set_skill_enabled("mika-relay", "qa-review", false)
+            .unwrap();
+
+        // Pre-condition: dev-groom is NOT in the table.
+        let pre = db.get_skill_overrides("mika-relay").unwrap();
+        assert!(
+            !pre.iter().any(|o| o.skill_name == "dev-groom"),
+            "dev-groom should not be in overrides before reconciliation"
+        );
+
+        // Run reconciliation (second call, overrides already exist).
+        seed_well_known_skill_overrides(&mut db, "mika-relay");
+
+        // Post-condition: every entry in MIKA_RELAY.disabled_skills now has
+        // enabled = Some(false), including dev-groom.
+        let post = db.get_skill_overrides("mika-relay").unwrap();
+        for skill_name in MIKA_RELAY.disabled_skills {
+            let row = post.iter().find(|o| o.skill_name == *skill_name);
+            assert!(
+                row.is_some(),
+                "expected disabled-row for {skill_name}, found none"
+            );
+            assert_eq!(
+                row.unwrap().enabled,
+                Some(false),
+                "{skill_name} should be disabled after reconciliation"
+            );
+        }
     }
 
     #[test]
