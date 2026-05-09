@@ -1227,15 +1227,33 @@ Rules:
                     }
                 }
 
-                // -- Idempotency marker (#757): written atomically with the
-                // extraction results. A crash or write failure between
+                // -- Idempotency marker (#757, #1052): written atomically with
+                // the extraction results. A crash or write failure between
                 // writing entities and writing the marker is the cascade
                 // path that burns budget forever; keeping both in one
                 // transaction eliminates that window.
+                //
+                // Changed from INSERT OR IGNORE to ON CONFLICT ... DO UPDATE
+                // (#1052) to fix the NULL-hash deadlock: pre-v26 rows with
+                // source_doc_hash IS NULL were perpetually "pending" (the
+                // pending query says "extract me") but INSERT OR IGNORE
+                // silently skipped them (the existing row occupied the unique
+                // slot). The upsert updates the row when the stored hash is
+                // NULL or differs from the chunk's current hash, breaking the
+                // deadlock and enabling content-change re-extraction.
                 tx.execute(
-                    "INSERT OR IGNORE INTO kg_extractions
+                    "INSERT INTO kg_extractions
                         (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model, entities_extracted, relationships_extracted, extraction_trace_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(docs_root_hash, source_doc_path) DO UPDATE SET
+                        source_doc_hash = excluded.source_doc_hash,
+                        extraction_model = excluded.extraction_model,
+                        entities_extracted = excluded.entities_extracted,
+                        relationships_extracted = excluded.relationships_extracted,
+                        extraction_trace_id = excluded.extraction_trace_id,
+                        created_at = excluded.created_at
+                     WHERE kg_extractions.source_doc_hash IS NULL
+                        OR kg_extractions.source_doc_hash != excluded.source_doc_hash",
                     rusqlite::params![
                         docs_root_hash,
                         docs_root_display,
@@ -1386,6 +1404,69 @@ Rules:
             );
         }
     }
+
+    /// Per-corpus extraction coverage statistics (#1052).
+    ///
+    /// Returns a snapshot of extraction coverage for this extractor's corpus:
+    /// total docs (distinct in kg_chunks), extracted docs (matching hash in
+    /// kg_extractions), null-hash docs (pre-v26 legacy), and coverage %.
+    pub async fn coverage_report(&self) -> Result<CorpusCoverage> {
+        let docs_root_hash = self.docs_root_hash.clone();
+
+        self.db
+            .with_db(move |db| {
+                let total_docs: u32 = db.conn.query_row(
+                    "SELECT COUNT(DISTINCT source_doc_path)
+                     FROM kg_chunks
+                     WHERE docs_root_hash = ?1",
+                    rusqlite::params![docs_root_hash],
+                    |row| row.get(0),
+                )?;
+
+                let extracted_docs: u32 = db.conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM kg_extractions
+                     WHERE docs_root_hash = ?1
+                       AND source_doc_hash IS NOT NULL",
+                    rusqlite::params![docs_root_hash],
+                    |row| row.get(0),
+                )?;
+
+                let null_hash_docs: u32 = db.conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM kg_extractions
+                     WHERE docs_root_hash = ?1
+                       AND source_doc_hash IS NULL",
+                    rusqlite::params![docs_root_hash],
+                    |row| row.get(0),
+                )?;
+
+                let coverage_pct = if total_docs > 0 {
+                    (extracted_docs as f64 / total_docs as f64) * 100.0
+                } else {
+                    100.0 // No docs = fully covered (vacuously true)
+                };
+
+                Ok(CorpusCoverage {
+                    docs_root_hash,
+                    total_docs,
+                    extracted_docs,
+                    null_hash_docs,
+                    coverage_pct,
+                })
+            })
+            .await
+    }
+}
+
+/// Per-corpus extraction coverage snapshot (#1052).
+#[derive(Debug, Clone)]
+pub struct CorpusCoverage {
+    pub docs_root_hash: String,
+    pub total_docs: u32,
+    pub extracted_docs: u32,
+    pub null_hash_docs: u32,
+    pub coverage_pct: f64,
 }
 
 // ---------------------------------------------------------------------------

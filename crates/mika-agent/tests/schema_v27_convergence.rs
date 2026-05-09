@@ -189,7 +189,7 @@ fn fresh_db_is_at_v32() {
         })
         .unwrap();
 
-    assert_eq!(version, 32, "Fresh DB must be at schema version 32");
+    assert_eq!(version, 33, "Fresh DB must be at schema version 33");
 }
 
 // ===== Index verification =====
@@ -258,6 +258,13 @@ fn shared_layer_indexes_use_docs_root_hash() {
 
 // ===== kg_extractions UNIQUE constraint =====
 
+/// Schema-level test: verifies the UNIQUE(docs_root_hash, source_doc_path)
+/// constraint on kg_extractions rejects duplicate inserts via INSERT OR IGNORE.
+///
+/// Note: The application code (#1052) now uses ON CONFLICT ... DO UPDATE
+/// (conditional upsert) instead of INSERT OR IGNORE. This test validates
+/// the schema constraint, not the application-level upsert semantics.
+/// See `kg_extractions_upsert_*` tests below for the application-level behavior.
 #[test]
 fn kg_extractions_first_writer_wins() {
     let (_dir, conn) = build_fresh_db().unwrap();
@@ -299,6 +306,144 @@ fn kg_extractions_first_writer_wins() {
         )
         .unwrap();
     assert_eq!(model, "test-model", "First writer's data must be preserved");
+}
+
+/// Application-level test: verifies the #1052 upsert updates NULL-hash rows.
+/// A row with source_doc_hash IS NULL should be updated when re-extracted
+/// with a non-NULL hash (fixes the NULL-hash deadlock).
+#[test]
+fn kg_extractions_upsert_updates_null_hash() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    // Seed a NULL-hash extraction row (pre-v26 legacy state)
+    conn.execute(
+        "INSERT INTO kg_extractions (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model)
+         VALUES ('0000000000000000', '/test/docs', 'doc1.md', NULL, 'old-model')",
+        [],
+    )
+    .unwrap();
+
+    // Upsert with the application's ON CONFLICT DO UPDATE pattern
+    conn.execute(
+        "INSERT INTO kg_extractions
+            (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model)
+         VALUES ('0000000000000000', '/test/docs', 'doc1.md', 'new-hash', 'new-model')
+         ON CONFLICT(docs_root_hash, source_doc_path) DO UPDATE SET
+            source_doc_hash = excluded.source_doc_hash,
+            extraction_model = excluded.extraction_model,
+            entities_extracted = excluded.entities_extracted,
+            relationships_extracted = excluded.relationships_extracted,
+            extraction_trace_id = excluded.extraction_trace_id,
+            created_at = excluded.created_at
+         WHERE kg_extractions.source_doc_hash IS NULL
+            OR kg_extractions.source_doc_hash != excluded.source_doc_hash",
+        [],
+    )
+    .unwrap();
+
+    let (hash, model): (String, String) = conn
+        .query_row(
+            "SELECT source_doc_hash, extraction_model FROM kg_extractions
+             WHERE docs_root_hash = '0000000000000000' AND source_doc_path = 'doc1.md'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        hash, "new-hash",
+        "NULL-hash row must be updated to new hash"
+    );
+    assert_eq!(model, "new-model", "extraction_model must be updated");
+}
+
+/// Application-level test: verifies the #1052 upsert is a no-op when
+/// the stored hash matches the incoming hash (content unchanged).
+#[test]
+fn kg_extractions_upsert_noop_on_matching_hash() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    // Seed a row with a known hash
+    conn.execute(
+        "INSERT INTO kg_extractions (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model)
+         VALUES ('0000000000000000', '/test/docs', 'doc1.md', 'same-hash', 'original-model')",
+        [],
+    )
+    .unwrap();
+
+    // Upsert with the same hash — WHERE clause should NOT fire
+    conn.execute(
+        "INSERT INTO kg_extractions
+            (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model)
+         VALUES ('0000000000000000', '/test/docs', 'doc1.md', 'same-hash', 'updated-model')
+         ON CONFLICT(docs_root_hash, source_doc_path) DO UPDATE SET
+            source_doc_hash = excluded.source_doc_hash,
+            extraction_model = excluded.extraction_model,
+            entities_extracted = excluded.entities_extracted,
+            relationships_extracted = excluded.relationships_extracted,
+            extraction_trace_id = excluded.extraction_trace_id,
+            created_at = excluded.created_at
+         WHERE kg_extractions.source_doc_hash IS NULL
+            OR kg_extractions.source_doc_hash != excluded.source_doc_hash",
+        [],
+    )
+    .unwrap();
+
+    let model: String = conn
+        .query_row(
+            "SELECT extraction_model FROM kg_extractions
+             WHERE docs_root_hash = '0000000000000000' AND source_doc_path = 'doc1.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        model, "original-model",
+        "Row must NOT be updated when hash matches (no-op)"
+    );
+}
+
+/// Application-level test: verifies the #1052 upsert updates rows when
+/// the hash changes (content-changed re-extraction).
+#[test]
+fn kg_extractions_upsert_updates_on_hash_mismatch() {
+    let (_dir, conn) = build_fresh_db().unwrap();
+
+    // Seed a row with an old hash
+    conn.execute(
+        "INSERT INTO kg_extractions (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model)
+         VALUES ('0000000000000000', '/test/docs', 'doc1.md', 'old-hash', 'old-model')",
+        [],
+    )
+    .unwrap();
+
+    // Upsert with a different hash — WHERE clause should fire
+    conn.execute(
+        "INSERT INTO kg_extractions
+            (docs_root_hash, docs_root, source_doc_path, source_doc_hash, extraction_model)
+         VALUES ('0000000000000000', '/test/docs', 'doc1.md', 'new-hash', 'new-model')
+         ON CONFLICT(docs_root_hash, source_doc_path) DO UPDATE SET
+            source_doc_hash = excluded.source_doc_hash,
+            extraction_model = excluded.extraction_model,
+            entities_extracted = excluded.entities_extracted,
+            relationships_extracted = excluded.relationships_extracted,
+            extraction_trace_id = excluded.extraction_trace_id,
+            created_at = excluded.created_at
+         WHERE kg_extractions.source_doc_hash IS NULL
+            OR kg_extractions.source_doc_hash != excluded.source_doc_hash",
+        [],
+    )
+    .unwrap();
+
+    let (hash, model): (String, String) = conn
+        .query_row(
+            "SELECT source_doc_hash, extraction_model FROM kg_extractions
+             WHERE docs_root_hash = '0000000000000000' AND source_doc_path = 'doc1.md'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(hash, "new-hash", "Hash must be updated on mismatch");
+    assert_eq!(model, "new-model", "Model must be updated on mismatch");
 }
 
 // ===== Column-level structural verification for KG tables =====
