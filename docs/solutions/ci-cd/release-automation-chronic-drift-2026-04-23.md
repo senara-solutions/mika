@@ -1,6 +1,7 @@
 ---
 title: "Release automation chronic drift — failure classes that outlive tool choice"
 date: 2026-04-23
+last_updated: 2026-05-09
 category: ci-cd
 problem_type: operational-pattern
 severity: medium
