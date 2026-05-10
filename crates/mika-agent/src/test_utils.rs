@@ -55,6 +55,7 @@ pub mod test_helpers {
             max_tasks_per_session: 25,
             pr_review_posted: &PR_REVIEW_POSTED,
             pr_reviews_posted: None,
+            callback_task_id: None,
         }
     }
 
@@ -130,6 +131,7 @@ pub mod test_helpers {
                 max_tasks_per_session: 25,
                 pr_review_posted: &PR_REVIEW_POSTED,
                 pr_reviews_posted: None,
+                callback_task_id: None,
             }
         }
 
@@ -159,6 +161,7 @@ pub mod test_helpers {
                 max_tasks_per_session: 25,
                 pr_review_posted: &PR_REVIEW_POSTED,
                 pr_reviews_posted: None,
+                callback_task_id: None,
             }
         }
         /// Create a ToolContext with custom home and global home directories.
@@ -192,6 +195,7 @@ pub mod test_helpers {
                 max_tasks_per_session: 25,
                 pr_review_posted: &PR_REVIEW_POSTED,
                 pr_reviews_posted: None,
+                callback_task_id: None,
             }
         }
     }

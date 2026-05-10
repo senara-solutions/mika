@@ -139,6 +139,11 @@ pub struct ToolContext<'a> {
     /// forces a retry into a new turn). `None` in CLI/test contexts where
     /// session-scoped dedup is not needed — falls back to per-turn AtomicBool.
     pub pr_reviews_posted: Option<&'a Arc<DashMap<String, HashSet<String>>>>,
+    /// The callback task ID, if this turn is processing a callback result.
+    /// Used by the executor gate to register deferred dispatches from callback
+    /// context (mika#1058). Set from `SilentTrigger::Callback { task_id, .. }`.
+    /// `None` for non-callback contexts.
+    pub callback_task_id: Option<&'a str>,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

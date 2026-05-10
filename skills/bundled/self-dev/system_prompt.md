@@ -182,7 +182,7 @@ Before applying the generic pipeline-failure path, classify the callback result 
 1. Extract metadata (Session, Cost, Turns, Duration) from the lines after the PIPELINE FAILURE prefix.
 2. Check `pipeline_retry_count` in task metadata (default 0). Call `check_task(task_id)`.
 3. If `pipeline_retry_count >= 2`: escalate — notify Vincent "Pipeline failure: {repo}#{issue_number} produced no commits after {n} retries." Proceed to Step 6 with `blocked`.
-4. If retries remain: notify Vincent "Pipeline produced no commits for {repo}#{issue_number} — retrying ({n}/2)." Call `update_task_status` with same status `in_progress` and `metadata: {"pipeline_retry_count": <current + 1>}`. Verify persistence via `check_task`. Then call `run_claude_pilot` with the same `repo#number` and `task_id` (handler reuses existing worktree). Wait for callback and re-enter this entry point.
+4. If retries remain: notify Vincent "Pipeline produced no commits for {repo}#{issue_number} — retrying ({n}/2)." Call `update_task_status` with same status `in_progress` and `metadata: {"pipeline_retry_count": <current + 1>}`. Verify persistence via `check_task`. Then call `run_claude_pilot` with the same `repo#number` and `task_id`. If the call returns `{"status": "deferred", "deferred": true}`, the retry has been automatically enqueued and will fire as a fresh session — do NOT retry again. Proceed to Step 6 with status `in_progress` and note "pipeline retry deferred — engine will auto-dispatch when dispatch slot is free."
 
 **On success (no "PIPELINE FAILURE:" prefix):**
 1. Extract metadata and persist immediately (see "Metadata extraction" above).

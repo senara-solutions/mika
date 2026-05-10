@@ -238,12 +238,19 @@ pub fn validate_required_fields(
 /// Applies a per-skill timeout wrapping the inner execution.
 /// If `long_running_ctx` is Some and the handler is `Exec { long_running: true }`,
 /// the subprocess is spawned in the background with a callback task.
+///
+/// `callback_task_id` and `callback_db` enable deferred dispatch registration
+/// from callback turns (mika#1058). When both are `Some`, the executor gate
+/// intercepts long-running tool calls and registers them as deferred dispatches
+/// instead of returning a hard error.
 pub async fn execute_skill_tool(
     skill_tool: &ResolvedSkillTool,
     input: serde_json::Value,
     timeout_secs: u64,
     long_running_ctx: Option<&LongRunningContext>,
     github_token: Option<&str>,
+    callback_task_id: Option<&str>,
+    callback_db: Option<&AsyncDatabase>,
 ) -> ToolOutput {
     // Validate required fields from tool schema before any execution (#955).
     // Catches the bug class where the LLM omits a required field — the subprocess
@@ -275,6 +282,10 @@ pub async fn execute_skill_tool(
     // (callback turns, silent mode, CLI test). The sync exec path does not
     // inject __mika_task_id/__mika_agent, so the handler would crash with
     // a cryptic error. Return an explicit error instead (#537).
+    //
+    // mika#1058: Callback turns with a known task_id can register deferred
+    // dispatches instead of receiving a hard error. The deferred callback fires
+    // as a DeferredDispatch silent turn which HAS long_running_ctx injected.
     if matches!(
         &skill_tool.handler,
         ToolHandler::Exec {
@@ -283,6 +294,49 @@ pub async fn execute_skill_tool(
         }
     ) && long_running_ctx.is_none()
     {
+        // Callback turns: attempt deferred dispatch registration instead of hard error.
+        if let Some(task_id) = callback_task_id
+            && let Some(db) = callback_db
+        {
+            match check_lineage_cycle(db, task_id, &input).await {
+                Ok(()) => {
+                    if register_deferred_callback(db, task_id, &input).await {
+                        info!(
+                            tool = %skill_tool.definition.name,
+                            task_id,
+                            "callback_deferred_dispatch_registered"
+                        );
+                        return ToolOutput::success(
+                            serde_json::json!({
+                                "status": "deferred",
+                                "message": "Long-running dispatch registered as deferred callback. \
+                                            It will fire automatically when the current dispatch \
+                                            slot is free. Do not retry.",
+                                "deferred": true
+                            })
+                            .to_string(),
+                        );
+                    }
+                    // Fall through to original error if registration failed (cap exceeded / DB error)
+                }
+                Err(cycle_msg) => {
+                    warn!(
+                        tool = %skill_tool.definition.name,
+                        task_id,
+                        "deferred_dispatch_cycle_detected"
+                    );
+                    return ToolOutput::error(
+                        serde_json::json!({
+                            "error": "deferred_dispatch_cycle_detected",
+                            "message": cycle_msg,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        }
+
+        // Original error for non-callback contexts (heartbeat, reflection, CLI test)
         warn!(
             tool = %skill_tool.definition.name,
             "long-running tool invoked without long_running_ctx"
@@ -878,6 +932,126 @@ async fn validate_dispatch_readiness(
     }
 
     Ok(task.status.clone())
+}
+
+/// Check for cycles in the task lineage before enqueuing a deferred dispatch (mika#1058).
+///
+/// Walks the `parent_task_id` chain (max 4 hops, bounded by `depth ≤ 3` schema CHECK).
+/// Extracts `(repo, issue_number, skill)` from each ancestor's metadata and compares
+/// against the proposed dispatch. Returns `Ok(())` if safe, `Err(message)` if cycle detected.
+///
+/// Fail-open: if metadata extraction fails for an ancestor, that ancestor is skipped.
+/// The `depth ≤ 3` schema CHECK is the structural backstop.
+async fn check_lineage_cycle(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    proposed_input: &serde_json::Value,
+) -> Result<(), String> {
+    let proposed_skill = proposed_input.get("skill").and_then(|v| v.as_str());
+    let proposed_prompt = proposed_input.get("prompt").and_then(|v| v.as_str());
+    let (proposed_repo, proposed_issue) = parse_repo_issue(proposed_prompt);
+
+    // If we can't extract what we're proposing, we can't detect a cycle — fail-open.
+    if proposed_skill.is_none() || proposed_repo.is_none() || proposed_issue.is_none() {
+        return Ok(());
+    }
+
+    let mut current_id = parent_task_id.to_string();
+    for _depth in 0..4 {
+        let task = match db.get_task_unscoped(&current_id).await {
+            Ok(Some(t)) => t,
+            _ => break, // task not found or DB error → stop walking (fail-open)
+        };
+
+        // Extract (repo, issue, skill) from this ancestor
+        if let Some((ancestor_repo, ancestor_issue, ancestor_skill)) = extract_dispatch_tuple(&task)
+            && proposed_skill == Some(ancestor_skill.as_str())
+            && proposed_repo == Some(ancestor_repo.as_str())
+            && proposed_issue == Some(ancestor_issue)
+        {
+            return Err(format!(
+                "Cycle detected: ancestor task {} has same dispatch tuple \
+                 ({}, #{}, skill={}). Refusing to enqueue.",
+                task.id, ancestor_repo, ancestor_issue, ancestor_skill
+            ));
+        }
+
+        // Walk up
+        match task.parent_task_id {
+            Some(pid) => current_id = pid,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Parse "repo#number" format from a prompt string.
+///
+/// Handles formats like "mika#159", "mika-skills#42", etc. Returns
+/// `(Some("mika"), Some(159))` on success, `(None, None)` on failure.
+fn parse_repo_issue(prompt: Option<&str>) -> (Option<&str>, Option<i64>) {
+    let prompt = match prompt {
+        Some(p) => p,
+        None => return (None, None),
+    };
+
+    // Search for the "repo#number" pattern anywhere in the prompt.
+    // The repo name is alphanumeric with hyphens, followed by # and digits.
+    for word in prompt.split_whitespace() {
+        if let Some((repo, num_str)) = word.split_once('#')
+            && !repo.is_empty()
+            && repo
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            && let Ok(num) = num_str.parse::<i64>()
+        {
+            return (Some(repo), Some(num));
+        }
+    }
+    (None, None)
+}
+
+/// Extract `(repo, issue_number, skill)` tuple from a task's metadata/action_config.
+///
+/// Tries multiple extraction strategies in order:
+/// 1. `action_config.original_call` (deferred callbacks store the full tool input)
+/// 2. Task metadata fields (manual tasks from `create_task`)
+/// 3. `reference_url` parsing (GitHub URL → repo#number) + `source` as skill hint
+fn extract_dispatch_tuple(task: &crate::db::Task) -> Option<(String, i64, String)> {
+    // Strategy 1: action_config.original_call (deferred callbacks)
+    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&task.action_config)
+        && let Some(original_call) = config.get("original_call")
+    {
+        let skill = original_call
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let prompt = original_call.get("prompt").and_then(|v| v.as_str());
+        let (repo, issue) = parse_repo_issue(prompt);
+        if let (Some(skill), Some(repo), Some(issue)) = (skill, repo, issue) {
+            return Some((repo.to_string(), issue, skill));
+        }
+    }
+
+    // Strategy 2: Parse from task label (long-running dispatch labels encode the skill)
+    // and reference_url (GitHub issue URL)
+    if let Some(ref_url) = &task.reference_url {
+        // Parse GitHub URL: https://github.com/owner/repo/issues/123
+        let parts: Vec<&str> = ref_url.rsplitn(3, '/').collect();
+        if parts.len() >= 3
+            && let Ok(issue_num) = parts[0].parse::<i64>()
+        {
+            // Extract repo name from URL path
+            let repo = parts[2].rsplit('/').next().unwrap_or(parts[2]).to_string();
+
+            // Use source as skill hint, or parse from label
+            let skill = task.source.as_deref().unwrap_or(&task.label).to_string();
+
+            return Some((repo, issue_num, skill));
+        }
+    }
+
+    None
 }
 
 /// Maximum number of pending deferred-dispatch callbacks per agent (mika#1011).
@@ -1596,6 +1770,8 @@ mod tests {
             30,
             None,
             None,
+            None,
+            None,
         )
         .await;
 
@@ -1627,8 +1803,16 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "handlers/handler.sh");
-        let output =
-            execute_skill_tool(&tool, serde_json::json!({"query": "test"}), 30, None, None).await;
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test"}),
+            30,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("hello from handler"));
     }
@@ -1642,7 +1826,8 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "fail.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         // Non-zero exit is NOT a tool error — the process ran to completion
         assert!(!output.is_error, "non-zero exit should not be is_error");
         assert!(
@@ -1666,7 +1851,8 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "status.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(
             !output.is_error,
             "non-zero exit should not be is_error, got: {}",
@@ -1690,7 +1876,8 @@ mod tests {
         write_script(&tmp.path().join("silent_fail.sh"), "#!/bin/sh\nexit 3");
 
         let tool = make_exec_tool(tmp.path(), "silent_fail.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(!output.is_error, "non-zero exit should not be is_error");
         assert!(
             output.content.contains("Exit code: 3"),
@@ -1705,7 +1892,7 @@ mod tests {
         // via 2>&1, so on non-zero exit the executor must read stdout (not stderr).
         let (_tmp, tool) = setup_shell_exec_handler();
         let input = serde_json::json!({"command": "echo 'health check output' && exit 2"});
-        let output = execute_skill_tool(&tool, input, 30, None, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
         assert!(
             !output.is_error,
             "non-zero exit via run.sh should not be is_error, got: {}",
@@ -1730,7 +1917,8 @@ mod tests {
         write_script(&tmp.path().join("ok.sh"), "#!/bin/sh\necho 'all good'");
 
         let tool = make_exec_tool(tmp.path(), "ok.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(!output.is_error);
         assert!(
             !output.content.contains("Exit code:"),
@@ -1750,7 +1938,8 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "both.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(!output.is_error);
         assert!(output.content.contains("Exit code: 1"));
         assert!(
@@ -1769,7 +1958,8 @@ mod tests {
     async fn test_exec_handler_missing_command() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = make_exec_tool(tmp.path(), "nonexistent.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(output.is_error);
         assert!(output.content.contains("not found"));
     }
@@ -1783,7 +1973,8 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "slow.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 2, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 2, None, None, None, None).await;
         assert!(
             output.is_error,
             "expected timeout error, got: {}",
@@ -1799,7 +1990,7 @@ mod tests {
 
         let tool = make_exec_tool(tmp.path(), "echo_input.sh");
         let input = serde_json::json!({"query": "hello world"});
-        let output = execute_skill_tool(&tool, input.clone(), 30, None, None).await;
+        let output = execute_skill_tool(&tool, input.clone(), 30, None, None, None, None).await;
         assert!(!output.is_error);
         // The output should contain the JSON input
         let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
@@ -1810,7 +2001,7 @@ mod tests {
     async fn test_exec_handler_command_with_quotes() {
         let (_tmp, tool) = setup_shell_exec_handler();
         let input = serde_json::json!({"command": "echo \"hello world\""});
-        let output = execute_skill_tool(&tool, input, 30, None, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("hello world"),
@@ -1837,7 +2028,7 @@ mod tests {
         let (_tmp, tool) = setup_shell_exec_handler();
         // CSS selectors and hex colors contain # which must survive JSON → jq → eval
         let input = serde_json::json!({"command": "echo '#custom-relay { color: #a6e3a1; }'"});
-        let output = execute_skill_tool(&tool, input, 30, None, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#custom-relay"),
@@ -1858,7 +2049,7 @@ mod tests {
         let input = serde_json::json!({
             "command": "cat << 'EOF'\n#selector { color: #fff; }\nEOF"
         });
-        let output = execute_skill_tool(&tool, input, 30, None, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#selector"),
@@ -1883,7 +2074,7 @@ mod tests {
             css_file.display()
         );
         let input = serde_json::json!({"command": cmd});
-        let output = execute_skill_tool(&tool, input, 30, None, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("#new-selector"),
@@ -1897,7 +2088,7 @@ mod tests {
         let (_tmp, tool) = setup_shell_exec_handler();
         // printf with \n format specifiers: backslashes must survive JSON → jq → eval → printf
         let input = serde_json::json!({"command": "printf 'line1\\nline2\\n'"});
-        let output = execute_skill_tool(&tool, input, 30, None, None).await;
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("line1"),
@@ -1935,7 +2126,8 @@ mod tests {
             },
             skill_dir: PathBuf::from("/tmp"),
         };
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 5, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 5, None, None, None, None).await;
         assert!(output.is_error);
         assert!(output.content.contains("unsupported HTTP method"));
     }
@@ -2101,7 +2293,8 @@ mod tests {
         write_script(&handler_dir.join("screenshot.sh"), &script);
 
         let tool = make_exec_tool(tmp.path(), "handlers/screenshot.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(output.content.contains("Screenshot taken."));
         assert_eq!(output.images.len(), 1);
@@ -2118,7 +2311,8 @@ mod tests {
         );
 
         let tool = make_exec_tool(tmp.path(), "plain.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(!output.is_error);
         assert!(output.content.contains("just plain text"));
         assert!(output.images.is_empty());
@@ -2141,7 +2335,8 @@ mod tests {
         }
 
         let tool = make_exec_tool(tmp.path(), "check_env.sh");
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         // Both vars should be empty because env_remove strips them
         assert_eq!(output.content.trim(), "TMUX= TMUX_PANE=");
@@ -2177,6 +2372,8 @@ mod tests {
             serde_json::json!({"query": "test"}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -2230,6 +2427,8 @@ mod tests {
             serde_json::json!({"query": "test", "task_id": wi_id}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -2295,7 +2494,16 @@ mod tests {
             dispatch_count: AtomicU32::new(0),
         };
 
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, Some(&ctx), None).await;
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             output.content.contains("sync result"),
@@ -2330,6 +2538,8 @@ mod tests {
             serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -2374,6 +2584,8 @@ mod tests {
             30,
             None,
             Some("ghp_test_token_123"),
+            None,
+            None,
         )
         .await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
@@ -2384,7 +2596,8 @@ mod tests {
         );
 
         // Without github_token — GH_TOKEN should be absent (scrubbed)
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
         assert!(!output.is_error, "unexpected error: {}", output.content);
         assert!(
             !output.content.contains("GH_TOKEN=ghp_"),
@@ -2414,7 +2627,8 @@ mod tests {
         };
 
         // Pass None for long_running_ctx — simulates callback turn / silent mode / CLI test
-        let output = execute_skill_tool(&tool, serde_json::json!({}), 30, None, None).await;
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
 
         assert!(output.is_error, "expected error, got: {}", output.content);
         assert!(
@@ -2512,6 +2726,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2539,6 +2755,8 @@ mod tests {
             serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -2569,6 +2787,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2596,6 +2816,8 @@ mod tests {
             serde_json::json!({"task_id": "00000000-0000-0000-0000-000000000000"}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -2626,6 +2848,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2655,6 +2879,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2683,6 +2909,8 @@ mod tests {
             serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -2717,6 +2945,8 @@ mod tests {
             serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -2775,6 +3005,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2809,6 +3041,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2840,6 +3074,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2869,6 +3105,8 @@ mod tests {
             serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -2918,6 +3156,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2957,6 +3197,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -2989,6 +3231,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
         assert!(output.is_error);
@@ -3006,6 +3250,8 @@ mod tests {
             serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -3038,6 +3284,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
         assert!(
@@ -3065,6 +3313,8 @@ mod tests {
             serde_json::json!({"task_id": wi_id}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -3103,6 +3353,8 @@ mod tests {
             30,
             Some(&ctx),
             None,
+            None,
+            None,
         )
         .await;
 
@@ -3136,6 +3388,8 @@ mod tests {
             serde_json::json!({"task_id": wi_b}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -3194,6 +3448,8 @@ mod tests {
             serde_json::json!({"task_id": wi}),
             30,
             Some(&ctx),
+            None,
+            None,
             None,
         )
         .await;
@@ -3354,5 +3610,360 @@ mod tests {
         // No token → blocked-by check skipped (fail-open), dispatch proceeds
         let result = validate_dispatch_readiness(&async_db, &wi_id, None, None).await;
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    // ===================================================================
+    // Cycle detection and callback deferred dispatch tests (mika#1058)
+    // ===================================================================
+
+    #[test]
+    fn test_parse_repo_issue_valid() {
+        let (repo, issue) = parse_repo_issue(Some("mika#159"));
+        assert_eq!(repo, Some("mika"));
+        assert_eq!(issue, Some(159));
+    }
+
+    #[test]
+    fn test_parse_repo_issue_with_prefix() {
+        let (repo, issue) = parse_repo_issue(Some("Fix bug in mika-skills#42 please"));
+        assert_eq!(repo, Some("mika-skills"));
+        assert_eq!(issue, Some(42));
+    }
+
+    #[test]
+    fn test_parse_repo_issue_none() {
+        let (repo, issue) = parse_repo_issue(None);
+        assert!(repo.is_none());
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn test_parse_repo_issue_no_match() {
+        let (repo, issue) = parse_repo_issue(Some("just some text without issue ref"));
+        assert!(repo.is_none());
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn test_parse_repo_issue_bare_hash() {
+        // "#42" — no repo name
+        let (repo, issue) = parse_repo_issue(Some("#42"));
+        assert!(repo.is_none());
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn test_extract_dispatch_tuple_from_action_config() {
+        let task = crate::db::Task {
+            id: "task-1".to_string(),
+            agent_id: "mika-dev".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": {
+                    "skill": "dev-groom",
+                    "prompt": "mika#159",
+                    "task_id": "parent-1"
+                }
+            })
+            .to_string(),
+            status: "pending".to_string(),
+            process_id: None,
+            input_context: None,
+            result: None,
+            created_by_session: None,
+            created_trace_id: None,
+            execution_trace_id: None,
+            created_at: "2026-05-10T00:00:00Z".to_string(),
+            updated_at: "2026-05-10T00:00:00Z".to_string(),
+            fired_at: None,
+            completed_at: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: "issue".to_string(),
+        };
+
+        let result = extract_dispatch_tuple(&task);
+        assert!(result.is_some(), "expected Some, got None");
+        let (repo, issue, skill) = result.unwrap();
+        assert_eq!(repo, "mika");
+        assert_eq!(issue, 159);
+        assert_eq!(skill, "dev-groom");
+    }
+
+    #[tokio::test]
+    async fn test_cycle_detection_rejects_same_tuple() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        // Create parent task with action_config containing (mika, 159, dev-groom)
+        let parent_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": {
+                    "skill": "dev-groom",
+                    "prompt": "mika#159",
+                    "task_id": "grandparent-1"
+                }
+            })
+            .to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+        };
+        let parent_id = async_db.create_task(parent_task).await.unwrap();
+
+        // Create child callback task
+        let child_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "callback".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+        };
+        let child_id = async_db.create_task(child_task).await.unwrap();
+
+        // Propose same (mika, 159, dev-groom) — should be rejected
+        let proposed = serde_json::json!({
+            "skill": "dev-groom",
+            "prompt": "mika#159",
+            "task_id": &child_id
+        });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(result.is_err(), "expected cycle detection to reject");
+        assert!(
+            result.unwrap_err().contains("Cycle detected"),
+            "expected cycle message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cycle_detection_allows_cross_skill() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        // Parent with (mika, 159, dev-groom)
+        let parent_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": {
+                    "skill": "dev-groom",
+                    "prompt": "mika#159",
+                    "task_id": "grandparent-1"
+                }
+            })
+            .to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+        };
+        let parent_id = async_db.create_task(parent_task).await.unwrap();
+
+        // Propose DIFFERENT skill (mika, 159, dev-pilot) — should be allowed
+        let proposed = serde_json::json!({
+            "skill": "dev-pilot",
+            "prompt": "mika#159",
+            "task_id": &parent_id
+        });
+        let result = check_lineage_cycle(&async_db, &parent_id, &proposed).await;
+        assert!(result.is_ok(), "cross-skill chain should be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_gate_preserved_for_non_callback() {
+        // Non-callback context: long_running tool with no long_running_ctx and
+        // no callback_task_id should return the original error message.
+        let tool = make_deferred_dispatch_tool();
+        let input =
+            serde_json::json!({"skill": "dev-pilot", "prompt": "mika#42", "task_id": "abc"});
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
+        assert!(output.is_error, "expected error for non-callback context");
+        assert!(
+            output.content.contains("cannot run in the current context"),
+            "expected original gate error, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_callback_deferred_dispatch_registered() {
+        // Callback context with callback_task_id and db should register a
+        // deferred dispatch instead of returning a hard error.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        // Create a parent manual task
+        let parent_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "implement mika#42".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+        };
+        let parent_id = async_db.create_task(parent_task).await.unwrap();
+
+        // Create callback task (child of parent)
+        let callback_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "callback".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+        };
+        let callback_id = async_db.create_task(callback_task).await.unwrap();
+
+        let tool = make_deferred_dispatch_tool();
+        let input = serde_json::json!({
+            "skill": "dev-pilot",
+            "prompt": "mika#42",
+            "task_id": &parent_id
+        });
+        let output = execute_skill_tool(
+            &tool,
+            input,
+            30,
+            None,
+            None,
+            Some(&callback_id),
+            Some(&async_db),
+        )
+        .await;
+
+        // Should succeed with deferred status, not error
+        assert!(
+            !output.is_error,
+            "expected deferred success, got error: {}",
+            output.content
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON, got: {}", output.content));
+        assert_eq!(parsed["status"], "deferred");
+        assert_eq!(parsed["deferred"], true);
+
+        // Verify a deferred callback was created in the DB
+        let count = async_db.count_pending_deferred_callbacks().await.unwrap();
+        assert_eq!(count, 1, "expected one deferred callback to be registered");
+    }
+
+    /// Helper: create a long_running tool fixture for deferred dispatch tests (mika#1058).
+    fn make_deferred_dispatch_tool() -> ResolvedSkillTool {
+        ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Test long-running tool".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill", "prompt", "task_id"],
+                    "properties": {
+                        "skill": { "type": "string" },
+                        "prompt": { "type": "string" },
+                        "task_id": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(3600),
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        }
     }
 }

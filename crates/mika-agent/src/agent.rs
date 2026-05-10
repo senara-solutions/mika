@@ -2199,6 +2199,7 @@ async fn run_agent_inner(
             .map_or(25, |s| s.max_agent_tasks_per_session),
         pr_review_posted: &pr_review_posted,
         pr_reviews_posted: params.pr_reviews_posted,
+        callback_task_id: None, // Conversation mode: not a callback turn
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -2707,6 +2708,12 @@ async fn execute_tool(
             dispatch.skill_timeout,
             dispatch.long_running_ctx,
             dispatch.ctx.github_token,
+            dispatch.ctx.callback_task_id,
+            if dispatch.ctx.callback_task_id.is_some() {
+                Some(dispatch.ctx.db)
+            } else {
+                None
+            },
         )
         .await;
     }
@@ -3221,6 +3228,16 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         params.github_token.map(String::from)
     };
 
+    // Extract callback_task_id from the trigger for deferred dispatch registration
+    // (mika#1058). Callback AND DeferredDispatch triggers carry a task_id needed for
+    // cycle detection. DeferredDispatch must also be able to re-defer if it hits
+    // global_dispatch_active on its own turn.
+    let callback_task_id = match &params.trigger {
+        SilentTrigger::Callback { task_id, .. }
+        | SilentTrigger::DeferredDispatch { task_id, .. } => Some(task_id.as_str()),
+        _ => None,
+    };
+
     let core_memory_edit_count = AtomicU32::new(0);
     let pr_review_posted = AtomicBool::new(false);
     let tool_ctx = ToolContext {
@@ -3257,6 +3274,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
             .map_or(25, |s| s.max_agent_tasks_per_session),
         pr_review_posted: &pr_review_posted,
         pr_reviews_posted: None, // Silent mode: no session-scoped dedup needed
+        callback_task_id,
     };
 
     // #862 — Turn-start snapshot of enabled tool names (silent mode).
@@ -3324,6 +3342,21 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         return Ok(());
     }
 
+    // Construct LongRunningContext for DeferredDispatch triggers only (mika#1058).
+    // DeferredDispatch turns MUST be able to call run_claude_pilot — that's their
+    // sole purpose. All other silent triggers (Heartbeat, Callback, etc.) keep None.
+    let long_running_ctx = if matches!(&params.trigger, SilentTrigger::DeferredDispatch { .. }) {
+        Some(executor::LongRunningContext {
+            db: db.clone(),
+            agent_name: db.agent_id().to_string(),
+            session_id: params.session_id.to_string(),
+            trace_id: trace_id.clone(),
+            dispatch_count: AtomicU32::new(0),
+        })
+    } else {
+        None
+    };
+
     let no_required_suffix_lines: Vec<String> = Vec::new();
     let result = run_loop(
         llm,
@@ -3335,8 +3368,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         &mode,
         params.session_id,
         db,
-        None, // MCP tools excluded from silent mode
-        None, // long_running not supported in silent mode
+        None,                      // MCP tools excluded from silent mode
+        long_running_ctx.as_ref(), // mika#1058: DeferredDispatch gets ctx, others get None
         &no_required_tools,
         &no_required_suffix_lines,
         &enabled_tool_names,
@@ -3664,6 +3697,7 @@ async fn run_team_agent_inner_impl(
             .map_or(25, |s| s.max_agent_tasks_per_session),
         pr_review_posted: &pr_review_posted,
         pr_reviews_posted: None, // Team mode: no session-scoped dedup needed
+        callback_task_id: None,  // Team mode: not a callback turn
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
