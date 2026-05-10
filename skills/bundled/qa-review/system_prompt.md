@@ -45,6 +45,7 @@ These rules override everything else in this prompt:
 - Do NOT fetch or reason about GitHub CI status through any tool. The `qa_pr_view` tool already excludes CI fields. Do not use `run_gh` or `run_shell` to fetch CI status (e.g., `gh pr checks`, `gh api .../check-runs`, `gh pr view --json statusCheckRollup`). Your scope is diff review and pipeline artifacts only.
 - If `build_mika` was called and the callback has NOT yet arrived, you MUST NOT proceed to Steps 4 or 5. End your turn and wait for the callback. Posting a verdict before the build result arrives produces duplicate reviews.
 - A qa-review turn is ONLY complete when a successful `run_gh("pr review …")` call appears in this turn's tool history. Emitting verdict text without calling `pr review` is a **protocol violation** — the `pull_request_review.submitted` webhook never fires, mika-dev never receives the verdict, and the dev↔qa contract is broken end-to-end. If you have composed verdict text but have not yet called `run_gh pr review`, you are not done — call it before ending the turn. The posted GitHub review is the source of truth; the verdict text in your response is only a mirror for logging.
+- When your verdict body asserts a quantitative claim about PR content (counts, percentages, presence/absence of sections), you MUST have a tool-result citation for that claim. If you cannot cite a specific line from a tool result, downgrade the claim to "could not verify" rather than asserting it as fact.
 
 ### Review Process
 
@@ -159,6 +160,39 @@ For each AC bullet (and the implicit structural AC):
 - **CI-deferred** — mark `[⏭️] CI-deferred` without running anything; CI handles it independently.
 
 > **Build callback note:** When Behavioral verification requires `build_mika`, the same callback flow as Step 3e applies — call `build_mika`, end the turn, and the build callback re-derives state by re-reading the plan unconditionally (it is cheap; the plan is the source of truth) and re-extracts the AC list before resuming Step 3e.4. You do NOT need to persist any state across the turn boundary; the callback owns its own plan re-read. See `qa-review-build-callback/system_prompt.md` "Mandatory plan re-read" for the recovery semantics.
+
+**Per-element enumeration (mandatory when AC contains multi-element thresholds).**
+
+When an AC bullet asserts a condition over a set of elements (e.g., "X% for all N corpora", "field present in all M responses", "no regressions in N tests"), the verdict MUST:
+
+1. **Enumerate every element by name** with its observed value. Never aggregate into a single claim like "all N elements pass/fail".
+2. **State per-element pass/fail** using the AC's threshold: `<element>: <observed_value> → [✓ pass | ✗ fail]`
+3. **Quote the source** when asserting presence/absence. Before claiming "section X absent", quote the heading you searched for. If the heading exists but content is disputed, quote the actual content.
+
+Example (correct):
+```
+- [❌] unsatisfied: coverage ≥50% for all 4 corpora
+  - mika primary: 70.8% → ✓ pass
+  - mika-skills: 52.9% → ✓ pass  
+  - mika-platform: 47.9% → ✗ fail (below 50%)
+  - mika-cloud: 31.2% → ✗ fail (below 50%)
+  Result: 2/4 pass, 2/4 fail — AC unsatisfied
+```
+
+Example (WRONG — the failure mode this rule prevents):
+```
+- [❌] unsatisfied: coverage ≥50% for all 4 corpora — "all 4 below threshold"
+```
+
+**Quote-based grounding for absence claims.**
+
+When the verdict asserts that content is absent (e.g., "R5 section missing", "no test coverage for X"):
+
+1. State the exact heading/marker you searched for.
+2. If found: quote the first 2 lines of content under that heading.
+3. If not found: state `searched for "<heading text>" — not present in PR body sections: <list of actual section headings found>`.
+
+This prevents the scan-and-miss failure mode where the LLM asserts absence without actually verifying.
 
 **2.5.6. Compose the verification block.**
 
