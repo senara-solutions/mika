@@ -216,6 +216,7 @@ mod tests {
             max_tasks_per_session: 25,
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
+            callback_task_id: None,
         };
         let tool = SendMessageTool;
 
@@ -287,6 +288,7 @@ mod tests {
             max_tasks_per_session: 25,
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
+            callback_task_id: None,
         };
         let tool = SendMessageTool;
 
@@ -340,6 +342,7 @@ mod tests {
             max_tasks_per_session: 25,
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
+            callback_task_id: None,
         };
         let tool = SendMessageTool;
 
@@ -389,6 +392,7 @@ mod tests {
             max_tasks_per_session: 25,
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
+            callback_task_id: None,
         };
         let tool = SendMessageTool;
 
@@ -442,6 +446,7 @@ mod tests {
             max_tasks_per_session: 25,
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
+            callback_task_id: None,
         };
         let tool = SendMessageTool;
 

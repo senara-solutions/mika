@@ -769,6 +769,7 @@ async fn run_investigation(
         max_tasks_per_session: 25,
         pr_review_posted: &pr_review_posted,
         pr_reviews_posted: None, // Investigation: no session-scoped dedup needed
+        callback_task_id: None,  // Investigation: not a callback turn
     };
 
     let mut text_sent = false;

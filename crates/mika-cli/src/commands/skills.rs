@@ -719,6 +719,8 @@ async fn test_skill_tool(
         entry.manifest.skill.timeout_secs,
         None,
         None,
+        None,
+        None,
     )
     .await;
 
