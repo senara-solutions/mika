@@ -2,11 +2,17 @@
 title: "Long-running handler silently falls through to sync exec path"
 category: logic-errors
 date: 2026-04-12
+last_updated: 2026-05-10
 tags: [skills, executor, long-running, callback, silent-mode]
 issue: "#537"
+superseded_in_part_by: "#1058"
 ---
 
 # Long-running handler silently falls through to sync exec path
+
+> **⚠ Superseded in part by mika#1058 (2026-05-10).** The gate this doc describes — "long-running tools cannot run in callback turns / silent mode" — was correct as a *hardening* of mika#537's silent-fallthrough bug, but the underlying *blanket refusal* of `long_running_ctx.is_none()` is itself a defect for legitimate use cases. PR #1061 (mika#1058) added a callback-safe path that wraps `DeferredDispatch` for callback turns carrying a `callback_task_id`, with lineage cycle detection on `(repo, issue_number, skill)`. Reading this doc without the mika#1058 update risks reintroducing the Mode B regression (mika-dev's pipeline-retry from callback context blocked, ~$4.61 of architect work discarded over 24h before the fix shipped).
+>
+> **Read alongside:** [`callback-deferred-dispatch-gate-rejection-2026-05-10.md`](./callback-deferred-dispatch-gate-rejection-2026-05-10.md) — the surgical fix that preserves this doc's defensive intent for direct calls but enables the safe callback path through deferred dispatch.
 
 ## Problem
 
