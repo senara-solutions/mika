@@ -87,6 +87,10 @@
   color: "2ea44f"
   description: Approved for autonomous dispatch
 
+- name: pipeline-exempt
+  color: "bfdadc"
+  description: "Docs-only or non-code PR exempt from pipeline gates"
+
 # ── Sprint Hooks ───────────────────────────────────────��─────────────────────
 - name: needs-build
   color: "d97706"
