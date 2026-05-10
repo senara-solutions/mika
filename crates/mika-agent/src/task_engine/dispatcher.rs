@@ -461,11 +461,11 @@ impl TaskDispatcher {
             // explicit advance instructions.
             self.maybe_fire_post_callback_advance(task).await;
 
-            // mika#1011 — Drain next pending deferred-dispatch callback (FIFO).
+            // mika#1011 — Promote next pending deferred-dispatch callback (FIFO).
             // The blocking dispatch just completed, so the slot is free. Promote
-            // the oldest pending deferred callback and dispatch it immediately.
-            // This must run AFTER mark_task_delivered to ensure the blocking
-            // callback is fully processed before the next dispatch fires.
+            // the oldest pending deferred callback to 'completed' status. The
+            // engine's next periodic scan (~60s) dispatches it as a
+            // DeferredDispatch silent turn. Must run AFTER mark_task_delivered.
             //
             // mika#1070 — Removed anti-cascade guard. The previous guard prevented
             // chain promotion when a DeferredDispatch turn itself completed (the

@@ -367,11 +367,11 @@ impl TaskEngine {
             chrono::Duration::minutes(crate::agent::STALE_FAILED_CALLBACK_MINUTES);
         let mut stale_skipped: usize = 0;
 
+        let now = crate::timestamp::now();
         for task in tasks {
             // Retry delay guard: skip tasks whose next_fire_at is in the future.
             // AgentBusy recovery (mika#1070) keeps status as 'completed' but sets
             // next_fire_at to enforce a 30s retry delay.
-            let now = crate::timestamp::now();
             if let Some(ref fire_at) = task.next_fire_at
                 && fire_at.as_str() > now.as_str()
             {
