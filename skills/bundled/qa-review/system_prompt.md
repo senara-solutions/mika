@@ -390,7 +390,7 @@ If missing: note it as a finding but do NOT block or hold for this alone. The co
 
 1. You have echoed `PR:`, `Size:`, `State:` (Step 1).
 2. You have emitted a `DIFF ANALYSIS:` section with real code-level bullets (Step 3d).
-3. You have emitted a `PLAN-AC VERIFICATION:` section (Step 2.5.6) listing every AC bullet — or, if Step 2.5.1/2.5.2 emitted `block[pipeline]`, you have not progressed to Step 5 with a non-block verdict.
+3. You have emitted a `PLAN-AC VERIFICATION:` section (Step 2.5.6) listing every AC bullet — or, if Step 2.5.1/2.5.2 emitted `block[pipeline]`, you have not progressed to Step 5 with a non-block verdict — or, if the `pipeline-exempt` bypass was honored in Step 2, you have emitted `PLAN-AC VERIFICATION: skipped (pipeline-exempt)`.
 4. If Step 3e ran, you have emitted a `BUILD VERIFICATION:` section (Step 3e.5).
 5. If verdict is `block[ac]`, you have emitted a `Plan amendment required:` section (Step 2.5.8).
 6. **You have called `run_gh("pr review <NUMBER> --<approve|comment> --body '<verdict_body>'")` and it returned success.** This is the only action that fires the `pull_request_review.submitted` webhook that mika-dev listens for. Without it, your review is invisible to the rest of the system — no matter how well-composed the verdict text is.
