@@ -474,15 +474,15 @@ pub async fn handle_task_complete(
                             warn!(task_id = %completed_task.id, error = %db_err, "failed to mark timed-out task as failed in DB");
                         }
                     } else {
-                        // Agent is busy — reset task to pending for the tick loop to retry
-                        debug!(task_id = %completed_task.id, "agent busy, deferring resume_agent to tick loop in 30s");
+                        // Agent is busy — keep status as 'completed' (already set at
+                        // update_task_completed above) so dispatch_undelivered_callbacks
+                        // can find it on the next scan. Only set next_fire_at for the
+                        // retry delay. mika#1070: resetting to 'pending' stranded
+                        // callbacks — neither get_schedulable_tasks (excludes callbacks)
+                        // nor get_undelivered_callback_tasks (requires completed/failed)
+                        // could find them.
+                        debug!(task_id = %completed_task.id, "agent busy, deferring resume_agent to callback scan in ~60s");
                         let retry_at = crate::timestamp::now_plus(chrono::Duration::seconds(30));
-                        if let Err(e) = db
-                            .update_task_status(&completed_task.id, task_status::PENDING)
-                            .await
-                        {
-                            warn!(task_id = %completed_task.id, error = %e, "failed to reset task status to pending for retry");
-                        }
                         if let Err(e) = db
                             .update_task_next_fire_at(&completed_task.id, &retry_at)
                             .await
