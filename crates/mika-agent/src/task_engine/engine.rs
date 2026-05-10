@@ -227,6 +227,11 @@ impl TaskEngine {
             // where the engine steals callbacks and processes them in a context-free
             // silent turn. See #264.
             if !self.dispatcher.cli_mode {
+                // mika#1070 — Promote-first ordering: promote deferred wrappers
+                // before scanning for dispatchable callbacks. The promotion DB write
+                // commits synchronously, so a promoted wrapper is visible to the
+                // dispatch_undelivered_callbacks scan in the same tick cycle.
+                self.promote_pending_deferred_if_idle().await;
                 self.dispatch_undelivered_callbacks().await;
             }
             // Reap parent self_dev tasks left in_progress after their callback
@@ -363,6 +368,16 @@ impl TaskEngine {
         let mut stale_skipped: usize = 0;
 
         for task in tasks {
+            // Retry delay guard: skip tasks whose next_fire_at is in the future.
+            // AgentBusy recovery (mika#1070) keeps status as 'completed' but sets
+            // next_fire_at to enforce a 30s retry delay.
+            let now = crate::timestamp::now();
+            if let Some(ref fire_at) = task.next_fire_at
+                && fire_at.as_str() > now.as_str()
+            {
+                continue;
+            }
+
             // Staleness guard: skip failed callbacks older than the threshold.
             // Completed callbacks are always delivered — they may carry legitimate results.
             if task.status == "failed" {
@@ -397,6 +412,26 @@ impl TaskEngine {
         if stale_skipped > 0 {
             info!(count = stale_skipped, "cleared stale failed callback tasks");
         }
+    }
+
+    /// Engine-level backstop for deferred-dispatch promotion (mika#1070).
+    ///
+    /// Runs every `DB_SCAN_INTERVAL_TICKS`. If pending deferred wrappers exist
+    /// AND no active non-deferred callback exists for the agent, promotes the
+    /// oldest wrapper. This recovers from any scenario where the inline
+    /// promotion at `dispatch_resume_agent` (dispatcher.rs) fails to fire.
+    async fn promote_pending_deferred_if_idle(&self) {
+        // Check if any non-deferred callback is currently in-flight
+        match self.db.has_any_active_callback().await {
+            Ok(true) => return, // Dispatch slot occupied — don't promote
+            Ok(false) => {}     // Slot free — check for promotable wrappers
+            Err(e) => {
+                warn!(error = %e, "failed to check active callbacks for deferred promotion");
+                return; // Fail-closed
+            }
+        }
+        // Promote the oldest pending deferred wrapper
+        self.dispatcher.dispatch_next_deferred_callback().await;
     }
 
     /// Detect dead subprocesses for active callback tasks (#959).

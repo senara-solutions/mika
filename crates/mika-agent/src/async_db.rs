@@ -573,6 +573,12 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Check if any non-deferred callback task is active (mika#1070).
+    pub async fn has_any_active_callback(&self) -> Result<bool> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.has_any_active_callback(&a)).await
+    }
+
     pub async fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
         self.with_db(move |db| db.prune_completed_tasks(older_than_secs))
             .await

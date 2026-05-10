@@ -5358,6 +5358,23 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Returns true if any non-deferred callback task is in pending or in_progress
+    /// status (i.e., a dispatch slot is occupied). Used by the engine-level
+    /// deferred-dispatch backstop (mika#1070).
+    pub fn has_any_active_callback(&self, agent_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND action_type = 'resume_agent'
+               AND status IN ('pending', 'in_progress')
+               AND label NOT LIKE '%:deferred'",
+            params![agent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
         let cutoff = timestamp::now_minus(Duration::seconds(older_than_secs));
         let n = self.conn.execute(
@@ -14339,5 +14356,175 @@ mod tests {
 
         // No more → returns false
         assert!(!db.promote_next_deferred_callback("mika").unwrap());
+    }
+
+    /// mika#1070 — Regression test: chain promotion works after anti-cascade
+    /// guard removal. Simulates the full lifecycle:
+    /// 1. Blocking callback completes → promotes wrapper W1
+    /// 2. W1's DeferredDispatch turn completes (mark delivered) → promotes W2
+    #[test]
+    fn test_deferred_dispatch_chain_promotion() {
+        let db = db();
+
+        // Create parent tasks
+        let p1 = db
+            .create_task(&new_task("mika", "host1", "manual", "none"))
+            .unwrap();
+        let p2 = db
+            .create_task(&new_task("mika", "host2", "manual", "none"))
+            .unwrap();
+
+        // Create two deferred wrappers
+        let mut w1 = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        w1.parent_task_id = Some(p1.clone());
+        let w1_id = db.create_task(&w1).unwrap();
+
+        let mut w2 = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        w2.parent_task_id = Some(p2.clone());
+        let w2_id = db.create_task(&w2).unwrap();
+
+        // Step 1: Promote W1 (simulates blocking callback completion)
+        assert!(db.promote_next_deferred_callback("mika").unwrap());
+        let t1 = db.get_task_unscoped(&w1_id).unwrap().unwrap();
+        assert_eq!(t1.status, "completed");
+        assert!(t1.completed_at.is_some());
+
+        // W1 should be returned by get_undelivered_callback_tasks
+        let since = crate::timestamp::now_minus(chrono::Duration::hours(1));
+        let undelivered = db.get_undelivered_callback_tasks("mika", &since).unwrap();
+        assert!(
+            undelivered.iter().any(|t| t.id == w1_id),
+            "promoted W1 should be in undelivered callbacks"
+        );
+
+        // Step 2: Mark W1 as delivered (simulates DeferredDispatch turn completion)
+        assert!(db.mark_task_delivered(&w1_id).unwrap());
+
+        // Step 3: Chain promotion — promote W2 (this was blocked by the
+        // anti-cascade guard before mika#1070)
+        assert!(db.promote_next_deferred_callback("mika").unwrap());
+        let t2 = db.get_task_unscoped(&w2_id).unwrap().unwrap();
+        assert_eq!(
+            t2.status, "completed",
+            "W2 should be promoted via chain promotion"
+        );
+
+        // W2 should be in undelivered callbacks
+        let undelivered = db.get_undelivered_callback_tasks("mika", &since).unwrap();
+        assert!(
+            undelivered.iter().any(|t| t.id == w2_id),
+            "promoted W2 should be in undelivered callbacks"
+        );
+    }
+
+    /// mika#1070 — Regression test: has_any_active_callback correctly identifies
+    /// active non-deferred callbacks and excludes deferred wrappers.
+    #[test]
+    fn test_has_any_active_callback() {
+        let db = db();
+
+        // No callbacks at all → false
+        assert!(!db.has_any_active_callback("mika").unwrap());
+
+        // Create parent task
+        let p1 = db
+            .create_task(&new_task("mika", "host1", "manual", "none"))
+            .unwrap();
+
+        // Add a deferred wrapper (should NOT count as active)
+        let mut deferred = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        deferred.parent_task_id = Some(p1.clone());
+        db.create_task(&deferred).unwrap();
+        assert!(
+            !db.has_any_active_callback("mika").unwrap(),
+            "deferred wrapper should not count as active callback"
+        );
+
+        // Add a regular callback (SHOULD count as active)
+        let p2 = db
+            .create_task(&new_task("mika", "host2", "manual", "none"))
+            .unwrap();
+        let mut regular = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        regular.parent_task_id = Some(p2.clone());
+        let reg_id = db.create_task(&regular).unwrap();
+        assert!(
+            db.has_any_active_callback("mika").unwrap(),
+            "regular pending callback should count as active"
+        );
+
+        // Complete then deliver → no more active
+        db.update_task_completed(&reg_id, "mika", Some("done"))
+            .unwrap();
+        db.mark_task_delivered(&reg_id).unwrap();
+        assert!(
+            !db.has_any_active_callback("mika").unwrap(),
+            "delivered callback should not count as active"
+        );
+    }
+
+    /// mika#1070 — Regression test: AgentBusy recovery keeps callback in
+    /// 'completed' status so dispatch_undelivered_callbacks can find it.
+    /// The old behavior reset to 'pending', which stranded the callback.
+    #[test]
+    fn test_agent_busy_callback_stays_completed() {
+        let db = db();
+
+        let p1 = db
+            .create_task(&new_task("mika", "host1", "manual", "none"))
+            .unwrap();
+
+        let mut cb = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        cb.parent_task_id = Some(p1.clone());
+        let cb_id = db.create_task(&cb).unwrap();
+
+        // Simulate external completion (webhook handler sets completed)
+        db.update_task_completed(&cb_id, "mika", Some("done"))
+            .unwrap();
+        let t = db.get_task_unscoped(&cb_id).unwrap().unwrap();
+        assert_eq!(t.status, "completed");
+
+        // Simulate AgentBusy: keep completed, just set next_fire_at for retry
+        let retry_at = crate::timestamp::now_plus(chrono::Duration::seconds(30));
+        db.update_task_next_fire_at(&cb_id, &retry_at).unwrap();
+
+        // The task should still be found by get_undelivered_callback_tasks
+        let since = crate::timestamp::now_minus(chrono::Duration::hours(1));
+        let undelivered = db.get_undelivered_callback_tasks("mika", &since).unwrap();
+        assert!(
+            undelivered.iter().any(|t| t.id == cb_id),
+            "AgentBusy callback should remain in completed status and be findable"
+        );
+
+        // Verify it has next_fire_at set (for retry delay guard in engine)
+        let t = db.get_task_unscoped(&cb_id).unwrap().unwrap();
+        assert!(
+            t.next_fire_at.is_some(),
+            "AgentBusy callback should have next_fire_at for retry delay"
+        );
     }
 }

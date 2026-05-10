@@ -466,12 +466,13 @@ impl TaskDispatcher {
             // the oldest pending deferred callback and dispatch it immediately.
             // This must run AFTER mark_task_delivered to ensure the blocking
             // callback is fully processed before the next dispatch fires.
-            if task.label != crate::agent::DEFERRED_DISPATCH_LABEL {
-                // Only drain from non-deferred callback completions to prevent
-                // cascading deferred dispatches from draining the whole queue
-                // in a single call stack (each deferred turn drains one more).
-                self.dispatch_next_deferred_callback().await;
-            }
+            //
+            // mika#1070 — Removed anti-cascade guard. The previous guard prevented
+            // chain promotion when a DeferredDispatch turn itself completed (the
+            // label matched DEFERRED_DISPATCH_LABEL). Each promotion is a DB write
+            // (LIMIT 1) that returns immediately; the promoted task dispatches on
+            // the next engine tick — no call-stack cascade.
+            self.dispatch_next_deferred_callback().await;
         }
 
         if let Err(e) = self.db.end_session(&session_id).await {
@@ -944,21 +945,21 @@ impl TaskDispatcher {
         true
     }
 
-    /// mika#1011 — Promote the next pending deferred-dispatch callback to `in_progress`.
+    /// mika#1011 — Promote the next pending deferred-dispatch callback to `completed`.
     ///
-    /// Called after a blocking callback completes (mark_task_delivered succeeded).
-    /// Promotes the oldest pending deferred callback to `in_progress` (FIFO).
-    /// The task engine's periodic scan picks up `in_progress` resume_agent tasks
+    /// Called after a blocking callback completes (mark_task_delivered succeeded),
+    /// and by the engine-level periodic backstop (mika#1070).
+    /// Promotes the oldest pending deferred callback to `completed` (FIFO).
+    /// The task engine's periodic scan picks up `completed` resume_agent tasks
     /// and dispatches them via `dispatch_resume_agent`, which constructs a
     /// `SilentTrigger::DeferredDispatch` turn for tasks with the deferred label.
-    async fn dispatch_next_deferred_callback(&self) {
+    pub(crate) async fn dispatch_next_deferred_callback(&self) {
         match self.db.promote_next_deferred_callback().await {
             Ok(true) => {
-                info!("deferred_dispatch_promoted — task marked completed for engine dispatch");
-                // The task engine's periodic scan will pick up the completed
-                // resume_agent callback task and dispatch it through
-                // dispatch_resume_agent, which detects DEFERRED_DISPATCH_LABEL
-                // and creates SilentTrigger::DeferredDispatch.
+                info!(
+                    event = "deferred_dispatch_promoted",
+                    "promoted oldest pending deferred wrapper for engine dispatch"
+                );
             }
             Ok(false) => {} // No pending deferred callbacks
             Err(e) => {
