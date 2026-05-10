@@ -16,8 +16,9 @@
 #   !docs && source          -> REJECT (code-only PR)
 #   !docs && !source         -> warn + pass (pure config or no diff)
 #
-# Exempt trailers (any commit in the base..HEAD range):
-#   Pipeline-Exempt: docs-only  -> bypass docs-only rejection
+# Exemptions:
+#   pipeline-exempt PR label    -> bypass docs-only rejection (preferred, mika#1067)
+#   Pipeline-Exempt: docs-only  -> bypass docs-only rejection (trailer fallback)
 #   Pipeline-Exempt: code-only  -> bypass code-only rejection
 #
 # Note: this script previously enforced an unconditional plan-doc-presence
@@ -86,13 +87,28 @@ if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only(\s.*)?$'; then
   EXEMPT_CODE_ONLY=1
 fi
 
+# Label-based exemption: read PR labels from GitHub Actions event payload
+# GITHUB_EVENT_PATH is always set in GitHub Actions; contains the full event JSON.
+# For pull_request events, labels are at .pull_request.labels[].name.
+# No gh CLI or GITHUB_TOKEN needed — reads a local file.
+EXEMPT_LABEL_DOCS=0
+if [[ -n "${GITHUB_EVENT_PATH:-}" ]]; then
+  if jq -e '.pull_request.labels[]? | select(.name == "pipeline-exempt")' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
+    EXEMPT_LABEL_DOCS=1
+  fi
+fi
+
 if [[ -n "$DOCS_BUCKET" && -z "$SOURCE_BUCKET" ]]; then
-  if [[ "$EXEMPT_DOCS_ONLY" == "1" ]]; then
-    echo "warn: docs-only PR allowed by Pipeline-Exempt: docs-only trailer" >&2
+  if [[ "$EXEMPT_DOCS_ONLY" == "1" || "$EXEMPT_LABEL_DOCS" == "1" ]]; then
+    if [[ "$EXEMPT_LABEL_DOCS" == "1" ]]; then
+      echo "warn: docs-only PR allowed by pipeline-exempt label" >&2
+    else
+      echo "warn: docs-only PR allowed by Pipeline-Exempt: docs-only trailer" >&2
+    fi
   else
     echo "REJECT: docs-only PR: plan/solution present but no source changes" >&2
-    echo "        Add 'Pipeline-Exempt: docs-only — <reason>' trailer to a commit" >&2
-    echo "        if this docs-only ship is intentional (e.g. standalone /ce:compound)." >&2
+    echo "        Apply the 'pipeline-exempt' label to the PR (preferred), or add" >&2
+    echo "        'Pipeline-Exempt: docs-only — <reason>' trailer to a commit." >&2
     ERRORS=$((ERRORS + 1))
   fi
 fi
