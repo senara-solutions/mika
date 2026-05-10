@@ -159,6 +159,9 @@ if task_id.is_some() && user_message.len() > MAX_CALLBACK_RESULT {
 | Trust boundary | Prompt injection from subprocess output | LLM-level defense |
 | Size limit (100KB) | Memory exhaustion from unbounded payloads | Resource defense |
 | Early return | Callback falling through to full agent | Structural separation |
+| Lineage cycle detection (mika#1058) | Callback re-dispatching itself or its ancestors via `(repo, issue_number, skill)` tuple | `parent_task_id` walk + `depth ≤ 3` schema CHECK as structural backstop |
+
+**Update (mika#1058, 2026-05-10):** when the executor's `long_running_ctx == None` rejection fires for a `run_claude_pilot` retry from a `PIPELINE FAILURE` callback, `executor.rs` now intercepts the rejection and registers a `DeferredDispatch` callback (label `long_running:run_claude_pilot:deferred`) instead of returning a hard error. The dispatcher fires it as a fresh silent turn with `long_running_ctx` injected. Loop prevention at this new layer is **lineage cycle detection on `(repo, issue_number, skill)` tuple via `parent_task_id` walk** (allows cross-skill chains like `groom-#159 → pilot-#159`; rejects same-tuple recurrence and A→B→A class). The original blanket gate is preserved for direct calls; only the new callback-safe path is gate-exempt. See `docs/solutions/logic-errors/callback-deferred-dispatch-gate-rejection-2026-05-10.md`.
 
 ## Architectural Invariants
 
