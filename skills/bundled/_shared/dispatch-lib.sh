@@ -355,6 +355,20 @@ ${RESULT}"
             fi
         fi
 
+        # Post-flight plan validation (mika#1033): detect dev-groom drift where
+        # the session exits "success" but produced no valid plan file (or only a
+        # stub/empty one). Runs independently of the HEAD-diff check — a session
+        # can commit a 0-byte plan (HEAD changed) but still fail this check.
+        if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
+            TODAY_PREFIX=$(date +%Y-%m-%d)
+            VALID_PLAN=$(find "$WORKTREE_DIR/docs/plans" -name "${TODAY_PREFIX}-*-plan.md" -size +500c 2>/dev/null | head -1)
+            if [ -z "$VALID_PLAN" ]; then
+                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no docs/plans/${TODAY_PREFIX}-*-plan.md >500 bytes found). Session likely drifted into executor mode.
+
+${RESULT}"
+            fi
+        fi
+
         # Issue #138: Discover actual PR URL from the branch
         if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
             PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
