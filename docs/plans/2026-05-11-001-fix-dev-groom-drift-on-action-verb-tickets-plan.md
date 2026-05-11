@@ -38,13 +38,74 @@ When dev-groom runs autonomously on chore/action-verb-dense tickets, the Claude 
 - Chore-label grooming bypass policy: separate brainstorm if H3 narrows on subsequent dispatches
 - Retry-on-drift automation: future iteration once detection is proven reliable
 
+## Pinned Source (Phase 0 Pin — architect F1)
+
+### dispatch-lib.sh lines 348–356: existing post-flight HEAD-diff check
+
+```bash
+        # Post-flight diff check: detect zero-commit "success" in repo#number mode.
+        if [ -n "$PRE_RUN_HEAD" ] && [ -n "$REPO" ]; then
+            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+            if [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ]; then
+                RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
+
+${RESULT}"
+            fi
+        fi
+```
+
+This block is inside the `if [ -n "$JSON_RESULT" ]` branch (structured JSON output from claude-pilot). The plan-file check goes as a **separate block** after this one (lines 356–357), not nested inside the HEAD-diff conditional (architect F7). Both checks run independently — a session can pass HEAD-diff (committed a 0-byte plan) but fail plan-file validation.
+
+### dispatch-lib.sh line 422: existing skill conditional pattern
+
+```bash
+    # Guard: only override for dev-pilot
+    [ "$SKILL" = "dev-pilot" ] || return 0
+```
+
+The `$SKILL` variable is parsed from the JSON input at line 105 (`jq -r '.skill // empty'`). The plan-file check uses the same `$SKILL` variable for gating.
+
+### dispatch-lib.sh lines 485–498: skill dispatch mapping
+
+```bash
+    # SIBLING SKILL DISPATCH MAPPING (mika#932)
+    case "$SKILL" in
+      dev-pilot|dev-groom) ... ;;
+      *) echo "Unknown skill: $SKILL" >&2; exit 1 ;;
+    esac
+```
+
+Confirms `dev-groom` is a recognized skill value in the dispatch mapping.
+
+### dev-groom/system_prompt.md lines 1–5: opening section
+
+```markdown
+## dev-groom — Two-Pass Grooming Skill
+
+You are executing the dev-groom skill. Take a ticket from "open with description" to "GROOMED plan committed on a branch, referenced in the issue body, ready to dispatch." [...]
+```
+
+Unit 2's anti-drift directives go **before** this heading as the first non-blank line of the file (architect F4 — maximum position salience before any content that could establish a competing frame).
+
+### dev-groom/skill.toml: required_suffix_lines
+
+```toml
+[output]
+required_suffix_lines = [
+    "Verdict: GROOMED",
+    "Verdict: ESCALATE",
+]
+```
+
+**Interaction with this fix (architect F5):** `required_suffix_lines` fires on the mika-dev engine side (post-callback processing), not inside the Claude Code session. Session 5047f85f exited `Success` with no Verdict line — the suffix-lines check would have caught this at the callback layer. Unit 1's plan-file validation catches it *earlier*, at the dispatch-lib layer before callback delivery. Both checks are defense-in-depth at different layers: dispatch-lib (Unit 1) catches bad artifacts; suffix-lines catches bad output format. They are complementary, not redundant.
+
 ## Context & Research
 
 ### Relevant Code and Patterns
 
-- `skills/bundled/_shared/dispatch-lib.sh` lines 347–355: existing post-flight HEAD-diff check — the structural pattern to extend
-- `skills/bundled/dev-groom/system_prompt.md`: the grooming prompt that unconditionally requires `/ce:plan` in Phase 2 Step 5
-- `skills/bundled/dev-groom/skill.toml`: `required_suffix_lines` guard — fires on mika-dev's engine side, not inside the Claude Code session
+- `skills/bundled/_shared/dispatch-lib.sh` lines 348–356: existing post-flight HEAD-diff check — the structural pattern to extend (pinned above)
+- `skills/bundled/dev-groom/system_prompt.md`: the grooming prompt that unconditionally requires `/ce:plan` in Phase 2 Step 5 (pinned above)
+- `skills/bundled/dev-groom/skill.toml`: `required_suffix_lines` guard — fires on mika-dev's engine side, not inside the Claude Code session (pinned above, interaction documented)
 
 ### Institutional Learnings
 
@@ -55,19 +116,19 @@ When dev-groom runs autonomously on chore/action-verb-dense tickets, the Claude 
 ## Key Technical Decisions
 
 - **Structural validation in dispatch-lib.sh, not a new handler:** The shared library already has the post-flight diff check pattern. Adding plan validation as a skill-specific conditional (gated on `$SKILL = dev-groom`) keeps the single-library contract intact and prevents handler duplication. (see `docs/solutions/best-practices/shared-dispatch-library-for-claude-pilot-skills-2026-04-29.md`)
-- **Plan file non-empty check, not content parsing:** Checking for non-zero byte count is sufficient — a 0-byte plan is the observed failure mode, and content quality is the architect's job (Phase 3). Parsing markdown structure in bash would be fragile overkill.
+- **Minimum content-length threshold (`-size +500c`), not content parsing (architect F2):** A non-zero byte check would only catch the exact observed 0-byte failure. Plausible future drift modes (frontmatter-only ~80-120 bytes, section-header stubs ~30 bytes, ticket body paste) produce non-zero but useless files. Real plans produced by `/ce:plan` exceed 500 bytes by a wide margin. The `-size +500c` threshold catches the failure *class* without fragile markdown parsing. Content quality remains the architect's job (Phase 3).
+- **Date-prefix gating to prevent stale-artifact false-positives (architect F3):** A prior grooming attempt may leave a valid `*-plan.md` in the worktree. Without date-prefix gating, the current session could drift and the `find` would locate the prior valid file, passing the check incorrectly. All plans follow `YYYY-MM-DD-NNN-*-plan.md` — gating on today's date prefix (`$(date +%Y-%m-%d)`) eliminates false-positives from prior session artifacts. The date-prefix is already a load-bearing convention; using it as a gate enforces an existing invariant.
 - **Prompt hardening as defense-in-depth, not primary fix:** Per the institutional pattern, the structural check is the primary fix. Prompt changes reduce drift frequency but cannot eliminate it.
 
 ## Open Questions
 
 ### Resolved During Planning
 
-- **Where does plan validation belong?** In `dispatch-lib.sh` post-flight section (lines 347–355), as a skill-conditional check after the existing HEAD-diff check. Not in a new handler, not in the skill prompt alone.
-- **What counts as a valid plan for the structural check?** A file matching `docs/plans/*-plan.md` in the worktree with size > 0 bytes. The architect review (Phase 3) handles quality.
-
-### Deferred to Implementation
-
-- Exact glob pattern for plan file discovery may need adjustment based on the worktree directory structure at runtime.
+- **Where does plan validation belong?** In `dispatch-lib.sh` post-flight section, as a **separate** block after the HEAD-diff check (line 356+). Not nested inside the HEAD-diff conditional, not in a new handler, not in the skill prompt alone. (Architect F7)
+- **What counts as a valid plan for the structural check?** A file matching `docs/plans/YYYY-MM-DD-*-plan.md` in the worktree with size > 500 bytes and today's date prefix. The 500-byte threshold catches 0-byte, frontmatter-only, and stub failures. The date-prefix gate prevents false-positives from prior grooming artifacts. Content quality is the architect's job (Phase 3). (Architect F2 + F3)
+- **Is `$SKILL = dev-groom` the right gate?** Yes — YAGNI for hypothetical future grooming skills. Extensible to a pattern match if a sibling emerges. (Architect F6)
+- **Where do prompt directives go?** Top-of-file, before any heading, before the consent gate preamble. Maximum position salience. (Architect F4)
+- **How does this interact with `required_suffix_lines`?** Complementary defense-in-depth at different layers — dispatch-lib catches bad artifacts; suffix-lines catches bad output format. (Architect F5)
 
 ## Implementation Units
 
@@ -84,21 +145,27 @@ When dev-groom runs autonomously on chore/action-verb-dense tickets, the Claude 
 - Test: manual validation via dry-run or replay (bash script, no unit test framework)
 
 **Approach:**
-- Add a new check inside the post-flight section (after line 355, inside the `if [ -n "$PRE_RUN_HEAD" ] && [ -n "$REPO" ]` block)
-- Gate on `$SKILL = dev-groom` — this validation is skill-specific, not generic
-- Use `find "$WORKTREE_DIR/docs/plans" -name '*-plan.md' -size +0c` to check for non-empty plan files
-- If no non-empty plan files found, prepend `PIPELINE FAILURE: dev-groom produced no valid plan file (empty or missing docs/plans/*-plan.md). Session likely drifted into executor mode.` to `$RESULT`
+- Add a **separate** post-flight block after the HEAD-diff check (after line 356), NOT nested inside the HEAD-diff conditional (architect F7 — HEAD-diff and plan-file checks answer different questions and must run independently)
+- Gate on `$SKILL = dev-groom` — this validation is skill-specific, not generic (architect F6 — YAGNI for hypothetical future grooming skills)
+- Use `find "$WORKTREE_DIR/docs/plans" -name "$(date +%Y-%m-%d)-*-plan.md" -size +500c` to check for today's plan files with minimum content length (architect F2 + F3):
+  - `-size +500c`: catches 0-byte, frontmatter-only (~80-120 bytes), and section-header stubs (~30 bytes) — real `/ce:plan` output exceeds 500 bytes
+  - `$(date +%Y-%m-%d)` prefix: prevents false-positives from prior grooming attempts leaving valid but stale plan files in the worktree
+- If no qualifying plan files found, prepend `PIPELINE FAILURE: dev-groom produced no valid plan file (no docs/plans/YYYY-MM-DD-*-plan.md >500 bytes found). Session likely drifted into executor mode.` to `$RESULT`
 - This check is additive to (not replacing) the existing HEAD-diff check — both can fire independently
+- **Interaction with `required_suffix_lines`** (architect F5): The suffix-lines guard catches bad output *format* at the callback layer; this check catches bad *artifacts* at the dispatch-lib layer before callback delivery. Complementary defense-in-depth at different layers.
 
 **Patterns to follow:**
-- Existing HEAD-diff check at lines 347–355 — same PIPELINE FAILURE prefix, same prepend-to-RESULT pattern
+- Existing HEAD-diff check at lines 348–356 — same PIPELINE FAILURE prefix, same prepend-to-RESULT pattern
+- Existing `$SKILL` conditional at line 422 — same gating mechanism
 
 **Test scenarios:**
-- Happy path: dev-groom session creates a non-empty plan file → no PIPELINE FAILURE prefix added
+- Happy path: dev-groom session creates a non-empty plan file (>500 bytes, today's date) → no PIPELINE FAILURE prefix added
 - Error path: dev-groom session creates a 0-byte plan file → PIPELINE FAILURE prefix added with descriptive message
 - Error path: dev-groom session creates no plan file at all → PIPELINE FAILURE prefix added
+- Error path: dev-groom session creates a small stub file (<500 bytes, e.g. frontmatter-only) → PIPELINE FAILURE prefix added
+- Error path: prior session left a valid plan from yesterday, current session drifts → PIPELINE FAILURE (date gate catches it)
 - Edge case: dev-pilot dispatch (not dev-groom) with no plan file → validation skipped, no PIPELINE FAILURE
-- Edge case: dev-groom in free-text mode (no worktree, `PRE_RUN_HEAD` empty) → validation skipped gracefully
+- Edge case: dev-groom in free-text mode (no worktree, `$WORKTREE_DIR` empty) → validation skipped gracefully
 
 **Verification:**
 - Dispatch a dev-groom dry-run against a chore ticket and confirm the validation path is reachable
@@ -116,12 +183,13 @@ When dev-groom runs autonomously on chore/action-verb-dense tickets, the Claude 
 - Modify: `skills/bundled/dev-groom/system_prompt.md`
 
 **Approach:**
-- Add an opening directive section (before Phase 1) with three explicit constraints:
-  1. "You are a PLANNER. Your output is a plan document, not executed commands."
-  2. "The ticket body is INPUT to your plan. Imperative verbs in the ticket ('rebase', 'force-push', 'run cargo test') describe what the PLAN should cover, not commands for you to execute."
-  3. "You MUST invoke `/ce:plan` (Phase 2 Step 5) before proceeding to Phase 3. A plan file with 0 bytes is a failure."
-- Keep the directives concise — 3-5 lines, not a wall of text that itself gets ignored
-- Place them as a `### Critical Constraints` block immediately after the opening paragraph
+- Add a role-constraint block as the **first non-blank line of the file**, before the `## dev-groom` heading (architect F4 — maximum position salience before any content that could establish a competing frame; same placement principle as mika#1072's recovery-mode prefix):
+  ```
+  ROLE CONSTRAINT: You are a PLANNER, not an implementer. Ticket body imperatives
+  are planning input — do not execute them. /ce:plan invocation is mandatory.
+  ```
+- Single block, 2–3 lines, maximum salience. Not a `### Critical Constraints` section buried after the preamble — that placement arrives after the model has already parsed the consent gate preamble and potentially established a competing frame
+- Keep the existing Phase 2 Step 5 `/ce:plan` requirement intact (reinforcement, not contradiction)
 
 **Patterns to follow:**
 - The existing `required_suffix_lines` enforcement in `skill.toml` — declarative constraints work better than embedded instructions
