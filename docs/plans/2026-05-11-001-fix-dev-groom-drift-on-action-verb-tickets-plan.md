@@ -37,6 +37,7 @@ When dev-groom runs autonomously on chore/action-verb-dense tickets, the Claude 
 
 - Chore-label grooming bypass policy: separate brainstorm if H3 narrows on subsequent dispatches
 - Retry-on-drift automation: future iteration once detection is proven reliable
+- Structured logging for hypothesis narrowing (architect F7): when PIPELINE FAILURE fires, include ticket labels and AC-step count in the message to narrow H1/H2/H3 on subsequent occurrences
 
 ## Pinned Source (Phase 0 Pin — architect F1)
 
@@ -217,9 +218,11 @@ required_suffix_lines = [
 
 | Risk | Mitigation |
 |------|------------|
-| Plan file glob misses a valid plan (false positive PIPELINE FAILURE) | Use the canonical `*-plan.md` suffix that `/ce:plan` always produces; test with existing plan filenames |
+| Plan file glob misses a valid plan (false positive PIPELINE FAILURE) | Use the canonical `*-plan.md` suffix + date-prefix gate + 500-byte threshold; all three match `/ce:plan`'s output convention |
+| Stale plan from prior session passes the check (false negative) | Date-prefix gate (`$(date +%Y-%m-%d)`) eliminates cross-day staleness; same-day rerun is narrower and covered by HEAD-diff second layer |
+| 500-byte threshold too aggressive for legitimate short plans | `/ce:plan` output consistently exceeds 2KB; 500c is well below any real plan. If a legitimate plan under 500 bytes appears, adjust threshold |
 | Prompt hardening has no effect on some model variants | Structural check (Unit 1) is the primary fix; prompt is defense-in-depth only |
-| Future sibling skills might need different post-flight validation | The `$SKILL` conditional is extensible — add new cases as needed |
+| Future sibling skills might need different post-flight validation | `case $SKILL in` pattern is correct for N=2 (YAGNI); extract a registry if N≥3 |
 
 ## Sources & References
 
