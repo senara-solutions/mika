@@ -91,12 +91,22 @@ fn print_task_summary(t: &Task) {
         .as_ref()
         .map(|s| format_ts(s))
         .unwrap_or_else(|| t.trigger_type.clone());
-    let pid_info = t
-        .process_id
-        .map(|pid| format!(" [PID {pid}]"))
-        .unwrap_or_default();
+    // For callback tasks, annotate executing vs queued (#1057)
+    let status_info = if t.trigger_type == "callback" {
+        if let Some(pid) = t.process_id {
+            format!(" [executing, PID {pid}]")
+        } else if t.status == "pending" || t.status == "in_progress" {
+            " [queued]".to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        t.process_id
+            .map(|pid| format!(" [PID {pid}]"))
+            .unwrap_or_default()
+    };
     println!(
-        "    {}: [{}] [{}] \"{}\" ({}){pid_info}",
+        "    {}: [{}] [{}] \"{}\" ({}){status_info}",
         short_id, t.status, t.action_type, t.label, when
     );
 }

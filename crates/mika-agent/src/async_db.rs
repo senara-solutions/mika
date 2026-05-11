@@ -8,10 +8,11 @@ use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
 use crate::db::{
-    AgentRow, AgentWithStats, AuditEvent, Commitment, CoreMemoryEntry, Database, Event, FailedSend,
-    NewTask, Person, Preference, SearchResult, Session, SessionMessage, SessionWithStats,
-    SkillOverride, Task, TaskFilters, TaskHealthSummary, TaskSessionRow, TeamRow, TeamRunFilters,
-    TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    AgentRow, AgentWithStats, AuditEvent, BackgroundTaskCounts, Commitment, CoreMemoryEntry,
+    Database, Event, FailedSend, NewTask, Person, Preference, SearchResult, Session,
+    SessionMessage, SessionWithStats, SkillOverride, Task, TaskFilters, TaskHealthSummary,
+    TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary, TeamWorkspaceEntry,
+    TimelineFilters, TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&mut Database) + Send>;
@@ -419,6 +420,12 @@ impl AsyncDatabase {
     pub async fn get_user_visible_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.get_user_visible_tasks(&id)).await
+    }
+
+    pub async fn get_background_task_counts(&self) -> Result<BackgroundTaskCounts> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.get_background_task_counts(&id))
+            .await
     }
 
     pub async fn get_active_background_task_count(&self) -> Result<usize> {
