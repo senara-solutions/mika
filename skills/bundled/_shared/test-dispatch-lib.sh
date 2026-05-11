@@ -179,6 +179,86 @@ else
     echo "  ✗ self-dev/system_prompt.md not found at expected path"
 fi
 
+# --- Test 6: Plan-on-branch detection (mika#1074) ---
+
+echo ""
+echo "Test 6: Plan-on-branch detection (_detect_plan_on_branch)"
+echo "----------------------------------------------------------"
+
+# Verify the helper function exists
+PLAN_FUNC=$(sed -n '/_detect_plan_on_branch()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "Function _detect_plan_on_branch exists" "_detect_plan_on_branch()" "$PLAN_FUNC"
+
+# Verify it guards on dev-pilot skill
+assert_contains "Guards on dev-pilot skill" 'dev-pilot' "$PLAN_FUNC"
+
+# Verify it checks ISSUE_BODY is non-empty
+assert_contains "Checks ISSUE_BODY is non-empty" 'ISSUE_BODY' "$PLAN_FUNC"
+
+# Verify it checks WORKTREE_DIR is non-empty
+assert_contains "Checks WORKTREE_DIR is non-empty" 'WORKTREE_DIR' "$PLAN_FUNC"
+
+# Verify it uses the correct plan callout pattern with docs/plans/ prefix
+assert_contains "Uses docs/plans/ prefix in pattern" 'docs/plans/' "$PLAN_FUNC"
+
+# Verify it validates file existence ([ -f or test -f)
+assert_contains "Validates plan file exists before overriding" '[ -f' "$PLAN_FUNC"
+
+# Verify it overrides ENTRY_COMMAND to /ce:work
+assert_contains "Overrides ENTRY_COMMAND to /ce:work" '/ce:work' "$PLAN_FUNC"
+
+# Verify the function is called in dispatch_claude_pilot after _set_up_worktree
+# and before _handle_dry_run
+DISPATCH_BODY=$(sed -n '/^dispatch_claude_pilot()/,/^}/p' "$DISPATCH_LIB")
+# Extract the call sequence: _set_up_worktree, _detect_plan_on_branch, _handle_dry_run
+CALL_SEQUENCE=$(printf '%s\n' "$DISPATCH_BODY" | grep -E '^\s+_(set_up_worktree|detect_plan_on_branch|handle_dry_run)' | tr -s ' ' | sed 's/^ //')
+EXPECTED_SEQUENCE=$(printf '%s\n' "_set_up_worktree" "_detect_plan_on_branch" "_handle_dry_run")
+assert_eq "Call ordering: _set_up_worktree -> _detect_plan_on_branch -> _handle_dry_run" "$EXPECTED_SEQUENCE" "$CALL_SEQUENCE"
+
+# Verify the case switch is unchanged (dev-pilot still maps to /mika as default)
+CASE_BLOCK=$(sed -n '/case "\$SKILL" in/,/esac/p' "$DISPATCH_LIB")
+assert_contains "Case switch still maps dev-pilot to /mika" 'dev-pilot)  ENTRY_COMMAND="/mika"' "$CASE_BLOCK"
+assert_contains "Case switch still maps dev-groom to /mika-groom-ticket" 'dev-groom)  ENTRY_COMMAND="/mika-groom-ticket"' "$CASE_BLOCK"
+
+# Verify fallback behavior: function returns 0 (no-op) on guard failures
+# 4 guards: skill, issue_body, worktree_dir, plan_path empty
+NON_COMMENT_RETURNS=$(printf '%s\n' "$PLAN_FUNC" | grep -v '^\s*#' | grep -c 'return 0' || true)
+assert_eq "Has 4 guard return statements (skill, body, worktree, plan_path)" "4" "$NON_COMMENT_RETURNS"
+
+# --- Test 7: Plan callout regex extraction (mika#1074) ---
+
+echo ""
+echo "Test 7: Plan callout regex extraction (live)"
+echo "----------------------------------------------"
+
+# Exercise the grep -oP regex against a canonical callout string
+CALLOUT_REGEX='> - \*\*Plan:\*\* `\Kdocs/plans/[^`]+'
+
+# Happy path: canonical callout with trailing context
+TEST_BODY='> - **Plan:** `docs/plans/2026-05-11-001-feat-foo-plan.md` (committed on branch @ abc1234)'
+EXTRACTED=$(printf '%s\n' "$TEST_BODY" | grep -oP "$CALLOUT_REGEX" | head -1)
+assert_eq "Extracts plan path from canonical callout" "docs/plans/2026-05-11-001-feat-foo-plan.md" "$EXTRACTED"
+
+# Edge case: callout with no trailing context (just backtick-close)
+TEST_BODY2='> - **Plan:** `docs/plans/short.md`'
+EXTRACTED2=$(printf '%s\n' "$TEST_BODY2" | grep -oP "$CALLOUT_REGEX" | head -1)
+assert_eq "Extracts plan path from minimal callout" "docs/plans/short.md" "$EXTRACTED2"
+
+# Edge case: prose containing "Plan:" without docs/plans/ prefix — should NOT match
+TEST_BODY3='The Plan: is to refactor the module'
+EXTRACTED3=$(printf '%s\n' "$TEST_BODY3" | grep -oP "$CALLOUT_REGEX" | head -1 || true)
+assert_eq "Prose Plan: without docs/plans/ prefix does not match" "" "$EXTRACTED3"
+
+# Edge case: multiple callouts — first one wins
+TEST_BODY4='> - **Plan:** `docs/plans/first.md` (committed on branch @ aaa)
+> - **Plan:** `docs/plans/second.md` (committed on branch @ bbb)'
+EXTRACTED4=$(printf '%s\n' "$TEST_BODY4" | grep -oP "$CALLOUT_REGEX" | head -1)
+assert_eq "Multiple callouts: first one wins" "docs/plans/first.md" "$EXTRACTED4"
+
+# Verify dry_run output includes entry_command field
+DRY_RUN_JQ=$(sed -n '/_handle_dry_run()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "Dry run output includes entry_command" 'entry_command' "$DRY_RUN_JQ"
+
 # --- Summary ---
 
 echo ""
