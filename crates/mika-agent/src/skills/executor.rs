@@ -857,10 +857,7 @@ async fn validate_dispatch_readiness(
     // Per-class dispatch guard (#583, #1001): reject if another task of the
     // SAME dispatch class has an active callback child. The slot split allows
     // one 'implement' + one 'groom' dispatch concurrently per agent.
-    let dispatch_class = tool_input
-        .and_then(extract_skill_from_input)
-        .map(Some)
-        .unwrap_or(None);
+    let dispatch_class = tool_input.and_then(extract_skill_from_input);
     let class = derive_dispatch_class(dispatch_class);
     match db.has_active_callback_tasks_excluding(task_id, class).await {
         Ok(Some((blocking_parent_id, blocking_callback_id))) => {
