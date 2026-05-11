@@ -84,7 +84,7 @@ Run these checks using `run_gh`. Combine into as few calls as possible. If ANY c
 If the labels include `pipeline-exempt`:
 1. Confirm the PR is docs-only by running the same source-change check as check 2:
    ```
-   run_gh("pr diff <PR_URL> --name-only | grep -v '^docs/plans/' | grep -v '^docs/solutions/' | grep -v '^\\.claude/' | grep -v '^\\.github/' | head -1")
+   run_gh("pr diff <PR_URL> --name-only | grep -v '^docs/' | grep -v '^\\.github/' | grep -v '^\\.claude/' | head -1")
    ```
 2. If the result is empty (no source files): skip checks 1–3 and Step 2.5 entirely. Note: "Pipeline-exempt: docs-only PR, skipping pipeline checks and plan-AC verification." Jump to Step 3.
 3. If the result is non-empty (source files present): note "pipeline-exempt label present but PR contains source changes — ignoring label." Continue with checks 1–3 normally.
@@ -97,9 +97,9 @@ If the labels do NOT include `pipeline-exempt`: continue with checks 1–3 norma
    ```
    If no match: `block[pipeline]` — "Missing plan document in docs/plans/"
 
-2. **Source changes exist** — Check that the PR has changes beyond `docs/plans/`, `docs/solutions/`, and `.claude/`:
+2. **Source changes exist** — Check that the PR has changes beyond `docs/`, `.github/`, and `.claude/`:
    ```
-   run_gh("pr diff <PR_URL> --name-only | grep -v '^docs/plans/' | grep -v '^docs/solutions/' | grep -v '^\\.claude/' | head -1")
+   run_gh("pr diff <PR_URL> --name-only | grep -v '^docs/' | grep -v '^\\.github/' | grep -v '^\\.claude/' | head -1")
    ```
    If empty: `block[pipeline]` — "No source changes beyond documentation"
 
