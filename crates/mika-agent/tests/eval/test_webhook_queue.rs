@@ -58,6 +58,7 @@ async fn create_task(db: &AsyncDatabase, pr_url: &str, branch: &str) -> String {
             source: Some("github_issue".to_string()),
             metadata: Some(serde_json::to_string(&metadata).unwrap()),
             r#type: None,
+            dispatch_class: None,
         })
         .await
         .expect("create task");
@@ -93,6 +94,7 @@ async fn create_callback_task(db: &AsyncDatabase, parent_id: &str) -> String {
         source: None,
         metadata: None,
         r#type: None,
+        dispatch_class: None,
     })
     .await
     .expect("create callback task")
@@ -402,6 +404,7 @@ async fn fallback_defers_when_sole_inflight_callback() {
             source: None,
             metadata: Some(serde_json::to_string(&metadata).unwrap()),
             r#type: None,
+            dispatch_class: None,
         })
         .await
         .expect("create task");

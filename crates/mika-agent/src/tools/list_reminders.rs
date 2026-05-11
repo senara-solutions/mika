@@ -114,6 +114,7 @@ mod tests {
                 source: None,
                 metadata: None,
                 r#type: None,
+                dispatch_class: None,
             })
             .await
             .unwrap()
@@ -174,6 +175,7 @@ mod tests {
                 source: None,
                 metadata: None,
                 r#type: None,
+                dispatch_class: None,
             })
             .await
             .unwrap();
@@ -215,6 +217,7 @@ mod tests {
                 source: None,
                 metadata: None,
                 r#type: None,
+                dispatch_class: None,
             })
             .await
             .unwrap();

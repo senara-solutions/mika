@@ -355,6 +355,7 @@ mod tests {
                 source: source.map(|s| s.to_string()),
                 metadata: None,
                 r#type: None,
+                dispatch_class: None,
             })
             .await
             .unwrap()
@@ -502,6 +503,7 @@ mod tests {
                     source: None,
                     metadata: None,
                     r#type: None,
+                    dispatch_class: None,
                 })
                 .await
                 .unwrap();
@@ -642,6 +644,7 @@ mod tests {
                 source: Some("user_request".to_string()),
                 metadata: None,
                 r#type: Some(task_type.to_string()),
+                dispatch_class: None,
             })
             .await
             .unwrap()

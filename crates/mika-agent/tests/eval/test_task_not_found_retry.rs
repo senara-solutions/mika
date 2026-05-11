@@ -45,6 +45,7 @@ async fn seed_task_with_ref(harness: &EvalHarness, label: &str, reference_url: &
             source: Some("self_dev".to_string()),
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         })
         .await
         .unwrap()

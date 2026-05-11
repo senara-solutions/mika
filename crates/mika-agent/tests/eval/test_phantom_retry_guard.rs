@@ -45,6 +45,7 @@ async fn seed_task(harness: &EvalHarness, label: &str) -> String {
             source: Some("self_dev".to_string()),
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         })
         .await
         .unwrap()
@@ -76,6 +77,7 @@ async fn create_callback_child(harness: &EvalHarness, parent_id: &str, status: &
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         })
         .await
         .unwrap();

@@ -68,6 +68,7 @@ async fn seed_task(harness: &EvalHarness, label: &str) -> String {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         })
         .await
         .unwrap()

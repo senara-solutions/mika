@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 33;
+pub const CURRENT_SCHEMA_VERSION: i64 = 34;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -166,6 +166,11 @@ pub struct Task {
     /// defaulted to `"issue"` for backward compatibility (added in schema v23). See
     /// [`VALID_TASK_TYPES`].
     pub r#type: String,
+    /// Dispatch class for long-running tasks: `"implement"` or `"groom"`. Nullable —
+    /// pre-v34 rows have `NULL` (treated as `"implement"` by the per-class dispatch
+    /// guard via `COALESCE`). Set on callback task creation based on the dispatched
+    /// skill (#1001).
+    pub dispatch_class: Option<String>,
 }
 
 /// A parent self_dev task left `in_progress` after its callback subtask
@@ -205,6 +210,10 @@ pub struct NewTask {
     /// other than those in [`VALID_TASK_TYPES`] are rejected by the DB CHECK
     /// constraint; prefer validating at the tool boundary before INSERT.
     pub r#type: Option<String>,
+    /// Dispatch class for per-class slot split (#1001). `None` means NULL in
+    /// the DB (treated as `"implement"` via `COALESCE` by the dispatch guard).
+    /// Set to `Some("groom")` for grooming dispatches.
+    pub dispatch_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1079,6 +1088,11 @@ impl Database {
             info!(version = 33, "database migrated to v33");
         }
 
+        if (3..=33).contains(&version) {
+            self.migrate_v33_to_v34()?;
+            info!(version = 34, "database migrated to v34");
+        }
+
         Ok(())
     }
 
@@ -1133,7 +1147,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (33);
+            INSERT INTO schema_version (version) VALUES (34);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1223,6 +1237,9 @@ impl Database {
                 type TEXT NOT NULL DEFAULT 'issue' CHECK (
                     type IN ('issue', 'milestone', 'project')
                 ),
+                dispatch_class TEXT CHECK (
+                    dispatch_class IS NULL OR dispatch_class IN ('implement', 'groom')
+                ),
                 created_by_session TEXT,
                 created_trace_id TEXT,
                 execution_trace_id TEXT,
@@ -1250,6 +1267,9 @@ impl Database {
                 WHERE trigger_type = 'manual'
                 AND reference_url IS NOT NULL
                 AND status NOT IN ('completed', 'cancelled', 'failed', 'delivered');
+            CREATE INDEX idx_tasks_dispatch_class
+                ON tasks(agent_id, dispatch_class, status)
+                WHERE dispatch_class IS NOT NULL;
 
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
@@ -3812,6 +3832,42 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v33_to_v34(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 34 {
+            return Ok(());
+        }
+
+        // #1001: Add dispatch_class column for per-class dispatch slot split.
+        // Nullable — pre-v34 rows stay NULL, treated as 'implement' via COALESCE
+        // in the dispatch guard query. CHECK constraint limits values.
+        // Column-exists guard for crash-recovery and convergence-test safety.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_col: bool = tx
+            .prepare("PRAGMA table_info(tasks)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "dispatch_class");
+        if !has_col {
+            tx.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN dispatch_class TEXT
+                   CHECK (dispatch_class IS NULL OR dispatch_class IN ('implement', 'groom'));",
+            )?;
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_dispatch_class
+               ON tasks(agent_id, dispatch_class, status)
+               WHERE dispatch_class IS NOT NULL;",
+        )?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (34)", [])?;
+        tx.commit()?;
+
+        info!("v33→v34: added dispatch_class column to tasks (#1001)");
+        Ok(())
+    }
+
     /// v27 startup guard: refuse to open the database if the coalesce step
     /// from #787 has not run. Pins to `schema_version == 27` — future v28
     /// should carry its own guard, not inherit v27's.
@@ -4130,13 +4186,13 @@ impl Database {
                 trigger_type, cron_expr, event_source, event_offset_secs, condition_expr,
                 next_fire_at, timeout_at, action_type, action_config,
                 input_context, created_by_session, created_trace_id,
-                reference_url, source, metadata, type
+                reference_url, source, metadata, type, dispatch_class
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11,
                 ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22
+                ?19, ?20, ?21, ?22, ?23
              )",
             params![
                 id,
@@ -4161,6 +4217,7 @@ impl Database {
                 task.source,
                 task.metadata,
                 task_type,
+                task.dispatch_class,
             ],
         )?;
         Ok(id)
@@ -4271,6 +4328,7 @@ impl Database {
             source: r.get(27)?,
             metadata: r.get(28)?,
             r#type: r.get(29)?,
+            dispatch_class: r.get(30)?,
         })
     }
 
@@ -4279,7 +4337,7 @@ impl Database {
          next_fire_at, timeout_at, action_type, action_config,
          status, process_id, input_context, result, created_by_session,
          created_trace_id, execution_trace_id, created_at, updated_at, fired_at, completed_at,
-         reference_url, source, metadata, type";
+         reference_url, source, metadata, type, dispatch_class";
 
     pub fn get_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
         let sql = format!(
@@ -4414,6 +4472,27 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Update the dispatch class of a task (#1001).
+    ///
+    /// Used when a task transitions between grooming and implementation phases
+    /// (e.g., after dev-groom completes and dev-pilot is about to dispatch on
+    /// the same task_id per mika#996's task-reuse pattern). Idempotent —
+    /// setting the same class is a no-op (updated_at still advances).
+    pub fn update_task_dispatch_class(
+        &self,
+        id: &str,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET dispatch_class = ?1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?2 AND agent_id = ?3",
+            params![dispatch_class, id, agent_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Promote a task from `failed` → `completed` (#958).
     ///
     /// Symmetric to `update_task_failed()`. Only transitions tasks currently
@@ -4507,7 +4586,7 @@ impl Database {
     }
 
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
-    const TASK_COLUMN_COUNT: usize = 30;
+    const TASK_COLUMN_COUNT: usize = 31;
 
     /// List manual (task) tasks for an agent with optional filters.
     /// Uses parameterized NULL checks to avoid dynamic SQL construction.
@@ -5271,15 +5350,20 @@ impl Database {
         Ok(rows)
     }
 
-    /// Check if any active callback tasks exist for a task OTHER than the excluded one.
+    /// Check if any active callback tasks exist for a task OTHER than the excluded one,
+    /// filtered by dispatch class.
     ///
     /// Returns `Some((parent_task_id, callback_task_id))` if an active callback task exists
-    /// whose parent differs from `excluded_parent_id`. Used by the global dispatch guard
-    /// to enforce single-session-at-a-time (#583).
+    /// whose parent differs from `excluded_parent_id` and whose dispatch class matches.
+    /// Used by the per-class dispatch guard to enforce one-slot-per-class (#583, #1001).
+    ///
+    /// Pre-v34 rows with `dispatch_class IS NULL` are treated as `'implement'` via
+    /// `COALESCE` — no application-layer NULL coercion needed (architect NF1).
     pub fn has_active_callback_tasks_excluding(
         &self,
         excluded_parent_id: &str,
         agent_id: &str,
+        dispatch_class: &str,
     ) -> Result<Option<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT parent_task_id, id FROM tasks
@@ -5288,9 +5372,10 @@ impl Database {
                AND parent_task_id IS NOT NULL
                AND parent_task_id != ?1
                AND agent_id = ?2
+               AND COALESCE(dispatch_class, 'implement') = ?3
              LIMIT 1",
         )?;
-        let mut rows = stmt.query(params![excluded_parent_id, agent_id])?;
+        let mut rows = stmt.query(params![excluded_parent_id, agent_id, dispatch_class])?;
         if let Some(row) = rows.next()? {
             Ok(Some((row.get(0)?, row.get(1)?)))
         } else {
@@ -9848,6 +9933,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(&task).unwrap();
         let t = db.get_task(&id, "mika").unwrap().unwrap();
@@ -9881,6 +9967,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(&task).unwrap();
         assert!(db.cancel_task(&id, "mika").unwrap());
@@ -10086,6 +10173,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         db.create_task(&task).unwrap();
         assert_eq!(db.count_pending_tasks("mika").unwrap(), 1);
@@ -10114,6 +10202,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         }
     }
 
@@ -10447,6 +10536,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id1 = db.create_task(&task).unwrap();
         assert!(!id1.is_empty());
@@ -10479,6 +10569,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id2 = db.create_task(&task2).unwrap();
         assert!(!id2.is_empty());
@@ -10513,6 +10604,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         }
     }
 
@@ -10787,6 +10879,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let _id = db.create_task(&reminder).unwrap();
 
@@ -11145,6 +11238,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         db.create_task(&task).unwrap();
 
@@ -11476,6 +11570,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(&task).unwrap();
         let t = db.get_task(&id, "mika").unwrap().unwrap();
@@ -11507,6 +11602,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: Some("milestone".to_string()),
+            dispatch_class: None,
         };
         let id = db.create_task(&task).unwrap();
         let t = db.get_task(&id, "mika").unwrap().unwrap();
@@ -11551,6 +11647,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -11596,6 +11693,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -11931,6 +12029,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(&task).unwrap();
 
@@ -12378,6 +12477,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         }
     }
 
@@ -13313,6 +13413,7 @@ mod tests {
         db2.migrate_v30_to_v31().unwrap();
         db2.migrate_v31_to_v32().unwrap();
         db2.migrate_v32_to_v33().unwrap();
+        db2.migrate_v33_to_v34().unwrap();
 
         let final_version: i64 = db2
             .conn

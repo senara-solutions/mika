@@ -39,6 +39,7 @@ fn new_task(agent_id: &str, label: &str) -> NewTask {
         source: None,
         metadata: None,
         r#type: None,
+        dispatch_class: None,
     }
 }
 

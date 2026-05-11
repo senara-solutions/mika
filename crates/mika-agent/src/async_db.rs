@@ -546,10 +546,20 @@ impl AsyncDatabase {
     pub async fn has_active_callback_tasks_excluding(
         &self,
         excluded_parent_id: &str,
+        dispatch_class: &str,
     ) -> Result<Option<(String, String)>> {
         let p = excluded_parent_id.to_owned();
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.has_active_callback_tasks_excluding(&p, &a))
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.has_active_callback_tasks_excluding(&p, &a, &c))
+            .await
+    }
+
+    pub async fn update_task_dispatch_class(&self, id: &str, dispatch_class: &str) -> Result<bool> {
+        let i = id.to_owned();
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.update_task_dispatch_class(&i, &a, &c))
             .await
     }
 
@@ -2317,6 +2327,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
         let t = db.get_task(&id).await.unwrap().unwrap();
