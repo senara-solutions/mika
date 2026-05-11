@@ -297,7 +297,8 @@ _handle_dry_run() {
         if [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
             jq -n --arg repo "$REPO" --argjson issue "$ISSUE_NUM" --arg branch "$BRANCH" \
                 --arg worktree "$WORKTREE_DIR" --arg prompt "$PROMPT" \
-                '{dry_run:true, repo:$repo, issue:$issue, branch:$branch, worktree_dir:$worktree, prompt:$prompt}'
+                --arg entry_command "$ENTRY_COMMAND" \
+                '{dry_run:true, repo:$repo, issue:$issue, branch:$branch, worktree_dir:$worktree, prompt:$prompt, entry_command:$entry_command}'
             git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
             PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo)
             rmdir "$PARENT_DIR" 2>/dev/null || true
@@ -408,6 +409,42 @@ _deliver_callback() {
     fi
 }
 
+_detect_plan_on_branch() {
+    # Plan-on-branch detection (mika#1074): When the issue body contains a groomed
+    # plan callout, override ENTRY_COMMAND from "/mika" to "/ce:work <path>".
+    # This eliminates the narrate-then-exit failure class — the model no longer
+    # needs to "decide" to invoke /ce:work because the entry command does it directly.
+    #
+    # Only applies to dev-pilot skill. dev-groom has its own entry command.
+    # Falls back silently (no-op) when any precondition fails.
+
+    # Guard: only override for dev-pilot
+    [ "$SKILL" = "dev-pilot" ] || return 0
+
+    # Guard: need an issue body to parse
+    [ -n "$ISSUE_BODY" ] || return 0
+
+    # Guard: need a worktree directory for file validation
+    [ -n "$WORKTREE_DIR" ] || return 0
+
+    # Extract plan path from the callout pattern:
+    #   > - **Plan:** `docs/plans/<filename>.md` (committed on branch @ <sha>)
+    # The pattern requires `docs/plans/` prefix to avoid false positives on
+    # prose containing "Plan:" (consistent with self-dev bypass predicate).
+    local PLAN_PATH
+    PLAN_PATH=$(printf '%s\n' "$ISSUE_BODY" | grep -oP '> - \*\*Plan:\*\* `\Kdocs/plans/[^`]+' | head -1)
+
+    [ -n "$PLAN_PATH" ] || return 0
+
+    # Validate the plan file exists in the worktree
+    if [ -f "$WORKTREE_DIR/$PLAN_PATH" ]; then
+        ENTRY_COMMAND="/ce:work $PLAN_PATH"
+        echo "Plan-on-branch detected: overriding entry command to '/ce:work $PLAN_PATH'" >&2
+    else
+        echo "Plan-on-branch callout found but file not in worktree: $WORKTREE_DIR/$PLAN_PATH — falling back to /mika" >&2
+    fi
+}
+
 # --- Public API ---
 
 # Single entrypoint. No args — entry command is derived from the $SKILL field
@@ -463,6 +500,7 @@ dispatch_claude_pilot() {
     _setup_gh_auth
     _scrub_env
     _set_up_worktree
+    _detect_plan_on_branch
     _handle_dry_run
     _run_claude_pilot "$ENTRY_COMMAND"
     _deliver_callback
