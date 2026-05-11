@@ -950,6 +950,7 @@ impl TeamEngine {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
 
         let parent_task_id = self
@@ -986,6 +987,7 @@ impl TeamEngine {
                 source: None,
                 metadata: None,
                 r#type: None,
+                dispatch_class: None,
             };
 
             match self.team_db.create_task(child_task).await {

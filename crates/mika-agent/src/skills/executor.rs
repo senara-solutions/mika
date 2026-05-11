@@ -747,6 +747,23 @@ fn truncate_output(s: &str) -> String {
 
 use crate::github_graphql::fetch_open_blockers;
 
+/// Derive the dispatch class from a skill name (#1001).
+///
+/// Used by the per-class dispatch slot split to determine which concurrency
+/// slot a dispatch occupies. `"groom"` class allows grooming to run concurrently
+/// with implementation; all other skills are `"implement"` class.
+fn derive_dispatch_class(skill: Option<&str>) -> &'static str {
+    match skill {
+        Some("dev-groom") => "groom",
+        _ => "implement", // dev-pilot, deploy_mika, and all others
+    }
+}
+
+/// Extract the skill name from a tool input JSON value.
+fn extract_skill_from_input(input: &serde_json::Value) -> Option<&str> {
+    input.get("skill").and_then(|v| v.as_str())
+}
+
 /// Validate that a task is in a dispatchable state for long-running execution.
 ///
 /// Stricter than `validate_task()` (which also allows `blocked` for delegation).
@@ -837,9 +854,12 @@ async fn validate_dispatch_readiness(
         }
     }
 
-    // Global dispatch guard (#583): reject if ANY other task has an active
-    // callback child. Enforces single-session-at-a-time across all tasks.
-    match db.has_active_callback_tasks_excluding(task_id).await {
+    // Per-class dispatch guard (#583, #1001): reject if another task of the
+    // SAME dispatch class has an active callback child. The slot split allows
+    // one 'implement' + one 'groom' dispatch concurrently per agent.
+    let dispatch_class = tool_input.and_then(extract_skill_from_input);
+    let class = derive_dispatch_class(dispatch_class);
+    match db.has_active_callback_tasks_excluding(task_id, class).await {
         Ok(Some((blocking_parent_id, blocking_callback_id))) => {
             // mika#1011 — Register a deferred-dispatch callback so the engine
             // auto-retries when the blocking dispatch completes. The LLM still
@@ -855,14 +875,15 @@ async fn validate_dispatch_readiness(
             let mut rejection = serde_json::json!({
                 "error": "global_dispatch_active",
                 "task_id": task_id,
+                "dispatch_class": class,
                 "blocking_task_id": blocking_parent_id,
                 "blocking_callback_id": blocking_callback_id,
                 "reason": format!(
-                    "Another task ('{}') already has an active dispatch \
-                     (callback task '{}'). Only one long-running dispatch may be \
+                    "Another task ('{}') already has an active {} dispatch \
+                     (callback task '{}'). Only one long-running dispatch per class may be \
                      active at a time. Wait for it to complete or cancel it before \
                      dispatching again.",
-                    blocking_parent_id, blocking_callback_id
+                    blocking_parent_id, class, blocking_callback_id
                 )
             });
             if deferred_registered {
@@ -870,7 +891,7 @@ async fn validate_dispatch_readiness(
             }
             return Err(rejection.to_string());
         }
-        Ok(None) => { /* No conflicting dispatch — proceed */ }
+        Ok(None) => { /* No conflicting dispatch in this class — proceed */ }
         Err(e) => {
             // Fail-closed: if we can't check global state, reject dispatch
             return Err(serde_json::json!({
@@ -1094,6 +1115,11 @@ async fn register_deferred_callback(
     })
     .to_string();
 
+    // Derive dispatch_class from the original call's skill parameter so
+    // the deferred callback occupies the correct slot when it fires (#1001).
+    let skill = extract_skill_from_input(input);
+    let class = derive_dispatch_class(skill);
+
     let task = NewTask {
         agent_id: db.agent_id().to_string(),
         team_run_id: None,
@@ -1116,6 +1142,7 @@ async fn register_deferred_callback(
         source: Some("deferred_dispatch".to_string()),
         metadata: None,
         r#type: None,
+        dispatch_class: Some(class.to_string()),
     };
 
     match db.create_task(task).await {
@@ -1291,6 +1318,9 @@ async fn execute_long_running(
         source: None,
         metadata: None,
         r#type: None,
+        dispatch_class: Some(
+            derive_dispatch_class(input.get("skill").and_then(|v| v.as_str())).to_string(),
+        ),
     };
 
     let task_id = match ctx.db.create_task(task).await {
@@ -2690,6 +2720,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let child_id = db.create_task(task).await.unwrap();
         if status != "pending" {
@@ -2994,6 +3025,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         async_db.create_task(non_callback).await.unwrap();
 
@@ -3417,7 +3449,7 @@ mod tests {
         // Check the DB method directly — should return None since the only
         // active callback belongs to the excluded parent
         let result = async_db
-            .has_active_callback_tasks_excluding(&wi)
+            .has_active_callback_tasks_excluding(&wi, "implement")
             .await
             .unwrap();
         assert!(
@@ -3484,7 +3516,7 @@ mod tests {
         let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
 
         let result = async_db
-            .has_active_callback_tasks_excluding("nonexistent")
+            .has_active_callback_tasks_excluding("nonexistent", "implement")
             .await
             .unwrap();
         assert!(result.is_none());
@@ -3501,7 +3533,7 @@ mod tests {
         create_callback_child(&async_db, &wi, "cancelled").await;
 
         let result = async_db
-            .has_active_callback_tasks_excluding("other-task")
+            .has_active_callback_tasks_excluding("other-task", "implement")
             .await
             .unwrap();
         assert!(
@@ -3519,13 +3551,184 @@ mod tests {
         let callback_id = create_callback_child(&async_db, &wi, "pending").await;
 
         let result = async_db
-            .has_active_callback_tasks_excluding("different-parent")
+            .has_active_callback_tasks_excluding("different-parent", "implement")
             .await
             .unwrap();
         assert!(result.is_some());
         let (parent_id, found_callback_id) = result.unwrap();
         assert_eq!(parent_id, wi);
         assert_eq!(found_callback_id, callback_id);
+    }
+
+    // ---- Per-class dispatch slot split tests (#1001) ----
+
+    /// Helper: create a callback child task with a specific dispatch_class.
+    async fn create_callback_child_with_class(
+        db: &crate::async_db::AsyncDatabase,
+        parent_id: &str,
+        status: &str,
+        dispatch_class: &str,
+    ) -> String {
+        use crate::db::NewTask;
+        use crate::task_engine::types::{action_type, trigger_type};
+
+        let task = NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 0,
+            label: format!("long_running:run_claude_pilot:{dispatch_class}"),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some(dispatch_class.to_string()),
+        };
+        let id = db.create_task(task).await.unwrap();
+        if status != "pending" {
+            db.update_manual_task_status(&id, status).await.unwrap();
+        }
+        id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_allows_different_class_concurrent() {
+        // An active 'implement' callback should NOT block a 'groom' dispatch
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi1 = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child_with_class(&async_db, &wi1, "pending", "implement").await;
+
+        // Querying for 'groom' class should find no blocking dispatch
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "groom")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "groom dispatch should not be blocked by active implement dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_blocks_same_class() {
+        // An active 'implement' callback SHOULD block another 'implement' dispatch
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi1 = create_task_with_status(&async_db, "in_progress").await;
+        let callback_id =
+            create_callback_child_with_class(&async_db, &wi1, "pending", "implement").await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "implement")
+            .await
+            .unwrap();
+        assert!(result.is_some(), "same-class dispatch should be blocked");
+        let (parent_id, found_id) = result.unwrap();
+        assert_eq!(parent_id, wi1);
+        assert_eq!(found_id, callback_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_groom_blocks_groom() {
+        // An active 'groom' callback should block another 'groom' dispatch
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi1 = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child_with_class(&async_db, &wi1, "pending", "groom").await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "groom")
+            .await
+            .unwrap();
+        assert!(result.is_some(), "groom-vs-groom should be blocked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pre_v34_null_dispatch_class_treated_as_implement() {
+        // Pre-v34 tasks have dispatch_class IS NULL — they should be treated
+        // as 'implement' via COALESCE in the SQL query.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi1 = create_task_with_status(&async_db, "in_progress").await;
+        // Create a callback child WITHOUT dispatch_class (simulating pre-v34)
+        create_callback_child(&async_db, &wi1, "pending").await;
+
+        // Should block 'implement' queries (NULL → 'implement' via COALESCE)
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "NULL dispatch_class should be treated as 'implement'"
+        );
+
+        // Should NOT block 'groom' queries
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "groom")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "NULL dispatch_class should not block groom dispatches"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_derive_dispatch_class_values() {
+        assert_eq!(derive_dispatch_class(Some("dev-groom")), "groom");
+        assert_eq!(derive_dispatch_class(Some("dev-pilot")), "implement");
+        assert_eq!(derive_dispatch_class(Some("deploy_mika")), "implement");
+        assert_eq!(derive_dispatch_class(None), "implement");
+        assert_eq!(derive_dispatch_class(Some("unknown-skill")), "implement");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_update_task_dispatch_class() {
+        // Verify that dispatch_class can be flipped on a task
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi = create_task_with_status(&async_db, "in_progress").await;
+
+        // Initially no dispatch_class
+        let task = async_db.get_task(&wi).await.unwrap().unwrap();
+        assert!(task.dispatch_class.is_none());
+
+        // Set to 'groom'
+        let updated = async_db
+            .update_task_dispatch_class(&wi, "groom")
+            .await
+            .unwrap();
+        assert!(updated);
+        let task = async_db.get_task(&wi).await.unwrap().unwrap();
+        assert_eq!(task.dispatch_class.as_deref(), Some("groom"));
+
+        // Flip to 'implement'
+        let updated = async_db
+            .update_task_dispatch_class(&wi, "implement")
+            .await
+            .unwrap();
+        assert!(updated);
+        let task = async_db.get_task(&wi).await.unwrap().unwrap();
+        assert_eq!(task.dispatch_class.as_deref(), Some("implement"));
     }
 
     // -- Blocked-by guard tests (#713) --
@@ -3561,6 +3764,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
         if status != "pending" {
@@ -3693,6 +3897,7 @@ mod tests {
             source: Some("deferred_dispatch".to_string()),
             metadata: None,
             r#type: "issue".to_string(),
+            dispatch_class: Some("groom".to_string()),
         };
 
         let result = extract_dispatch_tuple(&task);
@@ -3740,6 +3945,7 @@ mod tests {
             source: Some("deferred_dispatch".to_string()),
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let parent_id = async_db.create_task(parent_task).await.unwrap();
 
@@ -3766,6 +3972,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let child_id = async_db.create_task(child_task).await.unwrap();
 
@@ -3820,6 +4027,7 @@ mod tests {
             source: Some("deferred_dispatch".to_string()),
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let parent_id = async_db.create_task(parent_task).await.unwrap();
 
@@ -3880,6 +4088,7 @@ mod tests {
             source: Some("self_dev".to_string()),
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let parent_id = async_db.create_task(parent_task).await.unwrap();
 
@@ -3906,6 +4115,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let callback_id = async_db.create_task(callback_task).await.unwrap();
 

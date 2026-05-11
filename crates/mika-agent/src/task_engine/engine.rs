@@ -1023,6 +1023,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         }
     }
 
@@ -1178,6 +1179,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
 
@@ -1216,6 +1218,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
 
@@ -1254,6 +1257,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let parent_id = db.create_task(parent).await.unwrap();
 
@@ -1280,6 +1284,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let c1_id = db.create_task(child1).await.unwrap();
         db.update_task_completed(&c1_id, Some("done"))
@@ -1308,6 +1313,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let c2_id = db.create_task(child2).await.unwrap();
         // Mark expired manually (in real flow, expire_timed_out_tasks does this)
@@ -1380,6 +1386,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         }
     }
 

@@ -218,6 +218,7 @@ impl Tool for CreateScheduledTaskTool {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
 
         let id = ctx.db.create_task(task).await?;

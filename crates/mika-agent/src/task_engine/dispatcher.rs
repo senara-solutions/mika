@@ -1463,6 +1463,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -1497,6 +1498,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -1530,6 +1532,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
         let result = dispatcher.dispatch(&id).await;
@@ -1563,6 +1566,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
         // Callback with no result should error
@@ -1606,6 +1610,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let id = db.create_task(task).await.unwrap();
         // Should not error — reminder path reads from action_config
@@ -1720,6 +1725,7 @@ mod tests {
             source: Some("self_dev".to_string()),
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let parent_id = db.create_task(parent).await.unwrap();
 
@@ -1746,6 +1752,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let callback_id = db.create_task(callback).await.unwrap();
 
@@ -1805,6 +1812,7 @@ mod tests {
             source: Some("self_dev".to_string()),
             metadata: Some(r#"{"pipeline_retry_count": 1}"#.to_string()),
             r#type: None,
+            dispatch_class: None,
         };
         let parent_id = db.create_task(parent).await.unwrap();
 
@@ -1831,6 +1839,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let callback_id = db.create_task(callback).await.unwrap();
 
@@ -1886,6 +1895,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         let callback_id = db.create_task(callback).await.unwrap();
         db.update_task_completed(&callback_id, Some("Session: abc\nTurns: 10"))
@@ -1931,6 +1941,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: "issue".to_string(),
+            dispatch_class: None,
         }
     }
 
@@ -2039,6 +2050,7 @@ mod tests {
                 source: Some("self_dev".to_string()),
                 metadata: None,
                 r#type: Some("milestone".to_string()),
+                dispatch_class: None,
             })
             .await
             .unwrap();
@@ -2080,6 +2092,7 @@ mod tests {
                 source: None,
                 metadata: None,
                 r#type: Some("issue".to_string()),
+                dispatch_class: None,
             })
             .await
             .unwrap();
@@ -2134,6 +2147,7 @@ mod tests {
                 source: None,
                 metadata: None,
                 r#type: None,
+                dispatch_class: None,
             })
             .await
             .unwrap();
@@ -2175,6 +2189,7 @@ mod tests {
                 source: None,
                 metadata: None,
                 r#type: Some("issue".to_string()),
+                dispatch_class: None,
             })
             .await
             .unwrap();
@@ -2206,6 +2221,7 @@ mod tests {
                 source: None,
                 metadata: None,
                 r#type: Some("issue".to_string()),
+                dispatch_class: None,
             })
             .await
             .unwrap();
@@ -2278,6 +2294,7 @@ mod tests {
                 source: None,
                 metadata: None,
                 r#type: Some("issue".to_string()),
+                dispatch_class: None,
             })
             .await
             .unwrap();

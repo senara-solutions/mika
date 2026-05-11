@@ -1399,6 +1399,7 @@ mod tests {
             source: None,
             metadata: None,
             r#type: t.to_string(),
+            dispatch_class: None,
         }
     }
 

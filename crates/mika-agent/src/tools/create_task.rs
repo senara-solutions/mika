@@ -254,6 +254,7 @@ impl Tool for CreateTaskTool {
             source: source.map(|s| s.to_string()),
             metadata: None,
             r#type: Some(task_type.to_string()),
+            dispatch_class: None,
         };
 
         // Dedup path A (reference_url provided): attempt INSERT, catch UNIQUE violation
@@ -336,6 +337,7 @@ impl Tool for CreateTaskTool {
                         source: source.map(|s| s.to_string()),
                         metadata: None,
                         r#type: Some(task_type.to_string()),
+                        dispatch_class: None,
                     };
                     let id = ctx.db.create_task(retry_task).await?;
                     let after_value =

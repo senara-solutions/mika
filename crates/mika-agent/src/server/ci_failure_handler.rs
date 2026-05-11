@@ -295,8 +295,12 @@ pub async fn try_handle_ci_failure(
         );
     }
 
-    // 10. Check global dispatch guard (informational — included in pre-digest)
-    let global_dispatch_busy = match db.has_active_callback_tasks_excluding(&task.id).await {
+    // 10. Check global dispatch guard (informational — included in pre-digest).
+    // CI failures relate to implementation dispatches, so check the 'implement' class (#1001).
+    let global_dispatch_busy = match db
+        .has_active_callback_tasks_excluding(&task.id, "implement")
+        .await
+    {
         Ok(Some((parent_id, callback_id))) => {
             info!(
                 task_id = %task.id,

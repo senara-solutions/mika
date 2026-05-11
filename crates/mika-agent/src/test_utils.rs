@@ -227,6 +227,7 @@ pub mod test_helpers {
             source: None,
             metadata: None,
             r#type: None,
+            dispatch_class: None,
         };
         db.create_task(task).await.unwrap()
     }

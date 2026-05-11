@@ -1978,6 +1978,7 @@ notify = true
                 source: None,
                 metadata: None,
                 r#type: "issue".to_string(),
+                dispatch_class: None,
             }],
             anomalies: vec![TaskHealthAnomaly {
                 task_id: "def-456".to_string(),

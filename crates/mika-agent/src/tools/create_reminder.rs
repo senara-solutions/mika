@@ -264,6 +264,7 @@ impl Tool for CreateReminderTool {
             source: None,
             metadata,
             r#type: None,
+            dispatch_class: None,
         };
 
         let id = match ctx.db.create_task(task).await {
