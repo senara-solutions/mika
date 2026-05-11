@@ -297,7 +297,7 @@ pub struct TaskHealthAnomaly {
     pub label: String,
     pub trigger_type: String,
     pub status: String,
-    /// One of: "stuck_callback", "stale_blocked", "failed_recurring", "long_running", "github_linked"
+    /// One of: "stuck_callback", "stale_blocked", "failed_recurring", "long_running", "github_linked", "dispatch_failures", "dispatch_stale"
     pub anomaly_type: String,
     /// Human-readable age description (e.g., "3h 22m", "5 days").
     pub age_description: String,
@@ -4947,6 +4947,107 @@ impl Database {
                     "github_linked",
                     &|_| "has linked GitHub PR".to_string(),
                 )?);
+            }
+        }
+
+        // 7. Dispatch failures: dual-signal wedge detection (#980)
+        //    Signal A: >= THRESHOLD recent run_claude_pilot failures in the sliding window
+        //    Signal B: stale dispatch — no run_claude_pilot attempt in > 1h while task is in_progress
+        {
+            let remaining = health_thresholds::MAX_ANOMALIES.saturating_sub(anomalies.len());
+            if remaining > 0 {
+                let window_start = timestamp::format(
+                    &(now - Duration::seconds(health_thresholds::DISPATCH_FAILURE_WINDOW_SECS)),
+                );
+                let stale_threshold = timestamp::format(
+                    &(now - Duration::seconds(health_thresholds::LONG_RUNNING_DEFAULT_SECS)),
+                );
+
+                // Signal A: Count recent failures with session→task JOIN for correlation
+                let signal_a: Option<(u32, Option<String>, Option<String>)> = self
+                    .conn
+                    .prepare(
+                        "SELECT
+                            COUNT(*) as failure_count,
+                            t.id as task_id,
+                            t.label as task_label
+                         FROM tool_calls tc
+                         LEFT JOIN sessions s ON tc.session_id = s.id
+                         LEFT JOIN tasks t ON s.task_id = t.id AND t.status = 'in_progress'
+                         WHERE tc.agent_id = ?1
+                           AND tc.tool_name = 'run_claude_pilot'
+                           AND tc.success = 0
+                           AND tc.created_at >= ?2
+                         GROUP BY t.id
+                         ORDER BY failure_count DESC
+                         LIMIT 1",
+                    )?
+                    .query_row(params![agent_id, &window_start], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .ok();
+
+                // Signal B: Stale dispatch — most recent run_claude_pilot attempt is older than 1h
+                // while an in_progress manual task exists
+                let signal_b: Option<(String, String)> = self
+                    .conn
+                    .prepare(
+                        "SELECT t.id, t.label
+                         FROM tasks t
+                         WHERE t.agent_id = ?1
+                           AND t.status = 'in_progress'
+                           AND t.trigger_type = 'manual'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM tool_calls tc2
+                               WHERE tc2.agent_id = ?1
+                                 AND tc2.tool_name = 'run_claude_pilot'
+                                 AND tc2.created_at >= ?2
+                           )
+                         ORDER BY t.updated_at DESC
+                         LIMIT 1",
+                    )?
+                    .query_row(params![agent_id, &stale_threshold], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .ok();
+
+                let mut dispatch_anomaly_fired = false;
+
+                // Emit anomaly from Signal A (threshold met)
+                if let Some((count, task_id, task_label)) = signal_a
+                    && count >= health_thresholds::DISPATCH_FAILURE_THRESHOLD
+                {
+                    let (tid, tlabel) = match (task_id, task_label) {
+                        (Some(id), Some(label)) => (id, label),
+                        _ => (
+                            agent_id.to_string(),
+                            "run_claude_pilot dispatch".to_string(),
+                        ),
+                    };
+                    anomalies.push(TaskHealthAnomaly {
+                        task_id: tid,
+                        label: tlabel,
+                        trigger_type: "manual".to_string(),
+                        status: "in_progress".to_string(),
+                        anomaly_type: "dispatch_failures".to_string(),
+                        age_description: format!("{} failures in last 2h", count),
+                        reference_url: None,
+                    });
+                    dispatch_anomaly_fired = true;
+                }
+
+                // Emit anomaly from Signal B (stale dispatch) — only if Signal A didn't fire
+                if !dispatch_anomaly_fired && let Some((task_id, task_label)) = signal_b {
+                    anomalies.push(TaskHealthAnomaly {
+                        task_id,
+                        label: task_label,
+                        trigger_type: "manual".to_string(),
+                        status: "in_progress".to_string(),
+                        anomaly_type: "dispatch_stale".to_string(),
+                        age_description: "no dispatch attempt in >1h".to_string(),
+                        reference_url: None,
+                    });
+                }
             }
         }
 
@@ -12715,6 +12816,324 @@ mod tests {
     fn test_format_age_invalid_timestamp() {
         let now = Utc::now();
         assert_eq!(format_age("not-a-timestamp", now), "unknown");
+    }
+
+    // -- Dispatch failure anomaly tests (#980) --
+
+    /// Helper: insert a tool_call row directly for testing anomaly #7.
+    fn insert_tool_call(
+        db: &Database,
+        agent_id: &str,
+        session_id: &str,
+        tool_name: &str,
+        success: bool,
+        created_at: &str,
+    ) {
+        let id = uuid::Uuid::new_v4().to_string();
+        db.conn
+            .execute(
+                "INSERT INTO tool_calls (id, agent_id, session_id, tool_name, tool_source, success, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'builtin', ?5, ?6)",
+                params![id, agent_id, session_id, tool_name, success as i32, created_at],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_dispatch_failures_below_threshold_no_anomaly() {
+        let db = db();
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        // 2 recent failures — below threshold of 3
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(600)));
+        insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &recent);
+        insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &recent);
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .all(|a| a.anomaly_type != "dispatch_failures"),
+            "should not fire dispatch_failures with only 2 failures"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_failures_at_threshold() {
+        let db = db();
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        // 3 recent failures — at threshold
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(600)));
+        for _ in 0..3 {
+            insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &recent);
+        }
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        let anomaly = summary
+            .anomalies
+            .iter()
+            .find(|a| a.anomaly_type == "dispatch_failures");
+        assert!(
+            anomaly.is_some(),
+            "should fire dispatch_failures at threshold 3"
+        );
+        assert_eq!(anomaly.unwrap().age_description, "3 failures in last 2h");
+    }
+
+    #[test]
+    fn test_dispatch_failures_above_threshold_shows_count() {
+        let db = db();
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        // 6 recent failures — above threshold
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(600)));
+        for _ in 0..6 {
+            insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &recent);
+        }
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        let anomaly = summary
+            .anomalies
+            .iter()
+            .find(|a| a.anomaly_type == "dispatch_failures")
+            .expect("should fire dispatch_failures");
+        assert_eq!(anomaly.age_description, "6 failures in last 2h");
+    }
+
+    #[test]
+    fn test_dispatch_failures_outside_window_no_anomaly() {
+        let db = db();
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        // 3 failures older than 2h window
+        let old = timestamp::format(&(Utc::now() - Duration::seconds(8000)));
+        for _ in 0..3 {
+            insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &old);
+        }
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .all(|a| a.anomaly_type != "dispatch_failures"),
+            "failures outside 2h window should not trigger dispatch_failures"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_failures_mixed_success_counts_only_failures() {
+        let db = db();
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(600)));
+        // 2 failures + 3 successes — only 2 failures, below threshold
+        insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &recent);
+        insert_tool_call(&db, "mika", session_id, "run_claude_pilot", true, &recent);
+        insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &recent);
+        insert_tool_call(&db, "mika", session_id, "run_claude_pilot", true, &recent);
+        insert_tool_call(&db, "mika", session_id, "run_claude_pilot", true, &recent);
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .all(|a| a.anomaly_type != "dispatch_failures"),
+            "should count only failures, not successes"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_failures_task_correlation_via_session_join() {
+        let db = db();
+        let session_id = "task-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        // Create an in_progress manual task and link session to it
+        let task_id = db
+            .create_task(&new_task("mika", "Fix issue #42", "manual", "none"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE sessions SET task_id = ?1 WHERE id = ?2",
+                params![task_id, session_id],
+            )
+            .unwrap();
+
+        // 3 failures in that session
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(600)));
+        for _ in 0..3 {
+            insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &recent);
+        }
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        let anomaly = summary
+            .anomalies
+            .iter()
+            .find(|a| a.anomaly_type == "dispatch_failures")
+            .expect("should fire dispatch_failures with task correlation");
+        assert_eq!(anomaly.task_id, task_id);
+        assert_eq!(anomaly.label, "Fix issue #42");
+    }
+
+    #[test]
+    fn test_dispatch_stale_fires_when_no_recent_dispatch() {
+        let db = db();
+
+        // Create an in_progress manual task
+        let task_id = db
+            .create_task(&new_task("mika", "Stale work item", "manual", "none"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+
+        // No run_claude_pilot calls at all → stale dispatch
+        let summary = db.get_task_health_summary("mika").unwrap();
+        let anomaly = summary
+            .anomalies
+            .iter()
+            .find(|a| a.anomaly_type == "dispatch_stale");
+        assert!(
+            anomaly.is_some(),
+            "should fire dispatch_stale when no dispatch attempt in >1h"
+        );
+        assert_eq!(anomaly.unwrap().task_id, task_id);
+        assert_eq!(
+            anomaly.unwrap().age_description,
+            "no dispatch attempt in >1h"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_stale_not_fired_when_recent_dispatch_exists() {
+        let db = db();
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        // Create an in_progress manual task
+        let task_id = db
+            .create_task(&new_task("mika", "Active work item", "manual", "none"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+
+        // Recent successful dispatch within 1h
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(1800)));
+        insert_tool_call(&db, "mika", session_id, "run_claude_pilot", true, &recent);
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .all(|a| a.anomaly_type != "dispatch_stale"),
+            "should not fire dispatch_stale when recent dispatch exists"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_signal_a_suppresses_signal_b() {
+        let db = db();
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        // Create an in_progress manual task
+        let task_id = db
+            .create_task(&new_task("mika", "Work item", "manual", "none"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+
+        // 3 recent failures (Signal A fires) but also no recent dispatch (Signal B would fire)
+        // Only Signal A should appear
+        let recent = timestamp::format(&(Utc::now() - Duration::seconds(600)));
+        for _ in 0..3 {
+            insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &recent);
+        }
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        let dispatch_anomalies: Vec<_> = summary
+            .anomalies
+            .iter()
+            .filter(|a| a.anomaly_type == "dispatch_failures" || a.anomaly_type == "dispatch_stale")
+            .collect();
+        assert_eq!(
+            dispatch_anomalies.len(),
+            1,
+            "Signal A should suppress Signal B"
+        );
+        assert_eq!(dispatch_anomalies[0].anomaly_type, "dispatch_failures");
+    }
+
+    #[test]
+    fn test_dispatch_stale_fires_when_failures_aged_out() {
+        let db = db();
+        let session_id = "test-session";
+        db.create_session(session_id, "mika", "cli").unwrap();
+
+        // Create an in_progress manual task
+        let task_id = db
+            .create_task(&new_task("mika", "Aged out work", "manual", "none"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+
+        // 3 failures older than 2h window (aged out of Signal A)
+        // AND older than 1h (stale for Signal B)
+        let old = timestamp::format(&(Utc::now() - Duration::seconds(8000)));
+        for _ in 0..3 {
+            insert_tool_call(&db, "mika", session_id, "run_claude_pilot", false, &old);
+        }
+
+        let summary = db.get_task_health_summary("mika").unwrap();
+        // Signal A should NOT fire (aged out of 2h window)
+        assert!(
+            summary
+                .anomalies
+                .iter()
+                .all(|a| a.anomaly_type != "dispatch_failures"),
+            "Signal A should not fire for aged-out failures"
+        );
+        // Signal B SHOULD fire (no recent dispatch in >1h, in_progress task exists)
+        let stale = summary
+            .anomalies
+            .iter()
+            .find(|a| a.anomaly_type == "dispatch_stale");
+        assert!(
+            stale.is_some(),
+            "Signal B (dispatch_stale) should fire when failures aged out — this is the aging defense"
+        );
+        assert_eq!(stale.unwrap().task_id, task_id);
     }
 
     // ===== Internal message tests (#494) =====

@@ -46,6 +46,12 @@ pub mod health_thresholds {
 
     /// Maximum number of anomalies to include in the heartbeat prompt.
     pub const MAX_ANOMALIES: usize = 10;
+
+    /// Minimum number of recent dispatch failures that constitutes a "wedged" anomaly (#980).
+    pub const DISPATCH_FAILURE_THRESHOLD: u32 = 3;
+
+    /// Time window (seconds) in which dispatch failures are counted (#980).
+    pub const DISPATCH_FAILURE_WINDOW_SECS: i64 = 7_200; // 2 hours
 }
 
 /// String constants for task trigger type values stored in the `tasks.trigger_type` column.
