@@ -113,7 +113,7 @@ Ends the current session, creates a new one with a fresh UUID, and notifies the 
 
 ### /exit
 
-Quit the Mika TUI. Sets `should_quit = true` and produces no output.
+Quit the Mika TUI. Sets `should_quit = true` and produces no output. Works regardless of agent status (Idle, Thinking, or Responding) — critical for `tmux send-keys` scripts that need to stop autonomous agents mid-turn.
 
 **Aliases:** `/quit`, `/q` | **Arguments:** None
 
