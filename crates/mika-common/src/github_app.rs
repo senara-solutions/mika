@@ -110,6 +110,42 @@ impl GitHubApp {
         }))
     }
 
+    /// Create from raw credentials (app ID, base64-encoded PEM, installation ID).
+    ///
+    /// Returns `None` if the private key is invalid (same validation as
+    /// `from_settings`). Used by the gateway, which has its own settings type.
+    pub fn from_credentials(
+        app_id: u64,
+        private_key_b64: &str,
+        installation_id: u64,
+    ) -> Option<Arc<Self>> {
+        let pem_bytes =
+            match base64::engine::general_purpose::STANDARD.decode(private_key_b64.as_bytes()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("GitHub App private key: base64 decode failed: {e}");
+                    return None;
+                }
+            };
+
+        let signing_key = match EncodingKey::from_rsa_pem(&pem_bytes) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!("GitHub App private key: RSA PEM parse failed: {e}");
+                return None;
+            }
+        };
+
+        info!(app_id, installation_id, "GitHub App configured");
+        Some(Arc::new(Self {
+            app_id,
+            signing_key,
+            installation_id,
+            cache: RwLock::new(None),
+            http_client: reqwest::Client::new(),
+        }))
+    }
+
     /// Construct directly for testing (bypasses Settings).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new(app_id: u64, signing_key: EncodingKey, installation_id: u64) -> Arc<Self> {

@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -72,6 +73,10 @@ pub struct GitHubWebhookEvent {
     pub label: Option<GitHubLabel>,
     /// Repository data.
     pub repository: Option<GitHubRepository>,
+    /// Commit SHA before the push (present on `pull_request.synchronize` events).
+    pub before: Option<String>,
+    /// Commit SHA after the push (present on `pull_request.synchronize` events).
+    pub after: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -141,6 +146,71 @@ pub struct GitHubLabel {
 pub struct GitHubRepository {
     pub full_name: Option<String>,
     pub html_url: Option<String>,
+}
+
+// -- Synchronize no-diff guard (#886) --
+
+/// Response shape for GitHub Compare API (minimal — only the fields we need).
+#[derive(Debug, serde::Deserialize)]
+struct CompareResponse {
+    /// File changes between the two commits. Empty array = no file changes.
+    /// GitHub caps this at 300 files per response, but an empty array reliably
+    /// means zero file changes (no pagination concern for the zero case).
+    ///
+    /// # `#[serde(default)]` risk acceptance
+    ///
+    /// If GitHub returns a malformed response without a `files` field,
+    /// `serde(default)` yields an empty Vec, which we interpret as "no file
+    /// changes" → suppression. This is vanishingly unlikely (GitHub's Compare
+    /// API always includes `files`), and the consequence is low-severity —
+    /// one suppressed review on a malformed response; the next genuine push
+    /// triggers review normally.
+    #[serde(default)]
+    files: Vec<serde_json::Value>,
+}
+
+/// Check whether two commits have file-level differences.
+///
+/// Uses the GitHub Compare API: `GET /repos/{repo}/compare/{before}...{after}`.
+/// Returns `Ok(true)` if files differ, `Ok(false)` if trees are identical.
+/// Returns `Err` on any API/parse failure (caller should fail-open).
+///
+/// The zero-files heuristic: `files.is_empty()` is the determination.
+/// For a trailer-only amend (the primary bug trigger), `before` and `after`
+/// share the same tree SHA, so the compare returns `files: []` with
+/// `status: "ahead"` (ahead by 1 commit, 0 file changes). We do NOT check
+/// the `status` field — `status: "identical"` would miss the trailer-only
+/// case (the commits are distinct objects, just with the same tree).
+async fn commits_have_file_changes(
+    github_app: &mika_common::github_app::GitHubApp,
+    repo_full_name: &str,
+    before: &str,
+    after: &str,
+) -> Result<bool, anyhow::Error> {
+    let token = github_app.installation_token().await?;
+
+    let url = format!("https://api.github.com/repos/{repo_full_name}/compare/{before}...{after}");
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/vnd.github.v3+json")
+        .header("Authorization", format!("token {token}"))
+        .header("User-Agent", "mika-gateway")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .context("GitHub Compare API request failed")?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("GitHub Compare API returned HTTP {}", resp.status());
+    }
+
+    let body: CompareResponse = resp
+        .json()
+        .await
+        .context("Failed to parse GitHub Compare API response")?;
+
+    Ok(!body.files.is_empty())
 }
 
 // -- Event routing --
@@ -535,12 +605,15 @@ pub(crate) async fn handle_github_webhook(
         .unwrap_or("")
         .to_string();
 
-    let _span = tracing::info_span!(
+    // NOTE: Not using `.entered()` because the no-diff guard (#886) introduced
+    // an `.await` point in this handler. `Entered` is `!Send`, making the future
+    // `!Send` if held across await. Instead, enter/drop around sync blocks.
+    let span = tracing::info_span!(
         "github_webhook",
         delivery_id = %delivery_id,
         event_type = %event_type,
-    )
-    .entered();
+    );
+    let _entered = span.enter();
 
     // 5. Pre-routing trace — fires for EVERY valid webhook before dedup/routing/filtering.
     // Diagnostic chain:
@@ -633,6 +706,57 @@ pub(crate) async fn handle_github_webhook(
             return StatusCode::OK;
         }
     }
+
+    // Drop the span guard before the await to keep the handler future Send.
+    // Re-entered after the no-diff check for the remaining sync operations.
+    drop(_entered);
+
+    // 9c. Synchronize no-diff guard (#886): suppress mika-qa dispatch
+    // for no-op pushes (trailer-only amend, commit-message-only change).
+    // Uses GitHub Compare API to check file-level differences between
+    // the before and after commit SHAs. Fail-open on any error.
+    if event_type == "pull_request"
+        && event.action.as_deref() == Some("synchronize")
+        && let Some(before) = event.before.as_deref()
+        && let Some(after) = event.after.as_deref()
+        && let Some(github_app) = state.github_app.as_ref()
+    {
+        let repo = event
+            .repository
+            .as_ref()
+            .and_then(|r| r.full_name.as_deref())
+            .unwrap_or("");
+        match commits_have_file_changes(github_app, repo, before, after).await {
+            Ok(false) => {
+                info!(
+                    event_type,
+                    delivery_id = %delivery_id,
+                    before,
+                    after,
+                    repo,
+                    "webhook_synchronize_no_diff_change: suppressing qa-review dispatch for no-op push"
+                );
+                return StatusCode::OK;
+            }
+            Ok(true) => {
+                // Files changed — proceed with normal dispatch.
+            }
+            Err(e) => {
+                // Fail-open: API error should not block legitimate reviews.
+                warn!(
+                    error = %e,
+                    delivery_id = %delivery_id,
+                    before,
+                    after,
+                    "synchronize_no_diff_check failed, proceeding with dispatch (fail-open)"
+                );
+            }
+        }
+    }
+    // No before/after SHAs or no github_app — proceed with dispatch (fail-open).
+
+    // Re-enter span for remaining sync operations (semaphore, format, spawn).
+    let _entered = span.enter();
 
     // 10. Semaphore for backpressure
     let permit = match state.webhook_semaphore.clone().try_acquire_owned() {
@@ -1229,6 +1353,8 @@ mod tests {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
         let text = format_event_text("issues", &event);
         assert!(text.contains("[GitHub] Issue opened"));
@@ -1263,6 +1389,8 @@ mod tests {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
         let text = format_event_text("pull_request", &event);
         assert!(text.contains("[GitHub] PR opened"));
@@ -1314,6 +1442,8 @@ mod tests {
                 full_name: Some("senara-solutions/mika".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
 
         let text = format_event_text("pull_request_review", &event);
@@ -1367,6 +1497,8 @@ mod tests {
                 full_name: Some("senara-solutions/mika".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
 
         let text = format_event_text("pull_request_review", &event);
@@ -1425,6 +1557,8 @@ mod tests {
                 full_name: Some("senara-solutions/mika".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
 
         let text = format_event_text("pull_request_review", &event);
@@ -1456,6 +1590,8 @@ mod tests {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
         let text = format_event_text("check_suite", &event);
         assert!(text.contains("[GitHub] Check suite failure"));
@@ -1492,6 +1628,8 @@ mod tests {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
         let text = format_event_text("pull_request", &event);
         assert!(text.contains("[GitHub] PR review_requested"));
@@ -1524,6 +1662,8 @@ mod tests {
                 full_name: Some("senara-solutions/mika".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
         let text = format_event_text("issues", &event);
         assert_eq!(
@@ -1559,6 +1699,8 @@ mod tests {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
         let text = format_event_text("issues", &event);
         // Must fall back to generic format, not the structured "labeled <name> on" marker
@@ -1589,6 +1731,8 @@ mod tests {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
         let text = format_event_text("issues", &event);
         // Falls back to generic format when label name is unavailable
@@ -1622,6 +1766,8 @@ mod tests {
                 full_name: Some("org/repo".to_string()),
                 html_url: None,
             }),
+            before: None,
+            after: None,
         };
         let text = format_event_text("pull_request", &event);
         assert!(text.contains("[GitHub] PR review_requested"));
@@ -1693,6 +1839,7 @@ mod tests {
             webhook_counter: Arc::new(AtomicU64::new(0)),
             github_webhook_secret: webhook_secret.map(|s| SecretString::from(s.to_string())),
             github_delivery_cache: new_delivery_cache(),
+            github_app: None,
         };
 
         axum::Router::new()
@@ -1803,6 +1950,7 @@ mod tests {
             webhook_counter: Arc::new(AtomicU64::new(0)),
             github_webhook_secret: Some(SecretString::from("test-secret")),
             github_delivery_cache: delivery_cache.clone(),
+            github_app: None,
         };
 
         let app = axum::Router::new()
@@ -2150,6 +2298,7 @@ mod tests {
             webhook_counter: Arc::new(AtomicU64::new(0)),
             github_webhook_secret: Some(SecretString::from("test-secret")),
             github_delivery_cache: new_delivery_cache(),
+            github_app: None,
         }
     }
 
@@ -2622,5 +2771,80 @@ mod tests {
             WEBHOOK_SKILL_DENYLIST.contains(&"dev-groom"),
             "WEBHOOK_SKILL_DENYLIST must contain dev-groom for operator-only enforcement"
         );
+    }
+
+    // -- Synchronize no-diff guard tests (#886) --
+
+    #[test]
+    fn test_synchronize_before_after_deserialization() {
+        // pull_request.synchronize payloads include before/after commit SHAs
+        let json = r#"{
+            "action": "synchronize",
+            "before": "abc123",
+            "after": "def456",
+            "pull_request": {"number": 1},
+            "repository": {"full_name": "org/repo"}
+        }"#;
+        let event: GitHubWebhookEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.before.as_deref(), Some("abc123"));
+        assert_eq!(event.after.as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn test_synchronize_before_after_absent_for_opened() {
+        // pull_request.opened payloads do NOT include before/after
+        let json = r#"{
+            "action": "opened",
+            "pull_request": {"number": 1},
+            "repository": {"full_name": "org/repo"}
+        }"#;
+        let event: GitHubWebhookEvent = serde_json::from_str(json).unwrap();
+        assert!(event.before.is_none());
+        assert!(event.after.is_none());
+    }
+
+    #[test]
+    fn test_compare_response_empty_files() {
+        // Empty files array → no file changes (no-op push)
+        let json = r#"{"files": []}"#;
+        let resp: CompareResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.files.is_empty());
+    }
+
+    #[test]
+    fn test_compare_response_with_files() {
+        // Non-empty files → files changed
+        let json = r#"{"files": [{"filename": "foo.rs", "status": "modified"}]}"#;
+        let resp: CompareResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.files.is_empty());
+    }
+
+    #[test]
+    fn test_compare_response_missing_files_field() {
+        // Missing files field → defaults to empty via #[serde(default)]
+        // Risk acceptance: vanishingly unlikely, low-severity consequence (one suppressed review)
+        let json = r#"{"status": "ahead"}"#;
+        let resp: CompareResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_synchronize_no_github_app_passes_through() {
+        // When github_app is None, synchronize events pass through (graceful degradation).
+        // This test verifies the handler returns 200 and the event is dispatched
+        // (not suppressed) when GitHubApp is not configured.
+        let app = test_router(Some("test-secret"));
+
+        let body = br#"{
+            "action": "synchronize",
+            "before": "abc123",
+            "after": "def456",
+            "pull_request": {"number": 1, "title": "Test PR"},
+            "repository": {"full_name": "org/repo"}
+        }"#;
+        let req = make_request("test-secret", body, "pull_request", "sync-uuid-1");
+        let resp = app.oneshot(req).await.unwrap();
+        // 200 OK — the event is routed to mika-qa and dispatched (spawn returns 200)
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

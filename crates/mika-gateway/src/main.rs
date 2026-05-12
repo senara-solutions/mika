@@ -91,6 +91,26 @@ async fn main() -> Result<()> {
         info!("GitHub webhook endpoint disabled (MIKA_GITHUB_WEBHOOK_SECRET not set)");
     }
 
+    // Construct GitHub App for outbound API calls (synchronize no-diff guard #886).
+    // Returns None when credentials are incomplete — fail-open, all synchronize events pass through.
+    let github_app = match (
+        settings.github_app_id,
+        settings.github_app_private_key.as_ref(),
+        settings.github_app_installation_id,
+    ) {
+        (Some(app_id), Some(pk), Some(install_id)) => {
+            mika_common::github_app::GitHubApp::from_credentials(
+                app_id,
+                pk.expose_secret(),
+                install_id,
+            )
+        }
+        _ => {
+            info!("GitHub App not configured for gateway (synchronize no-diff guard disabled)");
+            None
+        }
+    };
+
     // Build app state
     let state = AppState {
         pool,
@@ -107,6 +127,7 @@ async fn main() -> Result<()> {
         webhook_counter: Arc::new(AtomicU64::new(0)),
         github_webhook_secret: settings.github_webhook_secret.clone(),
         github_delivery_cache: github::new_delivery_cache(),
+        github_app,
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)
