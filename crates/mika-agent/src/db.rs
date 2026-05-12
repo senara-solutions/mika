@@ -9595,9 +9595,16 @@ impl Database {
         tx.commit()?;
 
         // -- Category 9: Post-transaction FTS5 rebuild --
-        // External-content FTS5 table needs explicit rebuild after base table changes
-        self.conn
-            .execute("INSERT INTO fts_search(fts_search) VALUES('rebuild')", [])?;
+        // External-content FTS5 table needs explicit rebuild after base table changes.
+        // If the rebuild fails, the data is already deleted (transaction committed).
+        // Log a warning but return success — the FTS index will self-heal on next
+        // startup when search_content is re-indexed.
+        if let Err(e) = self
+            .conn
+            .execute("INSERT INTO fts_search(fts_search) VALUES('rebuild')", [])
+        {
+            tracing::warn!(error = %e, agent_id, "FTS5 rebuild failed after agent reset — index may be stale");
+        }
 
         Ok(counts)
     }

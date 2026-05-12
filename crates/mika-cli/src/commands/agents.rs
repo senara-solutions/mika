@@ -410,7 +410,7 @@ fn reset(
         let input = input.trim();
         if input != name {
             println!("  Name mismatch — aborting.");
-            std::process::exit(1);
+            return Ok(());
         }
     }
 
