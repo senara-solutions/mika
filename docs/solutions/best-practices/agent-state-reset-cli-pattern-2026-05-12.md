@@ -52,10 +52,14 @@ When deleting from a table that backs an FTS5 external-content virtual table (e.
 
 ```rust
 tx.commit()?;
-self.conn.execute("INSERT INTO fts_search(fts_search) VALUES('rebuild')", [])?;
+// If rebuild fails, data is already deleted — warn instead of propagating error.
+// The FTS index will self-heal on next startup when search_content is re-indexed.
+if let Err(e) = self.conn.execute("INSERT INTO fts_search(fts_search) VALUES('rebuild')", []) {
+    tracing::warn!(error = %e, agent_id, "FTS5 rebuild failed — index may be stale");
+}
 ```
 
-The `'rebuild'` command re-scans the content table and reconstructs the entire FTS index. Running it inside the transaction can conflict with active transactions.
+The `'rebuild'` command re-scans the content table and reconstructs the entire FTS index. Running it inside the transaction can conflict with active transactions. Handle rebuild failure gracefully — the transaction already committed, so propagating the error would mislead callers into thinking the reset failed when all data was already deleted.
 
 ### Shared-resource safety checks
 
@@ -95,7 +99,7 @@ io::stdout().flush()?;
 let mut input = String::new();
 io::stdin().read_line(&mut input)?;
 if input.trim() != name {
-    std::process::exit(1);
+    return Ok(());  // Clean exit on user abort — don't use process::exit()
 }
 ```
 
