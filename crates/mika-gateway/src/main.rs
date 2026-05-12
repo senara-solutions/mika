@@ -128,6 +128,7 @@ async fn main() -> Result<()> {
         github_webhook_secret: settings.github_webhook_secret.clone(),
         github_delivery_cache: github::new_delivery_cache(),
         github_app,
+        github_api_base_url: None,
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)

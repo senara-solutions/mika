@@ -181,15 +181,20 @@ struct CompareResponse {
 /// `status: "ahead"` (ahead by 1 commit, 0 file changes). We do NOT check
 /// the `status` field — `status: "identical"` would miss the trailer-only
 /// case (the commits are distinct objects, just with the same tree).
+///
+/// Accepts a pre-acquired token and API base URL to decouple token
+/// acquisition (which may fail independently) from the compare call.
+/// The caller handles token errors as a separate fail-open path.
+const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+
 async fn commits_have_file_changes(
-    github_app: &mika_common::github_app::GitHubApp,
+    token: &str,
+    api_base_url: &str,
     repo_full_name: &str,
     before: &str,
     after: &str,
 ) -> Result<bool, anyhow::Error> {
-    let token = github_app.installation_token().await?;
-
-    let url = format!("https://api.github.com/repos/{repo_full_name}/compare/{before}...{after}");
+    let url = format!("{api_base_url}/repos/{repo_full_name}/compare/{before}...{after}");
 
     let resp = reqwest::Client::new()
         .get(&url)
@@ -715,6 +720,10 @@ pub(crate) async fn handle_github_webhook(
     // for no-op pushes (trailer-only amend, commit-message-only change).
     // Uses GitHub Compare API to check file-level differences between
     // the before and after commit SHAs. Fail-open on any error.
+    //
+    // Token acquisition and Compare API call are split so that each
+    // failure mode (token refresh error vs. API error vs. timeout) has
+    // its own explicit fail-open path — required for test coverage (#886 AC).
     if event_type == "pull_request"
         && event.action.as_deref() == Some("synchronize")
         && let Some(before) = event.before.as_deref()
@@ -726,30 +735,48 @@ pub(crate) async fn handle_github_webhook(
             .as_ref()
             .and_then(|r| r.full_name.as_deref())
             .unwrap_or("");
-        match commits_have_file_changes(github_app, repo, before, after).await {
-            Ok(false) => {
-                info!(
-                    event_type,
-                    delivery_id = %delivery_id,
-                    before,
-                    after,
-                    repo,
-                    "webhook_synchronize_no_diff_change: suppressing qa-review dispatch for no-op push"
-                );
-                return StatusCode::OK;
-            }
-            Ok(true) => {
-                // Files changed — proceed with normal dispatch.
-            }
+        let api_base = state
+            .github_api_base_url
+            .as_deref()
+            .unwrap_or(GITHUB_API_BASE_URL);
+        match github_app.installation_token().await {
             Err(e) => {
-                // Fail-open: API error should not block legitimate reviews.
+                // Fail-open: token refresh failure should not block legitimate reviews.
                 warn!(
                     error = %e,
                     delivery_id = %delivery_id,
                     before,
                     after,
-                    "synchronize_no_diff_check failed, proceeding with dispatch (fail-open)"
+                    "synchronize_no_diff_check token refresh failed, proceeding with dispatch (fail-open)"
                 );
+            }
+            Ok(token) => {
+                match commits_have_file_changes(&token, api_base, repo, before, after).await {
+                    Ok(false) => {
+                        info!(
+                            event_type,
+                            delivery_id = %delivery_id,
+                            before,
+                            after,
+                            repo,
+                            "webhook_synchronize_no_diff_change: suppressing qa-review dispatch for no-op push"
+                        );
+                        return StatusCode::OK;
+                    }
+                    Ok(true) => {
+                        // Files changed — proceed with normal dispatch.
+                    }
+                    Err(e) => {
+                        // Fail-open: API error should not block legitimate reviews.
+                        warn!(
+                            error = %e,
+                            delivery_id = %delivery_id,
+                            before,
+                            after,
+                            "synchronize_no_diff_check failed, proceeding with dispatch (fail-open)"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1840,6 +1867,7 @@ mod tests {
             github_webhook_secret: webhook_secret.map(|s| SecretString::from(s.to_string())),
             github_delivery_cache: new_delivery_cache(),
             github_app: None,
+            github_api_base_url: None,
         };
 
         axum::Router::new()
@@ -1951,6 +1979,7 @@ mod tests {
             github_webhook_secret: Some(SecretString::from("test-secret")),
             github_delivery_cache: delivery_cache.clone(),
             github_app: None,
+            github_api_base_url: None,
         };
 
         let app = axum::Router::new()
@@ -2299,6 +2328,7 @@ mod tests {
             github_webhook_secret: Some(SecretString::from("test-secret")),
             github_delivery_cache: new_delivery_cache(),
             github_app: None,
+            github_api_base_url: None,
         }
     }
 
@@ -2846,5 +2876,341 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // 200 OK — the event is routed to mika-qa and dispatched (spawn returns 200)
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -- Synchronize no-diff guard integration tests (#886, tests 6-10) --
+    //
+    // These tests exercise the full webhook handler path with a mock GitHub
+    // Compare API server and a mock agent server, verifying both suppression
+    // (no-diff) and fail-open (error/timeout/token failure) behaviors.
+
+    /// RSA 2048-bit test key for GitHubApp construction in integration tests.
+    /// Same key as `mika-common::github_app::tests::TEST_RSA_PEM`.
+    /// Name must contain `TEST_RSA_PEM` to pass the no-secrets lefthook guard.
+    const TEST_RSA_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
+MIIEpAIBAAKCAQEAqmNXtQx4L3Eko0G+ky5u03BpRRwLfQ1+zuRzUxtDIAb2LFcf\n\
+2PCCusvna5qAuXfCttcsTTFt0+x3vqI3wkO7pZ7MQatBcuQSFL3eSDhqNNLZ8zh6\n\
+evsuCwgdhn+etApM8PtEpwcps/pjlLsIb9iyB7jcYBQsr0lGRrXVdsGPQXF0yGkr\n\
+Vd3zH11tqLOWdDGXlpZTZkwwow7ojVID5POWHkp1WkY6xYCq6qYA1Gt9VfQNCzE8\n\
+WKjsd0phBgN1W4le0Q30UFiaFDErbW1uqrsQShz0Wv9bHbUpVOyTotGdXOBWg0CP\n\
+rJ5IBmt8KF73HLaK0zOwIe9qwlCLMszH4d+TaQIDAQABAoIBAA6rd/EwDibzhFaE\n\
+Ag709/i/XGjlVb3iDBFvDNjSZ5CZ2NcPdz/70R2ZEacribquK3cHhppsz4pn+RVS\n\
+LR/OKhlD100uG/fy1/WuNTWdmdNLdhVhPvZYqumrPLOISFcy7dXvpEUHMll7DNjQ\n\
+05ShoQ5WJa8l/YTn96N940+Ssa1OHesGZJa4ATP+fxiXqow5Mq/DbLTWBQ0Kj2Qc\n\
+WZFa6wc1ws61zK81U69gtW7+nnX2hzcboQhq8RVEmtJKINmfieuHSl0QOZsEuh09\n\
+fFjLLwUhwIrmZKNv3hpqJpyKL6dvgr1f+5xyfgYUoQIFB2G8V7+Xto1urGYHNjRO\n\
+DVWCbXMCgYEA04A9zJnYxwNPqnC86rxWy9fN0AsB8S4sWoO9M/ZWexfiWsMK6Mze\n\
+uOfj1cVNjBm6aLJL6F2ts/ig4wA6alR72P5ZRqneAMFgIes5SP7j70U3gFodcCe/\n\
+RoVhWNyjX4Oz9Dwu57QK5DB+3NRM/4On0wsO4GjQgl1RQnDZfYccRUcCgYEAzjyz\n\
+CzQKzT21jyzb0/0xBovlUwxnctXV5lHScHETXh8TJdgD4gU+tBJNcJoa/swSNRgL\n\
+6KfXj1LH4tbl0vBZps3RpuWVobqEZrkBjkJO9aGRsTkqtlEQJ0Lc3yQPbTWENlG+\n\
+VbfrOkAyTn69LNmndOMBKq7syBrKJTtwgVcTec8CgYEAghGr79ftaPawV7FdfT62\n\
+YkYlXHxohVpQDJpYEUy9gpX9rrOkUecsUarKgv0D49UuvpRn+k8iNDwDNZc+VYX/\n\
+ZEOHw91TmkNSS4nNgQbARrXanCTPVdob19LPO0b1chgc42bfsb8Xs53fZw9pCvp8\n\
+i12RmJDdKk8ZWjLsjjY5PKECgYB9EqC+nZwjZlYyc1EJ2hYeUz8LQ42FPhuPp3WJ\n\
+DXpibVQOclfAfc/OIv9l13+hoJ82JdQrD4cR+3EPp6YPbAXivBV2Muuw/k2HgpFn\n\
+9dyu6IJTyUiW8shqFwmeJd9ZKsh4rNBSacy1MfOQWRpfFcyRfY3aleUxYdXQCKEt\n\
+P2KnTwKBgQCMt/E5AyZ1x7xsD68M/+dQc4kZG+3wyjfgkQ5tivveW5JxRNJ7Doy/\n\
+Zk4PUTq3pSCC2sQY5Ay2b2iPez8d660jFuWT02+0sQdFmGwnFC9IxdEUPZXxeRr6\n\
+omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
+-----END RSA PRIVATE KEY-----";
+
+    /// Build a mock GitHub Compare API server returning a controlled response.
+    /// The `compare_response` closure is called for each request to produce
+    /// the status code and body. Returns `(base_url, call_count)`.
+    async fn mock_github_compare_server(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+
+        let app = axum::Router::new().route(
+            "/repos/{owner}/{repo}/compare/{spec}",
+            axum::routing::get(move || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    (status, body.to_string())
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://127.0.0.1:{}", addr.port()), call_count)
+    }
+
+    /// Build a mock GitHub Compare API server that hangs forever (for timeout tests).
+    async fn mock_github_compare_server_hanging() -> (String, Arc<AtomicUsize>) {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+
+        let app = axum::Router::new().route(
+            "/repos/{owner}/{repo}/compare/{spec}",
+            axum::routing::get(move || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    // Hang beyond the 5s timeout
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    (StatusCode::OK, r#"{"files": []}"#.to_string())
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://127.0.0.1:{}", addr.port()), call_count)
+    }
+
+    /// Build a test router with a GitHubApp (pre-seeded token) and custom API base URL.
+    /// Also spins up a mock agent server so forwarded events are captured.
+    async fn test_router_with_github_app(
+        github_api_base_url: &str,
+        agent_base_url: &str,
+        github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
+    ) -> axum::Router {
+        use crate::routes::AppState;
+        use crate::telegram::TelegramClient;
+        use secrecy::SecretString;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let http_client = reqwest::Client::new();
+        let telegram =
+            TelegramClient::new(http_client.clone(), SecretString::from("fake-bot-token"));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("lazy pool");
+
+        let state = AppState {
+            pool,
+            telegram,
+            http_client,
+            internal_token: SecretString::from("a".repeat(64)),
+            webhook_secret: SecretString::from("b".repeat(64)),
+            ready: Arc::new(AtomicBool::new(true)),
+            webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
+            agent_base_url: Some(agent_base_url.to_string()),
+            agents_namespace: "test".to_string(),
+            webhook_counter: Arc::new(AtomicU64::new(0)),
+            github_webhook_secret: Some(SecretString::from("test-secret".to_string())),
+            github_delivery_cache: new_delivery_cache(),
+            github_app,
+            github_api_base_url: Some(github_api_base_url.to_string()),
+        };
+
+        axum::Router::new()
+            .route("/webhook/github", post(handle_github_webhook))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_synchronize_no_diff_suppressed() {
+        // Mock Compare API returns empty files → no-op push detected.
+        // Handler should suppress dispatch: return 200 but NOT forward to agent.
+        let (github_api_url, compare_count) =
+            mock_github_compare_server(StatusCode::OK, r#"{"files": []}"#).await;
+        let (agent_url, agent_count) = mock_agent_server(vec![StatusCode::OK]).await;
+        let github_app =
+            mika_common::github_app::GitHubApp::new_with_test_token("fake-token").await;
+
+        let app = test_router_with_github_app(&github_api_url, &agent_url, Some(github_app)).await;
+
+        let body = br#"{
+            "action": "synchronize",
+            "before": "abc123",
+            "after": "def456",
+            "pull_request": {"number": 42, "title": "Test PR"},
+            "repository": {"full_name": "org/repo"}
+        }"#;
+        let req = make_request("test-secret", body, "pull_request", "sync-no-diff-1");
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Compare API was called
+        assert_eq!(
+            compare_count.load(Ordering::SeqCst),
+            1,
+            "Compare API should be called exactly once"
+        );
+        // Give a brief window for any async spawn to land (there shouldn't be one)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Agent server should NOT have been called (dispatch suppressed)
+        assert_eq!(
+            agent_count.load(Ordering::SeqCst),
+            0,
+            "Agent should not receive the event when diff is empty (no-op push)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synchronize_with_diff_dispatched() {
+        // Mock Compare API returns non-empty files → genuine diff detected.
+        // Handler should forward the event to the agent.
+        let (github_api_url, compare_count) = mock_github_compare_server(
+            StatusCode::OK,
+            r#"{"files": [{"filename": "src/main.rs", "status": "modified"}]}"#,
+        )
+        .await;
+        let (agent_url, agent_count) = mock_agent_server(vec![StatusCode::OK]).await;
+        let github_app =
+            mika_common::github_app::GitHubApp::new_with_test_token("fake-token").await;
+
+        let app = test_router_with_github_app(&github_api_url, &agent_url, Some(github_app)).await;
+
+        let body = br#"{
+            "action": "synchronize",
+            "before": "abc123",
+            "after": "def456",
+            "pull_request": {"number": 42, "title": "Test PR"},
+            "repository": {"full_name": "org/repo"}
+        }"#;
+        let req = make_request("test-secret", body, "pull_request", "sync-with-diff-1");
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            compare_count.load(Ordering::SeqCst),
+            1,
+            "Compare API should be called exactly once"
+        );
+        // Wait for the async spawn to deliver the event
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            agent_count.load(Ordering::SeqCst),
+            1,
+            "Agent should receive the event when diff contains file changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synchronize_api_error_fail_open() {
+        // Mock Compare API returns HTTP 500 → fail-open, event dispatched.
+        let (github_api_url, compare_count) = mock_github_compare_server(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"message": "internal error"}"#,
+        )
+        .await;
+        let (agent_url, agent_count) = mock_agent_server(vec![StatusCode::OK]).await;
+        let github_app =
+            mika_common::github_app::GitHubApp::new_with_test_token("fake-token").await;
+
+        let app = test_router_with_github_app(&github_api_url, &agent_url, Some(github_app)).await;
+
+        let body = br#"{
+            "action": "synchronize",
+            "before": "abc123",
+            "after": "def456",
+            "pull_request": {"number": 42, "title": "Test PR"},
+            "repository": {"full_name": "org/repo"}
+        }"#;
+        let req = make_request("test-secret", body, "pull_request", "sync-api-err-1");
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            compare_count.load(Ordering::SeqCst),
+            1,
+            "Compare API should be called exactly once"
+        );
+        // Fail-open: event should be forwarded to agent despite API error
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            agent_count.load(Ordering::SeqCst),
+            1,
+            "Agent should receive the event on API error (fail-open)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synchronize_api_timeout_fail_open() {
+        // Mock Compare API hangs beyond the 5s timeout → fail-open, event dispatched.
+        let (github_api_url, compare_count) = mock_github_compare_server_hanging().await;
+        let (agent_url, agent_count) = mock_agent_server(vec![StatusCode::OK]).await;
+        let github_app =
+            mika_common::github_app::GitHubApp::new_with_test_token("fake-token").await;
+
+        let app = test_router_with_github_app(&github_api_url, &agent_url, Some(github_app)).await;
+
+        let body = br#"{
+            "action": "synchronize",
+            "before": "abc123",
+            "after": "def456",
+            "pull_request": {"number": 42, "title": "Test PR"},
+            "repository": {"full_name": "org/repo"}
+        }"#;
+        let req = make_request("test-secret", body, "pull_request", "sync-timeout-1");
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            compare_count.load(Ordering::SeqCst),
+            1,
+            "Compare API should receive the request before timing out"
+        );
+        // Fail-open: event should be forwarded to agent despite timeout
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            agent_count.load(Ordering::SeqCst),
+            1,
+            "Agent should receive the event on API timeout (fail-open)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synchronize_token_refresh_failure_fail_open() {
+        // GitHubApp with empty cache and unreachable exchange endpoint →
+        // installation_token() returns Err → fail-open, event dispatched.
+        //
+        // We use GitHubApp::new() with a valid signing key but no seeded token.
+        // installation_token() will attempt JWT exchange against the real GitHub
+        // API URL (which will fail in test), producing the Err path.
+        let signing_key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes()).unwrap();
+        // No seeded token — installation_token() will try (and fail) JWT exchange
+        let github_app = mika_common::github_app::GitHubApp::new(99999, signing_key, 99999);
+
+        // Mock agent server captures forwarded events
+        let (agent_url, agent_count) = mock_agent_server(vec![StatusCode::OK]).await;
+        // Compare API won't be reached (token failure happens first), but set up
+        // a base URL anyway to avoid hitting real GitHub.
+        let (github_api_url, compare_count) =
+            mock_github_compare_server(StatusCode::OK, r#"{"files": []}"#).await;
+
+        let app = test_router_with_github_app(&github_api_url, &agent_url, Some(github_app)).await;
+
+        let body = br#"{
+            "action": "synchronize",
+            "before": "abc123",
+            "after": "def456",
+            "pull_request": {"number": 42, "title": "Test PR"},
+            "repository": {"full_name": "org/repo"}
+        }"#;
+        let req = make_request("test-secret", body, "pull_request", "sync-token-fail-1");
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Compare API should NOT be called (token failure short-circuits)
+        assert_eq!(
+            compare_count.load(Ordering::SeqCst),
+            0,
+            "Compare API should not be called when token refresh fails"
+        );
+        // Fail-open: event should be forwarded to agent despite token failure
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            agent_count.load(Ordering::SeqCst),
+            1,
+            "Agent should receive the event on token refresh failure (fail-open)"
+        );
     }
 }

@@ -1981,6 +1981,7 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "jsonwebtoken",
  "lru 0.16.3",
  "mika-a2a",
  "mika-common",

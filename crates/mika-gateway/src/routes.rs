@@ -104,6 +104,8 @@ pub struct AppState {
     /// GitHub App for authenticating outbound GitHub API calls (synchronize no-diff guard).
     /// `None` when credentials are incomplete — all synchronize events pass through (fail-open).
     pub github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
+    /// Override for GitHub API base URL (testing only). Defaults to `https://api.github.com`.
+    pub github_api_base_url: Option<String>,
 }
 
 impl std::fmt::Debug for AppState {
