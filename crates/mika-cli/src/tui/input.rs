@@ -295,6 +295,21 @@ pub fn handle_key(app: &mut App<'_>, key: KeyEvent) {
         app.needs_redraw = true;
     }
 
+    // Always-safe quit commands bypass the Idle gate and autocomplete.
+    // Critical for autonomous agents that are rarely Idle — without this,
+    // `tmux send-keys "/exit" Enter` is silently dropped while busy.
+    if key.code == KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+    {
+        let input_text = app.input_text();
+        if matches!(input_text.trim(), "/exit" | "/quit" | "/q") {
+            app.should_quit = true;
+            return;
+        }
+    }
+
     if app.autocomplete.visible() {
         handle_key_autocomplete(app, key);
     } else {
@@ -1049,6 +1064,163 @@ pub fn try_load_image_file(path: &str) -> Option<ImageAttachment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use mika_agent::async_db::AsyncDatabase;
+    use mika_agent::db::Database;
+    use mika_agent::skills::SkillRegistry;
+    use mika_common::llm::{LlmError, LlmProvider, LlmRequest, LlmResponse, ProviderKind};
+    use tokio::sync::mpsc;
+
+    use crate::tui::app::AgentRequest;
+
+    /// Minimal no-op LLM provider for input handler tests.
+    struct NoopLlmProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NoopLlmProvider {
+        async fn send_message(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            Err(LlmError::ProviderError("noop provider".to_string()))
+        }
+
+        fn model_name(&self) -> &str {
+            "noop"
+        }
+
+        fn provider_name(&self) -> &str {
+            "noop"
+        }
+
+        fn max_tokens(&self) -> u32 {
+            4096
+        }
+
+        fn supports_tool_calling(&self) -> bool {
+            false
+        }
+
+        async fn check_health(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// Test helper: construct a minimal App for input handler tests.
+    async fn test_app() -> (
+        App<'static>,
+        mpsc::UnboundedReceiver<AgentRequest>,
+        tempfile::TempDir,
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home_dir = temp_dir.path().to_path_buf();
+        let global_home = temp_dir.path().to_path_buf();
+
+        let db = Database::open_in_memory().unwrap();
+        let async_db = AsyncDatabase::new(db);
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        async_db
+            .create_session(&session_id, "mika", "cli")
+            .await
+            .unwrap();
+
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
+        let (_response_tx, response_rx) = mpsc::unbounded_channel();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(NoopLlmProvider);
+        let skills = Arc::new(SkillRegistry::empty());
+
+        let app = App::new(
+            agent_tx,
+            response_rx,
+            session_id,
+            "claude-sonnet-4-6".to_string(),
+            "Mika".to_string(),
+            async_db,
+            llm,
+            home_dir,
+            skills,
+            "mika".to_string(),
+            global_home,
+            ProviderKind::Anthropic,
+        );
+
+        (app, agent_rx, temp_dir)
+    }
+
+    /// Helper: create a plain Enter key event.
+    fn enter_key() -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exit_while_thinking_sets_should_quit() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.status = AgentStatus::Thinking;
+        app.textarea.insert_str("/exit");
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, enter_key());
+
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn test_quit_while_responding_sets_should_quit() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.status = AgentStatus::Responding(42);
+        app.textarea.insert_str("/quit");
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, enter_key());
+
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn test_q_while_thinking_sets_should_quit() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.status = AgentStatus::Thinking;
+        app.textarea.insert_str("/q");
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, enter_key());
+
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn test_regular_message_while_busy_does_not_send() {
+        let (mut app, mut rx, _tmp): (App<'_>, mpsc::UnboundedReceiver<AgentRequest>, _) =
+            test_app().await;
+        app.status = AgentStatus::Thinking;
+        app.textarea.insert_str("hello");
+
+        handle_key(&mut app, enter_key());
+
+        // should_quit must remain false
+        assert!(!app.should_quit);
+        // No message should have been sent
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exit_while_idle_sets_should_quit() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.status = AgentStatus::Idle;
+        app.textarea.insert_str("/exit");
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, enter_key());
+
+        assert!(app.should_quit);
+    }
 
     #[test]
     fn test_try_load_image_file_nonexistent() {
