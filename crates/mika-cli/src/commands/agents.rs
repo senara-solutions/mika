@@ -6,6 +6,7 @@ use mika_common::home;
 
 use crate::cli::{AgentsArgs, AgentsCommand, OutputFormat};
 use crate::wizard;
+use mika_agent::db::{Database, ResetAgentCounts};
 
 pub async fn run(args: AgentsArgs) -> Result<()> {
     let global_home = home::resolve_home_dir()?;
@@ -25,6 +26,12 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
         AgentsCommand::Validate { name, format } => {
             validate_agents(&global_home, name.as_deref(), &format)
         }
+        AgentsCommand::Reset {
+            name,
+            force,
+            dry_run,
+            yes,
+        } => reset(&global_home, &name, force, dry_run, yes),
     }
 }
 
@@ -325,6 +332,141 @@ fn validate_agents(
     }
 
     Ok(())
+}
+
+fn reset(
+    global_home: &std::path::Path,
+    name: &str,
+    force: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    let name = agent::normalize_agent_name(name);
+
+    if !agent::agent_exists(global_home, &name) {
+        bail!("Agent '{name}' not found.");
+    }
+
+    // Open the database
+    let db_path = home::container_db_path(global_home);
+    if !db_path.exists() {
+        bail!(
+            "Mika database not found at {}. Run 'mika status' to initialize.",
+            db_path.display()
+        );
+    }
+    let db = Database::open(&db_path)?;
+
+    // Ensure the agent is registered in DB
+    let agents_db = db.list_agents_db()?;
+    let agent_id = match agents_db.iter().find(|a| a.id == name || a.name == name) {
+        Some(a) => a.id.clone(),
+        None => bail!("Agent '{name}' exists on disk but not in the database."),
+    };
+
+    // Active-task guard
+    let active_tasks = db.get_active_tasks_for_agent(&agent_id)?;
+    if !active_tasks.is_empty() && !force {
+        println!("\n  Cannot reset agent '{name}' — active tasks found:\n");
+        for (task_id, status) in &active_tasks {
+            println!("    {task_id}  ({status})");
+        }
+        println!("\n  Use --force to bypass this check, or cancel active tasks first.\n");
+        bail!("agent_busy: {} active task(s)", active_tasks.len());
+    }
+
+    // Dry-run: just show counts
+    if dry_run {
+        let counts = db.count_agent_state(&agent_id)?;
+        println!("\n  Dry run — rows that would be deleted for agent '{name}':\n");
+        print_counts(&counts);
+        println!("    {:<40} {}", "Total", counts.total());
+        println!();
+        return Ok(());
+    }
+
+    // Confirmation prompt
+    if !yes {
+        if !io::stdin().is_terminal() {
+            bail!(
+                "Non-interactive terminal requires --yes flag to bypass confirmation. \
+                 Use: mika agents reset {name} --yes"
+            );
+        }
+
+        // Show preview before asking
+        let counts = db.count_agent_state(&agent_id)?;
+        println!(
+            "\n  This will delete {} row(s) across all tables for agent '{name}'.",
+            counts.total()
+        );
+        println!("  The agent row and identity.toml will be preserved.\n");
+
+        print!("  Type the agent name to confirm: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+        if input != name {
+            println!("  Name mismatch — aborting.");
+            return Ok(());
+        }
+    }
+
+    // Execute reset
+    let counts = db.reset_agent_state(&agent_id)?;
+
+    println!("\n  Reset complete for agent '{name}':\n");
+    print_counts(&counts);
+    println!("    {:<40} {}", "Total", counts.total());
+    println!();
+    println!("  Custom skill overrides (LLM model routing) have been cleared.");
+    println!("  Re-apply via `mika skills llm set` if needed.");
+    println!("  Bundled skills will be restored on next startup.\n");
+
+    Ok(())
+}
+
+fn print_counts(counts: &ResetAgentCounts) {
+    let rows: &[(&str, u64)] = &[
+        ("sessions", counts.sessions),
+        ("messages", counts.messages),
+        ("core_memory", counts.core_memory),
+        ("llm_calls", counts.llm_calls),
+        ("tool_calls", counts.tool_calls),
+        ("audit_events", counts.audit_events),
+        ("audit_event_summaries", counts.audit_event_summaries),
+        ("people", counts.people),
+        ("commitments", counts.commitments),
+        ("preferences", counts.preferences),
+        ("events", counts.events),
+        ("search_content", counts.search_content),
+        ("tasks", counts.tasks),
+        ("kg_subject_resolutions", counts.kg_subject_resolutions),
+        ("kg_resolutions_log", counts.kg_resolutions_log),
+        ("agent_kg_corpora", counts.agent_kg_corpora),
+        ("kg_invalidated_no_match", counts.kg_invalidated_no_match),
+        ("skill_overrides", counts.skill_overrides),
+        ("heartbeat_sends", counts.heartbeat_sends),
+        ("reflection_runs", counts.reflection_runs),
+        ("customer_config", counts.customer_config),
+        ("failed_sends", counts.failed_sends),
+        ("kg_chunks", counts.kg_chunks),
+        ("kg_subject_entities", counts.kg_subject_entities),
+        ("kg_subject_relationships", counts.kg_subject_relationships),
+        ("kg_chunk_subjects", counts.kg_chunk_subjects),
+        (
+            "kg_chunk_subject_relationships",
+            counts.kg_chunk_subject_relationships,
+        ),
+        ("kg_extractions", counts.kg_extractions),
+    ];
+    for (name, count) in rows {
+        if *count > 0 {
+            println!("    {:<40} {}", name, count);
+        }
+    }
 }
 
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path, depth: u32) -> Result<()> {

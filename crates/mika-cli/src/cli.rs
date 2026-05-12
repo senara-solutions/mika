@@ -308,6 +308,20 @@ pub enum AgentsCommand {
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
+    /// Wipe all state for an agent without deleting the agent itself
+    Reset {
+        /// Agent name to reset
+        name: String,
+        /// Skip active-task safety check
+        #[arg(long)]
+        force: bool,
+        /// Preview what would be deleted without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Args)]

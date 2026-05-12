@@ -9305,6 +9305,311 @@ fn format_age(timestamp_str: &str, now: chrono::DateTime<Utc>) -> String {
     }
 }
 
+// ===== Agent Reset helpers =====
+
+/// Per-table counts of rows deleted (or that would be deleted) by an agent reset.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ResetAgentCounts {
+    pub sessions: u64,
+    pub messages: u64,
+    pub core_memory: u64,
+    pub llm_calls: u64,
+    pub tool_calls: u64,
+    pub audit_events: u64,
+    pub audit_event_summaries: u64,
+    pub people: u64,
+    pub commitments: u64,
+    pub preferences: u64,
+    pub events: u64,
+    pub search_content: u64,
+    pub tasks: u64,
+    pub kg_subject_resolutions: u64,
+    pub kg_resolutions_log: u64,
+    pub agent_kg_corpora: u64,
+    pub kg_invalidated_no_match: u64,
+    pub skill_overrides: u64,
+    pub heartbeat_sends: u64,
+    pub reflection_runs: u64,
+    pub customer_config: u64,
+    pub failed_sends: u64,
+    // Shared KG tables (only deleted if no other agent shares the corpus)
+    pub kg_chunks: u64,
+    pub kg_subject_entities: u64,
+    pub kg_subject_relationships: u64,
+    pub kg_chunk_subjects: u64,
+    pub kg_chunk_subject_relationships: u64,
+    pub kg_extractions: u64,
+}
+
+impl ResetAgentCounts {
+    /// Total rows across all tables.
+    pub fn total(&self) -> u64 {
+        self.sessions
+            + self.messages
+            + self.core_memory
+            + self.llm_calls
+            + self.tool_calls
+            + self.audit_events
+            + self.audit_event_summaries
+            + self.people
+            + self.commitments
+            + self.preferences
+            + self.events
+            + self.search_content
+            + self.tasks
+            + self.kg_subject_resolutions
+            + self.kg_resolutions_log
+            + self.agent_kg_corpora
+            + self.kg_invalidated_no_match
+            + self.skill_overrides
+            + self.heartbeat_sends
+            + self.reflection_runs
+            + self.customer_config
+            + self.failed_sends
+            + self.kg_chunks
+            + self.kg_subject_entities
+            + self.kg_subject_relationships
+            + self.kg_chunk_subjects
+            + self.kg_chunk_subject_relationships
+            + self.kg_extractions
+    }
+}
+
+impl Database {
+    /// Count per-table rows that would be deleted by `reset_agent_state`.
+    /// Used for `--dry-run` preview.
+    pub fn count_agent_state(&self, agent_id: &str) -> Result<ResetAgentCounts> {
+        // Verify agent exists
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("Agent '{agent_id}' not found in database");
+        }
+
+        let count = |table: &str, col: &str, val: &str| -> Result<u64> {
+            let sql = format!("SELECT COUNT(*) FROM {table} WHERE {col} = ?1");
+            let n = self
+                .conn
+                .query_row(&sql, params![val], |r| r.get::<_, i64>(0))?;
+            Ok(n as u64)
+        };
+
+        let mut counts = ResetAgentCounts {
+            sessions: count("sessions", "agent_id", agent_id)?,
+            messages: count("messages", "agent_id", agent_id)?,
+            core_memory: count("core_memory", "agent_id", agent_id)?,
+            llm_calls: count("llm_calls", "agent_id", agent_id)?,
+            tool_calls: count("tool_calls", "agent_id", agent_id)?,
+            audit_events: count("audit_events", "agent_id", agent_id)?,
+            audit_event_summaries: count("audit_event_summaries", "agent_id", agent_id)?,
+            people: count("people", "agent_id", agent_id)?,
+            commitments: count("commitments", "agent_id", agent_id)?,
+            preferences: count("preferences", "agent_id", agent_id)?,
+            events: count("events", "agent_id", agent_id)?,
+            search_content: count("search_content", "agent_id", agent_id)?,
+            tasks: count("tasks", "agent_id", agent_id)?,
+            kg_subject_resolutions: count("kg_subject_resolutions", "agent_id", agent_id)?,
+            kg_resolutions_log: count("kg_resolutions_log", "agent_id", agent_id)?,
+            agent_kg_corpora: count("agent_kg_corpora", "agent_id", agent_id)?,
+            kg_invalidated_no_match: count("kg_invalidated_no_match", "agent_id", agent_id)?,
+            skill_overrides: count("skill_overrides", "agent_id", agent_id)?,
+            heartbeat_sends: count("heartbeat_sends", "agent_id", agent_id)?,
+            reflection_runs: count("reflection_runs", "agent_id", agent_id)?,
+            customer_config: count("customer_config", "agent_id", agent_id)?,
+            failed_sends: count("failed_sends", "agent_id", agent_id)?,
+            ..Default::default()
+        };
+
+        // Shared KG tables: count rows that would be deleted
+        // (only if no other agent shares the same docs_root_hash)
+        let corpora = self.list_agent_corpora(agent_id)?;
+        for (hash, _path) in &corpora {
+            let other_refs: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM agent_kg_corpora WHERE docs_root_hash = ?1 AND agent_id != ?2",
+                params![hash, agent_id],
+                |r| r.get(0),
+            )?;
+            if other_refs == 0 {
+                // This agent is the sole owner — these would be deleted
+                let shared_tables = [
+                    ("kg_chunks", &mut counts.kg_chunks),
+                    ("kg_subject_entities", &mut counts.kg_subject_entities),
+                    (
+                        "kg_subject_relationships",
+                        &mut counts.kg_subject_relationships,
+                    ),
+                    ("kg_chunk_subjects", &mut counts.kg_chunk_subjects),
+                    (
+                        "kg_chunk_subject_relationships",
+                        &mut counts.kg_chunk_subject_relationships,
+                    ),
+                    ("kg_extractions", &mut counts.kg_extractions),
+                ];
+                for (table, field) in shared_tables {
+                    let sql = format!("SELECT COUNT(*) FROM {table} WHERE docs_root_hash = ?1");
+                    let n: i64 = self.conn.query_row(&sql, params![hash], |r| r.get(0))?;
+                    *field += n as u64;
+                }
+            }
+        }
+
+        Ok(counts)
+    }
+
+    /// Get active tasks for an agent (used by the active-task guard).
+    /// Returns `(task_id, status)` pairs for tasks in active states.
+    pub fn get_active_tasks_for_agent(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, status FROM tasks
+             WHERE agent_id = ?1
+               AND status IN ('pending', 'in_progress', 'recurring_active')",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete all per-agent state while preserving the agent row itself.
+    ///
+    /// Caller is responsible for the active-task guard and confirmation prompt.
+    /// After this call, the agent is in a freshly-provisioned state: zero rows
+    /// in all child tables, agent row preserved, `identity.toml` untouched.
+    pub fn reset_agent_state(&self, agent_id: &str) -> Result<ResetAgentCounts> {
+        // Verify agent exists
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("Agent '{agent_id}' not found in database");
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let mut counts = ResetAgentCounts::default();
+
+        // Helper: delete from a table by agent_id and record count
+        macro_rules! delete_by_agent {
+            ($table:expr, $field:ident) => {
+                tx.execute(
+                    &format!("DELETE FROM {} WHERE agent_id = ?1", $table),
+                    params![agent_id],
+                )?;
+                counts.$field = tx.changes();
+            };
+        }
+
+        // -- Category 1: Conversation --
+        delete_by_agent!("messages", messages);
+        delete_by_agent!("sessions", sessions);
+        delete_by_agent!("llm_calls", llm_calls);
+        delete_by_agent!("tool_calls", tool_calls);
+
+        // -- Category 2: Memory --
+        delete_by_agent!("core_memory", core_memory);
+        delete_by_agent!("people", people);
+        delete_by_agent!("commitments", commitments);
+        delete_by_agent!("preferences", preferences);
+        delete_by_agent!("events", events);
+        delete_by_agent!("search_content", search_content);
+
+        // -- Category 3: Audit --
+        delete_by_agent!("audit_events", audit_events);
+        delete_by_agent!("audit_event_summaries", audit_event_summaries);
+
+        // -- Category 4: Tasks --
+        delete_by_agent!("tasks", tasks);
+
+        // -- Category 5: Operations --
+        delete_by_agent!("heartbeat_sends", heartbeat_sends);
+        delete_by_agent!("reflection_runs", reflection_runs);
+        delete_by_agent!("customer_config", customer_config);
+        delete_by_agent!("failed_sends", failed_sends);
+
+        // -- Category 6: KG per-agent --
+        delete_by_agent!("kg_subject_resolutions", kg_subject_resolutions);
+        delete_by_agent!("kg_resolutions_log", kg_resolutions_log);
+        delete_by_agent!("kg_invalidated_no_match", kg_invalidated_no_match);
+
+        // -- Category 7: KG shared (conditional — only if no other agent shares the corpus) --
+        // Query corpora BEFORE deleting agent_kg_corpora rows
+        let corpora: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT docs_root_hash, docs_root_path FROM agent_kg_corpora WHERE agent_id = ?1",
+            )?;
+            stmt.query_map(params![agent_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        for (hash, _path) in &corpora {
+            let other_refs: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM agent_kg_corpora WHERE docs_root_hash = ?1 AND agent_id != ?2",
+                params![hash, agent_id],
+                |r| r.get(0),
+            )?;
+            if other_refs == 0 {
+                // Sole owner — delete shared-layer rows in FK-safe order
+                let shared_tables = [
+                    "kg_chunk_subject_relationships",
+                    "kg_chunk_subjects",
+                    "kg_subject_relationships",
+                    "kg_subject_entities",
+                    "kg_extractions",
+                    "kg_chunks",
+                ];
+                for table in &shared_tables {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE docs_root_hash = ?1"),
+                        params![hash],
+                    )?;
+                    let deleted = tx.changes();
+                    match *table {
+                        "kg_chunk_subject_relationships" => {
+                            counts.kg_chunk_subject_relationships += deleted
+                        }
+                        "kg_chunk_subjects" => counts.kg_chunk_subjects += deleted,
+                        "kg_subject_relationships" => counts.kg_subject_relationships += deleted,
+                        "kg_subject_entities" => counts.kg_subject_entities += deleted,
+                        "kg_extractions" => counts.kg_extractions += deleted,
+                        "kg_chunks" => counts.kg_chunks += deleted,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Now delete the agent_kg_corpora mapping rows
+        delete_by_agent!("agent_kg_corpora", agent_kg_corpora);
+
+        // -- Category 8: Skills --
+        delete_by_agent!("skill_overrides", skill_overrides);
+
+        tx.commit()?;
+
+        // -- Category 9: Post-transaction FTS5 rebuild --
+        // External-content FTS5 table needs explicit rebuild after base table changes.
+        // If the rebuild fails, the data is already deleted (transaction committed).
+        // Log a warning but return success — the FTS index will self-heal on next
+        // startup when search_content is re-indexed.
+        if let Err(e) = self
+            .conn
+            .execute("INSERT INTO fts_search(fts_search) VALUES('rebuild')", [])
+        {
+            tracing::warn!(error = %e, agent_id, "FTS5 rebuild failed after agent reset — index may be stale");
+        }
+
+        Ok(counts)
+    }
+}
+
 // ===== KG CLI helpers =====
 
 /// Counts of rows deleted by a KG purge operation.
@@ -15046,5 +15351,168 @@ mod tests {
             t.next_fire_at.is_some(),
             "AgentBusy callback should have next_fire_at for retry delay"
         );
+    }
+
+    // ===== Agent Reset tests (#964) =====
+
+    /// Helper to create a manual task for the given agent.
+    fn make_manual_task(agent_id: &str, label: &str) -> NewTask {
+        NewTask {
+            agent_id: agent_id.to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        }
+    }
+
+    #[test]
+    fn test_reset_agent_empty() {
+        // Reset an agent with no state — should be idempotent, all counts 0
+        let db = db();
+        let agent_id = "test-agent";
+        db.register_agent(agent_id, "Test Agent", "/tmp/test")
+            .unwrap();
+
+        // First reset: all zeros
+        let counts = db.reset_agent_state(agent_id).unwrap();
+        assert_eq!(counts.total(), 0);
+
+        // Agent row still exists
+        let agents = db.list_agents_db().unwrap();
+        assert!(agents.iter().any(|a| a.id == agent_id));
+
+        // Second reset: still idempotent
+        let counts2 = db.reset_agent_state(agent_id).unwrap();
+        assert_eq!(counts2.total(), 0);
+    }
+
+    #[test]
+    fn test_reset_agent_populated() {
+        let db = db();
+        let agent_id = "test-agent";
+        db.register_agent(agent_id, "Test Agent", "/tmp/test")
+            .unwrap();
+
+        // Insert data into multiple child tables
+        let sid = "test-reset-session";
+        db.create_session(sid, agent_id, "cli").unwrap();
+        db.save_message(agent_id, sid, "user", "hello", None)
+            .unwrap();
+        db.save_message(agent_id, sid, "assistant", "hi", None)
+            .unwrap();
+        db.set_core_memory(agent_id, "user_summary", "test user")
+            .unwrap();
+
+        // Create a task
+        let task = make_manual_task(agent_id, "test task");
+        db.create_task(&task).unwrap();
+
+        // Create a person fact
+        db.conn
+            .execute(
+                "INSERT INTO people (agent_id, canonical_name, relationship, notes)
+                 VALUES (?1, 'Alice', 'colleague', 'test')",
+                params![agent_id],
+            )
+            .unwrap();
+
+        // Create a heartbeat_sends entry
+        db.conn
+            .execute(
+                "INSERT INTO heartbeat_sends (agent_id, sent_at)
+                 VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+                params![agent_id],
+            )
+            .unwrap();
+
+        // Create a customer_config entry
+        db.conn
+            .execute(
+                "INSERT INTO customer_config (agent_id, key, value)
+                 VALUES (?1, 'test_key', 'test_value')",
+                params![agent_id],
+            )
+            .unwrap();
+
+        // Verify data exists before reset
+        let pre_counts = db.count_agent_state(agent_id).unwrap();
+        assert!(pre_counts.sessions > 0);
+        assert!(pre_counts.messages > 0);
+        assert!(pre_counts.core_memory > 0);
+        assert!(pre_counts.tasks > 0);
+        assert!(pre_counts.people > 0);
+        assert!(pre_counts.heartbeat_sends > 0);
+        assert!(pre_counts.customer_config > 0);
+
+        // Reset
+        let counts = db.reset_agent_state(agent_id).unwrap();
+        assert!(counts.total() > 0, "Should have deleted rows");
+
+        // Verify all child tables are empty for this agent
+        let post_counts = db.count_agent_state(agent_id).unwrap();
+        assert_eq!(post_counts.total(), 0, "All child tables should be empty");
+
+        // Agent row still exists
+        let agents = db.list_agents_db().unwrap();
+        assert!(
+            agents.iter().any(|a| a.id == agent_id),
+            "Agent row must survive reset"
+        );
+    }
+
+    #[test]
+    fn test_reset_agent_active_task_guard() {
+        let db = db();
+        let agent_id = "test-agent";
+        db.register_agent(agent_id, "Test Agent", "/tmp/test")
+            .unwrap();
+
+        // Create an in_progress task
+        let mut task = make_manual_task(agent_id, "active work");
+        task.trigger_type = "manual".to_string();
+        let task_id = db.create_task(&task).unwrap();
+
+        // Transition to in_progress
+        db.update_task_status(&task_id, "in_progress").unwrap();
+
+        // Active-task guard should find it
+        let active = db.get_active_tasks_for_agent(agent_id).unwrap();
+        assert!(!active.is_empty(), "Should detect active task");
+        assert!(
+            active.iter().any(|(id, _)| id == &task_id),
+            "Should include the in_progress task"
+        );
+    }
+
+    #[test]
+    fn test_reset_agent_nonexistent() {
+        let db = db();
+        let result = db.reset_agent_state("nonexistent-agent");
+        assert!(result.is_err(), "Should fail for nonexistent agent");
+    }
+
+    #[test]
+    fn test_count_agent_state_nonexistent() {
+        let db = db();
+        let result = db.count_agent_state("nonexistent-agent");
+        assert!(result.is_err(), "Should fail for nonexistent agent");
     }
 }
