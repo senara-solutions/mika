@@ -36,6 +36,8 @@ pub mod current_priorities_drift;
 pub mod fabricated_shell_errors;
 pub mod graphql_field_fabrication;
 pub mod kg_result_ignored;
+pub mod qa_review_absence_claim_grounded;
+pub mod qa_review_per_element_enumeration;
 pub mod quoted_resource_pre_fetch;
 pub mod required_suffix_line_caught;
 pub mod required_suffix_line_unconstrained;
