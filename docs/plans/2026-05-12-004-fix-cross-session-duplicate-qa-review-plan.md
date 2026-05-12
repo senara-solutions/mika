@@ -251,6 +251,8 @@ async fn commits_have_file_changes(
 
 **Why `Vec<serde_json::Value>` for `files`:** We only need to know if the array is empty. Deserializing full file objects is waste. `serde_json::Value` is the cheapest typed deserialization that preserves the "is it empty?" check.
 
+**`#[serde(default)]` risk acceptance (mika-arch NF1):** If GitHub returns a malformed response without a `files` field, `#[serde(default)]` yields an empty Vec, which we'd interpret as "no file changes" → suppression. This is vanishingly unlikely (GitHub's Compare API always includes `files`), and the consequence (one suppressed review on a malformed response) is low-severity — the next genuine push would trigger review normally. Add a code comment documenting this risk acceptance.
+
 **Why a fresh `reqwest::Client::new()`:** The gateway's `AppState.http_client` is configured for agent forwarding (potentially with different timeouts/headers). A dedicated client for the GitHub API avoids coupling. The cost is negligible — `reqwest::Client` is cheap to construct and connection pooling is per-host regardless.
 
 **5-second timeout rationale:** GitHub Compare API typical latency is 100-500ms. 5s provides 10x headroom for slow responses. On timeout, the `Err` path triggers fail-open — the event dispatches normally. Hardcoded (not configurable) — this is a single-purpose guard, not a user-facing feature.
