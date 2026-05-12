@@ -15,6 +15,120 @@ Anthropic billing rejections (HTTP 400 + "Your credit balance is too low") are c
 
 **Anthropic provider only.** No cross-provider generalization in this PR. When a second non-Anthropic billing incident occurs, the second variant will reveal the abstraction shape.
 
+## Pinned Source (mika-arch F1, F2)
+
+### Current `ClaudeApiError` enum (`:280-288`)
+
+```rust
+#[derive(Error, Debug)]
+pub enum ClaudeApiError {
+    #[error("Claude API HTTP error ({status}): {message}")]
+    HttpError { status: u16, message: String },
+    #[error("Claude API request failed")]
+    Transport(#[from] reqwest::Error),
+    #[error("Claude API response parse error")]
+    ParseError(#[source] reqwest::Error),
+}
+```
+
+Three variants. No existing variant covers billing. `HttpError` carries `{ status, message }` — same field pattern as the proposed `BillingError { message }`.
+
+### Current `ApiErrorResponse` / `ApiErrorDetail` structs (`:267-276`)
+
+```rust
+#[derive(Debug, Deserialize)]
+struct ApiErrorResponse {
+    error: ApiErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorDetail {
+    message: String,
+}
+```
+
+**Anthropic response shape mapping:** Anthropic returns `{ "type": "error", "error": { "type": "invalid_request_error", "message": "Your credit balance is too low..." } }`. `ApiErrorResponse` maps the outer object; `ApiErrorDetail` maps the inner `error` object. The outer `type: "error"` is not captured (unused). Adding `#[serde(rename = "type")] error_type: Option<String>` to `ApiErrorDetail` correctly captures the *inner* `error.type` — the discriminator we need. `Option<String>` because serde's `deny_unknown_fields` is not set, so missing `type` fields in non-standard responses deserialize as `None` without failing.
+
+### Current `send_once` response parsing (`:705-721`)
+
+```rust
+let status = response.status();
+if !status.is_success() {
+    let status_code = status.as_u16();
+    // Log the body at warn level but do NOT include it in the error
+    let body = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<ApiErrorResponse>(&body)
+        .map(|e| e.error.message)
+        .unwrap_or_else(|_| {
+            // Truncate raw body to avoid leaking proxy/CDN internals
+            let truncated: String = body.chars().take(200).collect();
+            format!("unexpected error response (HTTP {status_code}): {truncated}")
+        });
+    warn!(status = status_code, error_message = %message, "Claude API error response");
+    return Err(ClaudeApiError::HttpError {
+        status: status_code,
+        message,
+    });
+}
+```
+
+**Insertion point:** After `serde_json::from_str::<ApiErrorResponse>(&body)` parse, before the `warn!` + `HttpError` return. The parse already exists — this is extending it, not adding a new one. "One parse pass" claim confirmed.
+
+**Key change:** The current code calls `.map(|e| e.error.message)` which consumes the parsed struct. The revised code must keep the parsed result alive for the billing check: use `parsed.as_ref().map(|e| e.error.message.clone())` to borrow instead of consume.
+
+### Current `is_retryable` (`:736-742`)
+
+```rust
+fn is_retryable(error: &ClaudeApiError) -> bool {
+    match error {
+        ClaudeApiError::HttpError { status, .. } => matches!(status, 429 | 500 | 529),
+        ClaudeApiError::Transport(e) => e.is_timeout(),
+        _ => false,
+    }
+}
+```
+
+**Positive match pattern confirmed.** `HttpError` with 429/500/529 → true; `Transport` timeout → true; everything else → `false`. New `BillingError` variant falls into `_ => false` automatically. No code change needed.
+
+### Retry loop structure and deadline interaction (`:519-610`)
+
+```rust
+for attempt in 0..=MAX_RETRIES {
+    if attempt > 0 {
+        // Deadline-aware retry abort (PR#941)
+        if let Some(dl) = deadline {
+            let remaining = dl.saturating_duration_since(Instant::now());
+            if remaining < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS) {
+                break;  // → falls to post-loop last_error path
+            }
+        }
+        tokio::time::sleep(delay).await;
+    }
+
+    match self.send_once(request, auth_header.clone()).await {
+        Ok(response) => return Ok(response),
+        Err(e) => {
+            if attempt < MAX_RETRIES && is_retryable(&e) {
+                last_error = Some(e);
+                continue;  // → next iteration, hits deadline check
+            }
+            // Non-retryable: 401 OAuth refresh attempt, then final error mapping
+            return Err(match &e { ... });
+        }
+    }
+}
+```
+
+**Interaction confirmed safe.** `BillingError` from `send_once` → `is_retryable` returns `false` → skips `continue` → falls through to the final `return Err(match &e { ... })` block on the **same iteration** (attempt 0). The deadline check only fires when `attempt > 0`, so `BillingError` exits before any deadline evaluation. No retry, no sleep, no deadline interaction.
+
+### `ClaudeApiError` → `LlmError` wrapping
+
+`ClaudeApiError` is used directly by `ClaudeClient` (the Anthropic-specific client). It does not map to `LlmError` (the provider-agnostic error type used by `LlmProvider` trait). The `AnthropicProvider::send_message` implementation wraps `ClaudeClient` calls with `anyhow::Error` context. `BillingError` propagates through the `anyhow` chain — the variant is preserved in the error chain's source, and the context message carries the operator-visible billing URL.
+
+### Observed billing message (mika-arch F3)
+
+**Incident 2026-05-12:** All 1086 WARN entries carried the same message: `"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."` Only one variant observed. The prefix `"Your credit balance is too low"` covers this variant. If Anthropic adds variants (e.g., `"Your credit balance is too low for this model"`), the prefix will still match. If they change the prefix entirely, classification falls back to `HttpError` (safe default).
+
 ## Implementation Steps
 
 ### Step 1: Extend `ApiErrorDetail` with `error_type` field
