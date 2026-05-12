@@ -1060,13 +1060,15 @@ fn draw_footer(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect, terminal_width:
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        // Active background task badge
-        if app.active_background_task_count > 0 {
+        // Active background task badge — split executing vs queued (#1057)
+        if app.executing_task_count > 0 || app.queued_task_count > 0 {
             s.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-            s.push(Span::styled(
-                format!("[{} running]", app.active_background_task_count),
-                Style::default().fg(Color::Yellow),
-            ));
+            let badge = match (app.executing_task_count, app.queued_task_count) {
+                (e, q) if e > 0 && q > 0 => format!("[{e} running, {q} queued]"),
+                (e, _) if e > 0 => format!("[{e} running]"),
+                (_, q) => format!("[{q} queued]"),
+            };
+            s.push(Span::styled(badge, Style::default().fg(Color::Yellow)));
         }
         s
     };

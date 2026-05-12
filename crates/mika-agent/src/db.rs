@@ -173,6 +173,15 @@ pub struct Task {
     pub dispatch_class: Option<String>,
 }
 
+/// Split counts of active background callback tasks. `executing` = subprocess alive
+/// (`process_id IS NOT NULL`), `queued` = waiting for dispatch slot (`process_id IS NULL`).
+/// Used by TUI footer badge to distinguish `[1 running, 2 queued]` (#1057).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTaskCounts {
+    pub executing: usize,
+    pub queued: usize,
+}
+
 /// A parent self_dev task left `in_progress` after its callback subtask
 /// delivered without producing a PR. Used by the task engine reaper (#871).
 #[derive(Debug, Clone)]
@@ -5121,20 +5130,33 @@ impl Database {
         Ok(rows)
     }
 
-    /// Count active background tasks (long-running callback tasks that are pending or in-progress).
-    /// Used by TUI footer badge. Complements `get_user_visible_tasks()` which intentionally
-    /// excludes callback tasks.
-    pub fn get_active_background_task_count(&self, agent_id: &str) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks
+    /// Split counts of active background tasks: executing (subprocess alive) vs queued (waiting).
+    /// Uses `process_id IS NOT NULL` as the discriminator for executing tasks.
+    /// Used by TUI footer badge to show `[1 running, 2 queued]` instead of `[3 running]`.
+    pub fn get_background_task_counts(&self, agent_id: &str) -> Result<BackgroundTaskCounts> {
+        let (executing, queued): (i64, i64) = self.conn.query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN process_id IS NOT NULL THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN process_id IS NULL THEN 1 ELSE 0 END), 0)
+             FROM tasks
              WHERE agent_id = ?1
                AND trigger_type = 'callback'
                AND action_type = 'resume_agent'
                AND status IN ('pending', 'in_progress')",
             params![agent_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(count as usize)
+        Ok(BackgroundTaskCounts {
+            executing: executing as usize,
+            queued: queued as usize,
+        })
+    }
+
+    /// Count active background tasks (long-running callback tasks that are pending or in-progress).
+    /// Convenience wrapper that sums executing + queued counts.
+    pub fn get_active_background_task_count(&self, agent_id: &str) -> Result<usize> {
+        let counts = self.get_background_task_counts(agent_id)?;
+        Ok(counts.executing + counts.queued)
     }
 
     pub fn get_inject_context_tasks(&self, agent_id: &str) -> Result<Vec<Task>> {
@@ -11291,6 +11313,91 @@ mod tests {
 
         // Reminder should NOT count as a background task
         assert_eq!(db.get_active_background_task_count("mika").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_get_background_task_counts_splits_executing_and_queued() {
+        let db = db();
+
+        // No callback tasks → both zero
+        let counts = db.get_background_task_counts("mika").unwrap();
+        assert_eq!(
+            counts,
+            BackgroundTaskCounts {
+                executing: 0,
+                queued: 0
+            }
+        );
+
+        // Create two pending callback tasks (no process_id) → both queued
+        let id1 = db.create_task(&callback_task("mika")).unwrap();
+        let mut task2 = callback_task("mika");
+        task2.label = "build_project".to_string();
+        let _id2 = db.create_task(&task2).unwrap();
+        let counts = db.get_background_task_counts("mika").unwrap();
+        assert_eq!(
+            counts,
+            BackgroundTaskCounts {
+                executing: 0,
+                queued: 2
+            }
+        );
+
+        // Set process_id on task1 → 1 executing, 1 queued
+        db.set_task_process_id(&id1, Some(12345)).unwrap();
+        let counts = db.get_background_task_counts("mika").unwrap();
+        assert_eq!(
+            counts,
+            BackgroundTaskCounts {
+                executing: 1,
+                queued: 1
+            }
+        );
+
+        // Backward compat: total still matches
+        assert_eq!(db.get_active_background_task_count("mika").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_get_background_task_counts_all_executing() {
+        let db = db();
+
+        let id1 = db.create_task(&callback_task("mika")).unwrap();
+        let mut task2 = callback_task("mika");
+        task2.label = "build_project".to_string();
+        let id2 = db.create_task(&task2).unwrap();
+
+        db.set_task_process_id(&id1, Some(100)).unwrap();
+        db.set_task_process_id(&id2, Some(200)).unwrap();
+
+        let counts = db.get_background_task_counts("mika").unwrap();
+        assert_eq!(
+            counts,
+            BackgroundTaskCounts {
+                executing: 2,
+                queued: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_get_background_task_counts_excludes_terminal_status() {
+        let db = db();
+
+        let id1 = db.create_task(&callback_task("mika")).unwrap();
+        db.set_task_process_id(&id1, Some(100)).unwrap();
+
+        // Complete the task — should not appear in either bucket
+        db.update_task_completed(&id1, "mika", Some("done"))
+            .unwrap();
+        let counts = db.get_background_task_counts("mika").unwrap();
+        assert_eq!(
+            counts,
+            BackgroundTaskCounts {
+                executing: 0,
+                queued: 0
+            }
+        );
     }
 
     #[test]

@@ -1627,7 +1627,8 @@ mod tests {
         };
         app.pending_command = Some("/model opus".to_string());
         app.pending_task_count = 3;
-        app.active_background_task_count = 2;
+        app.executing_task_count = 1;
+        app.queued_task_count = 2;
         app.status = AgentStatus::Thinking;
 
         handle_clear(&mut app, "").await;
@@ -1648,8 +1649,12 @@ mod tests {
         );
         assert_eq!(app.pending_task_count, 0, "pending_task_count should be 0");
         assert_eq!(
-            app.active_background_task_count, 2,
-            "active_background_task_count should be preserved (agent-scoped, not session-scoped)"
+            app.executing_task_count, 1,
+            "executing_task_count should be preserved (agent-scoped, not session-scoped)"
+        );
+        assert_eq!(
+            app.queued_task_count, 2,
+            "queued_task_count should be preserved (agent-scoped, not session-scoped)"
         );
         assert_eq!(app.status, AgentStatus::Idle, "status should be Idle");
     }

@@ -578,7 +578,12 @@ pub struct App<'a> {
     pub pending_task_count: usize,
     /// Cached count of active background callback tasks (polled periodically for footer badge).
     /// Agent-scoped (not session-scoped) — NOT reset on /clear.
-    pub active_background_task_count: usize,
+    /// Cached count of actively-executing background tasks (process_id IS NOT NULL).
+    /// Agent-scoped — NOT reset on /clear.
+    pub executing_task_count: usize,
+    /// Cached count of queued background tasks (process_id IS NULL).
+    /// Agent-scoped — NOT reset on /clear.
+    pub queued_task_count: usize,
 
     // Team mode fields (None when in agent mode)
     /// Team worker channel for sending goals.
@@ -678,7 +683,8 @@ impl<'a> App<'a> {
             context_tokens: None,
             last_seen_msg_id: 0,
             pending_task_count: 0,
-            active_background_task_count: 0,
+            executing_task_count: 0,
+            queued_task_count: 0,
             team_tx: None,
             team_rx: None,
             team_name: None,
@@ -764,7 +770,8 @@ impl<'a> App<'a> {
             context_tokens: None,
             last_seen_msg_id: 0,
             pending_task_count: 0,
-            active_background_task_count: 0,
+            executing_task_count: 0,
+            queued_task_count: 0,
             team_tx: Some(team_tx),
             team_rx: Some(team_rx),
             team_name: Some(team_name.to_string()),
@@ -1032,10 +1039,12 @@ impl<'a> App<'a> {
         // Background task count polling: refresh every ~5s for footer badge.
         if !self.is_team_mode()
             && self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS)
-            && let Ok(count) = self.db.get_active_background_task_count().await
-            && count != self.active_background_task_count
+            && let Ok(counts) = self.db.get_background_task_counts().await
+            && (counts.executing != self.executing_task_count
+                || counts.queued != self.queued_task_count)
         {
-            self.active_background_task_count = count;
+            self.executing_task_count = counts.executing;
+            self.queued_task_count = counts.queued;
             self.needs_redraw = true;
         }
 
