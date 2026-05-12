@@ -110,6 +110,42 @@ impl GitHubApp {
         }))
     }
 
+    /// Create from raw credentials (app ID, base64-encoded PEM, installation ID).
+    ///
+    /// Returns `None` if the private key is invalid (same validation as
+    /// `from_settings`). Used by the gateway, which has its own settings type.
+    pub fn from_credentials(
+        app_id: u64,
+        private_key_b64: &str,
+        installation_id: u64,
+    ) -> Option<Arc<Self>> {
+        let pem_bytes =
+            match base64::engine::general_purpose::STANDARD.decode(private_key_b64.as_bytes()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("GitHub App private key: base64 decode failed: {e}");
+                    return None;
+                }
+            };
+
+        let signing_key = match EncodingKey::from_rsa_pem(&pem_bytes) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!("GitHub App private key: RSA PEM parse failed: {e}");
+                return None;
+            }
+        };
+
+        info!(app_id, installation_id, "GitHub App configured");
+        Some(Arc::new(Self {
+            app_id,
+            signing_key,
+            installation_id,
+            cache: RwLock::new(None),
+            http_client: reqwest::Client::new(),
+        }))
+    }
+
     /// Construct directly for testing (bypasses Settings).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new(app_id: u64, signing_key: EncodingKey, installation_id: u64) -> Arc<Self> {
@@ -120,6 +156,58 @@ impl GitHubApp {
             cache: RwLock::new(None),
             http_client: reqwest::Client::new(),
         })
+    }
+
+    /// Pre-seed the token cache for testing. Avoids hitting real GitHub API
+    /// in integration tests that need a valid `installation_token()` result.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn seed_test_token(&self, token: &str) {
+        let mut cache = self.cache.write().await;
+        *cache = Some(CachedToken {
+            token: token.to_string(),
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+        });
+    }
+
+    /// Create a test instance with a pre-seeded token. Convenience for
+    /// integration tests in downstream crates that don't depend on `jsonwebtoken`.
+    /// The signing key is a hardcoded test RSA key — never use in production.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn new_with_test_token(token: &str) -> Arc<Self> {
+        // Minimal 2048-bit RSA key for test-only JWT signing (PKCS#1 PEM format).
+        // Generated with: openssl genrsa -traditional 2048
+        const TEST_RSA_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
+MIIEpAIBAAKCAQEAqmNXtQx4L3Eko0G+ky5u03BpRRwLfQ1+zuRzUxtDIAb2LFcf\n\
+2PCCusvna5qAuXfCttcsTTFt0+x3vqI3wkO7pZ7MQatBcuQSFL3eSDhqNNLZ8zh6\n\
+evsuCwgdhn+etApM8PtEpwcps/pjlLsIb9iyB7jcYBQsr0lGRrXVdsGPQXF0yGkr\n\
+Vd3zH11tqLOWdDGXlpZTZkwwow7ojVID5POWHkp1WkY6xYCq6qYA1Gt9VfQNCzE8\n\
+WKjsd0phBgN1W4le0Q30UFiaFDErbW1uqrsQShz0Wv9bHbUpVOyTotGdXOBWg0CP\n\
+rJ5IBmt8KF73HLaK0zOwIe9qwlCLMszH4d+TaQIDAQABAoIBAA6rd/EwDibzhFaE\n\
+Ag709/i/XGjlVb3iDBFvDNjSZ5CZ2NcPdz/70R2ZEacribquK3cHhppsz4pn+RVS\n\
+LR/OKhlD100uG/fy1/WuNTWdmdNLdhVhPvZYqumrPLOISFcy7dXvpEUHMll7DNjQ\n\
+05ShoQ5WJa8l/YTn96N940+Ssa1OHesGZJa4ATP+fxiXqow5Mq/DbLTWBQ0Kj2Qc\n\
+WZFa6wc1ws61zK81U69gtW7+nnX2hzcboQhq8RVEmtJKINmfieuHSl0QOZsEuh09\n\
+fFjLLwUhwIrmZKNv3hpqJpyKL6dvgr1f+5xyfgYUoQIFB2G8V7+Xto1urGYHNjRO\n\
+DVWCbXMCgYEA04A9zJnYxwNPqnC86rxWy9fN0AsB8S4sWoO9M/ZWexfiWsMK6Mze\n\
+uOfj1cVNjBm6aLJL6F2ts/ig4wA6alR72P5ZRqneAMFgIes5SP7j70U3gFodcCe/\n\
+RoVhWNyjX4Oz9Dwu57QK5DB+3NRM/4On0wsO4GjQgl1RQnDZfYccRUcCgYEAzjyz\n\
+CzQKzT21jyzb0/0xBovlUwxnctXV5lHScHETXh8TJdgD4gU+tBJNcJoa/swSNRgL\n\
+6KfXj1LH4tbl0vBZps3RpuWVobqEZrkBjkJO9aGRsTkqtlEQJ0Lc3yQPbTWENlG+\n\
+VbfrOkAyTn69LNmndOMBKq7syBrKJTtwgVcTec8CgYEAghGr79ftaPawV7FdfT62\n\
+YkYlXHxohVpQDJpYEUy9gpX9rrOkUecsUarKgv0D49UuvpRn+k8iNDwDNZc+VYX/\n\
+ZEOHw91TmkNSS4nNgQbARrXanCTPVdob19LPO0b1chgc42bfsb8Xs53fZw9pCvp8\n\
+i12RmJDdKk8ZWjLsjjY5PKECgYB9EqC+nZwjZlYyc1EJ2hYeUz8LQ42FPhuPp3WJ\n\
+DXpibVQOclfAfc/OIv9l13+hoJ82JdQrD4cR+3EPp6YPbAXivBV2Muuw/k2HgpFn\n\
+9dyu6IJTyUiW8shqFwmeJd9ZKsh4rNBSacy1MfOQWRpfFcyRfY3aleUxYdXQCKEt\n\
+P2KnTwKBgQCMt/E5AyZ1x7xsD68M/+dQc4kZG+3wyjfgkQ5tivveW5JxRNJ7Doy/\n\
+Zk4PUTq3pSCC2sQY5Ay2b2iPez8d660jFuWT02+0sQdFmGwnFC9IxdEUPZXxeRr6\n\
+omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
+-----END RSA PRIVATE KEY-----";
+        let signing_key =
+            EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes()).expect("test RSA PEM is valid");
+        let app = Self::new(99999, signing_key, 99999);
+        app.seed_test_token(token).await;
+        app
     }
 
     /// Get a valid installation token, refreshing if needed.

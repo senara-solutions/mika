@@ -52,6 +52,18 @@ pub struct GatewaySettings {
     /// GitHub webhook secrets are arbitrary strings (not hex-constrained).
     #[serde(default)]
     pub github_webhook_secret: Option<SecretString>,
+
+    /// GitHub App ID (u64). Required for GitHub App authentication.
+    #[serde(default)]
+    pub github_app_id: Option<u64>,
+
+    /// GitHub App private key (base64-encoded PEM).
+    #[serde(default)]
+    pub github_app_private_key: Option<SecretString>,
+
+    /// GitHub App installation ID for the org (u64).
+    #[serde(default)]
+    pub github_app_installation_id: Option<u64>,
 }
 
 fn default_port() -> u16 {
@@ -161,6 +173,15 @@ impl std::fmt::Debug for GatewaySettings {
                 "github_webhook_secret",
                 &self.github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("github_app_id", &self.github_app_id)
+            .field(
+                "github_app_private_key",
+                &self.github_app_private_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "github_app_installation_id",
+                &self.github_app_installation_id,
+            )
             .finish()
     }
 }
@@ -227,12 +248,16 @@ mod tests {
                 gateway_log_file: None,
                 agents_namespace: "mika-agents".to_string(),
                 github_webhook_secret: Some(SecretString::from("gh-webhook-secret")),
+                github_app_id: Some(12345),
+                github_app_private_key: Some(SecretString::from("super-secret-pem")),
+                github_app_installation_id: Some(67890),
             }
         );
         assert!(!debug.contains("pass"));
         assert!(!debug.contains("ABC"));
         assert!(!debug.contains("token-123"));
         assert!(!debug.contains("gh-webhook-secret"));
+        assert!(!debug.contains("super-secret-pem"));
         assert!(debug.contains("[REDACTED]"));
     }
 }

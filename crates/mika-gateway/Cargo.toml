@@ -43,3 +43,5 @@ chrono = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true }
 http-body-util = { workspace = true }
+mika-common = { workspace = true, features = ["test-utils"] }
+jsonwebtoken = { workspace = true }
