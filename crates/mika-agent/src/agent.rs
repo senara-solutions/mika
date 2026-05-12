@@ -4020,7 +4020,7 @@ fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str, model_name: &
 /// solely via `always_on` or pulled in as dependencies do NOT enforce their constraints.
 /// This prevents always-on skills (like self-dev) from requiring tools on every message —
 /// constraints are only enforced when the user's message actually triggered the skill's
-/// keywords. See #265, #270.
+/// keywords. See #463, #270.
 ///
 /// ## Pre-fetch augmentation (mika#863)
 ///
@@ -4039,7 +4039,7 @@ fn collect_required_tools(matched: &[MatchedSkill<'_>], user_message: &str) -> H
 
     // mika#863 pre-fetch augmentation: opt-in skills extend required_tools
     // with brief-derived fetches. Only Keyword-matched skills contribute
-    // (same scoping as static required_tools per #265).
+    // (same scoping as static required_tools per #463).
     let needs_pre_fetch = matched.iter().any(|m| {
         m.reason == MatchReason::Keyword
             && m.entry
@@ -6572,7 +6572,7 @@ mod tests {
         assert!(should_inject, "Reminder trigger should receive task health");
     }
 
-    // -- collect_required_tools tests (#270, #265) --
+    // -- collect_required_tools tests (#270, #463) --
 
     #[test]
     fn test_collect_required_tools_empty_when_no_constraints() {
@@ -6620,7 +6620,7 @@ mod tests {
 
     #[test]
     fn test_collect_required_tools_ignores_always_on_matched_skills() {
-        // Skill matched via always_on should NOT contribute required_tools (#265)
+        // Skill matched via always_on should NOT contribute required_tools (#463)
         let s1 = make_skill_entry_with_constraints(
             "self-dev",
             30,
@@ -6766,7 +6766,7 @@ mod tests {
         }];
         let msg = "Review this:\n\nissue/788\n```\nThe issue body.\n```\n";
         let required = collect_required_tools(&matched, msg);
-        // AlwaysOn doesn't contribute any required_tools at all (#265)
+        // AlwaysOn doesn't contribute any required_tools at all (#463)
         assert!(
             required.is_empty(),
             "AlwaysOn skills should not enforce required_tools or pre-fetch"
