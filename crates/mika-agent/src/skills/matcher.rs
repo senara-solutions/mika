@@ -5,7 +5,7 @@ use super::index::SkillEntry;
 /// Why a skill was included in the matched set.
 ///
 /// Used by the `required_tools` enforcement gate to only enforce constraints
-/// from skills that matched via keyword (not just `always_on`). See #265.
+/// from skills that matched via keyword (not just `always_on`). See #463.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchReason {
     /// Matched because `always_on = true` with no keyword hit on this message.
@@ -198,7 +198,7 @@ mod tests {
     // before match_skills() is ever called (#629, #630). No match-time disabled
     // filter exists — the registry contract guarantees all entries are enabled.
 
-    // --- Match reason tests (#265) ---
+    // --- Match reason tests (#463) ---
 
     #[test]
     fn test_always_on_with_keyword_hit_is_keyword_reason() {

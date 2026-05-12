@@ -833,7 +833,7 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         }
     }
 
-    // 5c. Warn if always_on skill with no keywords declares required_tools (#265)
+    // 5c. Warn if always_on skill with no keywords declares required_tools (#463)
     // Such constraints will never be enforced because required_tools only triggers
     // when a skill is matched via keyword, not just always_on.
     if manifest.skill.always_on
