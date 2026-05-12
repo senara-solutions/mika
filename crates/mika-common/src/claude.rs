@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::oauth::OAuthTokenManager;
 
@@ -20,6 +20,12 @@ const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75";
 const CLAUDE_CODE_APP_HEADER: &str = "cli";
 
 use crate::llm::{RETRY_BUFFER_SECS, TYPICAL_CALL_DURATION_SECS};
+
+/// Prefix of the Anthropic error message when the account has insufficient credits.
+/// Pinned as a const because `invalid_request_error` is Anthropic's generic 4xx type
+/// (also covers malformed requests, bad model names, oversize payloads) — the substring
+/// is the actual discriminator.
+const ANTHROPIC_BILLING_MESSAGE_PREFIX: &str = "Your credit balance is too low";
 
 // -- Auth --
 
@@ -272,6 +278,8 @@ struct ApiErrorResponse {
 
 #[derive(Debug, Deserialize)]
 struct ApiErrorDetail {
+    #[serde(rename = "type")]
+    error_type: Option<String>,
     message: String,
 }
 
@@ -281,6 +289,8 @@ struct ApiErrorDetail {
 pub enum ClaudeApiError {
     #[error("Claude API HTTP error ({status}): {message}")]
     HttpError { status: u16, message: String },
+    #[error("Anthropic billing error: {message}")]
+    BillingError { message: String },
     #[error("Claude API request failed")]
     Transport(#[from] reqwest::Error),
     #[error("Claude API response parse error")]
@@ -580,6 +590,16 @@ impl ClaudeClient {
                         return Ok(response);
                     }
 
+                    // Handle billing error separately to avoid borrow/move conflict:
+                    // we need to read `message` from the variant AND consume `e`.
+                    if let ClaudeApiError::BillingError { ref message } = e {
+                        let context = format!(
+                            "Anthropic API rejected the request: {message}. \
+                             Top up the account at https://console.anthropic.com/settings/billing."
+                        );
+                        return Err(anyhow::Error::from(e).context(context));
+                    }
+
                     return Err(match &e {
                         ClaudeApiError::HttpError { status: 401, .. } => {
                             let hint = if self.auth.is_oauth() {
@@ -604,6 +624,9 @@ impl ClaudeClient {
                             .context("Received an unexpected response from Claude API."),
                         ClaudeApiError::HttpError { .. } => anyhow::Error::from(e)
                             .context("Claude API returned an unexpected error. Please try again."),
+                        // BillingError handled above; this arm is unreachable but required
+                        // for exhaustive matching.
+                        ClaudeApiError::BillingError { .. } => unreachable!(),
                     });
                 }
             }
@@ -707,13 +730,26 @@ impl ClaudeClient {
             let status_code = status.as_u16();
             // Log the body at warn level but do NOT include it in the error
             let body = response.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<ApiErrorResponse>(&body)
-                .map(|e| e.error.message)
+            let parsed = serde_json::from_str::<ApiErrorResponse>(&body);
+            let message = parsed
+                .as_ref()
+                .map(|e| e.error.message.clone())
                 .unwrap_or_else(|_| {
                     // Truncate raw body to avoid leaking proxy/CDN internals
                     let truncated: String = body.chars().take(200).collect();
                     format!("unexpected error response (HTTP {status_code}): {truncated}")
                 });
+
+            // Billing classification: HTTP 400 + invalid_request_error + billing prefix
+            if status_code == 400
+                && let Ok(ref parsed_err) = parsed
+                && parsed_err.error.error_type.as_deref() == Some("invalid_request_error")
+                && message.starts_with(ANTHROPIC_BILLING_MESSAGE_PREFIX)
+            {
+                error!(error_message = %message, "Anthropic billing error — non-retriable");
+                return Err(ClaudeApiError::BillingError { message });
+            }
+
             warn!(status = status_code, error_message = %message, "Claude API error response");
             return Err(ClaudeApiError::HttpError {
                 status: status_code,
@@ -1220,5 +1256,101 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
+    }
+
+    // -- Billing error classification tests (#1088) --
+
+    #[test]
+    fn classifies_400_billing_response_as_typed_variant() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+        let parsed = serde_json::from_str::<ApiErrorResponse>(body).unwrap();
+        let status_code: u16 = 400;
+        let message = parsed.error.message.clone();
+
+        // Verify the billing classification conjunction matches
+        assert_eq!(status_code, 400);
+        assert_eq!(
+            parsed.error.error_type.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert!(message.starts_with(ANTHROPIC_BILLING_MESSAGE_PREFIX));
+
+        // Verify the variant is constructed correctly
+        let err = ClaudeApiError::BillingError {
+            message: message.clone(),
+        };
+        assert!(matches!(err, ClaudeApiError::BillingError { .. }));
+        assert!(err.to_string().contains("billing"));
+        assert!(err.to_string().contains(&message));
+    }
+
+    #[test]
+    fn does_not_classify_400_non_billing_as_billing() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid model name 'foo'"}}"#;
+        let parsed = serde_json::from_str::<ApiErrorResponse>(body).unwrap();
+        let message = parsed.error.message.clone();
+
+        // error_type matches but message prefix does NOT — should NOT be billing
+        assert_eq!(
+            parsed.error.error_type.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert!(!message.starts_with(ANTHROPIC_BILLING_MESSAGE_PREFIX));
+
+        // Verify it would fall through to HttpError, not BillingError
+        let is_billing = parsed.error.error_type.as_deref() == Some("invalid_request_error")
+            && message.starts_with(ANTHROPIC_BILLING_MESSAGE_PREFIX);
+        assert!(!is_billing);
+    }
+
+    #[test]
+    fn retry_loop_returns_immediately_on_billing_error() {
+        // BillingError should be non-retriable: is_retryable returns false
+        let err = ClaudeApiError::BillingError {
+            message: "Your credit balance is too low to access the Anthropic API.".into(),
+        };
+        assert!(!is_retryable(&err), "BillingError must be non-retriable");
+
+        // Verify it does not match the retryable status codes
+        // (unlike 429/500/529 which are retryable)
+        let retryable_429 = ClaudeApiError::HttpError {
+            status: 429,
+            message: "rate limited".into(),
+        };
+        assert!(is_retryable(&retryable_429));
+
+        let retryable_500 = ClaudeApiError::HttpError {
+            status: 500,
+            message: "server error".into(),
+        };
+        assert!(is_retryable(&retryable_500));
+    }
+
+    #[test]
+    fn final_error_chain_contains_actionable_billing_message() {
+        let verbatim_message = "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.";
+        let err = ClaudeApiError::BillingError {
+            message: verbatim_message.into(),
+        };
+
+        // Simulate the final error mapping from the retry loop
+        let context_msg = format!(
+            "Anthropic API rejected the request: {verbatim_message}. \
+             Top up the account at https://console.anthropic.com/settings/billing."
+        );
+        let anyhow_err = anyhow::Error::from(err).context(context_msg);
+        let error_chain = format!("{anyhow_err:#}");
+
+        // Must contain the verbatim billing message
+        assert!(
+            error_chain.contains(verbatim_message),
+            "error chain must contain verbatim billing message, got: {error_chain}"
+        );
+
+        // Must contain the billing URL
+        assert!(
+            error_chain.contains("console.anthropic.com/settings/billing"),
+            "error chain must contain billing URL, got: {error_chain}"
+        );
     }
 }

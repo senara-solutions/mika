@@ -24,7 +24,7 @@ Multi-provider via `LlmProvider` trait — 11 supported providers, each with its
 
 ## Typed Errors
 
-- `ClaudeApiError` enum with HTTP status-code retry (429/500/529)
+- `ClaudeApiError` enum with HTTP status-code retry (429/500/529); `BillingError` variant for non-retriable Anthropic HTTP 400 billing rejections (detected via `error.type == "invalid_request_error"` + message prefix, logs at `error!`, surfaces billing URL in error chain)
 - Provider-agnostic `LlmError` enum (`Debug + Clone + Error`) with `HttpError`, `Transport`, `ParseError`, `ProviderError`, `UnsupportedFeature` variants
 
 ## Prompt Caching (Anthropic)
