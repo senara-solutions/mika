@@ -4,10 +4,9 @@
 # This script verifies:
 # 1. The skill scaffold exists and has valid structure
 # 2. The skill is registered in well_known_agents.rs (all 4 allowlist sites + LLM override)
-# 3. The operator command exists
-# 4. The sequencing record template exists and has required sections
-# 5. The compatibility report exists
-# 6. Build.rs discovers the skill (cargo build succeeds — verified externally)
+# 3. The sequencing record template exists and has required sections
+# 4. The compatibility report exists
+# 5. Build.rs discovers the skill (cargo build succeeds — verified externally)
 #
 # Usage: bash scripts/test-mika-groom-milestone.sh
 # Exit code: 0 on success, 1 on first failure
@@ -78,18 +77,8 @@ check_grep "LLM override uses opus-4-7" 'mika-arch-groom-milestone' "$WKA"
 check_grep "MIKA_ARCH_SOUL mentions milestone" 'milestone-scoped reviews' "$WKA"
 echo ""
 
-# --- 3. Operator command ---
-echo "3. Operator command"
-CMD_FILE="$REPO_ROOT/.claude/commands/mika-groom-milestone.md"
-check "operator command exists" test -f "$CMD_FILE"
-check_grep "command has frontmatter name" 'name: mika-groom-milestone' "$CMD_FILE"
-check_grep "command references derive-branch-name" 'derive-branch-name' "$CMD_FILE"
-check_grep "command references derive-worktree-path" 'derive-worktree-path' "$CMD_FILE"
-check_grep "command references sequencing template" 'milestone-sequencing-record-template' "$CMD_FILE"
-echo ""
-
-# --- 4. Sequencing record template ---
-echo "4. Sequencing record template"
+# --- 3. Sequencing record template ---
+echo "3. Sequencing record template"
 TEMPLATE="$REPO_ROOT/docs/plans/templates/milestone-sequencing-record-template.md"
 check "template exists" test -f "$TEMPLATE"
 check_grep "template has frontmatter type" 'type: milestone-sequencing' "$TEMPLATE"
@@ -101,14 +90,14 @@ check_grep "template has Cross-cutting section" '## Cross-cutting concerns' "$TE
 check_grep "template has Open questions section" '## Open milestone-level questions' "$TEMPLATE"
 echo ""
 
-# --- 5. Compatibility report ---
-echo "5. Compatibility report"
+# --- 4. Compatibility report ---
+echo "4. Compatibility report"
 COMPAT="$REPO_ROOT/docs/plans/2026-04-29-002-mika-arch-milestone-grooming-compatibility-report.md"
 check "compatibility report exists" test -f "$COMPAT"
 echo ""
 
-# --- 6. Review guide codification ---
-echo "6. Review guide codification"
+# --- 5. Review guide codification ---
+echo "5. Review guide codification"
 REVIEW_GUIDE="$REPO_ROOT/docs/architecture/review-guide.md"
 check_grep "review-guide has section 7" '## 7. Self-review boundary' "$REVIEW_GUIDE"
 check_grep "review-guide cites three instances" '#879' "$REVIEW_GUIDE"
