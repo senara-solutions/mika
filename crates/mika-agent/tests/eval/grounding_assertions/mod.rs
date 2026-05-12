@@ -160,6 +160,144 @@ pub fn assert_response_contains(trace: &AgentTrace, expected: &str) {
     }
 }
 
+/// Assert that the response contains per-element enumeration for each named element.
+///
+/// Checks that each element name appears in the response text and is followed
+/// (within a reasonable window) by a pass/fail indicator: `✓`, `✗`, `pass`, or `fail`.
+/// This enforces the per-element enumeration rule from qa-review Step 2.5.5:
+/// "Enumerate every element by name with its observed value. Never aggregate."
+///
+/// # Panics
+/// Panics if any named element is missing from the response or lacks a pass/fail indicator.
+pub fn assert_response_contains_per_element_enumeration(trace: &AgentTrace, elements: &[&str]) {
+    let text = trace.output.text.as_deref().unwrap_or("");
+    let lower = text.to_lowercase();
+
+    let mut missing_elements = Vec::new();
+    let mut missing_indicators = Vec::new();
+
+    for &element in elements {
+        let element_lower = element.to_lowercase();
+        match lower.find(&element_lower) {
+            None => {
+                missing_elements.push(element);
+            }
+            Some(pos) => {
+                // Look for a pass/fail indicator within 200 chars after the element name.
+                // Operate entirely on `lower` to avoid byte-offset mismatches between
+                // `lower` and `text` when to_lowercase() expands multi-byte characters.
+                let search_start = pos + element_lower.len();
+                let search_end = (search_start + 200).min(lower.len());
+                // Find safe UTF-8 boundary within `lower`
+                let mut end = search_end;
+                while end > search_start && !lower.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let window = &lower[search_start..end];
+
+                let has_indicator = window.contains('✓')
+                    || window.contains('✗')
+                    || window.contains("pass")
+                    || window.contains("fail");
+
+                if !has_indicator {
+                    missing_indicators.push(element);
+                }
+            }
+        }
+    }
+
+    if !missing_elements.is_empty() || !missing_indicators.is_empty() {
+        let mut detail = Vec::new();
+        for &el in &missing_elements {
+            detail.push(format!("  element {:?} not found in response", el));
+        }
+        for &el in &missing_indicators {
+            detail.push(format!(
+                "  element {:?} found but no pass/fail indicator nearby",
+                el
+            ));
+        }
+        panic!(
+            "assert_response_contains_per_element_enumeration failed:\n  \
+             expected per-element enumeration for {:?}\n{}\n  response: {:?}",
+            elements,
+            detail.join("\n"),
+            truncate(text, 500),
+        );
+    }
+}
+
+/// Assert that absence claims in the response are grounded with evidence.
+///
+/// When the response claims content is absent, it must include:
+/// 1. The searched heading text
+/// 2. A list of actual headings found (indicated by "sections:", "headings found:",
+///    "not present in", or similar phrasing)
+///
+/// The function first checks if the response contains an absence-claim keyword
+/// ("not present", "missing", "absent", "could not find", "does not appear",
+/// "no section"). If an absence claim is detected, it verifies the searched
+/// heading and evidence list are present.
+///
+/// # Panics
+/// Panics if an absence claim is detected but the searched heading or evidence
+/// list is missing from the response.
+pub fn assert_absence_claim_grounded(trace: &AgentTrace, searched_heading: &str) {
+    let text = trace.output.text.as_deref().unwrap_or("");
+    let lower = text.to_lowercase();
+
+    // Absence-claim keywords (conservative set — extend as new phrasings are observed)
+    let absence_keywords = [
+        "not present",
+        "missing",
+        "absent",
+        "could not find",
+        "does not appear",
+        "no section",
+    ];
+
+    let has_absence_claim = absence_keywords.iter().any(|kw| lower.contains(kw));
+
+    if !has_absence_claim {
+        // No absence claim detected — nothing to ground
+        return;
+    }
+
+    // Check 1: the searched heading must be mentioned
+    let heading_lower = searched_heading.to_lowercase();
+    if !lower.contains(&heading_lower) {
+        panic!(
+            "assert_absence_claim_grounded failed:\n  \
+             absence claim detected but searched heading {:?} not found in response\n  \
+             response: {:?}",
+            searched_heading,
+            truncate(text, 500),
+        );
+    }
+
+    // Check 2: evidence of actual headings found (list of sections)
+    let evidence_markers = [
+        "sections:",
+        "headings found:",
+        "not present in",
+        "section headings",
+        "pr body sections:",
+    ];
+    let has_evidence = evidence_markers.iter().any(|marker| lower.contains(marker));
+
+    if !has_evidence {
+        panic!(
+            "assert_absence_claim_grounded failed:\n  \
+             absence claim detected with heading {:?} but no evidence list of actual \
+             headings/sections found in response\n  \
+             response: {:?}",
+            searched_heading,
+            truncate(text, 500),
+        );
+    }
+}
+
 /// Truncate a string for display in panic messages.
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -323,5 +461,119 @@ mod tests {
         // "unmerged" should NOT trigger on "merged" — boundary check prevents it
         let trace = make_trace("The PR is still unmerged.", &[]);
         assert_response_forbids(&trace, &["merged"]);
+    }
+
+    // --- Per-element enumeration tests ---
+
+    #[test]
+    fn per_element_enumeration_passes_with_all_elements() {
+        let trace = make_trace(
+            "- mika primary: 70.8% → ✓ pass\n\
+             - mika-skills: 52.9% → ✓ pass\n\
+             - mika-platform: 47.9% → ✗ fail (below 50%)\n\
+             - mika-cloud: 31.2% → ✗ fail (below 50%)",
+            &[],
+        );
+        assert_response_contains_per_element_enumeration(
+            &trace,
+            &["mika primary", "mika-skills", "mika-platform", "mika-cloud"],
+        );
+    }
+
+    #[test]
+    fn per_element_enumeration_fails_when_element_missing() {
+        let trace = make_trace(
+            "- mika primary: 70.8% → ✓ pass\n\
+             - mika-skills: 52.9% → ✓ pass",
+            &[],
+        );
+        let result = std::panic::catch_unwind(|| {
+            assert_response_contains_per_element_enumeration(
+                &trace,
+                &["mika primary", "mika-skills", "mika-platform"],
+            );
+        });
+        assert!(result.is_err(), "Should panic when element is missing");
+    }
+
+    #[test]
+    fn per_element_enumeration_fails_when_no_indicator() {
+        let trace = make_trace(
+            "- mika primary: 70.8%\n\
+             - mika-skills: 52.9%",
+            &[],
+        );
+        let result = std::panic::catch_unwind(|| {
+            assert_response_contains_per_element_enumeration(
+                &trace,
+                &["mika primary", "mika-skills"],
+            );
+        });
+        assert!(
+            result.is_err(),
+            "Should panic when no pass/fail indicator present"
+        );
+    }
+
+    #[test]
+    fn per_element_enumeration_catches_aggregate_claim() {
+        // Aggregate claim: "all 4 below threshold" — no individual elements named
+        let trace = make_trace(
+            "coverage ≥50% for all 4 corpora — all 4 below threshold",
+            &[],
+        );
+        let result = std::panic::catch_unwind(|| {
+            assert_response_contains_per_element_enumeration(
+                &trace,
+                &["mika primary", "mika-skills", "mika-platform", "mika-cloud"],
+            );
+        });
+        assert!(
+            result.is_err(),
+            "Should panic on aggregate claim without per-element enumeration"
+        );
+    }
+
+    // --- Absence claim grounding tests ---
+
+    #[test]
+    fn absence_claim_grounded_passes_with_evidence() {
+        let trace = make_trace(
+            "searched for \"## R5 — Rollback procedure\" — not present in \
+             PR body sections: Summary, Test plan, Breaking changes, Migration steps",
+            &[],
+        );
+        assert_absence_claim_grounded(&trace, "R5");
+    }
+
+    #[test]
+    fn absence_claim_grounded_passes_when_no_absence_claim() {
+        // No absence keywords — helper should pass silently
+        let trace = make_trace("All sections verified and correct.", &[]);
+        assert_absence_claim_grounded(&trace, "R5");
+    }
+
+    #[test]
+    fn absence_claim_grounded_fails_without_heading() {
+        let trace = make_trace("section missing from the PR body", &[]);
+        let result = std::panic::catch_unwind(|| {
+            assert_absence_claim_grounded(&trace, "R5");
+        });
+        assert!(
+            result.is_err(),
+            "Should panic when absence claim lacks searched heading"
+        );
+    }
+
+    #[test]
+    fn absence_claim_grounded_fails_without_evidence_list() {
+        let trace = make_trace("R5 section missing from the PR body", &[]);
+        let result = std::panic::catch_unwind(|| {
+            assert_absence_claim_grounded(&trace, "R5");
+        });
+        assert!(
+            result.is_err(),
+            "Should panic when absence claim lacks evidence list"
+        );
     }
 }
