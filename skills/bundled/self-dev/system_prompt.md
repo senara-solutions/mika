@@ -240,7 +240,7 @@ After claude-pilot creates a PR, proceed directly to Step 6 with `in_progress`.
 
 When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the operator has set the `ready` label on the ticket — the canonical positive-consent signal for autonomous dispatch.
 
-> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846, #907).** The guard accepts EITHER a `run_claude_pilot` attempt (dispatch or auto-groom path) OR a `send_message` call (escalation path). Ending the turn without either will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
+> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846, #907, #1089).** The guard requires a `run_claude_pilot` attempt (dispatch via dev-pilot, or auto-groom via dev-groom). Ending the turn without calling `run_claude_pilot` will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
 
 **Atomic handler (label removal first, then grooming check, then dispatch — per mika#841, #907):**
 
@@ -265,6 +265,8 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
    c. Stop the turn. The grooming task runs in the background; its callback re-enters this session's task loop with the grooming result. **Do not call `send_message` to notify the operator** — auto-grooming is the new default behavior, not an exception.
 
+> **PROHIBITION (mika#1089):** In Steps 1-3, do NOT call `check_task`. The engine enforces per-class dispatch slot availability via `run_claude_pilot`'s deferred-status return path; pre-flight slot-checks are not in this handler's contract. Calling `check_task` with stale task IDs produces false negatives that short-circuit dispatch.
+
    **On the dev-groom callback (received as a regular post-callback turn):**
 
    d. Parse the callback result text for the verdict line. The dev-groom skill emits `Verdict: GROOMED` or `Verdict: ESCALATE` as its final line (enforced by the engine's required-suffix-line guard).
@@ -288,7 +290,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
    If `run_claude_pilot` returns a terminal error (`global_dispatch_active`, `task_not_dispatchable`, `dispatch_blocked_by`, `dispatch_limit_exceeded`), do NOT retry. Send the operator a `send_message` naming the rejection cause and stop — the engine guard accepts the attempt as satisfying the dispatch contract.
 
-**GATE: If Step 1 succeeded but you have completed NEITHER `run_claude_pilot` NOR `send_message` (escalation) in this turn, call Steps 2–5 immediately — do not end the turn.**
+**GATE: If Step 1 succeeded but you have NOT called `run_claude_pilot` in this turn, call Steps 2–5 immediately — do not end the turn.**
 
 **Other label-add events** (`bug`, `enhancement`, `p1-important`, etc.) — any `[GitHub] Issue labeled <name> on ...` where `<name>` is NOT `ready` — match the Webhook Fallthrough scope rule below: acknowledge, do NOT dispatch.
 
