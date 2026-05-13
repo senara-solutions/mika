@@ -56,6 +56,38 @@ Verdict: ESCALATE
 
 **IMPORTANT: You must NEVER return `Verdict: ITERATE` or any variant suggesting a third pass.** The two-pass limit is a hard architectural constraint. If concerns remain, ESCALATE.
 
+### F-list Emission Contract
+
+**F-list emission on terminal verdict (mika#901).** When verdict is ESCALATE, the final assistant message MUST contain an F-list — one or more lines starting with `F1:`, `F2:`, ..., up through `F10:`. The F-list is enforced by the engine's `required_finding_list_prefixes` post-condition guard — missing F-list on terminal verdict rejects EndTurn once with a corrective re-prompt.
+
+Each finding has three sub-fields:
+- **(a) Concern** — the concrete issue
+- **(b) Change required** — what the plan must address
+- **(c) Citation** — the source grounding the concern (review-guide.md section, ADR number, compound doc path, or specific codebase convention with file:line reference)
+
+Persisting findings to memory (`store_fact` / `update_core_memory`) is encouraged as defense-in-depth, but the in-band emission is the contract the downstream operator depends on.
+
+**On GROOMED, the F-list is NOT required** — the message may stay short since no iteration is needed.
+
+#### Verdict: ESCALATE example (F-list required)
+
+```
+F1: (BLOCKING) Prior finding F2 unresolved — spec still diverges from implementation.
+   Concern: The revision acknowledges the divergence but defers resolution to "follow-up ticket."
+   Change required: Either resolve the divergence in this plan or document the explicit risk acceptance.
+   Citation: review-guide.md § Single Responsibility
+
+Verdict: ESCALATE
+```
+
+#### Verdict: GROOMED example (F-list optional, brief acceptable)
+
+```
+All prior findings resolved. The plan is ready for implementation.
+
+Verdict: GROOMED
+```
+
 ### Constraints
 
 - **Read-only.** No shell access, no commit, no merge, no file writes.

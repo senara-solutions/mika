@@ -68,6 +68,7 @@ fn make_milestone_skill() -> SkillEntry {
                     "Disposition: ITERATE".to_string(),
                     "Disposition: ESCALATE".to_string(),
                 ],
+                required_finding_list_prefixes: vec![],
             },
             context: HashMap::new(),
             variants: Default::default(),
