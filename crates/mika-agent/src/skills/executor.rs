@@ -16,7 +16,8 @@ use tracing::{debug, info, warn};
 use super::index::ResolvedSkillTool;
 use super::manifest::ToolHandler;
 use crate::async_db::AsyncDatabase;
-use crate::db::NewTask;
+use crate::db::{self, NewTask};
+use crate::github_graphql::fetch_issue_body;
 use crate::task_engine::types::{action_type, trigger_type};
 use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
 
@@ -764,6 +765,34 @@ fn extract_skill_from_input(input: &serde_json::Value) -> Option<&str> {
     input.get("skill").and_then(|v| v.as_str())
 }
 
+/// Check an issue body for the three canonical grooming-marker signals (#919).
+///
+/// Returns a list of missing signal names. Empty list means all signals present.
+/// The three load-bearing substrings match the canonical `/mika-groom-ticket`
+/// Phase 5 callout shape. Both this function and the prompt-level check at
+/// `skills/bundled/self-dev/system_prompt.md:253` must update together if
+/// the callout shape changes.
+///
+/// The plan callout uses `docs/plans/` as the path-prefix substring rather
+/// than `Plan: docs/plans/` because the canonical callout shape in the issue
+/// body is `> - **Plan:** \`<repo>/docs/plans/<file>\`` — the bold markdown
+/// and backtick-wrapping mean `Plan: docs/plans/` never appears as a
+/// contiguous substring. `docs/plans/` is the essential anchoring directory
+/// prefix.
+pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !issue_body.contains("> - **Branch:**") {
+        missing.push("branch_callout");
+    }
+    if !issue_body.contains("docs/plans/") {
+        missing.push("plan_callout");
+    }
+    if !issue_body.contains("second-pass (GROOMED)") {
+        missing.push("groomed_verdict");
+    }
+    missing
+}
+
 /// Validate that a task is in a dispatchable state for long-running execution.
 ///
 /// Stricter than `validate_task()` (which also allows `blocked` for delegation).
@@ -903,6 +932,105 @@ async fn validate_dispatch_readiness(
         }
     }
 
+    // Hoist the GitHub ref parse above both the grooming-marker check (#919)
+    // and the blocked-by check (#713) so they share the binding.
+    let github_ref = task.reference_url.as_deref().and_then(parse_github_ref);
+
+    // Grooming-marker check (#919): reject dev-pilot dispatch when the target
+    // issue body lacks the three canonical grooming callouts (Branch + Plan +
+    // architect verdict). Engine-level gate — all dispatch paths (webhook,
+    // CLI ask, sprint, free-text) funnel through here.
+    //
+    // Coupled pair: the prompt-level check at
+    // `skills/bundled/self-dev/system_prompt.md:253` is defense-in-depth.
+    // Both must update if the canonical `/mika-groom-ticket` Phase 5 callout
+    // shape changes. Load-bearing substrings: `> - **Branch:**`,
+    // `docs/plans/`, `second-pass (GROOMED)`.
+    if let Some(GitHubRef::Issue {
+        ref owner,
+        ref repo,
+        number,
+    }) = github_ref
+    {
+        // Bypass 1: only gate dev-pilot dispatches (dev-groom is the marker
+        // producer; other skills are out of scope for #919)
+        let skill = tool_input.and_then(extract_skill_from_input);
+        let is_dev_pilot = skill == Some("dev-pilot");
+
+        // Bypass 2: milestones/projects don't carry plans on their own bodies
+        let is_issue_type = task.r#type == db::TASK_TYPE_ISSUE;
+
+        // Bypass 4: env var emergency override
+        let bypass_env = std::env::var("MIKA_DISPATCH_BYPASS_GROOMING_CHECK")
+            .map(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if is_dev_pilot && is_issue_type {
+            if bypass_env {
+                warn!(
+                    task_id = task_id,
+                    owner = %owner,
+                    repo = %repo,
+                    number = number,
+                    "dispatch grooming marker check bypassed via env var"
+                );
+            } else {
+                match github_token {
+                    Some(token) => {
+                        match fetch_issue_body(token, owner, repo, number).await {
+                            Ok(issue_body) => {
+                                let missing = check_grooming_markers(&issue_body);
+
+                                if !missing.is_empty() {
+                                    return Err(serde_json::json!({
+                                        "error": "dispatch_no_grooming_marker",
+                                        "task_id": task_id,
+                                        "issue": format!("{}/{}#{}", owner, repo, number),
+                                        "missing_signals": missing,
+                                        "predicate": "issue body must contain all three substrings: \
+                                                      '> - **Branch:**', 'docs/plans/', 'second-pass (GROOMED)'",
+                                        "recovery": "Run /mika-groom-ticket <ref> to produce the canonical \
+                                                     callout block, or dispatch dev-groom first via \
+                                                     'mika ask --agent mika-dev \"groom <typed-ref>\"', or \
+                                                     set MIKA_DISPATCH_BYPASS_GROOMING_CHECK=1 to bypass.",
+                                        "reason": format!(
+                                            "Cannot dispatch dev-pilot on ticket #{number}: issue body is \
+                                             missing one or more grooming-marker signals. The grooming-marker \
+                                             gate ensures architect-reviewed plans are committed before \
+                                             implementation begins (mika#907, mika#919)."
+                                        )
+                                    })
+                                    .to_string());
+                                }
+                            }
+                            Err(e) => {
+                                // Fail-closed: token present but API error
+                                warn!(
+                                    task_id = task_id,
+                                    error = %e,
+                                    "grooming-marker check failed, rejecting dispatch"
+                                );
+                                return Err(serde_json::json!({
+                                    "error": "dispatch_check_failed",
+                                    "task_id": task_id,
+                                    "reason": format!("Failed to fetch issue body for grooming-marker check: {e}")
+                                })
+                                .to_string());
+                            }
+                        }
+                    }
+                    None => {
+                        // Fail-open: no token configured (mirrors blocked-by behavior)
+                        warn!(
+                            task_id = task_id,
+                            "Skipping grooming-marker check: no GitHub token configured"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Blocked-by guard (#713): reject dispatch if the ticket's GitHub blockers
     // are still open. This is the most expensive check (external API call) so it
     // runs last, after all cheap DB checks have passed.
@@ -910,7 +1038,7 @@ async fn validate_dispatch_readiness(
         owner,
         repo,
         number,
-    }) = task.reference_url.as_deref().and_then(parse_github_ref)
+    }) = github_ref
     {
         match github_token {
             Some(token) => match fetch_open_blockers(token, &owner, &repo, number).await {
@@ -4175,5 +4303,108 @@ mod tests {
             },
             skill_dir: PathBuf::from("/tmp"),
         }
+    }
+
+    // --- check_grooming_markers tests (#919) ---
+
+    /// Fully groomed issue body — all three signals present.
+    #[test]
+    fn test_grooming_markers_all_present() {
+        let body = r#"
+> - **Branch:** `fix/919/self-dev-agent-operator-cli-dispatch`
+> - **Plan:** `mika/docs/plans/2026-05-13-001-fix-dispatch-grooming-marker-engine-guard-plan.md` (committed on branch @ `3f99625a`)
+> - **Grooming history:** /ce:plan → mika-arch first-pass (ITERATE) → revisions → mika-arch second-pass (GROOMED)
+
+## Symptom
+Some issue body text here.
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "expected no missing signals, got: {missing:?}"
+        );
+    }
+
+    /// Completely ungroomed — missing all three signals.
+    #[test]
+    fn test_grooming_markers_all_missing() {
+        let body = "## Some Issue\n\nJust a plain issue body with no grooming markers.";
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["branch_callout", "plan_callout", "groomed_verdict"]
+        );
+    }
+
+    /// Partially groomed — has Plan but missing Branch and verdict.
+    #[test]
+    fn test_grooming_markers_partial_missing() {
+        let body = r#"
+Some text here.
+
+Plan: docs/plans/some-plan.md is referenced.
+
+No branch callout and no second-pass line.
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(missing, vec!["branch_callout", "groomed_verdict"]);
+    }
+
+    /// Has Branch and Plan but missing the architect verdict.
+    #[test]
+    fn test_grooming_markers_missing_verdict_only() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `mika/docs/plans/some-plan.md` (committed on branch @ `abc123`)
+
+Plan: docs/plans/some-plan.md is also in the body.
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(missing, vec!["groomed_verdict"]);
+    }
+
+    /// Has verdict text but not the exact canonical shape — must fail.
+    #[test]
+    fn test_grooming_markers_wrong_verdict_shape() {
+        let body = r#"
+> - **Branch:** `feat/something`
+Plan: docs/plans/foo.md
+Verdict: GROOMED
+"#;
+        // "Verdict: GROOMED" is NOT the canonical shape. The canonical shape
+        // is "second-pass (GROOMED)" from the grooming history line.
+        let missing = check_grooming_markers(body);
+        assert_eq!(missing, vec!["groomed_verdict"]);
+    }
+
+    /// Empty body — all signals missing.
+    #[test]
+    fn test_grooming_markers_empty_body() {
+        let missing = check_grooming_markers("");
+        assert_eq!(
+            missing,
+            vec!["branch_callout", "plan_callout", "groomed_verdict"]
+        );
+    }
+
+    /// Bypass predicate: extract_skill_from_input returns correct skill.
+    #[test]
+    fn test_extract_skill_dev_pilot() {
+        let input = serde_json::json!({"skill": "dev-pilot", "prompt": "mika#919"});
+        assert_eq!(extract_skill_from_input(&input), Some("dev-pilot"));
+    }
+
+    /// Bypass predicate: extract_skill_from_input returns dev-groom.
+    #[test]
+    fn test_extract_skill_dev_groom() {
+        let input = serde_json::json!({"skill": "dev-groom", "prompt": "mika#919"});
+        assert_eq!(extract_skill_from_input(&input), Some("dev-groom"));
+    }
+
+    /// Bypass predicate: extract_skill_from_input returns None for missing skill.
+    #[test]
+    fn test_extract_skill_missing() {
+        let input = serde_json::json!({"prompt": "mika#919"});
+        assert_eq!(extract_skill_from_input(&input), None);
     }
 }

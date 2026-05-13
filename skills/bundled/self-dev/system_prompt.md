@@ -250,7 +250,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
 2. **Second**, call `run_gh` with args `issue view <n> --json title,body --repo <repo>` to fetch the issue title and body — required input for the grooming check and `create_task`.
 
-3. **Third (GROOMING PRE-FLIGHT — mika#907, mika#996)**, scan the fetched issue body for the grooming marker. The bypass predicate is `Plan: docs/plans/` — the substring must include the canonical plan-doc path prefix `docs/plans/` to avoid false positives on the word "Plan:" appearing in prose elsewhere in the issue body.
+3. **Third (GROOMING PRE-FLIGHT — mika#907, mika#996, mika#919)**, scan the fetched issue body for the grooming marker. The bypass predicate is `Plan: docs/plans/` — the substring must include the canonical plan-doc path prefix `docs/plans/` to avoid false positives on the word "Plan:" appearing in prose elsewhere in the issue body. (Engine-level coupled guard: `crates/mika-agent/src/skills/executor.rs::validate_dispatch_readiness`.)
 
    **If the marker IS found:** Proceed to Step 4 (dispatch via `dev-pilot`).
 
