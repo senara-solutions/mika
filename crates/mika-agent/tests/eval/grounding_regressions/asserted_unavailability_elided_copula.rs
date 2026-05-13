@@ -190,3 +190,126 @@ async fn test_asserted_unavailability_adverb_interposed_caught() -> anyhow::Resu
 
     Ok(())
 }
+
+// --- Regression-reproduction tests (pre-fix shapes from frozen fixtures) ---
+
+/// Regression-reproduction: elided-copula pre-fix shape (mika#893).
+/// Supplies the pre-fix phrasing as a mock response. Guard fires once
+/// (single-retry semantics exhausted), but agent ignores corrective re-prompt.
+#[tokio::test]
+async fn test_regression_elided_copula_pre_fix_shape() -> anyhow::Result<()> {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Turn 1: Elided copula (guard fires, rejected)
+            text_response(
+                "search_memory not callable in this CLI session — tool not \
+                 exposed here. I'll proceed with only the conversation context.",
+            ),
+            // Turn 2: Agent ignores re-prompt (guard exhausted, goes through)
+            text_response(
+                "Based on the available context, the gate-evasion pattern is \
+                 well documented.",
+            ),
+        ])
+        .build()
+        .await?;
+
+    let trace = harness
+        .run("What do you know about gate-evasion patterns?")
+        .await?;
+
+    // Guard fired exactly once — 2 LLM calls (initial + retry)
+    assert_eq!(
+        trace.llm_call_count, 2,
+        "Expected exactly 1 guard-retry (2 LLM calls), got {}",
+        trace.llm_call_count
+    );
+
+    // search_memory NOT called — this IS the pre-fix failure class
+    let sm_calls = trace.calls_for_tool("search_memory");
+    assert!(
+        sm_calls.is_empty(),
+        "Pre-fix shape: search_memory should NOT have been called, but was called {} times",
+        sm_calls.len()
+    );
+
+    Ok(())
+}
+
+/// Regression-reproduction: elided skill-scoped pre-fix shape (mika#654 variant).
+#[tokio::test]
+async fn test_regression_elided_skill_scoped_pre_fix_shape() -> anyhow::Result<()> {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Turn 1: Elided skill-scoped (guard fires, rejected)
+            text_response(
+                "search_memory skill-scoped, not callable here. Proceeding with \
+                 only the information in the current conversation.",
+            ),
+            // Turn 2: Agent ignores re-prompt (guard exhausted)
+            text_response(
+                "Based on the conversation context, skill-scoped tools are \
+                 managed by identity.toml.",
+            ),
+        ])
+        .build()
+        .await?;
+
+    let trace = harness
+        .run("What do you know about skill-scoped tools?")
+        .await?;
+
+    assert_eq!(
+        trace.llm_call_count, 2,
+        "Expected exactly 1 guard-retry (2 LLM calls), got {}",
+        trace.llm_call_count
+    );
+
+    let sm_calls = trace.calls_for_tool("search_memory");
+    assert!(
+        sm_calls.is_empty(),
+        "Pre-fix shape: search_memory should NOT have been called, but was called {} times",
+        sm_calls.len()
+    );
+
+    Ok(())
+}
+
+/// Regression-reproduction: adverb-interposed pre-fix shape (mika#863 variant).
+#[tokio::test]
+async fn test_regression_adverb_interposed_pre_fix_shape() -> anyhow::Result<()> {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Turn 1: Adverb interposed (guard fires, rejected)
+            text_response(
+                "search_memory is structurally not callable in this session — \
+                 the tool is skill-gated. I'll work with the available context.",
+            ),
+            // Turn 2: Agent ignores re-prompt (guard exhausted)
+            text_response(
+                "Based on the available context, structural tool access is \
+                 managed by the skill system.",
+            ),
+        ])
+        .build()
+        .await?;
+
+    let trace = harness
+        .run("What do you know about structural tool access?")
+        .await?;
+
+    assert_eq!(
+        trace.llm_call_count, 2,
+        "Expected exactly 1 guard-retry (2 LLM calls), got {}",
+        trace.llm_call_count
+    );
+
+    let sm_calls = trace.calls_for_tool("search_memory");
+    assert!(
+        sm_calls.is_empty(),
+        "Pre-fix shape: search_memory should NOT have been called, but was called {} times",
+        sm_calls.len()
+    );
+
+    Ok(())
+}

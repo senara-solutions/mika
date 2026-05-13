@@ -1,6 +1,6 @@
-# Grounding + Fabrication Regression Scenarios (#741, #862, #863, #864, #1059)
+# Grounding + Fabrication Regression Scenarios (#741, #862, #863, #864, #894, #1059)
 
-Twenty scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG milestone #14 retrospective (#741). Scenarios 6–7 from the gate-evasion compound doc (#862). Scenarios 8–10 from the quoted-resource pre-fetch guard (#863). Scenarios 11–15 from the required-suffix-line verdict-ghosting guard (#864). Scenarios 16–18 from the required-tools-gate transport-contract fix (#890). Scenarios 19–20 from the qa-review per-AC enumeration fix (#1059, mika-skills#159). Hard assertions only — no LLM-judge gating.
+Twenty-three scenarios testing concrete fabrication classes. Scenarios 1–5 from the KG milestone #14 retrospective (#741). Scenarios 6–7 from the gate-evasion compound doc (#862). Scenarios 8a–8c from the elided-copula regex extension (#894). Scenarios 9–11 from the quoted-resource pre-fetch guard (#863). Scenarios 12–16 from the required-suffix-line verdict-ghosting guard (#864). Scenarios 17–19 from the required-tools-gate transport-contract fix (#890). Scenarios 20–21 from the qa-review per-AC enumeration fix (#1059, mika-skills#159). Hard assertions only — no LLM-judge gating.
 
 ## Tag Vocabulary (`grounding:*`)
 
@@ -49,7 +49,10 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 5. kg_result_ignored | V | | | V | `source-cited-correctly`, `training-data-hallucination` (failure) |
 | 6. asserted_unavailability_caught | | V | | | `unavailability-asserted-without-attempt` (failure), `verification-before-claim` |
 | 7. asserted_unavailability_genuine | | | | | `unavailability-asserted-genuine` |
-| 8. quoted_resource_pre_fetch (caught) | | V | | | `pre-fetch-required-when-quoted`, `verification-before-claim` |
+| 8a. asserted_unavailability_elided_copula | | V | | | `unavailability-asserted-without-attempt` (failure), `verification-before-claim` |
+| 8b. asserted_unavailability_elided_skill_scoped | | V | | | `unavailability-asserted-without-attempt` (failure), `verification-before-claim` |
+| 8c. asserted_unavailability_adverb_interposed | | V | | | `unavailability-asserted-without-attempt` (failure), `verification-before-claim` |
+| 9. quoted_resource_pre_fetch (caught) | | V | | | `pre-fetch-required-when-quoted`, `verification-before-claim` |
 | 9. quoted_resource_pre_fetch (no-op) | | V | | | `pre-fetch-required-when-quoted` |
 | 10. quoted_resource_pre_fetch (mixed) | | V | | | `pre-fetch-required-when-quoted` |
 | 11. required_suffix_line_caught | | | | V | `verdict-suffix-required-but-ghosted` (failure), `verdict-suffix-emitted` |
@@ -76,7 +79,8 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 5. kg_result_ignored | V | V | V |
 | 6. asserted_unavailability_caught | V | - | - |
 | 7. asserted_unavailability_genuine | V | - | - |
-| 8-10. quoted_resource_pre_fetch | V | - | - |
+| 8a-c. asserted_unavailability_elided_copula | V | - | - |
+| 9-11. quoted_resource_pre_fetch | V | - | - |
 | 11-15. required_suffix_line | V | - | - |
 | 16-18. required_tools_retry_thin_final_turn | V | - | - |
 | 19. qa_review_per_element_enumeration | V | - | - |
@@ -94,7 +98,10 @@ Each scenario has a `fixtures/{scenario}_pre_fix.json` file containing the pre-f
 | 4 | `fabricated_shell_errors_pre_fix.json` | feedback doc |
 | 5 | `kg_result_ignored_pre_fix.json` | mika#740 D4 |
 | 6 | `asserted_unavailability_caught_pre_fix.json` | mika#654 |
-| 8 | `quoted_resource_pre_fetch_pre_fix.json` | mika#788 |
+| 8a | `asserted_unavailability_elided_copula_pre_fix.json` | mika#893 |
+| 8b | `asserted_unavailability_elided_skill_scoped_pre_fix.json` | mika#654 (variant) |
+| 8c | `asserted_unavailability_adverb_interposed_pre_fix.json` | mika#863 (variant) |
+| 9 | `quoted_resource_pre_fetch_pre_fix.json` | mika#788 |
 | 11 | `required_suffix_line_caught_pre_fix.json` | mika#788 (verdict ghost) |
 | 16 | `required_tools_retry_thin_final_turn_pre_fix.json` | mika#890 (thin final turn) |
 | 19 | `qa_review_per_element_enumeration_pre_fix.json` | mika-skills#159 (aggregate claim) |
