@@ -2354,12 +2354,32 @@ async fn run_agent_inner(
     let lr_ctx = if params.is_callback_turn {
         None
     } else {
+        // Extract the latest user-role message text for the webhook dispatch
+        // gate in executor.rs (mika#933). Same extraction as `user_input_text`
+        // in `run_loop`, but extracted here at construction time.
+        let originating_msg = request
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, mika_common::llm::types::LlmRole::User))
+            .map(|m| match &m.content {
+                mika_common::llm::types::LlmContent::Text(t) => t.clone(),
+                mika_common::llm::types::LlmContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        mika_common::llm::types::LlmContentBlock::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            });
         Some(executor::LongRunningContext {
             db: db.clone(),
             agent_name: db.agent_id.clone(),
             session_id: params.session_id.to_string(),
             trace_id: trace_id.to_string(),
             dispatch_count: std::sync::atomic::AtomicU32::new(0),
+            originating_message: originating_msg,
         })
     };
     // Store loaded skills in session metadata for observability
@@ -3427,6 +3447,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     // Construct LongRunningContext for DeferredDispatch triggers only (mika#1058).
     // DeferredDispatch turns MUST be able to call run_claude_pilot — that's their
     // sole purpose. All other silent triggers (Heartbeat, Callback, etc.) keep None.
+    // originating_message is None: deferred-dispatch retries are engine-initiated
+    // and have no fresh [GitHub]-prefixed user turn (mika#933).
     let long_running_ctx = if matches!(&params.trigger, SilentTrigger::DeferredDispatch { .. }) {
         Some(executor::LongRunningContext {
             db: db.clone(),
@@ -3434,6 +3456,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
             session_id: params.session_id.to_string(),
             trace_id: trace_id.clone(),
             dispatch_count: AtomicU32::new(0),
+            originating_message: None,
         })
     } else {
         None
@@ -4817,15 +4840,15 @@ const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[Your response was rejected b
      is retry-safe. EndTurn without (1) AND (2) will be rejected. \
      Re-read the callback framing and produce both terminal actions before EndTurn.]";
 
-/// Marker prefix emitted by `mika_gateway::github::format_event_text` for
-/// `issues.labeled` events where the label name is `ready`.  See
-/// `crates/mika-gateway/src/github.rs` `format_event_text` and #842.
-const READY_LABEL_DISPATCH_MARKER: &str = "[GitHub] Issue labeled ready on ";
+/// Re-export from `webhook_dispatch` module — single source of truth for the
+/// ready-label marker prefix (mika#933).
+use crate::webhook_dispatch::READY_LABEL_DISPATCH_MARKER;
 
 /// Triggers when a webhook turn was initiated by the ready-label dispatch
-/// marker.  Matches the gateway's exact format prefix (#842).
+/// marker.  Delegates to `webhook_dispatch::is_ready_label_dispatch_marker`
+/// for the single-source-of-truth predicate (mika#933).
 fn ready_label_dispatch_trigger(msg: &str) -> bool {
-    msg.starts_with(READY_LABEL_DISPATCH_MARKER)
+    crate::webhook_dispatch::is_ready_label_dispatch_marker(msg)
 }
 
 /// Returns `true` when `run_claude_pilot` was attempted in this turn
@@ -4848,8 +4871,17 @@ fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
 
 /// #910 — Triggers on `[GitHub]` webhook turns that are NOT ready-label
 /// dispatch events.  Inverse of `ready_label_dispatch_trigger` on the
-/// `[GitHub]` domain.  Uses `READY_LABEL_DISPATCH_MARKER` for consistency
-/// with the positive-case guard.
+/// `[GitHub]` domain.  Uses `READY_LABEL_DISPATCH_MARKER` (imported from
+/// `webhook_dispatch` module, mika#933) for consistency with the positive-case
+/// guard.
+///
+/// NOTE: This predicate is intentionally **over-broad** compared to the
+/// tool-boundary `is_unauthorized_webhook_dispatch()` in `webhook_dispatch.rs`.
+/// It matches PR and check-suite events too (qa/ci skill territory), which
+/// generates confusing post-hoc corrections but does not break those flows
+/// (the dispatch already happened by EndTurn).  Tightening this to match the
+/// tool-boundary allowlist is a follow-up ticket (see mika#933 plan §
+/// "Predicate sharing § Important").
 fn webhook_no_unauthorized_dispatch_trigger(msg: &str) -> bool {
     msg.starts_with("[GitHub]") && !msg.starts_with(READY_LABEL_DISPATCH_MARKER)
 }
