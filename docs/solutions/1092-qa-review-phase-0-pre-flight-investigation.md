@@ -35,10 +35,10 @@ date: 2026-05-13
 | 1k-5k | 1,391 | 7.2% |
 | 5k-10k | 280 | 1.5% |
 | 10k-20k | 929 | 4.8% |
-| 20k-32k | 24 | 0.1% |
+| 20k-32k | 24 | 0.12% |
 | 32k-64k | 10 | 0.05% |
 
-**Key finding:** 82.4% of mika-qa calls are empty/zero-token (likely multi-turn conversation continuations where caching handles input). The actual full-context PR review calls (>10k input) number 962, with an average of 13,646 input tokens. Even the worst case (38,931 tokens) is well under DeepSeek V3's marketed 128k context window.
+**Key finding:** 82.4% of mika-qa calls are empty/zero-token (likely multi-turn conversation continuations where caching handles input). The actual full-context PR review calls (>10k input) number 963, with an average of 13,646 input tokens. Even the worst case (38,931 tokens) is well under DeepSeek V3's marketed 128k context window.
 
 **DeepSeek provider config** (from `crates/mika-common/src/llm/mod.rs`): Default model `deepseek-chat`, max output tokens 8,192. No explicit context window limit configured — relies on API provider default.
 
@@ -58,7 +58,7 @@ date: 2026-05-13
 
 **Real PR replay scenarios:** 0. The eval harness (mika#1059) uses `MockLlmProvider` with canned responses for CI. No real PR diff + expected verdict pairs exist as a corpus.
 
-**Historical data available for backfill:** 19,221 mika-qa LLM calls from 2026-04-12 to 2026-05-13 (31 days). Of these, 962 are full-context PR review calls (>10k input tokens). This is a rich backfill source — each call contains the actual input tokens (system prompt + PR diff + context) and the model's output (verdict).
+**Historical data available for backfill:** 19,221 mika-qa LLM calls from 2026-04-12 to 2026-05-13 (31 days). Of these, 963 are full-context PR review calls (>10k input tokens). This is a rich backfill source — each call contains the actual input tokens (system prompt + PR diff + context) and the model's output (verdict).
 
 **Applying decision framework:** Corpus < 25 real PR scenarios → **PROCEED with backfill prerequisite**. A Phase 0.5 backfill ticket should:
 1. Target 50 scenarios (25 minimum for directional comparison).
@@ -117,5 +117,5 @@ date: 2026-05-13
 - Q4 (cost): **CLEAR.** Phase 2 worst-case $7.77, well under $100 threshold.
 
 **Next steps:**
-1. **Phase 0.5 ticket:** Backfill eval corpus from `llm_calls` historical data (19,221 calls, 962 full-context reviews). Target 50 diverse scenarios. ~2hr effort.
+1. **Phase 0.5 ticket:** Backfill eval corpus from `llm_calls` historical data (19,221 calls, 963 full-context reviews). Target 50 diverse scenarios. ~2hr effort.
 2. **Phase 1 ticket:** Baseline run — 1 variant (current Sonnet) × 50 scenarios. Gated on Phase 0.5 completion.

@@ -52,7 +52,7 @@ Investigation is ordered by uncertainty and blocking potential: Q2 first (highes
 ### Q2: DeepSeek effective context window (HIGHEST PRIORITY — hard blocker gate)
 
 **What to check:**
-- Measure qa-review system prompt token count: `skills/bundled/qa-review/system_prompt.md` is 49KB chars. Estimate ~12-15k tokens.
+- Measure qa-review system prompt token count: `skills/bundled/qa-review/system_prompt.md` is ~39KB chars (39,662 bytes, confirmed by investigation). Estimate ~10k tokens.
 - Measure representative PR diff size from a recent qa-review run: query `llm_calls` table for mika-qa agent invocations, extract actual input token counts.
   ```sql
   SELECT input_tokens, output_tokens, model, created_at
