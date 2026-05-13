@@ -4539,40 +4539,29 @@ struct IntentPrecondition {
 /// "trigger + tool-signature" pattern (e.g. persistence nudge, completion
 /// claim) remain as inline code outside this registry.
 const INTENT_GUARDS: &[IntentPrecondition] = &[
-    // #846 + #907 — ready-label webhook events require EITHER dispatch
-    // (run_claude_pilot) OR grooming-rejection notification (send_message).
+    // #846 + #907 + #1089 — ready-label webhook events require
+    // run_claude_pilot attempted (dispatch via dev-pilot, or auto-groom
+    // via dev-groom). send_message does NOT satisfy the guard.
     //
     // More specific than webhook_zero_tools (which any successful tool satisfies),
     // so it is evaluated FIRST.  Without this guard, the LLM successfully removes
     // the `ready` label via run_gh and EndTurns — webhook_zero_tools is satisfied
     // by the run_gh call but the dispatch never happens.
     //
-    // OR-shape (#907): The satisfied predicate accepts run_claude_pilot attempt
-    // OR send_message.  The skill prompt's Ready-Label Dispatch handler checks
-    // for the `> - **Plan:**` grooming marker in the issue body before dispatch.
-    // If the marker is absent, the agent notifies the operator via send_message
-    // instead of dispatching.  The guard accepts both paths as valid completion.
-    //
-    // The send_message match is intentionally over-broad — any send_message
-    // satisfies, not just grooming-rejection notifications.  This is acceptable
-    // because: (a) the prompt is the primary grooming gate, the guard is a
-    // backstop; (b) the trigger is very specific (only ready-label events);
-    // (c) content-based discrimination on truncated input_summary is fragile.
-    // Same pattern as callback_terminal_action's send_message matching.
-    //
-    // #846 + #907 + #1089 — run_claude_pilot ATTEMPTS (success or failure)
-    // count, not just successes. Terminal failures (task_not_dispatchable,
-    // dispatch_blocked_by, etc.) are structural and not recoverable by
-    // re-prompt — the LLM handles them via send_message per the prompt's
-    // Step 5 (#846 adversarial review).
+    // run_claude_pilot ATTEMPTS (success or failure) count, not just successes.
+    // Terminal failures (task_not_dispatchable, dispatch_blocked_by, etc.)
+    // are structural and not recoverable by re-prompt — the LLM handles them
+    // via send_message per the prompt's Step 5 (#846 adversarial review).
     // NOTE (mika#1011): global_dispatch_active ALSO has an engine-side
     // deferred-callback auto-recovery path (γ composition). The LLM may
-    // still call send_message; both paths are independent and
-    // validate_dispatch_readiness() arbitrates any race.
-    // NOTE (mika#1089): send_message was removed from the satisfied predicate.
-    // Post-#996 (auto-groom), all legitimate completion paths call
-    // run_claude_pilot. The send_message-only path was exploited by LLM
-    // fabrication (hallucinated check_task pre-flight → NoChannel escalation).
+    // still call send_message as a supplementary notification; it does not
+    // satisfy the guard but is permitted as a side-effect.
+    //
+    // History: #907 added an OR-shape (run_claude_pilot || send_message) for
+    // grooming-rejection notifications. #996 replaced the rejection path with
+    // auto-groom via run_claude_pilot(dev-groom). #1089 removed send_message
+    // from the predicate — the over-broad match was exploited by LLM fabrication
+    // (hallucinated check_task pre-flight → NoChannel escalation).
     IntentPrecondition {
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
@@ -4695,10 +4684,8 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
     msg.starts_with(READY_LABEL_DISPATCH_MARKER)
 }
 
-/// Returns `true` when the ready-label dispatch turn completed via one of
-/// two valid paths: (a) `run_claude_pilot` was attempted (dispatch path), or
-/// (b) `send_message` was called (grooming-rejection or error notification
-/// path).
+/// Returns `true` when `run_claude_pilot` was attempted in this turn
+/// (success or failure).
 ///
 /// #846, #907, #1089 — Requires `run_claude_pilot` attempted on ready-label
 /// webhook turns.  Attempts count regardless of success — terminal failures
