@@ -104,6 +104,7 @@ Sections measured by accumulated line-byte count including heading lines. Total 
 
 ### 1. `skills/bundled/self-dev-callback/`
 
+- **Canonical message-prefix shape (per NF4):** `[claude-pilot]` and `[deploy_mika]` user-message prefixes, plus `[callback:` Silent-mode trigger markers — per `mika-agent/CLAUDE.md` §Post-Conditions (intent-precondition registry) and §Silent Mode Agent Loop.
 - **Trigger keywords (`skill.toml`):** `["claude-pilot callback", "callback", "long_running:run_claude_pilot", "long_running:deploy_mika", "error_max_turns", "PIPELINE FAILURE"]`
 - **`always_on`:** `false`
 - **`dependencies`:** `["self-dev"]` (host owns Metadata extraction and Step 6 — Close out)
@@ -113,6 +114,7 @@ Sections measured by accumulated line-byte count including heading lines. Total 
 
 ### 2. `skills/bundled/self-dev-webhook-ready-label/`
 
+- **Canonical message-prefix shape (per NF4):** `[GitHub] Issue labeled ready on` marker — per `mika-agent/CLAUDE.md` §Post-Conditions entry (a) `webhook_ready_label_dispatch`.
 - **Trigger keywords (`skill.toml`):** `["issue labeled ready", "ready label", "issues.labeled.ready"]`
 - **`always_on`:** `false`
 - **`dependencies`:** `["self-dev"]`
