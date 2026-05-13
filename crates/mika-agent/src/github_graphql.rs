@@ -5,6 +5,58 @@
 
 use std::time::Duration;
 
+/// Fetch the body of a GitHub issue via the REST API.
+///
+/// Returns the raw body text on success. Used by the dispatch-readiness
+/// grooming-marker check (mika#919).
+///
+/// Reuses the same auth/header/timeout shape as `tools::check_task::
+/// github_get` for consistency with the existing GitHub HTTP layer.
+pub(crate) async fn fetch_issue_body(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<String, String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "mika-agent")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "token invalid or expired".to_string(),
+            403 => "token lacks required permissions".to_string(),
+            404 => "not found or not accessible".to_string(),
+            429 => "rate limit exceeded".to_string(),
+            _ => format!("HTTP {status}"),
+        };
+        return Err(format!("GitHub API error: {msg}"));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+
+    body.get("body")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "issue body field missing or null".to_string())
+}
+
 /// Query GitHub's GraphQL API for `blockedBy` edges on an issue.
 ///
 /// Returns the issue numbers of any open (non-CLOSED) blockers. Returns an empty

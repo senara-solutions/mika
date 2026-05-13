@@ -45,6 +45,7 @@ mod eval {
     mod test_context_summary_inject;
     mod test_deadline_in_flight_llm_call;
     mod test_di_builders;
+    mod test_dispatch_no_grooming_marker_guard;
     mod test_error_handling;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;

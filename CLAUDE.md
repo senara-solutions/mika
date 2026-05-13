@@ -170,6 +170,9 @@ Optional (startup behavior):
 Optional (callback watchdog):
 - `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` — Grace period (seconds) after subprocess death detection before marking a callback task `failed` (default: 120). The watchdog runs every 60s in the engine tick loop and detects dead subprocesses via `/proc/<pid>/stat` process start time comparison. Prevents stale long-running callbacks from blocking the dispatch queue indefinitely (#959).
 
+Optional (dispatch grooming gate):
+- `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
+
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)
