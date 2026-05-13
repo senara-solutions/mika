@@ -39,6 +39,7 @@ pub mod kg_result_ignored;
 pub mod qa_review_absence_claim_grounded;
 pub mod qa_review_per_element_enumeration;
 pub mod quoted_resource_pre_fetch;
+pub mod required_finding_list;
 pub mod required_suffix_line_caught;
 pub mod required_suffix_line_unconstrained;
 pub mod required_tools_retry_thin_final_turn;

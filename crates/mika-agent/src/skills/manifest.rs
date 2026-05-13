@@ -122,6 +122,12 @@ impl Constraints {
 /// exhaustive accept-set. The EndTurn post-condition guard scans the assistant's last
 /// 3 non-empty lines for an exact match; missing match rejects EndTurn once.
 ///
+/// Skills that need to enforce verbatim findings emission opt in via
+/// `required_finding_list_prefixes` listing the closed-alphabet F-list prefix set.
+/// The guard scans the message body (up to the suffix-line landmark) for at least one
+/// line starting with a declared prefix; enforced only on terminal dispositions
+/// (ITERATE/ESCALATE). See mika#901.
+///
 /// See mika#864 for the verdict-ghosting failure mode this addresses.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Output {
@@ -130,12 +136,20 @@ pub struct Output {
     /// that ends with EndTurn while this skill is active. Empty list = no constraint.
     #[serde(default)]
     pub required_suffix_lines: Vec<String>,
+
+    /// Closed-alphabet list of finding-line prefixes (e.g., `["F1:", "F2:", ..., "F10:"]`).
+    /// When non-empty AND the assistant's disposition is terminal (ITERATE/ESCALATE/Verdict: ESCALATE),
+    /// at least one line in the message body (up to the suffix-line landmark) must start with
+    /// one of these prefixes. Missing match rejects EndTurn once. Empty list = no constraint.
+    /// See mika#901 for the conditional-disclosure-evasion failure class this addresses.
+    #[serde(default)]
+    pub required_finding_list_prefixes: Vec<String>,
 }
 
 impl Output {
     /// Returns `true` if no output constraints are configured.
     pub fn is_empty(&self) -> bool {
-        self.required_suffix_lines.is_empty()
+        self.required_suffix_lines.is_empty() && self.required_finding_list_prefixes.is_empty()
     }
 }
 
@@ -804,6 +818,53 @@ mod tests {
         "#;
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert!(manifest.output.is_empty());
+    }
+
+    #[test]
+    fn test_parse_output_required_finding_list_prefixes() {
+        let toml_str = r#"
+            [skill]
+            name = "arch-groom-ticket"
+            description = "First-pass plan review"
+
+            [output]
+            required_suffix_lines = ["Disposition: READY", "Disposition: ITERATE", "Disposition: ESCALATE"]
+            required_finding_list_prefixes = ["F1:", "F2:", "F3:", "F4:", "F5:", "F6:", "F7:", "F8:", "F9:", "F10:"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.output.is_empty());
+        assert_eq!(manifest.output.required_finding_list_prefixes.len(), 10);
+        assert_eq!(manifest.output.required_finding_list_prefixes[0], "F1:");
+        assert_eq!(manifest.output.required_finding_list_prefixes[9], "F10:");
+    }
+
+    #[test]
+    fn test_output_is_empty_with_only_finding_list() {
+        let toml_str = r#"
+            [skill]
+            name = "test-skill"
+            description = "Only finding list"
+
+            [output]
+            required_finding_list_prefixes = ["F1:", "F2:"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.output.is_empty());
+        assert!(manifest.output.required_suffix_lines.is_empty());
+    }
+
+    #[test]
+    fn test_no_finding_list_defaults_empty() {
+        let toml_str = r#"
+            [skill]
+            name = "simple"
+            description = "No finding list"
+
+            [output]
+            required_suffix_lines = ["Verdict: GROOMED"]
+        "#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.output.required_finding_list_prefixes.is_empty());
     }
 
     // -- [context] section tests --

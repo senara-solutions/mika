@@ -751,6 +751,10 @@ fn strip_prior_images(messages: &mut [LlmMessage]) {
 /// `required_suffix_lines` specifies literal lines (from matched skills' `[output]` sections)
 /// that must appear in the assistant's last 3 non-empty lines. If none match, the response
 /// is rejected once with a corrective re-prompt. See #864.
+///
+/// `required_finding_list_prefixes` specifies finding-line prefixes (from matched skills'
+/// `[output]` sections) that must appear in the message body on terminal dispositions
+/// (ITERATE/ESCALATE). See #901.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     llm: &dyn LlmProvider,
@@ -766,6 +770,7 @@ async fn run_loop(
     long_running_ctx: Option<&executor::LongRunningContext>,
     required_tools: &HashSet<String>,
     required_suffix_lines: &[String],
+    required_finding_list_prefixes: &[String],
     enabled_tool_names: &HashSet<String>,
     store_llm_calls: bool,
     store_tool_calls: bool,
@@ -821,6 +826,10 @@ async fn run_loop(
     // Guards against verdict-ghosting: skills declaring `[output] required_suffix_lines`
     // must have one of the listed lines in the last 3 non-empty lines of the response. See #864.
     let mut required_suffix_line_retry_done = false;
+    // Whether we already injected a required-finding-list correction. Only allow one retry.
+    // Guards against thin-emission: skills declaring `[output] required_finding_list_prefixes`
+    // must have at least one F-list line in the message body on terminal dispositions. See #901.
+    let mut required_finding_list_retry_done = false;
     // Intent-precondition registry retry tracking (#702). Each entry label
     // gets inserted on first fire; presence prevents re-fire. Replaces the
     // former `webhook_zero_tools_retry_done` boolean and generalizes to all
@@ -1529,6 +1538,79 @@ async fn run_loop(
                         }
                     }
 
+                    // #901 — Required-finding-list guard. Skills can declare a closed-
+                    // alphabet set of F-list prefixes; on terminal dispositions
+                    // (ITERATE/ESCALATE), at least one line in the message body (up
+                    // to the suffix-line landmark) must start with a declared prefix.
+                    // Position: immediately after #864 suffix-line guard.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !required_finding_list_retry_done
+                        && !required_finding_list_prefixes.is_empty()
+                        && is_terminal_disposition(&text, required_suffix_lines)
+                    {
+                        // Scan from message start up to (exclusive of) the suffix-line
+                        // landmark. F-list lives in the body, not the tail.
+                        let lines: Vec<&str> = text.lines().collect();
+                        let suffix_line_idx = lines.iter().position(|line| {
+                            let trimmed = line.trim();
+                            required_suffix_lines
+                                .iter()
+                                .any(|req| trimmed == req.as_str())
+                        });
+                        let scan_end = suffix_line_idx.unwrap_or(lines.len());
+                        let scan_lines = &lines[..scan_end];
+
+                        let satisfied = scan_lines.iter().any(|line| {
+                            let trimmed = line.trim_start();
+                            required_finding_list_prefixes
+                                .iter()
+                                .any(|prefix| trimmed.starts_with(prefix.as_str()))
+                        });
+
+                        if !satisfied {
+                            required_finding_list_retry_done = true;
+                            warn!(
+                                step,
+                                label = mode.label(),
+                                "Required-finding-list guard: assistant response missing \
+                                 required F-list emission on terminal disposition — \
+                                 re-prompting (#901)"
+                            );
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::Assistant,
+                                content: LlmContent::Blocks(
+                                    mika_common::llm::response_content_to_blocks(&response.content),
+                                ),
+                            });
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::User,
+                                content: LlmContent::Text(
+                                    "[Your response was rejected because it does not contain \
+                                     the required F-list emission per the skill's \
+                                     `[output] required_finding_list_prefixes` contract.\n\n\
+                                     When disposition is ITERATE or ESCALATE (or verdict \
+                                     ESCALATE), the final assistant message MUST emit \
+                                     findings as `F1:`, `F2:`, etc., in the message body. \
+                                     Each finding needs: (a) **Concern** — the concrete \
+                                     issue, (b) **Change required** — what the plan must \
+                                     address, (c) **Citation** — the source grounding the \
+                                     concern.\n\n\
+                                     Persisting findings to memory (`store_fact` / \
+                                     `update_core_memory`) is encouraged as defense-in-depth, \
+                                     but the in-band emission is the contract the operator \
+                                     depends on. Re-emit the response with the F-list \
+                                     before EndTurn.\n\n\
+                                     (Required by skill [output].required_finding_list_prefixes. \
+                                     See feedback_prompt_enforcement_fragile.md for why \
+                                     prompt-level \"MUST\" doesn't bind here.)]"
+                                        .to_string(),
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+
                     // #846 + #907 + #1089 — operator notification when the
                     // ready-label dispatch guard fired but run_claude_pilot was
                     // not called after the retry.  Without this the failure is
@@ -2075,6 +2157,7 @@ async fn run_agent_inner(
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched, params.user_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
+    let required_finding_list_prefixes = collect_required_finding_list_prefixes(&matched);
 
     // Build active skill paths for context-redundancy checks in read tools.
     // Each matched skill's system_prompt.md is already injected into the system prompt
@@ -2326,6 +2409,7 @@ async fn run_agent_inner(
         lr_ctx.as_ref(),
         &required_tools,
         &required_suffix_lines,
+        &required_finding_list_prefixes,
         &enabled_tool_names,
         store_llm,
         store_tools,
@@ -3356,6 +3440,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     };
 
     let no_required_suffix_lines: Vec<String> = Vec::new();
+    let no_required_finding_list_prefixes: Vec<String> = Vec::new();
     let result = run_loop(
         llm,
         tools,
@@ -3370,6 +3455,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         long_running_ctx.as_ref(), // mika#1058: DeferredDispatch gets ctx, others get None
         &no_required_tools,
         &no_required_suffix_lines,
+        &no_required_finding_list_prefixes,
         &enabled_tool_names,
         store_llm,
         store_tools,
@@ -3648,6 +3734,7 @@ async fn run_team_agent_inner_impl(
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     let required_tools = collect_required_tools(&matched, params.task_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
+    let required_finding_list_prefixes = collect_required_finding_list_prefixes(&matched);
 
     // Append MCP tool definitions (if any MCP servers are connected)
     if let Some(mcp) = params.mcp_manager {
@@ -3758,6 +3845,7 @@ async fn run_team_agent_inner_impl(
         None, // long_running: team agents will be wired in Phase 4
         &required_tools,
         &required_suffix_lines,
+        &required_finding_list_prefixes,
         &enabled_tool_names,
         store_llm,
         store_tools,
@@ -4077,6 +4165,62 @@ fn collect_required_suffix_lines(matched: &[MatchedSkill<'_>]) -> Vec<String> {
         .flat_map(|m| m.entry.manifest.output.required_suffix_lines.iter())
         .cloned()
         .collect()
+}
+
+/// Collect required finding-list prefixes from keyword-matched and always-on skills'
+/// `[output]` sections. Returns the union of all declared `required_finding_list_prefixes`
+/// entries.
+///
+/// Same matching semantics as `collect_required_suffix_lines` — both `Keyword` and
+/// `AlwaysOn` matched skills contribute; `Dependency`-matched skills do not. See #901.
+fn collect_required_finding_list_prefixes(matched: &[MatchedSkill<'_>]) -> Vec<String> {
+    matched
+        .iter()
+        .filter(|m| matches!(m.reason, MatchReason::Keyword | MatchReason::AlwaysOn))
+        .flat_map(|m| {
+            m.entry
+                .manifest
+                .output
+                .required_finding_list_prefixes
+                .iter()
+        })
+        .cloned()
+        .collect()
+}
+
+/// Determine whether the assistant's disposition/verdict is "terminal" (requires F-list).
+///
+/// Terminal dispositions: `Disposition: ITERATE`, `Disposition: ESCALATE`, `Verdict: ESCALATE`.
+/// Non-terminal: `Disposition: READY`, `Verdict: GROOMED`.
+/// Per mika#901 R1: F-list is required only on terminal dispositions.
+fn is_terminal_disposition(text: &str, required_suffix_lines: &[String]) -> bool {
+    // Terminal disposition lines — these are the suffix lines that require an F-list.
+    const TERMINAL_DISPOSITIONS: &[&str] = &[
+        "Disposition: ITERATE",
+        "Disposition: ESCALATE",
+        "Verdict: ESCALATE",
+    ];
+
+    // Scan the last 3 non-empty lines (same window as the suffix-line guard)
+    // for any terminal disposition match against the skill's declared suffix lines.
+    let last_non_empty: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(3)
+        .collect();
+
+    last_non_empty.iter().any(|line| {
+        // Only consider lines that are both in the skill's declared suffix set AND
+        // in the terminal disposition set.
+        required_suffix_lines
+            .iter()
+            .any(|req| *line == req.as_str())
+            && TERMINAL_DISPOSITIONS.contains(line)
+    })
 }
 
 /// Filter required tools to only those available in the current tool set.

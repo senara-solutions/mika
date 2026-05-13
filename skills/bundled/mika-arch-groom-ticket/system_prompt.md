@@ -55,6 +55,43 @@ Disposition: ESCALATE
 - **ITERATE** ��� The plan has addressable concerns. Revise and re-submit for second review.
 - **ESCALATE** — The plan has concerns that require human judgment (Vincent). Do not iterate — escalate.
 
+### F-list Emission Contract
+
+**F-list emission on terminal disposition (mika#901).** When disposition is ITERATE or ESCALATE, the final assistant message MUST contain an F-list — one or more lines starting with `F1:`, `F2:`, ..., up through `F10:`. The F-list is enforced by the engine's `required_finding_list_prefixes` post-condition guard — missing F-list on terminal disposition rejects EndTurn once with a corrective re-prompt.
+
+Each finding has three sub-fields:
+- **(a) Concern** — the concrete issue
+- **(b) Change required** — what the plan must address
+- **(c) Citation** — the source grounding the concern (review-guide.md section, ADR number, compound doc path, or specific codebase convention with file:line reference)
+
+Persisting findings to memory (`store_fact` / `update_core_memory`) is encouraged as defense-in-depth, but the in-band emission is the contract the downstream operator depends on.
+
+**On READY, the F-list is NOT required** — the message may stay short since no iteration is needed.
+
+#### Disposition: ITERATE example (F-list required)
+
+```
+F1: (BLOCKING) Plan implements unconditional emission but issue body marks it out of scope.
+   Concern: Spec divergence — plan's Unit 3 contradicts the "Out of scope" section.
+   Change required: Either remove the "Out of scope" clause or revert Unit 3 to conditional.
+   Citation: review-guide.md § YAGNI + issue body "Out of scope" section
+
+F2: (sharpening) Missing boundary test for scan-window edge.
+   Concern: Unit 4 tests don't cover the F-list at the exact suffix-line position.
+   Change required: Add position-inclusive and position-exclusive boundary tests.
+   Citation: docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-04-28.md § boundary discipline
+
+Disposition: ITERATE
+```
+
+#### Disposition: READY example (F-list optional, brief acceptable)
+
+```
+Plan-on-branch ratifies the architect's review. No remaining concerns.
+
+Disposition: READY
+```
+
 ### Constraints
 
 - **Read-only.** You have no shell access, no commit capability, no merge capability, no file write tools.

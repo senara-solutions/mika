@@ -895,6 +895,40 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         }
     }
 
+    // 5e-bis. Validate [output] required_finding_list_prefixes (#901)
+    if !manifest.output.required_finding_list_prefixes.is_empty() {
+        for (i, prefix) in manifest
+            .output
+            .required_finding_list_prefixes
+            .iter()
+            .enumerate()
+        {
+            if prefix.trim().is_empty() {
+                diags.push(SkillDiagnostic::fail(format!(
+                    "[output] required_finding_list_prefixes[{i}] is empty or whitespace-only — \
+                     each entry must be a non-empty literal prefix"
+                )));
+            }
+        }
+    } else if manifest.output.required_finding_list_prefixes.is_empty()
+        && skill_dir.join("skill.toml").exists()
+    {
+        // Check if the [output] section exists but has an empty list (suspicious but not fatal).
+        if let Ok(raw) = std::fs::read_to_string(skill_dir.join("skill.toml"))
+            && let Ok(raw_table) = raw.parse::<toml::Table>()
+            && let Some(output_section) = raw_table.get("output")
+            && let Some(prefixes) = output_section.get("required_finding_list_prefixes")
+            && prefixes.as_array().is_some_and(|a| a.is_empty())
+        {
+            diags.push(SkillDiagnostic::warn(
+                "[output] required_finding_list_prefixes is an explicit empty list — \
+                 this means no finding-list constraint will be enforced. \
+                 If this is unintentional, add the expected F-list prefixes."
+                    .to_string(),
+            ));
+        }
+    }
+
     // 5f. Cross-check {{key}} placeholders in prompts against [context.*] declarations
     {
         let placeholder_re = regex::Regex::new(r"\{\{(\w+)\}\}").unwrap();

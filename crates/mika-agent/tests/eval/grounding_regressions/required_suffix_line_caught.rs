@@ -54,6 +54,7 @@ fn make_suffix_skill(name: &str, keywords: &[&str], suffix_lines: &[&str]) -> Sk
             constraints: Default::default(),
             output: Output {
                 required_suffix_lines: suffix_lines.iter().map(|s| s.to_string()).collect(),
+                required_finding_list_prefixes: vec![],
             },
             context: HashMap::new(),
             variants: Default::default(),
