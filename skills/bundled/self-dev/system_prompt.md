@@ -312,19 +312,7 @@ When you receive a GitHub webhook event (message starts with `[GitHub]`) and **n
 
 > **EVENT IDENTITY CHECK:** This message is a GitHub webhook event that does NOT match any dedicated webhook handler. It may be an issue assignment, issue comment, PR comment, label change, or other informational event. This is NOT a trigger to start new work.
 
-> **SCOPE RULE (HARD GATE)** — This turn handles ONLY the webhook event. The
-> permitted-actions list below is exhaustive; nothing else is allowed.
->
-> **Pre-dispatch label gate** — If the message references an issue and you
-> believe `run_claude_pilot` is appropriate, you MUST first run
-> `run_gh("issue view <n> --json labels", repo="senara-solutions/<repo>")` and
-> verify `ready` appears in the returned label list. If `ready` is absent,
-> abort the dispatch and post `send_message` to Vincent describing the event.
-> The engine enforces the same gate at the tool boundary
-> (`unauthorized_webhook_dispatch`); the label query is your evidence that
-> you considered the gate before acting.
->
-> Permitted actions:
+> **SCOPE RULE (HARD GATE):** This turn handles ONLY the webhook event. Do NOT `list_tasks`, do NOT create new tasks, do NOT call `run_claude_pilot` unless you first run `run_gh issue view <n> --json labels` on the referenced issue and confirm `ready` is present. The engine rejects unauthorized dispatch at the tool boundary (`unauthorized_webhook_dispatch`, mika#933). Permitted actions:
 > 1. Acknowledge the event
 > 2. If the event correlates to an existing active task (by PR URL or issue URL), update the task's note with relevant context
 > 3. If the event requires Vincent's attention (e.g., external contributor comment, security alert), notify via `send_message`
@@ -510,12 +498,9 @@ After `run_claude_pilot` returns "task submitted", the ONLY valid notification i
 
 When you receive a GitHub webhook event (`[GitHub]` prefix) and no webhook-specific skill (`self-dev-webhook-qa`, `self-dev-webhook-ci`) keyword-activated for this turn, you are in the **Webhook Fallthrough** entry point. Do NOT follow the generic Workflow (Steps 1–3). Do NOT call `list_tasks` to scan the backlog. Do NOT call `create_task` for issues mentioned in the webhook. Do NOT call `run_claude_pilot`. Acknowledge the event, optionally correlate to an existing task, and stop.
 
-The engine enforces a hard limit of one `run_claude_pilot` dispatch per turn and rejects dispatch when another task already has an active session. But prompt-level discipline is the first line of defense — do not rely on engine guards to catch scope violations.
+The engine rejects `run_claude_pilot` at the webhook-fallthrough tool boundary with `unauthorized_webhook_dispatch` (mika#933) and caps one dispatch per turn — but prompt-level discipline is the first line of defense.
 
-**Engine backstop:** The engine rejects `run_claude_pilot` at the tool boundary with `error: unauthorized_webhook_dispatch` when this rule is violated (mika#933). Treat this as a hard contract, not a soft preference.
-
-**Incident:** mika#583 on 2026-04-15 — `pull_request_review.submitted` webhook arrived, no webhook-specific skill activated. Agent followed generic Workflow, scanned backlog via `list_tasks`, dispatched claude-pilot on unrelated issues #571 and #572.
-mika#932 on 2026-05-02 — `issue_comment.created` webhook with dispatch-class keywords in body bypassed the prose rule; mika#910 post-hoc EndTurn guard fired but could not undo the dispatch.
+**Incidents:** mika#583 (2026-04-15) — `pull_request_review.submitted` webhook with no specific handler; agent ran the generic Workflow and dispatched claude-pilot on unrelated issues. mika#932 (2026-05-02) — `issue_comment.created` with dispatch-class keywords bypassed the prose rule; #910 post-hoc guard fired too late to undo.
 
 ### Rule 10 — Verify issue numbers before completion claims
 
