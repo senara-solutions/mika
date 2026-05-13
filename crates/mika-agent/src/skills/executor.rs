@@ -99,6 +99,13 @@ pub struct LongRunningContext {
     /// Per-turn dispatch counter (#583). Only one long-running dispatch is
     /// permitted per agent turn. Atomic for interior mutability through `&self`.
     pub dispatch_count: AtomicU32,
+    /// Originating user-message text for this turn, when available.
+    ///
+    /// Populated in conversation-mode turns (the actual user/webhook input).
+    /// `None` for silent triggers (`SilentTrigger::DeferredDispatch`, callback
+    /// continuation turns) where there is no fresh user input — those paths
+    /// have already passed an upstream gate.
+    pub originating_message: Option<String>,
 }
 
 /// Validate that all required fields declared in a skill tool's input schema are
@@ -806,7 +813,29 @@ async fn validate_dispatch_readiness(
     task_id: &str,
     github_token: Option<&str>,
     tool_input: Option<&serde_json::Value>,
+    originating_message: Option<&str>,
 ) -> Result<String, String> {
+    // #933 — Tool-boundary gate for unauthorized webhook dispatch. Cheapest check
+    // (pure string-prefix match, no DB), runs first. Rejects `run_claude_pilot`
+    // when the originating user message is in the Webhook Fallthrough domain.
+    if let Some(msg) = originating_message
+        && crate::webhook_dispatch::is_unauthorized_webhook_dispatch(msg)
+    {
+        return Err(serde_json::json!({
+            "error": "unauthorized_webhook_dispatch",
+            "task_id": task_id,
+            "reason": "This turn was initiated by a [GitHub] webhook event in the \
+                       Webhook Fallthrough domain (issue events, comments, or \
+                       unknown event types). Only `[GitHub] Issue labeled ready on` \
+                       webhooks (authorized dispatch) and PR / Check-suite events \
+                       handled by self-dev-webhook-qa / self-dev-webhook-ci skills \
+                       may dispatch claude-pilot. All other webhook events must use \
+                       Webhook Fallthrough: acknowledge without dispatching \
+                       (mika#841 positive-consent contract, mika#933)."
+        })
+        .to_string());
+    }
+
     // Re-fetch the task to get the full struct (validate_task confirmed existence)
     let task = match db.get_task(task_id).await {
         Ok(Some(t)) => t,
@@ -1334,11 +1363,18 @@ async fn execute_long_running(
     // allows `blocked` (needed by delegate_task). Long-running dispatch only permits
     // `pending` and `in_progress`. Returns the current status on success to avoid
     // a redundant DB read in the auto-transition below.
-    let wi_status =
-        match validate_dispatch_readiness(&ctx.db, task_id, github_token, Some(&input)).await {
-            Ok(status) => status,
-            Err(err) => return ToolOutput::error(err),
-        };
+    let wi_status = match validate_dispatch_readiness(
+        &ctx.db,
+        task_id,
+        github_token,
+        Some(&input),
+        ctx.originating_message.as_deref(),
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(err) => return ToolOutput::error(err),
+    };
 
     // Per-turn dispatch cap (#583): only one long-running dispatch per agent turn.
     // Check first without incrementing — the actual increment happens right before
@@ -2523,6 +2559,7 @@ mod tests {
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
+            originating_message: None,
         };
 
         let output = execute_skill_tool(
@@ -2578,6 +2615,7 @@ mod tests {
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
+            originating_message: None,
         };
 
         let output = execute_skill_tool(
@@ -2650,6 +2688,7 @@ mod tests {
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
+            originating_message: None,
         };
 
         let output = execute_skill_tool(
@@ -2689,6 +2728,7 @@ mod tests {
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
+            originating_message: None,
         };
 
         let output = execute_skill_tool(
@@ -2865,6 +2905,7 @@ mod tests {
             session_id: "test-session".to_string(),
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
+            originating_message: None,
         }
     }
 
@@ -3908,7 +3949,8 @@ mod tests {
         let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
 
         // No reference_url → blocked-by check skipped, dispatch proceeds
-        let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None).await;
+        let result =
+            validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None, None).await;
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 
@@ -3924,7 +3966,8 @@ mod tests {
         .await;
 
         // PR reference → blocked-by check skipped (only issues have blockedBy)
-        let result = validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None).await;
+        let result =
+            validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None, None).await;
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 
@@ -3940,7 +3983,64 @@ mod tests {
         .await;
 
         // No token → blocked-by check skipped (fail-open), dispatch proceeds
-        let result = validate_dispatch_readiness(&async_db, &wi_id, None, None).await;
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, None, None).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    // ===================================================================
+    // Unauthorized webhook dispatch guard tests (mika#933)
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_dispatch_guard_rejects_unauthorized_webhook() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        // Create an in_progress task that would otherwise pass all checks
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let result = validate_dispatch_readiness(
+            &async_db,
+            &wi_id,
+            Some("fake-token"),
+            None,
+            Some("[GitHub] New comment on senara-solutions/mika#933 (title) by @samidarko"),
+        )
+        .await;
+
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        let err: serde_json::Value = serde_json::from_str(&result.unwrap_err()).unwrap();
+        assert_eq!(err["error"], "unauthorized_webhook_dispatch");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_guard_allows_ready_label_webhook() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        // Ready-label event should NOT be rejected by the webhook gate
+        let result = validate_dispatch_readiness(
+            &async_db,
+            &wi_id,
+            Some("fake-token"),
+            None,
+            Some("[GitHub] Issue labeled ready on senara-solutions/mika#933 — title"),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_guard_allows_no_originating_message() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        // None originating_message (callback continuation / silent trigger)
+        let result =
+            validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None, None).await;
+
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 

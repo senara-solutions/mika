@@ -1,6 +1,13 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+
+## [Unreleased]
+
+### Fixed
+
+- *(self-dev)* Webhook fallthrough enforced at the dispatch tool boundary; `run_claude_pilot` on `[GitHub]` fallthrough-domain turns (issue events, comments, or unknown event types) is rejected with `unauthorized_webhook_dispatch` before the subprocess spawns. Ready-label dispatches and qa/ci handler-skill dispatches are explicitly allowlisted (mika#933).
+
 ## [v0.12.2](https://github.com/senara-solutions/mika/releases/tag/v0.12.2) — 2026-05-09
 
 ### Fixed
