@@ -24,7 +24,7 @@ Do **not** use `resolve_pr_conflicts` for:
 
 | Situation | Route to |
 |-----------|----------|
-| PR has merge conflicts | `resolve_pr_conflicts` (pass existing worktree path) |
+| PR has merge conflicts | `resolve_pr_conflicts` (pass `pr_url`) |
 | New feature or bug fix | `run_claude_pilot` via self-dev |
 | PR needs code changes from review feedback | `run_claude_pilot` with iteration context |
 | Branch just needs to be up-to-date with main | `resolve_pr_conflicts` |
@@ -33,16 +33,20 @@ Do **not** use `resolve_pr_conflicts` for:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `worktree_path` | Yes | Absolute path to the existing git worktree for the PR branch |
 | `task_id` | Yes | UUID from `create_task` for log correlation |
+| `pr_url` | Preferred | Full GitHub PR URL — handler derives the worktree path from the PR's branch name |
+| `worktree_path` | Deprecated | Absolute path to the existing git worktree. Use `pr_url` instead. |
+
+At least one of `pr_url` or `worktree_path` must be provided. When `pr_url` is given, the handler derives the correct worktree path automatically using the canonical branch-to-path sanitization rule.
 
 ### Behavior
 
-1. Validates the worktree path exists and is a git working tree
-2. Copies relay config (`.claude/claude-pilot.json`) into the worktree if missing
-3. Spawns claude-pilot with a conflict-resolution prompt (no `/mika` pipeline)
-4. Claude Code inside the session: fetches origin, detects base branch from PR metadata, rebases, resolves conflicts, runs tests, pushes with `--force-with-lease`
-5. Delivers result via `mika ask --task-id` callback
+1. Derives the worktree path from the PR's branch name (when `pr_url` provided) or validates the explicit `worktree_path`
+2. Validates the worktree path exists and is a git working tree
+3. Copies relay config (`.claude/claude-pilot.json`) into the worktree if missing
+4. Spawns claude-pilot with a conflict-resolution prompt (no `/mika` pipeline)
+5. Claude Code inside the session: fetches origin, detects base branch from PR metadata, rebases, resolves conflicts, runs tests, pushes with `--force-with-lease`
+6. Delivers result via `mika ask --task-id` callback
 
 ### Expected Outcomes
 
@@ -54,7 +58,7 @@ Do **not** use `resolve_pr_conflicts` for:
 
 ```
 resolve_pr_conflicts(
-  worktree_path: "/home/user/workspace/mika-platform/.claude/worktrees/feat-42-add-health-endpoint/mika",
-  task_id: "15383984-a3e7-41bf-ac6f-630ba9a89d63"
+  task_id: "15383984-a3e7-41bf-ac6f-630ba9a89d63",
+  pr_url: "https://github.com/senara-solutions/mika/pull/42"
 )
 ```

@@ -1,10 +1,12 @@
 #!/bin/sh
 # Handler for the resolve-pr-conflicts skill (long-running exec).
-# Input: JSON on stdin with worktree_path and task_id.
+# Input: JSON on stdin with task_id and pr_url (preferred) or worktree_path (deprecated).
 #        __mika_task_id and __mika_agent are injected by the executor.
 # Output: Delivers result via `mika ask --task-id` callback when done.
 #
 # Spawns claude-pilot with a focused conflict-resolution prompt (no --command).
+# When pr_url is provided, derives the worktree path from the PR's branch name
+# using the canonical derive-worktree-path script. Falls back to explicit worktree_path.
 # The worktree must already exist — this handler does NOT create worktrees.
 
 set -e
@@ -68,19 +70,73 @@ trap deliver_callback EXIT
 # Parse user-provided fields
 WORKTREE_PATH=$(printf '%s\n' "$INPUT" | jq -r '.worktree_path // empty')
 USER_TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.task_id // empty')
+PR_URL=$(printf '%s\n' "$INPUT" | jq -r '.pr_url // empty')
 
 # mika-platform root — base for relay config resolution
 # Resolve symlinks so prefix checks work regardless of which path the caller uses
 PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
 PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
 
-if [ -z "$WORKTREE_PATH" ]; then
-    echo "Error: worktree_path is required" >&2
+if [ -z "$USER_TASK_ID" ]; then
+    echo "Error: task_id is required" >&2
     exit 1
 fi
 
-if [ -z "$USER_TASK_ID" ]; then
-    echo "Error: task_id is required" >&2
+# Derive worktree path from PR URL using canonical branch-to-path sanitization
+derive_worktree_from_pr() {
+    # Parse repo and PR number from URL
+    # Pattern: https://github.com/{owner}/{repo}/pull/{number}
+    PR_NUMBER=$(printf '%s' "$PR_URL" | sed -n 's|.*/pull/\([0-9]*\).*|\1|p')
+    REPO_FULL=$(printf '%s' "$PR_URL" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p')
+
+    if [ -z "$PR_NUMBER" ] || [ -z "$REPO_FULL" ]; then
+        echo "Error: could not parse PR number and repo from pr_url '$PR_URL'" >&2
+        return 1
+    fi
+
+    REPO_SHORT=$(basename "$REPO_FULL")
+
+    # Get branch name from PR
+    BRANCH=$(gh pr view "$PR_NUMBER" --repo "$REPO_FULL" --json headRefName -q .headRefName 2>/dev/null)
+    if [ -z "$BRANCH" ]; then
+        echo "Error: could not get branch name from PR $PR_NUMBER in $REPO_FULL" >&2
+        return 1
+    fi
+
+    # Derive worktree path using canonical script
+    DERIVED_PATH=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO_SHORT")
+    if [ -z "$DERIVED_PATH" ]; then
+        echo "Error: derive-worktree-path returned empty path for branch '$BRANCH' repo '$REPO_SHORT'" >&2
+        return 1
+    fi
+
+    printf '%s' "$DERIVED_PATH"
+}
+
+# Two-tier worktree path resolution: pr_url (preferred) → worktree_path (deprecated fallback)
+if [ -n "$PR_URL" ]; then
+    # set +e so the subshell failure doesn't trigger set -e exit before we can handle it
+    set +e
+    DERIVED_PATH=$(derive_worktree_from_pr)
+    DERIVE_EXIT=$?
+    set -e
+    if [ "$DERIVE_EXIT" -ne 0 ]; then
+        # derive_worktree_from_pr already printed error to stderr
+        exit 1
+    fi
+
+    # Mismatch validation (defense-in-depth)
+    if [ -n "$WORKTREE_PATH" ]; then
+        CANONICAL_DERIVED=$(cd "$DERIVED_PATH" 2>/dev/null && pwd -P) || CANONICAL_DERIVED="$DERIVED_PATH"
+        CANONICAL_EXPLICIT=$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P) || CANONICAL_EXPLICIT="$WORKTREE_PATH"
+        if [ "$CANONICAL_DERIVED" != "$CANONICAL_EXPLICIT" ]; then
+            echo "WARN: derived worktree path ($DERIVED_PATH) != explicit worktree_path ($WORKTREE_PATH). Using derived path." >&2
+        fi
+    fi
+
+    WORKTREE_PATH="$DERIVED_PATH"
+elif [ -z "$WORKTREE_PATH" ]; then
+    echo "Error: either pr_url or worktree_path is required" >&2
     exit 1
 fi
 

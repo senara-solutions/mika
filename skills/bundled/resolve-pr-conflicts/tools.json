@@ -1,20 +1,24 @@
 [
   {
     "name": "resolve_pr_conflicts",
-    "description": "Resolve merge conflicts on a PR branch by rebasing onto the base branch. Long-running — returns a task ID immediately, results arrive via callback when claude-pilot finishes.",
+    "description": "Resolve merge conflicts on a PR branch by rebasing onto the base branch. Long-running — returns a task ID immediately, results arrive via callback when claude-pilot finishes. Pass pr_url and the handler derives the worktree path automatically — do NOT construct worktree paths manually.",
     "input_schema": {
       "type": "object",
       "properties": {
-        "worktree_path": {
-          "type": "string",
-          "description": "Absolute path to the existing git worktree for the PR branch. The worktree must already exist (created by self-dev or manually)."
-        },
         "task_id": {
           "type": "string",
           "description": "The UUID returned by create_task (36-char format like '15383984-a3e7-41bf-ac6f-630ba9a89d63'). Used for log filename and task correlation at /var/log/claude-pilot/{task_id}.log."
+        },
+        "pr_url": {
+          "type": "string",
+          "description": "Full GitHub PR URL (e.g., 'https://github.com/senara-solutions/mika/pull/42'). Handler derives the worktree path from the PR's branch name. Preferred over worktree_path."
+        },
+        "worktree_path": {
+          "type": "string",
+          "description": "DEPRECATED — use pr_url instead. Absolute path to the existing git worktree for the PR branch. If both pr_url and worktree_path are provided, they must resolve to the same path."
         }
       },
-      "required": ["worktree_path", "task_id"]
+      "required": ["task_id"]
     },
     "handler": {
       "type": "exec",
