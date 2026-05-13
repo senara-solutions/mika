@@ -15,3 +15,19 @@ required_tools = ["qa_pr_view", "run_gh", "run_shell", "build_mika"]
 [context.pr_diff]
 type = "gh_pr_diff"
 required = false
+
+# Engine-side verdict trailer guard (mika#899). The `--body` argument of
+# `run_gh pr review` must contain one of these literal lines as a trailing
+# non-empty line. Validated BEFORE subprocess spawn — missing trailer rejects
+# the tool call with a corrective error so the LLM can retry with the full body.
+[[output.required_tool_arg_suffixes]]
+tool = "run_gh"
+arg = "pr_review_body"
+required_lines = [
+  "VERDICT: pass",
+  "VERDICT: hold[review]",
+  "VERDICT: block[ac]",
+  "VERDICT: block[ci]",
+  "VERDICT: block[security]",
+  "VERDICT: block[pipeline]",
+]

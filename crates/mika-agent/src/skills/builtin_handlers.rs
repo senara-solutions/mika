@@ -1629,6 +1629,134 @@ const GH_ALLOWED_SUBCOMMANDS: &[&str] = &[
     "project",
 ];
 
+// ---------------------------------------------------------------------------
+// Logical-key → argv-extractor table (mika#899)
+// ---------------------------------------------------------------------------
+
+/// Known logical argument keys for `[output.required_tool_arg_suffixes]` entries.
+/// Each key maps to an extractor function that pulls the relevant argument value
+/// from a parsed argv array. Skills' manifest entries reference these keys;
+/// unknown keys loud-fail at `validate_skill()`.
+///
+/// Maintenance discipline (per architect F9): Adding a new key requires a
+/// simultaneous unit test verifying extraction from a synthetic argv fixture.
+pub const KNOWN_LOGICAL_KEYS: &[&str] = &["pr_review_body"];
+
+/// Extract the `--body` value from a `gh pr review <pr> --body "<value>"` argv.
+///
+/// Returns `None` if the gh subcommand is not `pr review` or `--body` is absent.
+/// Tolerant of argv ordering (--body can come before or after the PR number).
+pub fn extract_pr_review_body(argv: &[String]) -> Option<String> {
+    let mut saw_pr = false;
+    let mut saw_review = false;
+    let mut iter = argv.iter();
+    while let Some(s) = iter.next() {
+        if s == "pr" {
+            saw_pr = true;
+            continue;
+        }
+        if saw_pr && s == "review" {
+            saw_review = true;
+            continue;
+        }
+        if saw_review && s == "--body" {
+            return iter.next().cloned();
+        }
+    }
+    None
+}
+
+/// Type alias for argv-extractor functions used by `LOGICAL_KEY_EXTRACTORS`.
+type ArgvExtractor = fn(&[String]) -> Option<String>;
+
+/// Look up the extractor function for a logical key. Returns `None` for unknown keys.
+fn extractor_for_key(key: &str) -> Option<ArgvExtractor> {
+    match key {
+        "pr_review_body" => Some(extract_pr_review_body),
+        _ => None,
+    }
+}
+
+/// Validate a tool call's arguments against `required_tool_arg_suffixes` constraints.
+///
+/// Called in `run_gh` BEFORE subprocess spawn. For each matching constraint entry
+/// (tool name matches), extracts the argument via the logical-key extractor and
+/// checks that one of the `required_lines` appears (via `str::contains`) in one
+/// of the last 3 non-empty trimmed lines of the value.
+///
+/// Returns `Ok(())` on pass or `Err(ToolOutput)` with a structured corrective error.
+/// Uses `str::contains` (not regex/glob) per architect F10 — bracket characters
+/// in tokens like `block[ac]` have meta-meaning in regex/glob contexts.
+pub fn validate_tool_arg_suffixes(
+    tool_name: &str,
+    argv: &[String],
+    constraints: &[super::manifest::RequiredToolArgSuffix],
+    already_rejected: bool,
+) -> Result<(), ToolOutput> {
+    for entry in constraints {
+        if entry.tool != tool_name {
+            continue;
+        }
+
+        let extract_fn = match extractor_for_key(&entry.arg) {
+            Some(f) => f,
+            None => continue, // Unknown key — should have been caught at manifest validation
+        };
+
+        let value = match extract_fn(argv) {
+            Some(v) => v,
+            None => continue, // Subcommand doesn't match this entry's logical key — skip
+        };
+
+        // Check last 3 non-empty trimmed lines for a match (mirrors mika#864 semantics)
+        let last_3_non_empty: Vec<&str> = value
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .take(3)
+            .collect();
+
+        let satisfied = last_3_non_empty.iter().any(|line| {
+            entry
+                .required_lines
+                .iter()
+                .any(|req| line.contains(req.as_str()))
+        });
+
+        if !satisfied {
+            tracing::warn!(
+                tool = tool_name,
+                arg = entry.arg.as_str(),
+                "required_tool_arg_suffix_violation"
+            );
+
+            if already_rejected {
+                // Second failure in this turn — escalate rather than infinite loop
+                return Err(ToolOutput::error(
+                    "{\"error\": \"verdict_trailer_missing_escalate\", \"message\": \
+                     \"The review body is still missing the required VERDICT trailer after \
+                     a previous correction attempt. ESCALATE: use send_message to notify \
+                     the operator about this issue instead of retrying.\"}"
+                        .to_string(),
+                ));
+            }
+
+            let accepted = entry.required_lines.join(", ");
+            return Err(ToolOutput::error(format!(
+                "{{\"error\": \"verdict_trailer_missing\", \"message\": \
+                 \"The --body argument of this `{tool_name}` call is missing a required \
+                 trailer line. One of [{accepted}] must appear as a trailing line in the \
+                 body. Re-emit the tool call with the complete body including the \
+                 VERDICT and REASON lines at the end.\"}}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validated `run_gh` input — command args and optional repo.
 #[derive(Debug)]
 struct GhArgs {
@@ -1726,6 +1854,24 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
              turn — the review is already submitted.\"}"
                 .to_string(),
         );
+    }
+
+    // Tool-argument suffix validation (mika#899): check --body argument against
+    // skill-declared required_tool_arg_suffixes BEFORE subprocess spawn.
+    if !ctx.required_tool_arg_suffixes.is_empty() {
+        let already_rejected = ctx
+            .tool_arg_suffix_rejected
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Err(err) = validate_tool_arg_suffixes(
+            "run_gh",
+            &gh_args.args,
+            ctx.required_tool_arg_suffixes,
+            already_rejected,
+        ) {
+            ctx.tool_arg_suffix_rejected
+                .store(true, std::sync::atomic::Ordering::Release);
+            return err;
+        }
     }
 
     let mut cmd = tokio::process::Command::new("gh");
@@ -5591,5 +5737,255 @@ mod tests {
                 "elapsed_ms should be non-decreasing: {elapsed_values:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#899 — verdict trailer extraction and validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_pr_review_body_standard_order() {
+        // Standard: gh pr review 123 --body "..."
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--body".to_string(),
+            "Review content\nVERDICT: pass\nREASON: all good".to_string(),
+        ];
+        let body = extract_pr_review_body(&argv);
+        assert!(body.is_some());
+        assert!(body.unwrap().contains("VERDICT: pass"));
+    }
+
+    #[test]
+    fn test_extract_pr_review_body_body_before_pr_number() {
+        // Body flag before PR number: gh pr review --body "..." 123
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "--body".to_string(),
+            "Review content\nVERDICT: block[ac]\nREASON: unsatisfied AC".to_string(),
+            "123".to_string(),
+        ];
+        let body = extract_pr_review_body(&argv);
+        assert!(body.is_some());
+        assert!(body.unwrap().contains("VERDICT: block[ac]"));
+    }
+
+    #[test]
+    fn test_extract_pr_review_body_missing_body_flag() {
+        // No --body flag at all
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--approve".to_string(),
+        ];
+        assert!(extract_pr_review_body(&argv).is_none());
+    }
+
+    #[test]
+    fn test_extract_pr_review_body_wrong_subcommand() {
+        // Different subcommand (pr diff, not pr review)
+        let argv = vec![
+            "pr".to_string(),
+            "diff".to_string(),
+            "--body".to_string(),
+            "some body".to_string(),
+        ];
+        assert!(extract_pr_review_body(&argv).is_none());
+    }
+
+    #[test]
+    fn test_extract_pr_review_body_empty_argv() {
+        assert!(extract_pr_review_body(&[]).is_none());
+    }
+
+    #[test]
+    fn test_extract_pr_review_body_pr_only() {
+        let argv = vec!["pr".to_string()];
+        assert!(extract_pr_review_body(&argv).is_none());
+    }
+
+    fn make_qa_constraints() -> Vec<super::super::manifest::RequiredToolArgSuffix> {
+        vec![super::super::manifest::RequiredToolArgSuffix {
+            tool: "run_gh".to_string(),
+            arg: "pr_review_body".to_string(),
+            required_lines: vec![
+                "VERDICT: pass".to_string(),
+                "VERDICT: hold[review]".to_string(),
+                "VERDICT: block[ac]".to_string(),
+                "VERDICT: block[ci]".to_string(),
+                "VERDICT: block[security]".to_string(),
+                "VERDICT: block[pipeline]".to_string(),
+            ],
+        }]
+    }
+
+    #[test]
+    fn test_verdict_trailer_present_passes() {
+        // Body with valid VERDICT: pass as last non-empty line — should pass
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--body".to_string(),
+            "## DIFF ANALYSIS\nLooks good\n\nVERDICT: pass\nREASON: all ACs met".to_string(),
+        ];
+        let constraints = make_qa_constraints();
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verdict_trailer_block_ac_passes() {
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "456".to_string(),
+            "--body".to_string(),
+            "## Review\nIssues found\n\nVERDICT: block[ac]\nREASON: AC R5 unsatisfied".to_string(),
+        ];
+        let constraints = make_qa_constraints();
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verdict_trailer_dropped_caught() {
+        // Body WITHOUT verdict trailer — should be rejected (mika#899 reproduction)
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "898".to_string(),
+            "--body".to_string(),
+            "## DIFF ANALYSIS\nSubstantive findings\n\n## PLAN-AC VERIFICATION\n\
+             Plan amendment required:\n- AC: A test verifies symmetric behavior..."
+                .to_string(),
+        ];
+        let constraints = make_qa_constraints();
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("verdict_trailer_missing"));
+        // Should NOT be the escalation variant on first rejection
+        assert!(!err.content.contains("verdict_trailer_missing_escalate"));
+    }
+
+    #[test]
+    fn test_verdict_trailer_dropped_escalates_on_second_rejection() {
+        // Second rejection in same turn — should escalate
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "898".to_string(),
+            "--body".to_string(),
+            "Still no verdict trailer here".to_string(),
+        ];
+        let constraints = make_qa_constraints();
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("verdict_trailer_missing_escalate"));
+    }
+
+    #[test]
+    fn test_verdict_trailer_unconstrained_skill() {
+        // Empty constraints (non-qa-review skill) — no validation fires
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--body".to_string(),
+            "Review without any verdict trailer".to_string(),
+        ];
+        let constraints: Vec<super::super::manifest::RequiredToolArgSuffix> = vec![];
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verdict_trailer_different_tool_name_skipped() {
+        // Constraints for a different tool — should be skipped
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--body".to_string(),
+            "No verdict needed".to_string(),
+        ];
+        let constraints = vec![super::super::manifest::RequiredToolArgSuffix {
+            tool: "other_tool".to_string(),
+            arg: "pr_review_body".to_string(),
+            required_lines: vec!["VERDICT: pass".to_string()],
+        }];
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verdict_trailer_non_review_subcommand_skipped() {
+        // `gh pr diff` (not `pr review`) — extractor returns None, validation skipped
+        let argv = vec!["pr".to_string(), "diff".to_string(), "123".to_string()];
+        let constraints = make_qa_constraints();
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verdict_trailer_position_3_passes() {
+        // Verdict is 3rd-from-last non-empty line — should still pass (last 3 checked)
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--body".to_string(),
+            "## Review\n\nVERDICT: hold[review]\nREASON: needs human review\nSome trailing note"
+                .to_string(),
+        ];
+        let constraints = make_qa_constraints();
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verdict_trailer_position_4_fails() {
+        // Verdict is 4th-from-last non-empty line — outside the 3-line window, should fail
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--body".to_string(),
+            "## Review\n\nVERDICT: pass\nREASON: ok\nExtra line 1\nExtra line 2".to_string(),
+        ];
+        let constraints = make_qa_constraints();
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verdict_trailer_with_trailing_whitespace() {
+        // Body with trailing whitespace/empty lines — trimmed before check
+        let argv = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "123".to_string(),
+            "--body".to_string(),
+            "## Review\n\nVERDICT: block[ci]\nREASON: CI failed\n\n  \n".to_string(),
+        ];
+        let constraints = make_qa_constraints();
+        let result = validate_tool_arg_suffixes("run_gh", &argv, &constraints, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_extractor_for_known_key() {
+        assert!(extractor_for_key("pr_review_body").is_some());
+    }
+
+    #[test]
+    fn test_extractor_for_unknown_key() {
+        assert!(extractor_for_key("nonexistent_key").is_none());
     }
 }

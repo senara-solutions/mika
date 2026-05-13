@@ -198,6 +198,7 @@ mod tests {
         let mock = Arc::new(MockSender::new());
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
         let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -221,6 +222,8 @@ mod tests {
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
             callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         };
         let tool = SendMessageTool;
 
@@ -270,6 +273,7 @@ mod tests {
         }));
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
         let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -293,6 +297,8 @@ mod tests {
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
             callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         };
         let tool = SendMessageTool;
 
@@ -324,6 +330,7 @@ mod tests {
         ));
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
         let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -347,6 +354,8 @@ mod tests {
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
             callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         };
         let tool = SendMessageTool;
 
@@ -379,6 +388,7 @@ mod tests {
         let mock = Arc::new(MockSender::with_outcome(SendOutcome::NoChannel));
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
         let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -402,6 +412,8 @@ mod tests {
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
             callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         };
         let tool = SendMessageTool;
 
@@ -433,6 +445,7 @@ mod tests {
         }));
         let skills_dirty = std::sync::atomic::AtomicBool::new(false);
         let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
         let ctx = crate::tools::ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -456,6 +469,8 @@ mod tests {
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
             callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         };
         let tool = SendMessageTool;
 

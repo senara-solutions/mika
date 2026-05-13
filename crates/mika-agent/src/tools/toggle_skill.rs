@@ -274,6 +274,7 @@ mod tests {
         // static in ctx_with_home is process-wide and set by other toggle_skill tests).
         let skills_dirty = AtomicBool::new(false);
         let pr_review_posted = AtomicBool::new(false);
+        let tool_arg_suffix_rejected = AtomicBool::new(false);
         let ctx = ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -297,6 +298,8 @@ mod tests {
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
             callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         };
         // Pre-disable via DB
         ctx.db
@@ -324,6 +327,7 @@ mod tests {
         // Use local AtomicBools to avoid race with concurrent tests.
         let skills_dirty = AtomicBool::new(false);
         let pr_review_posted = AtomicBool::new(false);
+        let tool_arg_suffix_rejected = AtomicBool::new(false);
         let ctx = ToolContext {
             db: &harness.db,
             session_id: "test-session",
@@ -347,6 +351,8 @@ mod tests {
             pr_review_posted: &pr_review_posted,
             pr_reviews_posted: None,
             callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
         };
         let tool = ToggleSkillTool;
 

@@ -144,6 +144,14 @@ pub struct ToolContext<'a> {
     /// context (mika#1058). Set from `SilentTrigger::Callback { task_id, .. }`.
     /// `None` for non-callback contexts.
     pub callback_task_id: Option<&'a str>,
+    /// Tool-argument suffix constraints from active matched skills (mika#899).
+    /// Collected at turn-start alongside `required_suffix_lines`. Used by
+    /// `run_gh` to validate `--body` arguments before subprocess spawn.
+    pub required_tool_arg_suffixes: &'a [crate::skills::manifest::RequiredToolArgSuffix],
+    /// Per-turn flag: set to `true` after a tool-arg suffix validation rejects
+    /// a tool call. On second rejection in the same turn, the handler escalates
+    /// instead of retrying. Mirrors `pr_review_posted` pattern. See mika#899.
+    pub tool_arg_suffix_rejected: &'a std::sync::atomic::AtomicBool,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.

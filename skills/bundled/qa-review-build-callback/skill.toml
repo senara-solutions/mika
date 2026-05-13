@@ -8,3 +8,17 @@ dependencies = ["qa-review"]
 
 [triggers]
 keywords = ["build_mika", "build callback", "callback", "build result"]
+
+# Engine-side verdict trailer guard (mika#899). Same closed alphabet as
+# qa-review — build-callback turns also emit verdicts via `run_gh pr review`.
+[[output.required_tool_arg_suffixes]]
+tool = "run_gh"
+arg = "pr_review_body"
+required_lines = [
+  "VERDICT: pass",
+  "VERDICT: hold[review]",
+  "VERDICT: block[ac]",
+  "VERDICT: block[ci]",
+  "VERDICT: block[security]",
+  "VERDICT: block[pipeline]",
+]

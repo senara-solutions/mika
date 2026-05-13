@@ -747,6 +747,7 @@ async fn run_investigation(
     // session_id and trace_id carry the investigation context for the
     // create_github_issue tool to embed in issue bodies.
     let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+    let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
     let tool_ctx = crate::tools::ToolContext {
         db: &db,
         session_id: &investigation_session_id,
@@ -770,6 +771,8 @@ async fn run_investigation(
         pr_review_posted: &pr_review_posted,
         pr_reviews_posted: None, // Investigation: no session-scoped dedup needed
         callback_task_id: None,  // Investigation: not a callback turn
+        required_tool_arg_suffixes: &[],
+        tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
     };
 
     let mut text_sent = false;
