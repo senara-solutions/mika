@@ -30,6 +30,7 @@ pub use super::kg_fixtures;
 
 // --- Scenario modules (one per fabrication class, D2) ---
 pub mod asserted_unavailability_caught;
+pub mod asserted_unavailability_elided_copula;
 pub mod asserted_unavailability_genuine;
 pub mod auto_merge_vs_merged;
 pub mod current_priorities_drift;

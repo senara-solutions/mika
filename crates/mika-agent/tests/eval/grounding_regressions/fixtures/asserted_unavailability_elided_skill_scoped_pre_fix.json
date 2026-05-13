@@ -1,0 +1,24 @@
+{
+  "_comment": "Frozen pre-fix trace shape from mika#654 variant. The agent claimed a tool was 'skill-scoped, not callable here' (elided copula — missing 'is' before 'skill-scoped') and pattern 4 did not fire because it required 'is skill-scoped'. This fixture reproduces the elided-skill-scoped failure class for regression assertions.",
+  "incident": "mika#654 (variant)",
+  "related": ["mika#894"],
+  "agent": "mika-arch",
+  "failure_class": "unavailability-asserted-without-attempt",
+  "failure_shape": "elided-copula-skill-scoped",
+  "turns": [
+    {
+      "turn": 1,
+      "role": "assistant",
+      "text": "search_memory skill-scoped, not callable here. Proceeding with only the information in the current conversation.",
+      "tool_calls": [],
+      "guard_fired": false,
+      "note": "Pre-fix: pattern 4 required 'is skill-scoped' — the elided 'search_memory skill-scoped' did not match."
+    }
+  ],
+  "expected_with_fix": {
+    "turn_1_guard_fires": true,
+    "corrective_reprompt_injected": true,
+    "turn_2_calls_search_memory": true,
+    "note": "With the extended regex (mika#894), pattern 4's optional copula '(?:is )?' matches 'search_memory skill-scoped'."
+  }
+}

@@ -33,7 +33,7 @@ The architect agent (mika-arch) has a skill-declared `[constraints] required_too
 
 Two distinct evasion patterns surfaced in late April 2026, sharing a single underlying failure mode: under cognitive load, the architect produces a verdict that *appears* to satisfy the gate without actually calling the required tool. The gate then either catches it on a later turn (best case) or doesn't fire because the verdict pattern matches loosely (worst case).
 
-## The Two Recurrences
+## The Recurrences
 
 ### Recurrence 1 — 2026-04-26, mika#654 ("claim unavailability")
 
@@ -46,6 +46,14 @@ The architect was asked to second-pass a plan that cited a GitHub issue. Instead
 A different shape, same gate. The architect was asked to second-pass a plan; the operator's brief inlined the issue body as a verbatim quote. The architect issued a first-pass verdict (`Disposition: ITERATE`) without calling `gh_read`, treating the brief-quoted body as sufficient. On second-pass, the architect itself recognized the omission, called `gh_read` retroactively, and updated its core memory to catalogue the pattern. But while doing so, it spent its turn fighting a `MAX_TOKENS_PER_BLOCK` cap (compress-retry-compress) and never emitted the second-pass verdict line at all — an orthogonal failure mode (verdict-ghosting under cognitive load). This is now structurally guarded by mika#864's `required_suffix_line` EndTurn post-condition (manifest-driven `[output] required_suffix_lines` opt-in, last-3-non-empty-lines scan with single-retry, structural counterpart for trace `03d3ec38-0839-47b6-9226-111b38d8b52b`). See also the pending `prompt-level-output-discipline-fails-under-load.md` companion doc which cites this guard as its structural floor.
 
 **Failure shape:** treating brief-quoted content as a substitute for the live tool fetch. The brief is a claim *about* the issue body, not the issue body itself; quotes can drift between brief composition and review submission. The agent skipped the call because the claim looked authoritative.
+
+### Recurrence 3 — 2026-04-29, mika#893 ("elided-copula shape")
+
+The architect was asked to first-pass groom a plan. The first turn emitted `gh_read not callable in CLI session` — the same asserted-unavailability failure class as recurrence 1, but with the copula `is` elided. The structural guard from mika#862 was deployed and active in this session, but its regex pattern 2 required `<tool> is not callable` with the `is` present. The elided form `<tool> not callable` slipped through. The required-tools gate caught it one post-condition later (same safety-net as recurrence 1), and `gh_read` succeeded immediately on the retry.
+
+**Failure shape:** same underlying failure as recurrence 1 (claim unavailability without attempting the call), but a new *linguistic* manifestation — the English copula `is` is optional in the architect's phrasing. The structural guard's regex was overly specific. Closed by mika#894's regex extension: P2 now uses `(?:is )?` for optional copula and `(?:\w+ly )?` for optional adverb interposition. P4 gains the same optional copula.
+
+**Evidence:** N=6 cumulative instances across mika#654, #863, #886, #890, #893, and earlier occurrences. See mika#894 issue body for the full evidence table.
 
 ## The Common Underlying Failure
 
@@ -77,6 +85,18 @@ For the architect specifically, and for any agent operating under `required_tool
 
 *Structural counterpart:* the existing required-tools-gate (for Rule 1's failure class) plus the verdict-line guard tracked separately (for the orthogonal recurrence-2 verdict ghost). No new structural mechanism for Rule 3 itself — the rule's function is to prevent the *response* to recurrence from being "another catalogue."
 
+**Rule 4 — Pattern coverage is verbatim.** When a structural guard uses regex pattern matching, the test fixture set must include every catalogued recurrence's *verbatim* phrasing (not a normalized form). A pattern that catches "X is not Y" but misses "X not Y" is a false-floor guard — it appears to protect against the failure class but only protects against the typed-out form. Defense: any new recurrence catalogue entry MUST be added as a regex test fixture in the same PR that catalogues it.
+
+*Checkable behavior:* when a recurrence is added to the N catalogue, the PR includes a new test case in the matching fixture file with the recurrence's verbatim phrasing. If a guard fires on the test case, the regression is closed. If the guard does not fire, the regex must be extended in the same PR.
+
+*Canonical fixture locations:*
+- `crates/mika-agent/tests/eval/grounding_regressions/asserted_unavailability_caught.rs` (Patterns 1, 2, 4 — canonical phrasings)
+- `crates/mika-agent/tests/eval/grounding_regressions/asserted_unavailability_genuine.rs` (false-positive defense — genuinely disabled tool)
+- `crates/mika-agent/tests/eval/grounding_regressions/asserted_unavailability_elided_copula.rs` (Patterns 2, 3, 4 elided/adverb-interposed shapes — added by mika#894)
+- `crates/mika-agent/src/agent.rs` `#[cfg(test)] mod tests` block — unit tests for `detect_asserted_unavailability()` directly (registry-filter and case-insensitive coverage)
+
+A new contributor adding a recurrence to the N catalogue should add the verbatim phrasing to whichever file's shape it matches, and add a frozen `*_pre_fix.json` fixture to `tests/eval/grounding_regressions/fixtures/` alongside.
+
 ## What This Compound Doc Is Doing
 
 The N=2 threshold for promoting a recurrence to a compound doc is itself a discipline (see broader memory-classification practice): single incident is a fact, recurrence is a pattern that earns a doc. This doc exists because both incidents share enough mechanism to warrant a single durable artifact rather than two unrelated facts in core memory.
@@ -85,12 +105,14 @@ The compound doc's job is to be the *citable artifact* the next time the same sh
 
 ## Forward Work
 
-The required-tools-gate fires *after* the verdict is shaped (current chain: text-tool-call → required-tools → completion-claim). **Rule 1's structural counterpart — the `required_fetches_for_quoted_resources` pre-fetch guard — is now in place (mika#863).** It fires at turn-start in the skills pipeline, before the LLM generates text. When a keyword-matched skill opts in and the user message contains quoted fetchable resources, the corresponding fetch tools are pre-injected into the required set. **Rule 2's structural counterpart — the `asserted_unavailability` guard — is now in place (mika#862).** It fires in the EndTurn chain after the intent-precondition registry, before the persistence evaluation guard. Both structural counterparts are now operational — the gate-evasion patterns documented in this compound doc are closed by structural enforcement.
+The required-tools-gate fires *after* the verdict is shaped (current chain: text-tool-call → required-tools → completion-claim). **Rule 1's structural counterpart — the `required_fetches_for_quoted_resources` pre-fetch guard — is now in place (mika#863).** It fires at turn-start in the skills pipeline, before the LLM generates text. When a keyword-matched skill opts in and the user message contains quoted fetchable resources, the corresponding fetch tools are pre-injected into the required set. **Rule 2's structural counterpart — the `asserted_unavailability` guard — is now in place (mika#862) and regex-extended (mika#894).** It fires in the EndTurn chain after the intent-precondition registry, before the persistence evaluation guard. The #894 extension closed the elided-copula and adverb-interposed regex gaps that allowed N=4 catalogued phrasings to escape the guard. **Rule 4 (verbatim-fixture discipline)** governs pattern maintenance going forward — every new recurrence adds its verbatim phrasing as a test fixture in the same PR. All three structural counterparts are now operational — the gate-evasion patterns documented in this compound doc are closed by structural enforcement.
 
 ## Citations
 
 - mika#654 (2026-04-26) — recurrence 1: claim of `gh_read` unavailability across three second-pass turns; required-tools-gate caught at turn 8.
 - mika#788 (2026-04-28) — recurrence 2: first-pass verdict issued with brief-quoted body as substitute for `gh_read`; second-pass self-recognition triggered the cataloguing that produced this doc.
+- mika#893 (2026-04-29) — recurrence 3: elided-copula shape (`gh_read not callable in CLI session`); asserted-unavailability guard (#862) bypassed due to regex coverage gap; required-tools-gate safety net caught it. Closed by mika#894 regex extension.
+- mika#894 (2026-05-13) — regex-extension fix: P2 optional copula + adverb, P3 adverb, P4 optional copula. Closes the elided-copula and adverb-interposed gaps. Adds Rule 4 (verbatim-fixture discipline).
 - `mika/docs/solutions/architecture-patterns/engine-guards-vs-prompt-rules-for-agent-behavior-2026-04-19.md` — the broader argument that prompt-level enforcement drifts under load; this doc is a specific instance of that pattern.
 - `mika/docs/solutions/best-practices/mika-arch-first-dogfood-2026-04-25.md` — prior architect-discipline doc covering disposition-keyword paraphrasing; same agent, different failure surface.
 - `crates/mika-agent/src/agent/` — required-tools-gate implementation in the EndTurn post-condition chain.
