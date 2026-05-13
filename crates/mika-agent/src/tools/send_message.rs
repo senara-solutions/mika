@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mika_common::claude::ToolDefinition;
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::messaging::SendOutcome;
 
@@ -81,7 +81,11 @@ impl Tool for SendMessageTool {
                     // would cause Claude to retry in a loop. The message tells the
                     // LLM to use channel-appropriate tools instead.
                     Ok(SendOutcome::NoChannel) => {
-                        warn!("send_message: no reply channel (chat_id=0)");
+                        error!(
+                            trace_id = %ctx.trace_id,
+                            session_id = %ctx.session_id,
+                            "send_message_nochannel: tool returned success but message was NOT delivered — chat_id=0"
+                        );
                         Ok(ToolOutput::success(
                             "No reply channel for this session (chat_id is zero). \
                              The user cannot receive messages via send_message. \
@@ -364,6 +368,11 @@ mod tests {
     }
 
     /// NoChannel outcome returns success (not error) with actionable text (#650).
+    ///
+    /// Level 1 regression guard (mika#1090): NoChannel MUST return ToolOutput::success,
+    /// not ToolOutput::error. Returning error causes LLM retry loops because chat_id=0
+    /// is a permanent session condition. Level 3 (rejecting the call) would change this
+    /// intentionally — that's a separate ticket with retry-semantic coupling analysis.
     #[tokio::test]
     async fn test_send_message_no_channel() {
         let harness = TestHarness::new();
