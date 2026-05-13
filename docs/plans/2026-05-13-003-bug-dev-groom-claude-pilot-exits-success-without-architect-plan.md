@@ -34,17 +34,23 @@ Practical consequence: the model-swap direction (option 2 in the ticket) is stil
 
 The ticket is explicit: *"Without seeing what the LLM actually says in those 12 turns, root cause is invisible."* The current `--verbose --log-dir` plumbing writes only lifecycle markers (`[config]`, `[guardrails]`, `[init]`, `[prompt]`, `[tool:request]`, `[tool]`, `[done]`) to the file sink. The 441-byte reference log for mika#1057 contains NO `[tool:request]` lines between `[prompt]` and `[done]` — the 12 SDK "turns" produced zero permission callbacks AND zero text content blocks visible to `log_text`. That gap is the data we need to close before choosing a fix layer.
 
-### D0 — Pick a verbosity-augmentation strategy
+### Diagnostic sequence (COMMITTED order — three steps, ascending cost)
 
-Three options for capturing the missing data; pick one in Phase 0 step 1.
+The samidarko issue comment (2026-05-13T09:33:15Z) names two regression suspects from 2026-05-12 merges: **mika#1001** (per-class dispatch slot split — enabler of mass-dispatch concurrency that did not exist before) and **mika#1081** (ROLE CONSTRAINT block at lines 1-4 of `mika/skills/bundled/dev-groom/system_prompt.md` + post-flight validation). The plan executes three diagnostic steps in committed order, each cheaper than the next-listed approach. Each step is run-then-decide: only escalate to the next step if the current step does not localize the cause.
 
-**Option A: Extend claude-pilot's file-logger sink.** Add a `log_assistant_block(block)` helper that file-logs every content block on every `AssistantMessage` regardless of type — `text`, `thinking`, `tool_use`, `tool_result`. Today `_text_of` in `agent.py` returns `None` for non-text blocks, silently swallowing them. The patch goes in `agent.py` around line 104 and `ui.py` (a new `log_assistant_block` helper). Pro: persists evidence into the same log file the operator already grep's. Con: changes claude-pilot logging shape, needs a `--trace` flag to opt in so we don't double the on-disk volume for all sessions.
+**Step 0-pre — mika#1081 revert-candidate test.** Cheapest. Five minutes. Revert the ROLE CONSTRAINT block (lines 1-4 of `mika/skills/bundled/dev-groom/system_prompt.md`) on a scratch branch off `main`, rebuild + redeploy `make deploy`, single-dispatch `mika ask --agent mika-dev "groom mika issue#1057"`, observe. Outcomes:
+   - **A.** Early-exit DOES NOT occur → mika#1081's prompt block is the proximate cause. Skip to Phase 1 Layer A (prompt fix only); no claude-pilot patch needed. File a sibling note on mika#1081 explaining the regression. Re-evaluate whether the ROLE CONSTRAINT block is needed at all or whether it can be rewritten to be PLANNER-aligned without truncating the workflow.
+   - **B.** Early-exit DOES occur → mika#1081 is NOT the proximate cause. Proceed to Step 0-A.
 
-**Option B: Persist stderr from `dispatch-lib.sh` independently of success/crash path.** Today (line 396-401) stderr is appended to `RESULT` only as a 10 KB tail. If we redirect stderr to a per-task file (`/var/log/claude-pilot/<task_id>.stderr`) AND keep it on success path, the existing stderr-rendered tool/text events (which go through `write_log` → stderr+file) are preserved post-hoc. Pro: zero-change in claude-pilot. Con: assumes `write_log` actually emits the missing data to stderr — which the reference incident did not exhibit (stderr tail in the parent task's `result` field is empty for the 6 wasted sessions). Confirm before committing to this option.
+**Step 0-A — Persist dispatch-lib stderr post-success (Option B).** Cheap. Change `mika/skills/bundled/_shared/dispatch-lib.sh` lines 396-402 to write stderr to a persistent per-task file (`/var/log/claude-pilot/<task_id>.stderr`) in addition to the tail-append onto RESULT. No claude-pilot code change. Rebuild dispatch-lib (deploy via `make deploy`), then single-dispatch one of the wasted tickets (recommend **mika#1057**). Inspect the stderr file for content NOT in the existing log file — `permissions.py:67`'s `log_tool_request` writes through `write_log` → stderr+file, and `agent.py:107`'s `log_text` does the same; if the file shows nothing in the reference incident but the on-disk stderr file shows assistant content from a fresh session, Option B is the answer. Outcomes:
+   - **A.** Stderr captures the missing data (tool calls, assistant text, thinking blocks) → root cause is visible without claude-pilot code change. Pick Phase 1 fix layer from the captured shape.
+   - **B.** Stderr file is empty / matches the in-memory log file (i.e., the missing data is genuinely not flowing to either sink) → escalate to Step 0-B.
 
-**Option C: Enable SDK-level debug tracing.** `claude-agent-sdk` likely exposes a debug-trace hook (the SDK-internal `partial_message` stream + `system.subtype` events). Wire `--trace-sdk` in `cli.py` to a new sink that dumps every raw SDK event to JSONL. Pro: most-complete capture. Con: largest patch; deepest API coupling; depends on SDK version we have installed.
+**Step 0-B — Claude-pilot file-logger augmentation (Option A).** Larger patch but still local to code we own. Add a `log_assistant_block(block)` helper in `claude-pilot-py/src/claude_pilot/ui.py` that file-logs every content block on every `AssistantMessage` regardless of type — `text`, `thinking`, `tool_use`, `tool_result`. Wire it in `agent.py` around line 104 alongside the existing `log_text(text)` loop. Gate on a new `--trace` flag (default off) so disk volume only grows on opt-in. Rebuild claude-pilot (`uv tool install --force --editable claude-pilot-py`), re-dispatch with `--trace` enabled in dispatch-lib's claude-pilot invocation, capture full event stream. Pre-commit decision: if Step 0-A's outcome was clear, this step is skipped.
 
-**Recommended starting point: Option A** — smallest patch, lives in code we own, preserves the operator workflow of `cat /var/log/claude-pilot/<task_id>.log`. Phase 0 step 1 lands the patch with a `--trace` opt-in flag.
+**Step 0-C (deferred contingency) — SDK-level debug tracing (Option C).** Largest patch and deepest API coupling. Only escalate to this if Step 0-B does not localize the cause. Phase 0 does not pre-spec this; if it lands, it lands as a fresh ticket.
+
+Phase 0 must additionally instrument the SystemMessage init event under `--trace` (Step 0-B), logging `repr(message)` so OQ1 (empty session_id, `model = "unknown"`) is answered in the same reproduction window.
 
 ### D1 — Why `[init] Session , model unknown`?
 
@@ -52,35 +58,45 @@ The reference log shows the init message with empty `session_id` and `model = "u
 
 ### D2 — Reproduction protocol
 
-Once D0 lands and is deployed:
+For each diagnostic step (0-pre, 0-A, 0-B), run the same single-dispatch reproduction. **Always single-dispatch — never mass-dispatch — to keep the queue-depth signal clean.**
 
-1. Pick one of the six unrecovered wasted tickets — recommend **mika#1057** because it's the canonical case in the issue body.
-2. From the orchestrator-Claude session, **single-dispatch** (do NOT mass-dispatch — that defeats the queue-depth signal):
+1. Pick **mika#1057** as the canonical reproduction target (it's the case detailed in the issue body and has not been recovered yet).
+2. Single-dispatch:
    ```
    mika ask --agent mika-dev "groom mika issue#1057"
    ```
-3. Watch `/var/log/claude-pilot/<task_id>.log` while it runs.
+3. Watch `/var/log/claude-pilot/<task_id>.log` (and `/var/log/claude-pilot/<task_id>.stderr` after Step 0-A lands).
 4. After completion, capture:
-   - Full log content
-   - The `tool_calls` table rows for that session (`SELECT * FROM tool_calls WHERE session_id = ? ORDER BY id`)
-   - The `llm_calls` rows for that session (model name, tokens, reasoning column)
-   - The parent task's `metadata.claude_pilot.session_id`, `turns`, `cost_usd`, `duration_ms`
+   - Full log content (and stderr file)
+   - `tool_calls` rows for that session: `SELECT * FROM tool_calls WHERE session_id = ? ORDER BY id`
+   - `llm_calls` rows for that session (model name, tokens, reasoning column)
+   - Parent task's `metadata.claude_pilot.session_id`, `turns`, `cost_usd`, `duration_ms`
+
+If Step 0-pre yields outcome A (mika#1081 is the cause), stop reproduction and proceed straight to Phase 1 Layer A. The captured data set from a successful reproduction is the baseline for the regression test in Phase 2.
 
 ### D3 — Branch on the captured data
 
-Three outcomes from Phase 0 reproduction:
+Four outcomes from Phase 0 reproduction:
 
-**Outcome 1 — Reproduces with zero `[tool:request]` and only `thinking` blocks (or empty content).** The Anthropic model is producing extended-thinking turns and then exiting `end_turn` without any visible action. This is the "model gives up on the task" failure mode. Direction: fix lives in claude-pilot (Option A guard) or in the `/mika-groom-ticket` slash-command spec (move a mandatory `Bash` call to the first phase so the LLM cannot exit without trying).
+**Outcome 0 — Step 0-pre fixes it.** mika#1081's ROLE CONSTRAINT block is the proximate cause. Direction: Phase 1 Layer A only — rewrite the ROLE CONSTRAINT block to be PLANNER-aligned without truncating the workflow (or remove it if mika#1033's structural post-flight check is already sufficient). No claude-pilot patch needed.
+
+**Outcome 1 — Reproduces with zero `[tool:request]` and only `thinking` blocks (or empty content).** The Anthropic model is producing extended-thinking turns and then exiting `end_turn` without any visible action. This is the "model gives up on the task" failure mode. Direction: Phase 1 Layer B (structural guard in claude-pilot) plus Phase 1 Layer A (move a mandatory `Bash` call into the first phase of the slash command).
 
 **Outcome 2 — Reproduces with `[tool:request]` for tools that fail or get denied at Tier-1.** The model IS trying to act but each tool call is being silently rejected (e.g., `mika ask --agent mika-arch` rejected because mika-arch is missing, or `gh issue view` rejected). Direction: fix the tool-permission/tier-1 path, not the LLM.
 
-**Outcome 3 — Does NOT reproduce; single-dispatch always works; only mass-dispatch fails.** The variable is queue depth, not Claude Code's behavior. Direction: rate-limit dev-groom dispatch concurrency at the orchestration layer (mika-dev's `validate_dispatch_readiness` already enforces per-class slot — extend or document).
+**Outcome 3 — Does NOT reproduce; single-dispatch always works; only mass-dispatch fails.** The variable is queue depth + per-class dispatch slot split (mika#1001), not Claude Code's behavior. Direction: rate-limit dev-groom dispatch concurrency at the orchestration layer; file a sibling ticket per the issue body's out-of-scope clause.
 
-Phase 0 deliverable: a written report at `docs/solutions/workflow-issues/dev-groom-zero-artifact-exit-2026-05-13.md` that names which outcome applies, with citations to the captured log.
+Phase 0 deliverable: a written report at `mika/docs/solutions/workflow-issues/dev-groom-zero-artifact-exit-2026-05-13.md` that names which outcome applies, with citations to the captured log.
 
 ### D4 — Phase-0 acceptance signal
 
-Phase 0 is complete when **one** of the three outcomes is named with evidence. We do NOT proceed to Phase 1 fix-layer selection before Phase 0 lands a report.
+Phase 0 is complete when **one** of the four outcomes (0/1/2/3) is named with evidence. We do NOT proceed to Phase 1 fix-layer selection before Phase 0 lands a report.
+
+### D5 — Update the issue body's misattribution (F2)
+
+The issue body's "Scope (proposed)" section states *"the LLM driving these failures is kimi-k2.5, not sonnet."* This is incorrect — the failing LLM runs inside the claude-pilot child via `SubprocessCLITransport`, calling the Claude Code CLI against `MIKA_ANTHROPIC_API_KEY`. The plan corrects this internally in the "Layer correction to the ticket's scope-proposal" section, but per the issue-as-versioned-contract convention, the issue body itself must be updated.
+
+Phase 0 step: edit `mika#1097`'s body via `gh issue edit 1097 --repo senara-solutions/mika --body-file <tmpfile>`, replacing the misattribution paragraph with the Claude Code Sonnet attribution. Post a follow-up comment on the issue documenting the edit and citing this plan: `> Edit notice: Scope (proposed) section updated 2026-05-13. The failing LLM is Claude Code (Sonnet via SubprocessCLITransport), not kimi-k2.5. mika-dev's autonomous-loop kimi is the upstream caller; the early-exit happens inside the spawned claude-pilot child. See plan: \`docs/plans/2026-05-13-003-...\` § "Layer correction".`
 
 ## Phase 1 — Fix-layer selection (gated on Phase 0)
 
@@ -98,14 +114,24 @@ Coupled change: the `dev-groom` skill prompt at `mika/skills/bundled/dev-groom/s
 
 ### Layer B — Structural early-exit guard in `claude-pilot`
 
-Analogous to mika#864's `required_suffix_lines` guard but inside the claude-pilot Python process — claude-pilot inspects the ResultMessage at end-of-session and rejects `status="success"` with `num_turns < N` AND zero `Bash`/`Edit`/`Write` tool calls observed across the session. On rejection, claude-pilot re-prompts the SDK with `"You exited without taking any action. The task requires you to invoke /ce:plan, create a worktree, and call mika ask --agent mika-arch. Continue."` Single retry.
+Analogous to mika#864's `required_suffix_lines` guard but inside the claude-pilot Python process — claude-pilot inspects the ResultMessage at end-of-session and rejects `status="success"` with `num_turns < N` AND zero `Bash`/`Edit`/`Write` tool calls observed across the session. On rejection, claude-pilot re-prompts the SDK once with a spec-anchored corrective message (text below).
 
 Implementation surface:
-- `agent.py` tracks tool-call count via `permission_handler` callback bookkeeping (counter incremented inside `create_permission_handler.handler`).
-- On `ResultMessage` with `subtype == "success"`, check the counter. If `< N` (suggest N=3), re-prompt once via `client.query("...")` and continue the loop.
-- One retry only; on second early-exit, emit a `status="terminated"` ResultJson with `subtype="early_exit_zero_action"` so dispatch-lib can record the structural reason in the parent task result.
+- `agent.py` tracks tool-call count via `permission_handler` callback bookkeeping (counter incremented inside `create_permission_handler.handler`, after the existing `log_tool_request` line).
+- On `ResultMessage` with `subtype == "success"`, check the counter. If `< N`, re-prompt once and continue the loop.
+- One retry only; on second early-exit, emit a `status="terminated"` ResultJson with `subtype="early_exit_zero_action"` so dispatch-lib records the structural reason in the parent task result.
 
-Cost: ~30 lines in `agent.py` + `permissions.py` (counter wiring) + 1 test. Honest about scope: this is the smallest structural defense and it's reusable for the dev-pilot path too (see Layer A "open question 2" below).
+**Skill scoping (NF2).** Initial deployment gates the guard on `$SKILL == "dev-groom"` only. The threshold and surface have been observed on dev-groom; we have no production data for dev-pilot. Wire the threshold N via an environment variable (e.g., `CLAUDE_PILOT_MIN_TOOL_CALLS`) passed from `dispatch-lib.sh`'s case switch, defaulting to disabled in claude-pilot when unset. Calibrate dev-pilot's threshold after Layer B has been live for dev-groom long enough to observe — that's a fresh ticket, not a follow-up scope-add to this one.
+
+**Corrective re-prompt text (NF3).** Spec-anchored, no tool names, no executor-directive verbs:
+
+> Your session ended without completing the grooming workflow. Review the `/mika-groom-ticket` specification (loaded as the originating prompt) and continue from where you stopped. Do not re-state the workflow phases — perform them.
+
+This phrasing avoids the mika#1033 family failure mode (LLM treats the corrective as a new instruction set and switches into executor mode) by referencing the existing spec it already received rather than enumerating tool names.
+
+**SDK call shape (NF1).** Verify before implementation lands. Inspecting `claude-pilot-py/.venv/lib/python3.13/site-packages/claude_agent_sdk/_internal/client.py`, the SDK uses `query.stream_input(prompt)` and `query.spawn_task` against `SubprocessCLITransport` — the public surface is `ClaudeSDKClient.query(...)`. Mid-session re-prompt shape needs to be pinned to either (a) calling `client.query(text)` again on the same context, or (b) a `client.send_message` equivalent if available. Implementation step 1: write a no-op test that mid-session-re-prompts a `ClaudeSDKClient` and verify the call shape works as expected before writing the guard.
+
+Cost: ~30 lines in `agent.py` + `permissions.py` (counter wiring + env-var reader) + 1 SDK-shape smoke test + 1 unit test for the guard. Honest about scope: smallest structural defense; reusable for dev-pilot later but not in this ticket.
 
 ### Layer C — Anthropic model selection on dev-groom dispatches
 
@@ -153,4 +179,4 @@ Pick one or two layers from Phase 1 (A+B is the recommended bundle; B is the str
 ## Open questions
 
 - **OQ1 — `[init] Session , model unknown`.** Empty session_id + unknown model in the reference log. Is this an SDK init-event ordering issue, a logging bug, or a real session-state failure? Phase 0 D1 must answer.
-- **OQ2 — Does this surface also affect dev-pilot dispatches?** dev-pilot is the implementation skill; its slash command (`/mika`) has its own phase structure. If Layer B is added to claude-pilot, it would also fire for dev-pilot — is that a wanted side effect, or do we need a per-skill threshold? Tentative answer: it IS wanted — early-exit zero-action is bad for dev-pilot too — but the value of N (turn threshold) may differ. Decide during Layer B implementation.
+- **OQ2 — Should Layer B fire for dev-pilot too?** Decision committed in NF2 resolution: NO, not in this ticket. Layer B initially gates on `$SKILL == "dev-groom"` via an env-var wire-through. Dev-pilot threshold calibration is a follow-up ticket after live data accumulates.
