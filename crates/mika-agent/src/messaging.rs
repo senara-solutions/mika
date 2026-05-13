@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use std::time::Duration;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::async_db::AsyncDatabase;
 
@@ -145,9 +145,14 @@ impl MessageSender for GatewayMessageSender {
         // webhooks, non-Telegram sessions). Short-circuit before the HTTP POST —
         // no retry, no failed_sends entry, since this is a permanent condition.
         if chat_id == 0 {
-            warn!(
+            // Operator-visible: message content that was lost. Truncated to 500 chars
+            // because the operator needs to assess severity of the lost escalation,
+            // and most escalation messages fit within this budget.
+            error!(
                 agent_name = ?self.agent_name,
-                "send() called with chat_id=0 — no reply channel available"
+                request_id = ?self.request_id,
+                message_text = %truncate_for_log(text, 500),
+                "send_message_nochannel: message lost — chat_id=0, no reply channel available"
             );
             return Ok(SendOutcome::NoChannel);
         }
@@ -202,6 +207,16 @@ pub struct NoopSender;
 impl MessageSender for NoopSender {
     async fn send(&self, _text: &str) -> Result<SendOutcome> {
         Ok(SendOutcome::Delivered)
+    }
+}
+
+/// Returns a UTF-8-safe prefix of `text` up to `max_chars` characters.
+/// Uses `char_indices()` to find the byte boundary at the character limit,
+/// avoiding panics on multi-byte UTF-8 when truncating.
+fn truncate_for_log(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &text[..byte_idx],
+        None => text,
     }
 }
 
@@ -423,5 +438,57 @@ mod tests {
                 .contains("chat_id not configured"),
             "error should mention chat_id not configured"
         );
+    }
+
+    // --- truncate_for_log tests (mika#1090) ---
+
+    #[test]
+    fn test_truncate_for_log_empty() {
+        assert_eq!(truncate_for_log("", 500), "");
+    }
+
+    #[test]
+    fn test_truncate_for_log_shorter_than_limit() {
+        assert_eq!(truncate_for_log("hello", 500), "hello");
+    }
+
+    #[test]
+    fn test_truncate_for_log_exactly_at_limit() {
+        let text = "a".repeat(500);
+        assert_eq!(truncate_for_log(&text, 500), text.as_str());
+    }
+
+    #[test]
+    fn test_truncate_for_log_longer_than_limit() {
+        let text = "a".repeat(600);
+        let result = truncate_for_log(&text, 500);
+        assert_eq!(result.len(), 500);
+        assert_eq!(result, &text[..500]);
+    }
+
+    #[test]
+    fn test_truncate_for_log_multibyte_utf8() {
+        // Each emoji is 4 bytes. 3 emojis = 12 bytes, 3 chars.
+        let text = "🔥🔥🔥abc";
+        // Truncate at 3 chars — should get exactly the 3 emojis (12 bytes)
+        let result = truncate_for_log(text, 3);
+        assert_eq!(result, "🔥🔥🔥");
+        // Truncate at 5 chars — should get 3 emojis + "ab"
+        let result = truncate_for_log(text, 5);
+        assert_eq!(result, "🔥🔥🔥ab");
+    }
+
+    #[test]
+    fn test_truncate_for_log_cjk_characters() {
+        // CJK characters are 3 bytes each
+        let text = "你好世界abcd";
+        // Truncate at 4 chars
+        let result = truncate_for_log(text, 4);
+        assert_eq!(result, "你好世界");
+    }
+
+    #[test]
+    fn test_truncate_for_log_zero_limit() {
+        assert_eq!(truncate_for_log("hello", 0), "");
     }
 }
