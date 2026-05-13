@@ -332,7 +332,8 @@ _run_claude_pilot() {
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097)
     if [ -s "$STDERR_FILE" ]; then
-        cp "$STDERR_FILE" "$PERSISTENT_STDERR" 2>/dev/null || true
+        mkdir -p "$(dirname "$PERSISTENT_STDERR")" 2>/dev/null || true
+        cp "$STDERR_FILE" "$PERSISTENT_STDERR" 2>/dev/null || echo "Warning: failed to persist stderr to $PERSISTENT_STDERR" >&2
     fi
     # Issue #135: extract first JSON-object line from stdout
     PILOT_OUTPUT_RAW=$(cat "$STDOUT_FILE" 2>/dev/null)
