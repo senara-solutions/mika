@@ -1,10 +1,11 @@
 ---
 module: skills/bundled/dev-groom, claude-pilot-py
-tags: [autonomous-loop, dev-groom, claude-pilot, early-exit, guardrail]
+tags: [autonomous-loop, dev-groom, claude-pilot, early-exit, guardrail, dispatch-lib]
 problem_type: bug
 category: workflow-issues
 date: 2026-05-13
 ticket: mika#1097
+resolution_type: structural_guard
 ---
 
 # dev-groom zero-artifact exit — 2026-05-13
@@ -12,6 +13,20 @@ ticket: mika#1097
 ## Problem
 
 During the 2026-05-13 mass-dispatch window (07:28-07:31Z), 6 of 8 autonomous grooming sessions exited `status="success"` at ~12 turns / ~$0.40 / ~59s **without calling the architect and without committing any plan file**. The dispatch-lib post-flight checks (HEAD-unchanged, plan-file ≥500 bytes) caught the empty artifacts and rewrote results to `PIPELINE FAILURE`, but ~$2.80 was burned for zero output.
+
+## Symptoms
+
+- claude-pilot log: `[done] Success | 12 turns | $0.40 | 59s` with zero `[tool:request]` lines between `[prompt]` and `[done]`
+- `[init] Session , model unknown` — empty session_id, unknown model in the init event
+- Zero rows in `tool_calls` table for the session window
+- Parent task marked `failed` with `callback_delivered_without_pr_url`
+- All 6 failures occurred during a 3-minute mass-dispatch window (8 concurrent grooming tasks)
+
+## What didn't work
+
+1. **mika#1033's drift detection** — that fix caught sessions drifting INTO executor mode (running ticket commands instead of planning). It could not prevent sessions drifting OUT of all work (LLM emitting `end_turn` without any tool calls).
+2. **The ROLE CONSTRAINT block (mika#1081)** — placed as a bare prefix (lines 1-4 before any heading) in `dev-groom/system_prompt.md`. Hypothesis: the model may have interpreted this as a session-level constraint that inhibited tool use entirely, rather than as a planning-mode directive. The block's position before the heading made it structurally ambiguous.
+3. **Existing guardrails (stall/empty/idle)** — the stall detector triggers on consecutive text-only turns, but the failing sessions had zero content blocks at all (not even text), so the stall counter was never incremented.
 
 ## Root cause analysis
 
@@ -21,15 +36,11 @@ The issue body originally attributed the failure to kimi-k2.5 (mika-dev's base m
 
 ### Evidence shape
 
-All 6 failing sessions shared:
-- 12 turns, ~$0.40, ~59s
-- Zero `[tool:request]` lines in the log between `[prompt]` and `[done]`
-- `[init] Session , model unknown` (empty session_id, unknown model)
-- Zero rows in `tool_calls` table for the session window
+All 6 failing sessions shared the same signature: 12 turns of SDK-level "turns" (likely thinking blocks or empty content) followed by `stop_reason=end_turn`. Without `--trace` logging, the actual content of those 12 turns was invisible — neither `log_text` (requires text blocks) nor `log_tool_request` (requires permission callbacks) fired.
 
 ### Phase 0 diagnostic instrumentation (deployed)
 
-Three diagnostic capabilities were added:
+Three diagnostic capabilities were added to close the visibility gap:
 
 1. **Persistent stderr** (`dispatch-lib.sh`): stderr is now copied to `/var/log/claude-pilot/<task_id>.stderr` before processing, surviving callback delivery cleanup.
 
@@ -41,36 +52,59 @@ Three diagnostic capabilities were added:
 
 **Pending live reproduction.** Deploy the instrumented build and single-dispatch `mika ask --agent mika-dev "groom mika issue#1057"` with trace enabled. One of four outcomes will be named:
 
-- **Outcome 0**: mika#1081's ROLE CONSTRAINT block is the proximate cause (Step 0-pre)
+- **Outcome 0**: mika#1081's ROLE CONSTRAINT block is the proximate cause
 - **Outcome 1**: Model produces thinking blocks only and exits end_turn
 - **Outcome 2**: Tool calls are attempted but denied/fail silently
 - **Outcome 3**: Single-dispatch always works; mass-dispatch is the variable
 
-## Fix layers (deployed)
+## Solution
 
-### Layer A — Skill prompt hardening
+### Layer A — Skill prompt hardening (`dev-groom/system_prompt.md`)
 
-1. Moved the ROLE CONSTRAINT block from a leading prefix (lines 1-4, pre-heading) to a bolded inline paragraph within the skill description section. This prevents the constraint from being parsed as a session-level system override that might truncate the workflow.
+```markdown
+# Before (mika#1081 — pre-heading bare prefix)
+ROLE CONSTRAINT: You are a PLANNER, not an implementer...
+## dev-groom — Two-Pass Grooming Skill
 
-2. Added a **COMPLETION CONSTRAINT** clause explicitly warning about early-exit cost (~$0.40/session) and requiring all phases to complete.
+# After (mika#1097 — inline within skill description)
+## dev-groom — Two-Pass Grooming Skill
+...skill description...
+**ROLE CONSTRAINT:** You are a PLANNER, not an implementer...
+**COMPLETION CONSTRAINT (mika#1097):** You MUST complete all phases...
+### Phase 1 — Read the ticket and pick the branch (MANDATORY FIRST ACTION)
+1. **IMMEDIATELY** fetch the issue — this must be your FIRST tool call...
+```
 
-3. Made Phase 1's `gh issue view` call **MANDATORY FIRST ACTION** with explicit instruction to execute before any reasoning.
+Three changes: (1) moved ROLE CONSTRAINT inline after the heading, (2) added COMPLETION CONSTRAINT with cost warning, (3) made Phase 1's `gh issue view` a mandatory first tool call.
 
-### Layer B — Structural early-exit guard (claude-pilot)
+### Layer B — Structural early-exit guard (`claude-pilot`)
 
-Added a tool-call counter and re-prompt guard to claude-pilot:
+Added `ToolCallCounter` to `permissions.py` — increments on every allowed tool call (Tier 1 auto-approve and relay-allow). In `agent.py`, when a `ResultMessage` arrives with `status="success"` and observed tool calls < `CLAUDE_PILOT_MIN_TOOL_CALLS`:
 
-1. `ToolCallCounter` in `permissions.py` increments on every allowed tool call (Tier 1 auto-approve and relay-allow).
+1. **First early-exit** → re-prompt once with spec-anchored corrective (no executor-directive verbs to avoid mika#1033 family regression)
+2. **Second early-exit** → emit `status="terminated"`, `subtype="early_exit_zero_action"` (exit code 1)
+3. **Re-prompt failure** → emit the same terminated result with the exception details
 
-2. On `ResultMessage` with `status="success"` and observed tool calls < `CLAUDE_PILOT_MIN_TOOL_CALLS`, the agent is re-prompted once with a spec-anchored corrective message.
+Gated per-skill via `CLAUDE_PILOT_MIN_TOOL_CALLS` env var. dispatch-lib sets it to 3 for `dev-groom` only (calibrated from incident: failures had 0 tool calls, successful sessions have 15-40+).
 
-3. On second early-exit after re-prompt, claude-pilot emits `status="terminated"` with `subtype="early_exit_zero_action"` — a named structural failure that dispatch-lib can parse.
+## Why this works
 
-4. Gated per-skill: `CLAUDE_PILOT_MIN_TOOL_CALLS=3` is set by dispatch-lib only for `dev-groom`. Dev-pilot threshold is a follow-up ticket after live calibration data accumulates.
+The guard addresses the failure at two layers:
 
-### Layer D — Mass-dispatch rate-limit
+- **Layer A** (prompt) reduces the probability of early exit by making the first tool call structurally required and warning about cost consequences. This is fragile (prompt-only) but cheap.
+- **Layer B** (code) catches early exits that slip past the prompt and either recovers them (re-prompt) or names them (early_exit_zero_action subtype). This is structural and reliable.
 
-Out of scope per issue body. To be filed as a sibling ticket if Phase 0 outcome 3 lands.
+Together, the layers provide defense-in-depth: Layer A prevents, Layer B detects and recovers.
+
+## Prevention
+
+1. **New dispatch skills should set `CLAUDE_PILOT_MIN_TOOL_CALLS`** in the dispatch-lib case switch. The threshold should be calibrated from production data (check successful session tool-call counts).
+
+2. **Prompt-first actions should be tool calls, not reasoning.** When a skill's first phase requires fetching external data (issue metadata, branch state), make the fetch the mandatory first action with explicit "before any reasoning" language.
+
+3. **Use `--trace` for debugging zero-artifact sessions.** Set `CLAUDE_PILOT_TRACE=1` before dispatch to get full content-block logs. The trace file lives alongside the regular log at `/var/log/claude-pilot/<task_id>.log`.
+
+4. **Never mass-dispatch grooming tasks** until the queue-depth variable is resolved. Single-dispatch one at a time. The 2026-05-13 incident had 8 concurrent grooms in 3 minutes; 6 of 8 failed.
 
 ## Reproduction protocol
 
@@ -91,3 +125,4 @@ mika ask --agent mika-dev "groom mika issue#1057"
 - mika#1058 — callback-safe deferred dispatch (upstream fix)
 - mika#940 — dev-groom early-exit family root
 - mika#864 — required-suffix-line guard (pattern for this guard)
+- mika#1081 — ROLE CONSTRAINT block addition (possible regression suspect)
