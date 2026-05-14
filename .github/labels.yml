@@ -36,6 +36,10 @@
   color: "008672"
   description: Extra attention is needed
 
+- name: regression
+  color: "8b0000"
+  description: Functionality that previously worked has broken — distinct from new bugs
+
 # ── Priority ──────────────────────────────────────────────────────────────────
 - name: p0-critical
   color: "b60205"
@@ -81,6 +85,10 @@
 - name: dashboard
   color: "7057ff"
   description: Observability dashboard (React SPA)
+
+- name: kg
+  color: "5C6BC0"
+  description: Knowledge Graph subsystem (extraction, resolution, corpora, schema)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 - name: ready
