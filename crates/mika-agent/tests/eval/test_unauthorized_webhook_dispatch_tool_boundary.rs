@@ -160,19 +160,15 @@ async fn tool_boundary_allows_direct_prompt_dispatch() {
 }
 
 /// PR events are allowlisted (qa skill territory) — the tool-boundary gate
-/// does NOT block them. The post-hoc INTENT_GUARD #910 is intentionally
-/// over-broad and fires on PR events (known false positive, see plan §
-/// "Predicate sharing § Important"), so we provide 4 responses.
+/// does NOT block them. Post-#1102: the INTENT_GUARD #910 predicate was
+/// tightened to a positive allowlist — PR events no longer trip the guard,
+/// so the tool call passes through in 2 steps (no retry).
 #[tokio::test]
 async fn tool_boundary_allows_pr_event_dispatch() {
     let harness = EvalHarness::builder()
         .responses(vec![
-            // Step 1: tool executes (not blocked by #933) but #910 fires post-hoc
             tool_call_response("run_claude_pilot", json!({"prompt": "fix CI"})),
             text_response("Dispatching CI fix."),
-            // Step 2: after #910 retry, goes through (single-retry semantics)
-            tool_call_response("run_claude_pilot", json!({"prompt": "fix CI"})),
-            text_response("Dispatching CI fix again."),
         ])
         .tools(tools_with_pilot_and_action())
         .build()
@@ -185,19 +181,20 @@ async fn tool_boundary_allows_pr_event_dispatch() {
         .unwrap();
 
     assert_has_output(&trace);
-    assert_exact_steps(&trace, 4);
+    // 2 steps: tool call + final text. No guard interference post-#1102.
+    assert_exact_steps(&trace, 2);
+    assert_output_contains(&trace, "Dispatching");
 }
 
-/// Check-suite events are allowlisted (ci skill territory) — same pattern.
+/// Check-suite events are allowlisted (ci skill territory) — same pattern
+/// as PR events. Post-#1102: INTENT_GUARD #910 no longer fires on
+/// check-suite events, so tool call passes through in 2 steps.
 #[tokio::test]
 async fn tool_boundary_allows_check_suite_dispatch() {
     let harness = EvalHarness::builder()
         .responses(vec![
             tool_call_response("run_claude_pilot", json!({"prompt": "fix CI"})),
             text_response("Dispatching CI fix."),
-            // #910 INTENT_GUARD retry
-            tool_call_response("run_claude_pilot", json!({"prompt": "fix CI"})),
-            text_response("Dispatching CI fix again."),
         ])
         .tools(tools_with_pilot_and_action())
         .build()
@@ -210,5 +207,7 @@ async fn tool_boundary_allows_check_suite_dispatch() {
         .unwrap();
 
     assert_has_output(&trace);
-    assert_exact_steps(&trace, 4);
+    // 2 steps: tool call + final text. No guard interference post-#1102.
+    assert_exact_steps(&trace, 2);
+    assert_output_contains(&trace, "Dispatching");
 }

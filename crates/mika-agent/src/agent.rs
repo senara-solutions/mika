@@ -4842,7 +4842,7 @@ const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[Your response was rejected b
 
 /// Re-export from `webhook_dispatch` module — single source of truth for the
 /// ready-label marker prefix (mika#933).
-use crate::webhook_dispatch::READY_LABEL_DISPATCH_MARKER;
+use crate::webhook_dispatch::{READY_LABEL_DISPATCH_MARKER, is_unauthorized_webhook_dispatch};
 
 /// Triggers when a webhook turn was initiated by the ready-label dispatch
 /// marker.  Delegates to `webhook_dispatch::is_ready_label_dispatch_marker`
@@ -4869,21 +4869,18 @@ fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
     summaries.iter().any(|s| s.name == "run_claude_pilot")
 }
 
-/// #910 — Triggers on `[GitHub]` webhook turns that are NOT ready-label
-/// dispatch events.  Inverse of `ready_label_dispatch_trigger` on the
-/// `[GitHub]` domain.  Uses `READY_LABEL_DISPATCH_MARKER` (imported from
-/// `webhook_dispatch` module, mika#933) for consistency with the positive-case
-/// guard.
+/// #910, #1102 — Triggers on `[GitHub]` webhook turns that represent
+/// unauthorized dispatch surfaces.  Delegates to
+/// `is_unauthorized_webhook_dispatch()` from `crate::webhook_dispatch` — the
+/// same positive-allowlist predicate used by the tool-boundary guard in
+/// `executor.rs`.  This ensures the EndTurn defense-in-depth guard matches
+/// the primary prevention layer exactly.
 ///
-/// NOTE: This predicate is intentionally **over-broad** compared to the
-/// tool-boundary `is_unauthorized_webhook_dispatch()` in `webhook_dispatch.rs`.
-/// It matches PR and check-suite events too (qa/ci skill territory), which
-/// generates confusing post-hoc corrections but does not break those flows
-/// (the dispatch already happened by EndTurn).  Tightening this to match the
-/// tool-boundary allowlist is a follow-up ticket (see mika#933 plan §
-/// "Predicate sharing § Important").
+/// Excludes ready-label events (handled by `ready_label_dispatch_trigger`),
+/// PR review events (qa skill territory), and check-suite events (ci skill
+/// territory).  See mika#933 for the 8-row gateway-prefix-surface test matrix.
 fn webhook_no_unauthorized_dispatch_trigger(msg: &str) -> bool {
-    msg.starts_with("[GitHub]") && !msg.starts_with(READY_LABEL_DISPATCH_MARKER)
+    is_unauthorized_webhook_dispatch(msg)
 }
 
 /// #910 — Returns `true` when `run_claude_pilot` was NOT successfully called
@@ -8511,15 +8508,17 @@ mod tests {
     }
 
     #[test]
-    fn no_unauthorized_dispatch_trigger_matches_pr_review() {
-        assert!(webhook_no_unauthorized_dispatch_trigger(
+    fn no_unauthorized_dispatch_trigger_skips_pr_review() {
+        // PR review events are qa skill territory — must NOT trigger (#1102).
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
             "[GitHub] PR review (approved) on senara-solutions/mika#694 by reviewer"
         ));
     }
 
     #[test]
-    fn no_unauthorized_dispatch_trigger_matches_check_suite() {
-        assert!(webhook_no_unauthorized_dispatch_trigger(
+    fn no_unauthorized_dispatch_trigger_skips_check_suite() {
+        // Check suite events are ci skill territory — must NOT trigger (#1102).
+        assert!(!webhook_no_unauthorized_dispatch_trigger(
             "[GitHub] Check suite failure on branch fix/foo"
         ));
     }
