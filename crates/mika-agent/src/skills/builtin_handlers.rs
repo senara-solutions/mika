@@ -5,9 +5,10 @@
 //! to `ToolContext` (for home_dir, etc.) and return `ToolOutput`.
 
 use std::fmt::Write;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::bundled_skills::{is_trust_critical_skill, trust_critical_skill_names};
 use crate::skills::index::{resolve_canonical_provider_model, sanitize_model_dir_name};
@@ -338,11 +339,44 @@ fn parse_command_array(input: &serde_json::Value) -> Result<Vec<String>, ToolOut
     Ok(args)
 }
 
+/// Progress ticker interval for `spawn_and_collect` diagnostic logging (#900).
+/// 30 seconds in production; overridden in tests via `PROGRESS_TICKER_INTERVAL`.
+#[cfg(not(test))]
+const PROGRESS_TICKER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const PROGRESS_TICKER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Read from an async reader into a buffer up to `max_bytes`, incrementing
+/// `counter` after each chunk. Enables external progress observation (#900).
+async fn read_with_counter<R: AsyncRead + Unpin>(
+    reader: R,
+    max_bytes: usize,
+    counter: Arc<AtomicUsize>,
+) -> Vec<u8> {
+    let mut take = reader.take(max_bytes as u64);
+    let mut buf = Vec::with_capacity(max_bytes.min(8192));
+    let mut chunk = [0u8; 256];
+    loop {
+        match take.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                counter.fetch_add(n, Ordering::Relaxed);
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 /// Spawn a CLI subprocess, capture bounded stdout/stderr, and return ToolOutput.
 ///
 /// Shared logic for all CLI builtin handlers (gh, gws, etc.). The caller builds
 /// the `Command` with args, env vars, and security scrubbing; this function handles
 /// the spawn-read-wait-format cycle.
+///
+/// Includes diagnostic instrumentation (#900): per-invocation progress ticker at
+/// 30-second intervals logging stdout/stderr byte counts, plus a completion summary.
 async fn spawn_and_collect(
     mut cmd: tokio::process::Command,
     tool_name: &str,
@@ -360,22 +394,64 @@ async fn spawn_and_collect(
         }
     };
 
-    // Read stdout and stderr with bounded size to prevent memory exhaustion
+    let started_at = tokio::time::Instant::now();
+    let stdout_count = Arc::new(AtomicUsize::new(0));
+    let stderr_count = Arc::new(AtomicUsize::new(0));
+
+    // Read stdout and stderr with bounded size, tracking byte counts for diagnostics
     let stdout_handle = child.stdout.take().expect("stdout piped");
     let stderr_handle = child.stderr.take().expect("stderr piped");
-    let mut stdout_buf = Vec::with_capacity(MAX_OUTPUT_LEN);
-    let mut stderr_buf = Vec::with_capacity(MAX_OUTPUT_LEN);
 
-    let mut stdout_take = stdout_handle.take(MAX_OUTPUT_LEN as u64);
-    let mut stderr_take = stderr_handle.take(MAX_OUTPUT_LEN as u64);
-    let (stdout_res, stderr_res) = tokio::join!(
-        stdout_take.read_to_end(&mut stdout_buf),
-        stderr_take.read_to_end(&mut stderr_buf),
+    let stdout_reader = tokio::spawn(read_with_counter(
+        stdout_handle,
+        MAX_OUTPUT_LEN,
+        Arc::clone(&stdout_count),
+    ));
+    let stderr_reader = tokio::spawn(read_with_counter(
+        stderr_handle,
+        MAX_OUTPUT_LEN,
+        Arc::clone(&stderr_count),
+    ));
+
+    // Progress ticker: every PROGRESS_TICKER_INTERVAL, log byte count snapshots (#900)
+    let progress_task = {
+        let stdout_c = Arc::clone(&stdout_count);
+        let stderr_c = Arc::clone(&stderr_count);
+        let name = tool_name.to_string();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PROGRESS_TICKER_INTERVAL);
+            interval.tick().await; // discard immediate first tick
+            loop {
+                interval.tick().await;
+                tracing::info!(
+                    tool = %name,
+                    stdout_bytes = stdout_c.load(Ordering::Relaxed),
+                    stderr_bytes = stderr_c.load(Ordering::Relaxed),
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "spawn_and_collect progress"
+                );
+            }
+        })
+    };
+
+    // Wait for both reads + process exit
+    let (stdout_res, stderr_res, wait_res) =
+        tokio::join!(stdout_reader, stderr_reader, child.wait());
+    progress_task.abort();
+
+    let stdout_buf = stdout_res.unwrap_or_default();
+    let stderr_buf = stderr_res.unwrap_or_default();
+
+    // Post-completion summary (#900)
+    tracing::info!(
+        tool = %tool_name,
+        stdout_bytes = stdout_count.load(Ordering::Relaxed),
+        stderr_bytes = stderr_count.load(Ordering::Relaxed),
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "spawn_and_collect complete"
     );
-    stdout_res.ok();
-    stderr_res.ok();
 
-    let status = match child.wait().await {
+    let status = match wait_res {
         Ok(s) => s,
         Err(e) => {
             return ToolOutput::error(format!("Failed to execute {tool_name}: {e}"));
@@ -1649,6 +1725,21 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     if let Some(token) = ctx.github_token {
         cmd.env("GH_TOKEN", token);
     }
+
+    // Diagnostic instrumentation (#900): log the exact gh subcommand, env key set
+    // (keys only, never values), and token presence for timeout forensics.
+    let env_keys_set: &[&str] = match ctx.github_token {
+        Some(_) => &["GH_PROMPT_DISABLED", "GH_TOKEN"],
+        None => &["GH_PROMPT_DISABLED"],
+    };
+    tracing::info!(
+        tool = "run_gh",
+        argv = ?&gh_args.args,
+        repo = ?&gh_args.repo,
+        env_keys_set = ?env_keys_set,
+        has_github_token = ctx.github_token.is_some(),
+        "run_gh invocation"
+    );
 
     let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
 
@@ -5252,5 +5343,224 @@ mod tests {
         assert!(!is_pr_review_command(&args) || args.len() < 2);
         // Just verify it doesn't reach the pr review code path.
         assert!(!is_pr_review_command(&args));
+    }
+
+    // -- Diagnostic instrumentation tests (#900) --
+
+    /// Captured tracing event for test assertions.
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        message: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    /// A tracing layer that captures events into a shared Vec for test assertions.
+    struct CapturingLayer {
+        events: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            let mut visitor = FieldVisitor(&mut fields);
+            event.record(&mut visitor);
+            let message = fields.remove("message").unwrap_or_default();
+            if let Ok(mut events) = self.events.lock() {
+                events.push(CapturedEvent { message, fields });
+            }
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    /// Set up a tracing subscriber that captures events into a shared Vec.
+    fn capture_tracing_events() -> (
+        tracing::subscriber::DefaultGuard,
+        Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = CapturingLayer {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (guard, events)
+    }
+
+    #[tokio::test]
+    async fn test_spawn_and_collect_emits_complete_log() {
+        let (_guard, events) = capture_tracing_events();
+
+        let mut cmd = tokio::process::Command::new("echo");
+        cmd.arg("hello");
+        let output = spawn_and_collect(cmd, "test_echo", "").await;
+
+        assert!(!output.is_error);
+        assert_eq!(output.content.trim(), "hello");
+
+        let captured = events.lock().unwrap();
+        let complete_events: Vec<_> = captured
+            .iter()
+            .filter(|e| e.message == "spawn_and_collect complete")
+            .collect();
+        assert_eq!(
+            complete_events.len(),
+            1,
+            "expected exactly one 'spawn_and_collect complete' event"
+        );
+        let evt = &complete_events[0];
+        assert_eq!(
+            evt.fields.get("tool").map(|s| s.as_str()),
+            Some("test_echo")
+        );
+        // "hello\n" = 6 bytes
+        assert_eq!(
+            evt.fields.get("stdout_bytes").map(|s| s.as_str()),
+            Some("6")
+        );
+        assert_eq!(
+            evt.fields.get("stderr_bytes").map(|s| s.as_str()),
+            Some("0")
+        );
+        // elapsed_ms should be present and > 0
+        let elapsed: u64 = evt
+            .fields
+            .get("elapsed_ms")
+            .unwrap()
+            .parse()
+            .expect("elapsed_ms should be a number");
+        assert!(elapsed < 10_000, "echo should complete quickly");
+    }
+
+    #[tokio::test]
+    async fn test_run_gh_invocation_log_redacts_token() {
+        let (_guard, events) = capture_tracing_events();
+
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        let fake_token = "FAKE_TOKEN_DO_NOT_LOG_ME";
+        ctx.github_token = Some(fake_token);
+
+        // Use an allowed subcommand so we pass validation and reach the invocation log.
+        // `pr list` will fail (no repo context) but the log fires before spawn_and_collect.
+        let input = serde_json::json!({"command": ["pr", "list"]});
+        let _output = run_gh(&input, &ctx).await;
+
+        let captured = events.lock().unwrap();
+        let invocation_events: Vec<_> = captured
+            .iter()
+            .filter(|e| e.message == "run_gh invocation")
+            .collect();
+        assert_eq!(
+            invocation_events.len(),
+            1,
+            "expected exactly one 'run_gh invocation' event"
+        );
+        let evt = &invocation_events[0];
+
+        // env_keys_set should contain GH_TOKEN as a key name
+        let env_keys = evt.fields.get("env_keys_set").expect("env_keys_set field");
+        assert!(
+            env_keys.contains("GH_TOKEN"),
+            "env_keys_set should contain the key name GH_TOKEN"
+        );
+        assert_eq!(
+            evt.fields.get("has_github_token").map(|s| s.as_str()),
+            Some("true")
+        );
+
+        // No field should contain the actual token value
+        for (key, value) in &evt.fields {
+            assert!(
+                !value.contains(fake_token),
+                "field '{key}' leaked the token value: {value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_and_collect_handles_large_output() {
+        // Verify that spawn_and_collect returns within a reasonable time
+        // even when the subprocess produces output exceeding MAX_OUTPUT_LEN.
+        // This documents the pipe-deadlock risk for the follow-up ticket.
+        let (_guard, _events) = capture_tracing_events();
+
+        let start = std::time::Instant::now();
+        let mut cmd = tokio::process::Command::new("sh");
+        // Generate 20KB of output (2x MAX_OUTPUT_LEN)
+        cmd.args(["-c", "yes 'AAAAAAAAAA' | head -c 20000"]);
+        let output = spawn_and_collect(cmd, "test_large", "").await;
+        let elapsed = start.elapsed();
+
+        // Should complete within 10 seconds (not hang at 600s)
+        assert!(
+            elapsed.as_secs() < 10,
+            "spawn_and_collect took {elapsed:?} — possible pipe deadlock"
+        );
+        // Output should be capped at MAX_OUTPUT_LEN
+        assert!(
+            output.content.len() <= MAX_OUTPUT_LEN,
+            "output {} exceeds MAX_OUTPUT_LEN {}",
+            output.content.len(),
+            MAX_OUTPUT_LEN
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_and_collect_progress_ticker_fires() {
+        // With PROGRESS_TICKER_INTERVAL = 100ms in test mode, a 500ms sleep
+        // should produce at least 3 progress tick events.
+        let (_guard, events) = capture_tracing_events();
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("0.5");
+        let _output = spawn_and_collect(cmd, "test_sleep", "").await;
+
+        let captured = events.lock().unwrap();
+        let progress_events: Vec<_> = captured
+            .iter()
+            .filter(|e| e.message == "spawn_and_collect progress")
+            .collect();
+        assert!(
+            progress_events.len() >= 3,
+            "expected at least 3 progress ticks, got {}",
+            progress_events.len()
+        );
+
+        // Verify elapsed_ms is monotonically non-decreasing
+        let elapsed_values: Vec<u64> = progress_events
+            .iter()
+            .map(|e| e.fields.get("elapsed_ms").unwrap().parse::<u64>().unwrap())
+            .collect();
+        for window in elapsed_values.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "elapsed_ms should be non-decreasing: {elapsed_values:?}"
+            );
+        }
     }
 }

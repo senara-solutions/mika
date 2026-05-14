@@ -2765,6 +2765,14 @@ async fn execute_tool(
 ) -> ToolOutput {
     debug!(tool = %name, "tool_execution");
 
+    // Pre-compute input excerpt for timeout diagnostics (#900). Must happen
+    // before `input` is moved into the execute call.
+    let input_excerpt: String = serde_json::to_string(&input)
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect();
+
     // 1. Try builtin tool
     if let Some(tool) = dispatch.tools.get(name) {
         let timeout = tool.timeout_secs().unwrap_or(TOOL_TIMEOUT_SECS);
@@ -2780,7 +2788,7 @@ async fn execute_tool(
                 ToolOutput::error(format!("Tool error: {e}"))
             }
             Err(_) => {
-                warn!(tool = %name, timeout_secs = timeout, "tool execution timed out");
+                warn!(tool = %name, timeout_secs = timeout, input_excerpt = %input_excerpt, "tool execution timed out");
                 ToolOutput::error(format!("Tool '{name}' timed out after {timeout}s"))
             }
         };
@@ -2799,7 +2807,7 @@ async fn execute_tool(
             {
                 Ok(output) => output,
                 Err(_) => {
-                    warn!(tool = %name, timeout_secs = timeout, "builtin handler timed out");
+                    warn!(tool = %name, timeout_secs = timeout, input_excerpt = %input_excerpt, "builtin handler timed out");
                     ToolOutput::error(format!("Builtin tool '{name}' timed out after {timeout}s"))
                 }
             };
