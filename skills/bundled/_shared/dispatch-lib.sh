@@ -315,11 +315,26 @@ _run_claude_pilot() {
 
     STDERR_FILE=$(mktemp)
     STDOUT_FILE=$(mktemp)
+    # Persistent stderr copy for post-mortem forensics (mika#1097 Step 0-A).
+    # The mktemp file above is deleted after callback delivery; this copy persists
+    # alongside the claude-pilot log file so operators can inspect it independently.
+    PERSISTENT_STDERR="/var/log/claude-pilot/${LOG_ID}.stderr"
+    # --trace flag for full event-stream capture (mika#1097 Step 0-B).
+    # Enabled via CLAUDE_PILOT_TRACE env var (set per-skill in the case switch below).
+    local TRACE_FLAG=""
+    if [ "${CLAUDE_PILOT_TRACE:-}" = "1" ] || [ "${CLAUDE_PILOT_TRACE:-}" = "true" ]; then
+        TRACE_FLAG="--trace"
+    fi
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
+    # Persist stderr to durable file before any processing (mika#1097)
+    if [ -s "$STDERR_FILE" ]; then
+        mkdir -p "$(dirname "$PERSISTENT_STDERR")" 2>/dev/null || true
+        cp "$STDERR_FILE" "$PERSISTENT_STDERR" 2>/dev/null || echo "Warning: failed to persist stderr to $PERSISTENT_STDERR" >&2
+    fi
     # Issue #135: extract first JSON-object line from stdout
     PILOT_OUTPUT_RAW=$(cat "$STDOUT_FILE" 2>/dev/null)
     PILOT_OUTPUT=$(printf '%s\n' "$PILOT_OUTPUT_RAW" | grep -m1 '^{' || true)
@@ -508,7 +523,16 @@ dispatch_claude_pilot() {
     local ENTRY_COMMAND
     case "$SKILL" in
       dev-pilot)  ENTRY_COMMAND="/mika" ;;
-      dev-groom)  ENTRY_COMMAND="/mika-groom-ticket" ;;
+      dev-groom)
+        ENTRY_COMMAND="/mika-groom-ticket"
+        # Early-exit guard (mika#1097 Layer B): dev-groom sessions MUST produce
+        # tool calls (at minimum: gh issue view, git worktree, /ce:plan, mika ask).
+        # If the session exits "success" with fewer than this threshold, claude-pilot
+        # re-prompts once; a second early-exit emits early_exit_zero_action.
+        # Calibrated from the 2026-05-13 incident: failures had 0 tool calls;
+        # successful grooming sessions have 15-40+.
+        export CLAUDE_PILOT_MIN_TOOL_CALLS="${CLAUDE_PILOT_MIN_TOOL_CALLS:-3}"
+        ;;
       *) echo "Unknown skill: $SKILL" >&2; exit 1 ;;
     esac
     _setup_gh_auth
