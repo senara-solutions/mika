@@ -111,6 +111,23 @@ Update this plan in place with a `## Phase 0 outcome` section naming:
 
 **Gate to proceed:** Phase 1 (gate broadening) is unconditional — it begins regardless of Phase 0 outcome. Phase 2 (upstream fix) is conditioned on Phase 0 naming a specific upstream layer.
 
+## Phase 0 outcome
+
+**Implicated mechanism:** **(c) — Groomer Phase 5 emission drift**, with a contributing **(a)** component.
+
+**Evidence:**
+
+- **mika-arch second-review session:** `166ff701-7ff7-4f90-8b16-b1c0f27c382d` (agent: `mika-arch`, 2026-05-13 21:27–21:33Z)
+- **Architect's verbatim second-pass final line:** `Disposition: READY` (NOT `Verdict: GROOMED`)
+- The `required_suffix_lines` guard on `mika-arch-second-review` expects `Verdict: GROOMED` or `Verdict: ESCALATE`. The architect emitted `Disposition: READY` — a vocabulary mismatch (first-pass uses "Disposition", second-pass requires "Verdict").
+- **Contributing (a) factor:** The suffix-line guard either did not fire for this turn (if the skill was not keyword-matched in the multi-turn session's second-pass turn), or fired and the retry also produced the wrong prefix. Either way, the paraphrased verdict reached the dev-groom.
+- **Dev-groom's Phase 5 emission (mechanism c):** The dev-groom's spec tolerates `READY` as a paraphrased `GROOMED` equivalent, so Phase 5 step 18 emitted `second-pass (READY, paraphrased GROOMED per spec tolerance)` — a shape the dispatch gate then rejected.
+
+**Fix layer determined:**
+
+- **Phase 1 (gate broadening):** Unconditional — the primary fix per operator framing. Broadens the gate to accept both canonical `(GROOMED)` and spec-tolerated `(READY, paraphrased GROOMED ...)`.
+- **Phase 2 (upstream fix):** The suffix-line guard and dev-groom emission are both upstream contributors. However, fixing them is out of scope for this ticket — the gate broadening is sufficient per operator framing "AC1 stands, broaden the gate". A follow-up ticket may address the `Disposition:` vs `Verdict:` vocabulary drift in `mika-arch-second-review` sessions.
+
 ---
 
 ## Phase 1 — Broaden the dispatch gate (PRIMARY FIX — unconditional)
