@@ -17,9 +17,9 @@ const MAX_SKILL_TOML_SIZE: u64 = 64 * 1024;
 /// Default maximum size for system_prompt.md snippets (16 KB).
 pub(super) const MAX_PROMPT_SNIPPET_SIZE: u64 = 16 * 1024;
 
-/// Hard ceiling for per-skill `max_prompt_size` override (64 KB).
+/// Hard ceiling for per-skill `max_prompt_size` override (80 KB).
 /// Prevents marketplace skills from loading arbitrarily large prompts.
-pub(super) const MAX_PROMPT_SIZE_CEILING: u64 = 64 * 1024;
+pub(super) const MAX_PROMPT_SIZE_CEILING: u64 = 80 * 1024;
 
 /// Maximum size for tools.json files (256 KB).
 const MAX_TOOLS_JSON_SIZE: u64 = 256 * 1024;
@@ -516,7 +516,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
                     size,
                     limit,
                     "prompt exceeds size limit — skill NOT loaded. \
-                     Increase max_prompt_size in skill.toml (ceiling: 64KB) or reduce the prompt."
+                     Increase max_prompt_size in skill.toml (ceiling: 80KB) or reduce the prompt."
                 );
                 skipped.push(SkippedSkill {
                     name: manifest.skill.name.clone(),
@@ -2169,7 +2169,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        // 100KB prompt — over 64KB ceiling
+        // 100KB prompt — over 80KB ceiling
         let content = "x".repeat(100 * 1024);
         fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
 
@@ -2270,7 +2270,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        // 29KB prompt — over 16KB default but under 64KB ceiling
+        // 29KB prompt — over 16KB default but under 80KB ceiling
         let content = "x".repeat(29 * 1024);
         fs::write(skill_dir.join("system_prompt.md"), &content).unwrap();
 

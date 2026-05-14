@@ -55,7 +55,7 @@ fn bundled_skills_load_without_oversized_prompts() {
              Each skipped skill below is invisible at runtime — the agent \
              will boot in a silently-degraded state until the cause is fixed.\n\n\
              Per-skill remediation:\n  - 'oversized prompt': raise `max_prompt_size` \
-             in the skill's `skill.toml` (ceiling 64KB), or trim the prompt.\n  - other \
+             in the skill's `skill.toml` (ceiling 80KB), or trim the prompt.\n  - other \
              reasons: see the skill's manifest, prompt file, and `scan_skills_dir` \
              error variants.\n\nDropped skills:\n",
         );

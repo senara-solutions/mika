@@ -57,7 +57,7 @@ The manifest is a TOML file with two sections: `[skill]` (required) and `[trigge
 | `always_on`    | bool   | No       | `false` | If true, this skill is active on every turn regardless of keywords. For built-in skills, user overrides are stored in the `skill_overrides` DB table (not in `skill.toml`). |
 | `timeout_secs` | u64    | No       | `30`    | Per-tool execution timeout in seconds. |
 | `dependencies` | Array\<String\> | No | `[]` | Other skill names that should be loaded when this skill is active. One level only — no transitive resolution. |
-| `max_prompt_size` | u64 | No | `None` | Override the default 16KB size limit for `system_prompt.md`. Clamped to a 64KB ceiling to prevent abuse. |
+| `max_prompt_size` | u64 | No | `None` | Override the default 16KB size limit for `system_prompt.md`. Clamped to an 80KB ceiling to prevent abuse. |
 
 ### `[triggers]` section
 
@@ -377,7 +377,7 @@ description = "Skill with a large system prompt"
 max_prompt_size = 32768  # 32KB
 ```
 
-The `max_prompt_size` value is clamped to a hard ceiling of **64KB** regardless of what is specified. Use `mika skills validate` to check whether a skill's prompt exceeds its effective limit.
+The `max_prompt_size` value is clamped to a hard ceiling of **80KB** regardless of what is specified. Use `mika skills validate` to check whether a skill's prompt exceeds its effective limit.
 
 ### Per-Provider and Per-Model Variant Directories
 
