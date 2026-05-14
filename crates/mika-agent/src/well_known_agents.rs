@@ -126,9 +126,11 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
     soul: MIKA_QA_SOUL,
     disabled_skills: &[
         "self-dev",
+        "self-dev-callback",
         "self-dev-iterate",
         "self-dev-webhook-qa",
         "self-dev-webhook-ci",
+        "self-dev-webhook-ready-label",
         "dev-pilot",
         "permission-policy",
         "agents-teams",
@@ -174,9 +176,11 @@ pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
         // Disable all bundled skills except permission-policy.
         // Engine-coupled (skills/bundled/):
         "self-dev",
+        "self-dev-callback",
         "self-dev-iterate",
         "self-dev-webhook-qa",
         "self-dev-webhook-ci",
+        "self-dev-webhook-ready-label",
         "qa-review",
         "qa-review-build-callback",
         "skill-review",
