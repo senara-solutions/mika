@@ -4502,6 +4502,23 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Write a dispatch-rejection reason to `tasks.result` without changing status (#1108).
+    ///
+    /// Used by `validate_dispatch_readiness()` to surface rejection reasons to
+    /// operator-visible surfaces (`tasks.result` column). The task's status is
+    /// preserved — only `result` and `updated_at` are modified. Returns `true`
+    /// if the row was updated. Agent-unscoped because the caller may not know
+    /// the agent_id (e.g., the unauthorized-webhook check fires before task fetch).
+    pub fn write_task_dispatch_rejection(&self, id: &str, reason_json: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET result = ?1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?2 AND trigger_type = 'manual'",
+            params![reason_json, id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Promote a task from `failed` → `completed` (#958).
     ///
     /// Symmetric to `update_task_failed()`. Only transitions tasks currently

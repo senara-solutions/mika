@@ -16,6 +16,20 @@
 
 use mika_agent::skills::executor::check_grooming_markers;
 
+/// Verbatim 2026-05-13 mika#1097 incident body-callout shape (#1108 reproduce fixture).
+/// This is the exact grooming-history line that the dev-groom emitted when
+/// mika-arch issued a paraphrased GROOMED verdict (mechanism (c) — Phase 5
+/// emission drift). The dispatch gate previously rejected this shape.
+const PARAPHRASED_GROOMED_BODY: &str = r#"
+> - **Branch:** `bug/1097/autonomous-loop-dev-groom-claude-pilot`
+> - **Plan:** `mika/docs/plans/2026-05-13-003-bug-dev-groom-claude-pilot-early-exit-plan.md` (committed on branch @ `a1b2c3d4`)
+> - **Grooming history:** /ce:plan → mika-arch first-pass (ITERATE, 3 blocking + 3 non-blocking) → revisions → mika-arch second-pass (READY, paraphrased GROOMED per spec tolerance)
+
+## Description
+
+dev-groom claude-pilot exits Success at ~12 turns without calling architect.
+"#;
+
 /// Canonical groomed issue body with all three signals.
 const GROOMED_BODY: &str = r#"
 > - **Branch:** `fix/919/self-dev-agent-operator-cli-dispatch`
@@ -179,5 +193,52 @@ We plan to implement this feature by...
         missing,
         vec!["plan_callout"],
         "prose 'Plan:' without 'docs/plans/' path prefix should NOT pass the check"
+    );
+}
+
+// --- mika#1108: spec-tolerated paraphrased GROOMED verdict ---
+
+/// Regression: canonical `second-pass (GROOMED)` still passes after broadening (#1108).
+#[test]
+fn accepts_canonical_groomed() {
+    let missing = check_grooming_markers(GROOMED_BODY);
+    assert!(
+        missing.is_empty(),
+        "canonical 'second-pass (GROOMED)' should pass, got: {missing:?}"
+    );
+}
+
+/// New behavior (#1108): spec-tolerated paraphrase `second-pass (READY, paraphrased GROOMED
+/// per spec tolerance)` should be accepted by the gate.
+///
+/// Reproduce fixture: verbatim 2026-05-13 mika#1097 incident body-callout shape.
+#[test]
+fn accepts_paraphrased_groomed() {
+    let missing = check_grooming_markers(PARAPHRASED_GROOMED_BODY);
+    assert!(
+        missing.is_empty(),
+        "spec-tolerated paraphrased GROOMED should pass, got: {missing:?}"
+    );
+}
+
+/// Negative test (#1108): bare `second-pass (READY)` without the "paraphrased GROOMED"
+/// qualifier is NOT accepted. The broadening is bounded — only the spec-tolerated
+/// paraphrase shape is newly accepted.
+#[test]
+fn rejects_arbitrary_ready_paraphrase() {
+    let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/foo.md` (committed on branch @ `abc123`)
+> - **Grooming history:** /ce:plan → mika-arch first-pass (ITERATE) → mika-arch second-pass (READY)
+
+## Description
+
+Some issue.
+"#;
+    let missing = check_grooming_markers(body);
+    assert_eq!(
+        missing,
+        vec!["groomed_verdict"],
+        "bare 'second-pass (READY)' without 'paraphrased GROOMED' qualifier should be rejected"
     );
 }

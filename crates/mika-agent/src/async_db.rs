@@ -570,6 +570,18 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Write a dispatch-rejection reason to `tasks.result` without changing status (#1108).
+    pub async fn write_task_dispatch_rejection(
+        &self,
+        task_id: &str,
+        reason_json: &str,
+    ) -> Result<bool> {
+        let i = task_id.to_owned();
+        let r = reason_json.to_owned();
+        self.with_db(move |db| db.write_task_dispatch_rejection(&i, &r))
+            .await
+    }
+
     pub async fn count_pending_callback_tasks_by_team_run(&self, team_run_id: &str) -> Result<i64> {
         let r = team_run_id.to_owned();
         self.with_db(move |db| db.count_pending_callback_tasks_by_team_run(&r))

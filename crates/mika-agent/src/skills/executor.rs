@@ -786,6 +786,11 @@ fn extract_skill_from_input(input: &serde_json::Value) -> Option<&str> {
 /// and backtick-wrapping mean `Plan: docs/plans/` never appears as a
 /// contiguous substring. `docs/plans/` is the essential anchoring directory
 /// prefix.
+///
+/// The groomed-verdict check accepts both the canonical `second-pass (GROOMED)`
+/// and the spec-tolerated paraphrase `second-pass (READY, paraphrased GROOMED`
+/// shapes (#1108). The grooming spec's Phase 5 may emit either form; the gate
+/// must accept everything the spec authorizes.
 pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if !issue_body.contains("> - **Branch:**") {
@@ -794,10 +799,27 @@ pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     if !issue_body.contains("docs/plans/") {
         missing.push("plan_callout");
     }
-    if !issue_body.contains("second-pass (GROOMED)") {
+    let has_groomed_marker = issue_body.contains("second-pass (GROOMED)")
+        || issue_body.contains("second-pass (READY, paraphrased GROOMED");
+    if !has_groomed_marker {
         missing.push("groomed_verdict");
     }
     missing
+}
+
+/// Best-effort write of a dispatch-rejection reason to `tasks.result` (#1108).
+///
+/// Fire-and-forget: logs a warning on failure but never propagates the error.
+/// This surfaces rejection reasons to operator-visible surfaces (`mika tasks list`,
+/// dashboard task detail) without requiring DB-level inspection.
+async fn record_dispatch_rejection(db: &AsyncDatabase, task_id: &str, reason_json: &str) {
+    if let Err(e) = db.write_task_dispatch_rejection(task_id, reason_json).await {
+        warn!(
+            task_id = task_id,
+            error = %e,
+            "failed to write dispatch-rejection reason to tasks.result"
+        );
+    }
 }
 
 /// Validate that a task is in a dispatchable state for long-running execution.
@@ -807,7 +829,8 @@ pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
 /// active callback child task already exists (double-dispatch prevention).
 ///
 /// Returns `Err(json_error_string)` on rejection, `Ok(status)` with the task's
-/// current status if dispatch may proceed.
+/// current status if dispatch may proceed. Each rejection site also writes the
+/// structured reason to `tasks.result` (#1108) for operator visibility.
 async fn validate_dispatch_readiness(
     db: &AsyncDatabase,
     task_id: &str,
@@ -821,7 +844,7 @@ async fn validate_dispatch_readiness(
     if let Some(msg) = originating_message
         && crate::webhook_dispatch::is_unauthorized_webhook_dispatch(msg)
     {
-        return Err(serde_json::json!({
+        let rejection = serde_json::json!({
             "error": "unauthorized_webhook_dispatch",
             "task_id": task_id,
             "reason": "This turn was initiated by a [GitHub] webhook event in the \
@@ -832,8 +855,9 @@ async fn validate_dispatch_readiness(
                        may dispatch claude-pilot. All other webhook events must use \
                        Webhook Fallthrough: acknowledge without dispatching \
                        (mika#841 positive-consent contract, mika#933)."
-        })
-        .to_string());
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
     }
 
     // Re-fetch the task to get the full struct (validate_task confirmed existence)
@@ -861,7 +885,7 @@ async fn validate_dispatch_readiness(
     // Only pending and in_progress are dispatchable
     if !matches!(task.status.as_str(), "pending" | "in_progress") {
         let pr_url = extract_pr_url(&task.metadata);
-        return Err(serde_json::json!({
+        let rejection = serde_json::json!({
             "error": "task_not_dispatchable",
             "task_id": task_id,
             "current_status": task.status,
@@ -871,8 +895,9 @@ async fn validate_dispatch_readiness(
                  Only 'pending' and 'in_progress' tasks can be dispatched.",
                 task.status
             )
-        })
-        .to_string());
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
     }
 
     // Check for active callback children (double-dispatch prevention)
@@ -884,7 +909,7 @@ async fn validate_dispatch_readiness(
             });
             if let Some(child) = active_callback {
                 let pr_url = extract_pr_url(&task.metadata);
-                return Err(serde_json::json!({
+                let rejection = serde_json::json!({
                     "error": "task_active_dispatch",
                     "task_id": task_id,
                     "current_status": task.status,
@@ -897,8 +922,9 @@ async fn validate_dispatch_readiness(
                          dispatching again.",
                         child.id, child.status
                     )
-                })
-                .to_string());
+                });
+                record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+                return Err(rejection.to_string());
             }
         }
         Err(e) => {
@@ -947,6 +973,7 @@ async fn validate_dispatch_readiness(
             if deferred_registered {
                 rejection["deferred_dispatch_registered"] = serde_json::json!(true);
             }
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
             return Err(rejection.to_string());
         }
         Ok(None) => { /* No conflicting dispatch in this class — proceed */ }
@@ -974,7 +1001,8 @@ async fn validate_dispatch_readiness(
     // `skills/bundled/self-dev/system_prompt.md:253` is defense-in-depth.
     // Both must update if the canonical `/mika-groom-ticket` Phase 5 callout
     // shape changes. Load-bearing substrings: `> - **Branch:**`,
-    // `docs/plans/`, `second-pass (GROOMED)`.
+    // `docs/plans/`, and a `second-pass` marker (canonical `(GROOMED)` or
+    // spec-tolerated `(READY, paraphrased GROOMED ...)` per #1108).
     if let Some(GitHubRef::Issue {
         ref owner,
         ref repo,
@@ -1011,13 +1039,14 @@ async fn validate_dispatch_readiness(
                                 let missing = check_grooming_markers(&issue_body);
 
                                 if !missing.is_empty() {
-                                    return Err(serde_json::json!({
+                                    let rejection = serde_json::json!({
                                         "error": "dispatch_no_grooming_marker",
                                         "task_id": task_id,
                                         "issue": format!("{}/{}#{}", owner, repo, number),
                                         "missing_signals": missing,
                                         "predicate": "issue body must contain all three substrings: \
-                                                      '> - **Branch:**', 'docs/plans/', 'second-pass (GROOMED)'",
+                                                      '> - **Branch:**', 'docs/plans/', and a second-pass \
+                                                      marker ('(GROOMED)' or '(READY, paraphrased GROOMED ...)')",
                                         "recovery": "Run /mika-groom-ticket <ref> to produce the canonical \
                                                      callout block, or dispatch dev-groom first via \
                                                      'mika ask --agent mika-dev \"groom <typed-ref>\"', or \
@@ -1028,8 +1057,10 @@ async fn validate_dispatch_readiness(
                                              gate ensures architect-reviewed plans are committed before \
                                              implementation begins (mika#907, mika#919)."
                                         )
-                                    })
-                                    .to_string());
+                                    });
+                                    record_dispatch_rejection(db, task_id, &rejection.to_string())
+                                        .await;
+                                    return Err(rejection.to_string());
                                 }
                             }
                             Err(e) => {
@@ -1072,7 +1103,7 @@ async fn validate_dispatch_readiness(
         match github_token {
             Some(token) => match fetch_open_blockers(token, &owner, &repo, number).await {
                 Ok(blockers) if !blockers.is_empty() => {
-                    return Err(serde_json::json!({
+                    let rejection = serde_json::json!({
                         "error": "dispatch_blocked_by",
                         "task_id": task_id,
                         "blocking_issues": blockers,
@@ -1081,8 +1112,9 @@ async fn validate_dispatch_readiness(
                             blockers.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", "),
                             if blockers.len() == 1 { "is" } else { "are" }
                         )
-                    })
-                    .to_string());
+                    });
+                    record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+                    return Err(rejection.to_string());
                 }
                 Ok(_) => { /* No open blockers — proceed */ }
                 Err(e) => {
@@ -1380,17 +1412,16 @@ async fn execute_long_running(
     // Check first without incrementing — the actual increment happens right before
     // spawn to avoid leaving the counter stuck at 1 if create_task or path validation fails.
     if ctx.dispatch_count.load(Ordering::Relaxed) > 0 {
-        return ToolOutput::error(
-            serde_json::json!({
-                "error": "dispatch_limit_exceeded",
-                "task_id": task_id,
-                "dispatches_this_turn": ctx.dispatch_count.load(Ordering::Relaxed),
-                "reason": "Only one long-running dispatch is permitted per agent turn. \
-                           A dispatch has already been launched in this turn. Wait for the \
-                           current dispatch to complete via callback before launching another."
-            })
-            .to_string(),
-        );
+        let rejection = serde_json::json!({
+            "error": "dispatch_limit_exceeded",
+            "task_id": task_id,
+            "dispatches_this_turn": ctx.dispatch_count.load(Ordering::Relaxed),
+            "reason": "Only one long-running dispatch is permitted per agent turn. \
+                       A dispatch has already been launched in this turn. Wait for the \
+                       current dispatch to complete via callback before launching another."
+        });
+        record_dispatch_rejection(&ctx.db, task_id, &rejection.to_string()).await;
+        return ToolOutput::error(rejection.to_string());
     }
 
     let estimated = estimated_duration_secs.unwrap_or(3600);
