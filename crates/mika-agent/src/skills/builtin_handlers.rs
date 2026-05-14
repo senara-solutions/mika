@@ -363,7 +363,14 @@ async fn read_with_counter<R: AsyncRead + Unpin>(
                 buf.extend_from_slice(&chunk[..n]);
                 counter.fetch_add(n, Ordering::Relaxed);
             }
-            Err(_) => break,
+            Err(e) => {
+                tracing::warn!(
+                    bytes_read = counter.load(Ordering::Relaxed),
+                    error = %e,
+                    "read_with_counter I/O error, returning partial buffer"
+                );
+                break;
+            }
         }
     }
     buf
@@ -439,8 +446,20 @@ async fn spawn_and_collect(
         tokio::join!(stdout_reader, stderr_reader, child.wait());
     progress_task.abort();
 
-    let stdout_buf = stdout_res.unwrap_or_default();
-    let stderr_buf = stderr_res.unwrap_or_default();
+    let stdout_buf = match stdout_res {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::warn!(tool = %tool_name, error = %e, "stdout reader task failed");
+            Vec::new()
+        }
+    };
+    let stderr_buf = match stderr_res {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::warn!(tool = %tool_name, error = %e, "stderr reader task failed");
+            Vec::new()
+        }
+    };
 
     // Post-completion summary (#900)
     tracing::info!(

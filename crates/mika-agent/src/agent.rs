@@ -36,6 +36,8 @@ const MAX_CALLBACK_TOOL_STEPS: usize = 20;
 const MAX_TEAM_TOOL_STEPS: usize = 20;
 const TOOL_TIMEOUT_SECS: u64 = 30;
 const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// Max chars of serialized tool input to include in timeout log lines (#900).
+const TOOL_TIMEOUT_INPUT_EXCERPT_LEN: usize = 200;
 /// Maximum bytes for callback results injected into the system prompt via
 /// `format_callback_framing()`. Results exceeding this are truncated to prevent
 /// oversized prompts from consuming the agent timeout during serialization.
@@ -2770,7 +2772,7 @@ async fn execute_tool(
     let input_excerpt: String = serde_json::to_string(&input)
         .unwrap_or_default()
         .chars()
-        .take(200)
+        .take(TOOL_TIMEOUT_INPUT_EXCERPT_LEN)
         .collect();
 
     // 1. Try builtin tool
