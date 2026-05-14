@@ -1,0 +1,16 @@
+[skill]
+name = "self-dev-callback"
+description = "Callback handler for claude-pilot and deploy_mika background tasks"
+version = "0.1.0"
+always_on = false
+dependencies = ["self-dev"]
+
+[triggers]
+keywords = [
+    "claude-pilot callback",
+    "callback",
+    "long_running:run_claude_pilot",
+    "long_running:deploy_mika",
+    "error_max_turns",
+    "PIPELINE FAILURE",
+]

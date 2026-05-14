@@ -65,7 +65,7 @@ fn bundled_skills_load_without_oversized_prompts() {
         panic!("{}", report);
     }
 
-    // Defensive sanity check: production has 17 bundled engine-coupled skills as
+    // Defensive sanity check: production has 22 bundled engine-coupled skills as
     // of this regression's introduction. If the count drops to zero, the test
     // is pointing at the wrong tree and `skipped.is_empty()` is meaningless.
     assert!(

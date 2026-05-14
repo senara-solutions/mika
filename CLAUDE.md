@@ -244,9 +244,11 @@ Skills are bundled and discovered at build time via `crates/mika-agent/build.rs`
 skills/bundled/
 ├── _shared/               # Shared dispatch library (dispatch-lib.sh) — NOT a skill, excluded from build-time discovery
 ├── self-dev/              # Main self-development orchestration (per-issue + milestone + project workflows)
+├── self-dev-callback/     # Callback handler for claude-pilot and deploy_mika background tasks (#1106)
 ├── self-dev-iterate/      # PR iteration handler for self-dev
 ├── self-dev-webhook-qa/   # QA webhook handler for self-dev
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
+├── self-dev-webhook-ready-label/ # Ready-label dispatch handler for GitHub issue labeled ready (#1106)
 ├── dev-pilot/             # Claude Code implementation dispatch (thin wrapper → _shared/dispatch-lib.sh, entry: /mika)
 ├── dev-groom/             # Two-pass grooming dispatch — operator or autonomous (prompt-only sibling — host: dev-pilot via run_claude_pilot, entry: /mika-groom-ticket)
 ├── qa-review/             # PR review skill

@@ -1,0 +1,13 @@
+[skill]
+name = "self-dev-webhook-ready-label"
+description = "Webhook handler for GitHub issue labeled ready dispatch"
+version = "0.1.0"
+always_on = false
+dependencies = ["self-dev"]
+
+[triggers]
+keywords = [
+    "issue labeled ready",
+    "ready label",
+    "issues.labeled.ready",
+]
