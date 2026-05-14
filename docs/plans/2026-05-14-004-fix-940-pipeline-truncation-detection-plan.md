@@ -7,15 +7,72 @@
 
 ## Phase 0 — File Pinning
 
-Three change sites across two repos:
+Three change sites across two repos. Pinned at mika `8731102d` and claude-pilot-py `463d8573`.
 
-| # | File | Repo | Purpose |
-|---|------|------|---------|
-| 1 | `skills/bundled/_shared/dispatch-lib.sh` | mika | Post-flight PR-existence check + outcome classification |
-| 2 | `src/claude_pilot/agent.py` | claude-pilot-py | `pipeline_incomplete` subtype on exit |
-| 3 | `src/claude_pilot/permissions.py` | claude-pilot-py | PR-creation tracking in `ToolCallCounter` |
+### Pin 1: `mika/skills/bundled/_shared/dispatch-lib.sh` — lines 387-394 + 523-535
 
-**Cross-ticket sequencing (mika#1032):** mika#1032 also modifies `dispatch-lib.sh` (dev-groom drift detection). These two tickets touch adjacent but non-overlapping sections of post-flight logic (lines 363-394). **Merge ordering:** mika#940 (this ticket) should merge after mika#1032 if both are in flight simultaneously, since #940 adds new code after the existing post-flight block while #1032 modifies the existing dev-groom plan-validation check. If #1032 is not yet in flight, #940 can proceed independently — the changes don't conflict at the line level. The implementer should check `gh pr list --repo senara-solutions/mika --search "1032"` before starting.
+**Insertion point A** (post-flight PR check, after line 394 — new `PIPELINE FAILURE` block):
+```bash
+        # Issue #138: Discover actual PR URL from the branch
+        if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
+            PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+            if [ -n "$PR_URL" ]; then
+                RESULT="${RESULT}
+PR: ${PR_URL}"
+            fi
+        fi
+```
+Insert the new `PIPELINE FAILURE` block immediately after line 394 (closing `fi` of the PR-discovery block).
+
+**Insertion point B** (env var export, line 525 — `dev-pilot)` case branch):
+```bash
+    case "$SKILL" in
+      dev-pilot)  ENTRY_COMMAND="/mika" ;;
+      dev-groom)
+```
+Change line 525 to add `export CLAUDE_PILOT_REQUIRE_PR=1` after the `ENTRY_COMMAND` assignment.
+
+### Pin 2: `claude-pilot-py/src/claude_pilot/agent.py` — lines 244-271
+
+**Insertion point** (after `status == "success"` check at line 260, before `_emit_result`):
+```python
+                # Normal result handling
+                result = ResultJson(
+                    status=status,
+                    subtype=subtype,
+                    ...
+                )
+                _emit_result(result)
+
+                if status == "success":
+                    log_done(...)
+```
+The `pipeline_incomplete` check inserts between the `result = ResultJson(...)` construction and `_emit_result(result)` at lines 245-258. When `require_pr=True` and `tool_call_counter.pr_created is False`, override `status` and `subtype` before constructing `ResultJson`.
+
+### Pin 3: `claude-pilot-py/src/claude_pilot/permissions.py` — lines 53-69
+
+**Modification point** (`ToolCallCounter` class):
+```python
+class ToolCallCounter:
+    """Tracks the number of tool calls observed during a session."""
+
+    def __init__(self) -> None:
+        self._count = 0
+
+    def increment(self) -> None:
+        self._count += 1
+
+    @property
+    def count(self) -> int:
+        return self._count
+```
+Add `pr_created: bool = False` field and a `record_pr_creation(self, tool_name: str, tool_input: dict)` method that sets `self.pr_created = True` when `tool_name == "Bash"` and `"gh pr create"` is in `tool_input.get("command", "")`.
+
+### Cross-ticket sequencing (mika#1032)
+
+mika#1032 also modifies `dispatch-lib.sh` (dev-groom drift detection). These two tickets touch adjacent but non-overlapping sections of post-flight logic (lines 363-394). **Merge ordering:** mika#940 (this ticket) should merge after mika#1032 if both are in flight simultaneously, since #940 adds new code after the existing post-flight block while #1032 modifies the existing dev-groom plan-validation check. If #1032 is not yet in flight, #940 can proceed independently — the changes don't conflict at the line level. The implementer should check `gh pr list --repo senara-solutions/mika --search "1032"` before starting.
+
+**Shift note (post-#1032 merge):** If #1032 merges first, the line numbers for insertion point A may shift by a few lines. The anchor is the `# Issue #138: Discover actual PR URL from the branch` comment — insert after its closing `fi`.
 
 ## Problem
 
