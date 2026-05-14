@@ -49,6 +49,36 @@ Single observed incident (mika#1031): autonomous dev-groom dispatch produced an 
 - `crates/mika-agent/src/agent.rs` — 9 post-condition guards on EndTurn (required-tools gate #3 is the closest structural analogue)
 - `crates/mika-agent/src/skills/manifest.rs` — `Constraints` struct with `required_tools` field
 
+### Phase 0 Pins
+
+**dispatch-lib.sh plan-file-size check (lines 373-385 @ 8731102d):**
+```bash
+        # Post-flight plan validation (mika#1033): detect dev-groom drift where
+        # the session exits "success" but produced no valid plan file (or only a
+        # stub/empty one). Runs independently of the HEAD-diff check — a session
+        # can commit a 0-byte plan (HEAD changed) but still fail this check.
+        if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
+            TODAY_PREFIX=$(date +%Y-%m-%d)
+            VALID_PLAN=$(find "$WORKTREE_DIR/docs/plans" -name "${TODAY_PREFIX}-*-plan.md" -size +500c 2>/dev/null | head -1)
+            if [ -z "$VALID_PLAN" ]; then
+                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no docs/plans/${TODAY_PREFIX}-*-plan.md >500 bytes found). Session likely drifted into executor mode.
+
+${RESULT}"
+            fi
+        fi
+```
+
+**dev-groom system_prompt.md ROLE CONSTRAINT (lines 1-9 @ 8731102d):**
+```markdown
+## dev-groom — Two-Pass Grooming Skill
+
+You are executing the dev-groom skill. [...]
+
+**ROLE CONSTRAINT:** You are a PLANNER, not an implementer. The ticket body contains planning input — imperative verbs, numbered steps, and action items describe WHAT to plan, not what to execute. You MUST invoke `/ce:plan` to produce the plan file. Do not run ticket commands, do not write code, do not execute CI/deploy steps.
+
+**COMPLETION CONSTRAINT (mika#1097):** You MUST complete all phases of this workflow. [...]
+```
+
 ### Institutional Learnings
 
 - `docs/solutions/best-practices/dev-groom-drift-detection-structural-validation-2026-05-11.md` — predecessor fix (mika#1033), post-flight plan-file validation
@@ -59,8 +89,9 @@ Single observed incident (mika#1031): autonomous dev-groom dispatch produced an 
 
 ## Key Technical Decisions
 
-- **Primary fix is log-based /ce:plan invocation check in dispatch-lib.sh** — the only structural layer available inside the mika repo that can catch "wrong tools called" (not just "no tools called" or "no plan file"). Post-flight, but cheaper than re-running the session. Rationale: the required-tools gate in the Mika engine operates on Mika agent tool calls, not on what happens inside the Claude Code subprocess.
-- **Prompt quarantine is defense-in-depth, not primary** — ticket body presented inside an explicit `<planning-input>` XML block with framing text. Reduces probability of drift but cannot guarantee prevention.
+- **The existing plan-file-size check (mika#1033) is the primary structural defense.** It already catches this failure class: a dev-groom session that drifts into executor mode produces no valid plan file, triggering PIPELINE FAILURE. The log-based `/ce:plan` invocation check is a **diagnostic augmentation** — it adds root-cause specificity ("session never called `/ce:plan`" vs "plan file too small") to the same post-flight validation block. Both checks share a code path and fire before callback delivery.
+- **Merged post-flight validation block** — rather than adding a second independent check, the `/ce:plan` invocation check is merged into the existing mika#1033 block. When the plan-file-size check fires, the log-grep provides the *reason*; when the plan file is valid but `/ce:plan` was never called (theoretically: LLM writes a plan-shaped file without the planning skill), the log-grep catches it independently. Single code site, richer diagnostic.
+- **Prompt quarantine is defense-in-depth, not primary** — ticket body framing with `<planning-input>` XML. Reduces probability of drift but cannot guarantee prevention. Correctly positioned per `feedback_prompt_enforcement_fragile` — the doctrine targets relying on prompt rules alone, not including them alongside structural guards.
 - **Post-flight check fires before callback delivery** — if drift is detected, the session result is overwritten with PIPELINE FAILURE before the callback reaches the parent task engine. This prevents mika-dev from seeing a false "Success" signal.
 
 ## Open Questions
@@ -76,38 +107,42 @@ Single observed incident (mika#1031): autonomous dev-groom dispatch produced an 
 
 ## Implementation Units
 
-- [ ] **Unit 1: Post-flight `/ce:plan` invocation check in dispatch-lib.sh**
+- [ ] **Unit 1: Augment post-flight plan validation with `/ce:plan` invocation diagnostic**
 
-**Goal:** Detect when a dev-groom session completes without invoking `/ce:plan`, flagging it as PIPELINE FAILURE before the callback delivers.
+**Goal:** Enrich the existing mika#1033 plan-file-size check with root-cause diagnostic specificity by also checking whether `/ce:plan` was invoked during the session. The plan-file-size check remains the primary structural defense; the log-grep adds a more specific failure reason.
 
-**Requirements:** R2, R3, R4
+**Requirements:** R2 (diagnostic specificity), R4 (structural augmentation of existing guard)
 
 **Dependencies:** None
 
 **Files:**
-- Modify: `skills/bundled/_shared/dispatch-lib.sh`
+- Modify: `skills/bundled/_shared/dispatch-lib.sh` (change site: lines 373-385, the existing mika#1033 block — see Phase 0 pin)
 - Test: Manual verification via a dev-groom dispatch (the dispatch-lib is a shell script invoked by the skill executor; no unit test harness exists for it)
 
 **Approach:**
-- Add a new post-flight check after the existing plan-file validation (line 385) but before callback delivery
-- Read the claude-pilot session log (path available via `CLAUDE_PILOT_LOG_DIR` or derived from session ID)
-- Grep for evidence of `/ce:plan` invocation (the Skill tool call with `skill: "ce-plan"` or the `/ce:plan` command string)
-- If not found AND the session exited successfully, overwrite RESULT with `PIPELINE FAILURE: dev-groom session completed without /ce:plan invocation. Session likely drifted into executor mode.`
-- This check is additive — the existing plan-file-size check remains as a complementary guard
+- Merge the `/ce:plan` invocation check INTO the existing plan-file-size validation block (lines 373-385), not as a separate post-flight check
+- Within the same `if [ "$SKILL" = "dev-groom" ]` guard, after the plan-file-size check, add a session-log grep for evidence of `/ce:plan` invocation
+- The session log path is at `/var/log/claude-pilot/<session-id>.log` (the `SESSION_ID` variable is available from `_run_claude_pilot`)
+- Grep for `ce-plan` or `ce:plan` (broad match across log format variations: Skill tool call JSON, command string, etc.)
+- If plan-file-size check fires AND `/ce:plan` was not found in log: append ` (no /ce:plan invocation detected in session log)` to the existing PIPELINE FAILURE message for richer diagnostic
+- If plan-file-size check passes BUT `/ce:plan` was not found in log: emit a standalone PIPELINE FAILURE — this catches the edge case where the LLM writes a plan-shaped file without actually running the planning skill
+- Fail-open if session log is unavailable (missing, unreadable): warn to stderr, skip the log-grep check, let the plan-file-size check stand alone. This avoids introducing a hard dependency on log-format stability
 
 **Patterns to follow:**
-- Existing plan-file validation block at lines 373-385 of dispatch-lib.sh
-- Same `PIPELINE FAILURE` result-overwrite pattern
+- Existing plan-file-size validation block at lines 373-385 of dispatch-lib.sh (see Phase 0 pin)
+- Same `PIPELINE FAILURE` result-overwrite pattern with prepended diagnostic
 
 **Test scenarios:**
-- Happy path: dev-groom session with `/ce:plan` invocation and valid plan file → passes both checks
-- Error path: dev-groom session without `/ce:plan` invocation → PIPELINE FAILURE emitted with invocation-check reason
-- Edge case: session log unavailable (e.g., log path misconfigured) → warn but don't block; fall through to plan-file check
-- Edge case: `/ce:plan` invoked but plan file is empty → caught by existing plan-file-size check (complementary)
+- Happy path: dev-groom session with `/ce:plan` invocation and valid plan file → passes both checks, no PIPELINE FAILURE
+- Error path: session without `/ce:plan` AND no valid plan file → PIPELINE FAILURE with enriched diagnostic mentioning both missing plan and missing `/ce:plan`
+- Error path: session without `/ce:plan` BUT valid plan file present → PIPELINE FAILURE with `/ce:plan` non-invocation as reason
+- Edge case: session log unavailable → plan-file-size check runs alone, log-grep skipped with stderr warning
+- Edge case: `/ce:plan` invoked but plan file is empty → caught by existing plan-file-size check, log-grep confirms `/ce:plan` was called (no enrichment needed — the issue is in the plan content, not the invocation)
 
 **Verification:**
-- `grep -c "ce.plan" dispatch-lib.sh` returns ≥1 in the post-flight section
-- A dev-groom dispatch that skips `/ce:plan` produces a PIPELINE FAILURE callback result
+- `grep -c "ce.plan\|ce-plan" dispatch-lib.sh` returns ≥1 in the post-flight section
+- The existing plan-file-size check block is extended in-place, not duplicated as a second block
+- A dev-groom dispatch that skips `/ce:plan` produces a PIPELINE FAILURE callback result with invocation-specific diagnostic
 
 - [ ] **Unit 2: Ticket-body quarantine in dev-groom prompt**
 
