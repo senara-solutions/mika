@@ -50,12 +50,28 @@ Three diagnostic capabilities were added to close the visibility gap:
 
 ### Phase 0 outcome
 
-**Pending live reproduction.** Deploy the instrumented build and single-dispatch `mika ask --agent mika-dev "groom mika issue#1057"` with trace enabled. One of four outcomes will be named:
+**Outcome 0 — Skill-context vocabulary mismatch (mechanism (a): required_suffix_lines guard didn't fire on the architect response).**
 
-- **Outcome 0**: mika#1081's ROLE CONSTRAINT block is the proximate cause
-- **Outcome 1**: Model produces thinking blocks only and exits end_turn
-- **Outcome 2**: Tool calls are attempted but denied/fail silently
-- **Outcome 3**: Single-dispatch always works; mass-dispatch is the variable
+The grooming for mika#1097 completed structurally — mika-arch reviewed the plan in two passes (session `166ff701-7ff7-4f90-8b16-b1c0f27c382d`) — but the second-pass verdict used the wrong vocabulary, blocking downstream dispatch.
+
+**Evidence chain (from `~/.mika/data/mika.db`):**
+
+1. **Both passes ran under the first-pass skill context.** All `llm_calls` rows for session `166ff701` have `prompt_variant = {"mika-arch-groom-ticket":"base"}` — including the second-pass response (row `153e6316`). The `mika-arch-second-review` skill was never activated.
+
+2. **The architect emitted `Disposition: READY` instead of `Verdict: GROOMED`.** Message `33773` (second-pass response): *"Stored. The mika#1097 GROOMED verdict and the key diagnostic decisions are now persisted… Disposition: READY"*. The model believed it was emitting a GROOMED verdict (note the body text saying "GROOMED verdict") but used the first-pass keyword (`Disposition:`) and value (`READY`) instead of the second-pass vocabulary (`Verdict: GROOMED`).
+
+3. **The wrong guard accepted the response.** `mika-arch-groom-ticket/skill.toml` has `required_suffix_lines = ["Disposition: READY", "Disposition: ITERATE", "Disposition: ESCALATE"]`. Since the skill context stayed first-pass, `Disposition: READY` matched the guard and was accepted. The second-pass guard (`mika-arch-second-review/skill.toml`: `required_suffix_lines = ["Verdict: GROOMED", "Verdict: ESCALATE"]`) never ran.
+
+4. **The groomer faithfully transcribed "READY" into the issue body callout.** mika-dev sessions `a17e82c2` and `a77e701e` show the engine gate `dispatch_no_grooming_marker` rejecting the dispatch because the issue body contained `second-pass (READY)` instead of the required `second-pass (GROOMED)` verbatim. Session `018cf783` shows dispatch eventually succeeded after manual intervention.
+
+**Root cause:** The two-pass grooming ran in a single mika-arch session (`166ff701`), and the skill context was bound to `mika-arch-groom-ticket` at session creation and never switched to `mika-arch-second-review` for the second pass. The `required_suffix_lines` guard is per-skill, so the first-pass guard's vocabulary (`Disposition: READY/ITERATE/ESCALATE`) was applied on both passes. The vocabulary divergence between the two skills (`Disposition:` vs `Verdict:`, `READY` vs `GROOMED`) meant the second-pass response passed validation under the wrong guard but was semantically wrong for the downstream dispatch gate.
+
+**Disposition of original four outcomes:**
+
+- **Outcome 0** (mika#1081 ROLE CONSTRAINT): Not directly tested in this reproduction, but the fix (Layer A) rewrites the prompt as defense-in-depth.
+- **Outcome 1** (thinking-only exit): Not observed — the architect session had 10 tool calls and substantial content.
+- **Outcome 2** (tools denied/fail): Not observed — all tool calls succeeded.
+- **Outcome 3** (mass-dispatch variable): Partially confirmed — the original 6/8 failures occurred during mass-dispatch; the single-dispatch grooming of #1097 itself worked (architect reviewed and approved).
 
 ## Solution
 
