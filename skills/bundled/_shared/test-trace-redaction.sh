@@ -15,12 +15,14 @@ eval "$(sed -n '/^_scrub_secrets_from_output()/,/^}/p' "$SCRIPT_DIR/dispatch-lib
 # Simulate trace lines containing secrets (matches what set -x produces)
 TEST_INPUT="+ GH_APP_TOKEN=ghs_abc123XYZ_installation_token
 + echo ghs_abc123XYZ_installation_token
++ ghp_classic_pat_with_underscores
 + MIKA_ANTHROPIC_API_KEY=sk-ant-api03-very-secret
 + MIKA_INTERNAL_TOKEN=internal-secret-token
 + GH_TOKEN=ghp_1234567890abcdef
 + ghp_1234567890abcdef
 + github_pat_fine_grained_token_value
 + MIKA_GITHUB_APP_PRIVATE_KEY=base64encodedpemdata
++ ghu_OAuthUserToken1234
 + normal_command arg1 arg2
 + echo 'safe output with no secrets'"
 
@@ -38,11 +40,14 @@ EXPECTED_PATTERNS=(
 
 FORBIDDEN_PATTERNS=(
     "ghs_abc123"
+    "installation_token"
     "github_pat_fine"
     "sk-ant-api03"
     "internal-secret-token"
     "ghp_1234567890"
+    "ghp_classic_pat"
     "base64encodedpemdata"
+    "ghu_OAuthUser"
 )
 
 RESULT=$(echo "$TEST_INPUT" | _scrub_secrets_from_output)
