@@ -71,24 +71,17 @@ pub struct WellKnownAgent {
 }
 
 /// mika-dev agent specification.
+///
+/// Uses identity-driven `[skills].allowlist` (D2 cross-cutting, #815).
+/// New bundled skills must be explicitly added to `MIKA_DEV_IDENTITY`'s
+/// allowlist — they are denied by default.
 pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
     name: "mika-dev",
     display_name: "Dev",
     emoji: "🛠",
     soul: MIKA_DEV_SOUL,
-    // mika-arch-* skills are review-class for the architect agent only;
-    // exclude them from mika-dev to prevent context pollution and arch-style
-    // keyword triggers firing on dev work.
-    // dev-groom is operator-only (#845) — mika-dev must NOT auto-invoke grooming.
-    disabled_skills: &[
-        "qa-review",
-        "qa-review-build-callback",
-        "skill-review",
-        "mika-arch-groom-ticket",
-        "mika-arch-groom-milestone",
-        "mika-arch-second-review",
-        "dev-groom",
-    ],
+    // Empty: mika-dev uses identity allowlist, not denylist (#815).
+    disabled_skills: &[],
     config_toml: None,
     // KG disabled (#800): mika-dev has zero `query_knowledge_graph` usage —
     // retrieval goes through `search_memory` (FTS5+vec over memory_facts).
@@ -110,40 +103,56 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
 /// `provision_well_known_agents()`.
 pub const DISPATCH_TRIGGER_ALLOWLIST: &[&str] = &["samidarko", "mika-platform-dev"];
 
-/// mika-dev identity.toml — KG disabled per mika#800.
+/// mika-dev identity.toml — KG disabled per mika#800, identity-driven
+/// allowlist per mika#815 (D2 cross-cutting).
 const MIKA_DEV_IDENTITY: &str = "\
 name = \"Dev\"\n\
 emoji = \"🛠\"\n\
 \n\
 [kg]\n\
-enabled = false\n";
+enabled = false\n\
+\n\
+[skills]\n\
+allowlist = [\n\
+  \"self-dev\",\n\
+  \"self-dev-callback\",\n\
+  \"self-dev-iterate\",\n\
+  \"self-dev-webhook-qa\",\n\
+  \"self-dev-webhook-ci\",\n\
+  \"self-dev-webhook-ready-label\",\n\
+  \"dev-pilot\",\n\
+  \"build-mika\",\n\
+  \"deploy-mika\",\n\
+  \"permission-policy\",\n\
+  \"agents-teams\",\n\
+  \"address-pr-comments\",\n\
+  \"resolve-pr-conflicts\",\n\
+  \"self-check\",\n\
+  \"dev-handsoff\",\n\
+  \"tmux\",\n\
+  \"shell-exec\",\n\
+  \"web-search\",\n\
+  \"file-reader\",\n\
+  \"self-knowledge\",\n\
+  \"git-ops\",\n\
+  \"google-workspace\",\n\
+  \"github\",\n\
+  \"mcp\",\n\
+  \"browser-control\",\n\
+]\n";
 
 /// mika-qa agent specification.
+///
+/// Uses identity-driven `[skills].allowlist` (D2 cross-cutting, #815).
+/// New bundled skills must be explicitly added to `MIKA_QA_IDENTITY`'s
+/// allowlist — they are denied by default.
 pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
     name: "mika-qa",
     display_name: "QA",
     emoji: "🔍",
     soul: MIKA_QA_SOUL,
-    disabled_skills: &[
-        "self-dev",
-        "self-dev-callback",
-        "self-dev-iterate",
-        "self-dev-webhook-qa",
-        "self-dev-webhook-ci",
-        "self-dev-webhook-ready-label",
-        "dev-pilot",
-        "permission-policy",
-        "agents-teams",
-        "address-pr-comments",
-        "resolve-pr-conflicts",
-        // mika-arch-* skills are for the architect agent only — keep mika-qa
-        // focused on PR review without arch-style triggers.
-        "mika-arch-groom-ticket",
-        "mika-arch-groom-milestone",
-        "mika-arch-second-review",
-        // dev-groom is operator-only (#845) — mika-qa must NOT invoke grooming.
-        "dev-groom",
-    ],
+    // Empty: mika-qa uses identity allowlist, not denylist (#815).
+    disabled_skills: &[],
     config_toml: None,
     // KG disabled (#800): mika-qa has zero `query_knowledge_graph` usage —
     // retrieval goes through `search_memory` (FTS5+vec over memory_facts).
@@ -153,65 +162,68 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
     llm_overrides: &[],
 };
 
-/// mika-qa identity.toml — KG disabled per mika#800.
+/// mika-qa identity.toml — KG disabled per mika#800, identity-driven
+/// allowlist per mika#815 (D2 cross-cutting).
 const MIKA_QA_IDENTITY: &str = "\
 name = \"QA\"\n\
 emoji = \"🔍\"\n\
 \n\
 [kg]\n\
-enabled = false\n";
+enabled = false\n\
+\n\
+[skills]\n\
+allowlist = [\n\
+  \"qa-review\",\n\
+  \"qa-review-build-callback\",\n\
+  \"skill-review\",\n\
+  \"build-mika\",\n\
+  \"deploy-mika\",\n\
+  \"self-check\",\n\
+  \"dev-handsoff\",\n\
+  \"tmux\",\n\
+  \"shell-exec\",\n\
+  \"web-search\",\n\
+  \"file-reader\",\n\
+  \"self-knowledge\",\n\
+  \"git-ops\",\n\
+  \"google-workspace\",\n\
+  \"github\",\n\
+  \"mcp\",\n\
+  \"browser-control\",\n\
+]\n";
 
 /// mika-relay agent specification.
 ///
 /// Lightweight agent for handling claude-pilot (the binary) `can_use_tool`
-/// permission relay events. Only the `permission-policy` skill is enabled;
-/// all other bundled skills are disabled. Uses haiku for cheap, fast JSON
-/// classification.
+/// permission relay events. Only the `permission-policy` skill is enabled
+/// via identity-driven allowlist; all others are denied by default.
+/// Uses haiku for cheap, fast JSON classification.
+///
+/// Uses identity-driven `[skills].allowlist` (D2 cross-cutting, #815).
+/// mika-relay's 1-skill allowlist is the exemplar for restrictive agent
+/// scoping — new bundled skills are denied unless explicitly added.
 pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
     name: "mika-relay",
     display_name: "Relay",
     emoji: "🔑",
     soul: MIKA_RELAY_SOUL,
-    disabled_skills: &[
-        // Disable all bundled skills except permission-policy.
-        // Engine-coupled (skills/bundled/):
-        "self-dev",
-        "self-dev-callback",
-        "self-dev-iterate",
-        "self-dev-webhook-qa",
-        "self-dev-webhook-ci",
-        "self-dev-webhook-ready-label",
-        "qa-review",
-        "qa-review-build-callback",
-        "skill-review",
-        "dev-pilot",
-        "build-mika",
-        "deploy-mika",
-        "agents-teams",
-        "address-pr-comments",
-        "resolve-pr-conflicts",
-        "self-check",
-        "mika-arch-groom-ticket",
-        "mika-arch-groom-milestone",
-        "mika-arch-second-review",
-        "dev-groom",
-        "dev-handsoff",
-        // Community (hardcoded BUNDLED_SKILLS):
-        "tmux",
-        "shell-exec",
-        "web-search",
-        "file-reader",
-        "self-knowledge",
-        "git-ops",
-        "google-workspace",
-        "github",
-        "mcp",
-        "browser-control",
-    ],
+    // Empty: mika-relay uses identity allowlist, not denylist (#815).
+    disabled_skills: &[],
     config_toml: Some(MIKA_RELAY_CONFIG),
-    identity_source: None,
+    identity_source: Some(IdentitySource::Static(MIKA_RELAY_IDENTITY)),
     llm_overrides: &[],
 };
+
+/// mika-relay identity.toml — identity-driven allowlist per mika#815
+/// (D2 cross-cutting). Only `permission-policy` is enabled.
+const MIKA_RELAY_IDENTITY: &str = "\
+name = \"Relay\"\n\
+emoji = \"🔑\"\n\
+\n\
+[skills]\n\
+allowlist = [\n\
+  \"permission-policy\",\n\
+]\n";
 
 /// mika-arch agent specification.
 ///
@@ -508,12 +520,112 @@ pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disable
     }
 }
 
+/// One-time migration: delete stale `skill_overrides` denylist rows for
+/// well-known agents that moved to identity-driven `[skills].allowlist`
+/// (mika#815, D2 cross-cutting).
+///
+/// Scope: `agent_id IN ('mika-dev', 'mika-qa', 'mika-relay')` with
+/// `enabled = 0` (denylist-seeded rows only). Operator-set LLM overrides
+/// (`enabled IS NULL`, `llm_provider`/`llm_model` non-NULL) are preserved.
+/// User-defined agents are untouched.
+///
+/// Idempotency: guarded by `schema_meta` marker `well_known_d2_migration_v1`.
+/// Marker write + DELETE are atomic (single transaction).
+pub fn migrate_well_known_to_identity_allowlist(db: &mut Database) {
+    // Check if migration already ran
+    let has_marker: bool = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_meta WHERE key = 'well_known_d2_migration_v1'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if has_marker {
+        return;
+    }
+
+    // Run migration in a single transaction (marker + DELETE are atomic)
+    let tx = match db.conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => {
+            error!(
+                error = %e,
+                "failed to start transaction for well-known D2 migration"
+            );
+            return;
+        }
+    };
+
+    let agents = ["mika-dev", "mika-qa", "mika-relay"];
+    let mut total_deleted = 0u32;
+    for agent_id in &agents {
+        let deleted: usize = match tx.execute(
+            "DELETE FROM skill_overrides WHERE agent_id = ?1 AND enabled = 0",
+            [agent_id],
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                error!(
+                    agent = *agent_id,
+                    error = %e,
+                    "failed to delete denylist rows for well-known agent during D2 migration"
+                );
+                // Transaction will roll back on drop
+                return;
+            }
+        };
+        if deleted > 0 {
+            info!(
+                agent = *agent_id,
+                deleted_rows = deleted,
+                "deleted stale denylist skill_overrides rows (D2 migration)"
+            );
+        }
+        total_deleted += deleted as u32;
+    }
+
+    // Write idempotency marker
+    if let Err(e) = tx.execute(
+        "INSERT INTO schema_meta (key, value) VALUES ('well_known_d2_migration_v1', '1')",
+        [],
+    ) {
+        error!(
+            error = %e,
+            "failed to write D2 migration marker"
+        );
+        return;
+    }
+
+    if let Err(e) = tx.commit() {
+        error!(
+            error = %e,
+            "failed to commit well-known D2 migration transaction"
+        );
+        return;
+    }
+
+    info!(
+        total_deleted = total_deleted,
+        "well-known D2 migration complete: stale denylist rows removed, \
+         agents now use identity-driven [skills].allowlist"
+    );
+}
+
 /// Seed skill overrides for a well-known agent, with drift reconciliation.
 ///
 /// Seeds skill overrides for a well-known agent. On first creation (no
 /// existing rows), writes `set_skill_enabled(false)` for disabled skills
 /// and seeds LLM overrides. On subsequent runs, reconciles both disabled
 /// skills and LLM overrides that have drifted from the source spec.
+///
+/// **Fast-path exit:** agents with empty `disabled_skills` AND empty
+/// `llm_overrides` return immediately — nothing to seed or reconcile.
+/// Post-#815, this applies to mika-dev, mika-qa, and mika-relay (all
+/// use identity allowlist). mika-arch still enters for LLM override
+/// reconciliation.
 ///
 /// Disabled-skills reconciliation (mika#1041): when a new skill is added
 /// to the well-known denylist after the agent was first provisioned, the
@@ -525,6 +637,12 @@ pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
         Some(s) => s,
         None => return,
     };
+
+    // Fast-path exit: agents with identity-driven allowlist and no LLM
+    // overrides have nothing to seed or reconcile (#815).
+    if spec.disabled_skills.is_empty() && spec.llm_overrides.is_empty() {
+        return;
+    }
 
     // Check if any overrides already exist
     match db.get_skill_overrides(agent_name) {
@@ -969,19 +1087,22 @@ mod tests {
         "permission-policy",
     ];
 
-    /// Invariant: well-known agents that declare a `[skills].allowlist` (i.e.
-    /// they're advertised as scoped/read-only) must not have any write-capable
-    /// bundled skill in their active set after the allowlist is applied.
+    /// Invariant: well-known agents that are **read-only** (declare both
+    /// `[skills].allowlist` AND `[tools].disabled`) must not have any
+    /// write-capable bundled skill in their active set.
+    ///
+    /// Post-#815, all four well-known agents have `[skills].allowlist`, but
+    /// only mika-arch is read-only (has `[tools].disabled`). mika-dev,
+    /// mika-qa, and mika-relay are write-capable agents whose allowlists
+    /// legitimately include write-capable skills.
     ///
     /// This protects against the silent-reorder regression flagged by the
     /// testing reviewer: if a future refactor reorders `apply_identity_allowlist`
     /// vs `apply_overrides`, or if a new write-capable skill ships and isn't
     /// added to the denylist tracker above, this test fails loud.
     #[test]
-    fn test_well_known_allowlist_excludes_write_capable_skills() {
+    fn test_read_only_allowlist_excludes_write_capable_skills() {
         for spec in WELL_KNOWN_AGENTS {
-            // Render identity for this agent. Static-no-identity agents skip;
-            // computed agents use test settings.
             let identity_toml = match render_identity_content(spec, &test_settings_with_kg_roots())
             {
                 Ok(t) => t,
@@ -991,15 +1112,23 @@ mod tests {
                 Ok(i) => i,
                 Err(_) => continue,
             };
+
+            // Only check agents that are read-only (have [tools].disabled).
+            // Agents without a tool denylist are write-capable and their
+            // allowlists legitimately include write-capable skills.
+            if identity.tools.disabled.is_empty() {
+                continue;
+            }
+
             let allowlist = match identity.skills.allowlist {
                 Some(a) if !a.is_empty() => a,
-                _ => continue, // Agents without an allowlist aren't gated by this invariant.
+                _ => continue,
             };
 
             for entry in &allowlist {
                 assert!(
                     !WRITE_CAPABLE_SKILLS_FOR_INVARIANT_TEST.contains(&entry.as_str()),
-                    "well-known agent '{}' has write-capable skill '{}' in its [skills].allowlist. \
+                    "read-only agent '{}' has write-capable skill '{}' in its [skills].allowlist. \
                      Either remove it from the allowlist or remove it from \
                      WRITE_CAPABLE_SKILLS_FOR_INVARIANT_TEST (with justification).",
                     spec.name,
@@ -1032,6 +1161,19 @@ mod tests {
             dev_identity.contains("enabled = false"),
             "mika-dev must have KG disabled (#800)"
         );
+        // #815: mika-dev must have identity-driven allowlist
+        assert!(
+            dev_identity.contains("[skills]"),
+            "mika-dev identity must contain [skills] section (#815)"
+        );
+        assert!(
+            dev_identity.contains("allowlist"),
+            "mika-dev identity must contain allowlist (#815)"
+        );
+        assert!(
+            dev_identity.contains("\"self-dev\""),
+            "mika-dev allowlist must include self-dev"
+        );
 
         let qa_identity = fs::read_to_string(
             mika_common::agent::agent_dir(home, "mika-qa").join("identity.toml"),
@@ -1048,6 +1190,15 @@ mod tests {
             qa_identity.contains("enabled = false"),
             "mika-qa must have KG disabled (#800)"
         );
+        // #815: mika-qa must have identity-driven allowlist
+        assert!(
+            qa_identity.contains("[skills]"),
+            "mika-qa identity must contain [skills] section (#815)"
+        );
+        assert!(
+            qa_identity.contains("\"qa-review\""),
+            "mika-qa allowlist must include qa-review"
+        );
 
         let relay_identity = fs::read_to_string(
             mika_common::agent::agent_dir(home, "mika-relay").join("identity.toml"),
@@ -1055,6 +1206,15 @@ mod tests {
         .unwrap();
         assert!(relay_identity.contains("name = \"Relay\""));
         assert!(relay_identity.contains("emoji = \"🔑\""));
+        // #815: mika-relay must have identity-driven allowlist
+        assert!(
+            relay_identity.contains("[skills]"),
+            "mika-relay identity must contain [skills] section (#815)"
+        );
+        assert!(
+            relay_identity.contains("\"permission-policy\""),
+            "mika-relay allowlist must include permission-policy"
+        );
     }
 
     #[test]
@@ -1168,7 +1328,9 @@ mod tests {
     }
 
     #[test]
-    fn test_seed_skill_overrides_mika_dev() {
+    fn test_seed_skill_overrides_fast_path_mika_dev() {
+        // Post-#815: mika-dev has empty disabled_skills and empty llm_overrides,
+        // so seed_well_known_skill_overrides takes the fast-path exit.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
         let mut db = Database::open(&db_path).unwrap();
@@ -1178,19 +1340,15 @@ mod tests {
         seed_well_known_skill_overrides(&mut db, "mika-dev");
 
         let overrides = db.get_skill_overrides("mika-dev").unwrap();
-        assert_eq!(overrides.len(), MIKA_DEV.disabled_skills.len());
-        for ovr in &overrides {
-            assert_eq!(ovr.enabled, Some(false));
-            assert!(
-                MIKA_DEV.disabled_skills.contains(&ovr.skill_name.as_str()),
-                "unexpected override: {}",
-                ovr.skill_name
-            );
-        }
+        assert!(
+            overrides.is_empty(),
+            "mika-dev should have zero skill_overrides rows (uses identity allowlist)"
+        );
     }
 
     #[test]
-    fn test_seed_skill_overrides_mika_qa() {
+    fn test_seed_skill_overrides_fast_path_mika_qa() {
+        // Post-#815: mika-qa has empty disabled_skills and empty llm_overrides.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
         let mut db = Database::open(&db_path).unwrap();
@@ -1199,54 +1357,15 @@ mod tests {
         seed_well_known_skill_overrides(&mut db, "mika-qa");
 
         let overrides = db.get_skill_overrides("mika-qa").unwrap();
-        assert_eq!(overrides.len(), MIKA_QA.disabled_skills.len());
-        for ovr in &overrides {
-            assert_eq!(ovr.enabled, Some(false));
-            assert!(
-                MIKA_QA.disabled_skills.contains(&ovr.skill_name.as_str()),
-                "unexpected override: {}",
-                ovr.skill_name
-            );
-        }
-    }
-
-    #[test]
-    fn test_seed_skill_overrides_reconciles_existing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let mut db = Database::open(&db_path).unwrap();
-        db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
-            .unwrap();
-
-        // Set a custom override first (simulates a pre-existing agent)
-        db.set_skill_enabled("mika-dev", "some-custom-skill", false)
-            .unwrap();
-
-        // Now seed — should reconcile disabled_skills from spec
-        seed_well_known_skill_overrides(&mut db, "mika-dev");
-
-        let overrides = db.get_skill_overrides("mika-dev").unwrap();
-        // Should have the custom override PLUS all well-known disabled skills
-        assert_eq!(overrides.len(), 1 + MIKA_DEV.disabled_skills.len());
-        // Custom override preserved
         assert!(
-            overrides
-                .iter()
-                .any(|o| o.skill_name == "some-custom-skill")
+            overrides.is_empty(),
+            "mika-qa should have zero skill_overrides rows (uses identity allowlist)"
         );
-        // All spec disabled_skills reconciled
-        for skill_name in MIKA_DEV.disabled_skills {
-            let row = overrides.iter().find(|o| o.skill_name == *skill_name);
-            assert!(
-                row.is_some(),
-                "expected disabled-row for {skill_name}, found none"
-            );
-            assert_eq!(row.unwrap().enabled, Some(false));
-        }
     }
 
     #[test]
-    fn test_seed_skill_overrides_mika_relay() {
+    fn test_seed_skill_overrides_fast_path_mika_relay() {
+        // Post-#815: mika-relay has empty disabled_skills and empty llm_overrides.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
         let mut db = Database::open(&db_path).unwrap();
@@ -1256,48 +1375,39 @@ mod tests {
         seed_well_known_skill_overrides(&mut db, "mika-relay");
 
         let overrides = db.get_skill_overrides("mika-relay").unwrap();
-        assert_eq!(overrides.len(), MIKA_RELAY.disabled_skills.len());
-        for ovr in &overrides {
-            assert_eq!(ovr.enabled, Some(false));
-            assert!(
-                MIKA_RELAY
-                    .disabled_skills
-                    .contains(&ovr.skill_name.as_str()),
-                "unexpected override: {}",
-                ovr.skill_name
-            );
-        }
-    }
-
-    #[test]
-    fn test_relay_only_allows_permission_policy() {
-        // Verify that permission-policy is NOT in the disabled list
         assert!(
-            !MIKA_RELAY.disabled_skills.contains(&"permission-policy"),
-            "permission-policy must not be disabled for mika-relay"
+            overrides.is_empty(),
+            "mika-relay should have zero skill_overrides rows (uses identity allowlist)"
         );
     }
 
     #[test]
-    fn test_relay_disables_all_bundled_skills_except_permission_policy() {
-        // Comprehensive check: every bundled skill except permission-policy
-        // must be in mika-relay's disabled list. This catches new skills
-        // added to the bundled set without updating mika-relay.
-        let all_names = crate::bundled_skills::all_bundled_skill_names();
-        for name in &all_names {
-            if name.eq_ignore_ascii_case("permission-policy") {
-                continue;
-            }
+    fn test_all_well_known_agents_use_empty_disabled_skills() {
+        // Post-#815: ALL four well-known agents use identity allowlist, not denylist.
+        for spec in WELL_KNOWN_AGENTS {
             assert!(
-                MIKA_RELAY
-                    .disabled_skills
-                    .iter()
-                    .any(|d| d.eq_ignore_ascii_case(name)),
-                "bundled skill '{}' is not disabled for mika-relay — \
-                 add it to MIKA_RELAY.disabled_skills",
-                name
+                spec.disabled_skills.is_empty(),
+                "well-known agent '{}' should have empty disabled_skills \
+                 (uses identity allowlist post-#815)",
+                spec.name
             );
         }
+    }
+
+    #[test]
+    fn test_relay_allowlist_contains_only_permission_policy() {
+        // Verify mika-relay's identity has exactly permission-policy in its allowlist.
+        let identity: crate::prompt::Identity =
+            toml::from_str(MIKA_RELAY_IDENTITY).expect("MIKA_RELAY_IDENTITY must be valid TOML");
+        let allowlist = identity
+            .skills
+            .allowlist
+            .expect("relay must have allowlist");
+        assert_eq!(
+            allowlist,
+            vec!["permission-policy"],
+            "mika-relay should only allow permission-policy"
+        );
     }
 
     #[test]
@@ -1320,51 +1430,6 @@ mod tests {
     }
 
     #[test]
-    fn test_seed_reconciles_disabled_skills_drift() {
-        // Simulate a pre-#845 mika-relay: existing rows for the *original*
-        // denylist (e.g. self-dev) but not for dev-groom which was added later.
-        // This is the exact scenario that caused mika#1041.
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let mut db = Database::open(&db_path).unwrap();
-        db.register_agent("mika-relay", "Relay", "/tmp/mika-relay")
-            .unwrap();
-
-        // Seed only a subset of the denylist, simulating an outdated provisioning
-        // that predates the addition of dev-groom et al.
-        db.set_skill_enabled("mika-relay", "self-dev", false)
-            .unwrap();
-        db.set_skill_enabled("mika-relay", "qa-review", false)
-            .unwrap();
-
-        // Pre-condition: dev-groom is NOT in the table.
-        let pre = db.get_skill_overrides("mika-relay").unwrap();
-        assert!(
-            !pre.iter().any(|o| o.skill_name == "dev-groom"),
-            "dev-groom should not be in overrides before reconciliation"
-        );
-
-        // Run reconciliation (second call, overrides already exist).
-        seed_well_known_skill_overrides(&mut db, "mika-relay");
-
-        // Post-condition: every entry in MIKA_RELAY.disabled_skills now has
-        // enabled = Some(false), including dev-groom.
-        let post = db.get_skill_overrides("mika-relay").unwrap();
-        for skill_name in MIKA_RELAY.disabled_skills {
-            let row = post.iter().find(|o| o.skill_name == *skill_name);
-            assert!(
-                row.is_some(),
-                "expected disabled-row for {skill_name}, found none"
-            );
-            assert_eq!(
-                row.unwrap().enabled,
-                Some(false),
-                "{skill_name} should be disabled after reconciliation"
-            );
-        }
-    }
-
-    #[test]
     fn test_seed_skill_overrides_non_well_known() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
@@ -1379,52 +1444,301 @@ mod tests {
     }
 
     #[test]
-    fn test_well_known_agent_specs_dev_qa_no_overlap() {
-        // Dev and QA have complementary roles — dev builds, qa reviews. Their
-        // disabled lists should not overlap EXCEPT for skills that are owned
-        // by a third agent (mika-arch). Both dev and qa correctly exclude
-        // mika-arch's review skills to prevent context pollution.
-        // Skills owned by third-party agents (mika-arch) or operator-only skills
-        // are legitimately disabled on both mika-dev and mika-qa.
-        let allowed_overlap: &[&str] = &[
-            "mika-arch-groom-ticket",
-            "mika-arch-groom-milestone",
-            "mika-arch-second-review",
-            "dev-groom", // operator-only (#845) — disabled for both dev and qa
+    fn test_dev_qa_allowlists_have_no_overlap() {
+        // Dev builds, QA reviews — their allowlists should be complementary
+        // (no skill appears in both). Shared infra skills (tmux, shell-exec,
+        // web-search, etc.) are allowed on both.
+        let dev_identity: crate::prompt::Identity = toml::from_str(MIKA_DEV_IDENTITY).unwrap();
+        let qa_identity: crate::prompt::Identity = toml::from_str(MIKA_QA_IDENTITY).unwrap();
+        let dev_allowlist = dev_identity.skills.allowlist.unwrap();
+        let qa_allowlist = qa_identity.skills.allowlist.unwrap();
+
+        // Role-specific skills (self-dev family, dev-pilot, etc.) must NOT be
+        // in mika-qa's allowlist, and vice versa for qa-review family.
+        let dev_only = [
+            "self-dev",
+            "self-dev-callback",
+            "self-dev-iterate",
+            "self-dev-webhook-qa",
+            "self-dev-webhook-ci",
+            "self-dev-webhook-ready-label",
+            "dev-pilot",
+            "permission-policy",
+            "agents-teams",
+            "address-pr-comments",
+            "resolve-pr-conflicts",
         ];
-        for dev_skill in MIKA_DEV.disabled_skills {
-            if allowed_overlap.contains(dev_skill) {
-                continue;
-            }
+        for skill in &dev_only {
             assert!(
-                !MIKA_QA.disabled_skills.contains(dev_skill),
-                "skill '{}' is disabled for both mika-dev and mika-qa (and is not \
-                 in the allowed overlap set for third-agent-owned skills)",
-                dev_skill
+                dev_allowlist.contains(&skill.to_string()),
+                "mika-dev allowlist should contain '{skill}'"
+            );
+            assert!(
+                !qa_allowlist.contains(&skill.to_string()),
+                "mika-qa allowlist should NOT contain '{skill}' (dev-only)"
+            );
+        }
+
+        let qa_only = ["qa-review", "qa-review-build-callback", "skill-review"];
+        for skill in &qa_only {
+            assert!(
+                qa_allowlist.contains(&skill.to_string()),
+                "mika-qa allowlist should contain '{skill}'"
+            );
+            assert!(
+                !dev_allowlist.contains(&skill.to_string()),
+                "mika-dev allowlist should NOT contain '{skill}' (qa-only)"
             );
         }
     }
 
     #[test]
-    fn test_relay_disables_superset_of_dev_and_qa() {
-        // mika-relay should disable everything that both dev and qa disable
-        // (plus more), since it only needs permission-policy.
-        // Exception: permission-policy itself — qa disables it, relay keeps it.
-        for dev_skill in MIKA_DEV.disabled_skills {
+    fn test_relay_allowlist_is_strict_subset_of_dev_and_qa() {
+        // mika-relay's 1-skill allowlist must be a subset of mika-dev's allowlist
+        // (permission-policy is in mika-dev but not mika-qa).
+        let dev_identity: crate::prompt::Identity = toml::from_str(MIKA_DEV_IDENTITY).unwrap();
+        let relay_identity: crate::prompt::Identity = toml::from_str(MIKA_RELAY_IDENTITY).unwrap();
+        let dev_allowlist = dev_identity.skills.allowlist.unwrap();
+        let relay_allowlist = relay_identity.skills.allowlist.unwrap();
+        for skill in &relay_allowlist {
             assert!(
-                MIKA_RELAY.disabled_skills.contains(dev_skill),
-                "mika-relay should also disable '{}' (disabled for mika-dev)",
-                dev_skill
+                dev_allowlist.contains(skill),
+                "mika-relay allowlist skill '{skill}' must also be in mika-dev's allowlist"
             );
         }
-        for qa_skill in MIKA_QA.disabled_skills {
-            if *qa_skill == "permission-policy" {
-                continue; // relay's sole purpose is permission-policy
-            }
+    }
+
+    // -- D2 migration tests (#815) --
+
+    #[test]
+    fn test_d2_migration_deletes_denylist_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let mut db = Database::open(&db_path).unwrap();
+        db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
+            .unwrap();
+        db.register_agent("mika-qa", "QA", "/tmp/mika-qa").unwrap();
+        db.register_agent("mika-relay", "Relay", "/tmp/mika-relay")
+            .unwrap();
+
+        // Simulate pre-#815 state: denylist rows for all three agents
+        db.set_skill_enabled("mika-dev", "qa-review", false)
+            .unwrap();
+        db.set_skill_enabled("mika-dev", "skill-review", false)
+            .unwrap();
+        db.set_skill_enabled("mika-qa", "self-dev", false).unwrap();
+        db.set_skill_enabled("mika-qa", "dev-pilot", false).unwrap();
+        db.set_skill_enabled("mika-relay", "self-dev", false)
+            .unwrap();
+        db.set_skill_enabled("mika-relay", "qa-review", false)
+            .unwrap();
+
+        // Run migration
+        migrate_well_known_to_identity_allowlist(&mut db);
+
+        // All denylist rows should be deleted
+        let dev_overrides = db.get_skill_overrides("mika-dev").unwrap();
+        assert!(
+            dev_overrides.is_empty(),
+            "mika-dev should have no overrides after migration"
+        );
+        let qa_overrides = db.get_skill_overrides("mika-qa").unwrap();
+        assert!(
+            qa_overrides.is_empty(),
+            "mika-qa should have no overrides after migration"
+        );
+        let relay_overrides = db.get_skill_overrides("mika-relay").unwrap();
+        assert!(
+            relay_overrides.is_empty(),
+            "mika-relay should have no overrides after migration"
+        );
+    }
+
+    #[test]
+    fn test_d2_migration_preserves_operator_llm_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let mut db = Database::open(&db_path).unwrap();
+        db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
+            .unwrap();
+
+        // Simulate pre-#815 state: denylist row + operator LLM override
+        db.set_skill_enabled("mika-dev", "qa-review", false)
+            .unwrap();
+        db.set_skill_llm_override("mika-dev", "self-dev", "anthropic", "claude-sonnet-4-6")
+            .unwrap();
+
+        migrate_well_known_to_identity_allowlist(&mut db);
+
+        let overrides = db.get_skill_overrides("mika-dev").unwrap();
+        // Denylist row (enabled=false) should be deleted, LLM override preserved
+        assert_eq!(overrides.len(), 1, "only the LLM override should remain");
+        assert_eq!(overrides[0].skill_name, "self-dev");
+        assert_eq!(overrides[0].llm_provider.as_deref(), Some("anthropic"));
+        assert!(
+            overrides[0].enabled.is_none(),
+            "LLM override should have enabled=NULL"
+        );
+    }
+
+    #[test]
+    fn test_d2_migration_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let mut db = Database::open(&db_path).unwrap();
+        db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
+            .unwrap();
+
+        db.set_skill_enabled("mika-dev", "qa-review", false)
+            .unwrap();
+
+        // Run migration twice
+        migrate_well_known_to_identity_allowlist(&mut db);
+        migrate_well_known_to_identity_allowlist(&mut db);
+
+        // Should still work — second call is a no-op
+        let overrides = db.get_skill_overrides("mika-dev").unwrap();
+        assert!(overrides.is_empty());
+
+        // Marker should exist
+        let marker: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_meta WHERE key = 'well_known_d2_migration_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1);
+    }
+
+    #[test]
+    fn test_d2_migration_preserves_user_defined_agent_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let mut db = Database::open(&db_path).unwrap();
+        db.register_agent("custom-agent", "Custom", "/tmp/custom")
+            .unwrap();
+        db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
+            .unwrap();
+
+        // User-defined agent has overrides
+        db.set_skill_enabled("custom-agent", "self-dev", false)
+            .unwrap();
+        db.set_skill_enabled("custom-agent", "qa-review", false)
+            .unwrap();
+        // Well-known agent has overrides too
+        db.set_skill_enabled("mika-dev", "qa-review", false)
+            .unwrap();
+
+        migrate_well_known_to_identity_allowlist(&mut db);
+
+        // User-defined agent rows must be untouched
+        let custom_overrides = db.get_skill_overrides("custom-agent").unwrap();
+        assert_eq!(
+            custom_overrides.len(),
+            2,
+            "user-defined agent rows must be preserved"
+        );
+        // Well-known agent rows should be deleted
+        let dev_overrides = db.get_skill_overrides("mika-dev").unwrap();
+        assert!(dev_overrides.is_empty());
+    }
+
+    #[test]
+    fn test_d2_migration_preserves_mika_arch_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let mut db = Database::open(&db_path).unwrap();
+        db.register_agent("mika-arch", "Architect", "/tmp/mika-arch")
+            .unwrap();
+        db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
+            .unwrap();
+
+        // mika-arch has LLM override rows (not denylist)
+        db.set_skill_llm_override(
+            "mika-arch",
+            "mika-arch-groom-ticket",
+            "anthropic",
+            "claude-sonnet-4-6",
+        )
+        .unwrap();
+        // mika-dev has denylist rows
+        db.set_skill_enabled("mika-dev", "qa-review", false)
+            .unwrap();
+
+        migrate_well_known_to_identity_allowlist(&mut db);
+
+        // mika-arch rows must be untouched (migration only targets dev/qa/relay)
+        let arch_overrides = db.get_skill_overrides("mika-arch").unwrap();
+        assert_eq!(
+            arch_overrides.len(),
+            1,
+            "mika-arch LLM override must be preserved"
+        );
+        assert_eq!(arch_overrides[0].skill_name, "mika-arch-groom-ticket");
+    }
+
+    // -- Allowlist coverage tests (#815) --
+
+    #[test]
+    fn test_dev_identity_allowlist_count() {
+        let identity: crate::prompt::Identity =
+            toml::from_str(MIKA_DEV_IDENTITY).expect("MIKA_DEV_IDENTITY must parse as Identity");
+        let allowlist = identity
+            .skills
+            .allowlist
+            .expect("mika-dev must have allowlist");
+        assert_eq!(
+            allowlist.len(),
+            25,
+            "mika-dev allowlist should have 25 skills"
+        );
+    }
+
+    #[test]
+    fn test_qa_identity_allowlist_count() {
+        let identity: crate::prompt::Identity =
+            toml::from_str(MIKA_QA_IDENTITY).expect("MIKA_QA_IDENTITY must parse as Identity");
+        let allowlist = identity
+            .skills
+            .allowlist
+            .expect("mika-qa must have allowlist");
+        assert_eq!(
+            allowlist.len(),
+            17,
+            "mika-qa allowlist should have 17 skills"
+        );
+    }
+
+    #[test]
+    fn test_relay_identity_allowlist_count() {
+        let identity: crate::prompt::Identity = toml::from_str(MIKA_RELAY_IDENTITY)
+            .expect("MIKA_RELAY_IDENTITY must parse as Identity");
+        let allowlist = identity
+            .skills
+            .allowlist
+            .expect("mika-relay must have allowlist");
+        assert_eq!(
+            allowlist.len(),
+            1,
+            "mika-relay allowlist should have 1 skill"
+        );
+    }
+
+    #[test]
+    fn test_all_well_known_agents_have_valid_identity_toml() {
+        // Every well-known agent must produce valid TOML with a [skills].allowlist.
+        let settings = test_settings_with_kg_roots();
+        for spec in WELL_KNOWN_AGENTS {
+            let content = render_identity_content(spec, &settings)
+                .unwrap_or_else(|e| panic!("failed to render identity for {}: {e}", spec.name));
+            let identity: crate::prompt::Identity = toml::from_str(&content)
+                .unwrap_or_else(|e| panic!("invalid identity TOML for {}: {e}", spec.name));
             assert!(
-                MIKA_RELAY.disabled_skills.contains(qa_skill),
-                "mika-relay should also disable '{}' (disabled for mika-qa)",
-                qa_skill
+                identity.skills.allowlist.is_some(),
+                "well-known agent '{}' must have [skills].allowlist in identity.toml",
+                spec.name
             );
         }
     }
@@ -1437,15 +1751,6 @@ mod tests {
         assert_eq!(agent.name, "mika-arch");
         assert_eq!(agent.display_name, "Architect");
         assert_eq!(agent.emoji, "🏛");
-    }
-
-    #[test]
-    fn test_mika_arch_uses_empty_disabled_skills() {
-        // mika-arch uses identity allowlist, not denylist
-        assert!(
-            MIKA_ARCH.disabled_skills.is_empty(),
-            "mika-arch should have empty disabled_skills (uses identity allowlist)"
-        );
     }
 
     #[test]

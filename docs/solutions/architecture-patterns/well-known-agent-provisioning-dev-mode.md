@@ -32,13 +32,13 @@ The provisioning system follows a two-phase design to work within the existing s
 
 **Phase 1 (filesystem):** `provision_well_known_agents()` runs after `migrate_to_multi_agent()` but before `list_agents()` in server startup. For each well-known agent spec, it checks `agent_exists()`, calls `bootstrap_agent()` to create the directory structure, then overwrites `identity.toml` and `soul.md` with agent-specific content. If the spec provides `config_toml`, the default `config.toml` is also overwritten with agent-specific LLM settings (e.g., mika-relay uses haiku for cheap permission classification).
 
-**Phase 2 (DB overrides):** `seed_well_known_skill_overrides()` runs inside `init_agent()` after the DB is opened and `seed_bundled_skills_if_needed()` has written all skill files. It writes `set_skill_enabled(false)` for skills the agent should not have. Both phases are gated on `settings.dev_mode`.
+**Phase 2 (identity-driven allowlist, #815):** All four well-known agents declare `[skills].allowlist` in their identity.toml (static const for mika-dev/qa/relay, computed at provision time for mika-arch). `SkillRegistry::apply_identity_allowlist()` runs as Phase -1 before `apply_overrides()`, evicting all skills NOT in the allowlist. New bundled skills are denied by default unless explicitly added to an agent's allowlist. `seed_well_known_skill_overrides()` still runs inside `init_agent()` for agents with `llm_overrides` (mika-arch); agents with empty `disabled_skills` AND empty `llm_overrides` take a fast-path exit. Both phases are gated on `settings.dev_mode`. A one-time migration (`migrate_well_known_to_identity_allowlist`) deletes stale denylist `skill_overrides` rows for mika-dev/qa/relay, guarded by `schema_meta` marker `well_known_d2_migration_v1`.
 
 ### Key design decisions
 
-1. **DB overrides, not file filtering:** All bundled skills are still written to all agents by `seed_bundled_skills()` (preserving security update propagation). Per-agent filtering uses the existing `skill_overrides` DB table.
+1. **Identity allowlist, not DB denylist (#815):** All bundled skills are still written to all agents by `seed_bundled_skills()` (preserving security update propagation). Per-agent filtering uses `[skills].allowlist` in identity.toml — the agent's identity owns its skill set rather than splitting it between Rust compile-time constants and runtime DB rows. The `skill_overrides` table remains for operator-level per-skill LLM overrides and for user-defined agents.
 
-2. **First-creation-only overrides:** Skill overrides are written only when no `skill_overrides` rows exist for the agent. This preserves user customizations via `mika skills enable/disable` across restarts.
+2. **Deny by default:** With the allowlist pattern, new bundled skills are automatically denied unless explicitly added to an agent's allowlist. This is the correct default for well-known agents — new skills should be consciously assigned, not silently inherited.
 
 3. **`disable_agent_provisioning` env var:** Follows the `MIKA_DISABLE_BUNDLED_SKILLS` pattern. When true, prevents file creation/overwrite even when `dev_mode = true`. Allows manual edits to soul.md and identity.toml to persist across deploys.
 
@@ -46,9 +46,10 @@ The provisioning system follows a two-phase design to work within the existing s
 
 ### Adding a new well-known agent
 
-1. Add a `WellKnownAgent` static spec in `crates/mika-agent/src/well_known_agents.rs` with name, display_name, emoji, soul content, `disabled_skills` list, and optional `config_toml`
-2. Add a reference to `WELL_KNOWN_AGENTS` static slice
-3. The agent is automatically provisioned on next startup with `dev_mode = true`
+1. Add a `WellKnownAgent` static spec in `crates/mika-agent/src/well_known_agents.rs` with name, display_name, emoji, soul content, `disabled_skills: &[]`, optional `config_toml`, and `identity_source: Some(IdentitySource::Static(IDENTITY_CONST))`
+2. Add an identity const with `[skills].allowlist` listing the skills this agent should have
+3. Add a reference to `WELL_KNOWN_AGENTS` static slice
+4. The agent is automatically provisioned on next startup with `dev_mode = true`
 
 ### Agent spec structure
 
@@ -58,19 +59,25 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
     display_name: "Dev",
     emoji: "...",
     soul: MIKA_DEV_SOUL,
-    disabled_skills: &["qa-review", "qa-review-build-callback", "skill-review"],
-    config_toml: None,  // uses default config
+    disabled_skills: &[],  // empty — uses identity allowlist
+    config_toml: None,     // uses default config
+    identity_source: Some(IdentitySource::Static(MIKA_DEV_IDENTITY)),
+    llm_overrides: &[],
 };
 ```
 
-For agents needing a specific LLM model (e.g., mika-relay uses haiku for cheap permission classification):
+The identity const declares the skill allowlist:
 
 ```rust
-pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
-    name: "mika-relay",
-    // ...
-    config_toml: Some(MIKA_RELAY_CONFIG),  // overrides config.toml with haiku model
-};
+const MIKA_DEV_IDENTITY: &str = "\
+name = \"Dev\"\n\
+emoji = \"🛠\"\n\
+\n\
+[skills]\n\
+allowlist = [\n\
+  \"self-dev\",\n\
+  // ... 25 skills total\n\
+]\n";
 ```
 
 ## Why This Matters
@@ -97,8 +104,10 @@ list_agents()                       -> discovers all agents including new ones
 for each agent:
   init_agent()
     seed_bundled_skills()           -> writes ALL skills to ALL agents
-    seed_well_known_skill_overrides -> disables unwanted skills via DB
-    apply_overrides()               -> evicts disabled skills from registry
+    migrate_well_known_to_identity_allowlist -> one-time: delete stale denylist rows
+    seed_well_known_skill_overrides -> seeds LLM overrides (mika-arch); fast-path exit for others
+    apply_identity_allowlist()      -> Phase -1: evicts skills not in allowlist
+    apply_overrides()               -> Phase 0: applies DB overrides (LLM, enabled state)
 ```
 
 **Key files:**
@@ -112,5 +121,7 @@ for each agent:
 - Issue #254 -- original feature request
 - Issue #602 -- skill interference incident that motivated per-agent skill filtering
 - Issue #721 -- mika-relay agent for permission relay (first agent with `config_toml` override)
+- Issue #813 -- identity-driven allowlist mechanism (mika-arch first)
+- Issue #815 -- D2 cross-cutting: migrate mika-dev/qa/relay to identity allowlist
 - `docs/solutions/architecture-patterns/skill-enabled-state-db-eviction.md` -- how skill overrides work
 - `docs/solutions/architecture-patterns/per-agent-dotenv-config-injection.md` -- per-agent config loading

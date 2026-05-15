@@ -382,6 +382,10 @@ async fn init_agent(
     startup::seed_core_memory_if_empty(&db, agent_home, agent_name)?;
     startup::seed_bundled_skills_if_needed(agent_home, disable_bundled_skills);
     if agent_settings.dev_mode {
+        // One-time migration: delete stale denylist rows for agents that
+        // moved to identity-driven [skills].allowlist (#815). Idempotent
+        // via schema_meta marker — no-op after first successful run.
+        crate::well_known_agents::migrate_well_known_to_identity_allowlist(&mut db);
         crate::well_known_agents::seed_well_known_skill_overrides(&mut db, agent_name);
     }
     let async_db = AsyncDatabase::new_with_agent(db, agent_name);
