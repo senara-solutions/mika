@@ -68,6 +68,28 @@ pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
 /// flooding the conversation with stale failures (e.g., after an upgrade).
 pub const STALE_FAILED_CALLBACK_MINUTES: i64 = 5;
 
+/// Outcome of a team agent run. Typed to distinguish timeout from success
+/// so callers can make informed fallback decisions (#1128).
+#[derive(Debug)]
+pub enum TeamAgentOutcome {
+    /// Agent completed and produced text (or None for tool-use-only turns).
+    Done(Option<String>),
+    /// Agent hit the per-agent deadline. The string describes which timeout path fired.
+    TimedOut(String),
+}
+
+impl TeamAgentOutcome {
+    /// Extract the text, collapsing both variants into a single string.
+    /// For `Done`, returns the text or empty string. For `TimedOut`, returns the reason.
+    /// Use this for callers that don't need to distinguish timeout from success.
+    pub fn into_text(self) -> String {
+        match self {
+            Self::Done(text) => text.unwrap_or_default(),
+            Self::TimedOut(reason) => reason,
+        }
+    }
+}
+
 /// Build the trigger context for a callback in silent mode.
 ///
 /// Uses generic framing for all callback types. Workflow-specific behavior
@@ -3662,24 +3684,25 @@ pub struct TeamAgentParams<'a> {
 /// - Does NOT save messages to DB and does NOT run compaction
 /// - Returns `Some(text)` when the assistant produced a text response,
 ///   or `None` for tool-use-only turns.
-pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<Option<String>> {
+pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<TeamAgentOutcome> {
     let deadline = Instant::now() + Duration::from_secs(TEAM_AGENT_TIMEOUT_SECS);
     run_team_agent_inner(params, deadline).await
 }
 
 /// **Test-only entry point** for team mode that exposes the deadline.
 /// See [`run_agent_with_deadline`] for the gating rationale.
-pub async fn run_team_agent_with_deadline(
+#[allow(dead_code)] // Reserved for eval harness deadline-injection tests (#848b)
+pub(crate) async fn run_team_agent_with_deadline(
     params: &TeamAgentParams<'_>,
     deadline: Instant,
-) -> Result<Option<String>> {
+) -> Result<TeamAgentOutcome> {
     run_team_agent_inner(params, deadline).await
 }
 
 async fn run_team_agent_inner(
     params: &TeamAgentParams<'_>,
     deadline: Instant,
-) -> Result<Option<String>> {
+) -> Result<TeamAgentOutcome> {
     run_team_agent_inner_impl(params, deadline)
         .instrument(
             tracing::info_span!(target: "mika::otel", "team_agent", agent = %params.agent_name),
@@ -3690,7 +3713,7 @@ async fn run_team_agent_inner(
 async fn run_team_agent_inner_impl(
     params: &TeamAgentParams<'_>,
     deadline: Instant,
-) -> Result<Option<String>> {
+) -> Result<TeamAgentOutcome> {
     let llm = params.llm;
     let tools = params.tools;
 
@@ -3854,14 +3877,14 @@ async fn run_team_agent_inner_impl(
             agent = %params.agent_name,
             "team agent deadline exceeded during prelude — skipping loop"
         );
-        let fallback = "Agent timed out while processing team task.";
+        let fallback = "Agent timed out while processing team task (prelude deadline exceeded).";
         if let Some(task_id) = params.child_task_id {
             let _ = params
                 .db
                 .update_task_completed(task_id, Some(fallback))
                 .await;
         }
-        return Ok(Some(fallback.to_string()));
+        return Ok(TeamAgentOutcome::TimedOut(fallback.to_string()));
     }
 
     let result = run_loop(
@@ -3905,7 +3928,7 @@ async fn run_team_agent_inner_impl(
                     Ok(true) => {}
                 }
             }
-            Ok(text)
+            Ok(TeamAgentOutcome::Done(text))
         }
         LoopResult::MaxStepsExceeded {
             tool_call_summaries,
@@ -3919,14 +3942,14 @@ async fn run_team_agent_inner_impl(
                     agent = %params.agent_name,
                     "team agent max-steps exceeded but deadline too close for continuation"
                 );
-                let fallback = "Agent timed out while processing team task.";
+                let fallback = "Agent timed out while processing team task (max-steps exceeded, deadline too close for continuation).";
                 if let Some(task_id) = params.child_task_id {
                     let _ = params
                         .db
                         .update_task_completed(task_id, Some(fallback))
                         .await;
                 }
-                return Ok(Some(fallback.to_string()));
+                return Ok(TeamAgentOutcome::TimedOut(fallback.to_string()));
             }
 
             let cont = attempt_continuation_turn(
@@ -3959,7 +3982,7 @@ async fn run_team_agent_inner_impl(
                 }
             }
 
-            Ok(Some(cont.text))
+            Ok(TeamAgentOutcome::Done(Some(cont.text)))
         }
         LoopResult::DeadlineExceeded { .. } => {
             warn!(
@@ -3967,14 +3990,15 @@ async fn run_team_agent_inner_impl(
                 agent = %params.agent_name,
                 "team agent deadline exceeded"
             );
-            let fallback = "Agent timed out while processing team task.";
+            let fallback =
+                "Agent timed out while processing team task (deadline exceeded in run_loop).";
             if let Some(task_id) = params.child_task_id {
                 let _ = params
                     .db
                     .update_task_completed(task_id, Some(fallback))
                     .await;
             }
-            Ok(Some(fallback.to_string()))
+            Ok(TeamAgentOutcome::TimedOut(fallback.to_string()))
         }
     }
 }

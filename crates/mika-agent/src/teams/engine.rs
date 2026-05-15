@@ -13,7 +13,7 @@ use mika_common::llm::LlmProvider;
 use mika_common::team::TeamDefinition;
 use secrecy::ExposeSecret;
 
-use crate::agent::TeamAgentParams;
+use crate::agent::{TeamAgentOutcome, TeamAgentParams};
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
 use crate::skills::SkillRegistry;
@@ -711,7 +711,8 @@ impl TeamEngine {
 
         let response = self
             .run_agent(orchestrator_name, &message, &context)
-            .await?;
+            .await?
+            .into_text();
 
         let result = parse_task_assignments(&response, &self.team)?;
 
@@ -765,7 +766,10 @@ impl TeamEngine {
                      this goal. It's fine to skip members whose mandate doesn't fit, but \
                      the response must reflect that you considered them."
                 );
-                let retry_response = self.run_agent(orchestrator_name, &nudge, &context).await?;
+                let retry_response = self
+                    .run_agent(orchestrator_name, &nudge, &context)
+                    .await?
+                    .into_text();
                 let retry_result = parse_task_assignments(&retry_response, &self.team)?;
                 match retry_result {
                     DecomposeResult::Conversational(reply) => {
@@ -1093,7 +1097,7 @@ impl TeamEngine {
                             };
                             crate::agent::run_team_agent(&params)
                                 .await
-                                .map(|opt| opt.unwrap_or_default())
+                                .map(|outcome| outcome.into_text())
                         }
                         Err(e) => Err(e),
                     };
@@ -1316,7 +1320,8 @@ impl TeamEngine {
         let context = prompt::build_critic_context(&self.team, &self.run);
         let response = self
             .run_agent(&critic_name, "Review the team's outputs.", &context)
-            .await?;
+            .await?
+            .into_text();
 
         let (approved, feedback) = parse_review_response(&response)?;
 
@@ -1356,6 +1361,9 @@ impl TeamEngine {
     }
 
     /// Produce the final deliverable.
+    ///
+    /// On timeout, falls back to workspace content (#1128) rather than
+    /// surfacing a misleading "Agent timed out" message.
     async fn deliver(&self) -> Result<String> {
         // Use a writer/communicator agent if one exists, otherwise the orchestrator
         let writer = self
@@ -1370,9 +1378,25 @@ impl TeamEngine {
         };
 
         let context = prompt::build_deliverable_context(&self.run);
-        let response = self
+        let outcome = self
             .run_agent(&agent_name, "Produce the final deliverable.", &context)
             .await?;
+
+        let response = match outcome {
+            TeamAgentOutcome::Done(text) => text.unwrap_or_default(),
+            TeamAgentOutcome::TimedOut(reason) => {
+                warn!(
+                    target: "mika::otel",
+                    agent = %agent_name,
+                    workspace = %self.workspace_dir.display(),
+                    reason = %reason,
+                    "deliver agent timed out — falling back to workspace content"
+                );
+                // Workspace-content fallback (#1128): specialist outputs are already
+                // on disk — use them rather than surfacing a misleading timeout message.
+                self.read_workspace_fallback().unwrap_or(reason)
+            }
+        };
 
         // Persist deliverable to messages table
         let team_session_id = format!("team-{}", self.run.run_id);
@@ -1399,15 +1423,21 @@ impl TeamEngine {
         Ok(response)
     }
 
+    /// Read workspace files and format them as a fallback deliverable (#1128).
+    ///
+    /// Returns `None` if the workspace contains no non-metadata output files.
+    fn read_workspace_fallback(&self) -> Option<String> {
+        build_workspace_fallback(&self.workspace_dir)
+    }
+
     /// Run an agent with team context and workspace tools.
-    /// Returns the agent's text response, or an empty string if the agent
-    /// produced no text (tool-use-only turn).
+    /// Returns a typed [`TeamAgentOutcome`] distinguishing success from timeout (#1128).
     async fn run_agent(
         &self,
         agent_name: &str,
         task_message: &str,
         team_context: &str,
-    ) -> Result<String> {
+    ) -> Result<TeamAgentOutcome> {
         let resources = self
             .agents
             .get(agent_name)
@@ -1442,9 +1472,7 @@ impl TeamEngine {
             trace_id: Some(self.trace_id.clone()),
         };
 
-        Ok(crate::agent::run_team_agent(&params)
-            .await?
-            .unwrap_or_default())
+        crate::agent::run_team_agent(&params).await
     }
 
     /// Format task assignments as markdown for the metadata file.
@@ -1683,6 +1711,50 @@ fn extract_json(text: &str, open: char, close: char) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Read workspace files and format them as a fallback deliverable (#1128).
+///
+/// Returns `None` if the workspace directory is unreadable or contains no
+/// non-empty regular files. Directories (e.g. `.meta/`) are skipped.
+/// Files are sorted by modification time so specialist outputs appear in execution order.
+fn build_workspace_fallback(workspace_dir: &Path) -> Option<String> {
+    let mut parts: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let entries = std::fs::read_dir(workspace_dir).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Skip directories (e.g. .meta/) and non-files
+        if path.is_dir() {
+            continue;
+        }
+        // Use continue (not ?) so a single unreadable entry doesn't abort the whole scan.
+        let Some(filename) = path.file_name() else {
+            continue;
+        };
+        let filename = filename.to_string_lossy().to_string();
+        let Some(mtime) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && !content.trim().is_empty()
+        {
+            parts.push((mtime, format!("## {filename}\n\n{content}")));
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    // Sort by modification time so specialist outputs appear in execution order.
+    parts.sort_by_key(|(mtime, _)| *mtime);
+
+    let header = "# Team Deliverable (workspace fallback)\n\n\
+        > The synthesis agent timed out, but specialist outputs were completed successfully.\n\
+        > Below are the workspace outputs in execution order.\n\n";
+    let body: Vec<&str> = parts.iter().map(|(_, text)| text.as_str()).collect();
+    Some(format!("{}{}", header, body.join("\n\n---\n\n")))
 }
 
 #[cfg(test)]
@@ -2080,5 +2152,79 @@ mod tests {
             status: TaskStatus::Pending,
         }];
         assert!(missing_members(&tasks, &team).is_empty());
+    }
+
+    // -- read_workspace_fallback tests (#1128) --
+
+    #[test]
+    fn test_workspace_fallback_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write two files with different mtimes
+        std::fs::write(dir.path().join("cto-review.md"), "CTO analysis here").unwrap();
+        // Brief sleep to ensure different mtimes
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(dir.path().join("quant-review.md"), "Quantitative analysis").unwrap();
+
+        let result = build_workspace_fallback(dir.path());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("# Team Deliverable (workspace fallback)"));
+        assert!(text.contains("## cto-review.md"));
+        assert!(text.contains("CTO analysis here"));
+        assert!(text.contains("## quant-review.md"));
+        assert!(text.contains("Quantitative analysis"));
+        assert!(text.contains("---")); // separator between files
+    }
+
+    #[test]
+    fn test_workspace_fallback_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(build_workspace_fallback(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_workspace_fallback_only_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".meta")).unwrap();
+        std::fs::write(
+            dir.path().join(".meta/state.json"),
+            r#"{"phase":"deliver"}"#,
+        )
+        .unwrap();
+        assert!(build_workspace_fallback(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_workspace_fallback_mixed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a directory that should be skipped
+        std::fs::create_dir(dir.path().join(".meta")).unwrap();
+        std::fs::write(
+            dir.path().join(".meta/state.json"),
+            r#"{"phase":"deliver"}"#,
+        )
+        .unwrap();
+        // Create a real output file
+        std::fs::write(dir.path().join("analysis.md"), "Real output").unwrap();
+        // Create an empty file that should be skipped
+        std::fs::write(dir.path().join("empty.md"), "   ").unwrap();
+
+        let result = build_workspace_fallback(dir.path());
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("## analysis.md"));
+        assert!(text.contains("Real output"));
+        // Empty file and .meta directory should not appear
+        assert!(!text.contains("empty.md"));
+        assert!(!text.contains(".meta"));
+        assert!(!text.contains("state.json"));
+        // No separator since there's only one file
+        assert!(!text.contains("---"));
+    }
+
+    #[test]
+    fn test_workspace_fallback_nonexistent_dir() {
+        let path = std::path::PathBuf::from("/nonexistent/workspace/dir");
+        assert!(build_workspace_fallback(&path).is_none());
     }
 }
