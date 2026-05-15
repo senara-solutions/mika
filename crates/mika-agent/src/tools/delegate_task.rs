@@ -303,22 +303,28 @@ impl Tool for DelegateTaskTool {
 
         // Persist result message for observability (#253) — internal (agent-to-agent)
         match &result {
-            Ok(Some(text)) => {
-                if let Err(e) = async_db
-                    .save_message_with_metadata(
-                        &session_id,
-                        "assistant",
-                        text,
-                        None,
-                        Some(ctx.trace_id),
-                        true,
-                    )
-                    .await
+            Ok(outcome) => {
+                // Persist non-empty text responses; skip empty (tool-use-only turns)
+                let text = match outcome {
+                    crate::agent::TeamAgentOutcome::Done(Some(t)) => Some(t.as_str()),
+                    crate::agent::TeamAgentOutcome::TimedOut(t) => Some(t.as_str()),
+                    crate::agent::TeamAgentOutcome::Done(None) => None,
+                };
+                if let Some(text) = text
+                    && let Err(e) = async_db
+                        .save_message_with_metadata(
+                            &session_id,
+                            "assistant",
+                            text,
+                            None,
+                            Some(ctx.trace_id),
+                            true,
+                        )
+                        .await
                 {
                     tracing::warn!(session = %session_id, error = %e, "failed to persist delegate response");
                 }
             }
-            Ok(None) => {} // No text response — skip empty assistant message
             Err(e) => {
                 let error_msg = format!("Delegation failed: {e}");
                 if let Err(pe) = async_db
@@ -349,12 +355,18 @@ impl Tool for DelegateTaskTool {
         async_db.shutdown();
 
         match result {
-            Ok(Some(text)) => Ok(ToolOutput::success(format!(
-                "Response from {agent_name}:\n\n{text}"
-            ))),
-            Ok(None) => Ok(ToolOutput::success(format!(
-                "Agent '{agent_name}' completed the task but produced no text response."
-            ))),
+            Ok(outcome) => {
+                let text = outcome.into_text();
+                if text.is_empty() {
+                    Ok(ToolOutput::success(format!(
+                        "Agent '{agent_name}' completed the task but produced no text response."
+                    )))
+                } else {
+                    Ok(ToolOutput::success(format!(
+                        "Response from {agent_name}:\n\n{text}"
+                    )))
+                }
+            }
             Err(e) => Ok(ToolOutput::error(format!(
                 "Delegation to '{agent_name}' failed: {e}"
             ))),
