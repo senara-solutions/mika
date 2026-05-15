@@ -475,6 +475,17 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Return ALL children of a parent task for the reaper's structured log
+    /// event. See [`Database::get_reaper_child_snapshot`].
+    pub async fn get_reaper_child_snapshot(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Vec<crate::db::ReaperChildSnapshot>> {
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.get_reaper_child_snapshot(&p))
+            .await
+    }
+
     pub async fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
         let i = id.to_owned();
         self.with_db(move |db| db.set_task_process_id(&i, process_id))

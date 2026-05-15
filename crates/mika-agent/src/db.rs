@@ -192,6 +192,20 @@ pub struct OrphanedParentTask {
     pub created_at: String,
 }
 
+/// Snapshot of a child task for the orphaned-parent reaper's structured log
+/// event (`task_engine_reaper.evaluated`). Captures all children of a candidate
+/// parent at kill time for post-incident diagnosis (mika#1126).
+#[derive(Debug, Clone)]
+pub struct ReaperChildSnapshot {
+    pub id: String,
+    pub dispatch_class: Option<String>,
+    pub status: String,
+    pub trigger_type: String,
+    pub action_type: String,
+    pub updated_at: String,
+    pub label: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewTask {
     pub agent_id: String,
@@ -5305,6 +5319,35 @@ impl Database {
                     agent_id: row.get(1)?,
                     created_at: row.get(2)?,
                     callback_task_id: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Return ALL children of a parent task for the reaper's structured log event
+    /// (`task_engine_reaper.evaluated`). Captures a point-in-time snapshot at kill
+    /// time so post-incident diagnosis can see what the reaper saw (mika#1126).
+    pub fn get_reaper_child_snapshot(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Vec<ReaperChildSnapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, dispatch_class, status, trigger_type, action_type, updated_at, label
+             FROM tasks
+             WHERE parent_task_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![parent_task_id], |row| {
+                Ok(ReaperChildSnapshot {
+                    id: row.get(0)?,
+                    dispatch_class: row.get(1)?,
+                    status: row.get(2)?,
+                    trigger_type: row.get(3)?,
+                    action_type: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    label: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -11749,6 +11792,120 @@ mod tests {
             orphans.is_empty(),
             "stale parent class must not override the fresh child class — v1 regression"
         );
+    }
+
+    /// mika#1126 — H3 scenario: parent with two children where one has NULL
+    /// dispatch_class (treated as 'implement') and one has 'groom'. The NULL
+    /// child matches the reaper filter, so the parent IS reaped.
+    #[test]
+    fn test_find_orphaned_parent_tasks_mixed_children_groom_and_null() {
+        let db = db();
+        let (parent_id, child_a_id) = create_orphaned_parent_setup(&db);
+
+        // child_a: NULL dispatch_class (default from helper), callback, delivered
+        // Already set up by helper. Backdate past grace.
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_a_id],
+            )
+            .unwrap();
+
+        // child_b: groom dispatch_class, callback, delivered
+        let mut child_b = callback_task("mika");
+        child_b.parent_task_id = Some(parent_id.clone());
+        child_b.dispatch_class = Some("groom".to_string());
+        let child_b_id = db.create_task(&child_b).unwrap();
+        assert!(
+            db.update_task_completed(&child_b_id, "mika", Some("done"))
+                .unwrap()
+        );
+        assert!(db.mark_task_delivered(&child_b_id).unwrap());
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_b_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert_eq!(
+            orphans.len(),
+            1,
+            "parent with mixed children (NULL + groom) should be reaped — the NULL child matches"
+        );
+        assert_eq!(orphans[0].id, parent_id);
+    }
+
+    /// mika#1126 — parent with ONLY groom-class children should NOT be reaped.
+    /// Both children have dispatch_class='groom'; no implement-class child exists.
+    #[test]
+    fn test_find_orphaned_parent_tasks_only_groom_children_not_reaped() {
+        let db = db();
+        let (parent_id, child_a_id) = create_orphaned_parent_setup(&db);
+
+        // Set child_a to groom class
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'groom' WHERE id = ?1",
+                params![child_a_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_a_id],
+            )
+            .unwrap();
+
+        // child_b: also groom class
+        let mut child_b = callback_task("mika");
+        child_b.parent_task_id = Some(parent_id.clone());
+        child_b.dispatch_class = Some("groom".to_string());
+        let child_b_id = db.create_task(&child_b).unwrap();
+        assert!(
+            db.update_task_completed(&child_b_id, "mika", Some("done"))
+                .unwrap()
+        );
+        assert!(db.mark_task_delivered(&child_b_id).unwrap());
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_b_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "parent with only groom-class children should not be reaped"
+        );
+    }
+
+    /// mika#1126 — get_reaper_child_snapshot returns ALL children of a parent.
+    #[test]
+    fn test_get_reaper_child_snapshot_returns_all_children() {
+        let db = db();
+        let (parent_id, child_a_id) = create_orphaned_parent_setup(&db);
+
+        // Add a second groom-class child
+        let mut child_b = callback_task("mika");
+        child_b.parent_task_id = Some(parent_id.clone());
+        child_b.dispatch_class = Some("groom".to_string());
+        let child_b_id = db.create_task(&child_b).unwrap();
+
+        let snapshot = db.get_reaper_child_snapshot(&parent_id).unwrap();
+        assert_eq!(snapshot.len(), 2, "snapshot should return all children");
+
+        let ids: Vec<&str> = snapshot.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&child_a_id.as_str()));
+        assert!(ids.contains(&child_b_id.as_str()));
+
+        // Verify the groom child has dispatch_class populated
+        let groom_child = snapshot.iter().find(|s| s.id == child_b_id).unwrap();
+        assert_eq!(groom_child.dispatch_class.as_deref(), Some("groom"));
+        assert_eq!(groom_child.trigger_type, "callback");
+        assert_eq!(groom_child.action_type, "resume_agent");
     }
 
     #[test]

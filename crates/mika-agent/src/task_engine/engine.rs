@@ -618,6 +618,10 @@ impl TaskEngine {
     /// Transitions matched parents to `failed` with an audit-event trail.
     /// The `NOT EXISTS` sibling guard defers reaping when #870's correction
     /// loop has launched a retry via `create_task`.
+    ///
+    /// Any new writers of `callback_delivered_without_pr_url` must respect
+    /// the groom-class filter. SOLE WRITER: this method is the only site
+    /// that writes `callback_delivered_without_pr_url` to `tasks.result`.
     async fn reap_orphaned_parent_tasks(&self) {
         let candidates = match self
             .db
@@ -635,6 +639,66 @@ impl TaskEngine {
             let trace_id = mika_common::trace::generate_trace_id();
             let system_session = format!("system-{}", parent.agent_id);
 
+            // mika#1126 AC-1: snapshot ALL children at decision time for
+            // post-incident diagnosis of what the reaper saw.
+            let children = match self.db.get_reaper_child_snapshot(&parent.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_reaper: failed to snapshot children"
+                    );
+                    // Continue with the kill — snapshot failure is non-fatal.
+                    // The reaper already decided to reap via the SQL query.
+                    Vec::new()
+                }
+            };
+
+            // mika#1126 AC-1: structured log of what the reaper evaluated
+            info!(
+                parent_id = %parent.id,
+                parent_status = "in_progress",
+                parent_source = "self_dev",
+                callback_task_id = %parent.callback_task_id,
+                children_count = children.len(),
+                children = ?children,
+                "task_engine_reaper.evaluated"
+            );
+
+            // mika#1126 AC-3: defense-in-depth — re-check child dispatch_class
+            // at kill time. The SQL query should have excluded groom-class children,
+            // but if the class was NULL at query time and populated since, this
+            // guard catches the TOCTOU race (H2).
+            if !children.is_empty() {
+                let delivered_callback_children: Vec<_> = children
+                    .iter()
+                    .filter(|c| {
+                        c.trigger_type == "callback"
+                            && c.action_type == "resume_agent"
+                            && c.status == "delivered"
+                    })
+                    .collect();
+
+                if !delivered_callback_children.is_empty() {
+                    let all_non_implement = delivered_callback_children
+                        .iter()
+                        .all(|c| c.dispatch_class.as_deref().unwrap_or("implement") != "implement");
+
+                    if all_non_implement {
+                        warn!(
+                            parent_id = %parent.id,
+                            children = ?children,
+                            "task_engine_reaper: race detected — all delivered callback \
+                             children are non-implement class at kill time; skipping \
+                             reap (mika#1126 guard)"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // SOLE WRITER: callback_delivered_without_pr_url
             // Use update_task_failed (guarded UPDATE with terminal-state check)
             // instead of raw update_task_status to avoid overwriting concurrent
             // terminal transitions. Returns false when the parent already left
