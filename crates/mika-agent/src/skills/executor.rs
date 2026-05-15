@@ -4518,6 +4518,53 @@ Verdict: GROOMED
         );
     }
 
+    // --- check_grooming_markers recovery callout tests (#1123) ---
+
+    /// Recovery callout written by dispatch-lib.sh post-flight (mika#1123)
+    /// intentionally does NOT pass the gate — it surfaces drift without
+    /// fabricating an architect verdict.
+    #[test]
+    fn test_check_grooming_markers_recovery_callout_does_not_pass() {
+        let body = r#"> - **Branch:** `fix/794/agent-pr-merge`
+> - **Plan:** `docs/plans/2026-05-15-001-fix-plan.md` (committed on branch @ `abc1234`)
+> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
+
+## Symptom
+..."#;
+        let missing = check_grooming_markers(body);
+        // Branch and plan callouts pass, but groomed_verdict is correctly missing
+        assert!(
+            !missing.contains(&"branch_callout"),
+            "Recovery callout should pass branch_callout check"
+        );
+        assert!(
+            !missing.contains(&"plan_callout"),
+            "Recovery callout should pass plan_callout check"
+        );
+        assert!(
+            missing.contains(&"groomed_verdict"),
+            "Recovery callout must NOT pass the groomed_verdict check — \
+             it doesn't fabricate an architect verdict"
+        );
+    }
+
+    /// Organic callout written by the LLM in dev-groom step 18 — all three
+    /// signals present, should pass the gate completely.
+    #[test]
+    fn test_check_grooming_markers_organic_callout_passes() {
+        let body = r#"> - **Branch:** `fix/794/agent-pr-merge`
+> - **Plan:** `docs/plans/2026-05-15-001-fix-plan.md` (committed on branch @ `abc1234`)
+> - **Grooming history:** /ce:plan -> mika-arch first-pass (ITERATE) -> revisions -> mika-arch second-pass (GROOMED)
+
+## Symptom
+..."#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "Organic callout with all three signals should pass: {missing:?}"
+        );
+    }
+
     /// Bypass predicate: extract_skill_from_input returns correct skill.
     #[test]
     fn test_extract_skill_dev_pilot() {
