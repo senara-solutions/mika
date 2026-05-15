@@ -35,8 +35,9 @@ Stdout recovered from file."
         fi
     fi
     # Capture stderr tail on crash path BEFORE deleting the file (#104)
+    # Scrub secrets from stderr to prevent PAT leakage in callback delivery (mika#903).
     if [ -z "$RESULT" ] && [ -n "$STDERR_FILE" ] && [ -f "$STDERR_FILE" ]; then
-        _STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" 2>/dev/null)
+        _STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" 2>/dev/null | _scrub_secrets_from_output)
         if [ -n "$_STDERR_TAIL" ]; then
             RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result.
 
@@ -51,11 +52,14 @@ ${_STDERR_TAIL}"
         RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result."
     fi
     # --- Diagnostic trace tail (mika#887) ---
+    # Scrub secrets from trace tail to prevent PAT leakage in callback delivery (mika#903).
     if [ -f "$TRACE_FILE" ]; then
         case "$RESULT" in
             "HANDLER CRASH"*)
                 # Crash path: append trace tail, preserve file for forensics
-                _TRACE_TAIL=$(tail -50 "$TRACE_FILE" 2>/dev/null | sed 's/^/    /')
+                _TRACE_TAIL=$(tail -50 "$TRACE_FILE" 2>/dev/null \
+                    | _scrub_secrets_from_output \
+                    | sed 's/^/    /')
                 if [ -n "$_TRACE_TAIL" ]; then
                     RESULT="${RESULT}
 
@@ -141,7 +145,20 @@ _validate_inputs() {
     fi
 }
 
+_scrub_secrets_from_output() {
+    # Redact known secret patterns from diagnostic output before callback delivery (mika#903).
+    # Covers: env var assignments (GH_APP_TOKEN=..., MIKA_*=..., GH_TOKEN=...),
+    #         fine-grained PATs (github_pat_*), classic PATs (ghp_*),
+    #         GitHub App installation tokens (ghs_*), and server-to-server tokens (ghu_*).
+    sed -E 's/(GH_APP_TOKEN|GH_TOKEN|MIKA_[A-Z_]*TOKEN|MIKA_[A-Z_]*API_KEY|MIKA_[A-Z_]*PRIVATE_KEY)=[^ ]*/\1=<REDACTED>/g' \
+        | sed -E 's/github_pat_[A-Za-z0-9_]+/<REDACTED_PAT>/g' \
+        | sed -E 's/ghs_[A-Za-z0-9]+/<REDACTED_TOKEN>/g' \
+        | sed -E 's/ghp_[A-Za-z0-9]+/<REDACTED_PAT>/g'
+}
+
 _setup_gh_auth() {
+    # Suppress xtrace to prevent PAT from appearing in trace logs (mika#903).
+    { set +x; } 2>/dev/null
     # GitHub App installation token for gh CLI.
     # See mika#520 for context on why we check GH_TOKEN before calling gh auth login.
     if [ -z "${GH_TOKEN:-}" ]; then
@@ -153,6 +170,8 @@ _setup_gh_auth() {
             echo "WARNING: mika token github failed — gh CLI will fall back to host credentials" >&2
         fi
     fi
+    # Re-enable xtrace (was set by dispatch_claude_pilot before calling us).
+    set -x
 }
 
 _scrub_env() {
@@ -484,7 +503,12 @@ _detect_plan_on_branch() {
 dispatch_claude_pilot() {
     # --- Diagnostic trace (mika#887) ---
     TRACE_FILE="/tmp/dev-pilot-trace-$$.log"
+    # Restrict trace file to owner-only (0600) to prevent local users from reading
+    # secrets that may appear in the trace before _setup_gh_auth's set+x guard (mika#903).
+    _umask_prev=$(umask)
+    umask 077
     exec 9>>"$TRACE_FILE" 2>/dev/null || exec 9>/dev/null
+    umask "$_umask_prev"
     BASH_XTRACEFD=9
     set -x
 
