@@ -5250,15 +5250,20 @@ impl Database {
         Ok(n > 0)
     }
 
-    /// Find parent self_dev tasks left `in_progress` whose callback subtask
-    /// delivered without producing a PR (#871).
+    /// Find implement-class parent self_dev tasks left `in_progress` whose
+    /// callback subtask delivered without producing a PR (#871).
     ///
     /// A parent is "orphaned" when:
     /// - `status = 'in_progress'`, `source = 'self_dev'`, `trigger_type = 'manual'`
+    /// - `dispatch_class = 'implement'` (or NULL — pre-v34 rows via COALESCE)
     /// - Its latest callback subtask is `status = 'delivered'`
     /// - The callback's `updated_at` is older than `grace_seconds` ago
     /// - Parent metadata does NOT contain `$.claude_pilot.pr_url`
     /// - No other active callback child exists (defers to #870's retry loop)
+    ///
+    /// Groom-class parents (mika#1001) are NOT reaped here — their expected
+    /// artifact is a plan commit pushed to the branch, not a PR url. Groom-class
+    /// leak detection is a separate follow-up (mika#1118 Option B).
     pub fn find_orphaned_parent_tasks(
         &self,
         agent_id: &str,
@@ -5274,6 +5279,7 @@ impl Database {
                AND parent.status = 'in_progress'
                AND parent.source = 'self_dev'
                AND parent.trigger_type = 'manual'
+               AND COALESCE(parent.dispatch_class, 'implement') = 'implement'
                AND child.trigger_type = 'callback'
                AND child.action_type = 'resume_agent'
                AND child.status = 'delivered'
@@ -11606,6 +11612,107 @@ mod tests {
         // agent_a should see the orphan
         let orphans = db.find_orphaned_parent_tasks("agent_a", 600).unwrap();
         assert_eq!(orphans.len(), 1);
+    }
+
+    /// mika#1118 — groom-class parents must NOT be reaped by the implement-class
+    /// reaper. Their expected artifact is a plan commit pushed to a branch, not a
+    /// PR url. The reaper's pr_url check is implement-shaped only.
+    #[test]
+    fn test_find_orphaned_parent_tasks_groom_class_not_reaped() {
+        let db = db();
+        let (parent_id, child_id) = create_orphaned_parent_setup(&db);
+
+        // Set parent dispatch_class to 'groom' (v34+ schema)
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'groom' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+
+        // Backdate child past grace (would otherwise trigger reaping)
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "groom-class parent should not be reaped — produces plan commits, not PRs"
+        );
+    }
+
+    /// mika#1118 — implement-class parents are still reaped when callback delivers
+    /// without producing a PR. Confirms the dispatch_class='implement' filter does
+    /// not regress the original #871 behavior.
+    #[test]
+    fn test_find_orphaned_parent_tasks_implement_class_still_reaped() {
+        let db = db();
+        let (parent_id, child_id) = create_orphaned_parent_setup(&db);
+
+        // Set parent dispatch_class explicitly to 'implement'
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'implement' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+
+        // Backdate child past grace
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].id, parent_id);
+        assert_eq!(orphans[0].callback_task_id, child_id);
+    }
+
+    /// mika#1118 — NULL dispatch_class (pre-v34 rows) is treated as 'implement'
+    /// via COALESCE. Preserves backward compatibility with rows created before
+    /// the v33→v34 migration added the column.
+    #[test]
+    fn test_find_orphaned_parent_tasks_null_dispatch_class_treated_as_implement() {
+        let db = db();
+        let (parent_id, child_id) = create_orphaned_parent_setup(&db);
+
+        // Helper does NOT set dispatch_class — defaults to NULL.
+        // Verify the column is actually NULL on this row.
+        let class: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT dispatch_class FROM tasks WHERE id = ?1",
+                params![parent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            class.is_none(),
+            "test setup invariant: dispatch_class should be NULL pre-v34-style"
+        );
+
+        // Backdate child past grace
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let orphans = db.find_orphaned_parent_tasks("mika", 600).unwrap();
+        assert_eq!(
+            orphans.len(),
+            1,
+            "NULL dispatch_class must still be reaped (COALESCE -> 'implement')"
+        );
+        assert_eq!(orphans[0].id, parent_id);
     }
 
     #[test]
