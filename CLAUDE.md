@@ -286,4 +286,9 @@ Skills are loaded at runtime from this generated constant — no filesystem acce
    keywords = ["trigger", "words"]
    ```
 3. Add `system_prompt.md` with the skill's system prompt
-4. Build — the skill is automatically discovered and available
+4. **Add to well-known agent allowlists** — all four well-known agents use identity-driven `[skills].allowlist` in their identity templates (`well_known_agents.rs`). New bundled skills are **denied by default** unless explicitly added to an agent's allowlist. Add the skill name to each agent's identity const that should have access:
+   - `MIKA_DEV_IDENTITY` (25 skills) — development workflow skills
+   - `MIKA_QA_IDENTITY` (17 skills) — review and quality skills
+   - `MIKA_RELAY_IDENTITY` (1 skill) — only `permission-policy`; rarely needs new skills
+   - `MIKA_ARCH` uses a computed identity via `build_mika_arch_identity()` (3 skills) — read-only review skills only
+5. Build — the skill is automatically discovered and available
