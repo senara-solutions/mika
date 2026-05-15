@@ -465,15 +465,45 @@ ${RESULT}"
             fi
         fi
 
-        # Post-flight plan validation (mika#1033): detect dev-groom drift where
-        # the session exits "success" but produced no valid plan file (or only a
-        # stub/empty one). Runs independently of the HEAD-diff check — a session
-        # can commit a 0-byte plan (HEAD changed) but still fail this check.
+        # Post-flight plan validation (mika#1033, mika#1032): detect dev-groom
+        # drift where the session exits "success" but produced no valid plan file
+        # (or only a stub/empty one) and/or never invoked /ce:plan. The plan-file-
+        # size check is the primary structural defense; the log-grep for /ce:plan
+        # adds root-cause diagnostic specificity. Both checks are merged into a
+        # single block and fire before callback delivery.
         if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
             TODAY_PREFIX=$(date +%Y-%m-%d)
             VALID_PLAN=$(find "$WORKTREE_DIR/docs/plans" -name "${TODAY_PREFIX}-*-plan.md" -size +500c 2>/dev/null | head -1)
-            if [ -z "$VALID_PLAN" ]; then
+
+            # Check session log for /ce:plan invocation (mika#1032).
+            # Broad pattern covers Skill tool call JSON, command strings, etc.
+            # Fail-open: if log is unavailable, skip the check with a warning.
+            SESSION_LOG="/var/log/claude-pilot/${LOG_ID}.log"
+            CE_PLAN_INVOKED=""
+            if [ -f "$SESSION_LOG" ] && [ -r "$SESSION_LOG" ]; then
+                if grep -qiE 'ce[.:\-_]plan' "$SESSION_LOG" 2>/dev/null; then
+                    CE_PLAN_INVOKED="1"
+                fi
+            else
+                echo "Warning: session log not available at $SESSION_LOG — skipping /ce:plan invocation check" >&2
+                # Treat as unknown — don't fail on missing log
+                CE_PLAN_INVOKED="unknown"
+            fi
+
+            if [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
+                # Both checks failed: no plan file AND /ce:plan never called
+                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no docs/plans/${TODAY_PREFIX}-*-plan.md >500 bytes found) and no /ce:plan invocation detected in session log. Session drifted into executor mode.
+
+${RESULT}"
+            elif [ -z "$VALID_PLAN" ]; then
+                # Plan file missing but /ce:plan was called (or log unavailable)
                 RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no docs/plans/${TODAY_PREFIX}-*-plan.md >500 bytes found). Session likely drifted into executor mode.
+
+${RESULT}"
+            elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
+                # Valid plan file exists but /ce:plan was never invoked — LLM
+                # wrote a plan-shaped file without running the planning skill
+                RESULT="PIPELINE FAILURE: dev-groom produced a plan file but no /ce:plan invocation detected in session log. Plan may not have been generated through the planning skill.
 
 ${RESULT}"
             fi

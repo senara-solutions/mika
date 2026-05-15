@@ -1,7 +1,7 @@
 ---
 title: "fix: Harden dev-groom against executor-mode drift on action-verb tickets"
 type: fix
-status: active
+status: completed
 date: 2026-05-14
 ---
 
@@ -107,7 +107,7 @@ You are executing the dev-groom skill. [...]
 
 ## Implementation Units
 
-- [ ] **Unit 1: Augment post-flight plan validation with `/ce:plan` invocation diagnostic**
+- [x] **Unit 1: Augment post-flight plan validation with `/ce:plan` invocation diagnostic**
 
 **Goal:** Enrich the existing mika#1033 plan-file-size check with root-cause diagnostic specificity by also checking whether `/ce:plan` was invoked during the session. The plan-file-size check remains the primary structural defense; the log-grep adds a more specific failure reason.
 
@@ -144,7 +144,7 @@ You are executing the dev-groom skill. [...]
 - The existing plan-file-size check block is extended in-place, not duplicated as a second block
 - A dev-groom dispatch that skips `/ce:plan` produces a PIPELINE FAILURE callback result with invocation-specific diagnostic
 
-- [ ] **Unit 2: Ticket-body quarantine in dev-groom prompt**
+- [x] **Unit 2: Ticket-body quarantine in dev-groom prompt**
 
 **Goal:** Reduce the probability of executor-mode drift by presenting ticket content inside an explicit planning-input frame that the LLM is less likely to interpret as execution instructions.
 
