@@ -155,6 +155,80 @@ _scrub_secrets_from_output() {
         | sed -E 's/gh[spu]_[A-Za-z0-9_]+/<REDACTED_TOKEN>/g'
 }
 
+_verify_and_write_body_callout() {
+    # Post-flight body-callout recovery (mika#1123): detect dev-groom drift where
+    # the plan is committed and pushed but the issue body never received the
+    # canonical callout block. If missing, write a recovery callout that surfaces
+    # the drift without fabricating an architect verdict.
+    #
+    # Dual-write documentation: body callouts can be written by two paths:
+    #   (1) the LLM in dev-groom step 18 (organic, passes dispatch gate)
+    #   (2) this structural recovery (partial, does NOT pass dispatch gate)
+    local repo="$1" issue_num="$2" worktree_dir="$3" branch="$4"
+
+    # 1. Fetch current issue body
+    local current_body
+    current_body=$(gh issue view "$issue_num" --repo "senara-solutions/$repo" \
+        --json body -q '.body' 2>/dev/null) || return 0
+
+    # 2. Check if all three callout signals are already present
+    #    (mirrors check_grooming_markers() in executor.rs — Pin B)
+    local has_branch has_plan has_verdict
+    has_branch=$(printf '%s' "$current_body" | grep -cF '> - **Branch:**' || true)
+    has_plan=$(printf '%s' "$current_body" | grep -cF 'docs/plans/' || true)
+    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED\)|second-pass \(READY, paraphrased GROOMED' || true)
+
+    if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ]; then
+        return 0  # All present, nothing to do
+    fi
+
+    # 3. Find the plan file on the branch — scoped to issue number first
+    local plan_file
+    plan_file=$(find "$worktree_dir/docs/plans" -name "*-${issue_num}-*-plan.md" -size +500c \
+        2>/dev/null | sort -r | head -1)
+
+    # Fall back to any plan file if issue-scoped search finds nothing
+    if [ -z "$plan_file" ]; then
+        plan_file=$(find "$worktree_dir/docs/plans" -name "*-plan.md" -size +500c \
+            2>/dev/null | sort -r | head -1)
+    fi
+
+    [ -n "$plan_file" ] || return 0  # No valid plan file — can't write callout
+
+    local plan_relpath="${plan_file#"$worktree_dir/"}"
+    local head_sha
+    head_sha=$(git -C "$worktree_dir" rev-parse --short HEAD 2>/dev/null)
+
+    # 4. Construct recovery callout.
+    #    IMPORTANT: The grooming-history line does NOT contain "second-pass (GROOMED)"
+    #    because we cannot verify the architect actually issued that verdict from
+    #    branch state alone. This callout surfaces the drift for operator visibility
+    #    but does NOT pass the dispatch gate — the operator must verify and dispatch
+    #    manually (or re-run dev-groom which will write the organic callout).
+    local callout_block
+    callout_block=$(cat <<CALLOUT_EOF
+> - **Branch:** \`${branch}\`
+> - **Plan:** \`${plan_relpath}\` (committed on branch @ \`${head_sha}\`)
+> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
+CALLOUT_EOF
+    )
+
+    # 5. Prepend callout to existing body and write
+    local new_body
+    new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
+    local tmpfile
+    tmpfile=$(mktemp /tmp/body-callout-recover-XXXXXX.md)
+    printf '%s' "$new_body" > "$tmpfile"
+
+    if gh issue edit "$issue_num" --repo "senara-solutions/$repo" \
+        --body-file "$tmpfile" 2>/dev/null; then
+        echo "body_callout_drift_recovered: wrote missing callout to $repo#$issue_num (verdict NOT fabricated — operator dispatch required)" >&2
+    else
+        echo "WARN: body_callout_drift_recovery_failed for $repo#$issue_num" >&2
+    fi
+    rm -f "$tmpfile"
+}
+
 _setup_gh_auth() {
     # Suppress xtrace to prevent PAT from appearing in trace logs (mika#903).
     { set +x; } 2>/dev/null
@@ -403,6 +477,14 @@ ${RESULT}"
 
 ${RESULT}"
             fi
+        fi
+
+        # Post-flight body-callout verification (mika#1123): detect dev-groom drift
+        # where the plan is committed and pushed but the issue body never received the
+        # canonical callout block. If missing, write a recovery callout that surfaces
+        # the drift without fabricating an architect verdict.
+        if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] && [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
+            _verify_and_write_body_callout "$REPO" "$ISSUE_NUM" "$WORKTREE_DIR" "$BRANCH"
         fi
 
         # Issue #138: Discover actual PR URL from the branch
