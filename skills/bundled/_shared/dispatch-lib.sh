@@ -35,8 +35,9 @@ Stdout recovered from file."
         fi
     fi
     # Capture stderr tail on crash path BEFORE deleting the file (#104)
+    # Scrub secrets from stderr to prevent PAT leakage in callback delivery (mika#903).
     if [ -z "$RESULT" ] && [ -n "$STDERR_FILE" ] && [ -f "$STDERR_FILE" ]; then
-        _STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" 2>/dev/null)
+        _STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" 2>/dev/null | _scrub_secrets_from_output)
         if [ -n "$_STDERR_TAIL" ]; then
             RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result.
 
@@ -51,11 +52,14 @@ ${_STDERR_TAIL}"
         RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result."
     fi
     # --- Diagnostic trace tail (mika#887) ---
+    # Scrub secrets from trace tail to prevent PAT leakage in callback delivery (mika#903).
     if [ -f "$TRACE_FILE" ]; then
         case "$RESULT" in
             "HANDLER CRASH"*)
                 # Crash path: append trace tail, preserve file for forensics
-                _TRACE_TAIL=$(tail -50 "$TRACE_FILE" 2>/dev/null | sed 's/^/    /')
+                _TRACE_TAIL=$(tail -50 "$TRACE_FILE" 2>/dev/null \
+                    | _scrub_secrets_from_output \
+                    | sed 's/^/    /')
                 if [ -n "$_TRACE_TAIL" ]; then
                     RESULT="${RESULT}
 
@@ -141,18 +145,34 @@ _validate_inputs() {
     fi
 }
 
+_scrub_secrets_from_output() {
+    # Redact known secret patterns from diagnostic output before callback delivery (mika#903).
+    # Covers: env var assignments (GH_APP_TOKEN=..., MIKA_*=..., GH_TOKEN=...),
+    #         fine-grained PATs (github_pat_*), classic PATs (ghp_*),
+    #         GitHub App installation tokens (ghs_*), and user-to-server OAuth tokens (ghu_*).
+    sed -E 's/(GH_APP_TOKEN|GH_TOKEN|MIKA_[A-Z_]*TOKEN|MIKA_[A-Z_]*API_KEY|MIKA_[A-Z_]*PRIVATE_KEY)=[^ ]*/\1=<REDACTED>/g' \
+        | sed -E 's/github_pat_[A-Za-z0-9_]+/<REDACTED_PAT>/g' \
+        | sed -E 's/gh[spu]_[A-Za-z0-9_]+/<REDACTED_TOKEN>/g'
+}
+
 _setup_gh_auth() {
+    # Suppress xtrace to prevent PAT from appearing in trace logs (mika#903).
+    { set +x; } 2>/dev/null
     # GitHub App installation token for gh CLI.
     # See mika#520 for context on why we check GH_TOKEN before calling gh auth login.
     if [ -z "${GH_TOKEN:-}" ]; then
         GH_APP_TOKEN=$(mika ${AGENT:+--agent "$AGENT"} token github 2>/dev/null)
         if [ -n "$GH_APP_TOKEN" ]; then
             echo "$GH_APP_TOKEN" | gh auth login --with-token 2>/dev/null
+            unset GH_APP_TOKEN
             gh auth switch --user "mika-platform-bot[bot]" 2>/dev/null || true
         else
             echo "WARNING: mika token github failed — gh CLI will fall back to host credentials" >&2
         fi
     fi
+    # Re-enable xtrace (was set by dispatch_claude_pilot before calling us).
+    # GH_APP_TOKEN is already unset above, so set -x won't leak it.
+    set -x
 }
 
 _scrub_env() {
@@ -330,10 +350,11 @@ _run_claude_pilot() {
     # shellcheck disable=SC2086
     claude-pilot --verbose --log-dir --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $TRACE_FLAG $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
-    # Persist stderr to durable file before any processing (mika#1097)
+    # Persist stderr to durable file before any processing (mika#1097).
+    # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
     if [ -s "$STDERR_FILE" ]; then
         mkdir -p "$(dirname "$PERSISTENT_STDERR")" 2>/dev/null || true
-        cp "$STDERR_FILE" "$PERSISTENT_STDERR" 2>/dev/null || echo "Warning: failed to persist stderr to $PERSISTENT_STDERR" >&2
+        _scrub_secrets_from_output < "$STDERR_FILE" > "$PERSISTENT_STDERR" 2>/dev/null || echo "Warning: failed to persist stderr to $PERSISTENT_STDERR" >&2
     fi
     # Issue #135: extract first JSON-object line from stdout
     PILOT_OUTPUT_RAW=$(cat "$STDOUT_FILE" 2>/dev/null)
@@ -408,7 +429,7 @@ ${PILOT_OUTPUT_RAW}"
 
     # Append stderr tail for debugging context (last 10KB)
     if [ -s "$STDERR_FILE" ]; then
-        STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE")
+        STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" | _scrub_secrets_from_output)
         RESULT="${RESULT}
 
 Logs (last 10KB):
@@ -484,7 +505,12 @@ _detect_plan_on_branch() {
 dispatch_claude_pilot() {
     # --- Diagnostic trace (mika#887) ---
     TRACE_FILE="/tmp/dev-pilot-trace-$$.log"
+    # Restrict trace file to owner-only (0600) to prevent local users from reading
+    # secrets that may appear in the trace before _setup_gh_auth's set+x guard (mika#903).
+    _umask_prev=$(umask)
+    umask 077
     exec 9>>"$TRACE_FILE" 2>/dev/null || exec 9>/dev/null
+    umask "$_umask_prev"
     BASH_XTRACEFD=9
     set -x
 
