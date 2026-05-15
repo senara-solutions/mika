@@ -27,6 +27,14 @@ struct BundledSkill {
     content_hash: &'static str,
 }
 
+/// A support directory (underscore-prefixed, non-skill shared library).
+/// Seeded alongside skills so sibling skills can source them at runtime.
+/// See mika#923.
+struct SupportDir {
+    name: &'static str,
+    files: &'static [SkillFile],
+}
+
 /// Declare a bundled skill with its files.
 /// Use `+x` suffix to mark a file as executable (handler scripts).
 /// Legacy skills get an empty content_hash (drift detection scoped to engine-coupled
@@ -257,6 +265,12 @@ pub fn trust_critical_skill_names() -> &'static [&'static str] {
 /// collision with a bundled skill is detected. Therefore this function will
 /// never overwrite a marketplace-installed skill.
 pub fn seed_bundled_skills(skills_dir: &Path) {
+    // Support directories are also seeded unconditionally from startup.rs
+    // (before the disabled guard). This call ensures seed_bundled_skills()
+    // is self-contained when called directly (e.g., by create_agent tool
+    // or tests). The second write on the normal startup path is idempotent.
+    seed_support_dirs(skills_dir);
+
     for skill in all_bundled_skills() {
         let skill_dir = skills_dir.join(skill.name);
         let is_update = skill_dir.exists();
@@ -274,26 +288,19 @@ pub fn seed_bundled_skills(skills_dir: &Path) {
     }
 }
 
-/// Write all files for a single skill into the given directory.
-fn write_skill(skill_dir: &Path, skill: &BundledSkill) -> std::io::Result<()> {
-    // Refuse to write into symlinked skill directories (defense-in-depth).
-    // An attacker could replace a bundled skill directory with a symlink to
-    // redirect writes (including executable handler scripts) to an arbitrary
-    // location.
-    if skill_dir.exists() && skill_dir.symlink_metadata()?.file_type().is_symlink() {
-        return Err(std::io::Error::other(
-            "skill directory is a symlink, refusing to write",
-        ));
-    }
-
-    for file in skill.files {
-        let file_path = skill_dir.join(file.path);
+/// Write a set of files into the given directory.
+///
+/// Shared implementation for both skill and support directory seeding.
+/// Creates parent directories as needed, refuses to overwrite symlinked files.
+fn write_dir_files(dir: &Path, files: &[SkillFile]) -> std::io::Result<()> {
+    for file in files {
+        let file_path = dir.join(file.path);
 
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Refuse to overwrite a file that is a symlink (same defense-in-depth).
+        // Refuse to overwrite a file that is a symlink (defense-in-depth).
         if file_path.exists() && file_path.symlink_metadata()?.file_type().is_symlink() {
             return Err(std::io::Error::other(format!(
                 "file '{}' is a symlink, refusing to write",
@@ -310,6 +317,68 @@ fn write_skill(skill_dir: &Path, skill: &BundledSkill) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write all files for a single skill into the given directory.
+fn write_skill(skill_dir: &Path, skill: &BundledSkill) -> std::io::Result<()> {
+    // Refuse to write into symlinked skill directories (defense-in-depth).
+    // An attacker could replace a bundled skill directory with a symlink to
+    // redirect writes (including executable handler scripts) to an arbitrary
+    // location.
+    if skill_dir.exists() && skill_dir.symlink_metadata()?.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "skill directory is a symlink, refusing to write",
+        ));
+    }
+
+    write_dir_files(skill_dir, skill.files)
+}
+
+/// Seed support directories (underscore-prefixed shared libraries) into the
+/// given skills directory.
+///
+/// Support directories contain shared code (e.g. `_shared/dispatch-lib.sh`)
+/// that sibling skills source at runtime via relative path. They are NOT skills
+/// (no `skill.toml`) but must be present in the deployed skills tree.
+///
+/// Called unconditionally — even when `MIKA_DISABLE_BUNDLED_SKILLS=true` — because
+/// support dirs are infrastructure (dispatch plumbing), not skill prompts. The
+/// disable flag is for hot-patching skill prompts during dev, not for breaking
+/// the dispatch pipeline. See mika#923.
+pub fn seed_support_dirs(skills_dir: &Path) {
+    for dir in SUPPORT_DIRS {
+        let target_dir = skills_dir.join(dir.name);
+        let is_update = target_dir.exists();
+
+        // Refuse to write into symlinked support directories (defense-in-depth).
+        if target_dir.exists() {
+            match target_dir.symlink_metadata() {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    warn!(
+                        support_dir = dir.name,
+                        "support directory is a symlink, refusing to write"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(support_dir = dir.name, error = %e, "failed to stat support directory");
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        if let Err(e) = write_dir_files(&target_dir, dir.files) {
+            warn!(support_dir = dir.name, error = %e, "failed to seed support directory");
+            if !is_update {
+                let _ = std::fs::remove_dir_all(&target_dir);
+            }
+        } else if is_update {
+            debug!(support_dir = dir.name, "updated support directory");
+        } else {
+            info!(support_dir = dir.name, "seeded support directory");
+        }
+    }
 }
 
 /// Check on-disk bundled skills for content drift against the build-time embedded
@@ -810,6 +879,103 @@ mod tests {
                 skill.name
             );
         }
+    }
+
+    #[test]
+    fn test_seed_creates_support_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        seed_bundled_skills(skills_dir);
+
+        // _shared/dispatch-lib.sh must exist
+        let dispatch_lib = skills_dir.join("_shared").join("dispatch-lib.sh");
+        assert!(
+            dispatch_lib.is_file(),
+            "_shared/dispatch-lib.sh should be seeded"
+        );
+
+        // File should be non-empty
+        let content = std::fs::read_to_string(&dispatch_lib).unwrap();
+        assert!(!content.is_empty(), "dispatch-lib.sh should have content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_support_dir_files_are_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        seed_bundled_skills(skills_dir);
+
+        let dispatch_lib = skills_dir.join("_shared").join("dispatch-lib.sh");
+        let mode = std::fs::metadata(&dispatch_lib)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "_shared/dispatch-lib.sh should be executable"
+        );
+    }
+
+    #[test]
+    fn test_seed_support_dirs_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        seed_support_dirs(skills_dir);
+        seed_support_dirs(skills_dir);
+        seed_support_dirs(skills_dir);
+
+        // _shared directory should exist with correct files
+        let dispatch_lib = skills_dir.join("_shared").join("dispatch-lib.sh");
+        assert!(dispatch_lib.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_support_dir_symlink_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        // Seed once
+        seed_support_dirs(skills_dir);
+
+        // Replace _shared with a symlink
+        let target_dir = tempfile::tempdir().unwrap();
+        let shared_dir = skills_dir.join("_shared");
+        std::fs::remove_dir_all(&shared_dir).unwrap();
+        std::os::unix::fs::symlink(target_dir.path(), &shared_dir).unwrap();
+
+        // Seed again — the symlinked directory should be skipped
+        seed_support_dirs(skills_dir);
+
+        // The target directory should NOT contain any files
+        assert!(
+            std::fs::read_dir(target_dir.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "symlink target should remain empty — seed_support_dirs must refuse to follow it",
+        );
+    }
+
+    #[test]
+    fn test_support_dirs_exclude_test_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        seed_support_dirs(skills_dir);
+
+        // test-dispatch-lib.sh should NOT be seeded (excluded by *test* filter)
+        let test_file = skills_dir.join("_shared").join("test-dispatch-lib.sh");
+        assert!(
+            !test_file.exists(),
+            "test files should be excluded from support dir seeding"
+        );
     }
 
     #[test]
