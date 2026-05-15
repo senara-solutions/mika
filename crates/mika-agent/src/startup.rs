@@ -30,8 +30,21 @@ pub fn seed_core_memory_if_empty(db: &Database, home_dir: &Path, agent_name: &st
 /// Shared between CLI and server startup paths. Only writes skills whose
 /// directories don't already exist (never overwrites user customizations).
 /// When `disabled` is true, skips seeding entirely (useful for debugging handlers).
+///
+/// Support directories (underscore-prefixed shared libraries like `_shared/`)
+/// are seeded unconditionally — even when `disabled` is true — because they
+/// are infrastructure (dispatch plumbing), not skill prompts. See mika#923.
 pub fn seed_bundled_skills_if_needed(home_dir: &Path, disabled: bool) {
     let skills_dir = home_dir.join("skills");
+
+    // Support dirs are infrastructure (dispatch plumbing), not skill prompts.
+    // They must be seeded even when MIKA_DISABLE_BUNDLED_SKILLS=true — that
+    // flag is for hot-patching skill prompts during dev, not for breaking
+    // the dispatch pipeline. See mika#923, mika#984.
+    if skills_dir.is_dir() {
+        crate::bundled_skills::seed_support_dirs(&skills_dir);
+    }
+
     if disabled {
         tracing::warn!(
             "bundled skill seeding disabled by config \
@@ -68,8 +81,41 @@ mod tests {
         let skills_dir = tmp.path().join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
         seed_bundled_skills_if_needed(tmp.path(), true);
-        // Verify no skill directories were created
-        assert_eq!(std::fs::read_dir(&skills_dir).unwrap().count(), 0);
+        // Verify no skill directories were created (only support dirs)
+        let entries: Vec<_> = std::fs::read_dir(&skills_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('_'))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            0,
+            "no skill directories should be created when disabled"
+        );
+    }
+
+    #[test]
+    fn test_support_dirs_seeded_when_bundled_skills_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        seed_bundled_skills_if_needed(tmp.path(), true);
+        // Support dirs should exist even when disabled
+        let dispatch_lib = skills_dir.join("_shared").join("dispatch-lib.sh");
+        assert!(
+            dispatch_lib.is_file(),
+            "_shared/dispatch-lib.sh should be seeded even when MIKA_DISABLE_BUNDLED_SKILLS=true"
+        );
+        // But actual skill directories should NOT exist
+        let skill_dirs: Vec<_> = std::fs::read_dir(&skills_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('_'))
+            .collect();
+        assert!(
+            skill_dirs.is_empty(),
+            "skill directories should not be created when disabled"
+        );
     }
 
     #[test]

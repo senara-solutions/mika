@@ -9,7 +9,7 @@ use std::path::Path;
 #[path = "build_support/bundled_skills_discover.rs"]
 mod bundled_skills_discover;
 
-use bundled_skills_discover::discover_bundled_skills;
+use bundled_skills_discover::{discover_bundled_skills, discover_support_dirs};
 
 // Keep in sync with scripts/sync-agent-docs.sh DOCS array.
 // CI enforces this via the docs-sync job in .github/workflows/ci.yml.
@@ -193,6 +193,52 @@ fn generate_bundled_skills_table(manifest_dir: &str, out_dir: &str) {
                 "    BundledSkill {{ name: {name:?}, files: SKILL_{idx}_ENTRY_FILES, content_hash: {hash:?} }},\n",
                 name = entry.name,
                 hash = hash,
+            ));
+        }
+        out.push_str("];\n");
+    }
+
+    // --- Support directories (underscore-prefixed, non-skill) ---
+    // These are shared libraries (e.g. _shared/dispatch-lib.sh) that sibling
+    // skills source at runtime. Excluded from skill discovery but need to be
+    // seeded into the deployed skills tree. See mika#923.
+    let support_dirs = discover_support_dirs(&bundled_root);
+
+    // Emit rerun-if-changed for each support directory and its files.
+    for dir in &support_dirs {
+        println!("cargo:rerun-if-changed={}", dir.abs_dir.display());
+    }
+
+    out.push('\n');
+
+    if support_dirs.is_empty() {
+        out.push_str("static SUPPORT_DIRS: &[SupportDir] = &[];\n");
+    } else {
+        for (idx, dir) in support_dirs.iter().enumerate() {
+            out.push_str(&format!(
+                "static SUPPORT_DIR_{idx}_FILES: &[SkillFile] = &[\n"
+            ));
+            for file in &dir.files {
+                let abs = file
+                    .abs_path
+                    .to_str()
+                    .unwrap_or_else(|| panic!("non-utf8 path: {}", file.abs_path.display()));
+                out.push_str(&format!(
+                    "    SkillFile {{ path: {rel:?}, content: include_str!({abs:?}), executable: {exe} }},\n",
+                    rel = file.rel_path,
+                    abs = abs,
+                    exe = file.executable,
+                ));
+                println!("cargo:rerun-if-changed={}", file.abs_path.display());
+            }
+            out.push_str("];\n\n");
+        }
+
+        out.push_str("static SUPPORT_DIRS: &[SupportDir] = &[\n");
+        for (idx, dir) in support_dirs.iter().enumerate() {
+            out.push_str(&format!(
+                "    SupportDir {{ name: {name:?}, files: SUPPORT_DIR_{idx}_FILES }},\n",
+                name = dir.name,
             ));
         }
         out.push_str("];\n");
