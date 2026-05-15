@@ -207,3 +207,42 @@ guard end-to-end.
   different task types (not long-running callbacks for run_claude_pilot), so
   they're not involved in the reaper's domain. Logging from Step 1 will
   confirm/deny this if the bug recurs.
+
+## Scoped coverage (F2 architect feedback, 2026-05-15)
+
+The defense-in-depth re-check in Step 2 covers **only** hypothesis H2
+(TOCTOU race on the known groom child's `dispatch_class` flipping
+between the reaper's read and update). It does NOT cover:
+
+- **H1 (transient second NULL-class child):** a different child than
+  the one we inspect could have been the reaper's trigger. The
+  re-check on the known groom child cannot detect this — the trigger
+  child may already be gone or never appeared in our query result.
+  This residual risk is accepted; Step 1's structured logging will
+  surface H1 if it recurs (`child.id` in the log event identifies
+  which child triggered the reaper).
+- **H3 (parallel writer to `tasks.result`):** the re-check only
+  validates `dispatch_class`, not the writer of
+  `callback_delivered_without_pr_url`. Step 3 (grep for all writers)
+  is the gate that confirms H3's premise; if grep finds a second
+  writer, that's a separate fix outside this plan's scope.
+
+## NULL dispatch_class paths (F3 architect feedback, 2026-05-15)
+
+mika#1001's COALESCE contract treats NULL `dispatch_class` as
+`'implement'` at query time. If groom-class callbacks are ever created
+via a NULL `dispatch_class` path, the COALESCE resolution makes them
+invisible to this plan's defense — the re-check on the known child
+won't catch the case where the trigger was a transient NULL-class
+sibling.
+
+**Current state (verified 2026-05-15):** all groom dispatches go through
+`register_deferred_callback` in `executor.rs:1334`, which sets
+`dispatch_class: Some(class.to_string())` explicitly. No known NULL-class
+groom paths exist today. Adding such paths in the future would
+re-expose the bug class this plan defends against.
+
+**Mitigation:** when adding new task-creation paths in `dispatcher.rs` or
+`engine.rs`, always set `dispatch_class` explicitly to either
+`'implement'` or `'groom'`. Never rely on the COALESCE default for
+groom-semantic tasks.
