@@ -467,12 +467,39 @@ impl TaskDispatcher {
             // engine's next periodic scan (~60s) dispatches it as a
             // DeferredDispatch silent turn. Must run AFTER mark_task_delivered.
             //
-            // mika#1070 — Removed anti-cascade guard. The previous guard prevented
-            // chain promotion when a DeferredDispatch turn itself completed (the
-            // label matched DEFERRED_DISPATCH_LABEL). Each promotion is a DB write
-            // (LIMIT 1) that returns immediately; the promoted task dispatches on
-            // the next engine tick — no call-stack cascade.
-            self.dispatch_next_deferred_callback().await;
+            // mika#1070 — Removed anti-cascade guard. Rationale at the time was
+            // "promotion is just a DB write, no call-stack cascade."
+            //
+            // mika#1124 — Re-added the anti-cascade guard with refined rationale.
+            // Empirically (today, 2026-05-15 drain of 4-ticket queue), when a
+            // DeferredDispatch turn's silent run completes WITHOUT actually calling
+            // `run_claude_pilot` (e.g., LLM emits no tool calls, hits the stall
+            // detector, or has any other no-op shape), chain-promoting the next
+            // deferred callback creates an inline loop: N deferred wrappers each
+            // get promoted → silent turn fires → no pilot dispatched → marked
+            // delivered → chain-promotes the next → repeat, until the queue is
+            // empty. Reaper then kills the parent (no PR url, grace expired).
+            //
+            // Observed: parent `19c8bbbe` (mika#861 today) accumulated 10 deferred
+            // callbacks all delivered with result "deferred dispatch slot freed",
+            // none ran the impl pilot. Same shape on `14f9f32d` (mika#1124's own
+            // groom dispatch — 6 deferred wrappers, none ran).
+            //
+            // Fix: skip inline chain-promotion when the just-completed task is
+            // itself a deferred wrapper. Deferred wrappers don't represent real
+            // dispatch completion — their completion shouldn't trigger queue
+            // progression. Real callbacks (impl-class run_claude_pilot completions)
+            // still chain immediately. The periodic backstop
+            // (`promote_pending_deferred_if_idle`, ~60s cadence, slot-checked)
+            // handles re-promotion when the dispatch slot becomes truly idle.
+            if task.label != crate::agent::DEFERRED_DISPATCH_LABEL {
+                self.dispatch_next_deferred_callback().await;
+            } else {
+                debug!(
+                    task_id = %task.id,
+                    "deferred wrapper completed — skipping inline chain-promotion (mika#1124); periodic backstop will handle re-promotion if slot is idle"
+                );
+            }
         }
 
         if let Err(e) = self.db.end_session(&session_id).await {
@@ -2307,6 +2334,110 @@ mod tests {
         // Parent should still be in_progress (not auto-blocked)
         let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
         assert_eq!(parent.status, "in_progress");
+    }
+
+    /// mika#1124: drift guard — the DEFERRED_DISPATCH_LABEL constant is the
+    /// load-bearing string the anti-cascade guard at the chain-promotion
+    /// callsite matches against. If either side drifts, the wedge returns
+    /// silently.
+    #[test]
+    fn test_deferred_dispatch_label_string_drift_guard() {
+        assert_eq!(
+            crate::agent::DEFERRED_DISPATCH_LABEL,
+            "long_running:run_claude_pilot:deferred",
+            "DEFERRED_DISPATCH_LABEL changed — verify the anti-cascade guard \
+             in dispatch_resume_agent (mika#1124) still matches the wrapper task label."
+        );
+    }
+
+    /// mika#1124: the legitimate FIFO promotion path still works. Verifies that
+    /// `dispatch_next_deferred_callback` promotes the oldest pending deferred
+    /// callback when invoked. The anti-cascade guard short-circuits this call
+    /// only when the just-completed task is itself a deferred wrapper —
+    /// non-wrapper callbacks and the periodic backstop still drive the queue.
+    #[tokio::test]
+    async fn test_dispatch_next_deferred_callback_promotes_pending() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        let parent_id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "manual self_dev parent".to_string(),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap();
+
+        let deferred_id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: Some(parent_id),
+                depth: 1,
+                label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: r#"{"text": "deferred"}"#.to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("implement".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Pre-condition: deferred wrapper is `pending`.
+        let before = db.get_task_unscoped(&deferred_id).await.unwrap().unwrap();
+        assert_eq!(before.status, "pending");
+
+        // Drive the legitimate promotion path directly.
+        dispatcher.dispatch_next_deferred_callback().await;
+
+        // Post-condition: the wrapper is `completed` with the synthetic result
+        // the engine recognizes for DeferredDispatch silent-turn dispatch.
+        let after = db.get_task_unscoped(&deferred_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status, "completed",
+            "deferred wrapper should be promoted"
+        );
+        assert!(
+            after
+                .result
+                .as_deref()
+                .unwrap_or("")
+                .contains("deferred dispatch slot freed"),
+            "promoted wrapper carries the engine's synthetic result string"
+        );
     }
 
     /// #991: maybe_fire_post_callback_advance fires and auto-blocks when no
