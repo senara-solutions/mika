@@ -16,10 +16,57 @@
 #   !docs && source          -> REJECT (code-only PR)
 #   !docs && !source         -> warn + pass (pure config or no diff)
 #
-# Exemptions:
-#   pipeline-exempt PR label    -> bypass docs-only rejection (preferred, mika#1067)
-#   Pipeline-Exempt: docs-only  -> bypass docs-only rejection (trailer fallback)
-#   Pipeline-Exempt: code-only  -> bypass code-only rejection
+# Exemption mechanisms for docs-only PRs (checked in this order; first match wins):
+#
+#   1. Issue `documentation` label inheritance (mika#861):
+#      If the PR body contains `Closes #N` and issue N carries the
+#      `documentation` label, the docs-only rejection is bypassed. This is
+#      the PRIMARY classification-driven path — the linked issue is the
+#      single source of truth for whether work is docs-only.
+#
+#   2. PR `pipeline-exempt` label (mika#1067):
+#      Set by an operator directly on the PR. Read from
+#      `GITHUB_EVENT_PATH` (no gh CLI / token needed). Useful when the
+#      linked issue can't be re-labelled (cross-repo, immutable, or
+#      already-closed) or for one-off operator overrides.
+#
+#   3. `Pipeline-Exempt:` commit trailer (mika#860):
+#      Any commit in base..HEAD with
+#        Pipeline-Exempt: docs-only — <reason>   (preferred, audit trail)
+#        Pipeline-Exempt: docs-only               (accepted, warns)
+#        Pipeline-Exempt: code-only — <reason>    (preferred)
+#        Pipeline-Exempt: code-only               (accepted, warns)
+#      Bare form still passes for backwards compat (PR #860 shipped both
+#      forms) but emits a warning directing operators to the with-reason
+#      form for auditability. Trailer is the residual escape hatch.
+#
+#   4. Reject — no exemption found, exit 1.
+#
+# One-directional asymmetry (load-bearing):
+#   The `documentation` issue label and the `pipeline-exempt` PR label
+#   exempt the source-required check ONLY. They do NOT exempt the
+#   docs-required-when-source-changes check. A PR with source changes
+#   still needs a plan/solution doc regardless of label. This preserves
+#   the protection from mika-platform#17. Only the `Pipeline-Exempt:
+#   code-only` trailer bypasses the code-only rejection.
+#
+# Path-pattern auto-exemption was considered and rejected (mika#861):
+#   (1) Silent green CI with multiple exemption paths erodes structural
+#       visibility — operators can't tell at a glance which path allowed
+#       a green check.
+#   (2) Path-touching is an artifact of classification, not the
+#       classification itself (a docs-only PR is one whose intent is
+#       documentation, not one whose paths happen to start with `docs/`).
+#       Gating on the artifact rather than the decision is an inversion
+#       that erodes protections over time.
+#   (3) Creates a parallel taxonomy alongside `.github/labels.yml`
+#       (DRY violation).
+#
+# Cross-repo `Closes` references (e.g., `Closes senara-solutions/other#N`)
+#   are treated as "no linked issue in this repo" — the `gh api` call would
+#   404. This is intentional: the cross-repo split pattern is what
+#   mika-platform#17 protects against. Use the PR `pipeline-exempt` label
+#   or the trailer with reason for legitimate cross-repo docs-only ships.
 #
 # Note: this script previously enforced an unconditional plan-doc-presence
 # AND compound-doc-presence check. Both were strictly subsumed by the bucket
@@ -28,8 +75,7 @@
 # provide the escape hatch for legitimate docs-only / code-only PRs (e.g.
 # standalone /ce:compound shipments). Running the strict checks in addition
 # rejected legitimate /ce:compound docs-only PRs with no escape mechanism.
-# Aligned with mika-platform/scripts/verify-pipeline.sh; mika#861 tracks
-# layering label-inheritance on top of this for the as-above-so-below path.
+# Aligned with mika-platform/scripts/verify-pipeline.sh.
 #
 # Usage:
 #   ./scripts/verify-pipeline.sh              # local (compares to main)
@@ -76,48 +122,99 @@ else
   OTHER_BUCKET=""
 fi
 
-# Exempt trailers: scan commit messages in base..HEAD
-COMMIT_BODIES=$(git log --format=%B "${MERGE_BASE}..HEAD" 2>/dev/null || true)
-EXEMPT_DOCS_ONLY=0
-EXEMPT_CODE_ONLY=0
-if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only(\s.*)?$'; then
-  EXEMPT_DOCS_ONLY=1
+# --- mika#861: Label inheritance from linked issue ---
+# Parse `Closes #N` from PR body to identify linked issue.
+# Sources (priority order): GITHUB_PR_BODY env var (CI), gh pr view (fallback).
+# Branch-name fallback intentionally omitted — silent misfire on branches like
+# `feature/v2/...` is worse than no fallback (see plan F2).
+LINKED_ISSUE=""
+if [ -n "${GITHUB_PR_BODY:-}" ]; then
+  LINKED_ISSUE=$(echo "$GITHUB_PR_BODY" | grep -oE '(Closes|Fixes|Resolves) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
 fi
-if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only(\s.*)?$'; then
-  EXEMPT_CODE_ONLY=1
+if [ -z "$LINKED_ISSUE" ] && command -v gh >/dev/null 2>&1; then
+  _pr_body=$(gh pr view --json body --jq .body 2>/dev/null || echo "")
+  LINKED_ISSUE=$(echo "$_pr_body" | grep -oE '(Closes|Fixes|Resolves) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
 fi
 
-# Label-based exemption: read PR labels from GitHub Actions event payload
-# GITHUB_EVENT_PATH is always set in GitHub Actions; contains the full event JSON.
-# For pull_request events, labels are at .pull_request.labels[].name.
-# No gh CLI or GITHUB_TOKEN needed — reads a local file.
-EXEMPT_LABEL_DOCS=0
-if [[ -n "${GITHUB_EVENT_PATH:-}" ]]; then
-  if jq -e '.pull_request.labels[]? | select(.name == "pipeline-exempt")' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
-    EXEMPT_LABEL_DOCS=1
+ISSUE_HAS_DOCUMENTATION_LABEL=false
+if [ -n "$LINKED_ISSUE" ]; then
+  _repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo "")
+  if [ -n "$_repo" ]; then
+    _labels=$(gh api "repos/$_repo/issues/$LINKED_ISSUE" --jq '.labels[].name' 2>/dev/null || echo "")
+    if echo "$_labels" | grep -qx "documentation"; then
+      ISSUE_HAS_DOCUMENTATION_LABEL=true
+    fi
   fi
 fi
 
+# --- Exempt trailers: scan commit messages in base..HEAD ---
+COMMIT_BODIES=$(git log --format=%B "${MERGE_BASE}..HEAD" 2>/dev/null || true)
+EXEMPT_DOCS_ONLY=0
+EXEMPT_CODE_ONLY=0
+EXEMPT_DOCS_REASON=""
+EXEMPT_CODE_REASON=""
+
+# Dual-form matching: with-reason (preferred) vs bare (backwards compat, warns)
+if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only[[:space:]]+.+$'; then
+  EXEMPT_DOCS_ONLY=1
+  EXEMPT_DOCS_REASON=$(echo "$COMMIT_BODIES" | grep -oE '^Pipeline-Exempt: docs-only[[:space:]]+.+$' | head -1 | sed 's/^Pipeline-Exempt: docs-only[[:space:]]*//')
+elif echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only[[:space:]]*$'; then
+  EXEMPT_DOCS_ONLY=1
+  EXEMPT_DOCS_REASON=""
+fi
+
+if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only[[:space:]]+.+$'; then
+  EXEMPT_CODE_ONLY=1
+  EXEMPT_CODE_REASON=$(echo "$COMMIT_BODIES" | grep -oE '^Pipeline-Exempt: code-only[[:space:]]+.+$' | head -1 | sed 's/^Pipeline-Exempt: code-only[[:space:]]*//')
+elif echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only[[:space:]]*$'; then
+  EXEMPT_CODE_ONLY=1
+  EXEMPT_CODE_REASON=""
+fi
+
+# --- PR `pipeline-exempt` label exemption (mika#1067) ---
+# Read PR labels from GitHub Actions event payload. GITHUB_EVENT_PATH is always
+# set in GitHub Actions; contains the full event JSON. For pull_request events,
+# labels are at .pull_request.labels[].name. No gh CLI or GITHUB_TOKEN needed —
+# reads a local file.
+EXEMPT_PR_LABEL_DOCS=0
+if [[ -n "${GITHUB_EVENT_PATH:-}" ]]; then
+  if jq -e '.pull_request.labels[]? | select(.name == "pipeline-exempt")' "$GITHUB_EVENT_PATH" >/dev/null 2>&1; then
+    EXEMPT_PR_LABEL_DOCS=1
+  fi
+fi
+
+# --- Docs-only check (labels exempt source-required; trailer is escape hatch) ---
 if [[ -n "$DOCS_BUCKET" && -z "$SOURCE_BUCKET" ]]; then
-  if [[ "$EXEMPT_DOCS_ONLY" == "1" || "$EXEMPT_LABEL_DOCS" == "1" ]]; then
-    if [[ "$EXEMPT_LABEL_DOCS" == "1" ]]; then
-      echo "warn: docs-only PR allowed by pipeline-exempt label" >&2
+  if [ "$ISSUE_HAS_DOCUMENTATION_LABEL" = true ]; then
+    echo "info: [pipeline-exempt: issue-label] docs-only PR allowed by linked-issue documentation label (#$LINKED_ISSUE)" >&2
+  elif [[ "$EXEMPT_PR_LABEL_DOCS" == "1" ]]; then
+    echo "info: [pipeline-exempt: pr-label] docs-only PR allowed by pipeline-exempt PR label" >&2
+  elif [[ "$EXEMPT_DOCS_ONLY" == "1" ]]; then
+    if [ -n "$EXEMPT_DOCS_REASON" ]; then
+      echo "info: [pipeline-exempt: trailer] docs-only PR allowed by Pipeline-Exempt trailer with reason: $EXEMPT_DOCS_REASON" >&2
     else
-      echo "warn: docs-only PR allowed by Pipeline-Exempt: docs-only trailer" >&2
+      echo "warn: [pipeline-exempt: trailer] bare Pipeline-Exempt: docs-only trailer detected; prefer 'Pipeline-Exempt: docs-only — <reason>' for audit trail" >&2
     fi
   else
-    echo "REJECT: docs-only PR: plan/solution present but no source changes" >&2
-    echo "        Apply the 'pipeline-exempt' label to the PR (preferred), or add" >&2
-    echo "        'Pipeline-Exempt: docs-only — <reason>' trailer to a commit." >&2
+    echo "[pipeline-exempt: none] REJECT: docs-only PR: plan/solution present but no source changes" >&2
+    echo "        Add the 'documentation' label to the linked issue (preferred), or apply" >&2
+    echo "        the 'pipeline-exempt' label to the PR, or add" >&2
+    echo "        'Pipeline-Exempt: docs-only — <reason>' trailer to a commit" >&2
+    echo "        if this docs-only ship is intentional (e.g. standalone /ce:compound)." >&2
     ERRORS=$((ERRORS + 1))
   fi
 fi
 
+# --- Code-only check (label does NOT exempt docs-required-when-source-changes) ---
 if [[ -z "$DOCS_BUCKET" && -n "$SOURCE_BUCKET" ]]; then
   if [[ "$EXEMPT_CODE_ONLY" == "1" ]]; then
-    echo "warn: code-only PR allowed by Pipeline-Exempt: code-only trailer" >&2
+    if [ -n "$EXEMPT_CODE_REASON" ]; then
+      echo "info: [pipeline-exempt: trailer] code-only PR allowed by Pipeline-Exempt trailer with reason: $EXEMPT_CODE_REASON" >&2
+    else
+      echo "warn: [pipeline-exempt: trailer] bare Pipeline-Exempt: code-only trailer detected; prefer 'Pipeline-Exempt: code-only — <reason>' for audit trail" >&2
+    fi
   else
-    echo "REJECT: code-only PR: source changes present but no plan/solution doc" >&2
+    echo "[pipeline-exempt: none] REJECT: code-only PR: source changes present but no plan/solution doc" >&2
     echo "        Add 'Pipeline-Exempt: code-only — <reason>' trailer to a commit" >&2
     echo "        if this code-only ship is intentional." >&2
     ERRORS=$((ERRORS + 1))
