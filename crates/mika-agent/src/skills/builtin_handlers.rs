@@ -5525,27 +5525,37 @@ mod tests {
     async fn test_spawn_and_collect_handles_large_output() {
         // Verify that spawn_and_collect returns within a reasonable time
         // even when the subprocess produces output exceeding MAX_OUTPUT_LEN.
-        // This documents the pipe-deadlock risk for the follow-up ticket.
+        // This documents the pipe-deadlock risk: prior to #900, large stdout
+        // could hang the process indefinitely. The primary assertion is the
+        // timing one — completion under 10s vs the historical 600s hang.
+        //
+        // spawn_and_collect itself does NOT truncate output (truncation lives
+        // in truncate_output, called by dispatch_handler — see line 82). So
+        // we only assert "completes promptly without hang." The output size
+        // is not gated by MAX_OUTPUT_LEN at this layer.
         let (_guard, _events) = capture_tracing_events();
 
         let start = std::time::Instant::now();
         let mut cmd = tokio::process::Command::new("sh");
-        // Generate 20KB of output (2x MAX_OUTPUT_LEN)
+        // Generate 20KB of output (2x MAX_OUTPUT_LEN) to exercise the
+        // pipe-buffer-fill path that was historically deadlock-prone.
         cmd.args(["-c", "yes 'AAAAAAAAAA' | head -c 20000"]);
         let output = spawn_and_collect(cmd, "test_large", "").await;
         let elapsed = start.elapsed();
 
-        // Should complete within 10 seconds (not hang at 600s)
+        // Primary assertion: no pipe deadlock (was: 600s hang before #900).
         assert!(
             elapsed.as_secs() < 10,
             "spawn_and_collect took {elapsed:?} — possible pipe deadlock"
         );
-        // Output should be capped at MAX_OUTPUT_LEN
+        // Output should be non-empty (the function captured stdout).
+        // Exact length depends on whether `yes` got SIGPIPE before or after
+        // `head -c` completed, plus any `Exit code:` / `Killed by signal:`
+        // prefix when the pipeline exits non-zero — both make the precise
+        // length racy, so we only assert non-emptiness.
         assert!(
-            output.content.len() <= MAX_OUTPUT_LEN,
-            "output {} exceeds MAX_OUTPUT_LEN {}",
-            output.content.len(),
-            MAX_OUTPUT_LEN
+            !output.content.is_empty(),
+            "spawn_and_collect produced no output from a 20KB stdout source"
         );
     }
 
