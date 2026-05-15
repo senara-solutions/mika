@@ -5540,10 +5540,12 @@ mod tests {
             elapsed.as_secs() < 10,
             "spawn_and_collect took {elapsed:?} — possible pipe deadlock"
         );
-        // Output should be capped at MAX_OUTPUT_LEN
+        // Output should be bounded — each stream is capped at MAX_OUTPUT_LEN by
+        // read_with_counter, but the error path prepends "Exit code: N\n" (when
+        // `yes` catches SIGPIPE on some CI shells). Allow a small overhead margin.
         assert!(
-            output.content.len() <= MAX_OUTPUT_LEN,
-            "output {} exceeds MAX_OUTPUT_LEN {}",
+            output.content.len() < MAX_OUTPUT_LEN + 100,
+            "output {} far exceeds MAX_OUTPUT_LEN {}",
             output.content.len(),
             MAX_OUTPUT_LEN
         );
