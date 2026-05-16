@@ -535,12 +535,14 @@ PR: ${PR_URL}"
         # parent task `completed` on a stranded worktree.
         #
         # Guards:
+        #   - $STATUS = success: don't double-classify already-failed sessions
+        #     (per architect-validated plan; QA-review-#1140 finding 1).
         #   - $SKILL = dev-pilot: dev-groom commits a plan but no PR; the
         #     existing plan-validation check (mika#1134) covers that path.
         #   - $PR_URL empty: PR-discovery above found nothing.
         #   - $PRE_RUN_HEAD != $POST_RUN_HEAD: commits exist. If HEAD unchanged,
         #     the zero-commit check earlier in this block already fires.
-        if [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ]; then
+        if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ]; then
             RESULT="PIPELINE FAILURE: claude-pilot produced commits (${PRE_RUN_HEAD}..${POST_RUN_HEAD}) but no PR was opened on branch '${BRANCH}'. Pipeline truncated before git push + gh pr create.
 
 ${RESULT}"
@@ -558,7 +560,7 @@ Outcome: PIPELINE_INCOMPLETE — manual recovery needed."
             RESULT="${RESULT}
 
 Outcome: PR_OPENED — ${PR_URL}"
-        elif [ "$SKILL" = "dev-groom" ]; then
+        elif [ "$SKILL" = "dev-groom" ] && [ -n "$VALID_PLAN" ]; then
             RESULT="${RESULT}
 
 Outcome: PLAN_GROOMED — see callback body for plan path."
