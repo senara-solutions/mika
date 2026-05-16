@@ -72,10 +72,23 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "attach" | "img" => Some(handle_attach(app, args)),
         "undo" => Some(handle_undo(app).await),
         "rewind" => Some(handle_rewind(app, args).await),
+        "restart" => Some(handle_restart(app)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
     }
+}
+
+/// Tear down the dead agent worker and spawn a fresh one (mika#1149).
+/// Refuses on a healthy worker — `/clear` is the right tool for "start a new
+/// session." The actual respawn is performed by the chat loop on the next
+/// iteration once `pending_restart` is set.
+fn handle_restart(app: &mut App<'_>) -> String {
+    if !app.worker_crashed {
+        return "/restart only applies after the worker has crashed. Use /clear to start a new session on a healthy worker.".to_string();
+    }
+    app.pending_restart = true;
+    "Restarting agent worker… (the lost prompt is not replayed — please re-send it after the worker comes back up.)".to_string()
 }
 
 fn handle_help() -> String {
@@ -2176,6 +2189,43 @@ mod tests {
         assert!(
             !config_content.contains("qwen_model"),
             "should NOT create qwen_model, config: {config_content}"
+        );
+    }
+
+    // --- /restart command tests (mika#1149) ---
+
+    #[tokio::test]
+    async fn test_restart_refuses_on_healthy_worker() {
+        let (mut app, _rx, _td) = test_app().await;
+        // Default state: worker_crashed = false. /restart must refuse.
+        let output = handle_restart(&mut app);
+        assert!(
+            !app.pending_restart,
+            "must not arm restart on healthy worker"
+        );
+        assert!(
+            output.contains("only applies after"),
+            "refusal message should mention the precondition: {output}"
+        );
+        assert!(
+            output.contains("/clear"),
+            "refusal should redirect to /clear: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restart_arms_pending_restart_after_crash() {
+        let (mut app, _rx, _td) = test_app().await;
+        app.worker_crashed = true;
+        let output = handle_restart(&mut app);
+        assert!(app.pending_restart, "must arm pending_restart");
+        assert!(
+            output.contains("Restarting"),
+            "confirmation should announce restart: {output}"
+        );
+        assert!(
+            output.contains("not replayed"),
+            "confirmation should warn the prompt is lost: {output}"
         );
     }
 }

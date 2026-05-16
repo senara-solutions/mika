@@ -309,13 +309,21 @@ pub enum AgentRequest {
     Quit,
 }
 
-pub struct AgentResponse {
-    pub content: String,
-    pub is_error: bool,
-    pub thinking: Option<String>,
-    pub input_tokens: Option<u32>,
-    /// If skills were hot-reloaded during this turn, contains the new registry.
-    pub updated_skills: Option<Arc<SkillRegistry>>,
+/// Events the worker sends back to the TUI. `Reply` carries the normal
+/// turn result; `WorkerCrashed` is emitted by the worker supervisor when
+/// the spawned worker task exits unexpectedly (panic or premature clean exit
+/// while the session is still active). See mika#1149.
+pub enum AgentResponse {
+    Reply {
+        content: String,
+        is_error: bool,
+        thinking: Option<String>,
+        input_tokens: Option<u32>,
+        /// If skills were hot-reloaded during this turn, contains the new registry.
+        updated_skills: Option<Arc<SkillRegistry>>,
+    },
+    /// The agent worker task exited unexpectedly. `/restart` recovers.
+    WorkerCrashed { reason: String },
 }
 
 /// Shell-like input history with draft saving and optional disk persistence.
@@ -562,6 +570,15 @@ pub struct App<'a> {
     /// If set, the chat loop should switch to this agent after the current worker stops.
     pub pending_switch: Option<String>,
 
+    /// True after the worker supervisor reported a crash (mika#1149). Set by
+    /// `tick_agent_mode` on `AgentResponse::WorkerCrashed`. Cleared by a
+    /// successful `/restart`. Gates `/restart`'s healthy-worker refusal.
+    pub worker_crashed: bool,
+
+    /// If true, the chat loop should tear down the dead worker and spawn a
+    /// fresh one on the next iteration. Set by the `/restart` handler.
+    pub pending_restart: bool,
+
     // Image attachments pending send
     pub pending_images: Vec<ImageAttachment>,
 
@@ -678,6 +695,8 @@ impl<'a> App<'a> {
             agent_name,
             global_home,
             pending_switch: None,
+            worker_crashed: false,
+            pending_restart: false,
             pending_images: Vec::new(),
             thinking_level: None,
             context_tokens: None,
@@ -765,6 +784,8 @@ impl<'a> App<'a> {
             agent_name: String::new(),
             global_home,
             pending_switch: None,
+            worker_crashed: false,
+            pending_restart: false,
             pending_images: Vec::new(),
             thinking_level: None,
             context_tokens: None,
@@ -1232,28 +1253,34 @@ impl<'a> App<'a> {
     /// Tick handler for agent mode: poll agent_rx for responses.
     async fn tick_agent_mode(&mut self) {
         match self.agent_rx.try_recv() {
-            Ok(response) => {
+            Ok(AgentResponse::Reply {
+                content,
+                is_error,
+                thinking,
+                input_tokens,
+                updated_skills,
+            }) => {
                 // Update skills if hot-reloaded during this turn
-                if let Some(new_skills) = response.updated_skills {
+                if let Some(new_skills) = updated_skills {
                     self.skills = new_skills;
                 }
 
                 // Update context token tracking
-                if let Some(tokens) = response.input_tokens {
+                if let Some(tokens) = input_tokens {
                     self.context_tokens = Some(tokens);
                 }
 
-                if response.is_error {
+                if is_error {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
-                        content: format!("Error: {}", response.content),
+                        content: format!("Error: {content}"),
                         rendered: None,
                         channel: None,
                     });
                     self.status = AgentStatus::Idle;
                 } else {
                     // Show thinking block (instantly, not progressively revealed)
-                    if let Some(thinking) = response.thinking {
+                    if let Some(thinking) = thinking {
                         let rendered = Self::render_thinking(&thinking);
                         self.messages.push(ChatMessage {
                             role: ChatRole::Thinking,
@@ -1263,7 +1290,7 @@ impl<'a> App<'a> {
                         });
                     }
 
-                    if response.content.is_empty() {
+                    if content.is_empty() {
                         // Agent responded with tool-use only (no text) — show feedback
                         self.messages.push(ChatMessage {
                             role: ChatRole::System,
@@ -1273,15 +1300,32 @@ impl<'a> App<'a> {
                         });
                         self.status = AgentStatus::Idle;
                     } else {
-                        self.pending_response = Some(response.content);
+                        self.pending_response = Some(content);
                         self.reveal_index = 0;
                         self.status = AgentStatus::Responding(0);
                     }
                 }
                 self.needs_redraw = true;
             }
+            Ok(AgentResponse::WorkerCrashed { reason }) => {
+                // Worker died — surface a visible error, clear the spinner,
+                // and arm /restart. Silent toasts defeat the point (mika#1149).
+                self.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: format!(
+                        "\u{26a0} Agent worker crashed: {reason}. Use /restart to recover."
+                    ),
+                    rendered: None,
+                    channel: None,
+                });
+                self.status = AgentStatus::Idle;
+                self.worker_crashed = true;
+                self.needs_redraw = true;
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
-                // Agent worker crashed or exited unexpectedly
+                // Channel closed without a WorkerCrashed event in flight. With
+                // supervision (mika#1149) this is rare — typically only happens
+                // if the supervisor itself is torn down ahead of the channel.
                 if self.status == AgentStatus::Thinking {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
@@ -1290,6 +1334,7 @@ impl<'a> App<'a> {
                         channel: None,
                     });
                     self.status = AgentStatus::Idle;
+                    self.worker_crashed = true;
                     self.needs_redraw = true;
                 }
             }
@@ -1960,5 +2005,109 @@ mod tests {
 
         assert!(!output.contains("Agents:"));
         assert!(output.contains("Done"));
+    }
+
+    // === tick_agent_mode WorkerCrashed handling (mika#1149) ===
+
+    /// Build a minimal `App` whose `agent_rx` is paired with the returned sender,
+    /// so a test can simulate the supervisor delivering events to the TUI.
+    async fn app_with_response_sender() -> (
+        App<'static>,
+        mpsc::UnboundedSender<AgentResponse>,
+        tempfile::TempDir,
+    ) {
+        use mika_agent::async_db::AsyncDatabase;
+        use mika_agent::db::Database;
+        use mika_agent::skills::SkillRegistry;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home_dir = temp_dir.path().to_path_buf();
+        let global_home = temp_dir.path().to_path_buf();
+        let db = Database::open_in_memory().unwrap();
+        let async_db = AsyncDatabase::new(db);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        async_db
+            .create_session(&session_id, "mika", "cli")
+            .await
+            .unwrap();
+
+        let (agent_tx, _request_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+
+        let app = App::new(
+            agent_tx,
+            response_rx,
+            session_id,
+            "test-model".to_string(),
+            "Mika".to_string(),
+            async_db,
+            mika_common::llm::dummy_provider(),
+            home_dir,
+            Arc::new(SkillRegistry::empty()),
+            "mika".to_string(),
+            global_home,
+            mika_common::llm::ProviderKind::Anthropic,
+        );
+
+        (app, response_tx, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn tick_agent_mode_surfaces_worker_crashed_event() {
+        let (mut app, response_tx, _td) = app_with_response_sender().await;
+        app.status = AgentStatus::Thinking; // simulate an in-flight prompt
+
+        response_tx
+            .send(AgentResponse::WorkerCrashed {
+                reason: "worker panicked: simulated tool panic".to_string(),
+            })
+            .unwrap();
+
+        app.tick_agent_mode().await;
+
+        assert!(app.worker_crashed, "must arm /restart by flipping the flag");
+        assert_eq!(app.status, AgentStatus::Idle, "must clear the spinner");
+        let last = app.messages.last().expect("banner pushed");
+        assert!(
+            matches!(last.role, ChatRole::System),
+            "banner must be a System message, got {:?}",
+            last.role
+        );
+        assert!(
+            last.content.contains("Agent worker crashed"),
+            "banner must mention the crash: {}",
+            last.content
+        );
+        assert!(
+            last.content.contains("simulated tool panic"),
+            "banner must include the supervisor's reason: {}",
+            last.content
+        );
+        assert!(
+            last.content.contains("/restart"),
+            "banner must point at the recovery affordance: {}",
+            last.content
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_agent_mode_replies_do_not_set_worker_crashed() {
+        let (mut app, response_tx, _td) = app_with_response_sender().await;
+        app.status = AgentStatus::Thinking;
+
+        response_tx
+            .send(AgentResponse::Reply {
+                content: "hello".to_string(),
+                is_error: false,
+                thinking: None,
+                input_tokens: None,
+                updated_skills: None,
+            })
+            .unwrap();
+
+        app.tick_agent_mode().await;
+
+        assert!(!app.worker_crashed, "Reply must not arm /restart");
+        assert_eq!(app.pending_response.as_deref(), Some("hello"));
     }
 }

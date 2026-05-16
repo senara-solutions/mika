@@ -2,6 +2,10 @@
 
 TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
+## Crate layout
+
+`src/main.rs` is the binary entry point and owns the full module tree under it (`init`, `commands`, `tui`, `wizard`). `src/lib.rs` is a minimal library surface (currently re-exporting `supervision` only) for types and primitives that need to be reachable from integration tests under `crates/mika-cli/tests/`. The binary tree and the library tree are independent — the binary accesses lib re-exports as `mika_cli::*`. Keep `lib.rs` minimal; do not bloat it to make arbitrary binary modules reachable from tests (most logic stays binary-private and is tested via inline `#[cfg(test)] mod tests`).
+
 ## Subcommands
 
 `status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`.
@@ -38,8 +42,9 @@ Scoped flags: `--agent <name>` (override active agent, most subcommands), `--tea
 
 ## TUI Features
 
-- **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`
+- **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` ends the current session, creates a new one, notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped)
+- `/restart` tears down a crashed agent-worker tokio task and spawns a fresh worker for the same agent (mika#1149). Refuses on a healthy worker — `/clear` is the right tool for starting a new session. The lost in-flight prompt is NOT replayed; the operator must re-type. Background callback tasks survive the restart and continue delivering to the new worker
 - `/provider` and `/model` pre-validate via `Settings::make_llm_provider()` before updating the UI. `/provider` switch persists default `{provider}_model` when none exists, warns about stale fields and max_tokens limits, and spawns a background `get_models()` to pre-warm the model list cache. `/model` lists available models from cache/API, supports aliases and direct `provider/model` format with cross-provider switching
 - **Footer badges:** `[N tasks]` (Cyan) for pending reminders, `[N running]` (Yellow) for active background callback tasks (polled every ~5s), `[N hidden]` (DarkGray) for suppressed internal messages in inbox mode, and dashboard status indicator with clickable `[start]`/`[stop]` and `[open]` buttons
 - **Inbox mode:** Default on — hides internal (agent-to-agent) messages from the chat view. `/inbox` toggles between inbox mode (filtered) and audit mode (all messages visible). Reloads message history from DB on toggle. `hidden_internal_count` tracks new internal messages arriving during the session
