@@ -43,16 +43,48 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
       - Notify Vincent via `send_message`: "{repo}#{number} passed QA. CI pending — auto-merge enabled. {PR URL}"
       - Proceed to Step 5 with `in_progress` and note "QA passed, auto-merge enabled, awaiting CI. PR: {url}".
 
-      **`"blocked"`** — Required CI checks failing:
-      - Correlate to task (Step 4).
-      - Check `ci_fix_count` in task metadata (default 0). If >= 2: escalate — notify Vincent "CI blocked after {n} fix attempts on QA-passed {repo}#{number}. Sprint paused. {PR URL}". Proceed to Step 5 with `blocked`.
-      - Otherwise: notify Vincent "{repo}#{number} passed QA but CI failing — attempting fix ({n}/2). {PR URL}"
-      - Set metadata `ci_fix_dispatched_from: "qa_pass_merge"` to prevent duplicate dispatch from a subsequent `block[ci]` verdict.
-      - Launch claude-pilot with a free-text prompt including the failing check names from the `pr_merge_with_gate` response (see Rule 5 — must use `run_claude_pilot`, not direct edits). Update `ci_fix_count` in metadata. Proceed to Step 5 with `in_progress`.
+      **`"blocked"`** — PR cannot merge. Branch on the `reason` field:
+
+        **`reason.reason = "required_check_failed"`** — Required CI checks failing:
+        - Correlate to task (Step 4).
+        - Check `ci_fix_count` in task metadata (default 0). If >= 2: escalate — notify Vincent "CI blocked after {n} fix attempts on QA-passed {repo}#{number}. Sprint paused. {PR URL}". Proceed to Step 5 with `blocked`.
+        - Otherwise: notify Vincent "{repo}#{number} passed QA but CI failing — attempting fix ({n}/2). {PR URL}"
+        - Set metadata `ci_fix_dispatched_from: "qa_pass_merge"` to prevent duplicate dispatch from a subsequent `block[ci]` verdict.
+        - Launch claude-pilot with a free-text prompt including the failing check names from the `failing_checks` array (see Rule 5 — must use `run_claude_pilot`, not direct edits). Update `ci_fix_count` in metadata. Proceed to Step 5 with `in_progress`.
+
+        **`reason.reason = "merge_conflict"`** — PR has merge conflicts:
+        - Correlate to task (Step 4).
+        - Notify Vincent via `send_message`: "{repo}#{number} has merge conflicts. Rebase needed. {PR URL}"
+        - Do NOT call `run_gh pr merge`.
+        - Do NOT call `run_claude_pilot` (conflict resolution is conversation-mode territory).
+        - Task status: `in_progress`.
+
+        **`reason.reason = "missing_approval"`** — PR needs review approval:
+        - Correlate to task (Step 4).
+        - Notify Vincent via `send_message`: "{repo}#{number} needs approval review. {PR URL}"
+        - Task status: `in_progress`.
+
+        **`reason.reason = "draft"` or `reason.reason = "pr_closed"`** — Unexpected in webhook-qa:
+        - Correlate to task (Step 4).
+        - Notify Vincent with context. Escalate.
+
+        **Unrecognized `reason` value** — Future variant not yet handled:
+        - Correlate to task (Step 4).
+        - Notify Vincent via `send_message`: "Unrecognized block reason: {reason}. {PR URL}"
+        - Do NOT call `run_gh pr merge`.
+        - Task status: `in_progress`.
+
+      **`"gate_errored"`** — Tool infrastructure failure:
+        - Correlate to task (Step 4).
+        - Notify Vincent with `kind` and `detail` from response: "Merge gate error for {repo}#{number}: {kind.kind} — {detail}. {PR URL}"
+        - Do NOT fall back to `run_gh pr merge` (explicit prohibition).
+        - Do NOT call `run_claude_pilot`.
+        - Task status: `in_progress`.
 
       **Error (no `action` field)** — Tool returned a plain string instead of a JSON object with `action`:
       - Correlate to task (Step 4).
       - Notify Vincent via `send_message`: "Merge failed for {repo}#{number}: {error message}. {PR URL}"
+      - Do NOT fall back to `run_gh pr merge`.
       - Proceed to Step 5 with `in_progress` (do not block — Vincent may resolve manually).
 
    Build and deploy (`build_mika`, `deploy_mika`) are exec-handler skills NOT available in webhook sessions. For mika repo PRs, build/deploy runs via `make deploy` after merge.
@@ -168,7 +200,9 @@ If you find yourself tempted to "quickly fix" a CI failure via `write_agent_file
 
 Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR. Always use `pr_merge_with_gate` with `pr_number` (integer) and `repo` (owner/repo string). The tool checks required CI statuses and returns a structured `action` — act on it.
 
-**Incident:** mika#485 on 2026-04-08 — PR merged with required CI check in FAILURE state because agent used `run_gh pr merge` which has no CI gate.
+**Structural enforcement:** `pr_merge_with_gate` now returns typed variants (`merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`). The `gate_errored` and `blocked` branches above are the exhaustive handling surface. On ANY error or blocked state, do NOT fall back to `run_gh pr merge`. Runtime enforcement via policy table — see follow-up ticket.
+
+**Incident:** mika#485 on 2026-04-08 — PR merged with required CI check in FAILURE state because agent used `run_gh pr merge` which has no CI gate. mika#792 on 2026-04-24 — agent improvised `run_gh pr merge --auto` when gate returned an unstructured error on a CONFLICTING PR.
 
 ### Rule 7 — `run_gh` input schema discipline
 
