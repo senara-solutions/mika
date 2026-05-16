@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use mika_common::llm::{LlmMessage, LlmProvider, LlmRequest, LlmRole};
+use mika_common::llm::{LlmMessage, LlmProvider, LlmRequest, LlmRole, LlmUsage};
 
 use crate::async_db::AsyncDatabase;
 
@@ -139,6 +139,22 @@ pub struct ExtractedRelationship {
     pub rel_type: String,
     pub chunk_indices: Vec<usize>,
     pub confidence: f64,
+}
+
+/// Result of `call_llm_with_retry` — carries the parsed output alongside
+/// per-API-call usage records (one per `send_message` invocation).
+struct ExtractionResult {
+    output: ExtractionOutput,
+    /// One entry per LLM API call. Single-attempt: len()==1; retry: len()==2.
+    call_records: Vec<LlmCallRecord>,
+}
+
+/// Per-API-call usage + latency record for `llm_calls` row persistence.
+struct LlmCallRecord {
+    usage: LlmUsage,
+    latency_ms: u64,
+    /// `"kg_extraction"` for the first call, `"kg_extraction_retry"` for retry.
+    kg_phase: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -455,28 +471,29 @@ impl SubjectExtractor {
         let prompt = self.build_extraction_prompt(&annotated_text);
 
         // 4. LLM call with C2.2 retry taxonomy.
-        let start = Instant::now();
-        let extraction_output = self.call_llm_with_retry(&prompt).await?;
-        let latency_ms = start.elapsed().as_millis() as u64;
+        let extraction_result = self.call_llm_with_retry(&prompt).await?;
 
         // 5. Parse and validate output.
-        let validated = match extraction_output {
-            Some(ref output) => match validate_extraction_output(output, max_chunk_index) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        trace_id = %self.trace_id,
-                        agent_id = %agent_id,
-                        doc = %doc_path,
-                        error = %e,
-                        event = "extraction_validation_failed",
-                        "extraction output failed validation — log-and-skip per C2.3"
-                    );
-                    return Ok(ExtractionStats::default());
-                }
-            },
+        let extraction_result = match extraction_result {
+            Some(result) => result,
             None => {
                 // LLM returned nothing usable after retries
+                return Ok(ExtractionStats::default());
+            }
+        };
+
+        let validated = match validate_extraction_output(&extraction_result.output, max_chunk_index)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    trace_id = %self.trace_id,
+                    agent_id = %agent_id,
+                    doc = %doc_path,
+                    error = %e,
+                    event = "extraction_validation_failed",
+                    "extraction output failed validation — log-and-skip per C2.3"
+                );
                 return Ok(ExtractionStats::default());
             }
         };
@@ -487,10 +504,16 @@ impl SubjectExtractor {
             ..Default::default()
         };
 
-        // 6. Store llm_calls row (C2.4).
-        if let Some(ref raw_output) = extraction_output {
-            self.store_llm_call(doc_path, latency_ms, raw_output).await;
+        // 6. Store llm_calls rows — one per API call (C2.4).
+        for record in &extraction_result.call_records {
+            self.store_llm_call(doc_path, record.latency_ms, &record.usage, record.kg_phase)
+                .await;
         }
+        let latency_ms: u64 = extraction_result
+            .call_records
+            .iter()
+            .map(|r| r.latency_ms)
+            .sum();
 
         // Read the per-doc source hash so the idempotency marker can be
         // written atomically with the extraction results (#757 review P1).
@@ -861,10 +884,13 @@ Rules:
     }
 
     /// Call the LLM with C2.2 retry taxonomy.
+    ///
+    /// Returns `ExtractionResult` carrying both the parsed output and per-API-call
+    /// usage records (one row per `send_message` invocation for llm_calls persistence).
     async fn call_llm_with_retry(
         &self,
         prompt: &(String, String),
-    ) -> Result<Option<ExtractionOutput>> {
+    ) -> Result<Option<ExtractionResult>> {
         let (system, user_text) = prompt;
 
         let request = LlmRequest {
@@ -880,11 +906,21 @@ Rules:
         };
 
         // Attempt 1
+        let start = Instant::now();
         match self.llm.send_message(&request).await {
             Ok(response) => {
+                let first_latency = start.elapsed().as_millis() as u64;
+                let first_usage = response.usage.clone();
                 let text = response.text_content();
                 match self.parse_extraction_json(&text) {
-                    Ok(output) => Ok(Some(output)),
+                    Ok(output) => Ok(Some(ExtractionResult {
+                        output,
+                        call_records: vec![LlmCallRecord {
+                            usage: first_usage,
+                            latency_ms: first_latency,
+                            kg_phase: "kg_extraction",
+                        }],
+                    })),
                     Err(parse_err) => {
                         // Semantic failure — one retry with reinforcement (C2.2)
                         warn!(
@@ -893,7 +929,13 @@ Rules:
                             event = "extraction_parse_failed_retry",
                             "malformed JSON from LLM — retrying with reinforcement"
                         );
-                        self.retry_with_reinforcement(&request, &text).await
+                        let first_record = LlmCallRecord {
+                            usage: first_usage,
+                            latency_ms: first_latency,
+                            kg_phase: "kg_extraction",
+                        };
+                        self.retry_with_reinforcement(&request, &text, first_record)
+                            .await
                     }
                 }
             }
@@ -902,12 +944,30 @@ Rules:
                 for attempt in 1..=2 {
                     let backoff = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
                     tokio::time::sleep(backoff).await;
+                    let retry_start = Instant::now();
                     match self.llm.send_message(&request).await {
                         Ok(response) => {
+                            let latency = retry_start.elapsed().as_millis() as u64;
+                            let usage = response.usage.clone();
                             let text = response.text_content();
                             return match self.parse_extraction_json(&text) {
-                                Ok(output) => Ok(Some(output)),
-                                Err(_) => self.retry_with_reinforcement(&request, &text).await,
+                                Ok(output) => Ok(Some(ExtractionResult {
+                                    output,
+                                    call_records: vec![LlmCallRecord {
+                                        usage,
+                                        latency_ms: latency,
+                                        kg_phase: "kg_extraction",
+                                    }],
+                                })),
+                                Err(_) => {
+                                    let first_record = LlmCallRecord {
+                                        usage,
+                                        latency_ms: latency,
+                                        kg_phase: "kg_extraction",
+                                    };
+                                    self.retry_with_reinforcement(&request, &text, first_record)
+                                        .await
+                                }
                             };
                         }
                         Err(retry_err) if is_retryable_error(&retry_err) => continue,
@@ -943,11 +1003,15 @@ Rules:
     }
 
     /// Retry with prompt reinforcement after semantic failure.
+    ///
+    /// Carries the first call's record so both can be persisted as separate
+    /// `llm_calls` rows (one per API call — see plan § "Why two rows").
     async fn retry_with_reinforcement(
         &self,
         original_request: &LlmRequest,
         bad_output: &str,
-    ) -> Result<Option<ExtractionOutput>> {
+        first_record: LlmCallRecord,
+    ) -> Result<Option<ExtractionResult>> {
         let reinforcement = format!(
             "Your previous response was not valid JSON. The output was:\n{}\n\n\
              Please return ONLY a valid JSON object with \"entities\" and \"relationships\" arrays. \
@@ -965,11 +1029,24 @@ Rules:
             content: mika_common::llm::LlmContent::Text(reinforcement),
         });
 
+        let retry_start = Instant::now();
         match self.llm.send_message(&retry_request).await {
             Ok(response) => {
+                let retry_latency = retry_start.elapsed().as_millis() as u64;
+                let retry_usage = response.usage.clone();
                 let text = response.text_content();
                 match self.parse_extraction_json(&text) {
-                    Ok(output) => Ok(Some(output)),
+                    Ok(output) => Ok(Some(ExtractionResult {
+                        output,
+                        call_records: vec![
+                            first_record,
+                            LlmCallRecord {
+                                usage: retry_usage,
+                                latency_ms: retry_latency,
+                                kg_phase: "kg_extraction_retry",
+                            },
+                        ],
+                    })),
                     Err(e) => {
                         warn!(
                             trace_id = %self.trace_id,
@@ -1335,7 +1412,13 @@ Rules:
     }
 
     /// Store an llm_calls row (C2.4).
-    async fn store_llm_call(&self, _doc_path: &str, latency_ms: u64, _output: &ExtractionOutput) {
+    async fn store_llm_call(
+        &self,
+        _doc_path: &str,
+        latency_ms: u64,
+        usage: &LlmUsage,
+        kg_phase: &str,
+    ) {
         let call_id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let provider = self.llm.provider_name().to_string();
         let model = self.llm.model_name().to_string();
@@ -1348,16 +1431,16 @@ Rules:
                 Some(&self.trace_id),
                 &provider,
                 &model,
-                0, // input_tokens not available from extraction calls
-                0, // output_tokens not available
-                None,
-                None,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
                 latency_ms,
                 Some("end_turn"),
                 "success",
                 None,
                 0,
-                Some("kg_extraction"),
+                Some(kg_phase),
                 None,
                 None,
             )
