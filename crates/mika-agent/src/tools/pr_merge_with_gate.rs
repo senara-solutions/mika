@@ -44,7 +44,10 @@ impl Tool for PrMergeWithGateTool {
                 IMPORTANT: 'auto_merge_enabled' means GitHub will merge when all checks pass — \
                 the PR is NOT yet merged. Do not claim the PR is merged until you confirm it.\n\n\
                 After a successful merge (action: 'merged'), update the task status before \
-                reporting to the user."
+                reporting to the user.\n\n\
+                Returns a structured JSON response with an 'action' field. Possible actions: \
+                'merged', 'auto_merge_enabled', 'blocked', 'already_merged', 'gate_errored'. \
+                Branch on 'action' to determine next steps."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -122,36 +125,67 @@ impl Tool for PrMergeWithGateTool {
             }
         };
 
-        // -- Step 1: Fetch required check statuses --
+        // -- Step 1: Preflight — check PR state via gh pr view --
+        let preflight = match run_gh_pr_view(pr_number, repo, token).await {
+            Ok(pf) => pf,
+            Err(e) => {
+                let result = MergeGateResult::GateError {
+                    kind: GateErrorKind::GhCliFailure {
+                        exit_code: e.exit_code.unwrap_or(-1),
+                    },
+                    detail: e.message,
+                };
+                return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+            }
+        };
+
+        // Classify preflight result
+        if let Some(result) = classify_preflight(&preflight) {
+            return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+        }
+
+        // -- Step 2: Fetch required check statuses --
         let checks_result = run_gh_checks(pr_number, repo, token).await;
         let checks = match checks_result {
             Ok(c) => c,
             Err(e) => {
-                return Ok(ToolOutput::error(format!(
-                    "Failed to fetch check statuses: {e}"
-                )));
+                let result = MergeGateResult::GateError {
+                    kind: GateErrorKind::GhCliFailure {
+                        exit_code: parse_exit_code_from_error(&e),
+                    },
+                    detail: format!("Failed to fetch check statuses: {e}"),
+                };
+                return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
             }
         };
 
-        // -- Step 2: Classify and act --
+        // -- Step 3: Classify and act --
         let classification = classify_checks(&checks);
 
         match classification {
             CheckClassification::HasFailures => {
-                let failing: Vec<&GhCheck> = checks
+                let failing: Vec<CheckInfo> = checks
                     .iter()
                     .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
+                    .map(|c| CheckInfo {
+                        name: c.name.clone(),
+                        state: c.state.clone(),
+                        link: c.link.clone(),
+                    })
                     .collect();
 
                 let result = MergeGateResult::Blocked {
-                    failing_checks: failing
-                        .iter()
-                        .map(|c| CheckInfo {
-                            name: c.name.clone(),
-                            state: c.state.clone(),
-                            link: c.link.clone(),
-                        })
-                        .collect(),
+                    reason: BlockReason::RequiredCheckFailed {
+                        failing_checks: failing.clone(),
+                    },
+                    failing_checks: failing,
+                    detail: format!(
+                        "{} required check(s) failed",
+                        checks
+                            .iter()
+                            .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
+                            .count()
+                    ),
                 };
                 Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
             }
@@ -177,7 +211,15 @@ impl Tool for PrMergeWithGateTool {
                         };
                         Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                     }
-                    Err(e) => Ok(ToolOutput::error(format!("Auto-merge failed: {e}"))),
+                    Err(e) => {
+                        let result = MergeGateResult::GateError {
+                            kind: GateErrorKind::GhCliFailure {
+                                exit_code: parse_exit_code_from_error(&e),
+                            },
+                            detail: format!("Auto-merge failed: {e}"),
+                        };
+                        Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    }
                 }
             }
             CheckClassification::AllPassed => {
@@ -199,19 +241,34 @@ impl Tool for PrMergeWithGateTool {
                     let result = MergeGateResult::Merged;
                     Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                 } else if output_lower.contains("draft") {
-                    Ok(ToolOutput::error(
-                        "PR is a draft — convert to ready before merging",
-                    ))
+                    let result = MergeGateResult::Blocked {
+                        reason: BlockReason::Draft,
+                        failing_checks: vec![],
+                        detail: "PR is a draft — convert to ready before merging".to_string(),
+                    };
+                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                 } else if output_lower.contains("merge conflict")
                     || output_lower.contains("not mergeable")
                 {
-                    Ok(ToolOutput::error(
-                        "Merge conflicts — resolve before merging",
-                    ))
+                    let result = MergeGateResult::Blocked {
+                        reason: BlockReason::MergeConflict,
+                        failing_checks: vec![],
+                        detail: "PR has merge conflicts — rebase needed".to_string(),
+                    };
+                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                 } else if output_lower.contains("review") && output_lower.contains("required") {
-                    Ok(ToolOutput::error("Required reviews not met"))
+                    let result = MergeGateResult::Blocked {
+                        reason: BlockReason::MissingApproval,
+                        failing_checks: vec![],
+                        detail: "Required reviews not met".to_string(),
+                    };
+                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                 } else {
-                    Ok(ToolOutput::error(format!("Merge failed: {output}")))
+                    let result = MergeGateResult::GateError {
+                        kind: GateErrorKind::Unknown,
+                        detail: format!("Merge failed: {output}"),
+                    };
+                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                 }
             }
         }
@@ -223,21 +280,69 @@ impl Tool for PrMergeWithGateTool {
 // ---------------------------------------------------------------------------
 
 /// Structured result returned by the tool as JSON.
-#[derive(Debug, Serialize)]
+/// Tagged union — the LLM branches on the `action` field.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "action")]
-enum MergeGateResult {
+pub(crate) enum MergeGateResult {
     #[serde(rename = "merged")]
     Merged,
     #[serde(rename = "auto_merge_enabled")]
     AutoMergeEnabled { pending_checks: Vec<CheckInfo> },
     #[serde(rename = "blocked")]
-    Blocked { failing_checks: Vec<CheckInfo> },
+    Blocked {
+        reason: BlockReason,
+        /// Retained for backward compatibility — existing prompts branch on this field.
+        failing_checks: Vec<CheckInfo>,
+        detail: String,
+    },
     #[serde(rename = "already_merged")]
     AlreadyMerged,
+    #[serde(rename = "gate_errored")]
+    GateError { kind: GateErrorKind, detail: String },
+}
+
+/// Why a PR is blocked from merging.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "reason")]
+pub(crate) enum BlockReason {
+    /// PR is CONFLICTING or mergeStateStatus is DIRTY.
+    #[serde(rename = "merge_conflict")]
+    MergeConflict,
+    /// One or more required CI checks failed.
+    #[serde(rename = "required_check_failed")]
+    RequiredCheckFailed { failing_checks: Vec<CheckInfo> },
+    /// Branch protection requires approval reviews.
+    #[serde(rename = "missing_approval")]
+    MissingApproval,
+    /// PR is closed (not merged).
+    #[serde(rename = "pr_closed")]
+    PrClosed,
+    /// PR is a draft.
+    #[serde(rename = "draft")]
+    Draft,
+}
+
+/// Why the gate tool itself failed (infrastructure, not PR state).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind")]
+#[allow(dead_code)] // Variants are part of the exhaustive error taxonomy; not all constructed yet.
+pub(crate) enum GateErrorKind {
+    /// gh CLI returned non-zero exit code.
+    #[serde(rename = "gh_cli_failure")]
+    GhCliFailure { exit_code: i32 },
+    /// Network-level failure.
+    #[serde(rename = "network_error")]
+    NetworkError,
+    /// Failed to parse gh output.
+    #[serde(rename = "parse_error")]
+    ParseError,
+    /// Unclassified failure.
+    #[serde(rename = "unknown")]
+    Unknown,
 }
 
 /// Check info included in the structured result.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CheckInfo {
     pub(crate) name: String,
     pub(crate) state: String,
@@ -264,6 +369,24 @@ pub(crate) enum CheckClassification {
     HasPending,
     /// At least one check has failed or been cancelled.
     HasFailures,
+}
+
+/// Preflight PR state from `gh pr view`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PrPreflight {
+    pub(crate) mergeable: String,
+    pub(crate) merge_state_status: String,
+    #[serde(default)]
+    pub(crate) is_draft: bool,
+    pub(crate) state: String,
+}
+
+/// Error from `run_gh_pr_view` with optional exit code.
+#[derive(Debug)]
+pub(crate) struct PreflightError {
+    pub(crate) message: String,
+    pub(crate) exit_code: Option<i32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +420,53 @@ fn validate_merge_method(method: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Preflight classification (pure function — easily testable)
+// ---------------------------------------------------------------------------
+
+/// Classify preflight PR state into an immediate result, or None if checks
+/// should proceed (PR is open, not draft, not conflicting).
+pub(crate) fn classify_preflight(preflight: &PrPreflight) -> Option<MergeGateResult> {
+    let state_upper = preflight.state.to_uppercase();
+
+    // Already merged — primary detection path (before merge attempt)
+    if state_upper == "MERGED" {
+        return Some(MergeGateResult::AlreadyMerged);
+    }
+
+    // Closed without merge
+    if state_upper == "CLOSED" {
+        return Some(MergeGateResult::Blocked {
+            reason: BlockReason::PrClosed,
+            failing_checks: vec![],
+            detail: "PR is closed".to_string(),
+        });
+    }
+
+    // Draft PR
+    if preflight.is_draft {
+        return Some(MergeGateResult::Blocked {
+            reason: BlockReason::Draft,
+            failing_checks: vec![],
+            detail: "PR is a draft — convert to ready before merging".to_string(),
+        });
+    }
+
+    // Merge conflict detection — the #792 fix
+    let mergeable_upper = preflight.mergeable.to_uppercase();
+    let merge_state_upper = preflight.merge_state_status.to_uppercase();
+    if mergeable_upper == "CONFLICTING" || merge_state_upper == "DIRTY" {
+        return Some(MergeGateResult::Blocked {
+            reason: BlockReason::MergeConflict,
+            failing_checks: vec![],
+            detail: "PR has merge conflicts — rebase needed".to_string(),
+        });
+    }
+
+    // No immediate blocker — proceed to check classification
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Check classification (pure function — easily testable)
 // ---------------------------------------------------------------------------
 
@@ -318,6 +488,38 @@ pub(crate) fn classify_checks(checks: &[GhCheck]) -> CheckClassification {
 // ---------------------------------------------------------------------------
 // Subprocess helpers
 // ---------------------------------------------------------------------------
+
+/// Run `gh pr view <number> --repo <repo> --json mergeable,mergeStateStatus,isDraft,state`
+/// and return the parsed preflight struct.
+pub(crate) async fn run_gh_pr_view(
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+) -> Result<PrPreflight, PreflightError> {
+    let pr_str = pr_number.to_string();
+    let args = vec![
+        "pr",
+        "view",
+        &pr_str,
+        "--repo",
+        repo,
+        "--json",
+        "mergeable,mergeStateStatus,isDraft,state",
+    ];
+
+    let output = run_gh_subprocess(&args, token).await.map_err(|e| {
+        let exit_code = parse_exit_code_from_error(&e);
+        PreflightError {
+            message: e,
+            exit_code: Some(exit_code),
+        }
+    })?;
+
+    serde_json::from_str::<PrPreflight>(output.trim()).map_err(|e| PreflightError {
+        message: format!("Failed to parse gh pr view output: {e}"),
+        exit_code: None,
+    })
+}
 
 /// Run `gh pr checks <number> --repo <repo> --required --json name,state,bucket,link`
 /// and return the parsed check list.
@@ -453,6 +655,21 @@ pub(crate) async fn run_gh_subprocess(args: &[&str], token: &str) -> Result<Stri
 
         Err(err)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Try to extract an exit code integer from an error string like "gh exit code 1: ..."
+fn parse_exit_code_from_error(err: &str) -> i32 {
+    if let Some(rest) = err.strip_prefix("gh exit code ")
+        && let Some(code_str) = rest.split(':').next()
+        && let Ok(code) = code_str.trim().parse::<i32>()
+    {
+        return code;
+    }
+    -1
 }
 
 // ---------------------------------------------------------------------------
@@ -667,18 +884,116 @@ mod tests {
     }
 
     #[test]
-    fn serialize_blocked_result() {
+    fn serialize_blocked_result_required_check_failed() {
         let result = MergeGateResult::Blocked {
+            reason: BlockReason::RequiredCheckFailed {
+                failing_checks: vec![CheckInfo {
+                    name: "CI".to_string(),
+                    state: "FAILURE".to_string(),
+                    link: Some("https://example.com".to_string()),
+                }],
+            },
             failing_checks: vec![CheckInfo {
                 name: "CI".to_string(),
                 state: "FAILURE".to_string(),
                 link: Some("https://example.com".to_string()),
             }],
+            detail: "1 required check(s) failed".to_string(),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["action"], "blocked");
+        // Backward compat: top-level failing_checks
         assert_eq!(json["failing_checks"][0]["name"], "CI");
         assert_eq!(json["failing_checks"][0]["link"], "https://example.com");
+        // New: reason field with tagged union
+        assert_eq!(json["reason"]["reason"], "required_check_failed");
+        assert_eq!(json["reason"]["failing_checks"][0]["name"], "CI");
+        assert_eq!(json["detail"], "1 required check(s) failed");
+    }
+
+    #[test]
+    fn serialize_blocked_merge_conflict() {
+        let result = MergeGateResult::Blocked {
+            reason: BlockReason::MergeConflict,
+            failing_checks: vec![],
+            detail: "PR has merge conflicts — rebase needed".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "blocked");
+        assert_eq!(json["reason"]["reason"], "merge_conflict");
+        assert_eq!(json["failing_checks"].as_array().unwrap().len(), 0);
+        assert_eq!(json["detail"], "PR has merge conflicts — rebase needed");
+    }
+
+    #[test]
+    fn serialize_blocked_missing_approval() {
+        let result = MergeGateResult::Blocked {
+            reason: BlockReason::MissingApproval,
+            failing_checks: vec![],
+            detail: "Required reviews not met".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "blocked");
+        assert_eq!(json["reason"]["reason"], "missing_approval");
+    }
+
+    #[test]
+    fn serialize_blocked_draft() {
+        let result = MergeGateResult::Blocked {
+            reason: BlockReason::Draft,
+            failing_checks: vec![],
+            detail: "PR is a draft".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "blocked");
+        assert_eq!(json["reason"]["reason"], "draft");
+    }
+
+    #[test]
+    fn serialize_blocked_pr_closed() {
+        let result = MergeGateResult::Blocked {
+            reason: BlockReason::PrClosed,
+            failing_checks: vec![],
+            detail: "PR is closed".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "blocked");
+        assert_eq!(json["reason"]["reason"], "pr_closed");
+    }
+
+    #[test]
+    fn serialize_gate_error() {
+        let result = MergeGateResult::GateError {
+            kind: GateErrorKind::GhCliFailure { exit_code: 1 },
+            detail: "gh exit code 1: no checks reported".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "gate_errored");
+        assert_eq!(json["kind"]["kind"], "gh_cli_failure");
+        assert_eq!(json["kind"]["exit_code"], 1);
+        assert_eq!(json["detail"], "gh exit code 1: no checks reported");
+    }
+
+    #[test]
+    fn serialize_gate_error_network() {
+        let result = MergeGateResult::GateError {
+            kind: GateErrorKind::NetworkError,
+            detail: "Connection refused".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "gate_errored");
+        assert_eq!(json["kind"]["kind"], "network_error");
+    }
+
+    #[test]
+    fn serialize_gate_error_parse() {
+        let result = MergeGateResult::GateError {
+            kind: GateErrorKind::ParseError,
+            detail: "Invalid JSON from gh".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "gate_errored");
+        assert_eq!(json["kind"]["kind"], "parse_error");
     }
 
     #[test]
@@ -702,6 +1017,188 @@ mod tests {
         let result = MergeGateResult::AlreadyMerged;
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["action"], "already_merged");
+    }
+
+    // -- Preflight classification tests --
+
+    #[test]
+    fn preflight_conflicting_returns_merge_conflict() {
+        let preflight = PrPreflight {
+            mergeable: "CONFLICTING".to_string(),
+            merge_state_status: "DIRTY".to_string(),
+            is_draft: false,
+            state: "OPEN".to_string(),
+        };
+        let result = classify_preflight(&preflight);
+        assert_eq!(
+            result,
+            Some(MergeGateResult::Blocked {
+                reason: BlockReason::MergeConflict,
+                failing_checks: vec![],
+                detail: "PR has merge conflicts — rebase needed".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn preflight_dirty_returns_merge_conflict() {
+        let preflight = PrPreflight {
+            mergeable: "UNKNOWN".to_string(),
+            merge_state_status: "DIRTY".to_string(),
+            is_draft: false,
+            state: "OPEN".to_string(),
+        };
+        let result = classify_preflight(&preflight);
+        assert_eq!(
+            result,
+            Some(MergeGateResult::Blocked {
+                reason: BlockReason::MergeConflict,
+                failing_checks: vec![],
+                detail: "PR has merge conflicts — rebase needed".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn preflight_mergeable_open_passes_through() {
+        let preflight = PrPreflight {
+            mergeable: "MERGEABLE".to_string(),
+            merge_state_status: "CLEAN".to_string(),
+            is_draft: false,
+            state: "OPEN".to_string(),
+        };
+        assert_eq!(classify_preflight(&preflight), None);
+    }
+
+    #[test]
+    fn preflight_closed_returns_pr_closed() {
+        let preflight = PrPreflight {
+            mergeable: "MERGEABLE".to_string(),
+            merge_state_status: "CLEAN".to_string(),
+            is_draft: false,
+            state: "CLOSED".to_string(),
+        };
+        let result = classify_preflight(&preflight);
+        assert_eq!(
+            result,
+            Some(MergeGateResult::Blocked {
+                reason: BlockReason::PrClosed,
+                failing_checks: vec![],
+                detail: "PR is closed".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn preflight_merged_returns_already_merged() {
+        let preflight = PrPreflight {
+            mergeable: "MERGEABLE".to_string(),
+            merge_state_status: "CLEAN".to_string(),
+            is_draft: false,
+            state: "MERGED".to_string(),
+        };
+        assert_eq!(
+            classify_preflight(&preflight),
+            Some(MergeGateResult::AlreadyMerged)
+        );
+    }
+
+    #[test]
+    fn preflight_draft_returns_draft() {
+        let preflight = PrPreflight {
+            mergeable: "MERGEABLE".to_string(),
+            merge_state_status: "CLEAN".to_string(),
+            is_draft: true,
+            state: "OPEN".to_string(),
+        };
+        let result = classify_preflight(&preflight);
+        assert_eq!(
+            result,
+            Some(MergeGateResult::Blocked {
+                reason: BlockReason::Draft,
+                failing_checks: vec![],
+                detail: "PR is a draft — convert to ready before merging".to_string(),
+            })
+        );
+    }
+
+    /// #792 regression test (Unit 1, tool-layer):
+    /// Mock gh pr view returning CONFLICTING + DIRTY + empty statusCheckRollup.
+    /// Assert the tool returns Blocked { reason: MergeConflict } WITHOUT
+    /// attempting any gh pr merge call.
+    #[test]
+    fn regression_792_conflicting_pr_returns_blocked_merge_conflict() {
+        // This is the exact state from PR #792 that triggered the incident:
+        // mergeable: CONFLICTING, mergeStateStatus: DIRTY, statusCheckRollup: []
+        let preflight = PrPreflight {
+            mergeable: "CONFLICTING".to_string(),
+            merge_state_status: "DIRTY".to_string(),
+            is_draft: false,
+            state: "OPEN".to_string(),
+        };
+
+        let result = classify_preflight(&preflight);
+
+        // Must return Blocked { MergeConflict }, NOT an error string
+        match result {
+            Some(MergeGateResult::Blocked {
+                reason: BlockReason::MergeConflict,
+                ..
+            }) => {} // Expected
+            other => panic!(
+                "Expected Blocked {{ MergeConflict }}, got: {other:?}. \
+                 The tool must detect CONFLICTING state before attempting merge."
+            ),
+        }
+    }
+
+    // -- Backward compatibility test --
+
+    #[test]
+    fn backward_compat_blocked_has_action_and_failing_checks_at_top_level() {
+        // Ensure existing prompts that branch on action == "blocked"
+        // and read failing_checks at the top level still work.
+        let result = MergeGateResult::Blocked {
+            reason: BlockReason::RequiredCheckFailed {
+                failing_checks: vec![CheckInfo {
+                    name: "CI / test".to_string(),
+                    state: "FAILURE".to_string(),
+                    link: None,
+                }],
+            },
+            failing_checks: vec![CheckInfo {
+                name: "CI / test".to_string(),
+                state: "FAILURE".to_string(),
+                link: None,
+            }],
+            detail: "1 required check(s) failed".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+
+        // These are the fields existing prompts rely on:
+        assert_eq!(json["action"], "blocked");
+        assert!(json["failing_checks"].is_array());
+        assert_eq!(json["failing_checks"][0]["name"], "CI / test");
+    }
+
+    // -- parse_exit_code_from_error tests --
+
+    #[test]
+    fn parse_exit_code_success() {
+        assert_eq!(
+            parse_exit_code_from_error("gh exit code 1: no checks reported"),
+            1
+        );
+        assert_eq!(
+            parse_exit_code_from_error("gh exit code 128: not a git repository"),
+            128
+        );
+    }
+
+    #[test]
+    fn parse_exit_code_fallback() {
+        assert_eq!(parse_exit_code_from_error("some random error"), -1);
+        assert_eq!(parse_exit_code_from_error(""), -1);
     }
 
     // -- Tool integration tests --
@@ -797,6 +1294,7 @@ mod tests {
         assert_eq!(def.name, "pr_merge_with_gate");
         assert!(def.description.contains("CI gate"));
         assert!(def.description.contains("auto_merge_enabled"));
+        assert!(def.description.contains("gate_errored"));
 
         // Verify schema has required fields
         let props = &def.input_schema["properties"];
