@@ -164,6 +164,11 @@ _verify_and_write_body_callout() {
     # Dual-write documentation: body callouts can be written by two paths:
     #   (1) the LLM in dev-groom step 18 (organic, passes dispatch gate)
     #   (2) this structural recovery (partial, does NOT pass dispatch gate)
+    # When the issue-scoped plan file is missing (dev-groom drift produced no
+    # plan at all), this function logs body_callout_drift_recovery_skipped and
+    # exits without writing — the orchestrator's Class A path handles it
+    # (re-dispatch dev-groom). See mika#1144 for the Class C drift this guards
+    # against.
     local repo="$1" issue_num="$2" worktree_dir="$3" branch="$4"
 
     # 1. Fetch current issue body
@@ -182,18 +187,20 @@ _verify_and_write_body_callout() {
         return 0  # All present, nothing to do
     fi
 
-    # 3. Find the plan file on the branch — scoped to issue number first
+    # 3. Find the plan file on the branch — scoped to issue number only.
+    # Class C drift fix (mika#1144): no fallback to "any plan file". A worktree
+    # branched from main carries every previously-merged plan in docs/plans/, so
+    # an unscoped `find | sort -r | head -1` reliably returns the most recent
+    # unrelated plan. A missing callout (Class A) is more recoverable than a
+    # wrong one (Class C).
     local plan_file
     plan_file=$(find "$worktree_dir/docs/plans" -name "*-${issue_num}-*-plan.md" -size +500c \
         2>/dev/null | sort -r | head -1)
 
-    # Fall back to any plan file if issue-scoped search finds nothing
     if [ -z "$plan_file" ]; then
-        plan_file=$(find "$worktree_dir/docs/plans" -name "*-plan.md" -size +500c \
-            2>/dev/null | sort -r | head -1)
+        echo "body_callout_drift_recovery_skipped: no issue-scoped plan file found for $repo#$issue_num (Class A — orchestrator will re-dispatch dev-groom)" >&2
+        return 0
     fi
-
-    [ -n "$plan_file" ] || return 0  # No valid plan file — can't write callout
 
     local plan_relpath="${plan_file#"$worktree_dir/"}"
     local head_sha

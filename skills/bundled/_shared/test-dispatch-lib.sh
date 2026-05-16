@@ -259,6 +259,41 @@ assert_eq "Multiple callouts: first one wins" "docs/plans/first.md" "$EXTRACTED4
 DRY_RUN_JQ=$(sed -n '/_handle_dry_run()/,/^}/p' "$DISPATCH_LIB")
 assert_contains "Dry run output includes entry_command" 'entry_command' "$DRY_RUN_JQ"
 
+# --- Test 8: Recovery shim fallback removed (mika#1144) ---
+
+echo ""
+echo "Test 8: _verify_and_write_body_callout has no unscoped fallback"
+echo "-----------------------------------------------------------------"
+
+VERIFY_FUNC=$(sed -n '/_verify_and_write_body_callout()/,/^}/p' "$DISPATCH_LIB")
+
+# Assertion 1 (POSITIVE — F2 paired-test discipline): the issue-scoped find is
+# retained. If a refactor accidentally removes BOTH finds, this assertion fires.
+SCOPED_FIND_COUNT=$(printf '%s\n' "$VERIFY_FUNC" \
+    | grep -cE 'find.*-name *"\*-\$\{issue_num\}-\*-plan\.md"' || true)
+assert_eq "Issue-scoped find call retained" "1" "$SCOPED_FIND_COUNT"
+
+# Assertion 2 (NEGATIVE — the core mika#1144 regression guard): the unscoped
+# fallback find is gone. Detection shape: an assignment to plan_file with a
+# `find ... -name "*-plan.md"` glob that does NOT contain `${issue_num}`.
+# The scoped find above DOES contain `${issue_num}` and is filtered out by the
+# `grep -v issue_num` step.
+UNSCOPED_FALLBACK_COUNT=$(printf '%s\n' "$VERIFY_FUNC" \
+    | grep -E 'plan_file=.*find.*-name *"\*-plan\.md"' \
+    | grep -vc 'issue_num' || true)
+assert_eq "No unscoped fallback find call (mika#1144 strip)" "0" "$UNSCOPED_FALLBACK_COUNT"
+
+# Assertion 3: the new stderr log key is present (signals the skip path is
+# explicit, not silent).
+assert_contains "Skipped-recovery stderr log present" \
+    'body_callout_drift_recovery_skipped' "$VERIFY_FUNC"
+
+# Assertion 4: the function still has the early-return guard after the
+# issue-scoped find — no plan file → return 0, now with a log line on stderr.
+SKIP_BLOCK=$(printf '%s\n' "$VERIFY_FUNC" | sed -n '/if \[ -z "\$plan_file" \]/,/^[[:space:]]*fi$/p' | head -10)
+assert_contains "Skip block returns 0" "return 0" "$SKIP_BLOCK"
+assert_contains "Skip block logs to stderr" '>&2' "$SKIP_BLOCK"
+
 # --- Summary ---
 
 echo ""

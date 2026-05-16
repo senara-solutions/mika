@@ -3,7 +3,7 @@ title: Strip recovery shim's "any plan file" fallback — Class C body-callout d
 ticket: mika#1144
 parent_ticket: mika#1123
 type: bug
-status: drafted
+status: completed
 created: 2026-05-16
 ---
 
