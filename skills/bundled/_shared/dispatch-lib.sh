@@ -560,10 +560,15 @@ Outcome: PIPELINE_INCOMPLETE — manual recovery needed."
             RESULT="${RESULT}
 
 Outcome: PR_OPENED — ${PR_URL}"
-        elif [ "$SKILL" = "dev-groom" ] && [ -n "$VALID_PLAN" ]; then
+        elif [ "$SKILL" = "dev-groom" ] && [ -n "${VALID_PLAN:-}" ]; then
+            # $VALID_PLAN is set by the dev-groom plan-validation block earlier
+            # in this success branch (~line 476) when a docs/plans/*-plan.md
+            # file >500 bytes is found. Non-local — in scope here.
+            # QA-review-#1140 finding 2: surface the resolved plan path instead
+            # of a generic message.
             RESULT="${RESULT}
 
-Outcome: PLAN_GROOMED — see callback body for plan path."
+Outcome: PLAN_GROOMED — ${VALID_PLAN}"
         else
             RESULT="${RESULT}
 
