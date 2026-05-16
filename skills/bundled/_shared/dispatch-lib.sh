@@ -518,12 +518,61 @@ ${RESULT}"
         fi
 
         # Issue #138: Discover actual PR URL from the branch
+        PR_URL=""
         if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
             PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
             if [ -n "$PR_URL" ]; then
                 RESULT="${RESULT}
 PR: ${PR_URL}"
             fi
+        fi
+
+        # mika#940 Unit 1: post-flight PR-existence check.
+        # Detect dev-pilot success-with-commits-but-no-PR — the premature-EndTurn
+        # family where the model emits `[done] Success` after Edit/Compound
+        # phases but before reaching git push + gh pr create. Classify as
+        # PIPELINE FAILURE so mika-dev surfaces the gap instead of marking the
+        # parent task `completed` on a stranded worktree.
+        #
+        # Guards:
+        #   - $STATUS = success: don't double-classify already-failed sessions
+        #     (per architect-validated plan; QA-review-#1140 finding 1).
+        #   - $SKILL = dev-pilot: dev-groom commits a plan but no PR; the
+        #     existing plan-validation check (mika#1134) covers that path.
+        #   - $PR_URL empty: PR-discovery above found nothing.
+        #   - $PRE_RUN_HEAD != $POST_RUN_HEAD: commits exist. If HEAD unchanged,
+        #     the zero-commit check earlier in this block already fires.
+        if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ]; then
+            RESULT="PIPELINE FAILURE: claude-pilot produced commits (${PRE_RUN_HEAD}..${POST_RUN_HEAD}) but no PR was opened on branch '${BRANCH}'. Pipeline truncated before git push + gh pr create.
+
+${RESULT}"
+        fi
+
+        # mika#940 Unit 3: outcome classification line for operator/mika-dev
+        # consumption. Replaces heuristic log inspection with a single
+        # structured marker. Order matters: pipeline failure wins over any
+        # success-shape outcome.
+        if echo "$RESULT" | grep -qF "PIPELINE FAILURE:"; then
+            RESULT="${RESULT}
+
+Outcome: PIPELINE_INCOMPLETE — manual recovery needed."
+        elif [ -n "$PR_URL" ]; then
+            RESULT="${RESULT}
+
+Outcome: PR_OPENED — ${PR_URL}"
+        elif [ "$SKILL" = "dev-groom" ] && [ -n "${VALID_PLAN:-}" ]; then
+            # $VALID_PLAN is set by the dev-groom plan-validation block earlier
+            # in this success branch (~line 476) when a docs/plans/*-plan.md
+            # file >500 bytes is found. Non-local — in scope here.
+            # QA-review-#1140 finding 2: surface the resolved plan path instead
+            # of a generic message.
+            RESULT="${RESULT}
+
+Outcome: PLAN_GROOMED — ${VALID_PLAN}"
+        else
+            RESULT="${RESULT}
+
+Outcome: UNKNOWN — inspect worktree manually."
         fi
     elif [ "$PILOT_EXIT" -eq 0 ]; then
         RESULT="claude-pilot completed (exit 0) but output was not structured JSON.
@@ -660,7 +709,16 @@ dispatch_claude_pilot() {
     # the contract.
     local ENTRY_COMMAND
     case "$SKILL" in
-      dev-pilot)  ENTRY_COMMAND="/mika" ;;
+      dev-pilot)
+        ENTRY_COMMAND="/mika"
+        # mika#940: signal claude-pilot to fail the session if `gh pr create`
+        # is never invoked. Caught by the source-level pipeline_incomplete
+        # detection in claude-pilot-py (Unit 2). Defense-in-depth against the
+        # premature-EndTurn family observed on 2026-05-02 (mika#931, #938,
+        # #939) — the model emits `[done] Success` after Edit-heavy phases
+        # before reaching git push + gh pr create.
+        export CLAUDE_PILOT_REQUIRE_PR=1
+        ;;
       dev-groom)
         ENTRY_COMMAND="/mika-groom-ticket"
         # Early-exit guard (mika#1097 Layer B): dev-groom sessions MUST produce
