@@ -16,9 +16,9 @@
 //! writes these entity_keys. See `docs/solutions/logic-errors/a2a-dual-write-duplicate-rows.md`.
 //!
 //! Additionally, this module **deletes** `kg_resolutions_log` rows with
-//! `outcome='no_match'` when entity types gain new entities (#960). This is a
-//! consequent of the domain-graph mutation, not an independent concern — same
-//! pattern as `prune_stale_entities`.
+//! `outcome IN ('no_match', 'no_candidate_of_type')` when entity types gain
+//! new entities (#960, #1154). This is a consequent of the domain-graph
+//! mutation, not an independent concern — same pattern as `prune_stale_entities`.
 //!
 //! ## Invariants
 //!
@@ -211,9 +211,9 @@ pub struct RebuildStats {
     pub edges_depends_on: usize,
     pub edges_provides: usize,
     pub duration_ms: u128,
-    /// Per-type counts of `outcome='no_match'` resolution log rows invalidated
-    /// this rebuild. Populated when entity types gain new entities; empty when
-    /// no type had `added > 0`. See #960.
+    /// Per-type counts of `outcome IN ('no_match', 'no_candidate_of_type')`
+    /// resolution log rows invalidated this rebuild. Populated when entity types
+    /// gain new entities; empty when no type had `added > 0`. See #960, #1154.
     pub invalidated_no_match: HashMap<String, usize>,
 }
 
@@ -445,7 +445,7 @@ impl<'a> DomainGraphBuilder<'a> {
                     }
                     let invalidated = tx.execute(
                         "DELETE FROM kg_resolutions_log
-                         WHERE outcome = 'no_match'
+                         WHERE outcome IN ('no_match', 'no_candidate_of_type')
                            AND subject_entity_id IN (
                              SELECT id FROM kg_subject_entities WHERE type = ?1
                            )",
