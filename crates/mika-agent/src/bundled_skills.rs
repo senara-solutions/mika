@@ -231,6 +231,27 @@ pub fn all_bundled_skill_names() -> Vec<&'static str> {
 /// - `agents-teams`: controls multi-agent orchestration and delegation
 static TRUST_CRITICAL_SKILLS: &[&str] = &["skill-review", "self-knowledge", "agents-teams"];
 
+/// Skill names that were once bundled but have been renamed or removed,
+/// listed here so the prune pass can clean up their per-agent directories
+/// on hosts that were deployed before the rename or removal.
+///
+/// **Update procedure:** any future PR that renames or removes a bundled
+/// skill MUST add the OLD name here in the same commit. Stale entries are
+/// harmless (the directories no longer exist on previously-cleaned hosts).
+/// Entries can be removed in a later cleanup PR once every production host
+/// is confirmed to have rebooted since the rename/removal landed.
+///
+/// **Marketplace-safety invariant:** entries in this list will be
+/// `remove_dir_all`'d from every agent's `skills/` dir. Names added here
+/// must be names that were definitively bundled in a prior release.
+/// Adding the name of a marketplace skill here would wipe user state.
+pub(crate) const KNOWN_REMOVED_BUNDLED_SKILLS: &[&str] = &[
+    // claude-pilot was renamed to dev-pilot + dev-groom in mika#853
+    // (deployed 2026-04-28). 12 stale per-agent directories survived
+    // the rename — see mika#859 § Phase 0 P0.8 for verification output.
+    "claude-pilot",
+];
+
 /// Check whether a skill is trust-critical (blocked from review/adaptation).
 ///
 /// Only trust-critical bundled skills are blocked from `review_skill`. Other
@@ -248,6 +269,76 @@ pub fn is_trust_critical_skill(name: &str) -> bool {
 /// Return the list of trust-critical skill names (for error messages and prompts).
 pub fn trust_critical_skill_names() -> &'static [&'static str] {
     TRUST_CRITICAL_SKILLS
+}
+
+/// Remove per-agent skill directories whose name appears in
+/// [`KNOWN_REMOVED_BUNDLED_SKILLS`]. Called once at the top of
+/// [`seed_bundled_skills`].
+///
+/// Defense-in-depth (matches `write_skill`):
+/// - Symlinks are never followed and never removed.
+/// - `_`-prefixed support directories (e.g. `_shared/`) are skipped.
+/// - `.`-prefixed entries (e.g. `.mika-bundled` markers in a future
+///   revision) are skipped.
+/// - I/O errors are logged and skipped — a single bad directory must not
+///   block the seed.
+///
+/// Returns the number of directories actually removed.
+pub(crate) fn prune_known_removed_bundled_skills(skills_dir: &Path) -> usize {
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "failed to read skills_dir for known-removed prune");
+            return 0;
+        }
+    };
+
+    let mut pruned = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if name.starts_with('_') || name.starts_with('.') {
+            continue;
+        }
+
+        let is_known_removed = KNOWN_REMOVED_BUNDLED_SKILLS
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(name));
+        if !is_known_removed {
+            continue;
+        }
+
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                info!(
+                    skill = name,
+                    "pruned orphaned bundled-skill directory (known-removed list)"
+                );
+                pruned += 1;
+            }
+            Err(e) => {
+                warn!(
+                    skill = name,
+                    error = %e,
+                    "failed to prune orphaned bundled-skill directory"
+                );
+            }
+        }
+    }
+    pruned
 }
 
 /// Seed bundled skills into the given skills directory.
@@ -270,6 +361,18 @@ pub fn seed_bundled_skills(skills_dir: &Path) {
     // is self-contained when called directly (e.g., by create_agent tool
     // or tests). The second write on the normal startup path is idempotent.
     seed_support_dirs(skills_dir);
+
+    // Prune known-removed orphans BEFORE the write loop. Order matters:
+    // if a future PR ever reuses a removed name, we want the prune to
+    // happen first so the subsequent write_skill is a clean create rather
+    // than an update over stale content.
+    let pruned = prune_known_removed_bundled_skills(skills_dir);
+    if pruned > 0 {
+        info!(
+            count = pruned,
+            "pruned known-removed bundled-skill directories"
+        );
+    }
 
     for skill in all_bundled_skills() {
         let skill_dir = skills_dir.join(skill.name);
@@ -993,5 +1096,160 @@ mod tests {
             content.contains("NEVER use shell commands"),
             "shell-exec prompt missing shell prohibition"
         );
+    }
+
+    // --- T1–T9: prune_known_removed_bundled_skills tests (mika#859) ---
+
+    #[test]
+    fn prune_removes_directory_in_known_removed_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let orphan = skills_dir.join("claude-pilot");
+        std::fs::create_dir_all(orphan.join("handlers")).unwrap();
+        std::fs::write(
+            orphan.join("skill.toml"),
+            "[skill]\nname = \"claude-pilot\"",
+        )
+        .unwrap();
+
+        let removed = prune_known_removed_bundled_skills(skills_dir);
+        assert_eq!(removed, 1);
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn prune_is_case_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let orphan = skills_dir.join("Claude-Pilot");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(
+            orphan.join("skill.toml"),
+            "[skill]\nname = \"Claude-Pilot\"",
+        )
+        .unwrap();
+
+        let removed = prune_known_removed_bundled_skills(skills_dir);
+        assert_eq!(removed, 1);
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn prune_preserves_directory_not_in_known_removed_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let custom = skills_dir.join("my-custom-skill");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("skill.toml"),
+            "[skill]\nname = \"my-custom-skill\"",
+        )
+        .unwrap();
+
+        let removed = prune_known_removed_bundled_skills(skills_dir);
+        assert_eq!(removed, 0);
+        assert!(custom.exists());
+    }
+
+    #[test]
+    fn prune_preserves_symlinked_skill_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let real_target = tempfile::tempdir().unwrap();
+        std::fs::write(real_target.path().join("skill.toml"), "content").unwrap();
+
+        let link_path = skills_dir.join("claude-pilot");
+        std::fs::create_dir_all(skills_dir).unwrap();
+        std::os::unix::fs::symlink(real_target.path(), &link_path).unwrap();
+
+        let removed = prune_known_removed_bundled_skills(skills_dir);
+        assert_eq!(removed, 0);
+        assert!(link_path.exists());
+        assert!(real_target.path().join("skill.toml").exists());
+    }
+
+    #[test]
+    fn prune_preserves_support_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let shared = skills_dir.join("_shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("dispatch-lib.sh"), "#!/bin/sh").unwrap();
+
+        let removed = prune_known_removed_bundled_skills(skills_dir);
+        assert_eq!(removed, 0);
+        assert!(shared.exists());
+    }
+
+    #[test]
+    fn prune_preserves_current_bundled_skill_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let current = skills_dir.join("dev-pilot");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("skill.toml"), "[skill]\nname = \"dev-pilot\"").unwrap();
+
+        let removed = prune_known_removed_bundled_skills(skills_dir);
+        assert_eq!(removed, 0);
+        assert!(current.exists());
+    }
+
+    #[test]
+    fn prune_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+        let orphan = skills_dir.join("claude-pilot");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("skill.toml"), "content").unwrap();
+
+        let first = prune_known_removed_bundled_skills(skills_dir);
+        assert_eq!(first, 1);
+
+        let second = prune_known_removed_bundled_skills(skills_dir);
+        assert_eq!(second, 0);
+    }
+
+    #[test]
+    fn seed_bundled_skills_prunes_before_seeding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path();
+
+        // Create stale orphan
+        let orphan = skills_dir.join("claude-pilot");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(
+            orphan.join("skill.toml"),
+            "[skill]\nname = \"claude-pilot\"",
+        )
+        .unwrap();
+
+        seed_bundled_skills(skills_dir);
+
+        // Orphan should be gone
+        assert!(
+            !orphan.exists(),
+            "claude-pilot orphan should be pruned by seed_bundled_skills"
+        );
+        // Current bundled skills should exist
+        assert!(
+            skills_dir.join("dev-pilot").exists(),
+            "dev-pilot should be seeded"
+        );
+        assert!(
+            skills_dir.join("dev-groom").exists(),
+            "dev-groom should be seeded"
+        );
+    }
+
+    #[test]
+    fn known_removed_disjoint_from_current_bundle() {
+        for name in KNOWN_REMOVED_BUNDLED_SKILLS {
+            assert!(
+                !is_bundled_skill(name),
+                "KNOWN_REMOVED_BUNDLED_SKILLS contains '{name}', which is also in the \
+                 current bundle. Either remove it from KNOWN_REMOVED_BUNDLED_SKILLS \
+                 (if you intend to re-bundle it), or rename the new bundled skill."
+            );
+        }
     }
 }
