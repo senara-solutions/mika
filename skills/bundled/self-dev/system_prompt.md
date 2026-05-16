@@ -83,6 +83,8 @@ The handler derives everything else (branch, worktree, pipeline command).
 - **One session per issue** — the handler runs the full pipeline.
 - **Wait for the callback** — results arrive via callback when claude-pilot finishes. Do NOT poll.
 - **Do NOT do the work inline** — never read source files, analyze code, or produce implementation plans. That wastes your context window. Always use `run_claude_pilot`.
+- **State-awareness on re-dispatch (engine guard — see `executor.rs` `dispatch_task_has_open_pr`, mika#920):**
+  If `run_claude_pilot` returns `dispatch_task_has_open_pr`, the task already has an open PR. Surface the rejection's `pr_url`, `pr_state`, `latest_qa_verdict`, and `merge_state` to the operator via `send_message` along with the suggested options (iterate with `iteration_context`, wait for blocker to resolve, or skip). Wait for explicit instructions. Do NOT retry without the operator's go-ahead. The engine guard in `validate_dispatch_readiness()` is the authoritative enforcement point; this rule is defense-in-depth.
 
 #### Metadata extraction (reused across callbacks and close-out)
 
