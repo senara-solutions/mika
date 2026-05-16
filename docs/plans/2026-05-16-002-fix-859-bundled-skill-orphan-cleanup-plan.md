@@ -2,9 +2,9 @@
 title: Prune orphaned bundled-skill directories via a one-shot known-removed list
 ticket: mika#859
 type: fix
-status: draft
+status: groomed
 created: 2026-05-16
-revision: 2 (post mika-arch first-pass ITERATE — F1/F2/F3)
+revision: 3 (post mika-arch second-pass — paraphrased GROOMED with T9 add per U1)
 ---
 
 # Plan: Prune orphaned bundled-skill directories (mika#859)
@@ -493,11 +493,35 @@ End-to-end: tempdir with `skills/claude-pilot/skill.toml`. Call
 `skills/dev-pilot/` exists, `skills/dev-groom/` exists. Verifies the
 prune-before-seed ordering and the full incident fix end-to-end.
 
+### T9 — `known_removed_disjoint_from_current_bundle`
+
+Invariant: every entry in `KNOWN_REMOVED_BUNDLED_SKILLS` must NOT be
+present in `all_bundled_skills()`. If a future PR ever reuses a removed
+name as a new bundled skill (without first removing the entry from the
+const list), the prune would delete the new skill's directory at every
+boot — silent breakage. This test catches the overlap at CI time.
+
+```rust
+#[test]
+fn known_removed_disjoint_from_current_bundle() {
+    for name in KNOWN_REMOVED_BUNDLED_SKILLS {
+        assert!(
+            !is_bundled_skill(name),
+            "KNOWN_REMOVED_BUNDLED_SKILLS contains '{name}', which is also in the \
+             current bundle. Either remove it from KNOWN_REMOVED_BUNDLED_SKILLS \
+             (if you intend to re-bundle it), or rename the new bundled skill."
+        );
+    }
+}
+```
+
+Added per architect second-pass U1 ruling.
+
 ## Phase 3 — Acceptance
 
 Unit:
 
-- `cargo test -p mika-agent bundled_skills` — T1–T8 pass.
+- `cargo test -p mika-agent bundled_skills` — T1–T9 pass.
 - `cargo test -p mika-agent kg::domain_builder::tests::rebuild_deletes_removed_entities`
   continues to pass unchanged (P0.7).
 - `cargo clippy -p mika-agent --all-targets -- -D warnings` clean.
@@ -565,8 +589,9 @@ Manual (operator-side, post-deploy of this PR):
   don't re-appear, but no user state is lost (we only deleted
   marketplace-safe known-removed names). Worst case is operator re-runs
   `make deploy` on a previous tag.
-- **Test cost:** 8 tests, all using `tempfile::tempdir`. No new fixtures
-  or test infrastructure. Estimated +~140 lines under `mod tests`.
+- **Test cost:** 9 tests, all using `tempfile::tempdir` except T9 which
+  is pure const assertion. No new fixtures or test infrastructure.
+  Estimated +~150 lines under `mod tests`.
 
 ## Architect-decision provenance
 
@@ -589,22 +614,19 @@ Disposition: ITERATE. Three BLOCKING findings:
   or the next server boot reconciles (`init.rs:68`, `agents.rs:114`).
   No production correctness gap.
 
-Remaining uncertainties for second pass:
+mika-arch second-pass (session `e344299b-e79c-46df-8c24-9ee0718237e3`,
+paraphrased GROOMED): proceed to branch push + issue-body callout
+attachment with T9 added per U1.
 
-- U1: With Part A removed, the only orphan-class we defend against is
-  "name was bundled, now isn't." If a future rename also happens to be a
-  *rename* (claude-pilot → dev-pilot), the OLD name must be added to the
-  const list in the same PR. There is no engine-side guard that catches
-  "the rename PR forgot to update KNOWN_REMOVED." A test that ensures
-  `KNOWN_REMOVED_BUNDLED_SKILLS` entries are not in the current bundle
-  could be added; the inverse ("every rename PR added its OLD name to
-  this const") is unenforceable without external tooling. T6 partially
-  covers the first half. Worth adding a `const_known_removed_disjoint_from_bundle`
-  invariant test, or out of scope?
-- U2: T8 ("seed_bundled_skills_prunes_before_seeding") asserts ordering
-  by checking the end state. The seeder is not currently ordering-tested
-  in any other way. Is the end-state assertion sufficient, or should the
-  test thread some kind of sentinel that records observed call order?
-  My lean: end-state is fine for this scope — adding a call-order
-  sentinel would require infrastructure not present elsewhere in the
-  module.
+- **U1 ruling (architect: add)** — T9 disjointness invariant test added
+  (Phase 2 T9). Catches the failure mode "future PR re-bundles a name
+  in `KNOWN_REMOVED_BUNDLED_SKILLS` without removing the const entry,"
+  which would silently delete the new bundled skill at every boot.
+- **U2 ruling (operator-lean: no change)** — T8 end-state assertion
+  retained. Call-order sentinel would require infrastructure not present
+  elsewhere in the module and a future reorder would re-surface the
+  exact bug-class mika#859 surfaced today.
+- **U3 (not raised — operator-lean: log line stays at INFO)** — `info!`
+  line on prune is sufficient operator visibility for an expected
+  cleanup. Promoting to `warn!` would create recurring noise on
+  unreconciled hosts.
