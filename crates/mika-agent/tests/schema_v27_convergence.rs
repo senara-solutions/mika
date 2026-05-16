@@ -189,7 +189,7 @@ fn fresh_db_is_at_v34() {
         })
         .unwrap();
 
-    assert_eq!(version, 34, "Fresh DB must be at schema version 34");
+    assert_eq!(version, 35, "Fresh DB must be at schema version 35");
 }
 
 // ===== Index verification =====

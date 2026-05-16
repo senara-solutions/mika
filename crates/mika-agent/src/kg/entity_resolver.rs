@@ -59,6 +59,7 @@ mod outcome {
     pub const MATCHED_LLM: &str = "matched_llm";
     pub const MATCHED_LLM_DB_FALLBACK: &str = "matched_llm_db_fallback";
     pub const NO_MATCH: &str = "no_match";
+    pub const NO_CANDIDATE_OF_TYPE: &str = "no_candidate_of_type";
     pub const SKIPPED_DISCOVERED_TYPE: &str = "skipped_discovered_type";
     pub const SKIPPED_NO_LLM: &str = "skipped_no_llm";
     pub const ERROR: &str = "error";
@@ -120,8 +121,11 @@ enum ResolutionResult {
         domain_entity_id: i64,
         confidence: f64,
     },
-    /// LLM said no match or no candidates found.
+    /// LLM said no match (candidates existed but none matched).
     NoMatch,
+    /// No domain entity of this subject's type exists — extractor produced a
+    /// phantom subject with no possible domain counterpart (#1154).
+    NoCandidateOfType,
     /// Discovered type — no domain counterpart.
     SkippedDiscoveredType,
     /// No LLM configured and exact match failed.
@@ -140,6 +144,7 @@ pub struct ResolutionStats {
     pub matched_llm: usize,
     pub matched_llm_db_fallback: usize,
     pub no_match: usize,
+    pub no_candidate_of_type: usize,
     pub skipped_discovered: usize,
     pub skipped_no_llm: usize,
     pub errors: usize,
@@ -406,6 +411,7 @@ impl SubjectEntityResolver {
             matched_llm = stats.matched_llm,
             matched_llm_db_fallback = stats.matched_llm_db_fallback,
             no_match = stats.no_match,
+            no_candidate_of_type = stats.no_candidate_of_type,
             skipped_discovered = stats.skipped_discovered,
             skipped_no_llm = stats.skipped_no_llm,
             errors = stats.errors,
@@ -490,6 +496,18 @@ impl SubjectEntityResolver {
                 .await;
                 stats.no_match += 1;
             }
+            ResolutionResult::NoCandidateOfType => {
+                let model = self.llm.as_ref().map(|l| l.model_name().to_string());
+                self.write_log(
+                    entity.id,
+                    outcome::NO_CANDIDATE_OF_TYPE,
+                    extraction_trace_id,
+                    model.as_deref(),
+                    Some(duration_ms),
+                )
+                .await;
+                stats.no_candidate_of_type += 1;
+            }
             ResolutionResult::SkippedDiscoveredType => {
                 self.write_log(
                     entity.id,
@@ -557,7 +575,10 @@ impl SubjectEntityResolver {
         }
 
         // Stage 1: Exact match (D1).
-        match self.try_exact_match(entity).await {
+        // Track whether Stage 1 found an existing domain entity (even if
+        // low-confidence) vs. no entity_key match at all. This distinction
+        // drives the NoMatch vs NoCandidateOfType outcome split (#1154).
+        let stage1_found = match self.try_exact_match(entity).await {
             Ok(Some(domain)) => {
                 // Exact match found. If extraction confidence > threshold, resolve.
                 if entity.confidence > EXACT_MATCH_CONFIDENCE_THRESHOLD {
@@ -570,9 +591,11 @@ impl SubjectEntityResolver {
                     );
                 }
                 // Low confidence — escalate to LLM for verification.
+                true
             }
             Ok(None) => {
                 // No exact match — escalate to LLM.
+                false
             }
             Err(e) => {
                 return (
@@ -580,7 +603,7 @@ impl SubjectEntityResolver {
                     false,
                 );
             }
-        }
+        };
 
         // Stage 2: LLM disambiguation (D1 stage 2).
         let Some(ref llm) = self.llm else {
@@ -592,7 +615,26 @@ impl SubjectEntityResolver {
             return (ResolutionResult::SkippedBudget, false);
         }
 
-        match self.disambiguate_with_llm(llm, entity).await {
+        // #1154: Pre-check for empty candidates before entering the LLM path.
+        // If no domain entities of this type exist at all, the LLM cannot
+        // disambiguate — short-circuit to NoCandidateOfType without an LLM call.
+        let candidates = match self.get_domain_candidates(&entity.entity_type).await {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    ResolutionResult::Error(format!("candidate fetch failed: {e}")),
+                    false,
+                );
+            }
+        };
+        if candidates.is_empty() {
+            return (ResolutionResult::NoCandidateOfType, false);
+        }
+
+        match self
+            .disambiguate_with_llm_candidates(llm, entity, candidates)
+            .await
+        {
             Ok(Some((domain_id, llm_confidence, db_fallback))) => {
                 // D2: confidence = min(extraction_confidence, llm_confidence).
                 let combined_confidence = entity.confidence.min(llm_confidence);
@@ -614,7 +656,18 @@ impl SubjectEntityResolver {
                     )
                 }
             }
-            Ok(None) => (ResolutionResult::NoMatch, true),
+            // #1154: Split no-match outcome based on Stage 1 result.
+            // If Stage 1 found an exact entity_key match (low confidence),
+            // candidates existed but disambiguation failed → NoMatch.
+            // If Stage 1 found nothing, the extractor produced a phantom
+            // subject with no domain counterpart → NoCandidateOfType.
+            Ok(None) => {
+                if stage1_found {
+                    (ResolutionResult::NoMatch, true)
+                } else {
+                    (ResolutionResult::NoCandidateOfType, true)
+                }
+            }
             Err(e) => (
                 ResolutionResult::Error(format!("LLM disambiguation failed: {e}")),
                 true,
@@ -659,20 +712,16 @@ impl SubjectEntityResolver {
     /// Returns `(domain_entity_id, confidence, db_fallback)`. `db_fallback` is
     /// `true` when the LLM's `matched_key` was not in the in-prompt candidate
     /// slice but was validated against `kg_entities` via DB lookup (#874).
-    async fn disambiguate_with_llm(
+    ///
+    /// Accepts pre-fetched candidates (#1154). The caller fetches candidates
+    /// and handles the empty-candidates case before entering this function.
+    async fn disambiguate_with_llm_candidates(
         &self,
         llm: &Arc<dyn LlmProvider>,
         entity: &PendingEntity,
+        candidates: Vec<DomainCandidate>,
     ) -> Result<Option<(i64, f64, bool)>> {
         let agent_id = self.db.agent_id.clone();
-
-        // 1. Fetch domain candidates of the same type (bounded to MAX_DISAMBIGUATION_CANDIDATES).
-        let candidates = self.get_domain_candidates(&entity.entity_type).await?;
-
-        if candidates.is_empty() {
-            // No domain entities of this type → no match possible.
-            return Ok(None);
-        }
 
         // 2. Fetch source chunk context.
         let chunk_context = self.get_chunk_context(entity.id).await?;
@@ -1552,12 +1601,13 @@ impl SubjectEntityResolver {
     async fn emit_audit_event(&self, stats: &ResolutionStats) {
         let target_key = format!("kg_resolution:{}", self.trace_id);
         let after_value = format!(
-            r#"{{"total":{},"matched_exact":{},"matched_llm":{},"matched_llm_db_fallback":{},"no_match":{},"skipped_discovered":{},"skipped_no_llm":{},"errors":{}}}"#,
+            r#"{{"total":{},"matched_exact":{},"matched_llm":{},"matched_llm_db_fallback":{},"no_match":{},"no_candidate_of_type":{},"skipped_discovered":{},"skipped_no_llm":{},"errors":{}}}"#,
             stats.total,
             stats.matched_exact,
             stats.matched_llm,
             stats.matched_llm_db_fallback,
             stats.no_match,
+            stats.no_candidate_of_type,
             stats.skipped_discovered,
             stats.skipped_no_llm,
             stats.errors,
@@ -2095,12 +2145,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stats.no_match, 1, "Path 3 should produce no_match");
+        // #1154: Stage 1 returned Ok(None) (subject entity_key doesn't match
+        // any domain entity), so even though the LLM tried a cross-type match,
+        // the outcome is no_candidate_of_type (the subject is a phantom).
+        assert_eq!(
+            stats.no_candidate_of_type, 1,
+            "Path 3 should produce no_candidate_of_type (Stage 1 was Ok(None))"
+        );
+        assert_eq!(stats.no_match, 0);
         assert_eq!(stats.matched_llm, 0);
         assert_eq!(stats.matched_llm_db_fallback, 0);
 
         let outcome = f3_get_outcome(&db, subject_id).await;
-        assert_eq!(outcome.as_deref(), Some(outcome::NO_MATCH));
+        assert_eq!(outcome.as_deref(), Some(outcome::NO_CANDIDATE_OF_TYPE));
 
         let resolution = f3_get_resolution(&db, subject_id).await;
         assert!(
@@ -2110,8 +2167,9 @@ mod tests {
     }
 
     /// F3 Path 4: DB miss — matched_key does not exist in kg_entities at all.
-    /// Expected: outcome = no_match, no resolution row, WARN log with
-    /// db_fallback_attempted=true and db_fallback_hit=false fields.
+    /// Expected: outcome = no_candidate_of_type (Stage 1 returned Ok(None)),
+    /// no resolution row, WARN log with db_fallback_attempted=true and
+    /// db_fallback_hit=false fields.
     #[tokio::test]
     async fn f3_path4_db_miss() {
         use mika_common::llm::mock::{MockLlmProvider, text_response};
@@ -2143,12 +2201,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stats.no_match, 1, "Path 4 should produce no_match");
+        // #1154: Stage 1 returned Ok(None) (subject entity_key doesn't match
+        // any domain entity), so the outcome is no_candidate_of_type.
+        assert_eq!(
+            stats.no_candidate_of_type, 1,
+            "Path 4 should produce no_candidate_of_type (Stage 1 was Ok(None))"
+        );
+        assert_eq!(stats.no_match, 0);
         assert_eq!(stats.matched_llm, 0);
         assert_eq!(stats.matched_llm_db_fallback, 0);
 
         let outcome = f3_get_outcome(&db, subject_id).await;
-        assert_eq!(outcome.as_deref(), Some(outcome::NO_MATCH));
+        assert_eq!(outcome.as_deref(), Some(outcome::NO_CANDIDATE_OF_TYPE));
 
         let resolution = f3_get_resolution(&db, subject_id).await;
         assert!(
@@ -2333,6 +2397,174 @@ mod tests {
             outcome.as_deref(),
             Some(outcome::SKIPPED_NO_LLM),
             "should write skipped_no_llm log row"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1154: no_candidate_of_type outcome split tests
+    // -----------------------------------------------------------------------
+
+    /// #1154 AC7a — Phantom subject: Stage 1 returns Ok(None) (no exact match),
+    /// Stage 2 returns Ok(None) (LLM says no match) → outcome = no_candidate_of_type.
+    /// This is the primary scenario from the experiment: extractor produces
+    /// `agent:vincent` but no domain entity with that entity_key exists.
+    #[tokio::test]
+    async fn no_candidate_of_type_phantom_subject() {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let db = f3_test_db();
+
+        // Seed a domain entity under "agent" type so the candidate list is
+        // non-empty (prevents the candidates.is_empty() short-circuit from
+        // conflating with this test's target path).
+        f3_seed_domain_entity(&db, "agent", "mika-dev").await;
+
+        // Subject entity with a name that does NOT match any domain entity.
+        // Stage 1 will return Ok(None). Confidence 0.8 < 0.9 threshold is
+        // irrelevant here since Stage 1 returns None anyway.
+        let subject_id = f3_seed_subject_entity(&db, "agent", "vincent", 0.85).await;
+
+        // Mock LLM says no match — returns null for the match field.
+        let mock = MockLlmProvider::builder()
+            .response(text_response(r#"{"match": null, "confidence": 0.0}"#))
+            .build();
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            Some(Arc::new(mock)),
+            vec!["0000000000000000".to_string()],
+            Some("test-1154-phantom"),
+        );
+
+        let stats = resolver
+            .resolve_doc_entities(&[subject_id], "extraction-trace-1154a", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.no_candidate_of_type, 1,
+            "phantom subject should produce no_candidate_of_type"
+        );
+        assert_eq!(stats.no_match, 0, "should NOT produce no_match");
+
+        let outcome = f3_get_outcome(&db, subject_id).await;
+        assert_eq!(outcome.as_deref(), Some(outcome::NO_CANDIDATE_OF_TYPE));
+
+        let resolution = f3_get_resolution(&db, subject_id).await;
+        assert!(
+            resolution.is_none(),
+            "no resolution row should be written for phantom subject"
+        );
+    }
+
+    /// #1154 AC7b — Disambig failure: Stage 1 returns Ok(Some) with low
+    /// confidence (domain entity exists but extraction confidence < 0.9),
+    /// Stage 2 returns Ok(None) (LLM rejects) → outcome = no_match.
+    /// Narrowed semantic: "candidates existed, LLM couldn't disambiguate."
+    #[tokio::test]
+    async fn no_match_disambig_failure_with_existing_candidate() {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let db = f3_test_db();
+
+        // Seed a domain entity that WILL exact-match the subject's entity_key.
+        f3_seed_domain_entity(&db, "agent", "mika-dev").await;
+
+        // Subject entity with the SAME name — Stage 1 finds it. But
+        // confidence = 0.5 < 0.9 threshold → escalates to Stage 2.
+        let subject_id = f3_seed_subject_entity(&db, "agent", "mika-dev", 0.5).await;
+
+        // Mock LLM says no match despite having the exact candidate.
+        let mock = MockLlmProvider::builder()
+            .response(text_response(r#"{"match": null, "confidence": 0.0}"#))
+            .build();
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            Some(Arc::new(mock)),
+            vec!["0000000000000000".to_string()],
+            Some("test-1154-disambig-fail"),
+        );
+
+        let stats = resolver
+            .resolve_doc_entities(&[subject_id], "extraction-trace-1154b", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.no_match, 1,
+            "disambig failure with existing candidate should produce no_match"
+        );
+        assert_eq!(
+            stats.no_candidate_of_type, 0,
+            "should NOT produce no_candidate_of_type"
+        );
+
+        let outcome = f3_get_outcome(&db, subject_id).await;
+        assert_eq!(outcome.as_deref(), Some(outcome::NO_MATCH));
+
+        let resolution = f3_get_resolution(&db, subject_id).await;
+        assert!(
+            resolution.is_none(),
+            "no resolution row should be written for disambig failure"
+        );
+    }
+
+    /// #1154 AC7c — Empty type bucket: no domain entities of the subject's type
+    /// exist at all → candidates.is_empty() short-circuit → no_candidate_of_type.
+    /// Distinct from the phantom test: here there are ZERO domain entities of
+    /// the type, so the LLM is never called.
+    #[tokio::test]
+    async fn no_candidate_of_type_empty_type_bucket() {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let db = f3_test_db();
+
+        // Seed NO domain entities of type "problem_type".
+        // (Seed one of a different type to ensure the DB is not empty.)
+        f3_seed_domain_entity(&db, "skill", "some-skill").await;
+
+        // Subject entity of type "problem_type" — no candidates exist.
+        let subject_id =
+            f3_seed_subject_entity(&db, "problem_type", "nonexistent_problem", 0.9).await;
+
+        // Mock LLM should NOT be called (candidates list is empty, short-circuits).
+        // Provide a response anyway so the test doesn't hang if logic is wrong.
+        let mock = MockLlmProvider::builder()
+            .response(text_response(
+                r#"{"match": "problem_type:fabrication", "confidence": 0.9}"#,
+            ))
+            .build();
+
+        let resolver = SubjectEntityResolver::new(
+            db.clone(),
+            Some(Arc::new(mock)),
+            vec!["0000000000000000".to_string()],
+            Some("test-1154-empty-bucket"),
+        );
+
+        let stats = resolver
+            .resolve_doc_entities(&[subject_id], "extraction-trace-1154c", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.no_candidate_of_type, 1,
+            "empty type bucket should produce no_candidate_of_type"
+        );
+        assert_eq!(stats.no_match, 0, "should NOT produce no_match");
+        assert_eq!(
+            stats.llm_calls, 0,
+            "LLM should not be called when candidates list is empty"
+        );
+
+        let outcome = f3_get_outcome(&db, subject_id).await;
+        assert_eq!(outcome.as_deref(), Some(outcome::NO_CANDIDATE_OF_TYPE));
+
+        let resolution = f3_get_resolution(&db, subject_id).await;
+        assert!(
+            resolution.is_none(),
+            "no resolution row should be written for empty type bucket"
         );
     }
 }
