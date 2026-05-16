@@ -2006,4 +2006,108 @@ mod tests {
         assert!(!output.contains("Agents:"));
         assert!(output.contains("Done"));
     }
+
+    // === tick_agent_mode WorkerCrashed handling (mika#1149) ===
+
+    /// Build a minimal `App` whose `agent_rx` is paired with the returned sender,
+    /// so a test can simulate the supervisor delivering events to the TUI.
+    async fn app_with_response_sender() -> (
+        App<'static>,
+        mpsc::UnboundedSender<AgentResponse>,
+        tempfile::TempDir,
+    ) {
+        use mika_agent::async_db::AsyncDatabase;
+        use mika_agent::db::Database;
+        use mika_agent::skills::SkillRegistry;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home_dir = temp_dir.path().to_path_buf();
+        let global_home = temp_dir.path().to_path_buf();
+        let db = Database::open_in_memory().unwrap();
+        let async_db = AsyncDatabase::new(db);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        async_db
+            .create_session(&session_id, "mika", "cli")
+            .await
+            .unwrap();
+
+        let (agent_tx, _request_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+
+        let app = App::new(
+            agent_tx,
+            response_rx,
+            session_id,
+            "test-model".to_string(),
+            "Mika".to_string(),
+            async_db,
+            mika_common::llm::dummy_provider(),
+            home_dir,
+            Arc::new(SkillRegistry::empty()),
+            "mika".to_string(),
+            global_home,
+            mika_common::llm::ProviderKind::Anthropic,
+        );
+
+        (app, response_tx, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn tick_agent_mode_surfaces_worker_crashed_event() {
+        let (mut app, response_tx, _td) = app_with_response_sender().await;
+        app.status = AgentStatus::Thinking; // simulate an in-flight prompt
+
+        response_tx
+            .send(AgentResponse::WorkerCrashed {
+                reason: "worker panicked: simulated tool panic".to_string(),
+            })
+            .unwrap();
+
+        app.tick_agent_mode().await;
+
+        assert!(app.worker_crashed, "must arm /restart by flipping the flag");
+        assert_eq!(app.status, AgentStatus::Idle, "must clear the spinner");
+        let last = app.messages.last().expect("banner pushed");
+        assert!(
+            matches!(last.role, ChatRole::System),
+            "banner must be a System message, got {:?}",
+            last.role
+        );
+        assert!(
+            last.content.contains("Agent worker crashed"),
+            "banner must mention the crash: {}",
+            last.content
+        );
+        assert!(
+            last.content.contains("simulated tool panic"),
+            "banner must include the supervisor's reason: {}",
+            last.content
+        );
+        assert!(
+            last.content.contains("/restart"),
+            "banner must point at the recovery affordance: {}",
+            last.content
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_agent_mode_replies_do_not_set_worker_crashed() {
+        let (mut app, response_tx, _td) = app_with_response_sender().await;
+        app.status = AgentStatus::Thinking;
+
+        response_tx
+            .send(AgentResponse::Reply {
+                content: "hello".to_string(),
+                is_error: false,
+                thinking: None,
+                input_tokens: None,
+                updated_skills: None,
+            })
+            .unwrap();
+
+        app.tick_agent_mode().await;
+
+        assert!(!app.worker_crashed, "Reply must not arm /restart");
+        assert_eq!(app.pending_response.as_deref(), Some("hello"));
+    }
 }

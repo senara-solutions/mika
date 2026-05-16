@@ -2191,4 +2191,41 @@ mod tests {
             "should NOT create qwen_model, config: {config_content}"
         );
     }
+
+    // --- /restart command tests (mika#1149) ---
+
+    #[tokio::test]
+    async fn test_restart_refuses_on_healthy_worker() {
+        let (mut app, _rx, _td) = test_app().await;
+        // Default state: worker_crashed = false. /restart must refuse.
+        let output = handle_restart(&mut app);
+        assert!(
+            !app.pending_restart,
+            "must not arm restart on healthy worker"
+        );
+        assert!(
+            output.contains("only applies after"),
+            "refusal message should mention the precondition: {output}"
+        );
+        assert!(
+            output.contains("/clear"),
+            "refusal should redirect to /clear: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restart_arms_pending_restart_after_crash() {
+        let (mut app, _rx, _td) = test_app().await;
+        app.worker_crashed = true;
+        let output = handle_restart(&mut app);
+        assert!(app.pending_restart, "must arm pending_restart");
+        assert!(
+            output.contains("Restarting"),
+            "confirmation should announce restart: {output}"
+        );
+        assert!(
+            output.contains("not replayed"),
+            "confirmation should warn the prompt is lost: {output}"
+        );
+    }
 }

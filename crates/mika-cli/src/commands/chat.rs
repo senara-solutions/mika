@@ -714,7 +714,16 @@ pub async fn run(
                 &mut worker.supervisor_handle,
                 tokio::spawn(async {}), // placeholder
             );
-            let _ = tokio::time::timeout(Duration::from_secs(2), old_supervisor).await;
+            if tokio::time::timeout(Duration::from_secs(2), old_supervisor)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target_agent = %target_name,
+                    "old agent worker did not shut down within 2s during agent switch; \
+                     supervisor task abandoned"
+                );
+            }
 
             // Initialize the new agent
             match init::init_for_agent(&target_name) {
@@ -797,7 +806,15 @@ pub async fn run(
                 &mut worker.supervisor_handle,
                 tokio::spawn(async {}), // placeholder
             );
-            let _ = tokio::time::timeout(Duration::from_secs(2), old_supervisor).await;
+            if tokio::time::timeout(Duration::from_secs(2), old_supervisor)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "old agent worker did not shut down within 2s during /restart; \
+                     supervisor task abandoned"
+                );
+            }
 
             match init::init_for_agent(agent_name) {
                 Ok(new_ctx) => {
@@ -882,10 +899,14 @@ pub async fn run(
     worker.poller_handle.abort();
 
     // Wait for the supervisor (which owns the worker JoinHandle). It exits
-    // silently because shutdown_initiated was set above; we just need to
-    // join it within a bounded window.
-    worker.shutdown_initiated.store(true, Ordering::Release);
-    let _ = tokio::time::timeout(Duration::from_secs(2), worker.supervisor_handle).await;
+    // silently because shutdown_initiated was set in the Quit branch above
+    // (before agent_tx.send(Quit), which is the load-bearing ordering).
+    if tokio::time::timeout(Duration::from_secs(2), worker.supervisor_handle)
+        .await
+        .is_err()
+    {
+        tracing::warn!("agent worker supervisor did not shut down within 2s; abandoning task");
+    }
 
     // Database shutdown happens automatically via Drop on worker._ctx
     Ok(())
