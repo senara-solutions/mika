@@ -105,6 +105,12 @@ The new guard **reuses** this helper — no new helper to add. It's already call
 
 The `pr_url` field under `claude_pilot` is written by `extract_callback_fields()` at `crates/mika-agent/src/task_engine/dispatcher.rs:1368-1421` via regex `(?m)^PR:\s+(https?://github\.com/\S+)` against claude-pilot subprocess stdout. The emitter is the shared `skills/bundled/_shared/dispatch-lib.sh` (mika#871 R4 contract). The guard's correctness depends on this contract: any change to the `^PR:` emission discipline downstream forces a corresponding update to either `extract_callback_fields()` (preferred) or this guard's pr_url extraction site.
 
+### Anchor F — `run_claude_pilot` JSON Schema contract
+
+Verified at `skills/bundled/dev-pilot/tools.json` (commit `a070ce7e`): the `input_schema` declares `properties: { skill, prompt, task_id, iteration_context }` with `required: [skill, prompt, task_id]`, and **does not declare `additionalProperties: false`**. JSON Schema's default is permissive (`additionalProperties: true`), so engine-injected fields flow through validation unchanged.
+
+**Coupling contract.** `run_claude_pilot`'s schema MUST NOT declare `additionalProperties: false`. Engine-injected fields (currently `iteration_context` from autonomous handlers, `__internal_deferred_dispatch` from this plan's F3 fix) flow through `tool_input` without schema advertisement. The dev-pilot `tools.json` is the contract owner; this guard's correctness depends on the permissive `additionalProperties` mode.
+
 ### Anchor E — `register_deferred_callback()` for F3 resolution
 
 Existing function at executor.rs:1277-1340 already preserves the original tool input:
@@ -152,6 +158,8 @@ When `DeferredDispatch` fires, the engine replays `original_call` as the tool in
 2. **Skill is not `dev-pilot`** — `dev-groom` dispatches are fresh grooming, not implementation re-runs.
 3. **Task has no `claude_pilot.pr_url` in metadata** — fresh-dispatch path, no prior PR to conflict with.
 4. **(F2) `originating_message` matches the ready-label webhook signature** — `Some(msg)` where `msg.contains("[GitHub] Issue labeled ready on")`. This is the operator's positive-consent signal per mika#841; re-applying `ready` on an issue with an open PR is explicitly "go work on this again." Blocking this would fight the autonomous-loop dispatch contract.
+
+   **Coupling contract.** The substring is emitted by the gateway's webhook event-text formatter (`format_event_text()` in `mika-gateway`); the grooming-marker guard at `dispatch_no_grooming_marker` (#919) shares the same string-shape fragility class against the `> - **Branch:**` substring. Changes to either webhook event-text format or the issue-body callout shape must update both guards in lockstep. A follow-up refactor lifting these substrings into named helpers under `crate::webhook_dispatch` would consolidate the fragility surface — explicitly **out of scope** for this plan.
 5. **(F3) Calling turn is `SilentTrigger::DeferredDispatch`** — engine-initiated recovery from a prior `global_dispatch_active` rejection (#1011/#1058). The deferred turn replays the original tool_input; blocking it would create a livelock (deferred fires → guard rejects → engine re-defers).
 
 **F3 implementation mechanic.** `SilentTrigger::DeferredDispatch` produces `originating_message: None` in `LongRunningContext`, but `None` alone is not a sufficient signal — every silent trigger (callback, heartbeat, reflection) has `originating_message: None`, and only DeferredDispatch is structurally allowed to call `run_claude_pilot` (the executor's `long_running_ctx == None` rejection blocks the others except via deferred re-dispatch). The guard detects DeferredDispatch by adding a sentinel `__internal_deferred_dispatch: true` field to the saved `original_call` inside `register_deferred_callback()` (Anchor E). The guard then checks this sentinel on the inbound `tool_input` and bypasses when present. Rationale for sentinel-on-input rather than a new `LongRunningContext` field: the bypass surface stays uniform (`tool_input` JSON), one place to inspect, no API-surface expansion.
@@ -302,10 +310,13 @@ This ticket builds on top of **merged** #919 (PR #1101). The new guard's positio
 ## Architect review trail
 
 - 2026-05-16 first-pass (session `0a98390f-cc65-44ff-aed5-83bf37b7de28`): Disposition ITERATE.
-  - F1 (Phase 0 Pin absent) — addressed via new Phase 0 § Anchors A–E.
+  - F1 (Phase 0 Pin absent) — addressed via new Phase 0 § Anchors A–F.
   - F2 (ready-label webhook interaction) — addressed via bypass condition #4.
   - F3 (DeferredDispatch livelock) — addressed via bypass condition #5 + `__internal_deferred_dispatch` sentinel in `register_deferred_callback`.
   - NF1 (guard ordering rationale) — folded into § "Guard ordering rationale."
   - NF2 (fail-open on missing token) — accepted per architect; added to § "Out of scope."
   - NF3 (Unit 3 prompt code-comment) — folded into Unit 3 with engine-guard cross-reference.
   - NF4 (operator bypass UX example prompts) — folded into § "Operator bypass UX."
+- 2026-05-16 second-pass (same session): Verdict GROOMED.
+  - NF5 (run_claude_pilot schema contract) — folded into new Anchor F (verified `additionalProperties` permissive in `tools.json` at `a070ce7e`).
+  - NF6 (webhook substring cross-reference) — folded into bypass condition #4's coupling-contract note (sibling fragility with #919 grooming-marker).
