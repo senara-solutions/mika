@@ -6,8 +6,14 @@ labels: [enhancement, p2-normal, agent-core, kg]
 created: 2026-05-16
 plan_seq: 003
 status: drafted
-revision: pass-1-pending
+revision: pass-1-iterate-applied
 base_commit: 31c1b0a5c12db57e6898c341fdeb3d7adad2c4d9
+pass1_session_id: 862c3695-f5dc-42c9-8ba7-bd0050795bc2
+pass1_disposition: ITERATE
+pass1_findings:
+  - F1 — Phase 0 Pin absent in brief (plan had pin section; surface inline in pass-2)
+  - F2 — Lenient-mode bypass lacks "loaded and empty" discrimination
+  - F3 — Roster mismatch rejection mode unspecified
 related:
   - mika#1154 (Shape 3 — `no_match` split; primary fix, merged via #1159)
   - mika#1152 (parent investigation — resolver-sonnet baseline)
@@ -353,14 +359,78 @@ domain graph. Skills/tools added after boot won't appear in this tick's
 roster — they will appear in the next boot's tick. Acceptable: KG
 extraction is a soft, eventual-consistency surface.
 
-Edge case: if `kg_entities` is empty (e.g., fresh DB before
-`domain_builder` finishes), `extract_pending` logs a `WARN` (event:
-`extraction_empty_roster`) and skips the roster injection for this batch.
-The extractor falls back to current behavior (no roster section in
-prompt). Validation runs in **lenient mode** — non-roster non-discovered
-entities are accepted (because there is no roster to check against).
-This matches today's behavior precisely; it's strictly safer than hard-
-refusing all entities.
+**Empty-roster handling — F2 from pass-1 review.** "Roster is empty" has
+two distinct causes that must be discriminated:
+
+| State | Cause | Correct response |
+|---|---|---|
+| **Not yet loaded** | `extract_pending` called before `load_roster_snapshot()` returned (impossible by construction — `load_roster_snapshot` is called synchronously at the top of `extract_pending`) | N/A |
+| **Loaded and empty (transient)** | `domain_builder` hasn't run on this boot yet — `kg_entities` literally has zero rows of roster-constrained types | Skip the batch with `WARN extraction_roster_unbuilt` and return zero stats. Next tick (or the next boot) will see a populated roster. |
+| **Loaded and empty (permanent)** | `domain_builder` ran, but ran into an error and silently left `kg_entities` empty (or partial) for the roster types | Skip the batch with `ERROR extraction_roster_failed` and return zero stats. Operator alert. |
+
+The `RosterSnapshot` struct carries a discriminant:
+
+```rust
+#[derive(Debug, Clone)]
+pub struct RosterSnapshot {
+    members: HashSet<(String, String)>,
+    rendered_section: String,
+    /// Why the roster looks the way it does. Drives empty-roster handling
+    /// at the call site.
+    load_state: RosterLoadState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RosterLoadState {
+    /// Successful load with N≥1 entries of at least one roster-constrained type.
+    Populated,
+    /// Successful load that returned zero rows, AND `kg_entities` itself has
+    /// zero rows of any type. domain_builder probably hasn't run yet on this
+    /// boot (transient).
+    UnbuiltGraph,
+    /// Successful load that returned zero rows for the roster types, but
+    /// `kg_entities` has rows of OTHER types. domain_builder ran but failed
+    /// to produce roster-relevant entities (permanent until fixed).
+    EmptyRosterTypes,
+}
+```
+
+`load_roster_snapshot()` discriminates by issuing a second cheap query:
+
+```sql
+SELECT COUNT(*) FROM kg_entities
+```
+
+If the count is zero → `UnbuiltGraph` (transient). If the count is
+nonzero but the roster-types query returned zero → `EmptyRosterTypes`
+(permanent — every single roster type is missing). Otherwise `Populated`.
+
+**Behavior at the call site** (in `extract_pending`, before the per-doc
+loop):
+
+- `Populated` → proceed with extraction, validator runs in enforcing
+  mode.
+- `UnbuiltGraph` → log `WARN extraction_roster_unbuilt
+  agent_id=... reason="kg_entities is empty; domain_builder has not yet
+  populated"`, return `BatchStats::default()` for this batch. The 30-min
+  periodic tick will retry. No LLM calls made.
+- `EmptyRosterTypes` → log `ERROR extraction_roster_failed
+  agent_id=... reason="kg_entities has N rows but zero of roster types
+  (skill, tool, agent, problem_type); domain_builder likely failed"`,
+  return `BatchStats::default()`. **No LLM calls made.** Operator
+  visibility through ERROR-level event; can be paged.
+
+Lenient mode (validator running with `roster_enforced=false` while
+extraction still produces entities) is **rejected**. The original brief's
+"lenient mode" silently degraded the safety property; the corrected
+behavior refuses extraction outright when the roster cannot be trusted.
+
+Both empty states are caller-visible via `RosterLoadState::is_loaded()`
+and `is_extractable()` methods — the extractor never silently extracts
+against an unsafe roster.
+
+This costs at most one extra `COUNT(*)` query per batch (cheap; the
+table is small and the count is indexable).
 
 ---
 
@@ -537,6 +607,72 @@ defaulted by the caller to `roster.member_count() > 0`. When
 `roster_enforced == false`, the roster lookup is skipped (lenient mode).
 This makes the lenient-mode intent explicit in the call signature.
 
+### Roster mismatch handling — F3 from pass-1 review
+
+When the LLM emits a roster-constrained entity with `discovered=false`
+(or omits the field) AND `(type, name)` is NOT in the roster, the
+validator must take one of three actions:
+
+| Option | Behavior | Pros | Cons |
+|---|---|---|---|
+| (1) **Silent drop** | Filter the entity out of the validated output; no log; no audit row | Simplest implementation | No way to measure how often the LLM ignores the roster directive; loses extraction signal |
+| (2) **Log + drop** | Filter the entity; emit `WARN subject_roster_mismatch` with the offending `(type, name)`, chunk_indices, source_doc_path | Preserves audit signal without changing the `discovered` flag's semantics | Slight log volume; the extraction data itself is lost |
+| (3) **Coerce to discovered** | Validator auto-sets `discovered=true`, `discovery_reason="validator_coerced: roster mismatch"`; entity survives | Preserves the data; resolver short-circuits via the discovered-subject path; no phantom reaches resolution | Changes the meaning of `discovered=true` from "LLM said so" to "LLM said so OR validator overrode"; auditing real LLM discovery becomes harder |
+
+**Disposition: Option 2 — log + drop.** Rationale:
+
+1. **Semantic clarity.** Option 3 muddies the `discovered` flag — operators
+   reading `kg_subject_entities WHERE discovered = 1` would no longer see
+   a clean LLM-discovery signal; they'd see a mix of LLM-discovery and
+   validator-coercion. Distinguishing them requires reading
+   `discovery_reason` which is free-text. Option 2 keeps the flag clean.
+2. **Data-loss tradeoff is acceptable here.** The validator already
+   drops entities for other reasons (line 183 type-approval, line 194
+   colon-rejection) — this is consistent precedent. The dropped entity
+   is by definition wrong (phantom or mis-shaped); we don't want to
+   preserve wrong data.
+3. **Audit signal is preserved.** The `WARN subject_roster_mismatch`
+   event lets operators measure how often the LLM ignores the roster
+   directive — a key signal for evaluating the success of this PR. The
+   event carries enough to find the chunk and tune the prompt or model.
+4. **Resolver is not load-bearing.** Option 3 would route mismatches
+   to the resolver's `SKIPPED_DISCOVERED_SUBJECT` path, but the resolver
+   already accepts the safer behavior of "if subject doesn't exist, no
+   resolution row is written." Drop-at-validator is identical from the
+   resolver's perspective.
+
+**Validator behavior** (extends Pin C):
+
+```rust
+} else if !roster.contains(&entity.entity_type, &entity.name) {
+    warn!(
+        agent_id = %agent_id,
+        doc = %doc_path,
+        entity_type = %entity.entity_type,
+        entity_name = %entity.name,
+        chunk_indices = ?entity.chunk_indices,
+        event = "subject_roster_mismatch",
+        "LLM emitted non-roster entity without discovered=true; dropping"
+    );
+    entity_errors.push(format!(
+        "entity[{i}]: type='{}' name='{}' not in canonical roster — \
+         either match a roster entry or emit with discovered=true + discovery_reason",
+        entity.entity_type, entity.name
+    ));
+}
+```
+
+The error is pushed into `errors` (existing log line at
+`extraction_validation_filtered`, line 311 — preserves the
+existing-pattern observability path), AND an explicit
+`subject_roster_mismatch` event fires per offending entity. Operators
+get both an aggregate count via the existing filtered_count log AND
+per-entity detail via the new event.
+
+If `subject_roster_mismatch` events fire at high volume (above a
+documented threshold), it signals the LLM is ignoring the roster
+directive — a model swap or prompt-tuning ticket is warranted.
+
 ### Storage extension (Pin G)
 
 v34→v35 migration in `db.rs`:
@@ -691,11 +827,20 @@ commit before drafting the migration body.)
 8. **Validation — non-roster-constrained types unaffected.** A `concept`,
    `solution_path`, `failure_mode`, or `pattern` entity validates per
    prior rules regardless of roster contents.
-9. **Lenient mode.** When `kg_entities` has zero rows of any
-   roster-constrained type, `extract_pending` logs `WARN
-   extraction_empty_roster` once per batch, and the validator runs with
-   `roster_enforced=false` (no roster lookup, all rows that pass other
-   rules accepted).
+9. **Empty-roster handling (F2 from pass-1).** `RosterSnapshot` carries
+   a `RosterLoadState` discriminant. `Populated` proceeds; `UnbuiltGraph`
+   logs `WARN extraction_roster_unbuilt` and returns `BatchStats::default`
+   without making any LLM call; `EmptyRosterTypes` logs `ERROR
+   extraction_roster_failed` and returns `BatchStats::default` without
+   making any LLM call. **Lenient/permissive validator mode is removed.**
+   Extraction never runs when the roster cannot be trusted.
+9a. **Roster mismatch logging (F3 from pass-1).** When the validator
+    drops a non-roster non-discovered entity, it emits a structured
+    `WARN subject_roster_mismatch` event with `(agent_id, doc,
+    entity_type, entity_name, chunk_indices)`. The dropped entity is
+    counted in the existing `extraction_validation_filtered` aggregate
+    log line. The PR adds the new event name to the
+    `crates/mika-agent/CLAUDE.md` observability section.
 10. **Storage.** `kg_subject_entities` has `discovered` and
     `discovery_reason` columns (after v34→v35 migration). Discovered
     rows have `discovered=1` and a non-empty `discovery_reason`.
@@ -708,9 +853,12 @@ commit before drafting the migration body.)
 13. **Concept passthrough.** A `concept` entity in extraction output is
     rejected by Pin C's existing colon-rejection rule (no change). The
     Q-pass1-A follow-up is filed at PR close.
-14. **Empirical prompt-size report.** PR description includes
-    `roster_entries=N, rendered_chars=X, estimated_tokens≈Y` against the
-    configured `MIKA_KG_EXTRACTION_MODEL`.
+14. **Empirical prompt-size report (PR-description checkbox).** PR
+    description must include a verbatim line of the form:
+    `roster_entries=N, rendered_chars=X, estimated_tokens≈Y` measured
+    against the configured `MIKA_KG_EXTRACTION_MODEL` (or fallback
+    `MIKA_KG_INGESTION_MODEL`). PR reviewer verifies the line is
+    present and the numbers look sane (e.g., not `estimated_tokens=0`).
 15. **No regression.** Existing 30+ subject_extractor tests pass
     unchanged (forward-compatible `#[serde(default)]` keeps old fixtures
     valid). Existing 30+ entity_resolver tests pass unchanged.
@@ -738,6 +886,14 @@ next server boot (because `domain_builder` is boot-time only). This is
 acceptable: the staleness window is bounded by the next restart, and
 the `discovered: true` carveout absorbs in-window misses.
 
+**Per-tick roster refresh invariant (NF3 from pass-1).** The roster is
+re-queried at every `extract_pending` invocation (boot spawn + each
+30-min tick). The current cost is one cheap indexed query + one
+`COUNT(*)` per batch. If `domain_builder` ever becomes incremental
+(splitting one boot-time pass into multiple in-flight passes), the
+per-batch refresh would automatically pick up late additions without
+code changes. Stays as a documented invariant; no speculative refactor.
+
 **Cost ceiling.** Roster injection adds an estimated ~750 tokens per
 extraction LLM call (Q3). Across `MIKA_KG_BATCH_BUDGET=500` per agent
 per tick and 48 ticks/day, that's ~36k token-equivalents extra per
@@ -745,30 +901,48 @@ agent per day — negligible at OpenRouter cheap-tier pricing.
 
 ---
 
+## Pass-1 findings — disposition trace
+
+| Pass-1 finding | Disposition |
+|---|---|
+| F1 — Phase 0 Pin absent | Pins already in plan (sections A–I); pass-2 brief surfaces them inline so the architect can verify against the brief alone. No plan change beyond the pin sections that already exist. |
+| F2 — Lenient-mode discrimination | Added `RosterLoadState` discriminant with three states (`Populated` / `UnbuiltGraph` / `EmptyRosterTypes`). Removed lenient validator mode. Extraction refuses to run on untrusted rosters. |
+| F3 — Roster mismatch rejection mode | Committed to Option 2 (log + drop). New `WARN subject_roster_mismatch` event; existing `extraction_validation_filtered` aggregate path preserved. Documented as AC-9a. |
+| NF1 — Concept exclusion | Confirmed; no change. Follow-up ticket for colon-rejection filed at PR close. |
+| NF2 — Explicit `roster_enforced` boolean | Subsumed by F2's `RosterLoadState`. The discriminant replaces the boolean; the *intent* (explicit at call site) is preserved. |
+| NF3 — Per-tick refresh YAGNI | Documented invariant in Operational notes section. |
+| NF4 — `skipped_discovered_subject` naming | Confirmed; no change. |
+| NF5 — CHECK constraint sequencing | Resolved by F1's pins. AC-16 (`Migration safety`) implicitly verifies. |
+| NF6 — Prompt-size measurement AC | AC-14 updated to be explicit verbatim-line requirement on PR description. |
+| NF7 — Two-migration shape | Confirmed; no change. |
+
 ## Open questions for second-pass architect review
 
-**Q-pass2-A**: Is Q-pass1-A's lean (a) — defer concept-name colon
-question to a follow-up — the right call, or should the validator
-relaxation (option b) ship in this PR? Option (b) is contained but
-expands scope.
+**Q-pass2-A**: F2's `RosterLoadState::EmptyRosterTypes` issues an
+`ERROR`-level event when `kg_entities` has rows of other types but
+zero of roster-constrained types. Is `ERROR` the right severity, or
+should it be `WARN` like `UnbuiltGraph` and let the operator alert on
+volume rather than per-event severity? My lean: `ERROR` because the
+condition is structurally bad (the fix is structurally bypassed), and
+batch refusal means no actual production work is being lost — the
+error is recoverable but should be visible.
 
-**Q-pass2-B**: Is the `roster_enforced` boolean parameter on the
-validator the right shape, or should "empty roster" be implicit (caller
-constructs an empty `RosterSnapshot` and the validator treats empty as
-"don't enforce")? The boolean makes the intent explicit at the call
-site; implicit-via-empty is less code but harder to grep.
+**Q-pass2-B**: The two `COUNT(*) FROM kg_entities` calls (one for the
+roster, one for the discrimination probe) could be collapsed into a
+single multi-result query. Worth doing, or keep them separate for
+readability? The cost is one extra DB roundtrip per batch (~ms), not
+significant. My lean: keep them separate; the discrimination probe is
+called only when the roster query returns zero rows, which is the rare
+path.
 
-**Q-pass2-C**: Should the periodic tick (#1052) also re-fetch the
-roster, or is "roster snapshot is boot-fixed per tick" acceptable?
-Current plan caches per-batch. Alternative is to make `load_roster_snapshot`
-a hot path called per-tick — adds one DB query per tick, but catches
-late-boot writes to `kg_entities` (e.g., if domain_builder is split
-into incremental passes in the future).
-
-**Q-pass2-D**: Resolver outcome name — `skipped_discovered_subject` vs
-something shorter like `discovered_subject`? Plan uses the longer form
-for symmetry with `skipped_discovered_type`. Architect may prefer the
-shorter form.
+**Q-pass2-C**: Should `subject_roster_mismatch` events also count toward
+a per-doc threshold for retry? Currently the LLM retry path
+(`retry_with_reinforcement`) fires on JSON parse failure only. If a
+batch produces ≥ N mismatches per doc, that's a signal the prompt isn't
+landing — should the extractor retry the doc with stronger
+reinforcement? My lean: no for this PR; treat it as an
+observability-only signal and let operators escalate to model/prompt
+tuning. Adding retry-on-mismatch is in-scope creep.
 
 ---
 
