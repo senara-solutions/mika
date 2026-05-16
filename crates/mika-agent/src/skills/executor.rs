@@ -17,7 +17,7 @@ use super::index::ResolvedSkillTool;
 use super::manifest::ToolHandler;
 use crate::async_db::AsyncDatabase;
 use crate::db::{self, NewTask};
-use crate::github_graphql::fetch_issue_body;
+use crate::github_graphql::{fetch_issue_body, fetch_pr_summary, parse_pr_url};
 use crate::task_engine::types::{action_type, trigger_type};
 use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
 
@@ -988,6 +988,19 @@ async fn validate_dispatch_readiness(
         }
     }
 
+    // Manual re-dispatch state-awareness guard (mika#920): reject `dev-pilot`
+    // re-dispatch when the task already has an open PR and the caller did not
+    // pass `iteration_context`. The autonomous retry paths (verdict_handler,
+    // ci_failure_handler) supply `iteration_context` and bypass this guard;
+    // engine-initiated recovery (DeferredDispatch) and operator positive-consent
+    // (ready-label webhook) bypass via dedicated predicates.
+    if let Some(rejection) =
+        check_task_has_open_pr(&task, tool_input, originating_message, github_token).await
+    {
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
     // Hoist the GitHub ref parse above both the grooming-marker check (#919)
     // and the blocked-by check (#713) so they share the binding.
     let github_ref = task.reference_url.as_deref().and_then(parse_github_ref);
@@ -1144,6 +1157,203 @@ async fn validate_dispatch_readiness(
     Ok(task.status.clone())
 }
 
+/// Engine-internal sentinel field name (mika#920 F3 bypass).
+///
+/// Injected into `original_call` by `register_deferred_callback()` so that the
+/// `DeferredDispatch` replay turn bypasses the `dispatch_task_has_open_pr`
+/// guard. Without this bypass, deferred recoveries from `global_dispatch_active`
+/// rejections would livelock: deferred fires → guard rejects → re-defer → repeat.
+///
+/// The `__internal_*` prefix marks this as engine-internal — not part of the
+/// public `run_claude_pilot` tool schema. The dev-pilot `tools.json` MUST NOT
+/// advertise this field; correctness depends on the schema's permissive
+/// `additionalProperties` mode (see plan Anchor F).
+pub(crate) const INTERNAL_DEFERRED_DISPATCH_FIELD: &str = "__internal_deferred_dispatch";
+
+/// Build the `dispatch_task_has_open_pr` rejection (mika#920) if all guard
+/// conditions are met, otherwise return `None` to allow dispatch.
+///
+/// Bypass conditions (evaluated in order — any one short-circuits to `None`):
+/// 1. `iteration_context` is present in `tool_input` — explicit operator/handler
+///    re-dispatch with context (autonomous verdict/ci handlers, or manual
+///    operator-with-context invocations).
+/// 2. Skill is not `dev-pilot` — `dev-groom` is fresh grooming, not an
+///    implementation re-run.
+/// 3. Task has no `claude_pilot.pr_url` in metadata — fresh dispatch, no prior
+///    PR to conflict with.
+/// 4. `originating_message` matches the ready-label webhook marker — the
+///    operator's positive-consent signal (mika#841). Coupled pair with the
+///    `[GitHub] Issue labeled ready on` format in
+///    `mika_gateway::github::format_event_text`; changes to either side must
+///    update both.
+/// 5. `tool_input` carries the `__internal_deferred_dispatch` sentinel —
+///    engine-initiated recovery from a prior `global_dispatch_active`
+///    rejection (mika#1011/#1058). Without this bypass the deferred replay
+///    would livelock against this guard.
+///
+/// When no bypass fires, the function attempts a best-effort GitHub REST
+/// enrichment (PR state, latest mika-qa verdict, mergeable_state). API
+/// failures degrade gracefully: the core decision is based on `pr_url`
+/// presence in DB metadata, enrichment only fills out the rejection body.
+async fn check_task_has_open_pr(
+    task: &db::Task,
+    tool_input: Option<&serde_json::Value>,
+    originating_message: Option<&str>,
+    github_token: Option<&str>,
+) -> Option<serde_json::Value> {
+    let input = tool_input?;
+
+    // Bypass 1: explicit iteration_context — caller already supplied state context.
+    if let Some(ctx) = input.get("iteration_context").and_then(|v| v.as_str())
+        && !ctx.is_empty()
+    {
+        return None;
+    }
+
+    // Bypass 5 (F3): engine-initiated deferred-dispatch replay.
+    if input
+        .get(INTERNAL_DEFERRED_DISPATCH_FIELD)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    // Bypass 2: only dev-pilot dispatches are in scope.
+    let skill = extract_skill_from_input(input);
+    if skill != Some("dev-pilot") {
+        return None;
+    }
+
+    // Bypass 4 (F2): ready-label webhook is the operator's positive-consent path.
+    if let Some(msg) = originating_message
+        && crate::webhook_dispatch::is_ready_label_dispatch_marker(msg)
+    {
+        return None;
+    }
+
+    // Bypass 3: no prior PR in metadata → fresh dispatch, nothing to conflict with.
+    let pr_url = extract_pr_url(&task.metadata)?;
+
+    // Best-effort GitHub REST enrichment. The rejection decision is already
+    // made (pr_url present + no bypass) — enrichment only fills out detail
+    // fields for the LLM's structured handling.
+    let (owner, repo, pr_number) = match parse_pr_url(&pr_url) {
+        Some(parsed) => parsed,
+        None => {
+            warn!(
+                task_id = task.id.as_str(),
+                pr_url = pr_url.as_str(),
+                "dispatch_task_has_open_pr: could not parse pr_url; rejecting without enrichment"
+            );
+            return Some(build_open_pr_rejection(
+                &task.id, &pr_url, None, None, None, None,
+            ));
+        }
+    };
+
+    let summary = match github_token {
+        Some(token) => match fetch_pr_summary(token, &owner, &repo, pr_number).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(
+                    task_id = task.id.as_str(),
+                    pr_url = pr_url.as_str(),
+                    error = %e,
+                    "dispatch_task_has_open_pr: PR API enrichment failed; rejecting without enrichment"
+                );
+                None
+            }
+        },
+        None => {
+            warn!(
+                task_id = task.id.as_str(),
+                "dispatch_task_has_open_pr: no GitHub token; rejecting without enrichment"
+            );
+            None
+        }
+    };
+
+    let (pr_state, latest_verdict, merge_state) = match summary {
+        Some(s) => (s.state, s.latest_verdict, s.merge_state),
+        None => (None, None, None),
+    };
+
+    Some(build_open_pr_rejection(
+        &task.id,
+        &pr_url,
+        Some(pr_number),
+        pr_state,
+        latest_verdict,
+        merge_state,
+    ))
+}
+
+/// Build the structured `dispatch_task_has_open_pr` rejection body (mika#920).
+///
+/// Optional fields are omitted when `None`; the `recovery` and `reason`
+/// strings are stable so the self-dev LLM prompt can pattern-match on them.
+fn build_open_pr_rejection(
+    task_id: &str,
+    pr_url: &str,
+    pr_number: Option<u64>,
+    pr_state: Option<String>,
+    latest_verdict: Option<String>,
+    merge_state: Option<String>,
+) -> serde_json::Value {
+    let pr_label = pr_number
+        .map(|n| format!("#{n}"))
+        .unwrap_or_else(|| pr_url.to_string());
+    let verdict_clause = latest_verdict
+        .as_deref()
+        .map(|v| format!(" with QA verdict '{v}'"))
+        .unwrap_or_default();
+    let reason = format!(
+        "Task has an open PR ({pr_label}){verdict_clause}. Re-dispatching without \
+         iteration_context would re-run the full pipeline against a mostly-complete \
+         branch — likely a no-op."
+    );
+    let recovery = "This task already has an open PR. Options: (a) re-dispatch with \
+                    iteration_context to address specific feedback, (b) wait for the \
+                    blocker to resolve, (c) check PR status manually. To bypass: pass \
+                    iteration_context in the run_claude_pilot call.";
+
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "error".to_string(),
+        serde_json::Value::String("dispatch_task_has_open_pr".to_string()),
+    );
+    obj.insert(
+        "task_id".to_string(),
+        serde_json::Value::String(task_id.to_string()),
+    );
+    obj.insert(
+        "pr_url".to_string(),
+        serde_json::Value::String(pr_url.to_string()),
+    );
+    if let Some(n) = pr_number {
+        obj.insert("pr_number".to_string(), serde_json::Value::from(n));
+    }
+    if let Some(s) = pr_state {
+        obj.insert("pr_state".to_string(), serde_json::Value::String(s));
+    }
+    if let Some(v) = latest_verdict {
+        obj.insert(
+            "latest_qa_verdict".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
+    if let Some(m) = merge_state {
+        obj.insert("merge_state".to_string(), serde_json::Value::String(m));
+    }
+    obj.insert(
+        "recovery".to_string(),
+        serde_json::Value::String(recovery.to_string()),
+    );
+    obj.insert("reason".to_string(), serde_json::Value::String(reason));
+    serde_json::Value::Object(obj)
+}
+
 /// Check for cycles in the task lineage before enqueuing a deferred dispatch (mika#1058).
 ///
 /// Walks the `parent_task_id` chain (max 4 hops, bounded by `depth ≤ 3` schema CHECK).
@@ -1298,9 +1508,21 @@ async fn register_deferred_callback(
     }
 
     // Encode the original dispatch arguments so the deferred turn can replay them.
+    // Inject the `__internal_deferred_dispatch` sentinel into the saved
+    // original_call so that when the deferred turn replays this dispatch, the
+    // `dispatch_task_has_open_pr` guard (mika#920) bypasses on F3 condition.
+    // Without the sentinel the deferred replay would livelock against the
+    // open-PR guard.
+    let mut original_call = input.clone();
+    if let Some(obj) = original_call.as_object_mut() {
+        obj.insert(
+            INTERNAL_DEFERRED_DISPATCH_FIELD.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
     let action_config = serde_json::json!({
         "trigger_kind": "deferred_dispatch",
-        "original_call": input,
+        "original_call": original_call,
     })
     .to_string();
 
@@ -4073,6 +4295,223 @@ mod tests {
             validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None, None).await;
 
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    // ===================================================================
+    // dispatch_task_has_open_pr guard tests (mika#920)
+    // ===================================================================
+
+    /// Helper: write a `claude_pilot.pr_url` field into the task's metadata.
+    async fn set_task_pr_url(db: &crate::async_db::AsyncDatabase, task_id: &str, pr_url: &str) {
+        let metadata = serde_json::json!({
+            "claude_pilot": { "pr_url": pr_url }
+        })
+        .to_string();
+        db.update_task_metadata(task_id, &metadata).await.unwrap();
+    }
+
+    /// Build a `run_claude_pilot` tool input with the given fields.
+    fn pilot_input(skill: &str, prompt: &str, task_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "skill": skill,
+            "prompt": prompt,
+            "task_id": task_id,
+        })
+    }
+
+    /// Scenario 1: Re-dispatch with open PR and no `iteration_context` → rejection.
+    #[tokio::test]
+    async fn test_open_pr_guard_rejects_re_dispatch_without_context() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        let err = result.expect_err("dispatch should be rejected");
+        let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(parsed["error"], "dispatch_task_has_open_pr");
+        assert_eq!(
+            parsed["pr_url"],
+            "https://github.com/senara-solutions/mika/pull/915"
+        );
+        assert_eq!(parsed["pr_number"], 915);
+        assert_eq!(parsed["task_id"], wi_id);
+        assert!(
+            parsed["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("iteration_context")
+        );
+        assert!(parsed["reason"].as_str().unwrap().contains("open PR"));
+
+        // Rejection JSON is also written to tasks.result for operator visibility (#1108).
+        let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        let stored = task
+            .result
+            .expect("rejection should be written to tasks.result");
+        assert!(stored.contains("dispatch_task_has_open_pr"));
+    }
+
+    /// Scenario 2: Re-dispatch with open PR AND `iteration_context` → bypass.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_with_iteration_context() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let mut input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        input["iteration_context"] = serde_json::json!("Fix the failing AC on Unit 5");
+
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        assert!(
+            result.is_ok(),
+            "iteration_context bypass should allow dispatch, got: {result:?}"
+        );
+    }
+
+    /// Scenario 3: Fresh dispatch (no `pr_url` in metadata) → bypass.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_when_no_pr_url() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        // No metadata write — task has no claude_pilot.pr_url field.
+
+        let input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        assert!(
+            result.is_ok(),
+            "fresh dispatch without pr_url should proceed, got: {result:?}"
+        );
+    }
+
+    /// Scenario 4 (F2 regression): Ready-label webhook with open PR → bypass.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_ready_label_webhook() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        let result = validate_dispatch_readiness(
+            &async_db,
+            &wi_id,
+            None,
+            Some(&input),
+            Some("[GitHub] Issue labeled ready on senara-solutions/mika#920 — title"),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "ready-label webhook should bypass open-PR guard (operator positive consent), got: {result:?}"
+        );
+    }
+
+    /// Scenario 5 (F3 regression): DeferredDispatch sentinel with open PR → bypass.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_deferred_dispatch_sentinel() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let mut input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        input[INTERNAL_DEFERRED_DISPATCH_FIELD] = serde_json::json!(true);
+
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        assert!(
+            result.is_ok(),
+            "deferred-dispatch sentinel should bypass open-PR guard (engine recovery), got: {result:?}"
+        );
+    }
+
+    /// Bypass via skill: `dev-groom` is fresh grooming, not implementation re-run.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_dev_groom_skill() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let input = pilot_input("dev-groom", "mika#920", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        assert!(
+            result.is_ok(),
+            "dev-groom dispatch should bypass open-PR guard, got: {result:?}"
+        );
+    }
+
+    /// Sentinel-on-input survives the register_deferred_callback → replay round-trip.
+    #[tokio::test]
+    async fn test_register_deferred_callback_injects_sentinel() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        let input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        let registered = register_deferred_callback(&async_db, &wi_id, &input).await;
+        assert!(registered, "deferred callback should register");
+
+        // Walk the child tasks to find the deferred one and inspect its action_config.
+        let children = async_db.get_child_tasks(&wi_id).await.unwrap();
+        let deferred = children
+            .iter()
+            .find(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL)
+            .expect("deferred callback should be a child of the parent");
+
+        let config: serde_json::Value = serde_json::from_str(&deferred.action_config).unwrap();
+        let original_call = config
+            .get("original_call")
+            .expect("action_config should contain original_call");
+        assert_eq!(
+            original_call.get(INTERNAL_DEFERRED_DISPATCH_FIELD),
+            Some(&serde_json::Value::Bool(true)),
+            "register_deferred_callback must inject the __internal_deferred_dispatch sentinel"
+        );
+        // Original fields must be preserved alongside the sentinel.
+        assert_eq!(
+            original_call.get("skill"),
+            Some(&serde_json::json!("dev-pilot"))
+        );
+        assert_eq!(
+            original_call.get("prompt"),
+            Some(&serde_json::json!("mika#920"))
+        );
     }
 
     // ===================================================================

@@ -46,6 +46,7 @@ mod eval {
     mod test_deadline_in_flight_llm_call;
     mod test_di_builders;
     mod test_dispatch_no_grooming_marker_guard;
+    mod test_dispatch_task_has_open_pr_guard;
     mod test_error_handling;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
