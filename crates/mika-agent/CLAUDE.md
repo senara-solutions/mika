@@ -124,7 +124,7 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 ### PR Merge Gate
 
-`pr_merge_with_gate` builtin tool — structural backstop against merging PRs with failing required CI checks. Registered in `default_tools()` (all agents, including delegates). Decision matrix: fail/cancel -> blocked; pending -> auto-merge; all pass -> immediate merge; already merged -> no-op. 60s timeout. Requires `ctx.github_token`. See #490.
+`pr_merge_with_gate` builtin tool — structural backstop against merging PRs with failing required CI checks. Registered in `default_tools()` (all agents, including delegates). Returns a tagged-union `MergeGateResult` via `#[serde(tag = "action")]` — the LLM branches on the `action` field. Five variants: `merged`, `auto_merge_enabled`, `blocked` (with `BlockReason` sub-enum and backward-compat `failing_checks`), `already_merged`, `gate_errored` (with `GateErrorKind` sub-enum). Preflight `gh pr view` detects CONFLICTING/CLOSED/DRAFT before attempting merge (#794). Decision matrix: CONFLICTING/DIRTY -> blocked[merge_conflict]; fail/cancel -> blocked[required_check_failed]; pending -> auto-merge; all pass -> immediate merge; already merged -> no-op; infra failure -> gate_errored. 60s timeout. Requires `ctx.github_token`. See #490, #794.
 
 ### Issue Dependency Resolution
 
