@@ -33,6 +33,7 @@ pub mod test_helpers {
         static HOME_DIR: &str = "/tmp/mika-test";
         static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
         static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
+        static TOOL_ARG_SUFFIX_REJECTED: AtomicBool = AtomicBool::new(false);
         ToolContext {
             db,
             session_id: "test-session",
@@ -56,6 +57,8 @@ pub mod test_helpers {
             pr_review_posted: &PR_REVIEW_POSTED,
             pr_reviews_posted: None,
             callback_task_id: None,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
         }
     }
 
@@ -109,6 +112,7 @@ pub mod test_helpers {
         pub fn ctx_with_reflection(&self) -> ToolContext<'_> {
             static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
             static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
+            static TOOL_ARG_SUFFIX_REJECTED: AtomicBool = AtomicBool::new(false);
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
@@ -132,6 +136,8 @@ pub mod test_helpers {
                 pr_review_posted: &PR_REVIEW_POSTED,
                 pr_reviews_posted: None,
                 callback_task_id: None,
+                required_tool_arg_suffixes: &[],
+                tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
             }
         }
 
@@ -139,6 +145,7 @@ pub mod test_helpers {
         pub fn ctx_with_home<'a>(&'a self, home: &'a std::path::Path) -> ToolContext<'a> {
             static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
             static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
+            static TOOL_ARG_SUFFIX_REJECTED: AtomicBool = AtomicBool::new(false);
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
@@ -162,6 +169,8 @@ pub mod test_helpers {
                 pr_review_posted: &PR_REVIEW_POSTED,
                 pr_reviews_posted: None,
                 callback_task_id: None,
+                required_tool_arg_suffixes: &[],
+                tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
             }
         }
         /// Create a ToolContext with custom home and global home directories.
@@ -173,6 +182,7 @@ pub mod test_helpers {
         ) -> ToolContext<'a> {
             static SKILLS_DIRTY: AtomicBool = AtomicBool::new(false);
             static PR_REVIEW_POSTED: AtomicBool = AtomicBool::new(false);
+            static TOOL_ARG_SUFFIX_REJECTED: AtomicBool = AtomicBool::new(false);
             ToolContext {
                 db: &self.db,
                 session_id: "test-session",
@@ -196,6 +206,8 @@ pub mod test_helpers {
                 pr_review_posted: &PR_REVIEW_POSTED,
                 pr_reviews_posted: None,
                 callback_task_id: None,
+                required_tool_arg_suffixes: &[],
+                tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
             }
         }
     }

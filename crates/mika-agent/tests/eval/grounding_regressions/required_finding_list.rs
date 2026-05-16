@@ -58,6 +58,7 @@ fn make_groom_skill(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                required_tool_arg_suffixes: vec![],
             },
             context: HashMap::new(),
             variants: Default::default(),

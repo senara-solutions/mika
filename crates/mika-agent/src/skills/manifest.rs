@@ -144,12 +144,47 @@ pub struct Output {
     /// See mika#901 for the conditional-disclosure-evasion failure class this addresses.
     #[serde(default)]
     pub required_finding_list_prefixes: Vec<String>,
+
+    /// Per-tool argument-level required suffixes (mika#899). Skills opt in via
+    /// `[[output.required_tool_arg_suffixes]]` entries in `skill.toml`. Each entry
+    /// declares: tool name, logical argument key (must exist in the engine's
+    /// `LOGICAL_KEY_EXTRACTORS` table), and a closed-alphabet literal list of
+    /// accepted trailer lines. The engine validates BEFORE subprocess spawn —
+    /// if no listed line appears in the last 3 non-empty lines of the extracted
+    /// argument, the tool call is rejected with a corrective error.
+    ///
+    /// Flat `Vec` (not `HashMap`): deterministic iteration order for log/error
+    /// messages, no surprise dedup. See mika#864 for the sibling EndTurn-text guard.
+    #[serde(default)]
+    pub required_tool_arg_suffixes: Vec<RequiredToolArgSuffix>,
+}
+
+/// A single tool-argument suffix constraint declared in
+/// `[[output.required_tool_arg_suffixes]]` of `skill.toml`.
+///
+/// Skills that emit structured trailers (e.g., `VERDICT: pass`) in tool-call
+/// argument bodies declare the closed alphabet here. The engine validates the
+/// argument before dispatch. See mika#899.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RequiredToolArgSuffix {
+    /// Tool name (e.g., `"run_gh"`).
+    pub tool: String,
+    /// Logical argument key — must be in the engine's static
+    /// `LOGICAL_KEY_EXTRACTORS` table. Unknown keys loud-fail at manifest
+    /// validation time (`validate_skill()`).
+    pub arg: String,
+    /// Literal list of accepted trailer lines. Closed alphabet, case-sensitive.
+    /// One of these must appear (via `str::contains`) in one of the last 3
+    /// non-empty trimmed lines of the extracted argument value.
+    pub required_lines: Vec<String>,
 }
 
 impl Output {
     /// Returns `true` if no output constraints are configured.
     pub fn is_empty(&self) -> bool {
-        self.required_suffix_lines.is_empty() && self.required_finding_list_prefixes.is_empty()
+        self.required_suffix_lines.is_empty()
+            && self.required_finding_list_prefixes.is_empty()
+            && self.required_tool_arg_suffixes.is_empty()
     }
 }
 

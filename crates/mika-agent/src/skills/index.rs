@@ -929,6 +929,40 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
         }
     }
 
+    // 5e2. Validate [output] required_tool_arg_suffixes (mika#899)
+    for (i, entry) in manifest
+        .output
+        .required_tool_arg_suffixes
+        .iter()
+        .enumerate()
+    {
+        // Loud-fail on unknown logical keys (architect F3)
+        if !super::builtin_handlers::KNOWN_LOGICAL_KEYS.contains(&entry.arg.as_str()) {
+            diags.push(SkillDiagnostic::fail(format!(
+                "[output] required_tool_arg_suffixes[{i}]: unknown logical key '{}'. \
+                 Valid keys: {:?}",
+                entry.arg,
+                super::builtin_handlers::KNOWN_LOGICAL_KEYS
+            )));
+        }
+        // Validate required_lines is non-empty
+        if entry.required_lines.is_empty() {
+            diags.push(SkillDiagnostic::fail(format!(
+                "[output] required_tool_arg_suffixes[{i}]: required_lines is empty — \
+                 each entry must declare at least one accepted trailer line"
+            )));
+        }
+        // Validate no empty/whitespace entries in required_lines
+        for (j, line) in entry.required_lines.iter().enumerate() {
+            if line.trim().is_empty() {
+                diags.push(SkillDiagnostic::fail(format!(
+                    "[output] required_tool_arg_suffixes[{i}].required_lines[{j}] \
+                     is empty or whitespace-only"
+                )));
+            }
+        }
+    }
+
     // 5f. Cross-check {{key}} placeholders in prompts against [context.*] declarations
     {
         let placeholder_re = regex::Regex::new(r"\{\{(\w+)\}\}").unwrap();
@@ -5117,6 +5151,112 @@ mod tests {
         assert!(
             outside_warn.is_some(),
             "Handler symlink pointing outside skill dir should warn. Got: {diags:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#899 — required_tool_arg_suffixes manifest validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_skill_unknown_logical_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("skill.toml"),
+            r#"
+[skill]
+name = "test-unknown-key"
+description = "test"
+version = "0.1.0"
+
+[triggers]
+keywords = ["test"]
+
+[[output.required_tool_arg_suffixes]]
+tool = "run_gh"
+arg = "nonexistent_logical_key"
+required_lines = ["VERDICT: pass"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("system_prompt.md"), "test prompt").unwrap();
+
+        let diags = validate_skill(dir.path());
+        let fail = diags.iter().find(|d| {
+            matches!(d.level, DiagnosticLevel::Fail)
+                && d.message.contains("unknown logical key")
+                && d.message.contains("nonexistent_logical_key")
+        });
+        assert!(
+            fail.is_some(),
+            "Unknown logical key should produce Fail diagnostic. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_known_logical_key_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("skill.toml"),
+            r#"
+[skill]
+name = "test-known-key"
+description = "test"
+version = "0.1.0"
+
+[triggers]
+keywords = ["test"]
+
+[[output.required_tool_arg_suffixes]]
+tool = "run_gh"
+arg = "pr_review_body"
+required_lines = ["VERDICT: pass", "VERDICT: block[ac]"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("system_prompt.md"), "test prompt").unwrap();
+
+        let diags = validate_skill(dir.path());
+        let fail = diags.iter().find(|d| {
+            matches!(d.level, DiagnosticLevel::Fail) && d.message.contains("unknown logical key")
+        });
+        assert!(
+            fail.is_none(),
+            "Known logical key should not produce a Fail diagnostic. Got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skill_empty_required_lines_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("skill.toml"),
+            r#"
+[skill]
+name = "test-empty-lines"
+description = "test"
+version = "0.1.0"
+
+[triggers]
+keywords = ["test"]
+
+[[output.required_tool_arg_suffixes]]
+tool = "run_gh"
+arg = "pr_review_body"
+required_lines = []
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("system_prompt.md"), "test prompt").unwrap();
+
+        let diags = validate_skill(dir.path());
+        let fail = diags.iter().find(|d| {
+            matches!(d.level, DiagnosticLevel::Fail)
+                && d.message.contains("required_lines is empty")
+        });
+        assert!(
+            fail.is_some(),
+            "Empty required_lines should produce Fail diagnostic. Got: {diags:?}"
         );
     }
 }

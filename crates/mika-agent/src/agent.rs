@@ -2182,6 +2182,8 @@ async fn run_agent_inner(
     let required_tools = collect_required_tools(&matched, params.user_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
     let required_finding_list_prefixes = collect_required_finding_list_prefixes(&matched);
+    let required_tool_arg_suffixes = collect_required_tool_arg_suffixes(&matched);
+    let tool_arg_suffix_rejected = AtomicBool::new(false);
 
     // Build active skill paths for context-redundancy checks in read tools.
     // Each matched skill's system_prompt.md is already injected into the system prompt
@@ -2305,6 +2307,8 @@ async fn run_agent_inner(
         pr_review_posted: &pr_review_posted,
         pr_reviews_posted: params.pr_reviews_posted,
         callback_task_id: None, // Conversation mode: not a callback turn
+        required_tool_arg_suffixes: &required_tool_arg_suffixes,
+        tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -3307,6 +3311,20 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     );
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
+    // Tool-arg suffix validation fires in silent mode too — qa-review runs
+    // in callback turns and must still validate verdict trailers before GitHub
+    // submission. Unlike required_suffix_lines (which is intentionally empty
+    // in silent mode since EndTurn text is not delivered), tool-arg validation
+    // protects an external side-effect (the GitHub review body). See mika#899.
+    // Silent mode's `matched` is `Vec<&SkillEntry>` (no MatchReason wrapper),
+    // so we collect directly from entries rather than using the MatchedSkill variant.
+    let required_tool_arg_suffixes_silent: Vec<crate::skills::manifest::RequiredToolArgSuffix> =
+        matched
+            .iter()
+            .flat_map(|e| e.manifest.output.required_tool_arg_suffixes.iter())
+            .cloned()
+            .collect();
+    let tool_arg_suffix_rejected_silent = AtomicBool::new(false);
 
     // For silent mode, provide a brief "trigger" as the user message.
     // #991 — Milestone-context callbacks encode the parent task ID in the
@@ -3409,6 +3427,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         pr_review_posted: &pr_review_posted,
         pr_reviews_posted: None, // Silent mode: no session-scoped dedup needed
         callback_task_id,
+        required_tool_arg_suffixes: &required_tool_arg_suffixes_silent,
+        tool_arg_suffix_rejected: &tool_arg_suffix_rejected_silent,
     };
 
     // #862 — Turn-start snapshot of enabled tool names (silent mode).
@@ -3791,6 +3811,8 @@ async fn run_team_agent_inner_impl(
     let required_tools = collect_required_tools(&matched, params.task_message);
     let required_suffix_lines = collect_required_suffix_lines(&matched);
     let required_finding_list_prefixes = collect_required_finding_list_prefixes(&matched);
+    let required_tool_arg_suffixes_team = collect_required_tool_arg_suffixes(&matched);
+    let tool_arg_suffix_rejected_team = AtomicBool::new(false);
 
     // Append MCP tool definitions (if any MCP servers are connected)
     if let Some(mcp) = params.mcp_manager {
@@ -3839,6 +3861,8 @@ async fn run_team_agent_inner_impl(
         pr_review_posted: &pr_review_posted,
         pr_reviews_posted: None, // Team mode: no session-scoped dedup needed
         callback_task_id: None,  // Team mode: not a callback turn
+        required_tool_arg_suffixes: &required_tool_arg_suffixes_team,
+        tool_arg_suffix_rejected: &tool_arg_suffix_rejected_team,
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
@@ -4241,6 +4265,21 @@ fn collect_required_finding_list_prefixes(matched: &[MatchedSkill<'_>]) -> Vec<S
                 .required_finding_list_prefixes
                 .iter()
         })
+        .cloned()
+        .collect()
+}
+
+/// Collect tool-argument suffix constraints from keyword-matched and always-on skills'
+/// `[output]` sections. Returns the union of all declared `required_tool_arg_suffixes`
+/// entries. Both `Keyword` and `AlwaysOn` matched skills contribute (same policy as
+/// `collect_required_suffix_lines`). See mika#899.
+fn collect_required_tool_arg_suffixes(
+    matched: &[MatchedSkill<'_>],
+) -> Vec<crate::skills::manifest::RequiredToolArgSuffix> {
+    matched
+        .iter()
+        .filter(|m| matches!(m.reason, MatchReason::Keyword | MatchReason::AlwaysOn))
+        .flat_map(|m| m.entry.manifest.output.required_tool_arg_suffixes.iter())
         .cloned()
         .collect()
 }
