@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 34;
+pub const CURRENT_SCHEMA_VERSION: i64 = 35;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1116,6 +1116,11 @@ impl Database {
             info!(version = 34, "database migrated to v34");
         }
 
+        if (3..=34).contains(&version) {
+            self.migrate_v34_to_v35()?;
+            info!(version = 35, "database migrated to v35");
+        }
+
         Ok(())
     }
 
@@ -1170,7 +1175,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (34);
+            INSERT INTO schema_version (version) VALUES (35);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1713,7 +1718,8 @@ impl Database {
                 subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
                 outcome TEXT NOT NULL CHECK (outcome IN (
                     'matched_exact', 'matched_llm', 'matched_llm_db_fallback',
-                    'no_match', 'skipped_discovered_type', 'skipped_no_llm', 'error'
+                    'no_match', 'no_candidate_of_type',
+                    'skipped_discovered_type', 'skipped_no_llm', 'error'
                 )),
                 resolution_trace_id TEXT NOT NULL,
                 source_extraction_trace_id TEXT,
@@ -3888,6 +3894,76 @@ impl Database {
         tx.commit()?;
 
         info!("v33→v34: added dispatch_class column to tasks (#1001)");
+        Ok(())
+    }
+
+    /// v34→v35: Expand `kg_resolutions_log.outcome` CHECK constraint to include
+    /// `'no_candidate_of_type'` (#1154). Table rebuild mirroring the v29→v30
+    /// shape: RENAME → CREATE → INSERT INTO ... SELECT → DROP → recreate index.
+    fn migrate_v34_to_v35(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 35 {
+            return Ok(());
+        }
+
+        let count_before: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_resolutions_log", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+
+             ALTER TABLE kg_resolutions_log RENAME TO kg_resolutions_log_v34_backup;
+
+             CREATE TABLE kg_resolutions_log (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                 subject_entity_id INTEGER NOT NULL REFERENCES kg_subject_entities(id) ON DELETE CASCADE,
+                 outcome TEXT NOT NULL CHECK (outcome IN (
+                     'matched_exact', 'matched_llm', 'matched_llm_db_fallback',
+                     'no_match', 'no_candidate_of_type',
+                     'skipped_discovered_type', 'skipped_no_llm', 'error'
+                 )),
+                 resolution_trace_id TEXT NOT NULL,
+                 source_extraction_trace_id TEXT,
+                 model TEXT,
+                 duration_ms INTEGER,
+                 resolved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                 UNIQUE (agent_id, subject_entity_id)
+             );
+
+             INSERT INTO kg_resolutions_log
+                 (id, agent_id, subject_entity_id, outcome, resolution_trace_id,
+                  source_extraction_trace_id, model, duration_ms, resolved_at)
+             SELECT id, agent_id, subject_entity_id, outcome, resolution_trace_id,
+                    source_extraction_trace_id, model, duration_ms, resolved_at
+             FROM kg_resolutions_log_v34_backup;
+
+             DROP TABLE kg_resolutions_log_v34_backup;
+
+             CREATE INDEX idx_kg_res_log_pending ON kg_resolutions_log(agent_id, outcome);
+
+             PRAGMA foreign_keys = ON;
+
+             UPDATE schema_version SET version = 35;",
+        )?;
+        tx.commit()?;
+
+        let count_after: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM kg_resolutions_log", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        info!(
+            count_before = count_before,
+            count_after = count_after,
+            "v34→v35: expanded kg_resolutions_log outcome CHECK to include 'no_candidate_of_type' (#1154)"
+        );
+
         Ok(())
     }
 
@@ -14562,6 +14638,7 @@ mod tests {
         db2.migrate_v31_to_v32().unwrap();
         db2.migrate_v32_to_v33().unwrap();
         db2.migrate_v33_to_v34().unwrap();
+        db2.migrate_v34_to_v35().unwrap();
 
         let final_version: i64 = db2
             .conn
