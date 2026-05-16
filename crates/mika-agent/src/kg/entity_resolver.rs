@@ -34,7 +34,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use mika_common::llm::{LlmMessage, LlmProvider, LlmRequest, LlmRole};
+use mika_common::llm::{LlmMessage, LlmProvider, LlmRequest, LlmRole, LlmUsage};
 
 use crate::async_db::AsyncDatabase;
 use crate::db::kg_schema::KG_DOMAIN_ENTITY_TYPES;
@@ -694,15 +694,27 @@ impl SubjectEntityResolver {
 
         // 4. LLM call with C2.2 retry taxonomy.
         let start = Instant::now();
-        let response_text = match self.call_llm_with_retry(llm, &request).await? {
-            Some(text) => text,
+        let (response_text, first_usage) = match self.call_llm_with_retry(llm, &request).await? {
+            Some(pair) => pair,
             None => return Ok(None), // All retries exhausted, log-and-skip.
         };
         let latency_ms = start.elapsed().as_millis() as u64;
 
         // 5. Parse and validate response. Semantic retry on malformed JSON (C2.2).
         let parsed = match parse_disambiguation_json(&response_text) {
-            Ok(p) => p,
+            Ok(p) => {
+                // Store llm_calls row for the successful first call (C2.4).
+                self.store_llm_call(
+                    &entity.entity_key,
+                    latency_ms,
+                    llm.provider_name(),
+                    llm.model_name(),
+                    &first_usage,
+                    "kg_resolution",
+                )
+                .await;
+                p
+            }
             Err(parse_err) => {
                 warn!(
                     trace_id = %self.trace_id,
@@ -711,24 +723,39 @@ impl SubjectEntityResolver {
                     event = "resolution_parse_failed_retry",
                     "malformed JSON from LLM — retrying with reinforcement"
                 );
+                // Store llm_calls row for the failed first call before retry.
+                self.store_llm_call(
+                    &entity.entity_key,
+                    latency_ms,
+                    llm.provider_name(),
+                    llm.model_name(),
+                    &first_usage,
+                    "kg_resolution",
+                )
+                .await;
+                let retry_start = Instant::now();
                 match self
                     .retry_disambiguation_with_reinforcement(llm, &request, &response_text)
                     .await
                 {
-                    Ok(Some(p)) => p,
+                    Ok(Some((p, retry_usage))) => {
+                        let retry_latency = retry_start.elapsed().as_millis() as u64;
+                        // Store separate llm_calls row for the retry call.
+                        self.store_llm_call(
+                            &entity.entity_key,
+                            retry_latency,
+                            llm.provider_name(),
+                            llm.model_name(),
+                            &retry_usage,
+                            "kg_resolution_retry",
+                        )
+                        .await;
+                        p
+                    }
                     Ok(None) | Err(_) => return Ok(None), // Log-and-skip per C2.3.
                 }
             }
         };
-
-        // Store llm_calls row (C2.4).
-        self.store_llm_call(
-            &entity.entity_key,
-            latency_ms,
-            llm.provider_name(),
-            llm.model_name(),
-        )
-        .await;
 
         match parsed.matched {
             Some(matched_key) => {
@@ -1375,17 +1402,23 @@ impl SubjectEntityResolver {
         &self,
         llm: &Arc<dyn LlmProvider>,
         request: &LlmRequest,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, LlmUsage)>> {
         // Attempt 1
         match llm.send_message(request).await {
-            Ok(response) => Ok(Some(text_content(&response))),
+            Ok(response) => {
+                let usage = response.usage.clone();
+                Ok(Some((text_content(&response), usage)))
+            }
             Err(e) if e.is_retryable() => {
                 // Transport/rate-limit retry (up to 2 more attempts)
                 for attempt in 1..=2 {
                     let backoff = std::time::Duration::from_millis(1000 * 2u64.pow(attempt));
                     tokio::time::sleep(backoff).await;
                     match llm.send_message(request).await {
-                        Ok(response) => return Ok(Some(text_content(&response))),
+                        Ok(response) => {
+                            let usage = response.usage.clone();
+                            return Ok(Some((text_content(&response), usage)));
+                        }
                         Err(retry_err) if retry_err.is_retryable() => continue,
                         Err(retry_err) => {
                             warn!(
@@ -1419,12 +1452,14 @@ impl SubjectEntityResolver {
     }
 
     /// Retry disambiguation with prompt reinforcement after semantic failure (C2.2).
+    ///
+    /// Returns the parsed response alongside its usage for separate `llm_calls` row.
     async fn retry_disambiguation_with_reinforcement(
         &self,
         llm: &Arc<dyn LlmProvider>,
         original_request: &LlmRequest,
         bad_output: &str,
-    ) -> Result<Option<DisambiguationResponse>> {
+    ) -> Result<Option<(DisambiguationResponse, LlmUsage)>> {
         let reinforcement = format!(
             "Your previous response was not valid JSON. The output was:\n{}\n\n\
              Please return ONLY a valid JSON object: {{\"match\": \"<entity_key>\" | null, \"confidence\": 0.0-1.0}}\n\
@@ -1444,9 +1479,10 @@ impl SubjectEntityResolver {
 
         match llm.send_message(&retry_request).await {
             Ok(response) => {
+                let usage = response.usage.clone();
                 let text = text_content(&response);
                 match parse_disambiguation_json(&text) {
-                    Ok(parsed) => Ok(Some(parsed)),
+                    Ok(parsed) => Ok(Some((parsed, usage))),
                     Err(e) => {
                         warn!(
                             trace_id = %self.trace_id,
@@ -1470,7 +1506,15 @@ impl SubjectEntityResolver {
     }
 
     /// Store an llm_calls row (C2.4).
-    async fn store_llm_call(&self, entity_key: &str, latency_ms: u64, provider: &str, model: &str) {
+    async fn store_llm_call(
+        &self,
+        _entity_key: &str,
+        latency_ms: u64,
+        provider: &str,
+        model: &str,
+        usage: &LlmUsage,
+        kg_phase: &str,
+    ) {
         let call_id = uuid::Uuid::new_v4().to_string().replace('-', "");
 
         if let Err(e) = self
@@ -1481,16 +1525,16 @@ impl SubjectEntityResolver {
                 Some(&self.trace_id),
                 provider,
                 model,
-                0,
-                0,
-                None,
-                None,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
                 latency_ms,
                 Some("end_turn"),
                 "success",
                 None,
                 0,
-                Some("kg_resolution"),
+                Some(kg_phase),
                 None,
                 None,
             )
@@ -1498,7 +1542,6 @@ impl SubjectEntityResolver {
         {
             warn!(
                 trace_id = %self.trace_id,
-                entity_key = %entity_key,
                 error = %e,
                 event = "resolution_llm_call_record_failed",
             );
