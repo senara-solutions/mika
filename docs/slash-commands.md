@@ -12,7 +12,7 @@ Slash commands are client-side actions executed directly in the Mika TUI. They a
 database and renders output in-place, while typing a regular message (no `/` prefix)
 sends it to the Claude-backed agent loop as usual.
 
-All 23 commands are defined in a single `COMMANDS` array
+All 24 commands are defined in a single `COMMANDS` array
 (`crates/mika-cli/src/tui/commands/mod.rs`), dispatched through pattern matching in
 `handlers.rs`, and surfaced via an autocomplete popup driven by `autocomplete.rs`.
 
@@ -546,6 +546,33 @@ The rewind engine automatically reverses memory mutations (core memory edits, fa
 Cross-session rewinds are supported -- if the target messages are in a different session than the current one, the marker notes the originating session.
 
 Errors: `Cannot rewind while agent is busy.` or `No messages to rewind.`
+
+---
+
+### /restart
+
+Recover from an agent-worker crash. The TUI runs the agent loop in a supervised
+`tokio::spawn` task; if that worker panics or exits prematurely, a banner appears
+("Agent worker crashed: <reason>. Use /restart to recover."). `/restart` tears the
+dead worker down and spawns a fresh one for the same agent (mika#1149).
+
+**Aliases:** None | **Arguments:** None
+
+**On a healthy worker** -- refuses:
+```
+/restart only applies after the worker has crashed. Use /clear to start a new session on a healthy worker.
+```
+
+**After a crash** -- arms the restart and the chat loop spawns a replacement on
+its next iteration:
+```
+Restarting agent worker… (the lost prompt is not replayed — please re-send it after the worker comes back up.)
+```
+
+The lost in-flight prompt is **not** replayed; the operator must re-type. Background
+callback tasks survive the restart and continue delivering to the new worker.
+The `agent_worker_silenced` structured `error!` event is emitted to the per-agent
+log on every crash for post-incident triage.
 
 ---
 
