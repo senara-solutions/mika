@@ -1460,7 +1460,7 @@ Rules:
                             confidence = MAX(excluded.confidence, kg_subject_entities.confidence),
                             properties_json = COALESCE(excluded.properties_json, kg_subject_entities.properties_json),
                             trace_id = excluded.trace_id,
-                            discovered = excluded.discovered,
+                            discovered = MAX(excluded.discovered, kg_subject_entities.discovered),
                             discovery_reason = COALESCE(excluded.discovery_reason, kg_subject_entities.discovery_reason)",
                         rusqlite::params![
                             docs_root_hash,
