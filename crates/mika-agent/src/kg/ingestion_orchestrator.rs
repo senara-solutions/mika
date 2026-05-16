@@ -132,7 +132,18 @@ impl IngestionOrchestrator {
                 Some(&self.trace_id),
             );
 
-            match extractor.extract_document(&rel_path, None).await {
+            // Load roster for extraction-time constraint (#1158).
+            let roster = extractor.load_roster_snapshot().await.unwrap_or_else(|e| {
+                tracing::warn!(
+                    trace_id = %self.trace_id,
+                    error = %e,
+                    event = "compound_roster_load_failed",
+                    "failed to load roster for compound extraction — using empty"
+                );
+                super::subject_extractor::RosterSnapshot::empty()
+            });
+
+            match extractor.extract_document(&rel_path, None, &roster).await {
                 Ok(stats) => {
                     // extract_document writes the kg_extractions marker
                     // atomically with the extraction results (#757 review P1),
@@ -211,7 +222,21 @@ impl IngestionOrchestrator {
                     Some(&self.trace_id),
                 );
 
-                match extractor.extract_document(&rel_path, Some(prev)).await {
+                // Load roster for extraction-time constraint (#1158).
+                let roster = extractor.load_roster_snapshot().await.unwrap_or_else(|e| {
+                    tracing::warn!(
+                        trace_id = %self.trace_id,
+                        error = %e,
+                        event = "compound_roster_load_failed",
+                        "failed to load roster for reingest extraction — using empty"
+                    );
+                    super::subject_extractor::RosterSnapshot::empty()
+                });
+
+                match extractor
+                    .extract_document(&rel_path, Some(prev), &roster)
+                    .await
+                {
                     Ok(stats) => {
                         // extract_document writes the kg_extractions marker
                         // atomically with the extraction results (#757 review P1).
