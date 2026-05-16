@@ -67,6 +67,7 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
         **`reason.reason = "draft"` or `reason.reason = "pr_closed"`** — Unexpected in webhook-qa:
         - Correlate to task (Step 4).
         - Notify Vincent with context. Escalate.
+        - Proceed to Step 5 with `blocked`.
 
         **Unrecognized `reason` value** — Future variant not yet handled:
         - Correlate to task (Step 4).

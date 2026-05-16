@@ -997,6 +997,18 @@ mod tests {
     }
 
     #[test]
+    fn serialize_gate_error_unknown() {
+        let result = MergeGateResult::GateError {
+            kind: GateErrorKind::Unknown,
+            detail: "Merge failed: unexpected output".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "gate_errored");
+        assert_eq!(json["kind"]["kind"], "unknown");
+        assert_eq!(json["detail"], "Merge failed: unexpected output");
+    }
+
+    #[test]
     fn serialize_auto_merge_result() {
         let result = MergeGateResult::AutoMergeEnabled {
             pending_checks: vec![CheckInfo {
