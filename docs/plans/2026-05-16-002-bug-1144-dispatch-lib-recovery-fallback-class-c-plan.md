@@ -31,6 +31,15 @@ recoverable than a wrong one.
 the only delta on the branch; the source files pinned below are unchanged
 from `origin/main`.
 
+> **Naming note (mika-arch second-pass NF6):** The issue body of mika#1144
+> refers to the function as `recover_body_callout_drift()`. The actual function
+> name in `skills/bundled/_shared/dispatch-lib.sh` (verified via Pin P0.1 below
+> at line 158) is **`_verify_and_write_body_callout()`**. This plan and the
+> implementation target the underscore-prefixed name as it appears in the
+> source tree; the issue body's reference is inaccurate but functionally
+> unambiguous (the lines 185–196 citation pins the same code regardless of
+> what the function is called). No rename is in scope for this PR.
+
 Five sites determine the load-bearing claims of this plan. P0.1, P0.4, and P0.5
 are the implementer-facing pins (the exact slices that are deleted, retained, or
 inserted-after). P0.2 and P0.3 are dispatch-gate / orchestrator-path context.
