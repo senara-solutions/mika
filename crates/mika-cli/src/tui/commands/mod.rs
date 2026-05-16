@@ -194,6 +194,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         args_hint: Some("[<count> | to <message_id>]"),
         completer: None,
     },
+    SlashCommand {
+        name: "restart",
+        aliases: &[],
+        description: "Restart the agent worker after a crash (mika#1149)",
+        args_hint: None,
+        completer: None,
+    },
 ];
 
 /// Resolve a thinking level keyword to (budget_tokens, level_name).

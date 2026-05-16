@@ -35,10 +35,17 @@ use mika_common::llm::LlmImage;
 use mika_common::team;
 use std::path::Path;
 
-/// Holds the agent worker task handle, poller handle, and the AppContext (for DB shutdown).
+/// Holds the agent worker supervisor handle, poller handle, the AppContext (for DB shutdown),
+/// and the shutdown-initiated flag the supervisor reads to distinguish operator-driven
+/// shutdown from worker death (mika#1149).
 struct AgentWorker {
-    handle: JoinHandle<()>,
+    /// Supervisor task — owns the worker's JoinHandle and forwards unexpected exits
+    /// as `AgentResponse::WorkerCrashed` events.
+    supervisor_handle: JoinHandle<()>,
     poller_handle: JoinHandle<()>,
+    /// Set to `true` before tearing down the worker (Quit, agent switch, /restart)
+    /// so the supervisor exits silently on the resulting `Ok(())` from the worker loop.
+    shutdown_initiated: Arc<AtomicBool>,
     _ctx: AppContext,
 }
 
@@ -205,6 +212,9 @@ async fn spawn_agent_worker(
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<AgentRequest>();
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
+    // Cloned for the supervisor task so a worker crash can surface to the TUI
+    // after the worker's own `agent_tx` has been dropped (mika#1149).
+    let supervisor_agent_tx = agent_tx.clone();
 
     let worker_db = ctx.async_db.clone();
     let mut worker_llm = ctx.llm.clone();
@@ -318,14 +328,14 @@ async fn spawn_agent_worker(
                     };
 
                     let response = match result {
-                        Ok(output) => AgentResponse {
+                        Ok(output) => AgentResponse::Reply {
                             content: output.text.unwrap_or_default(),
                             is_error: false,
                             thinking: output.thinking,
                             input_tokens: output.usage.as_ref().map(|u| u.input_tokens as u32),
                             updated_skills,
                         },
-                        Err(e) => AgentResponse {
+                        Err(e) => AgentResponse::Reply {
                             content: format!("{e}"),
                             is_error: true,
                             thinking: None,
@@ -405,7 +415,7 @@ async fn spawn_agent_worker(
                     .await;
 
                     let response = match callback_result {
-                        Ok(output) => AgentResponse {
+                        Ok(output) => AgentResponse::Reply {
                             content: output.text.unwrap_or_default(),
                             is_error: false,
                             thinking: output.thinking,
@@ -426,7 +436,7 @@ async fn spawn_agent_worker(
                                     "failed to unclaim callback task after agent error"
                                 );
                             }
-                            AgentResponse {
+                            AgentResponse::Reply {
                                 content: format!("Failed to process callback result: {e}"),
                                 is_error: true,
                                 thinking: None,
@@ -477,9 +487,36 @@ async fn spawn_agent_worker(
     let model = ctx.settings.active_model_display();
     let identity_name = identity.name.clone();
 
+    // Supervise the worker task (mika#1149). The supervisor awaits `handle` and
+    // forwards `JoinError` (panic) or premature `Ok(())` (user_rx closed while the
+    // session is still active) as `AgentResponse::WorkerCrashed`. The chat loop sets
+    // `shutdown_initiated = true` before tearing the worker down so expected exits
+    // (Quit, agent switch, /restart) are silenced.
+    let shutdown_initiated = Arc::new(AtomicBool::new(false));
+    let supervisor_shutdown = shutdown_initiated.clone();
+    let supervisor_agent_id = ctx.async_db.agent_id().to_string();
+    let supervisor_session_id = session_id.clone();
+    let supervisor_handle = tokio::spawn(async move {
+        mika_cli::supervision::supervise(handle, supervisor_shutdown, move |failure| {
+            tracing::error!(
+                target: "mika::otel",
+                event = "agent_worker_silenced",
+                agent_id = %supervisor_agent_id,
+                session_id = %supervisor_session_id,
+                reason = %failure.reason,
+                "TUI agent worker entered failure state; pending prompt dropped"
+            );
+            let _ = supervisor_agent_tx.send(AgentResponse::WorkerCrashed {
+                reason: failure.reason,
+            });
+        })
+        .await;
+    });
+
     let worker = AgentWorker {
-        handle,
+        supervisor_handle,
         poller_handle,
+        shutdown_initiated,
         _ctx: ctx,
     };
 
@@ -665,13 +702,19 @@ pub async fn run(
                 tracing::warn!(error = %e, "failed to end session on agent switch");
             }
 
-            // Abort the old poller and wait for the worker to stop (with timeout)
+            // Silence the supervisor before tearing down the old worker — dropping
+            // app.agent_tx + sending Quit would otherwise resolve as
+            // `Ok(())` and trip the WorkerCrashed path (mika#1149).
+            worker.shutdown_initiated.store(true, Ordering::Release);
+
+            // Abort the old poller and wait for the supervisor (and its worker) to
+            // stop, with a timeout in case the worker is mid-LLM-call.
             worker.poller_handle.abort();
-            let old_handle = std::mem::replace(
-                &mut worker.handle,
+            let old_supervisor = std::mem::replace(
+                &mut worker.supervisor_handle,
                 tokio::spawn(async {}), // placeholder
             );
-            let _ = tokio::time::timeout(Duration::from_secs(2), old_handle).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), old_supervisor).await;
 
             // Initialize the new agent
             match init::init_for_agent(&target_name) {
@@ -736,7 +779,89 @@ pub async fn run(
             app.needs_redraw = true;
         }
 
+        // Handle /restart: tear down the crashed worker + supervisor and spin up a
+        // fresh pair for the same agent (mika#1149 §S1.2). Reuses the agent-switch
+        // shape but skips re-init for a different agent.
+        if app.pending_restart {
+            app.pending_restart = false;
+
+            // End the old session before restarting so the dashboard shows it as
+            // completed rather than ongoing.
+            if let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await {
+                tracing::warn!(error = %e, "failed to end session on /restart");
+            }
+
+            worker.shutdown_initiated.store(true, Ordering::Release);
+            worker.poller_handle.abort();
+            let old_supervisor = std::mem::replace(
+                &mut worker.supervisor_handle,
+                tokio::spawn(async {}), // placeholder
+            );
+            let _ = tokio::time::timeout(Duration::from_secs(2), old_supervisor).await;
+
+            match init::init_for_agent(agent_name) {
+                Ok(new_ctx) => {
+                    match spawn_agent_worker(new_ctx, agent_name, &http_client, None).await {
+                        Ok((
+                            new_worker,
+                            new_tx,
+                            new_rx,
+                            new_session,
+                            new_model,
+                            _new_identity,
+                            new_skills,
+                        )) => {
+                            app.agent_tx = new_tx;
+                            app.agent_rx = new_rx;
+                            app.session_id = new_session;
+                            app.model = new_model;
+                            app.db = new_worker._ctx.async_db.clone();
+                            app.llm = new_worker._ctx.llm.clone();
+                            app.skills = new_skills;
+                            app.worker_crashed = false;
+
+                            worker = new_worker;
+
+                            app.load_thinking_level().await;
+
+                            app.messages.push(ChatMessage {
+                                role: ChatRole::System,
+                                content:
+                                    "Agent worker restarted. In-flight callback caches were lost; pending background tasks will still deliver."
+                                        .to_string(),
+                                rendered: None,
+                                channel: None,
+                            });
+                        }
+                        Err(e) => {
+                            // Worker stays absent; the WorkerCrashed banner remains.
+                            app.messages.push(ChatMessage {
+                                role: ChatRole::System,
+                                content: format!("Failed to restart agent worker: {e}"),
+                                rendered: None,
+                                channel: None,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.messages.push(ChatMessage {
+                        role: ChatRole::System,
+                        content: format!("Failed to restart agent worker: {e}"),
+                        rendered: None,
+                        channel: None,
+                    });
+                }
+            }
+
+            app.scroll_offset = 0;
+            app.needs_redraw = true;
+        }
+
         if app.should_quit {
+            // Mark shutdown so the supervisor stays silent when the worker's
+            // while-let loop exits via the Quit branch (mika#1149).
+            worker.shutdown_initiated.store(true, Ordering::Release);
             let _ = app.agent_tx.send(AgentRequest::Quit);
             break;
         }
@@ -756,14 +881,11 @@ pub async fn run(
     // Stop the reminder poller
     worker.poller_handle.abort();
 
-    // Check agent worker for panics
-    if worker.handle.is_finished() {
-        if let Err(e) = worker.handle.await {
-            eprintln!("Agent worker error: {e}");
-        }
-    } else {
-        worker.handle.abort();
-    }
+    // Wait for the supervisor (which owns the worker JoinHandle). It exits
+    // silently because shutdown_initiated was set above; we just need to
+    // join it within a bounded window.
+    worker.shutdown_initiated.store(true, Ordering::Release);
+    let _ = tokio::time::timeout(Duration::from_secs(2), worker.supervisor_handle).await;
 
     // Database shutdown happens automatically via Drop on worker._ctx
     Ok(())

@@ -72,10 +72,23 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "attach" | "img" => Some(handle_attach(app, args)),
         "undo" => Some(handle_undo(app).await),
         "rewind" => Some(handle_rewind(app, args).await),
+        "restart" => Some(handle_restart(app)),
         _ => Some(format!(
             "Unknown command: /{cmd_name}. Type /help for available commands."
         )),
     }
+}
+
+/// Tear down the dead agent worker and spawn a fresh one (mika#1149).
+/// Refuses on a healthy worker — `/clear` is the right tool for "start a new
+/// session." The actual respawn is performed by the chat loop on the next
+/// iteration once `pending_restart` is set.
+fn handle_restart(app: &mut App<'_>) -> String {
+    if !app.worker_crashed {
+        return "/restart only applies after the worker has crashed. Use /clear to start a new session on a healthy worker.".to_string();
+    }
+    app.pending_restart = true;
+    "Restarting agent worker… (the lost prompt is not replayed — please re-send it after the worker comes back up.)".to_string()
 }
 
 fn handle_help() -> String {
