@@ -3271,7 +3271,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                  is firing this turn unconditionally.\n\n\
                  Parent task: {parent_task_id} (type: {parent_kind})\n\n\
                  You MUST either:\n\
-                 1. Dispatch the next pending child via run_claude_pilot, OR\n\
+                 1. Dispatch the next pending child via run_claude_pilot (implement) \
+                    or run_claude_pilot_groom (groom), OR\n\
                  2. Mark the {parent_kind} parent as `blocked` (with a reason in the note \
                     field) or `completed` via update_task_status.\n\n\
                  Do NOT narrate, summarize, or ask for confirmation. The engine enforces \
@@ -3285,13 +3286,15 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
             ..
         } => {
             format!(
-                "DEFERRED-DISPATCH RETRY (mika#1011). A previous run_claude_pilot call \
-                 was rejected with global_dispatch_active. The dispatch slot is now free. \
-                 Re-invoke run_claude_pilot with the original arguments to complete the \
-                 deferred dispatch.\n\n\
+                "DEFERRED-DISPATCH RETRY (mika#1011). A previous run_claude_pilot or \
+                 run_claude_pilot_groom call was rejected with global_dispatch_active. \
+                 The dispatch slot is now free. Re-invoke the same tool with the original \
+                 arguments to complete the deferred dispatch (read `Original dispatch \
+                 config` below to determine which tool — `skill: dev-groom` → \
+                 run_claude_pilot_groom; `skill: dev-pilot` → run_claude_pilot).\n\n\
                  Parent task: {parent_task_id}\n\
                  Original dispatch config: {action_config}\n\n\
-                 You MUST call run_claude_pilot. Do not call update_task_status, \
+                 You MUST call the matching dispatch tool. Do not call update_task_status, \
                  send_message, or any other tool first."
             )
         }
@@ -4938,15 +4941,16 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         trigger: ready_label_dispatch_trigger,
         satisfied: ready_label_dispatch_satisfied,
         correction_message: "[Your response was rejected. The `ready` label has been \
-             removed but you did not call run_claude_pilot. The Ready-Label \
-             Dispatch handler requires you to: \
+             removed but you did not call run_claude_pilot or run_claude_pilot_groom. \
+             The Ready-Label Dispatch handler requires you to: \
              (1) run_gh `issue view <n> --json title,body --repo <repo>` to fetch \
              the issue, (2) check the issue body for the grooming marker \
              `> - **Plan:**`. If the marker is PRESENT: call create_task then \
              run_claude_pilot with skill=dev-pilot, prompt=\"<repo>#<n>\", and \
              task_id=<UUID>. If the marker is ABSENT: call create_task then \
-             run_claude_pilot with skill=dev-groom to auto-groom the ticket. \
-             Do not end this turn until you have called run_claude_pilot.]",
+             run_claude_pilot_groom with skill=dev-groom (mika#1173 — grooming \
+             uses its own tool) to auto-groom the ticket. \
+             Do not end this turn until you have called the appropriate dispatch tool.]",
     },
     // #910 — non-ready [GitHub] webhook turns must NOT call run_claude_pilot.
     // Per mika#841 Layer 1 source-check, only `[GitHub] Issue labeled ready on`
@@ -4971,11 +4975,11 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         trigger: webhook_no_unauthorized_dispatch_trigger,
         satisfied: webhook_no_unauthorized_dispatch_satisfied,
         correction_message: "[Your response was rejected. You called \
-             run_claude_pilot on a [GitHub] webhook turn that was NOT a 'ready' \
-             label event. Per Layer 1 source-check (mika#841), only '[GitHub] \
-             Issue labeled ready on' webhooks may dispatch. All other [GitHub] \
-             events (comments, other labels, edits) must use Webhook Fallthrough: \
-             acknowledge without calling run_claude_pilot.]",
+             run_claude_pilot or run_claude_pilot_groom on a [GitHub] webhook \
+             turn that was NOT a 'ready' label event. Per Layer 1 source-check \
+             (mika#841), only '[GitHub] Issue labeled ready on' webhooks may \
+             dispatch. All other [GitHub] events (comments, other labels, edits) \
+             must use Webhook Fallthrough: acknowledge without dispatching.]",
     },
     // #696 — webhook events require at least one successful tool call.
     IntentPrecondition {
@@ -5070,7 +5074,12 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 /// after fabricated `check_task` pre-flights exploited the over-broad match to
 /// short-circuit dispatch via a hallucinated escalation that hit NoChannel.
 fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries.iter().any(|s| s.name == "run_claude_pilot")
+    // mika#1173: dev-groom owns its own tool (run_claude_pilot_groom) after the
+    // structural revert. Auto-groom path dispatches via the groom tool; both
+    // names satisfy the ready-label dispatch contract.
+    summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
 }
 
 /// #910, #1102 — Triggers on `[GitHub]` webhook turns that represent
@@ -5093,9 +5102,11 @@ fn webhook_no_unauthorized_dispatch_trigger(msg: &str) -> bool {
 /// ignored — the dispatch-readiness guard in `executor.rs` already blocked
 /// them structurally.
 fn webhook_no_unauthorized_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
+    // mika#1173: also reject the groom tool — unauthorized dispatch is
+    // unauthorized regardless of which claude-pilot tool was called.
     !summaries
         .iter()
-        .any(|s| s.name == "run_claude_pilot" && s.success)
+        .any(|s| (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom") && s.success)
 }
 
 /// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
@@ -5178,7 +5189,10 @@ fn deferred_dispatch_trigger(msg: &str) -> bool {
 
 /// mika#1011 — Satisfied when `run_claude_pilot` has been attempted (success or failure).
 fn deferred_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries.iter().any(|s| s.name == "run_claude_pilot")
+    // mika#1173: deferred replay may target either tool.
+    summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
 }
 
 /// #870 — Returns `true` when BOTH `update_task_status` AND `send_message`
@@ -5238,8 +5252,11 @@ fn callback_milestone_advance_satisfied(
     parent_task_id: &str,
     summaries: &[ToolCallSummary],
 ) -> bool {
-    // Path A: any run_claude_pilot call (advance to next child)
-    let has_advance = summaries.iter().any(|s| s.name == "run_claude_pilot");
+    // Path A: any run_claude_pilot or run_claude_pilot_groom call advances the queue
+    // (the latter is the milestone-cascade auto-groom path; mika#1173).
+    let has_advance = summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom");
 
     if has_advance {
         return true;
@@ -7540,6 +7557,94 @@ mod tests {
             non_zero_exit: false,
             step: 0,
         }]));
+    }
+
+    // mika#1173: regression tests asserting intent-guard satisfied predicates
+    // accept both run_claude_pilot AND run_claude_pilot_groom. The structural
+    // revert split grooming onto its own tool; without these guards updated,
+    // the auto-groom path on ready-label/milestone-cascade/deferred-replay
+    // would all fail at the EndTurn guard layer.
+    // (Reuses the `make_summary(name, output, success)` helper defined later in
+    // this test module; passing "" for output as these guards key on name+success.)
+
+    #[test]
+    fn test_ready_label_dispatch_satisfied_accepts_both_tools() {
+        assert!(!ready_label_dispatch_satisfied(&[]));
+        assert!(ready_label_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot",
+            "",
+            true
+        )]));
+        assert!(ready_label_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot_groom",
+            "",
+            true
+        )]));
+        // Failed attempts still count as "attempted" per the guard's contract.
+        assert!(ready_label_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot_groom",
+            "",
+            false
+        )]));
+        assert!(!ready_label_dispatch_satisfied(&[make_summary(
+            "send_message",
+            "",
+            true
+        )]));
+    }
+
+    #[test]
+    fn test_deferred_dispatch_satisfied_accepts_groom_tool() {
+        assert!(deferred_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot_groom",
+            "",
+            true
+        )]));
+        assert!(!deferred_dispatch_satisfied(&[make_summary(
+            "update_task_status",
+            "",
+            true
+        )]));
+    }
+
+    #[test]
+    fn test_callback_milestone_advance_satisfied_path_a_accepts_groom_tool() {
+        let parent_id = "abc-123";
+        // Path A: groom-tool advance.
+        assert!(callback_milestone_advance_satisfied(
+            parent_id,
+            &[make_summary("run_claude_pilot_groom", "", true)]
+        ));
+        // Path A: implement-tool advance still works.
+        assert!(callback_milestone_advance_satisfied(
+            parent_id,
+            &[make_summary("run_claude_pilot", "", true)]
+        ));
+        // Neither path → not satisfied.
+        assert!(!callback_milestone_advance_satisfied(
+            parent_id,
+            &[make_summary("send_message", "", true)]
+        ));
+    }
+
+    #[test]
+    fn test_webhook_no_unauthorized_dispatch_satisfied_rejects_both_tools() {
+        // No tools called → satisfied (no unauthorized dispatch).
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&[]));
+        // Successful run_claude_pilot → unauthorized → NOT satisfied.
+        assert!(!webhook_no_unauthorized_dispatch_satisfied(&[
+            make_summary("run_claude_pilot", "", true)
+        ]));
+        // Successful run_claude_pilot_groom → also unauthorized → NOT satisfied.
+        assert!(!webhook_no_unauthorized_dispatch_satisfied(&[
+            make_summary("run_claude_pilot_groom", "", true)
+        ]));
+        // Failed dispatch attempts don't count (engine guards block them upstream).
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot_groom",
+            "",
+            false
+        )]));
     }
 
     // -- detect_text_based_tool_call tests --

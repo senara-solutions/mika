@@ -1,0 +1,35 @@
+[
+  {
+    "name": "run_claude_pilot_groom",
+    "description": "Dispatch a headless Claude Code grooming session via claude-pilot. Runs the /mika-groom-ticket pipeline (two-pass mika-arch review → plan-on-branch). Long-running — returns a task ID immediately, results arrive via callback when Claude Code finishes.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "skill": {
+          "type": "string",
+          "enum": ["dev-groom"],
+          "description": "Must be 'dev-groom'. Field is required for engine dispatch-class derivation."
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Typed ticket reference (e.g., 'mika#214', 'mika-skills#8'). The handler derives the branch, creates a worktree, and runs /mika-groom-ticket."
+        },
+        "task_id": {
+          "type": "string",
+          "description": "The UUID returned by create_task (36-char format like '15383984-a3e7-41bf-ac6f-630ba9a89d63'). Used for log filename and task correlation at /var/log/claude-pilot/{task_id}.log."
+        },
+        "iteration_context": {
+          "type": "string",
+          "description": "Iteration feedback for an existing grooming session. When present, appended to the prompt so the pipeline addresses specific feedback rather than starting from scratch."
+        }
+      },
+      "required": ["skill", "prompt", "task_id"]
+    },
+    "handler": {
+      "type": "exec",
+      "command": "handlers/run.sh",
+      "long_running": true,
+      "estimated_duration_secs": 7200
+    }
+  }
+]

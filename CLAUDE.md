@@ -252,7 +252,7 @@ skills/bundled/
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
 ├── self-dev-webhook-ready-label/ # Ready-label dispatch handler for GitHub issue labeled ready (#1106)
 ├── dev-pilot/             # Claude Code implementation dispatch (thin wrapper → _shared/dispatch-lib.sh, entry: /mika)
-├── dev-groom/             # Two-pass grooming dispatch — operator or autonomous (prompt-only sibling — host: dev-pilot via run_claude_pilot, entry: /mika-groom-ticket)
+├── dev-groom/             # Two-pass grooming dispatch — operator or autonomous (own tool: run_claude_pilot_groom, entry: /mika-groom-ticket; mika#1173)
 ├── qa-review/             # PR review skill
 ├── qa-review-build-callback/ # Build callback handler for QA review
 ├── permission-policy/     # Permission handler for claude-pilot sessions
@@ -289,7 +289,7 @@ Skills are loaded at runtime from this generated constant — no filesystem acce
    ```
 3. Add `system_prompt.md` with the skill's system prompt
 4. **Add to well-known agent allowlists** — all four well-known agents use identity-driven `[skills].allowlist` in their identity templates (`well_known_agents.rs`). New bundled skills are **denied by default** unless explicitly added to an agent's allowlist. Add the skill name to each agent's identity const that should have access:
-   - `MIKA_DEV_IDENTITY` (25 skills) — development workflow skills
+   - `MIKA_DEV_IDENTITY` (26 skills) — development workflow skills
    - `MIKA_QA_IDENTITY` (17 skills) — review and quality skills
    - `MIKA_RELAY_IDENTITY` (1 skill) — only `permission-policy`; rarely needs new skills
    - `MIKA_ARCH` uses a computed identity via `build_mika_arch_identity()` (3 skills) — read-only review skills only

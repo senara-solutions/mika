@@ -2006,7 +2006,7 @@ mod tests {
                     "properties": {
                         "skill": {
                             "type": "string",
-                            "enum": ["dev-pilot", "dev-groom"]
+                            "enum": ["dev-pilot"]
                         },
                         "prompt": { "type": "string" },
                         "task_id": { "type": "string" }
@@ -2033,7 +2033,6 @@ mod tests {
         assert!(output.content.contains("missing_required_field"));
         assert!(output.content.contains("skill"));
         assert!(output.content.contains("dev-pilot"));
-        assert!(output.content.contains("dev-groom"));
     }
 
     #[test]
@@ -2201,7 +2200,7 @@ mod tests {
                     "properties": {
                         "skill": {
                             "type": "string",
-                            "enum": ["dev-pilot", "dev-groom"]
+                            "enum": ["dev-pilot"]
                         },
                         "prompt": { "type": "string" },
                         "task_id": { "type": "string" }
