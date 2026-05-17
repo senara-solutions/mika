@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::init::{self, AppContext};
 use crate::tui::app::{
-    AgentRequest, AgentResponse, App, ChatMessage, ChatRole, TeamRequest,
+    AgentRequest, AgentResponse, AgentStatus, App, ChatMessage, ChatRole, TeamRequest,
     session_message_to_chat_message,
 };
 use crate::tui::event::{AppEvent, EventReader};
@@ -707,8 +707,13 @@ pub async fn run(
             // `Ok(())` and trip the WorkerCrashed path (mika#1149).
             worker.shutdown_initiated.store(true, Ordering::Release);
 
-            // Abort the old poller and wait for the supervisor (and its worker) to
-            // stop, with a timeout in case the worker is mid-LLM-call.
+            // mika#1150 cohort: send Quit BEFORE aborting so the worker's
+            // post-loop `mcp.shutdown().await` runs on the common case
+            // (worker is healthy, just switching agents). Abort is the
+            // fallback if the worker is mid-LLM-call and the 2s drain
+            // window expires.
+            let _ = app.agent_tx.send(AgentRequest::Quit);
+
             worker.poller_handle.abort();
             let old_supervisor = std::mem::replace(
                 &mut worker.supervisor_handle,
@@ -721,7 +726,7 @@ pub async fn run(
                 tracing::warn!(
                     target_agent = %target_name,
                     "old agent worker did not shut down within 2s during agent switch; \
-                     supervisor task abandoned"
+                     supervisor task abandoned (mcp.shutdown handshake may have been skipped)"
                 );
             }
 
@@ -750,6 +755,14 @@ pub async fn run(
                             app.skills = new_skills;
                             app.agent_name = target_name.clone();
                             app.history = crate::tui::app::InputHistory::load(&app.home_dir);
+                            // mika#1150 cohort: the new worker is healthy by
+                            // construction; drop any residual lifecycle flags
+                            // from the agent we just left so the operator's
+                            // next /restart targets *this* agent rather than
+                            // restarting healthy-agent-B because A had crashed.
+                            app.worker_crashed = false;
+                            app.pending_restart = false;
+                            app.status = AgentStatus::Idle;
 
                             worker = new_worker;
 
