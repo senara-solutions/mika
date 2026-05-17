@@ -2093,11 +2093,88 @@ mod tests {
         );
     }
 
+    /// R2: with two implement deferred wrappers pending and the implement slot
+    /// idle, exactly one wrapper promotes per backstop tick. Pins the
+    /// at-most-one-per-class-per-tick invariant at the engine seam (the DB
+    /// primitive's `LIMIT 1` is verified separately by
+    /// `test_promote_next_deferred_callback_for_class_filters_by_class`).
+    #[tokio::test]
+    async fn test_promote_pending_deferred_if_idle_single_class_one_per_tick() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl_1) = seed_deferred_wrapper(&db, "p_impl_1", Some("implement")).await;
+        let (_, w_impl_2) = seed_deferred_wrapper(&db, "p_impl_2", Some("implement")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        // Exactly one wrapper must transition. Per-class tick budget is one
+        // promotion; FIFO at second-resolution timestamps is best-effort
+        // (correctness review C-01 — same-second wrappers tie-break by rowid),
+        // so we assert "one and only one" rather than locking the specific row.
+        let t1 = db.get_task(&w_impl_1).await.unwrap().unwrap();
+        let t2 = db.get_task(&w_impl_2).await.unwrap().unwrap();
+        let promoted = [&t1, &t2]
+            .iter()
+            .filter(|t| t.status == "completed")
+            .count();
+        let pending = [&t1, &t2].iter().filter(|t| t.status == "pending").count();
+        assert_eq!(
+            promoted, 1,
+            "exactly one same-class wrapper must promote per tick (mika#1175 R2); \
+             got promoted={promoted} pending={pending} t1={:?} t2={:?}",
+            t1.status, t2.status
+        );
+        assert_eq!(pending, 1, "the other wrapper must stay pending");
+
+        // A second tick promotes the remaining wrapper — confirms the loop
+        // is not somehow stuck after the first promotion.
+        engine.promote_pending_deferred_if_idle().await;
+        let t1 = db.get_task(&w_impl_1).await.unwrap().unwrap();
+        let t2 = db.get_task(&w_impl_2).await.unwrap().unwrap();
+        assert_eq!(t1.status, "completed");
+        assert_eq!(t2.status, "completed");
+    }
+
+    /// R4: with one implement + one groom deferred wrapper pending and BOTH
+    /// class slots occupied, no wrapper promotes. Exercises the double-`continue`
+    /// path through the per-class loop.
+    #[tokio::test]
+    async fn test_promote_pending_deferred_if_idle_both_classes_busy() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        let (_, w_groom) = seed_deferred_wrapper(&db, "p_groom", Some("groom")).await;
+        seed_active_non_deferred(&db, "p_busy_impl", Some("implement")).await;
+        seed_active_non_deferred(&db, "p_busy_groom", Some("groom")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        assert_eq!(
+            db.get_task(&w_impl).await.unwrap().unwrap().status,
+            "pending",
+            "implement wrapper must NOT promote when implement slot is busy (mika#1175 R4)"
+        );
+        assert_eq!(
+            db.get_task(&w_groom).await.unwrap().unwrap().status,
+            "pending",
+            "groom wrapper must NOT promote when groom slot is busy (mika#1175 R4)"
+        );
+    }
+
     /// Drift detector for the `DISPATCH_CLASSES` slice. Every value returned by
     /// `derive_dispatch_class` for the currently-known skills must be in
     /// `DISPATCH_CLASSES`. If a new class is added to `derive_dispatch_class`
     /// (e.g., a third skill maps to a new class), this test surfaces the gap
     /// before the periodic backstop silently loses promotion for that class.
+    ///
+    /// COUPLED PAIR (mika#1175): the probe list below is hand-maintained. When
+    /// adding a new arm to `derive_dispatch_class`, also add a representative
+    /// skill input here. The cross-pointer at the match site in
+    /// `skills/executor.rs` names this test as the required co-update.
     #[test]
     fn test_dispatch_classes_universe_matches_derive_fn() {
         use crate::skills::executor::derive_dispatch_class;

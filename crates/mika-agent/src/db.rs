@@ -5969,8 +5969,12 @@ impl Database {
     }
 
     /// Returns true if any non-deferred callback task is in pending or in_progress
-    /// status (i.e., a dispatch slot is occupied). Used by the engine-level
-    /// deferred-dispatch backstop (mika#1070).
+    /// status (i.e., a dispatch slot is occupied). Was used by the engine-level
+    /// deferred-dispatch backstop (mika#1070). Post-mika#1175, the engine
+    /// backstop calls `has_any_active_callback_for_class` per-class; this
+    /// agent-wide form has no remaining production callers and is retained as
+    /// a regression-test baseline + as a sibling reference for the class-scoped
+    /// shape. See `has_any_active_callback_for_class` for production usage.
     pub fn has_any_active_callback(&self, agent_id: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
