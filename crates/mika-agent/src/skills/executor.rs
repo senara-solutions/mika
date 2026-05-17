@@ -4113,6 +4113,126 @@ mod tests {
         );
     }
 
+    /// Helper: create a deferred-wrapper callback child (mika#1163 regression coverage).
+    /// Mirrors `register_deferred_callback`'s output shape — label suffix `:deferred`,
+    /// trigger_type=`callback`, action_type=`resume_agent`, dispatch_class as supplied.
+    async fn create_deferred_wrapper_child(
+        db: &crate::async_db::AsyncDatabase,
+        parent_id: &str,
+        dispatch_class: Option<&str>,
+    ) -> String {
+        use crate::db::NewTask;
+        use crate::task_engine::types::{action_type, trigger_type};
+
+        let task = NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 0,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        db.create_task(task).await.unwrap()
+    }
+
+    /// mika#1163 — Per-class slot guard MUST NOT block on pending deferred wrappers.
+    ///
+    /// Reproduces the multi-wrapper deadlock observed 2026-05-17: when two parents
+    /// each hold a pending `:deferred` wrapper, the per-class predicate (used by
+    /// `validate_dispatch_readiness`) used to see the OTHER parent's wrapper as an
+    /// active dispatch and register yet another wrapper. With the fix in place,
+    /// neither wrapper blocks the other; only real (non-deferred) callbacks count
+    /// as slot-occupying.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_does_not_block_on_deferred_wrappers() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // Two in-progress parents, each with a pending `:deferred` wrapper.
+        let parent_a = create_task_with_status(&async_db, "in_progress").await;
+        let parent_b = create_task_with_status(&async_db, "in_progress").await;
+        create_deferred_wrapper_child(&async_db, &parent_a, Some("implement")).await;
+        create_deferred_wrapper_child(&async_db, &parent_b, Some("implement")).await;
+
+        // A's dispatch attempt: must NOT see B's wrapper as an active dispatch.
+        let result = async_db
+            .has_active_callback_tasks_excluding(&parent_a, "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "Parent A's dispatch must not be blocked by Parent B's pending deferred wrapper \
+             (mika#1163 deadlock — wrappers are pending markers, not active dispatches)"
+        );
+
+        // Symmetric: B's dispatch attempt must not see A's wrapper either.
+        let result = async_db
+            .has_active_callback_tasks_excluding(&parent_b, "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "Parent B's dispatch must not be blocked by Parent A's pending deferred wrapper"
+        );
+
+        // Add Parent C with a REAL (non-deferred) pending callback. This IS an
+        // active dispatch and MUST still be detected — exclusion is narrowly
+        // scoped to `:deferred` rows.
+        let parent_c = create_task_with_status(&async_db, "in_progress").await;
+        let real_c =
+            create_callback_child_with_class(&async_db, &parent_c, "pending", "implement").await;
+
+        // Parent A's dispatch attempt now: should be blocked by C's real callback,
+        // not by B's wrapper.
+        let result = async_db
+            .has_active_callback_tasks_excluding(&parent_a, "implement")
+            .await
+            .unwrap();
+        let (blocking_parent, blocking_callback) = result.expect(
+            "real pending callback MUST still block — only :deferred wrappers are excluded",
+        );
+        assert_eq!(blocking_parent, parent_c, "real dispatch is the blocker");
+        assert_eq!(blocking_callback, real_c);
+    }
+
+    /// mika#1163 — Pre-v34 NULL dispatch_class deferred wrapper must also be
+    /// excluded from the slot check. COALESCE+label clauses both apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_ignores_null_class_deferred_wrapper() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let parent_a = create_task_with_status(&async_db, "in_progress").await;
+        // dispatch_class=None → COALESCE → 'implement' for the slot query
+        create_deferred_wrapper_child(&async_db, &parent_a, None).await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "Pre-v34 NULL-class deferred wrapper must be excluded — the :deferred \
+             filter runs alongside the COALESCE class match"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_derive_dispatch_class_values() {
         assert_eq!(derive_dispatch_class(Some("dev-groom")), "groom");
