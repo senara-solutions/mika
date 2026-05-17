@@ -1617,16 +1617,7 @@ fn parse_file_view_response(body: &str, args: &GhReadArgs) -> Result<String, GhR
 
 /// Allowed top-level `gh` subcommands.
 const GH_ALLOWED_SUBCOMMANDS: &[&str] = &[
-    "pr",
-    "issue",
-    "run",
-    "workflow",
-    "release",
-    "repo",
-    "search",
-    "label",
-    "milestone",
-    "project",
+    "pr", "issue", "run", "workflow", "release", "repo", "search", "label", "api",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1800,6 +1791,25 @@ fn validate_gh_input(input: &serde_json::Value) -> Result<GhArgs, ToolOutput> {
     Ok(GhArgs { args, repo })
 }
 
+/// Extract the HTTP method from a `gh api` argv.
+///
+/// Scans for `--method X` or `--method=X` (also `-X` shorthand). Defaults to `"GET"`
+/// (matches `gh` default behavior when `--method` is absent).
+fn extract_api_method(args: &[String]) -> &str {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if (arg == "--method" || arg == "-X")
+            && let Some(val) = iter.next()
+        {
+            return val.as_str();
+        }
+        if let Some(val) = arg.strip_prefix("--method=") {
+            return val;
+        }
+    }
+    "GET"
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -1872,6 +1882,24 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
                 .store(true, std::sync::atomic::Ordering::Release);
             return err;
         }
+    }
+
+    // Audit event for `gh api` invocations — structural observability for the
+    // expanded security surface (mika#788, engine-guards-vs-prompt-rules principle).
+    if gh_args.args.first().map(|s| s.as_str()) == Some("api") {
+        let method = extract_api_method(&gh_args.args);
+        let path = gh_args
+            .args
+            .get(1)
+            .map(|s| s.as_str())
+            .unwrap_or("<missing>");
+        tracing::info!(
+            event = "gh_api_invocation",
+            session_id = %ctx.session_id,
+            method = %method,
+            path = %path,
+            "gh api invocation"
+        );
     }
 
     let mut cmd = tokio::process::Command::new("gh");
@@ -2682,21 +2710,67 @@ mod tests {
     #[test]
     fn test_run_gh_allowlist_accepts_valid() {
         for sub in &[
-            "pr",
-            "issue",
-            "run",
-            "workflow",
-            "release",
-            "repo",
-            "search",
-            "label",
-            "milestone",
-            "project",
+            "pr", "issue", "run", "workflow", "release", "repo", "search", "label", "api",
         ] {
             let input = serde_json::json!({"command": [sub, "list"]});
             let result = validate_gh_input(&input);
             assert!(result.is_ok(), "subcommand '{sub}' should be allowed");
         }
+    }
+
+    #[test]
+    fn test_run_gh_allowlist_rejects_removed_subcommands() {
+        for sub in &["milestone", "project"] {
+            let input = serde_json::json!({"command": [sub, "list"]});
+            let result = validate_gh_input(&input);
+            assert!(result.is_err(), "subcommand '{sub}' should NOT be allowed");
+            let err = result.unwrap_err();
+            assert!(
+                err.content.contains("is not allowed"),
+                "error for '{sub}' should mention 'is not allowed', got: {}",
+                err.content
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_gh_allowlist_accepts_api() {
+        let input = serde_json::json!({
+            "command": ["api", "/repos/owner/repo/milestones/1", "--method", "PATCH", "-f", "state=closed"]
+        });
+        let result = validate_gh_input(&input);
+        assert!(result.is_ok(), "gh api should be allowed");
+    }
+
+    #[test]
+    fn test_extract_api_method() {
+        // --method X form
+        let args: Vec<String> = vec!["api", "/repos/o/r/milestones/1", "--method", "PATCH"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(extract_api_method(&args), "PATCH");
+
+        // --method=X form
+        let args: Vec<String> = vec!["api", "/repos/o/r/milestones/1", "--method=DELETE"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(extract_api_method(&args), "DELETE");
+
+        // -X shorthand
+        let args: Vec<String> = vec!["api", "/repos/o/r/milestones/1", "-X", "POST"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(extract_api_method(&args), "POST");
+
+        // Default to GET when absent
+        let args: Vec<String> = vec!["api", "/repos/o/r/milestones/1"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(extract_api_method(&args), "GET");
     }
 
     #[test]
