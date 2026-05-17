@@ -1,6 +1,7 @@
 ---
 title: "Deferred-dispatch wrappers fail to promote after blocking dispatch completes (autonomous loop deadlock)"
 date: 2026-05-10
+last_updated: 2026-05-17
 category: logic-errors
 module: task-engine
 problem_type: logic_error
@@ -10,6 +11,7 @@ symptoms:
   - "Deferred wrappers stay pending indefinitely despite blocking callbacks reaching delivered status"
   - "pgrep -af claude-pilot returns empty — no subprocess spawns for deferred wrappers"
   - "mika-dev reports deferred dispatch fired but DB state shows wrappers still pending"
+  - "After cancelling a stuck parent task, deferred sibling tickets never promote — they cycle citing each other's callback IDs every ~60s (mika#1163)"
 root_cause: logic_error
 resolution_type: code_fix
 severity: critical
@@ -20,6 +22,7 @@ tags:
   - deadlock
   - task-engine
   - agent-busy
+  - asymmetric-perimeter
 ---
 
 # Deferred-dispatch wrappers fail to promote after blocking dispatch completes
@@ -112,3 +115,56 @@ Three defects formed a gap with no recovery path:
 - mika#991 — PostCallbackAdvance backstop pattern (same structural approach)
 - `docs/solutions/logic-errors/callback-deferred-dispatch-gate-rejection-2026-05-10.md` — predecessor fix for executor gate
 - `docs/solutions/best-practices/callback-advance-2026-05-06.md` — engine-level promotion pattern
+
+---
+
+## Update 2026-05-17 (mika#1163) — Fourth structural defect: asymmetric `:deferred` exclusion
+
+The 2026-05-10 fix shipped three structural changes. A fourth defect remained — same domain, different surface — and re-deadlocked the queue on 2026-05-17 with three ready-labeled tickets (mika#1155, mika#797, mika#859) wedged after operator cancelled mika#1158's stuck parent at 23:43Z.
+
+### What was missing
+
+`has_any_active_callback` (the engine-side backstop predicate at `crates/mika-agent/src/db.rs:5839`) was correctly fixed in mika#1070 to exclude `:deferred` wrappers via `AND label NOT LIKE '%:deferred'`. Its sibling `has_active_callback_tasks_excluding` (the tool-boundary per-class slot guard at `crates/mika-agent/src/db.rs:5752`) was NOT updated — it kept counting pending deferred wrappers as "active dispatches".
+
+This is an **asymmetric perimeter** failure: two predicates encoding the same concept ("is the dispatch slot occupied?") for two different consumers (engine backstop in `engine.rs:423` vs. tool-boundary gate in `executor.rs:946`). When their inclusion sets diverged, the system entered a state where:
+
+1. Backstop correctly saw slot-idle (zero non-deferred callbacks) and promoted a wrapper to `completed`.
+2. Promoted wrapper dispatched as `SilentTrigger::DeferredDispatch` turn.
+3. The turn's LLM called `run_claude_pilot`.
+4. `validate_dispatch_readiness` → `has_active_callback_tasks_excluding(parent, 'implement')` saw **other parents' pending deferred wrappers** and rejected with `global_dispatch_active`.
+5. `register_deferred_callback` re-created ANOTHER pending wrapper. Net real dispatches: zero. Cycle repeats every 60s.
+
+The mika#1124 anti-cascade guard at `dispatcher.rs:495` did not help — that guard governs the INLINE chain-promotion path, not the tool-boundary gate. With the guard active, the periodic backstop becomes the sole promotion driver, and the gate undid the backstop's work every cycle.
+
+### Fix
+
+One SQL clause added to `has_active_callback_tasks_excluding`:
+
+```sql
+SELECT parent_task_id, id FROM tasks
+WHERE trigger_type = 'callback'
+  AND status IN ('pending', 'in_progress')
+  AND parent_task_id IS NOT NULL
+  AND parent_task_id != ?1
+  AND agent_id = ?2
+  AND COALESCE(dispatch_class, 'implement') = ?3
+  AND label NOT LIKE '%:deferred'   -- NEW (mika#1163)
+LIMIT 1
+```
+
+Mirrors the sibling clause verbatim. Now both predicates agree: deferred wrappers are pending markers awaiting promotion, not active dispatches occupying a slot.
+
+### Why prior reviews missed it
+
+mika#1011 (initial deferred-dispatch primitive), mika#1058 (LongRunningContext wiring), mika#1070 (the three-defect fix), and mika#1124 (re-added inline anti-cascade guard) all reasoned about the engine-side promotion path. The tool-boundary gate's slot predicate was treated as orthogonal infrastructure (per-class slot split was mika#1001's concern). No prior fix touched both predicates in the same change, and no test pinned predicate parity. The bug only manifested when ≥2 parents held pending wrappers simultaneously — a state mika#1070's testing didn't construct.
+
+### Prevention pattern
+
+This is the third documented instance of "asymmetric perimeter predicate drift" (after mika#910's webhook-guard pair). The pattern and its mitigations are now captured in `docs/solutions/architecture-patterns/asymmetric-perimeter-predicate-drift.md`. Key takeaway: when two predicates encode the same concept for two different consumers, treat them as a coupled pair — share a function or pin their parity with a structural test.
+
+### Related (added 2026-05-17)
+
+- mika#1163 — this update's ticket
+- `docs/solutions/architecture-patterns/asymmetric-perimeter-predicate-drift.md` — generalized pattern
+- mika#1124 — re-added inline anti-cascade guard (orthogonal to this fix; both stay in place)
+- mika#1162 — parent task auto-transition (separate ticket; not implicated in #1163)

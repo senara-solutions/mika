@@ -5749,6 +5749,14 @@ impl Database {
     ///
     /// Pre-v34 rows with `dispatch_class IS NULL` are treated as `'implement'` via
     /// `COALESCE` — no application-layer NULL coercion needed (architect NF1).
+    ///
+    /// mika#1163: Excludes `:deferred` wrappers via `label NOT LIKE '%:deferred'`.
+    /// Deferred wrappers are pending markers waiting for promotion, NOT active
+    /// dispatches occupying a slot. Without this exclusion, two parents each
+    /// holding a pending wrapper deadlock — every dispatch attempt from one
+    /// wrapper sees the OTHER as slot-occupied and registers yet another
+    /// wrapper. Mirrors the equivalent clause in `has_any_active_callback`
+    /// (mika#1070), which the engine-level promotion backstop uses.
     pub fn has_active_callback_tasks_excluding(
         &self,
         excluded_parent_id: &str,
@@ -5763,6 +5771,7 @@ impl Database {
                AND parent_task_id != ?1
                AND agent_id = ?2
                AND COALESCE(dispatch_class, 'implement') = ?3
+               AND label NOT LIKE '%:deferred'
              LIMIT 1",
         )?;
         let mut rows = stmt.query(params![excluded_parent_id, agent_id, dispatch_class])?;
@@ -15929,6 +15938,145 @@ mod tests {
         assert!(
             !db.has_any_active_callback("mika").unwrap(),
             "delivered callback should not count as active"
+        );
+    }
+
+    /// mika#1163 — Regression test: `has_active_callback_tasks_excluding` must
+    /// exclude `:deferred` wrappers when looking for "slot occupied" evidence.
+    ///
+    /// The sibling predicate `has_any_active_callback` (mika#1070) already
+    /// excludes `:deferred` rows; this test pins the same semantics on the
+    /// per-class slot predicate used by `validate_dispatch_readiness`. Without
+    /// the `label NOT LIKE '%:deferred'` clause, two parents each holding a
+    /// pending deferred wrapper deadlock: every dispatch attempt from one
+    /// wrapper sees the OTHER wrapper as an active dispatch, so neither ever
+    /// promotes through `run_claude_pilot`.
+    #[test]
+    fn test_has_active_callback_tasks_excluding_ignores_deferred_wrappers() {
+        let db = db();
+
+        // Parent A with one pending deferred wrapper as a callback child.
+        let p_a = db
+            .create_task(&new_task("mika", "host_a", "manual", "none"))
+            .unwrap();
+        let mut w_a = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        w_a.parent_task_id = Some(p_a.clone());
+        db.create_task(&w_a).unwrap();
+
+        // Querying for any other parent: a `:deferred` wrapper is NOT an
+        // active dispatch, so the predicate must return None.
+        let result = db
+            .has_active_callback_tasks_excluding("other-task", "mika", "implement")
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "pending :deferred wrapper must not count as an active dispatch \
+             (mika#1163 — was previously detected as slot-occupied, deadlocking \
+             every cross-parent dispatch attempt)"
+        );
+
+        // Add Parent B with a REAL (non-deferred) pending callback. This IS
+        // an active dispatch and MUST be detected.
+        let p_b = db
+            .create_task(&new_task("mika", "host_b", "manual", "none"))
+            .unwrap();
+        let mut real_b = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        real_b.parent_task_id = Some(p_b.clone());
+        let real_b_id = db.create_task(&real_b).unwrap();
+
+        // Querying from a third parent: should find Parent B's real callback,
+        // proving the exclusion is wrapper-only, not blanket.
+        let result = db
+            .has_active_callback_tasks_excluding("other-task", "mika", "implement")
+            .unwrap();
+        let (parent_id, callback_id) = result.expect(
+            "real (non-deferred) pending callback MUST still be detected as an \
+             active dispatch — exclusion is narrowly scoped to :deferred wrappers",
+        );
+        assert_eq!(parent_id, p_b, "should match Parent B (the real dispatch)");
+        assert_eq!(callback_id, real_b_id);
+
+        // Mixed-state: querying from Parent B itself excludes B's own callback
+        // via the parent_task_id != ?1 clause, and the only remaining row is
+        // A's deferred wrapper. Result must be None.
+        let result = db
+            .has_active_callback_tasks_excluding(&p_b, "mika", "implement")
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "Parent B's query: own callback excluded by parent filter, A's \
+             wrapper excluded by :deferred filter — no blocking dispatch"
+        );
+
+        // Suffix-anchor pin: the `%:deferred` LIKE pattern matches END of the
+        // label, not arbitrary substring. A hypothetical future label that
+        // contains `:deferred` mid-string (e.g., `:deferred:retry`) is NOT
+        // excluded by the wildcard — it would be counted as an active
+        // dispatch. This pins the convention so a refactor that shifts the
+        // suffix convention has to update the SQL clause deliberately.
+        let p_d = db
+            .create_task(&new_task("mika", "host_d", "manual", "none"))
+            .unwrap();
+        let mut suffix_variant = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred:retry",
+            "callback",
+            "resume_agent",
+        );
+        suffix_variant.parent_task_id = Some(p_d.clone());
+        let suffix_variant_id = db.create_task(&suffix_variant).unwrap();
+        // Delete the existing real callback for Parent B so this assertion
+        // can isolate the suffix-variant row's behavior.
+        db.cancel_task(&real_b_id, "mika").unwrap();
+        let result = db
+            .has_active_callback_tasks_excluding("other-task", "mika", "implement")
+            .unwrap();
+        let (parent_id, callback_id) = result.expect(
+            "label `:deferred:retry` is NOT a suffix match for `%:deferred` — \
+             must still be counted as an active dispatch",
+        );
+        assert_eq!(parent_id, p_d, "suffix-variant row should be the blocker");
+        assert_eq!(callback_id, suffix_variant_id);
+
+        // Forward-compat for in_progress deferred wrappers: today no code path
+        // sets a `:deferred` row to `in_progress`, but the SQL `status IN
+        // ('pending', 'in_progress')` clause catches both. Verify the
+        // exclusion also holds for in_progress wrappers so a future code path
+        // that flips a wrapper to in_progress doesn't accidentally reintroduce
+        // the deadlock.
+        db.update_task_status(&suffix_variant_id, "cancelled")
+            .unwrap(); // clean up suffix-variant first
+        let p_e = db
+            .create_task(&new_task("mika", "host_e", "manual", "none"))
+            .unwrap();
+        let mut deferred_in_progress = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        deferred_in_progress.parent_task_id = Some(p_e.clone());
+        let dip_id = db.create_task(&deferred_in_progress).unwrap();
+        db.update_task_status(&dip_id, "in_progress").unwrap();
+        let result = db
+            .has_active_callback_tasks_excluding("other-task", "mika", "implement")
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "in_progress :deferred wrapper must also be excluded (forward-compat \
+             — today no code path sets a wrapper to in_progress, but the SQL \
+             status filter covers both pending+in_progress, so the exclusion \
+             contract must hold for both)"
         );
     }
 
