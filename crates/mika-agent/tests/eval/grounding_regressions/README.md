@@ -53,18 +53,18 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 8b. asserted_unavailability_elided_skill_scoped | | V | | | `unavailability-asserted-without-attempt` (failure), `verification-before-claim` |
 | 8c. asserted_unavailability_adverb_interposed | | V | | | `unavailability-asserted-without-attempt` (failure), `verification-before-claim` |
 | 9. quoted_resource_pre_fetch (caught) | | V | | | `pre-fetch-required-when-quoted`, `verification-before-claim` |
-| 9. quoted_resource_pre_fetch (no-op) | | V | | | `pre-fetch-required-when-quoted` |
-| 10. quoted_resource_pre_fetch (mixed) | | V | | | `pre-fetch-required-when-quoted` |
-| 11. required_suffix_line_caught | | | | V | `verdict-suffix-required-but-ghosted` (failure), `verdict-suffix-emitted` |
-| 12. required_suffix_line_caught (pre-fix) | | | | | `verdict-suffix-required-but-ghosted` (failure) |
-| 13. required_suffix_line_position_3 | | | | | `verdict-suffix-emitted` |
-| 14. required_suffix_line_position_4 | | | | V | `verdict-suffix-required-but-ghosted` (failure), `verdict-suffix-emitted` |
-| 15. required_suffix_line_unconstrained | | | | | `verdict-suffix-not-required` |
-| 16. required_tools_retry_thin_final_turn (regression) | | | | | `transport-contract-thin-final-turn` (failure) |
-| 17. required_tools_retry_thin_final_turn (post-fix) | | | V | V | `transport-contract-self-contained` |
-| 18. required_tools_retry_thin_final_turn (correction msg) | | | | | `transport-contract-self-contained` |
-| 19. qa_review_per_element_enumeration | | | | V | `per-element-enumeration-correct`, `aggregate-claim-suppressed` |
-| 20. qa_review_absence_claim_grounded | | | | V | `absence-claim-grounded`, `absence-claimed-without-evidence` (failure) |
+| 10. quoted_resource_pre_fetch (no-op) | | V | | | `pre-fetch-required-when-quoted` |
+| 11. quoted_resource_pre_fetch (mixed) | | V | | | `pre-fetch-required-when-quoted` |
+| 12. required_suffix_line_caught | | | | V | `verdict-suffix-required-but-ghosted` (failure), `verdict-suffix-emitted` |
+| 13. required_suffix_line_caught (pre-fix) | | | | | `verdict-suffix-required-but-ghosted` (failure) |
+| 14. required_suffix_line_position_3 | | | | | `verdict-suffix-emitted` |
+| 15. required_suffix_line_position_4 | | | | V | `verdict-suffix-required-but-ghosted` (failure), `verdict-suffix-emitted` |
+| 16. required_suffix_line_unconstrained | | | | | `verdict-suffix-not-required` |
+| 17. required_tools_retry_thin_final_turn (regression) | | | | | `transport-contract-thin-final-turn` (failure) |
+| 18. required_tools_retry_thin_final_turn (post-fix) | | | V | V | `transport-contract-self-contained` |
+| 19. required_tools_retry_thin_final_turn (correction msg) | | | | | `transport-contract-self-contained` |
+| 20. qa_review_per_element_enumeration | | | | V | `per-element-enumeration-correct`, `aggregate-claim-suppressed` |
+| 21. qa_review_absence_claim_grounded | | | | V | `absence-claim-grounded`, `absence-claimed-without-evidence` (failure) |
 
 *Scenario 4 accepts either a verification tool call OR a question mark in response (asking for evidence).
 
@@ -81,10 +81,10 @@ Scenario 5 sits on the boundary — it uses `#740`'s KG fixture helpers but tags
 | 7. asserted_unavailability_genuine | V | - | - |
 | 8a-c. asserted_unavailability_elided_copula | V | - | - |
 | 9-11. quoted_resource_pre_fetch | V | - | - |
-| 11-15. required_suffix_line | V | - | - |
-| 16-18. required_tools_retry_thin_final_turn | V | - | - |
-| 19. qa_review_per_element_enumeration | V | - | - |
-| 20. qa_review_absence_claim_grounded | V | - | - |
+| 12-16. required_suffix_line | V | - | - |
+| 17-19. required_tools_retry_thin_final_turn | V | - | - |
+| 20. qa_review_per_element_enumeration | V | - | - |
+| 21. qa_review_absence_claim_grounded | V | - | - |
 
 ## Frozen Regression Fixtures
 
@@ -102,10 +102,10 @@ Each scenario has a `fixtures/{scenario}_pre_fix.json` file containing the pre-f
 | 8b | `asserted_unavailability_elided_skill_scoped_pre_fix.json` | mika#654 (variant) |
 | 8c | `asserted_unavailability_adverb_interposed_pre_fix.json` | mika#863 (variant) |
 | 9 | `quoted_resource_pre_fetch_pre_fix.json` | mika#788 |
-| 11 | `required_suffix_line_caught_pre_fix.json` | mika#788 (verdict ghost) |
-| 16 | `required_tools_retry_thin_final_turn_pre_fix.json` | mika#890 (thin final turn) |
-| 19 | `qa_review_per_element_enumeration_pre_fix.json` | mika-skills#159 (aggregate claim) |
-| 20 | `qa_review_absence_claim_grounded_pre_fix.json` | mika-skills#159 (ungrounded absence) |
+| 12 | `required_suffix_line_caught_pre_fix.json` | mika#788 (verdict ghost) |
+| 17 | `required_tools_retry_thin_final_turn_pre_fix.json` | mika#890 (thin final turn) |
+| 20 | `qa_review_per_element_enumeration_pre_fix.json` | mika-skills#159 (aggregate claim) |
+| 21 | `qa_review_absence_claim_grounded_pre_fix.json` | mika-skills#159 (ungrounded absence) |
 
 ## Adding a New Scenario
 
