@@ -38,8 +38,10 @@ pub struct IngestStats {
     pub docs_skipped_unchanged: usize,
     pub docs_ingested: usize,
     pub docs_pruned: usize,
+    pub docs_index_backfilled: usize,
     pub chunks_added: usize,
     pub chunks_deleted: usize,
+    pub chunks_indexed_backfill: usize,
     pub duration_ms: u64,
 }
 
@@ -49,6 +51,7 @@ pub struct DocStats {
     pub outcome: DocOutcome,
     pub chunks_added: usize,
     pub chunks_deleted: usize,
+    pub chunks_indexed_backfill: usize,
 }
 
 /// Outcome of ingesting a single document.
@@ -60,6 +63,8 @@ pub enum DocOutcome {
     Ingested,
     /// Doc was pruned (no longer on disk).
     Pruned,
+    /// Doc was unchanged but per-agent search index was missing — backfilled.
+    IndexBackfilled,
 }
 
 /// Session ID sentinel for audit events emitted during startup ingestion.
@@ -136,8 +141,10 @@ impl LexicalIngestor {
             docs_skipped_unchanged: 0,
             docs_ingested: 0,
             docs_pruned: 0,
+            docs_index_backfilled: 0,
             chunks_added: 0,
             chunks_deleted: 0,
+            chunks_indexed_backfill: 0,
             duration_ms: 0,
         };
 
@@ -162,6 +169,10 @@ impl LexicalIngestor {
                         DocOutcome::Pruned => {
                             stats.docs_pruned += 1;
                             stats.chunks_deleted += doc_stats.chunks_deleted;
+                        }
+                        DocOutcome::IndexBackfilled => {
+                            stats.docs_index_backfilled += 1;
+                            stats.chunks_indexed_backfill += doc_stats.chunks_indexed_backfill;
                         }
                     }
                 }
@@ -207,8 +218,10 @@ impl LexicalIngestor {
             docs_skipped = stats.docs_skipped_unchanged,
             docs_ingested = stats.docs_ingested,
             docs_pruned = stats.docs_pruned,
+            docs_index_backfilled = stats.docs_index_backfilled,
             chunks_added = stats.chunks_added,
             chunks_deleted = stats.chunks_deleted,
+            chunks_indexed_backfill = stats.chunks_indexed_backfill,
             duration_ms = stats.duration_ms,
             event = "lexical_ingest_complete",
         );
@@ -248,6 +261,7 @@ impl LexicalIngestor {
                 outcome: DocOutcome::Skipped,
                 chunks_added: 0,
                 chunks_deleted,
+                chunks_indexed_backfill: 0,
             });
         }
 
@@ -263,7 +277,10 @@ impl LexicalIngestor {
 
         // Single with_db call: hash check + delete + insert are one transaction.
         // This eliminates the empty-window gap between delete and insert.
-        let (chunks_added, chunks_deleted, was_skipped) = self
+        //
+        // Returns: (chunks_added, chunks_deleted, outcome_kind, chunks_backfilled)
+        // where outcome_kind: 0=ingested, 1=skipped, 2=index_backfilled
+        let (chunks_added, chunks_deleted, outcome_kind, chunks_backfilled) = self
             .db
             .with_db(move |db| {
                 // 1. Hash check: is the doc unchanged?
@@ -280,9 +297,111 @@ impl LexicalIngestor {
                     .collect()
                 };
 
-                // Single matching hash → unchanged, skip.
+                // Single matching hash → unchanged. Check per-agent search index.
                 if existing_hashes.len() == 1 && existing_hashes[0] == new_hash_owned {
-                    return Ok((0usize, 0usize, true));
+                    // Two-axis idempotency: chunks are shared (docs_root_hash scope),
+                    // but search_content is per-agent. Check if this agent has
+                    // search_content rows for all existing chunks.
+                    //
+                    // kg_chunks has no `text` column — chunk text is only in
+                    // search_content.content. We use the in-memory chunker output
+                    // (deterministic for same content hash) paired with DB chunk IDs.
+                    let db_chunk_ids: Vec<i64> = {
+                        let mut stmt = db.conn.prepare(
+                            "SELECT id FROM kg_chunks
+                             WHERE docs_root_hash = ?1 AND source_doc_path = ?2
+                             ORDER BY seq_id",
+                        )?;
+                        stmt.query_map(
+                            rusqlite::params![docs_root_hash, rel_path_owned],
+                            |row| row.get(0),
+                        )?
+                        .filter_map(|r| r.ok())
+                        .collect()
+                    };
+
+                    // D3a: fail-loud on row-count mismatch between DB and in-memory chunker.
+                    // If they disagree, something is wrong (chunker version drift) —
+                    // fall through to the delete+insert path.
+                    if db_chunk_ids.len() != chunks.len() {
+                        warn!(
+                            trace_id = %trace_id,
+                            agent_id = %agent_id,
+                            doc = %rel_path_owned,
+                            db_count = db_chunk_ids.len(),
+                            memory_count = chunks.len(),
+                            event = "lexical_backfill_chunk_count_mismatch",
+                        );
+                        // Fall through to delete+insert path below.
+                    } else {
+                        // Find which chunks are missing from this agent's search_content.
+                        let missing_indices: Vec<usize> = if db_chunk_ids.is_empty() {
+                            Vec::new()
+                        } else {
+                            // Query agent's existing search_content source_ids for these chunks.
+                            let placeholders: String = db_chunk_ids
+                                .iter()
+                                .map(|_| "?")
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let sql = format!(
+                                "SELECT source_id FROM search_content
+                                 WHERE agent_id = ?1 AND source_type = ?2
+                                   AND source_id IN ({})",
+                                placeholders
+                            );
+                            let mut stmt = db.conn.prepare(&sql)?;
+                            // Bind agent_id and source_type, then chunk IDs.
+                            let mut param_idx = 1;
+                            stmt.raw_bind_parameter(param_idx, &agent_id)?;
+                            param_idx += 1;
+                            stmt.raw_bind_parameter(param_idx, KG_CHUNK_SOURCE_TYPE)?;
+                            param_idx += 1;
+                            for &cid in &db_chunk_ids {
+                                stmt.raw_bind_parameter(param_idx, cid)?;
+                                param_idx += 1;
+                            }
+                            let existing_ids: HashSet<i64> = {
+                                let mut rows = stmt.raw_query();
+                                let mut set = HashSet::new();
+                                while let Some(row) = rows.next()? {
+                                    let id: i64 = row.get(0)?;
+                                    set.insert(id);
+                                }
+                                set
+                            };
+
+                            db_chunk_ids
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, id)| !existing_ids.contains(id))
+                                .map(|(idx, _)| idx)
+                                .collect()
+                        };
+
+                        if missing_indices.is_empty() {
+                            // True no-op: chunks exist and agent has all search rows.
+                            return Ok((0usize, 0usize, 1u8, 0usize));
+                        }
+
+                        // Backfill: write missing search_content rows in a transaction.
+                        // Text comes from the in-memory chunker (deterministic for same hash).
+                        let backfill_count = missing_indices.len();
+                        let tx = db.conn.unchecked_transaction()?;
+                        for &idx in &missing_indices {
+                            let chunk_id = db_chunk_ids[idx];
+                            let text = &chunks[idx].text;
+                            db.index_content(
+                                &agent_id,
+                                KG_CHUNK_SOURCE_TYPE,
+                                Some(chunk_id),
+                                text,
+                            )?;
+                        }
+                        tx.commit()?;
+
+                        return Ok((0usize, 0usize, 2u8, backfill_count));
+                    }
                 }
 
                 // 2. Atomic delete + insert in one transaction.
@@ -350,23 +469,30 @@ impl LexicalIngestor {
                 }
 
                 tx.commit()?;
-                Ok((chunks.len(), deleted, false))
+                Ok((chunks.len(), deleted, 0u8, 0usize))
             })
             .await?;
 
-        if was_skipped {
-            return Ok(DocStats {
+        match outcome_kind {
+            1 => Ok(DocStats {
                 outcome: DocOutcome::Skipped,
                 chunks_added: 0,
                 chunks_deleted: 0,
-            });
+                chunks_indexed_backfill: 0,
+            }),
+            2 => Ok(DocStats {
+                outcome: DocOutcome::IndexBackfilled,
+                chunks_added: 0,
+                chunks_deleted: 0,
+                chunks_indexed_backfill: chunks_backfilled,
+            }),
+            _ => Ok(DocStats {
+                outcome: DocOutcome::Ingested,
+                chunks_added,
+                chunks_deleted,
+                chunks_indexed_backfill: 0,
+            }),
         }
-
-        Ok(DocStats {
-            outcome: DocOutcome::Ingested,
-            chunks_added,
-            chunks_deleted,
-        })
     }
 
     /// Delete all chunks for a document, including search_content cleanup.
@@ -449,6 +575,7 @@ impl LexicalIngestor {
                             outcome: DocOutcome::Pruned,
                             chunks_added: 0,
                             chunks_deleted: count,
+                            chunks_indexed_backfill: 0,
                         };
                         self.emit_audit_event(&path, &prune_stats).await;
                     }
@@ -475,11 +602,12 @@ impl LexicalIngestor {
             DocOutcome::Skipped => "skipped",
             DocOutcome::Ingested => "ingested",
             DocOutcome::Pruned => "pruned",
+            DocOutcome::IndexBackfilled => "index_backfilled",
         };
 
         let after_value = format!(
-            r#"{{"chunks_added":{},"chunks_deleted":{}}}"#,
-            doc_stats.chunks_added, doc_stats.chunks_deleted,
+            r#"{{"chunks_added":{},"chunks_deleted":{},"chunks_indexed_backfill":{}}}"#,
+            doc_stats.chunks_added, doc_stats.chunks_deleted, doc_stats.chunks_indexed_backfill,
         );
 
         let target_key = format!("kg_chunk:{rel_path}");
@@ -590,6 +718,9 @@ pub fn compute_hash(normalized: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_db::AsyncDatabase;
+    use crate::db::Database;
+    use crate::db::kg_schema::KG_CHUNK_SOURCE_TYPE;
 
     #[test]
     fn normalize_strips_bom() {
@@ -634,5 +765,348 @@ mod tests {
         let h1 = compute_hash("hello\n");
         let h2 = compute_hash("world\n");
         assert_ne!(h1, h2);
+    }
+
+    // -- Backfill tests (#1155) --
+
+    /// Helper: create a temp dir with a docs/solutions structure and a single .md file.
+    /// Returns (temp_dir_guard, docs_root_path).
+    fn setup_test_docs(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let docs_root = tmp.path().join("docs").join("solutions");
+        std::fs::create_dir_all(&docs_root).unwrap();
+        std::fs::write(docs_root.join("test-doc.md"), content).unwrap();
+        (tmp, docs_root)
+    }
+
+    /// Helper: count search_content rows for an agent + source_type using with_db.
+    async fn count_search_content_async(db: &AsyncDatabase, agent_id: &str) -> usize {
+        let agent_id = agent_id.to_owned();
+        db.with_db(move |db| {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM search_content WHERE agent_id = ?1 AND source_type = ?2",
+                    rusqlite::params![agent_id, KG_CHUNK_SOURCE_TYPE],
+                    |row| row.get::<_, usize>(0),
+                )
+                .map_err(Into::into)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Helper: ensure an agent exists in the agents table.
+    async fn ensure_agent_async(db: &AsyncDatabase, agent_id: &str) {
+        let agent_id = agent_id.to_owned();
+        db.with_db(move |db| {
+            db.conn
+                .execute(
+                    "INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES (?1, ?1, '')",
+                    rusqlite::params![agent_id],
+                )
+                .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Test 1: agent B ingests a doc after agent A already ingested it.
+    /// Agent B should get search_content rows via backfill.
+    #[tokio::test]
+    async fn backfill_when_second_agent_finds_chunks_already_indexed() {
+        let doc_content = "---\ntitle: Test\n---\n\n## Section One\n\nSome content here.\n\n## Section Two\n\nMore content here.\n";
+        let (_tmp, docs_root) = setup_test_docs(doc_content);
+
+        let tmp_db = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp_db.path()).unwrap();
+        let db_a = AsyncDatabase::new_with_agent(db, "agent-a");
+        ensure_agent_async(&db_a, "agent-a").await;
+        ensure_agent_async(&db_a, "agent-b").await;
+
+        // Agent A ingests first.
+        let ingestor_a = LexicalIngestor::new(db_a.clone(), docs_root.clone(), None);
+        let stats_a = ingestor_a.ingest_all().await.unwrap();
+        assert!(stats_a.docs_ingested > 0);
+        assert!(stats_a.chunks_added > 0);
+        let a_count = count_search_content_async(&db_a, "agent-a").await;
+        assert!(a_count > 0, "agent-a should have search_content rows");
+
+        // Agent B ingests — same docs_root → shared corpus, same DB connection.
+        let db_b = db_a.with_agent("agent-b");
+        let ingestor_b = LexicalIngestor::new(db_b.clone(), docs_root.clone(), None);
+        let stats_b = ingestor_b.ingest_all().await.unwrap();
+
+        // Agent B should see backfill, not fresh ingest.
+        assert_eq!(stats_b.docs_index_backfilled, 1);
+        assert_eq!(stats_b.docs_ingested, 0);
+        assert_eq!(stats_b.docs_skipped_unchanged, 0);
+        assert!(stats_b.chunks_indexed_backfill > 0);
+
+        let b_count = count_search_content_async(&db_b, "agent-b").await;
+        assert_eq!(
+            b_count, a_count,
+            "agent-b should have same count as agent-a"
+        );
+    }
+
+    /// Test 2: agent A re-ingests — should be a true no-op (Skipped).
+    #[tokio::test]
+    async fn no_backfill_when_agent_already_has_search_rows() {
+        let doc_content = "---\ntitle: Test\n---\n\n## Section\n\nContent.\n";
+        let (_tmp, docs_root) = setup_test_docs(doc_content);
+
+        let tmp_db = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp_db.path()).unwrap();
+        let async_db = AsyncDatabase::new_with_agent(db, "mika");
+
+        let ingestor = LexicalIngestor::new(async_db.clone(), docs_root.clone(), None);
+
+        // First ingest.
+        let stats1 = ingestor.ingest_all().await.unwrap();
+        assert!(stats1.docs_ingested > 0);
+
+        // Second ingest — true skip.
+        let stats2 = ingestor.ingest_all().await.unwrap();
+        assert_eq!(stats2.docs_skipped_unchanged, 1);
+        assert_eq!(stats2.docs_index_backfilled, 0);
+        assert_eq!(stats2.chunks_indexed_backfill, 0);
+    }
+
+    /// Test 3: agent B has a subset of chunks pre-seeded — only missing ones are backfilled.
+    #[tokio::test]
+    async fn partial_backfill_when_agent_has_subset_of_chunks() {
+        let doc_content = "---\ntitle: Test\n---\n\n## Section One\n\nContent one.\n\n## Section Two\n\nContent two.\n\n## Section Three\n\nContent three.\n";
+        let (_tmp, docs_root) = setup_test_docs(doc_content);
+
+        let tmp_db = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp_db.path()).unwrap();
+        let db_a = AsyncDatabase::new_with_agent(db, "agent-a");
+        ensure_agent_async(&db_a, "agent-a").await;
+        ensure_agent_async(&db_a, "agent-b").await;
+
+        // Agent A ingests first.
+        let ingestor_a = LexicalIngestor::new(db_a.clone(), docs_root.clone(), None);
+        let stats_a = ingestor_a.ingest_all().await.unwrap();
+        let total_chunks = stats_a.chunks_added;
+        assert!(total_chunks >= 3, "should have at least 3 chunks");
+
+        // Pre-seed ONE chunk for agent-b.
+        let docs_root_hash = super::super::config::hash_docs_root(&docs_root);
+        let docs_root_hash_clone = docs_root_hash.clone();
+        db_a.with_db(move |db| {
+            let first_chunk_id: i64 = db
+                .conn
+                .query_row(
+                    "SELECT id FROM kg_chunks WHERE docs_root_hash = ?1 ORDER BY seq_id LIMIT 1",
+                    rusqlite::params![docs_root_hash_clone],
+                    |row| row.get(0),
+                )?;
+
+            let first_chunk_text: String = db
+                .conn
+                .query_row(
+                    "SELECT content FROM search_content WHERE agent_id = 'agent-a' AND source_type = ?1 AND source_id = ?2",
+                    rusqlite::params![KG_CHUNK_SOURCE_TYPE, first_chunk_id],
+                    |row| row.get(0),
+                )?;
+
+            db.index_content("agent-b", KG_CHUNK_SOURCE_TYPE, Some(first_chunk_id), &first_chunk_text)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let pre_count = count_search_content_async(&db_a, "agent-b").await;
+        assert_eq!(pre_count, 1);
+
+        // Agent B ingests — should backfill only the missing chunks.
+        let db_b = db_a.with_agent("agent-b");
+        let ingestor_b = LexicalIngestor::new(db_b.clone(), docs_root.clone(), None);
+        let stats_b = ingestor_b.ingest_all().await.unwrap();
+
+        assert_eq!(stats_b.docs_index_backfilled, 1);
+        assert_eq!(
+            stats_b.chunks_indexed_backfill,
+            total_chunks - 1,
+            "should backfill all but the pre-seeded chunk"
+        );
+
+        let post_count = count_search_content_async(&db_b, "agent-b").await;
+        assert_eq!(
+            post_count, total_chunks,
+            "agent-b should have all chunks now"
+        );
+    }
+
+    /// Test 4: backfill is idempotent — second run after backfill is a true skip.
+    #[tokio::test]
+    async fn backfill_preserves_idempotency_on_repeat() {
+        let doc_content = "---\ntitle: Test\n---\n\n## Section\n\nContent.\n";
+        let (_tmp, docs_root) = setup_test_docs(doc_content);
+
+        let tmp_db = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp_db.path()).unwrap();
+        let db_a = AsyncDatabase::new_with_agent(db, "agent-a");
+        ensure_agent_async(&db_a, "agent-a").await;
+        ensure_agent_async(&db_a, "agent-b").await;
+
+        // Agent A ingests.
+        let ingestor_a = LexicalIngestor::new(db_a.clone(), docs_root.clone(), None);
+        ingestor_a.ingest_all().await.unwrap();
+
+        // Agent B first run — backfill.
+        let db_b = db_a.with_agent("agent-b");
+        let ingestor_b = LexicalIngestor::new(db_b.clone(), docs_root.clone(), None);
+        let stats1 = ingestor_b.ingest_all().await.unwrap();
+        assert_eq!(stats1.docs_index_backfilled, 1);
+
+        // Agent B second run — true skip (not backfill again).
+        let stats2 = ingestor_b.ingest_all().await.unwrap();
+        assert_eq!(stats2.docs_skipped_unchanged, 1);
+        assert_eq!(stats2.docs_index_backfilled, 0);
+        assert_eq!(stats2.chunks_indexed_backfill, 0);
+    }
+
+    /// Test 5: FTS search works after backfill.
+    #[tokio::test]
+    async fn fts_search_rows_present_after_backfill() {
+        let doc_content =
+            "---\ntitle: Test\n---\n\n## Section\n\nThe magic needle keyword appears here.\n";
+        let (_tmp, docs_root) = setup_test_docs(doc_content);
+
+        let tmp_db = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp_db.path()).unwrap();
+        let db_a = AsyncDatabase::new_with_agent(db, "agent-a");
+        ensure_agent_async(&db_a, "agent-a").await;
+        ensure_agent_async(&db_a, "agent-b").await;
+
+        // Agent A ingests.
+        let ingestor_a = LexicalIngestor::new(db_a.clone(), docs_root.clone(), None);
+        ingestor_a.ingest_all().await.unwrap();
+
+        // Agent B backfills.
+        let db_b = db_a.with_agent("agent-b");
+        let ingestor_b = LexicalIngestor::new(db_b.clone(), docs_root.clone(), None);
+        let stats = ingestor_b.ingest_all().await.unwrap();
+        assert!(stats.docs_index_backfilled > 0);
+
+        // FTS search for agent-b should find the keyword.
+        let results = db_b
+            .with_db(move |db| db.fts_search("agent-b", "needle", 10, Some(KG_CHUNK_SOURCE_TYPE)))
+            .await
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "FTS search should find 'needle' for agent-b after backfill"
+        );
+    }
+
+    /// Test 6: get_chunk_context join shape succeeds after backfill.
+    #[tokio::test]
+    async fn get_chunk_context_join_succeeds_post_backfill() {
+        let doc_content = "---\ntitle: Test\n---\n\n## Section\n\nContent for join test.\n";
+        let (_tmp, docs_root) = setup_test_docs(doc_content);
+
+        let tmp_db = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp_db.path()).unwrap();
+        let db_a = AsyncDatabase::new_with_agent(db, "agent-a");
+        ensure_agent_async(&db_a, "agent-a").await;
+        ensure_agent_async(&db_a, "agent-b").await;
+
+        // Agent A ingests.
+        let ingestor_a = LexicalIngestor::new(db_a.clone(), docs_root.clone(), None);
+        ingestor_a.ingest_all().await.unwrap();
+
+        let docs_root_hash = super::super::config::hash_docs_root(&docs_root);
+        let drh = docs_root_hash.clone();
+
+        // Seed a kg_chunk_subjects row.
+        let (_chunk_id, subject_entity_id) = db_a
+            .with_db(move |db| {
+                let (chunk_id, docs_root): (i64, String) = db.conn.query_row(
+                    "SELECT id, docs_root FROM kg_chunks WHERE docs_root_hash = ?1 LIMIT 1",
+                    rusqlite::params![drh],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+
+                db.conn.execute(
+                    "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence)
+                     VALUES (?1, ?2, 'concept:test_entity', 'concept', 'test_entity', 0.9)",
+                    rusqlite::params![drh, docs_root],
+                )?;
+                let subject_entity_id = db.conn.last_insert_rowid();
+
+                db.conn.execute(
+                    "INSERT INTO kg_chunk_subjects (docs_root_hash, docs_root, chunk_id, subject_entity_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![drh, docs_root, chunk_id, subject_entity_id],
+                )?;
+
+                Ok((chunk_id, subject_entity_id))
+            })
+            .await
+            .unwrap();
+
+        // Agent B backfills.
+        let db_b = db_a.with_agent("agent-b");
+        let ingestor_b = LexicalIngestor::new(db_b.clone(), docs_root.clone(), None);
+        ingestor_b.ingest_all().await.unwrap();
+
+        // Run the get_chunk_context join shape for agent-b.
+        let drh2 = docs_root_hash.clone();
+        let result: Option<String> = db_b
+            .with_db(move |db| {
+                use rusqlite::OptionalExtension;
+                db.conn
+                    .query_row(
+                        "SELECT sc.content
+                         FROM kg_chunk_subjects cs
+                         JOIN search_content sc ON sc.source_type = 'kg_chunk'
+                             AND sc.source_id = cs.chunk_id AND sc.agent_id = ?1
+                         WHERE cs.docs_root_hash = ?2 AND cs.subject_entity_id = ?3
+                         LIMIT 1",
+                        rusqlite::params!["agent-b", drh2, subject_entity_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "get_chunk_context join should find content for agent-b after backfill"
+        );
+    }
+
+    /// Test 7: changed content takes the normal ingest path, not backfill.
+    #[tokio::test]
+    async fn changed_content_takes_normal_ingest_path_not_backfill() {
+        let doc_content_v1 = "---\ntitle: V1\n---\n\n## Section\n\nOriginal.\n";
+        let (_tmp, docs_root) = setup_test_docs(doc_content_v1);
+
+        let tmp_db = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(tmp_db.path()).unwrap();
+        let async_db = AsyncDatabase::new_with_agent(db, "mika");
+
+        let ingestor = LexicalIngestor::new(async_db.clone(), docs_root.clone(), None);
+
+        // First ingest.
+        let stats1 = ingestor.ingest_all().await.unwrap();
+        assert_eq!(stats1.docs_ingested, 1);
+
+        // Change the doc content.
+        std::fs::write(
+            docs_root.join("test-doc.md"),
+            "---\ntitle: V2\n---\n\n## Section\n\nUpdated content here.\n",
+        )
+        .unwrap();
+
+        // Re-ingest — should be Ingested, not IndexBackfilled.
+        let stats2 = ingestor.ingest_all().await.unwrap();
+        assert_eq!(stats2.docs_ingested, 1);
+        assert_eq!(stats2.docs_index_backfilled, 0);
+        assert_eq!(stats2.chunks_indexed_backfill, 0);
     }
 }
