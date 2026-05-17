@@ -489,38 +489,93 @@ pointer.
 ### Phase C — Tests and telemetry (covers BOTH co-causes)
 
 8. **Hermetic CI regression guard for co-cause 1.** Land as
-   `crates/mika-agent/tests/correction_message_classifier_guard.rs`.
-   The test exercises the gate-3 retry loop with a mock LLM transport
-   that returns a tool-call response when called, and **captures the
-   user-role correction message the agent loop injects on retry**. The
-   assertion is on the captured text directly, NOT on a mock that
-   pattern-matches request shape:
+   `crates/mika-agent/tests/eval/test_correction_message_classifier_guard.rs`
+   alongside the existing `tests/eval/test_*_guard.rs` files. Uses
+   the existing `EvalHarness` + `MockLlmProvider` infrastructure —
+   **no production-code change required for the capture mechanism**.
 
-   ```text
-   // Assertion shape (load-bearing — the test must fail if the agent
-   // emits old mandate-shaped text):
-   let injected = harness.captured_injected_corrections();
-   assert!(injected.len() >= 1, "agent did not inject correction on no-tool-call response");
-   for msg in &injected {
-       assert!(msg.starts_with("[mika-engine]"),
-               "correction missing trusted-marker prefix: {msg}");
+   **Capture mechanism: passive via `MockLlmProvider::captured_requests()`.**
+   At base SHA 72021b78, `crates/mika-common/src/llm/mock.rs:100`
+   defines:
+   ```rust
+   pub fn captured_requests(&self) -> Vec<LlmRequest> { ... }
+   ```
+   `LlmRequest.messages: Vec<LlmMessage>` and `LlmMessage { role:
+   LlmRole, content: LlmContent }` preserve role annotations at
+   message granularity (verified at
+   `crates/mika-common/src/llm/types.rs`). `LlmRole::User` is a
+   stable variant. The test reads back the captured request log
+   after the run and filters for user-role text messages whose
+   content starts with `[Your response` (old shape, regression
+   detector) or `[mika-engine]` (new shape, post-reshape
+   expectation):
+
+   ```rust
+   use mika_common::llm::{LlmContent, LlmRole};
+
+   harness.run("<message that fires required-tools gate>").await?;
+   let requests = harness.mock().captured_requests();
+   let user_corrections: Vec<String> = requests.iter()
+       .flat_map(|req| req.messages.iter())
+       .filter(|m| matches!(m.role, LlmRole::User))
+       .filter_map(|m| match &m.content {
+           LlmContent::Text(t)
+               if t.starts_with("[Your response") || t.starts_with("[mika-engine]")
+               => Some(t.clone()),
+           _ => None,
+       })
+       .collect();
+
+   assert!(
+       !user_corrections.is_empty(),
+       "agent did not inject any correction message on the no-tool-call retry turn \
+        (load-bearing — if this fires, the test driver is not exercising the gate)"
+   );
+   for msg in &user_corrections {
+       assert!(
+           msg.starts_with("[mika-engine]"),
+           "correction missing trusted-marker prefix (regression toward old shape): {msg}"
+       );
        assert!(!msg.contains("You MUST call"),
-               "correction still contains mandate phrasing: {msg}");
+           "correction still contains mandate phrasing: {msg}");
        assert!(!msg.contains("rejected because"),
-               "correction still uses rejection framing: {msg}");
+           "correction still uses rejection framing: {msg}");
    }
    ```
 
-   Driving the agent loop: configure the mock to return a no-tool-call
-   text response on the first request, then any response on subsequent
-   requests. Run a turn that should fire the required-tools gate (a
-   keyword-matched skill turn). Assert the captured correction count
-   ≥1 and each captured correction passes the substring properties
-   above. This tests the AGENT's emitted text, not the mock's
-   pattern-matching. Regression where someone partially reverts the
-   reshape (e.g., reshapes 14 of 15 sites and forgets one) fails the
-   test because at least one captured correction violates the
-   substring properties.
+   **Driving the loop:** configure the mock via
+   `EvalHarnessBuilder::responses()` to return a no-tool-call text
+   response on the first request (triggers the required-tools gate
+   at site #3) and any tool-call response on subsequent requests
+   (lets the retry complete cleanly). Run a turn that hits the
+   required-tools gate (a keyword-matched skill turn with
+   `required_tools` declared in its `skill.toml`).
+
+   **Why passive over active intercept (decision documented inline):**
+   an active `#[cfg(test)]` intercept in `run_loop` would require an
+   `EvalHarness` field addition + production-code shim (the
+   "active intercept" Option-B from the architect's F1). The existing
+   `captured_requests()` already preserves the role + content
+   granularity needed, so the intercept would be redundant
+   production-code scope creep. **If a future refactor erases role at
+   the request boundary, this test starts failing on
+   "agent did not inject any correction" rather than silently passing
+   wrong** (the load-bearing assertion is the non-empty + substring
+   shape, not the filter expression — empty `user_corrections`
+   triggers the first assert, which fails loud).
+
+   **Regression coverage:** a partial reshape (e.g., 15 of 16 sites
+   reshaped, site #5 forgotten) fails this test if site #5's
+   correction fires during the recorded run — its text will appear
+   in `captured_requests()` with the old `[Your response was
+   rejected...` prefix and fail the `starts_with("[mika-engine]")`
+   assertion. The test does NOT enumerate all 16 sites — it asserts
+   the property must hold for every captured user-role correction
+   in the recorded run, so any site that fires during the test
+   exercises the assertion. To exhaustively exercise all 16 sites,
+   add per-site test variants in commit A2 (one variant per gate,
+   each configured with a mock response that triggers that specific
+   gate).
 
    Runs on every CI build; no network, no API key.
 
@@ -829,3 +884,16 @@ primary + footnote.
   `~/.claude/projects/-data-workspace-mika-platform/memory/feedback_read_issue_comments_during_grooming.md`
   — Phase 1 of `/mika-groom-ticket` must fetch issue comments, not
   just body; co-cause corrections live there.
+- 2026-05-17 — Fresh `/mika-groom-ticket mika#1168` pass 1
+  (mika-arch session `2858b625-3f33-41d5-974a-5cada5c26e1d`):
+  Disposition ITERATE. One BLOCKING (F1: Step 8 capture mechanism
+  unspecified — implementer would face an architectural decision
+  at impl time between passive trace filter and active `#[cfg(test)]`
+  intercept). Resolved by re-reading the existing test
+  infrastructure (`crates/mika-common/src/llm/mock.rs:100` —
+  `captured_requests() -> Vec<LlmRequest>` already exists with
+  role+content granularity preserved) and committing Step 8 to the
+  passive approach. No production-code change required; existing
+  `EvalHarness` infrastructure covers the capture mechanism. Step 8
+  rewritten with concrete `captured_requests()` usage + assertion
+  shape + explicit "why passive over active" rationale inline.
