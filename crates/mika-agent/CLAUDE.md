@@ -368,6 +368,8 @@ docs_roots = [
 
 **Parse tolerance (#876):** `parse_extraction_json` tolerates reasoning prose before/after the JSON object — a common failure mode with haiku-class models (sibling of #768). Three-layer parsing: (1) strip markdown code fences, (2) direct `serde_json::from_str`, (3) `extract_first_json_object()` brace-matching fallback that locates the first balanced `{…}` in surrounding text with string-literal/escape-aware depth tracking. Schema validation stays strict — only surrounding-prose tolerance is added. When the slow path (layer 3) succeeds, emits `extraction_parse_slow_path` WARN for operator visibility. The extraction prompt also includes a JSON-only output instruction as defense-in-depth.
 
+**Roster-grounding observability (#1158):** Three structured log events for domain-roster injection diagnostics: (1) `subject_roster_mismatch` WARN — LLM emitted a non-roster entity without `discovered=true`; entity is dropped and an error line added to the semantic-retry prompt. Fields: `agent_id`, `doc`, `entity_type`, `entity_name`, `chunk_indices`. (2) `extraction_roster_unbuilt` WARN — `kg_entities` table is empty at extraction time (domain builder has not yet populated); extraction batch skipped. Fields: `trace_id`, `agent_id`. (3) `extraction_roster_failed` ERROR — `kg_entities` has rows but zero of the roster types (skill, tool, agent, problem_type); domain builder likely failed; extraction batch skipped. Fields: `trace_id`, `agent_id`.
+
 ## Knowledge Graph — Entity Resolver
 
 `src/kg/entity_resolver.rs` — Per-agent entity resolution that bridges subject graph entities to domain graph nodes (#691). Two-stage pipeline: exact match (case-insensitive) then LLM disambiguation for unresolved or ambiguous cases.
