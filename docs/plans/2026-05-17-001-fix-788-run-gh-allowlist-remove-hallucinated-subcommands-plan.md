@@ -191,6 +191,8 @@ The structural-binding observability layer (per § Scope, the `gh_api_invocation
 
 **What's NOT in this risk surface:** the GitHub App installation scope (if `MIKA_GITHUB_APP_*` is configured). App scope can differ from PAT scope; the operator owns App permission configuration. This plan does not assume PAT-scope as the security boundary — it assumes the existing `pr`/`issue` whitelist as the blast-radius anchor (a property of the allowlist itself, not of token scope). Auditing the live App config is operator-owned and orthogonal to this PR.
 
+The `engine-guards-vs-prompt-rules` citation in § "mika#805 disposition" justifies observability as the *prerequisite* for structural tightening (mika#1167's opening criteria), not as a *substitute* for it.
+
 ## Implementation steps (post-architect-GROOMED)
 
 1. Update `GH_ALLOWED_SUBCOMMANDS` constant (remove `milestone`/`project`, add `api`).
