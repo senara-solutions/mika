@@ -192,6 +192,27 @@ pub struct OrphanedParentTask {
     pub created_at: String,
 }
 
+/// A parent self_dev task left `in_progress` after its callback subtask
+/// delivered WITH a `pr_url` (success indicator). Used by the success-side
+/// engine backstop (mika#1162) — sibling shape to `OrphanedParentTask`.
+/// Returned by `find_completable_parent_tasks_on_pr_url`.
+///
+/// Why this is a separate type from `OrphanedParentTask` despite near-identical
+/// fields: the `pr_url` field is included in the SELECT so the completer can
+/// build its audit-event reason string without a second DB round-trip (see plan
+/// docs/plans/2026-05-17-001-fix-1162-...md, decision D1).
+#[derive(Debug, Clone)]
+pub struct CompletableParentTask {
+    pub id: String,
+    pub agent_id: String,
+    pub callback_task_id: String,
+    pub created_at: String,
+    /// pr_url extracted from `parent.metadata.claude_pilot.pr_url`. Embedded
+    /// in the SELECT so the completer doesn't need a second round-trip to
+    /// build its audit-event reason string.
+    pub pr_url: String,
+}
+
 /// Snapshot of a child task for the orphaned-parent reaper's structured log
 /// event (`task_engine_reaper.evaluated`). Captures all children of a candidate
 /// parent at kill time for post-incident diagnosis (mika#1126).
@@ -5479,6 +5500,12 @@ impl Database {
     /// Groom-class callbacks (mika#1001) are NOT reaped here — their expected
     /// artifact is a plan commit pushed to the branch, not a PR url. Groom-class
     /// leak detection is a separate follow-up (mika#1118 Option B).
+    ///
+    /// **Coupled pair:** `find_completable_parent_tasks_on_pr_url` is the
+    /// success-side sibling (mika#1162). Any filter change here (agent_id,
+    /// status, source, trigger_type, dispatch_class, sibling guard, grace
+    /// window) MUST be applied symmetrically there. The two queries differ
+    /// only on the `pr_url` predicate (`IS NULL` here vs `IS NOT NULL` there).
     pub fn find_orphaned_parent_tasks(
         &self,
         agent_id: &str,
@@ -5517,6 +5544,71 @@ impl Database {
                     agent_id: row.get(1)?,
                     created_at: row.get(2)?,
                     callback_task_id: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Find parent self_dev tasks left `in_progress` after their callback
+    /// subtask delivered WITH a `pr_url` (success indicator). Sibling to
+    /// `find_orphaned_parent_tasks` — same JOIN shape, same guards, but
+    /// inverted on the `pr_url` predicate. Used by the success-side engine
+    /// backstop (mika#1162).
+    ///
+    /// A parent is `completable` when:
+    /// - Parent is `status='in_progress'`, `source='self_dev'`, `trigger_type='manual'`
+    /// - Its latest callback subtask is `status='delivered'`
+    /// - **The callback's** `dispatch_class='implement'` (or NULL — pre-v34 via COALESCE)
+    /// - The callback's `updated_at` is older than `grace_seconds` ago
+    /// - Parent metadata HAS a non-empty `$.claude_pilot.pr_url`
+    /// - No other active callback child exists (mirrors the reaper's guard)
+    ///
+    /// Groom-class callbacks (mika#1001) cannot trip this path because they
+    /// never emit `PR:` lines — the `dispatch_class` filter is defense-in-depth.
+    ///
+    /// SOLE WRITER warning: this method is the only DB query that selects
+    /// candidates for the `parent_completed_from_callback` audit transition.
+    pub fn find_completable_parent_tasks_on_pr_url(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+    ) -> Result<Vec<CompletableParentTask>> {
+        let grace_modifier = format!("-{grace_seconds} seconds");
+        let mut stmt = self.conn.prepare(
+            "SELECT parent.id, parent.agent_id, parent.created_at,
+                    MIN(child.id) AS callback_task_id,
+                    json_extract(parent.metadata, '$.claude_pilot.pr_url') AS pr_url
+             FROM tasks parent
+             JOIN tasks child ON parent.id = child.parent_task_id
+             WHERE parent.agent_id = ?1
+               AND parent.status = 'in_progress'
+               AND parent.source = 'self_dev'
+               AND parent.trigger_type = 'manual'
+               AND COALESCE(child.dispatch_class, 'implement') = 'implement'
+               AND child.trigger_type = 'callback'
+               AND child.action_type = 'resume_agent'
+               AND child.status = 'delivered'
+               AND child.updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NOT NULL
+               AND json_extract(parent.metadata, '$.claude_pilot.pr_url') != ''
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks sibling
+                 WHERE sibling.parent_task_id = parent.id
+                   AND sibling.id != child.id
+                   AND sibling.status IN ('pending', 'in_progress')
+               )
+             GROUP BY parent.id
+             ORDER BY parent.id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, grace_modifier], |row| {
+                Ok(CompletableParentTask {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    callback_task_id: row.get(3)?,
+                    pr_url: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -12113,6 +12205,410 @@ mod tests {
         assert_eq!(groom_child.dispatch_class.as_deref(), Some("groom"));
         assert_eq!(groom_child.trigger_type, "callback");
         assert_eq!(groom_child.action_type, "resume_agent");
+    }
+
+    // -- find_completable_parent_tasks_on_pr_url tests (mika#1162) --
+
+    /// Helper: like `create_orphaned_parent_setup` but stamps a `pr_url` on the
+    /// parent's metadata to make it a success-side candidate.
+    fn create_completable_parent_setup(db: &Database, pr_url: &str) -> (String, String) {
+        let (parent_id, child_id) = create_orphaned_parent_setup(db);
+        let meta = format!(r#"{{"claude_pilot":{{"pr_url":"{pr_url}"}}}}"#);
+        db.conn
+            .execute(
+                "UPDATE tasks SET metadata = ?1 WHERE id = ?2",
+                params![meta, parent_id],
+            )
+            .unwrap();
+        (parent_id, child_id)
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_happy_path() {
+        let db = db();
+        let pr_url = "https://github.com/owner/repo/pull/1234";
+        let (parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        // Backdate the child's updated_at past the grace period
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, parent_id);
+        assert_eq!(candidates[0].callback_task_id, child_id);
+        assert_eq!(candidates[0].pr_url, pr_url);
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_no_pr_url_excluded() {
+        // Mirror of the reaper's happy path — when pr_url is absent the
+        // completer must NOT match. (The reaper handles that case.)
+        let db = db();
+        let (_parent_id, child_id) = create_orphaned_parent_setup(&db);
+
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "parent without pr_url is reaper territory, not completer"
+        );
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_empty_pr_url_excluded() {
+        let db = db();
+        let (_parent_id, child_id) = create_completable_parent_setup(&db, "");
+
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "empty pr_url string must not trip the completer"
+        );
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_grace_period_not_elapsed() {
+        let db = db();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let (_parent_id, _child_id) = create_completable_parent_setup(&db, pr_url);
+
+        // Child was just delivered, well within the 600s grace window
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "parent within grace period should not be auto-completed yet"
+        );
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_child_in_progress_excluded() {
+        let db = db();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+
+        // Custom setup: parent ready, but child is `in_progress` (not delivered).
+        let mut parent = new_task("mika", "Implement mika#1162", "manual", "none");
+        parent.source = Some("self_dev".to_string());
+        let parent_id = db.create_task(&parent).unwrap();
+        let meta = format!(r#"{{"claude_pilot":{{"pr_url":"{pr_url}"}}}}"#);
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress', metadata = ?1 WHERE id = ?2",
+                params![meta, parent_id],
+            )
+            .unwrap();
+
+        let mut child = callback_task("mika");
+        child.parent_task_id = Some(parent_id.clone());
+        let child_id = db.create_task(&child).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "child must be `delivered`, not `in_progress`"
+        );
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_groom_class_excluded() {
+        // Defense-in-depth: groom-class callbacks don't emit `PR:` lines, but
+        // the dispatch_class filter must still exclude them. Mirror of the
+        // reaper's same-named guard.
+        let db = db();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let (_parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'groom' WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "groom-class callbacks must not trip the success-side completer"
+        );
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_implement_class_matched() {
+        let db = db();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let (parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'implement' WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, parent_id);
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_null_dispatch_class_treated_as_implement() {
+        let db = db();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let (parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        // Helper leaves dispatch_class NULL (pre-v34 row shape)
+        let class: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT dispatch_class FROM tasks WHERE id = ?1",
+                params![child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(class.is_none(), "test invariant: pre-v34 shape");
+
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "NULL dispatch_class must still match (COALESCE -> 'implement')"
+        );
+        assert_eq!(candidates[0].id, parent_id);
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_parent_not_in_progress() {
+        let db = db();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let (parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        // Parent is already completed (race with the inline path).
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "parent not in `in_progress` must not be re-completed"
+        );
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_active_sibling_defers() {
+        let db = db();
+        let pr_url = "https://github.com/owner/repo/pull/1";
+        let (parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        // Another callback child is still in_progress
+        let mut sibling = callback_task("mika");
+        sibling.parent_task_id = Some(parent_id.clone());
+        let sibling_id = db.create_task(&sibling).unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+                params![sibling_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "parent with active sibling callback should wait for sibling completion"
+        );
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_excludes_other_agents() {
+        let db = db();
+        db.register_agent("agent_a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent_b", "Agent B", "/tmp/b").unwrap();
+
+        let mut parent = new_task("agent_a", "Implement mika#1162", "manual", "none");
+        parent.source = Some("self_dev".to_string());
+        let parent_id = db.create_task(&parent).unwrap();
+        let meta = r#"{"claude_pilot":{"pr_url":"https://github.com/x/y/pull/1"}}"#;
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'in_progress', metadata = ?1 WHERE id = ?2",
+                params![meta, parent_id],
+            )
+            .unwrap();
+
+        let mut child = NewTask {
+            agent_id: "agent_a".to_string(),
+            ..callback_task("agent_a")
+        };
+        child.parent_task_id = Some(parent_id.clone());
+        let child_id = db.create_task(&child).unwrap();
+        assert!(
+            db.update_task_completed(&child_id, "agent_a", Some("done"))
+                .unwrap()
+        );
+        assert!(db.mark_task_delivered(&child_id).unwrap());
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        // agent_b should see nothing
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("agent_b", 600)
+            .unwrap();
+        assert!(candidates.is_empty());
+
+        // agent_a should see the candidate
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("agent_a", 600)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_stale_parent_class_doesnt_drive_selection() {
+        // mika#1162 v2 — symmetric to test_find_orphaned_parent_tasks_stale_parent_class_*.
+        // mika#920 task-reuse pattern means a parent's dispatch_class can be
+        // stale relative to the most recent child callback. The selection MUST
+        // key off the CHILD's dispatch_class, not the parent's. Set parent class
+        // to 'groom' (stale, would have caused false-negative if we keyed off
+        // parent) and child to 'implement' (the fresh dispatch). Parent must be
+        // selected.
+        let db = db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        // Set PARENT class to 'groom' (stale data from a prior dispatch)
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'groom' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+        // Set CHILD class to 'implement' (the fresh per-dispatch authority)
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'implement' WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "stale parent class must not override the fresh child class — must select on child.dispatch_class"
+        );
+        assert_eq!(candidates[0].id, parent_id);
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_returns_pr_url_field() {
+        // Defense-in-depth: confirm the pr_url comes through unchanged from
+        // json_extract. The engine completer relies on this for its audit log.
+        let db = db();
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1158";
+        let (_parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pr_url, pr_url);
     }
 
     #[test]

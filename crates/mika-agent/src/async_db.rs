@@ -475,6 +475,19 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Find completable parent self_dev tasks whose callback subtask delivered
+    /// WITH a `pr_url` (success indicator) but were never transitioned by the
+    /// silent agent turn (mika#1162). See
+    /// [`Database::find_completable_parent_tasks_on_pr_url`].
+    pub async fn find_completable_parent_tasks_on_pr_url(
+        &self,
+        grace_seconds: i64,
+    ) -> Result<Vec<crate::db::CompletableParentTask>> {
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.find_completable_parent_tasks_on_pr_url(&a, grace_seconds))
+            .await
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log
     /// event. See [`Database::get_reaper_child_snapshot`].
     pub async fn get_reaper_child_snapshot(

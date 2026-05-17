@@ -408,6 +408,13 @@ impl TaskDispatcher {
             // #958: If the callback carries a pr_url (success indicator) and the
             // parent was reaped to `failed`, promote it back to `completed`.
             try_promote_parent_on_retry_success(&self.db, task).await;
+            // mika#1162: success-side structural backstop. If the callback
+            // carries a pr_url and the parent is still `in_progress` (silent
+            // turn hasn't run yet, or hasn't called update_task_status), mark
+            // the parent `completed` so the dispatch slot frees without
+            // depending on the LLM to fire the transition. Coupled pair with
+            // `reap_orphaned_parent_tasks` (failure path).
+            try_complete_parent_on_callback_success(&self.db, task).await;
         }
 
         // Suppress user-facing notifications for team-child callbacks.
@@ -1339,6 +1346,119 @@ async fn try_promote_parent_on_retry_success(db: &AsyncDatabase, task: &Task) {
                 parent_task_id = %parent_id,
                 error = %e,
                 "engine: failed to promote parent task on retry success"
+            );
+        }
+    }
+}
+
+/// Auto-complete the parent task when a callback delivers with a `pr_url`
+/// success indicator (mika#1162).
+///
+/// Structural backstop sibling to `try_promote_parent_on_retry_success`
+/// (mika#958): that function handles `failed → completed` AFTER the reaper
+/// has fired; this one handles `in_progress → completed` for the direct
+/// success case where the silent agent turn fails to call `update_task_status`
+/// (timeout, max-steps continuation, transport error, etc.).
+///
+/// Together with the reaper (`in_progress → failed` when no pr_url), the
+/// engine covers every (callback outcome × parent state) combination.
+///
+/// Best-effort, fire-and-forget — same shape as the sibling helpers.
+async fn try_complete_parent_on_callback_success(db: &AsyncDatabase, task: &Task) {
+    // 1. Need a parent to complete.
+    let parent_id = match &task.parent_task_id {
+        Some(id) => id.clone(),
+        None => return,
+    };
+
+    // 2. Read the parent — only complete self_dev manual tasks currently in
+    //    `in_progress`. Mirror the reaper's scope; the retry-promoter owns
+    //    the `failed` precondition.
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t))
+            if t.trigger_type == "manual"
+                && t.status == "in_progress"
+                && t.source.as_deref() == Some("self_dev") =>
+        {
+            t
+        }
+        _ => return,
+    };
+
+    // 3. Defense-in-depth: only auto-complete implement-class dispatches.
+    //    Groom-class callbacks don't emit `PR:` lines, so step 4 would
+    //    short-circuit anyway, but the filter mirrors mika#1118's reaper
+    //    invariant for symmetric drift-protection.
+    if task.dispatch_class.as_deref().unwrap_or("implement") != "implement" {
+        return;
+    }
+
+    // 4. Check whether the callback result contains a pr_url (success indicator).
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let extracted = extract_callback_fields(result);
+    let pr_url = extracted
+        .get("claude_pilot")
+        .and_then(|cp| cp.get("pr_url"))
+        .and_then(|v| v.as_str());
+
+    let pr_url = match pr_url {
+        Some(url) if !url.is_empty() => url.to_string(),
+        _ => return,
+    };
+
+    // 5. Transition: in_progress → completed via the guarded
+    //    `update_task_completed` (WHERE status IN ('pending', 'in_progress')).
+    //    Concurrent operator cancels or agent updates lose the race cleanly.
+    let reason = format!("parent_completed_from_callback (pr_url: {pr_url})");
+    match db.update_task_completed(&parent_id, Some(&reason)).await {
+        Ok(true) => {
+            // Emit audit event for traceability — same tool_name as the
+            // periodic backstop in engine.rs so consumers can grep both
+            // call sites with a single query.
+            let system_session = format!("system-{}", parent.agent_id);
+            let trace_id = mika_common::trace::generate_trace_id();
+            if let Err(e) = db
+                .log_audit_event(
+                    &system_session,
+                    "task_engine_parent_completer",
+                    &parent_id,
+                    Some("in_progress"),
+                    Some("completed"),
+                    Some(&reason),
+                    Some(&trace_id),
+                )
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "engine: failed to write parent-completer audit event"
+                );
+            }
+            info!(
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                pr_url = %pr_url,
+                "engine: auto-completed parent task from callback success (mika#1162)"
+            );
+        }
+        Ok(false) => {
+            // Parent already left `in_progress` (concurrent operator cancel,
+            // agent update, or sibling completer) — skip.
+            debug!(
+                parent_task_id = %parent_id,
+                "engine: parent no longer in_progress, skipping auto-completion"
+            );
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: failed to auto-complete parent task on callback success"
             );
         }
     }
@@ -2467,6 +2587,355 @@ mod tests {
         assert_eq!(
             parent.status, "failed",
             "parent milestone should be auto-blocked when advance turn fails"
+        );
+    }
+
+    // -- try_complete_parent_on_callback_success tests (mika#1162) --
+
+    /// Helper: create a self_dev parent in `in_progress` with an `implement`
+    /// callback child whose result carries the supplied `PR:` line.
+    async fn create_success_callback_pair(
+        db: &AsyncDatabase,
+        pr_line: Option<&str>,
+    ) -> (String, String) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement mika#1162".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        // Move parent to in_progress
+        db.update_task_status(&parent_id, "in_progress")
+            .await
+            .unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        let mut body = String::from(
+            "claude-pilot completed (status: done).\n\
+             Session: sess-1162\n\
+             Turns: 181\n\
+             Cost: $20.82\n\
+             Duration: 2391500ms",
+        );
+        if let Some(pr) = pr_line {
+            body.push_str(&format!("\nPR: {pr}"));
+        }
+        db.update_task_completed(&callback_id, Some(&body))
+            .await
+            .unwrap();
+        (parent_id, callback_id)
+    }
+
+    #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_happy_path() {
+        let db = test_db();
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1160";
+        let (parent_id, callback_id) = create_success_callback_pair(&db, Some(pr_url)).await;
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_complete_parent_on_callback_success(&db, &task).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "completed");
+        let result = parent.result.unwrap();
+        assert!(
+            result.contains("parent_completed_from_callback"),
+            "result should carry the audit-grep marker, got: {result}"
+        );
+        assert!(
+            result.contains(pr_url),
+            "result should embed the pr_url, got: {result}"
+        );
+        assert!(parent.completed_at.is_some());
+
+        // R3 — audit event must be written for observability.
+        let pid = parent_id.clone();
+        let events = db
+            .with_db(move |inner| {
+                inner.list_audit_events_paginated(
+                    "mika",
+                    Some("task_engine_parent_completer"),
+                    Some(&pid),
+                    10,
+                    0,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "exactly one audit event must be written");
+        let event = &events[0];
+        assert_eq!(event.before_value.as_deref(), Some("in_progress"));
+        assert_eq!(event.after_value.as_deref(), Some("completed"));
+        let reasoning = event.reasoning.as_deref().unwrap();
+        assert!(reasoning.contains("parent_completed_from_callback"));
+        assert!(reasoning.contains(pr_url));
+        assert!(event.trace_id.is_some(), "audit event must carry trace_id");
+    }
+
+    #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_no_pr_url_noop() {
+        let db = test_db();
+        let (parent_id, callback_id) = create_success_callback_pair(&db, None).await;
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_complete_parent_on_callback_success(&db, &task).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "in_progress",
+            "no pr_url means the reaper owns this case, not the completer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_parent_failed_noop() {
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, callback_id) = create_success_callback_pair(&db, Some(pr_url)).await;
+
+        // Simulate the reaper having marked the parent failed already.
+        db.update_task_failed(&parent_id, "callback_delivered_without_pr_url")
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_complete_parent_on_callback_success(&db, &task).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "the retry-promoter (mika#958) owns the failed → completed transition, not this fn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_parent_already_completed_noop() {
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, callback_id) = create_success_callback_pair(&db, Some(pr_url)).await;
+
+        // Agent's silent turn already completed the parent.
+        db.update_task_completed(&parent_id, Some("agent_self_completed"))
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_complete_parent_on_callback_success(&db, &task).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "completed");
+        // Must NOT overwrite the agent's result with the structural-backstop reason.
+        assert_eq!(parent.result.as_deref(), Some("agent_self_completed"));
+    }
+
+    #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_no_parent_noop() {
+        // Callback with no parent_task_id — should be a no-op (no panic).
+        let db = test_db();
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some("PR: https://x/y/pull/1"))
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        // No panic, no DB side effect — fire-and-forget contract.
+        try_complete_parent_on_callback_success(&db, &task).await;
+    }
+
+    #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_groom_class_noop() {
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, callback_id) = create_success_callback_pair(&db, Some(pr_url)).await;
+
+        // Demote the child to groom-class.
+        db.update_task_dispatch_class(&callback_id, "groom")
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_complete_parent_on_callback_success(&db, &task).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "in_progress",
+            "groom-class callbacks must not auto-complete their parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_parent_cancelled_noop() {
+        // mika#1162 plan Unit 2 scenario 5 — cancelled parent must not be
+        // resurrected by the auto-completer. The early-return guard
+        // (`status == "in_progress"`) catches this before `update_task_completed`
+        // would (the DB-level guard only allows `pending` and `in_progress`
+        // through). Test both layers of defense by ensuring the result string
+        // is not overwritten with the auto-complete reason.
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, callback_id) = create_success_callback_pair(&db, Some(pr_url)).await;
+
+        // Cancel the parent via direct status flip — the cancel_task tool path
+        // would do the same thing.
+        let pid = parent_id.clone();
+        db.with_db(move |inner| {
+            inner.conn.execute(
+                "UPDATE tasks SET status = 'cancelled', result = 'operator_cancel' WHERE id = ?1",
+                rusqlite::params![pid],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_complete_parent_on_callback_success(&db, &task).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "cancelled");
+        assert_eq!(
+            parent.result.as_deref(),
+            Some("operator_cancel"),
+            "operator's cancel reason must not be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_non_self_dev_noop() {
+        // Mirror the reaper's source guard: only self_dev parents are in scope.
+        let db = test_db();
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Non-self_dev parent".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None, // <- not self_dev
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        db.update_task_status(&parent_id, "in_progress")
+            .await
+            .unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some("PR: https://github.com/x/y/pull/1"))
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_complete_parent_on_callback_success(&db, &task).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "in_progress",
+            "non-self_dev parent must not be auto-completed"
         );
     }
 }
