@@ -5934,9 +5934,47 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Class-scoped sibling of `promote_next_deferred_callback`. Promotes the
+    /// oldest pending deferred wrapper matching the given `dispatch_class`.
+    /// Returns `true` if a task was promoted. Used by the periodic backstop's
+    /// per-class iteration (mika#1175). Pre-v34 NULL rows treated as 'implement'
+    /// via COALESCE (matches `has_active_callback_tasks_excluding` semantics).
+    pub fn promote_next_deferred_callback_for_class(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<bool> {
+        let now = crate::timestamp::now();
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'completed',
+                 result = 'deferred dispatch slot freed',
+                 completed_at = ?3,
+                 next_fire_at = ?3,
+                 updated_at = ?3
+             WHERE id = (
+                 SELECT id FROM tasks
+                 WHERE agent_id = ?1
+                   AND trigger_type = 'callback'
+                   AND status = 'pending'
+                   AND label = 'long_running:run_claude_pilot:deferred'
+                   AND COALESCE(dispatch_class, 'implement') = ?4
+                 ORDER BY created_at ASC
+                 LIMIT 1
+             )
+             AND agent_id = ?2",
+            params![agent_id, agent_id, now, dispatch_class],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Returns true if any non-deferred callback task is in pending or in_progress
-    /// status (i.e., a dispatch slot is occupied). Used by the engine-level
-    /// deferred-dispatch backstop (mika#1070).
+    /// status (i.e., a dispatch slot is occupied). Was used by the engine-level
+    /// deferred-dispatch backstop (mika#1070). Post-mika#1175, the engine
+    /// backstop calls `has_any_active_callback_for_class` per-class; this
+    /// agent-wide form has no remaining production callers and is retained as
+    /// a regression-test baseline + as a sibling reference for the class-scoped
+    /// shape. See `has_any_active_callback_for_class` for production usage.
     pub fn has_any_active_callback(&self, agent_id: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
@@ -5946,6 +5984,31 @@ impl Database {
                AND status IN ('pending', 'in_progress')
                AND label NOT LIKE '%:deferred'",
             params![agent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Class-scoped sibling of `has_any_active_callback`. Returns `true` if any
+    /// non-deferred callback task in the given `dispatch_class` is `pending` or
+    /// `in_progress` (i.e., the per-class dispatch slot is occupied). Used by
+    /// the periodic backstop's per-class slot check (mika#1175). Excludes
+    /// `:deferred` wrappers (parity with mika#1163's symmetric exclusion).
+    /// Pre-v34 NULL rows treated as 'implement' via COALESCE.
+    pub fn has_any_active_callback_for_class(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND action_type = 'resume_agent'
+               AND status IN ('pending', 'in_progress')
+               AND label NOT LIKE '%:deferred'
+               AND COALESCE(dispatch_class, 'implement') = ?2",
+            params![agent_id, dispatch_class],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -16313,6 +16376,139 @@ mod tests {
         assert!(!db.promote_next_deferred_callback("mika").unwrap());
     }
 
+    /// mika#1175 — Class-scoped sibling of `test_promote_next_deferred_callback_fifo`.
+    /// Verifies that `promote_next_deferred_callback_for_class` filters by
+    /// `dispatch_class`, that NULL-class rows are treated as `'implement'` via
+    /// `COALESCE`, and that FIFO is preserved within a class.
+    #[test]
+    fn test_promote_next_deferred_callback_for_class_filters_by_class() {
+        let db = db();
+
+        // No deferred callbacks → both class predicates return false.
+        assert!(
+            !db.promote_next_deferred_callback_for_class("mika", "implement")
+                .unwrap()
+        );
+        assert!(
+            !db.promote_next_deferred_callback_for_class("mika", "groom")
+                .unwrap()
+        );
+
+        // Parent tasks (FK requirement).
+        let p_impl = db
+            .create_task(&new_task("mika", "p_impl", "manual", "none"))
+            .unwrap();
+        let p_groom = db
+            .create_task(&new_task("mika", "p_groom", "manual", "none"))
+            .unwrap();
+        let p_null = db
+            .create_task(&new_task("mika", "p_null", "manual", "none"))
+            .unwrap();
+
+        // Three deferred wrappers: implement, groom, NULL (pre-v34 row).
+        let mut w_impl = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        w_impl.parent_task_id = Some(p_impl.clone());
+        w_impl.dispatch_class = Some("implement".to_string());
+        let id_impl = db.create_task(&w_impl).unwrap();
+
+        let mut w_groom = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        w_groom.parent_task_id = Some(p_groom.clone());
+        w_groom.dispatch_class = Some("groom".to_string());
+        let id_groom = db.create_task(&w_groom).unwrap();
+
+        let mut w_null = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        w_null.parent_task_id = Some(p_null.clone());
+        w_null.dispatch_class = None; // pre-v34 NULL row
+        let id_null = db.create_task(&w_null).unwrap();
+
+        // Promote groom: only the groom wrapper transitions.
+        assert!(
+            db.promote_next_deferred_callback_for_class("mika", "groom")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_task_unscoped(&id_groom).unwrap().unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            db.get_task_unscoped(&id_impl).unwrap().unwrap().status,
+            "pending",
+            "implement wrapper must not transition on a groom promotion"
+        );
+        assert_eq!(
+            db.get_task_unscoped(&id_null).unwrap().unwrap().status,
+            "pending",
+            "NULL-class wrapper must not transition on a groom promotion"
+        );
+
+        // No more groom wrappers pending.
+        assert!(
+            !db.promote_next_deferred_callback_for_class("mika", "groom")
+                .unwrap()
+        );
+
+        // First implement promotion: one of (implement, NULL) transitions
+        // (FIFO within the implement+NULL class group via COALESCE).
+        assert!(
+            db.promote_next_deferred_callback_for_class("mika", "implement")
+                .unwrap()
+        );
+        let after_first_impl = (
+            db.get_task_unscoped(&id_impl).unwrap().unwrap().status,
+            db.get_task_unscoped(&id_null).unwrap().unwrap().status,
+        );
+        assert!(
+            matches!(
+                after_first_impl,
+                (ref a, ref b) if (a == "completed" && b == "pending") || (a == "pending" && b == "completed")
+            ),
+            "exactly one of (implement, NULL) must transition on first implement promotion, got {after_first_impl:?}"
+        );
+
+        // Second implement promotion: the remaining wrapper transitions
+        // (NULL is matched by 'implement' via COALESCE).
+        assert!(
+            db.promote_next_deferred_callback_for_class("mika", "implement")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_task_unscoped(&id_impl).unwrap().unwrap().status,
+            "completed",
+            "implement wrapper must be completed after second implement promotion"
+        );
+        assert_eq!(
+            db.get_task_unscoped(&id_null).unwrap().unwrap().status,
+            "completed",
+            "NULL-class wrapper must be completed after second implement \
+             promotion (COALESCE treats NULL as 'implement')"
+        );
+
+        // Drained.
+        assert!(
+            !db.promote_next_deferred_callback_for_class("mika", "implement")
+                .unwrap()
+        );
+        assert!(
+            !db.promote_next_deferred_callback_for_class("mika", "groom")
+                .unwrap()
+        );
+    }
+
     /// mika#1070 — Regression test: chain promotion works after anti-cascade
     /// guard removal. Simulates the full lifecycle:
     /// 1. Blocking callback completes → promotes wrapper W1
@@ -16434,6 +16630,117 @@ mod tests {
         assert!(
             !db.has_any_active_callback("mika").unwrap(),
             "delivered callback should not count as active"
+        );
+    }
+
+    /// mika#1175 — Class-scoped sibling of `test_has_any_active_callback`.
+    /// Verifies that `has_any_active_callback_for_class` is scoped to the given
+    /// `dispatch_class`, that `:deferred` wrappers are excluded in both classes
+    /// (parity with mika#1163), and that NULL-class rows are matched by the
+    /// `'implement'` predicate via `COALESCE`.
+    #[test]
+    fn test_has_any_active_callback_for_class_class_scoped() {
+        let db = db();
+
+        // Empty DB → both predicates false.
+        assert!(
+            !db.has_any_active_callback_for_class("mika", "implement")
+                .unwrap()
+        );
+        assert!(
+            !db.has_any_active_callback_for_class("mika", "groom")
+                .unwrap()
+        );
+
+        // Active non-deferred implement callback.
+        let p_impl = db
+            .create_task(&new_task("mika", "p_impl", "manual", "none"))
+            .unwrap();
+        let mut active_impl = new_task(
+            "mika",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        active_impl.parent_task_id = Some(p_impl.clone());
+        active_impl.dispatch_class = Some("implement".to_string());
+        db.create_task(&active_impl).unwrap();
+
+        assert!(
+            db.has_any_active_callback_for_class("mika", "implement")
+                .unwrap(),
+            "implement-class predicate must detect the active implement callback"
+        );
+        assert!(
+            !db.has_any_active_callback_for_class("mika", "groom")
+                .unwrap(),
+            "groom-class predicate must not see the implement callback"
+        );
+
+        // Add `:deferred` wrappers in BOTH classes — must not flip either predicate.
+        let p_def_impl = db
+            .create_task(&new_task("mika", "p_def_impl", "manual", "none"))
+            .unwrap();
+        let mut def_impl = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        def_impl.parent_task_id = Some(p_def_impl.clone());
+        def_impl.dispatch_class = Some("implement".to_string());
+        db.create_task(&def_impl).unwrap();
+
+        let p_def_groom = db
+            .create_task(&new_task("mika", "p_def_groom", "manual", "none"))
+            .unwrap();
+        let mut def_groom = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        def_groom.parent_task_id = Some(p_def_groom.clone());
+        def_groom.dispatch_class = Some("groom".to_string());
+        db.create_task(&def_groom).unwrap();
+
+        assert!(
+            db.has_any_active_callback_for_class("mika", "implement")
+                .unwrap(),
+            "implement predicate unchanged by :deferred wrappers (mika#1163 parity)"
+        );
+        assert!(
+            !db.has_any_active_callback_for_class("mika", "groom")
+                .unwrap(),
+            "groom predicate unchanged by :deferred wrappers (mika#1163 parity)"
+        );
+
+        // NULL-class active callback must be matched by `"implement"` via COALESCE.
+        // Use a fresh agent so the assertion is independent of the rows above.
+        db.register_agent("mika-null", "mika-null", "").unwrap();
+        let p_null = db
+            .create_task(&new_task("mika-null", "p_null", "manual", "none"))
+            .unwrap();
+        let mut active_null = new_task(
+            "mika-null",
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        active_null.parent_task_id = Some(p_null.clone());
+        active_null.dispatch_class = None;
+        db.create_task(&active_null).unwrap();
+
+        assert!(
+            db.has_any_active_callback_for_class("mika-null", "implement")
+                .unwrap(),
+            "NULL-class active callback must be matched by 'implement' predicate \
+             (COALESCE matches mika#1163 slot-guard semantics)"
+        );
+        assert!(
+            !db.has_any_active_callback_for_class("mika-null", "groom")
+                .unwrap(),
+            "NULL-class active callback must NOT be matched by 'groom' predicate"
         );
     }
 

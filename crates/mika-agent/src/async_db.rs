@@ -626,10 +626,29 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Class-scoped sibling of `promote_next_deferred_callback` (mika#1175).
+    pub async fn promote_next_deferred_callback_for_class(
+        &self,
+        dispatch_class: &str,
+    ) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_string();
+        self.with_db(move |db| db.promote_next_deferred_callback_for_class(&a, &c))
+            .await
+    }
+
     /// Check if any non-deferred callback task is active (mika#1070).
     pub async fn has_any_active_callback(&self) -> Result<bool> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.has_any_active_callback(&a)).await
+    }
+
+    /// Class-scoped sibling of `has_any_active_callback` (mika#1175).
+    pub async fn has_any_active_callback_for_class(&self, dispatch_class: &str) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_string();
+        self.with_db(move |db| db.has_any_active_callback_for_class(&a, &c))
+            .await
     }
 
     pub async fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {

@@ -1002,6 +1002,32 @@ impl TaskDispatcher {
         }
     }
 
+    /// mika#1175 — Class-scoped sibling of `dispatch_next_deferred_callback`.
+    /// Promotes the oldest pending deferred wrapper matching the given
+    /// `dispatch_class`. Used by the periodic backstop's per-class iteration.
+    pub(crate) async fn dispatch_next_deferred_callback_for_class(&self, dispatch_class: &str) {
+        match self
+            .db
+            .promote_next_deferred_callback_for_class(dispatch_class)
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    event = "deferred_dispatch_promoted",
+                    dispatch_class, "promoted oldest pending deferred wrapper for engine dispatch"
+                );
+            }
+            Ok(false) => {} // No pending deferred callbacks in this class
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    dispatch_class,
+                    "failed to promote deferred callback — will retry on next tick"
+                );
+            }
+        }
+    }
+
     /// #991 — Post-callback advance backstop. After a milestone/project-context
     /// callback turn completes, checks whether the queue was advanced. If not,
     /// fires a `PostCallbackAdvance` trigger to give the agent one more explicit
