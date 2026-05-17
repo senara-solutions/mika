@@ -16017,6 +16017,67 @@ mod tests {
             "Parent B's query: own callback excluded by parent filter, A's \
              wrapper excluded by :deferred filter — no blocking dispatch"
         );
+
+        // Suffix-anchor pin: the `%:deferred` LIKE pattern matches END of the
+        // label, not arbitrary substring. A hypothetical future label that
+        // contains `:deferred` mid-string (e.g., `:deferred:retry`) is NOT
+        // excluded by the wildcard — it would be counted as an active
+        // dispatch. This pins the convention so a refactor that shifts the
+        // suffix convention has to update the SQL clause deliberately.
+        let p_d = db
+            .create_task(&new_task("mika", "host_d", "manual", "none"))
+            .unwrap();
+        let mut suffix_variant = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred:retry",
+            "callback",
+            "resume_agent",
+        );
+        suffix_variant.parent_task_id = Some(p_d.clone());
+        let suffix_variant_id = db.create_task(&suffix_variant).unwrap();
+        // Delete the existing real callback for Parent B so this assertion
+        // can isolate the suffix-variant row's behavior.
+        db.cancel_task(&real_b_id, "mika").unwrap();
+        let result = db
+            .has_active_callback_tasks_excluding("other-task", "mika", "implement")
+            .unwrap();
+        let (parent_id, callback_id) = result.expect(
+            "label `:deferred:retry` is NOT a suffix match for `%:deferred` — \
+             must still be counted as an active dispatch",
+        );
+        assert_eq!(parent_id, p_d, "suffix-variant row should be the blocker");
+        assert_eq!(callback_id, suffix_variant_id);
+
+        // Forward-compat for in_progress deferred wrappers: today no code path
+        // sets a `:deferred` row to `in_progress`, but the SQL `status IN
+        // ('pending', 'in_progress')` clause catches both. Verify the
+        // exclusion also holds for in_progress wrappers so a future code path
+        // that flips a wrapper to in_progress doesn't accidentally reintroduce
+        // the deadlock.
+        db.update_task_status(&suffix_variant_id, "cancelled")
+            .unwrap(); // clean up suffix-variant first
+        let p_e = db
+            .create_task(&new_task("mika", "host_e", "manual", "none"))
+            .unwrap();
+        let mut deferred_in_progress = new_task(
+            "mika",
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        deferred_in_progress.parent_task_id = Some(p_e.clone());
+        let dip_id = db.create_task(&deferred_in_progress).unwrap();
+        db.update_task_status(&dip_id, "in_progress").unwrap();
+        let result = db
+            .has_active_callback_tasks_excluding("other-task", "mika", "implement")
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "in_progress :deferred wrapper must also be excluded (forward-compat \
+             — today no code path sets a wrapper to in_progress, but the SQL \
+             status filter covers both pending+in_progress, so the exclusion \
+             contract must hold for both)"
+        );
     }
 
     /// mika#1070 — Regression test: AgentBusy recovery keeps callback in
