@@ -137,15 +137,15 @@ assumption (in-scope) reflects the silent-trigger turn-construction
 pattern, which constructs initial prompts as user-role messages to
 drive the turn.
 
-**Reshape target wording for sites 3205, 3226:** drop the "You MUST"
+**Reshape target wording for sites 3273, 3297:** drop the "You MUST"
 phrasing; reframe as state-machine description ("The engine requires
-either ... or ..." / "The engine expects run_claude_pilot to be
-re-invoked with the original arguments"). Same reshape principle as
-the `[mika-engine]` prefix on the 15 post-response sites; the prefix
-itself isn't load-bearing here because the silent-trigger prompts are
-the FIRST message of the turn (no prior context to disambiguate
-trusted vs. user injection) — so drop the mandate phrasing and rely
-on imperative-without-mandate-verb framing.
+either ... or ..." / "The engine expects the matching dispatch tool
+to be re-invoked with the original arguments"). Same reshape
+principle as the `[mika-engine]` prefix on the 16 post-response
+sites; the prefix itself isn't load-bearing here because the
+silent-trigger prompts are the FIRST message of the turn (no prior
+context to disambiguate trusted vs. user injection) — so drop the
+mandate phrasing and rely on imperative-without-mandate-verb framing.
 
 Greppability check post-reshape:
 ```bash
@@ -897,3 +897,11 @@ primary + footnote.
   `EvalHarness` infrastructure covers the capture mechanism. Step 8
   rewritten with concrete `captured_requests()` usage + assertion
   shape + explicit "why passive over active" rationale inline.
+- 2026-05-17 — Pass 2 same session: **Verdict GROOMED.** F1
+  resolution ratified; NR2 (per-site test partition: Phase C
+  single-run + A2 per-site variants) ratified as correct
+  partition. One non-blocking copy-edit artifact (NR1: sibling
+  silent-trigger line numbers in the "Reshape target wording"
+  paragraph still said 3205/3226 from the pre-rebase b4a6c4fe
+  era; corrected to 3273/3297 + updated 15→16 site count
+  reference in the same paragraph). Plan is dispatch-ready.
