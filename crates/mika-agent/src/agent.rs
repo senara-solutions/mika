@@ -1311,11 +1311,13 @@ async fn run_loop(
                                  locally is not the same as closing it on GitHub — the \
                                  previous incident (milestone#17, 2026-04-24) left local \
                                  state and GitHub state divergent for hours.\n\
-                                 Call `run_gh({{\"command\": [\"api\", \"-X\", \"PATCH\", \
-                                 \"/repos/senara-solutions/<repo>/milestones/<n>\", \"-f\", \
-                                 \"state=closed\"]}})` AND verify via readback before claiming \
+                                 Call `run_gh` with the close PATCH (subcommand `api`, \
+                                 method `-X PATCH`, path \
+                                 `/repos/<owner>/<repo>/milestones/<n>`, field \
+                                 `-f state=closed`) AND verify via readback before claiming \
                                  the milestone is closed, OR retract the claim if the close \
-                                 was not actually performed.]",
+                                 was not actually performed. See self-dev system prompt M5 \
+                                 step 3 for the canonical call shape.]",
                             )),
                         });
                         continue;
