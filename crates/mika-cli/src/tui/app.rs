@@ -849,6 +849,24 @@ impl<'a> App<'a> {
             return;
         }
 
+        // mika#850 second-order guard: if the worker is dead, refuse the send
+        // rather than persisting/displaying the message and routing through a
+        // dead channel that `let _ = self.agent_tx.send(...)` would swallow.
+        // Without this guard, the supervisor surfaces the crash once but every
+        // subsequent keystroke recreates the silent-drop UX the ticket reports.
+        if self.worker_crashed.is_some() {
+            self.messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: "Agent worker has crashed. Run /restart before sending more messages."
+                    .to_string(),
+                rendered: None,
+                channel: None,
+            });
+            self.reset_textarea();
+            self.needs_redraw = true;
+            return;
+        }
+
         // Save to history
         self.history.push(text.clone());
 
@@ -1320,24 +1338,35 @@ impl<'a> App<'a> {
                     rendered: None,
                     channel: None,
                 });
-                if let Err(e) = self
-                    .db
-                    .log_audit_event(
-                        &self.session_id,
-                        "system",
-                        "agent_worker_crashed",
-                        None,
-                        Some(&reason),
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "failed to log agent_worker_crashed audit event");
-                }
-                self.worker_crashed = Some(reason);
                 self.status = AgentStatus::Idle;
                 self.needs_redraw = true;
+                // Fire-and-forget the audit write so the tick loop never blocks
+                // on the DB thread — the worker may have crashed mid-DB-closure,
+                // making the AsyncDatabase channel the most likely source of
+                // back-pressure precisely on this code path.
+                let db = self.db.clone();
+                let session = self.session_id.clone();
+                let reason_for_audit = reason.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = db
+                        .log_audit_event(
+                            &session,
+                            "system",
+                            "agent_worker_crashed",
+                            None,
+                            Some(&reason_for_audit),
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to log agent_worker_crashed audit event"
+                        );
+                    }
+                });
+                self.worker_crashed = Some(reason);
             }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 // Agent worker channel closed without an explicit WorkerCrashed

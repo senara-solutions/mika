@@ -710,17 +710,27 @@ pub async fn run(
                 tracing::warn!(error = %e, "failed to end session on agent switch");
             }
 
-            // Abort the old poller and wait for the supervisor to stop (with
-            // timeout). Aborting the worker explicitly produces a `Cancelled`
-            // JoinError that the supervisor consumes silently — avoids a
-            // spurious WorkerCrashed event on intentional teardown.
+            // /agent-switch already sent AgentRequest::Quit via handle_switch;
+            // give the worker a short window to exit cleanly so the post-loop
+            // `mcp.shutdown().await` block runs (and the supervisor sees
+            // `Ok(()) + quit_received=true` and stays silent). Abort only as a
+            // fallback if the worker is wedged.
             worker.poller_handle.abort();
-            worker.worker_abort.abort();
             let old_handle = std::mem::replace(
                 &mut worker.handle,
                 tokio::spawn(async {}), // placeholder
             );
-            let _ = tokio::time::timeout(Duration::from_secs(2), old_handle).await;
+            if tokio::time::timeout(Duration::from_secs(2), old_handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    event = "supervisor_drain_timeout",
+                    site = "agent_switch",
+                    "old worker did not exit within 2s of Quit; aborting"
+                );
+                worker.worker_abort.abort();
+            }
 
             // Initialize the new agent
             match init::init_for_agent(&target_name) {
@@ -747,6 +757,11 @@ pub async fn run(
                             app.skills = new_skills;
                             app.agent_name = target_name.clone();
                             app.history = crate::tui::app::InputHistory::load(&app.home_dir);
+                            // The new agent is healthy; drop any residual flags
+                            // from a crash on the agent we just left.
+                            app.worker_crashed = None;
+                            app.pending_restart = false;
+                            app.status = AgentStatus::Idle;
 
                             worker = new_worker;
 
@@ -885,16 +900,22 @@ pub async fn run(
     // Stop the reminder poller
     worker.poller_handle.abort();
 
-    // Drain the supervisor task. If it hasn't finished (e.g., the worker is
-    // stuck mid-tool), abort the worker — the supervisor consumes the cancelled
-    // JoinError silently.
-    if worker.handle.is_finished() {
-        if let Err(e) = worker.handle.await {
+    // App-exit already sent AgentRequest::Quit; await the supervisor briefly so
+    // the worker's post-loop `mcp.shutdown()` block runs. Abort only on timeout
+    // so a wedged worker can't hang the CLI on exit.
+    match tokio::time::timeout(Duration::from_secs(2), worker.handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
             eprintln!("Agent worker supervisor error: {e}");
         }
-    } else {
-        worker.worker_abort.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(2), worker.handle).await;
+        Err(_) => {
+            tracing::warn!(
+                event = "supervisor_drain_timeout",
+                site = "app_exit",
+                "worker did not exit within 2s of Quit; aborting"
+            );
+            worker.worker_abort.abort();
+        }
     }
 
     // Database shutdown happens automatically via Drop on worker._ctx
@@ -1171,7 +1192,7 @@ fn spawn_worker_supervisor(
             agent_id = %agent_id,
             session_id = %session_id,
             reason = %reason,
-            seconds_since_message_persist = ?elapsed_secs,
+            seconds_since_dispatch_start = ?elapsed_secs,
             "TUI agent worker entered failure state; pending prompt dropped"
         );
 
