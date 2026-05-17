@@ -1743,6 +1743,33 @@ mod tests {
             result.contains(pr_url),
             "result must embed the pr_url for audit traceability"
         );
+
+        // R3 — audit event must be written. Same tool_name as the inline path
+        // so consumers grep one name and see both call sites.
+        let pid = parent_id.clone();
+        let events = db
+            .with_db(move |inner| {
+                inner.list_audit_events_paginated(
+                    "mika",
+                    Some("task_engine_parent_completer"),
+                    Some(&pid),
+                    10,
+                    0,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "periodic backstop must log one audit event"
+        );
+        let event = &events[0];
+        assert_eq!(event.before_value.as_deref(), Some("in_progress"));
+        assert_eq!(event.after_value.as_deref(), Some("completed"));
+        let reasoning = event.reasoning.as_deref().unwrap();
+        assert!(reasoning.contains("parent_completed_from_callback_backstop"));
+        assert!(reasoning.contains(pr_url));
     }
 
     #[tokio::test]
