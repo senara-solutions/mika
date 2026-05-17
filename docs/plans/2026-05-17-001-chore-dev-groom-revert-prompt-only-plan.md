@@ -8,6 +8,48 @@ created: 2026-05-17
 
 # Plan — Revert dev-groom prompt-only design; restore deterministic handlers/+tools.json
 
+## 0. Phase 0 — Root-cause verification (added in pass-1 iteration per mika-arch F1)
+
+**Claim under verification** (from pass-1 brief): mika-dev DID call `run_claude_pilot({"skill": "dev-groom"})` for the cited regression; the failure is downstream in the inner Claude Code session, not at the outer dispatch surface.
+
+**Evidence** (queried 2026-05-17, `~/.mika/data/mika.db`):
+
+The ticket cites mika#1166 as the most recent regression. The actual triggering session for `/mika-audit` of this class was mika#1162 (same failure class, same date). Verbatim from `tool_calls` table (input column truncated to 200 chars; full input preserved in DB):
+
+```
+2026-05-17T07:39:40Z  run_claude_pilot  dev-pilot  success=1  {"prompt":"mika#1162","skill":"dev-groom","task_id":"52abc348-898e-4082-95d2-07bca7a487c3"}
+2026-05-17T07:41:23Z  run_claude_pilot  dev-pilot  success=1  {"prompt":"mika#1162","skill":"dev-groom","task_id":"52abc348-898e-4082-95d2-07bca7a487c3"}
+2026-05-17T08:06:41Z  run_claude_pilot  dev-pilot  success=1  {"prompt":"mika#1162","skill":"dev-groom","task_id":"52abc348-898e-4082-95d2-07bca7a487c3"}
+2026-05-17T08:34:42Z  run_claude_pilot  dev-pilot  success=1  {"prompt":"mika#1162","skill":"dev-groom","task_id":"11749683-a350-499a-9979-8c0cfe9474cf"}
+```
+
+Five `run_claude_pilot` calls fired with `skill="dev-groom"` and `success=1`. **Outer dispatch is not the failure surface.**
+
+The corresponding task row (`b5a18e32-df4d-4521-b767-9b48d99c00d0`, action_config preserved):
+
+```
+input: {"prompt":"mika#1162","skill":"dev-groom","task_id":"52abc348-898e-4082-95d2-07bca7a487c3"}
+status: delivered
+result: PIPELINE FAILURE: dev-groom produced no valid plan file (no docs/plans/2026-05-17-*-plan.md >500 bytes found) and no /ce:plan invocation detected in session log. Session drifted into executor mode.
+        PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (...)
+        claude-pilot completed (status: success).
+        Session: c044d2e8-7acd-4dd9-8295-c040979cd52a
+        Turns: 2  Cost: $0.0  Duration: 3ms
+        log tail: [init] Session , model unknown, task b5a18e32-... [done] Success | 2 turns | $0.00 | 0s
+```
+
+The "model unknown" pattern in the log tail is consistent with claude-pilot reaching the `[init]` stage but failing to bind the Anthropic model field — a session-init failure on the **inner side**, downstream of the outer dispatch. This is distinct from the mika#1168 outer-refusal pattern (sonnet-4-6 returning "Prompt injection. Rejected."), which would surface at the **mika-dev** loop, not the claude-pilot subprocess.
+
+**Adjacent finding** (from same DB query): the earliest attempts for mika#1162 had `skill="dev-pilot"` with `success=0` (engine rejected — wrong dispatch class for a groom-needing ticket). Then mika-dev self-corrected to `skill="dev-groom"`. **This is itself evidence for D1's Option A choice** — the union-enum tool surface invites this exact confusion. With two discrete tools (`run_claude_pilot` for implement, `run_claude_pilot_groom` for groom), the LLM cannot pick the wrong enum value because the tool's existence in the schema is class-bound.
+
+**Conclusion of Phase 0 verification:**
+- Outer dispatch fires correctly (5/5 attempts success=1 once mika-dev picked the right skill).
+- Inner Claude Code session is the failure surface — 3ms, 2 turns, $0, no plan file, no `/ce:plan` invocation.
+- mika#1168 outer-refusal pattern is NOT the active cause for this regression class (different failure shape, different agent surface).
+- The plan's structural fix (Option A + inner-session slash-command propagation) remains correctly scoped.
+
+The plan proceeds.
+
 ## 1. Problem
 
 `dev-groom` was made prompt-only in PR #934 (commit b07b4778, 2026-05-02) to resolve a `run_claude_pilot` tool-name collision with `dev-pilot`. The collision was real (engine's `inject_skills_and_resolve_tools` dedupes overlapping tool names; see `crates/mika-agent/src/agent.rs` test `test_inject_skills_deduplicates_tool_names`). The chosen fix removed `dev-groom/handlers/` and `dev-groom/tools.json` entirely and consolidated the union enum `["dev-pilot", "dev-groom"]` on dev-pilot's tool.
@@ -26,15 +68,17 @@ Every fix is **detection** (catch drift post-hoc, emit `PIPELINE FAILURE`), not 
 
 ### Root cause
 
+Per Phase 0 verification (DB-grounded above), the failure surface is **not** the outer mika-dev dispatch — that fires correctly (`run_claude_pilot({"skill": "dev-groom", ...})` returns `success=1` consistently). The failure is in the **inner Claude Code session** spawned by claude-pilot.
+
 The current shape couples three layers that should be decoupled:
 
-1. **Outer dispatch (mika-dev → claude-pilot).** mika-dev's LLM emits `run_claude_pilot({"skill": "dev-groom", ...})`. The engine routes the tool call to **dev-pilot's** handler (because dev-pilot owns the tool name). dispatch-lib reads `$SKILL` from input JSON and case-switches `dev-groom` → `ENTRY_COMMAND="/mika-groom-ticket"`. This part is structurally fine.
-2. **Skill-prompt loading on mika-dev.** dev-groom's `system_prompt.md` (112 lines, full Phase 1–5 walkthrough) is loaded into mika-dev when the trigger keywords match — but **`dev-groom` is not in mika-dev's identity allowlist** (`crates/mika-agent/src/well_known_agents.rs` `MIKA_DEV_IDENTITY` lists only `dev-pilot`). So on mika-dev, the prompt is technically denied — but the prose in `self-dev/system_prompt.md` (lines 219–245) carries the same dispatch instructions. **Whether the dev-groom prompt itself ever loads in production depends on the engine's enforcement of identity allowlists at trigger time**, which is the first thing the architect should sanity-check.
-3. **Inner session reliability.** When claude-pilot launches Claude Code with `--command "/mika-groom-ticket" -- "mika#N"`, the inner session receives `/mika-groom-ticket mika#N` as its first message. Claude Code resolves slash commands from `.claude/commands/` under the cwd. The worktree's `.claude/` directory **does not** receive `commands/` from dispatch-lib (only `claude-pilot.json` and `settings.local.json` are copied — see `skills/bundled/_shared/dispatch-lib.sh` lines 354–357). The slash command file lives at the meta-repo root (`/data/workspace/mika-platform/.claude/commands/mika-groom-ticket.md`), outside the worktree. **This is the structural failure surface** — the inner LLM gets `/mika-groom-ticket mika#N` as raw text with no resolving file, so it has to improvise. Sometimes it follows the implicit pattern; other times it drifts into executor mode (running ticket-body commands directly) or exits after fetching the issue with no plan.
+1. **Outer dispatch (mika-dev → claude-pilot).** mika-dev's LLM emits `run_claude_pilot({"skill": "dev-groom", ...})`. The engine routes the tool call to **dev-pilot's** handler (because dev-pilot owns the tool name via union enum). dispatch-lib reads `$SKILL` from input JSON and case-switches `dev-groom` → `ENTRY_COMMAND="/mika-groom-ticket"`. This part fires correctly per Phase 0. **But** the union-enum tool surface invites mika-dev's LLM to pick the wrong value at the boundary: the 2026-05-17 mika#1162 trace shows the LLM first emitting `skill="dev-pilot"` (engine rejected, `success=0`), then self-correcting to `skill="dev-groom"`. With Option A (separate tool names), the wrong-enum-value class becomes structurally impossible — the LLM is exposed to two discrete tools and cannot conflate them.
+2. **Skill-prompt loading on mika-dev.** dev-groom's `system_prompt.md` (112 lines, full Phase 1–5 walkthrough) is currently authored as if it loads into mika-dev's prompt context. But `dev-groom` is **not** in `MIKA_DEV_IDENTITY.allowlist` (`crates/mika-agent/src/well_known_agents.rs:108`). Either (a) the prompt loads anyway via trigger-keyword matching (allowlist not enforced at trigger time), or (b) it never loads and the prompt is dead documentation. Either way, the Phase 1–5 prose is misaddressed — the workflow runs inside claude-pilot's spawned Claude Code session via `/mika-groom-ticket.md`, not in mika-dev's loop. Collapsing the prompt to a thin "call the tool" shape (D3) resolves the misaddress regardless of which case (a/b) holds.
+3. **Inner session reliability.** When claude-pilot launches Claude Code with `--command "/mika-groom-ticket" -- "mika#N"`, the inner session receives `/mika-groom-ticket mika#N` as its first message. Claude Code resolves slash commands from `.claude/commands/` under the cwd. The worktree's `.claude/` directory does **not** receive `commands/` from dispatch-lib (only `claude-pilot.json` and `settings.local.json` are copied — `skills/bundled/_shared/dispatch-lib.sh` lines 354–357). The slash-command file lives at the meta-repo root (`/data/workspace/mika-platform/.claude/commands/mika-groom-ticket.md`), outside the worktree. **This is the verified structural failure surface** — Phase 0's "model unknown, $0, 2 turns, 3ms" log tail matches the shape of a session that couldn't resolve its entry slash command and exited fast. The inner LLM gets `/mika-groom-ticket mika#N` as raw text with no resolving file, has to improvise from training-data priors, and either drifts into executor mode or exits after fetching the issue with no plan.
 
-The ticket frames the problem as "LLM-dependency at the OUTER dispatch surface" (the `/ce:plan` emission when the dev-groom system prompt loads). That framing is incomplete — the deeper structural gap is the **inner session's missing slash-command resolution**. Restoring `handlers/`+`tools.json` on dev-groom is necessary but not sufficient if we don't also fix the inner-session slash-command propagation.
+The ticket frames the problem as "LLM-dependency at the OUTER dispatch surface" (the `/ce:plan` emission when the dev-groom system prompt loads). Per Phase 0, that framing is incomplete — the active failure mode is the **inner session's missing slash-command resolution**. Restoring `handlers/`+`tools.json` on dev-groom (Option A) is necessary for prevention of the wrong-enum-value class (point 1) and for prompt-collapse hygiene (point 2), but the structural fix for the active regression is Step 5 (inner-session slash-command propagation).
 
-This plan addresses both layers.
+This plan addresses all three layers in one PR.
 
 ## 2. Decisions
 
@@ -199,6 +243,21 @@ In `_set_up_worktree`, after the existing `cp` block (lines 354–357):
 +        # /mika, /mika-groom-ticket, /ce:plan-adjacent commands, etc.
 +        # Without this, --command "/mika-groom-ticket" arrives as raw text in
 +        # the inner session and the LLM has to improvise (mika#1173).
++        #
++        # Staleness profile (NF1, pass-1 review): the cp is a snapshot at
++        # worktree-creation time. If the operator edits a command file at the
++        # platform root after worktree creation but before the inner session
++        # completes, the inner session sees the pre-edit version. This is
++        # acceptable for two reasons:
++        #   1. Worktrees are short-lived (per-task, <2h typical).
++        #   2. Slash commands are checked into git at the platform root —
++        #      mid-session edits to /mika or /mika-groom-ticket are a violation
++        #      of the slug-immutability principle (mika#844) and should not
++        #      happen.
++        # If the staleness becomes a problem, the snapshot-vs-symlink tradeoff
++        # can be revisited in a follow-up. For now, snapshot semantics match
++        # the rest of dispatch-lib's worktree-prep behavior (claude-pilot.json,
++        # settings.local.json are also snapshotted).
 +        if [ -d "$PLATFORM_DIR/.claude/commands" ]; then
 +            cp -r "$PLATFORM_DIR/.claude/commands" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
 +        fi
