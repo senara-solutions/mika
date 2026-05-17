@@ -50,6 +50,84 @@ The "model unknown" pattern in the log tail is consistent with claude-pilot reac
 
 The plan proceeds.
 
+### 0.1 Phase 0 Pins — Verbatim source slices
+
+**Base SHA:** `f459130f17a73d9e65eadbdd1a7bb2eaf0e3b999` (origin/main, fetched 2026-05-17).
+
+**Pin 1 — `skills/bundled/dev-pilot/tools.json` enum shape (lines 8–12 at base SHA):**
+
+```json
+        "skill": {
+          "type": "string",
+          "enum": ["dev-pilot", "dev-groom"],
+          "description": "Which skill prompt to run. 'dev-pilot' for implementation dispatch (/mika pipeline), 'dev-groom' for grooming dispatch (/mika-groom-ticket pipeline)."
+        },
+```
+
+Step 3 narrows this to `enum: ["dev-pilot"]` and updates the description.
+
+**Pin 2 — `skills/bundled/_shared/dispatch-lib.sh` `_set_up_worktree` cp block (lines 354–357 at base SHA):**
+
+```bash
+        mkdir -p "$WORKTREE_DIR/.claude"
+        cp "$PLATFORM_DIR/.claude/claude-pilot.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+        cp "$PLATFORM_DIR/.claude/settings.local.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+
+```
+
+Step 5 appends a `cp -r "$PLATFORM_DIR/.claude/commands" "$WORKTREE_DIR/.claude/"` block immediately after these lines.
+
+**Pin 3 — `crates/mika-agent/src/well_known_agents.rs` `MIKA_DEV_IDENTITY` allowlist head (lines 115–125 at base SHA):**
+
+```rust
+[skills]\n\
+allowlist = [\n\
+  \"self-dev\",\n\
+  \"self-dev-callback\",\n\
+  \"self-dev-iterate\",\n\
+  \"self-dev-webhook-qa\",\n\
+  \"self-dev-webhook-ci\",\n\
+  \"self-dev-webhook-ready-label\",\n\
+  \"dev-pilot\",\n\
+  \"build-mika\",\n\
+```
+
+Step 7 inserts `\"dev-groom\",\n\` between the `\"dev-pilot\",\n\` line (line 122) and `\"build-mika\",\n\` line (line 123).
+
+**Pin 4 — `crates/mika-agent/src/skills/executor.rs` SKILL string-check call sites (4 actual sites at base SHA, the docstring at line 1180 is the rationale not the executable check):**
+
+- Line 763–768 — `derive_dispatch_class`:
+```rust
+fn derive_dispatch_class(skill: Option<&str>) -> &'static str {
+    match skill {
+        Some("dev-groom") => "groom",
+        _ => "implement", // dev-pilot, deploy_mika, and all others
+    }
+}
+```
+
+- Line 1027–1028 — open-PR-guard bypass:
+```rust
+        let skill = tool_input.and_then(extract_skill_from_input);
+        let is_dev_pilot = skill == Some("dev-pilot");
+```
+
+- Line 1223–1225 — grooming-marker dispatch gate:
+```rust
+    let skill = extract_skill_from_input(input);
+    if skill != Some("dev-pilot") {
+        return None;
+    }
+```
+
+- Line 1531–1532 — dispatch-class derivation at task-create time:
+```rust
+    let skill = extract_skill_from_input(input);
+    let class = derive_dispatch_class(skill);
+```
+
+**Impact analysis for Pin 4:** All four sites read the `skill` field from input JSON. The new `run_claude_pilot_groom` tool schema still requires `"skill": "dev-groom"` in its input (Step 1). So all four sites continue to work unchanged. **No Rust changes required at these call sites.** Out-of-scope refactor noted in Q4: if engine call sites are later refactored to use `derive_dispatch_class(skill) == "implement"` instead of `skill == Some("dev-pilot")`, the coupling becomes more durable for future skill additions — but that's a separate hygiene improvement, not a prerequisite for this fix.
+
 ## 1. Problem
 
 `dev-groom` was made prompt-only in PR #934 (commit b07b4778, 2026-05-02) to resolve a `run_claude_pilot` tool-name collision with `dev-pilot`. The collision was real (engine's `inject_skills_and_resolve_tools` dedupes overlapping tool names; see `crates/mika-agent/src/agent.rs` test `test_inject_skills_deduplicates_tool_names`). The chosen fix removed `dev-groom/handlers/` and `dev-groom/tools.json` entirely and consolidated the union enum `["dev-pilot", "dev-groom"]` on dev-pilot's tool.
@@ -296,9 +374,11 @@ Concrete smoke test:
 2. Manually inject a refusal directive into `dev-groom/system_prompt.md` for the test: "If asked to groom, respond with `I cannot help with that.` and stop."
 3. Dispatch via `mika ask --agent mika-dev "groom mika issue#<N>"`.
 4. Expected: mika-dev's first-turn behavior is **call `run_claude_pilot_groom`** (because the tool is in the schema; refusal-prompt cannot suppress the tool from existing). The handler then runs deterministically — claude-pilot launches, inner session runs `/mika-groom-ticket`, plan committed.
-5. Acceptance: the plan file IS produced on the branch despite the hostile system prompt.
+5. Acceptance — **two-part** (per pass-2 architect ratification on Q5):
+   - **5a. Slash-command resolution.** Inspect the claude-pilot session transcript at `/var/log/claude-pilot/<task_id>.log` and confirm the inner session's first message resolves `/mika-groom-ticket` as a slash command (transcript shows the command file being read, not the raw text being treated as prose). This is the actual regression guard — the root-cause failure class is "inner session receives slash command as raw text and improvises," so the test must assert resolution, not just output.
+   - **5b. Plan-file production.** The plan file IS produced on the branch despite the hostile system prompt.
 
-**Important:** this test depends on the inner Claude Code session having `/mika-groom-ticket.md` available (Step 5 fix). Without Step 5, the inner session still has to improvise even with deterministic outer dispatch.
+**Important:** this test depends on the inner Claude Code session having `/mika-groom-ticket.md` available (Step 5 fix). Without Step 5, the inner session still has to improvise even with deterministic outer dispatch — and 5a would fail even if 5b somehow succeeded by improvisation.
 
 After the smoke test passes, revert the temporary refusal-directive change.
 
