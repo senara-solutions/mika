@@ -237,6 +237,12 @@ impl TaskEngine {
             // Reap parent self_dev tasks left in_progress after their callback
             // subtask delivered without producing a PR (#871).
             self.reap_orphaned_parent_tasks().await;
+
+            // Auto-complete parent self_dev tasks left in_progress after their
+            // callback subtask delivered WITH a PR url (mika#1162). Success-side
+            // sibling to the reaper: catches crash-recovery cases and pre-deploy
+            // wedges that the inline path in `dispatch_resume_agent` can't reach.
+            self.complete_parent_tasks_on_callback_success().await;
         }
 
         let now = crate::timestamp::now();
@@ -774,6 +780,129 @@ impl TaskEngine {
                         parent_id = %parent.id,
                         error = %e,
                         "task_engine_reaper: db error during transition"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Auto-complete parent self_dev tasks whose callback delivered with a
+    /// `pr_url` but were never transitioned by the silent agent turn (mika#1162).
+    ///
+    /// Success-side sibling to `reap_orphaned_parent_tasks`. Same scan cadence
+    /// (every `DB_SCAN_INTERVAL_TICKS`), same agent/source/trigger_type and
+    /// `dispatch_class='implement'` filters, same `REAPER_GRACE_SECONDS` grace
+    /// window — but transitions matching parents to `completed` instead of
+    /// `failed`. Mutually exclusive with the reaper on the `pr_url` predicate
+    /// (reaper requires `IS NULL`, completer requires `IS NOT NULL`), so the
+    /// two queries never select the same row.
+    ///
+    /// Layered with the inline path in `dispatcher::try_complete_parent_on_callback_success`:
+    /// the inline path fires at delivery time and frees the slot fast; this
+    /// periodic backstop catches crash-recovery cases (server died between
+    /// callback delivery and the inline call) and pre-deploy wedges.
+    ///
+    /// SOLE WRITER: this method and the inline counterpart are the only sites
+    /// that write the `parent_completed_from_callback` audit-event transition.
+    async fn complete_parent_tasks_on_callback_success(&self) {
+        let candidates = match self
+            .db
+            .find_completable_parent_tasks_on_pr_url(REAPER_GRACE_SECONDS)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "task_engine_parent_completer: failed to query completable parents"
+                );
+                return;
+            }
+        };
+
+        for parent in candidates {
+            let trace_id = mika_common::trace::generate_trace_id();
+            let system_session = format!("system-{}", parent.agent_id);
+            let reason = format!(
+                "parent_completed_from_callback_backstop (pr_url: {})",
+                parent.pr_url
+            );
+
+            match self
+                .db
+                .update_task_completed(&parent.id, Some(&reason))
+                .await
+            {
+                Ok(true) => {
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_parent_completer",
+                            &parent.id,
+                            Some("in_progress"),
+                            Some("completed"),
+                            Some(&reason),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        warn!(
+                            parent_id = %parent.id,
+                            error = %e,
+                            "task_engine_parent_completer: failed to write audit event"
+                        );
+                    }
+
+                    // Surface pre-existing leaks reaped from before deploy
+                    // (mirror reaper's F6 pattern).
+                    let age_hours = compute_reaper_age_hours(&parent.created_at);
+                    if age_hours > 24 {
+                        info!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            pr_url = %parent.pr_url,
+                            age_hours,
+                            "task_engine_parent_completer: auto-completed pre-existing wedged \
+                             parent (possible backfill from before completer deployment)"
+                        );
+                    } else {
+                        info!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            pr_url = %parent.pr_url,
+                            "task_engine_parent_completer: auto-completed parent task on \
+                             callback success"
+                        );
+                    }
+                }
+                Ok(false) => {
+                    // Parent already transitioned away from in_progress
+                    // (race with inline path or operator action) — skip.
+                    debug!(
+                        parent_id = %parent.id,
+                        "task_engine_parent_completer: parent already in terminal state, skipping"
+                    );
+                }
+                Err(e) => {
+                    // Audit-event-on-error so operators catch silent failures
+                    // (mirror reaper's F5 pattern).
+                    let _ = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_parent_completer",
+                            &parent.id,
+                            Some("in_progress"),
+                            None,
+                            Some(&format!("completer_db_error: {e}")),
+                            Some(&trace_id),
+                        )
+                        .await;
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_parent_completer: db error during transition"
                     );
                 }
             }
@@ -1503,6 +1632,236 @@ mod tests {
         assert_eq!(
             task.status, "completed",
             "cli_mode should prevent engine from dispatching callbacks"
+        );
+    }
+
+    // -- complete_parent_tasks_on_callback_success tests (mika#1162) --
+
+    /// Helper: seed a `self_dev` parent in `in_progress` with `pr_url` metadata.
+    /// Adds a `delivered` implement-class callback child whose `updated_at`
+    /// is backdated past the reaper grace window.
+    async fn seed_completable_parent(db: &AsyncDatabase, pr_url: &str) -> (String, String) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement mika#1162".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        db.update_task_status(&parent_id, "in_progress")
+            .await
+            .unwrap();
+        let meta = format!(r#"{{"claude_pilot":{{"pr_url":"{pr_url}"}}}}"#);
+        db.update_task_metadata(&parent_id, &meta).await.unwrap();
+
+        let child = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let child_id = db.create_task(child).await.unwrap();
+        db.update_task_completed(&child_id, Some("done"))
+            .await
+            .unwrap();
+        db.mark_task_delivered(&child_id).await.unwrap();
+        // Backdate the delivered child past the grace window
+        backdate_task(db, &child_id).await;
+        (parent_id, child_id)
+    }
+
+    /// Test-only helper: shove `updated_at` back by 700s to push a task past
+    /// `REAPER_GRACE_SECONDS`. Uses `with_db` to drop into the underlying
+    /// connection — there is no public AsyncDatabase method for time travel.
+    async fn backdate_task(db: &AsyncDatabase, task_id: &str) {
+        let id = task_id.to_string();
+        db.with_db(move |inner| {
+            inner.conn.execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_complete_parent_tasks_on_callback_success_happy_path() {
+        let db = test_db();
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1234";
+        let (parent_id, _child_id) = seed_completable_parent(&db, pr_url).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.complete_parent_tasks_on_callback_success().await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "completed");
+        let result = parent.result.unwrap();
+        assert!(
+            result.contains("parent_completed_from_callback_backstop"),
+            "result must carry the backstop marker (distinct from inline path), got: {result}"
+        );
+        assert!(
+            result.contains(pr_url),
+            "result must embed the pr_url for audit traceability"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complete_parent_tasks_on_callback_success_idempotent_race_with_inline() {
+        // If the inline path already completed the parent, the periodic backstop
+        // is a no-op — the WHERE clause on `update_task_completed` guards it.
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, _child_id) = seed_completable_parent(&db, pr_url).await;
+
+        // Simulate the inline path having already completed the parent.
+        db.update_task_completed(&parent_id, Some("inline_path_won"))
+            .await
+            .unwrap();
+
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.complete_parent_tasks_on_callback_success().await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "completed");
+        // The inline path's reason must not be overwritten by the periodic
+        // backstop (note: this race is also blocked by the query filter
+        // `parent.status = 'in_progress'` — the WHERE clause is a second
+        // line of defense).
+        assert_eq!(parent.result.as_deref(), Some("inline_path_won"));
+    }
+
+    #[tokio::test]
+    async fn test_reaper_and_completer_orthogonal_on_pr_url() {
+        // Seed two parents: one with pr_url (completer territory), one without
+        // (reaper territory). After running both methods in the same tick, each
+        // handles its candidate without cross-contamination.
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/42";
+        let (completer_parent, _completer_child) = seed_completable_parent(&db, pr_url).await;
+
+        // Build a reaper candidate: same shape but no pr_url on the parent
+        // metadata. Manual setup since the helper always sets pr_url.
+        let parent_b = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement #other".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let reaper_parent = db.create_task(parent_b).await.unwrap();
+        db.update_task_status(&reaper_parent, "in_progress")
+            .await
+            .unwrap();
+
+        let child_b = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(reaper_parent.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let child_b_id = db.create_task(child_b).await.unwrap();
+        db.update_task_completed(&child_b_id, Some("done"))
+            .await
+            .unwrap();
+        db.mark_task_delivered(&child_b_id).await.unwrap();
+        backdate_task(&db, &child_b_id).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Run both methods in the same tick (matching the production order).
+        engine.reap_orphaned_parent_tasks().await;
+        engine.complete_parent_tasks_on_callback_success().await;
+
+        let p_completer = db
+            .get_task_unscoped(&completer_parent)
+            .await
+            .unwrap()
+            .unwrap();
+        let p_reaper = db.get_task_unscoped(&reaper_parent).await.unwrap().unwrap();
+        assert_eq!(
+            p_completer.status, "completed",
+            "parent with pr_url goes to completer"
+        );
+        assert_eq!(
+            p_reaper.status, "failed",
+            "parent without pr_url goes to reaper"
         );
     }
 }
