@@ -5156,14 +5156,14 @@ static ASSERTED_UNAVAILABILITY_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> 
             )
             .expect("asserted_unavailability pattern 1"),
             regex::Regex::new(
-                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) is not (?:available|callable|accessible)",
+                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) (?:is )?(?:\w+ly )?not (?:available|callable|accessible)",
             )
             .expect("asserted_unavailability pattern 2"),
             regex::Regex::new(
-                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) isn'?t (?:available|callable|accessible)",
+                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) isn'?t (?:\w+ly )?(?:available|callable|accessible)",
             )
             .expect("asserted_unavailability pattern 3"),
-            regex::Regex::new(r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) is skill-scoped")
+            regex::Regex::new(r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) (?:is )?skill-scoped")
                 .expect("asserted_unavailability pattern 4"),
             regex::Regex::new(r"(?i)\bcannot call (?:the )?(?P<tool>[a-z_][a-z0-9_]*)")
                 .expect("asserted_unavailability pattern 5"),
@@ -8912,6 +8912,85 @@ mod tests {
             asserted_unavailability_satisfied("gh_read", &enabled, &summaries),
             "Tool in enabled set with failed call = satisfied (attempt was made, \
              real failure surfaced — not a fabrication)"
+        );
+    }
+
+    // -- #894 asserted-unavailability elided-copula + adverb-interposed detection tests --
+
+    #[test]
+    fn test_detect_asserted_unavailability_elided_copula() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // Elided copula: "gh_read not callable in CLI session" (mika#893 verbatim shape)
+        assert_eq!(
+            detect_asserted_unavailability("gh_read not callable in CLI session", &enabled),
+            Some("gh_read".to_string()),
+            "Elided copula 'X not callable' must match (mika#893 shape)"
+        );
+        // Elided copula with "not available"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read not available here", &enabled),
+            Some("gh_read".to_string()),
+            "Elided copula 'X not available' must match"
+        );
+        // Elided copula with "not accessible"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read not accessible in this mode", &enabled),
+            Some("gh_read".to_string()),
+            "Elided copula 'X not accessible' must match"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_adverb_interposed() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // Adverb interposed with copula: "gh_read is structurally not callable" (mika#863 shape)
+        assert_eq!(
+            detect_asserted_unavailability(
+                "gh_read is structurally not callable in this session",
+                &enabled
+            ),
+            Some("gh_read".to_string()),
+            "Adverb-interposed 'X is structurally not callable' must match (mika#863 shape)"
+        );
+        // Adverb interposed without copula: "gh_read structurally not callable"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read structurally not callable", &enabled),
+            Some("gh_read".to_string()),
+            "Elided copula + adverb 'X structurally not callable' must match"
+        );
+        // Adverb interposed with isn't (P3): "gh_read isn't currently callable"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read isn't currently callable", &enabled),
+            Some("gh_read".to_string()),
+            "Adverb-interposed isn't 'X isn't currently callable' must match"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_elided_skill_scoped() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // Elided copula on skill-scoped: "gh_read skill-scoped" (mika#654 variant)
+        assert_eq!(
+            detect_asserted_unavailability("gh_read skill-scoped, not callable here", &enabled),
+            Some("gh_read".to_string()),
+            "Elided copula 'X skill-scoped' must match (mika#654 variant)"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_elided_copula_natural_language_filtered() {
+        let mut enabled = HashSet::new();
+        enabled.insert("search_memory".to_string());
+        // "service not available" — elided form of existing natural-language filter test.
+        // "service" is not in the enabled set → None.
+        assert_eq!(
+            detect_asserted_unavailability("the service not available right now", &enabled),
+            None,
+            "Natural language 'service not available' (elided copula) must still be \
+             filtered by the enabled-set lookup — 'service' is not a tool"
         );
     }
 
