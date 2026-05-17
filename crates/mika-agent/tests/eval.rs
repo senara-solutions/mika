@@ -73,4 +73,7 @@ mod eval {
     mod test_webhook_no_unauthorized_dispatch_guard;
     mod test_webhook_queue;
     mod test_webhook_zero_tools_guard;
+
+    // Multi-agent corpus parity: regression guard for #1155 search_content gap
+    mod kg_multi_agent_corpus_parity;
 }
