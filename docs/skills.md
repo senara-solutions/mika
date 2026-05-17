@@ -571,7 +571,7 @@ The **skill-review** skill provides `review_skill` for generating and persisting
 
 The **file-reader** skill (`always_on = true`) provides the `read_file` tool on every turn. It detects image files (JPEG, PNG, GIF, WebP) via `file --mime-type` and returns them using the `__mika_v1` envelope protocol for visual analysis by the agent, rather than dumping raw binary to stdout. Being always-on ensures `read_file` is available for image chaining (e.g., a screenshot skill saves a file, then the agent uses `read_file` to view it).
 
-The **github** skill provides `run_gh` for interacting with GitHub via the `gh` CLI. It uses an allowlist of safe subcommands (pr, issue, run, workflow, release, repo, search, label, milestone, project) and scrubs sensitive `MIKA_*` environment variables before execution. Requires `gh` CLI to be installed (included in Docker image).
+The **github** skill provides `run_gh` for interacting with GitHub via the `gh` CLI. It uses an allowlist of safe subcommands (pr, issue, run, workflow, release, repo, search, label, api) and scrubs sensitive `MIKA_*` environment variables before execution. The `api` subcommand enables REST and GraphQL operations (e.g., closing milestones via `gh api --method PATCH`); each `gh api` invocation emits a `gh_api_invocation` structured log event with `session_id`, `method`, and `path` fields for post-hoc observability. Requires `gh` CLI to be installed (included in Docker image).
 
 All bundled exec-handler scripts require `jq` for JSON input parsing and will fail with a clear error if `jq` is not found. The Docker agent image includes `jq`; CLI users must install it separately. Note: all exec-handler skills are excluded from heartbeat mode by `safe_always_on_skills()`.
 
