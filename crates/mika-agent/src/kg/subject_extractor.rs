@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use mika_common::llm::{LlmMessage, LlmProvider, LlmRequest, LlmRole, LlmUsage};
 
@@ -126,6 +126,16 @@ pub struct ExtractedEntity {
     pub description: Option<String>,
     pub chunk_indices: Vec<usize>,
     pub confidence: f64,
+    /// True when the LLM flagged this entity as not in the canonical roster
+    /// but clearly referenced in the document. Discovered entities skip
+    /// resolution entirely (`skipped_discovered_subject`) and never enter
+    /// the domain graph (sole-writer contract preserved).
+    #[serde(default)]
+    pub discovered: bool,
+    /// Required when `discovered == true`. Explains why the LLM believes
+    /// this entity should be added to the canonical set.
+    #[serde(default)]
+    pub discovery_reason: Option<String>,
 }
 
 /// A single extracted relationship.
@@ -184,13 +194,21 @@ impl std::error::Error for ValidationError {}
 ///
 /// Returns the validated output with any filtered entities/relationships removed,
 /// or a `ValidationError` if the output is structurally invalid.
+///
+/// `roster`: the domain entity roster from `load_roster_snapshot`. Used to
+/// validate that roster-constrained entities match the canonical set.
+/// `agent_id` and `doc_path`: for structured log events on roster mismatch.
 pub fn validate_extraction_output(
     output: &ExtractionOutput,
     max_chunk_index: usize,
+    roster: &RosterSnapshot,
+    agent_id: &str,
+    doc_path: &str,
 ) -> Result<ExtractionOutput, ValidationError> {
     let mut errors = Vec::new();
     let mut valid_entities = Vec::new();
     let mut valid_entity_keys: HashSet<String> = HashSet::new();
+    let roster_enforced = roster.is_extractable();
 
     // Validate entities
     for (i, entity) in output.entities.iter().enumerate() {
@@ -233,6 +251,56 @@ pub fn validate_extraction_output(
                 "entity[{i}]: confidence {} out of range [0.0, 1.0]",
                 entity.confidence
             ));
+        }
+
+        // Roster constraint check (#1158) — only for roster-constrained types.
+        if entity_errors.is_empty() && roster_enforced {
+            let is_roster_constrained =
+                ROSTER_CONSTRAINED_TYPES.contains(&entity.entity_type.as_str());
+
+            if is_roster_constrained {
+                if entity.discovered {
+                    // Discovered path: must have non-empty reason.
+                    if entity
+                        .discovery_reason
+                        .as_ref()
+                        .is_none_or(|r| r.trim().is_empty())
+                    {
+                        entity_errors.push(format!(
+                            "entity[{i}]: discovered=true requires non-empty discovery_reason"
+                        ));
+                    }
+                } else if !roster.contains(&entity.entity_type, &entity.name) {
+                    // Non-discovered must match roster — log + drop (F3 disposition).
+                    warn!(
+                        agent_id = %agent_id,
+                        doc = %doc_path,
+                        entity_type = %entity.entity_type,
+                        entity_name = %entity.name,
+                        chunk_indices = ?entity.chunk_indices,
+                        event = "subject_roster_mismatch",
+                        "LLM emitted non-roster entity without discovered=true; dropping"
+                    );
+                    entity_errors.push(format!(
+                        "entity[{i}]: type='{}' name='{}' not in canonical roster — \
+                         either match a roster entry or emit with discovered=true + discovery_reason",
+                        entity.entity_type, entity.name
+                    ));
+                }
+            } else {
+                // Non-roster-constrained types: still validate discovery_reason
+                // when discovered=true.
+                if entity.discovered
+                    && entity
+                        .discovery_reason
+                        .as_ref()
+                        .is_none_or(|r| r.trim().is_empty())
+                {
+                    entity_errors.push(format!(
+                        "entity[{i}]: discovered=true requires non-empty discovery_reason"
+                    ));
+                }
+            }
         }
 
         if entity_errors.is_empty() {
@@ -384,6 +452,117 @@ pub struct PreviousState {
 }
 
 // ---------------------------------------------------------------------------
+// Roster snapshot (#1158) — closed-set domain entity constraint
+// ---------------------------------------------------------------------------
+
+/// Roster-constrained entity types. All five `KG_DOMAIN_ENTITY_TYPES` minus
+/// `concept` (Q-pass1-A: concept names contain colons which the colon-rejection
+/// validator rule blocks; deferred to a follow-up ticket).
+const ROSTER_CONSTRAINED_TYPES: &[&str] = &["skill", "tool", "agent", "problem_type"];
+
+/// Why the roster looks the way it does. Drives empty-roster handling
+/// at the call site in `extract_pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterLoadState {
+    /// Successful load with N≥1 entries of at least one roster-constrained type.
+    Populated,
+    /// Successful load that returned zero rows, AND `kg_entities` itself has
+    /// zero rows of any type. `domain_builder` probably hasn't run yet on this
+    /// boot (transient).
+    UnbuiltGraph,
+    /// Successful load that returned zero rows for the roster types, but
+    /// `kg_entities` has rows of OTHER types. `domain_builder` ran but failed
+    /// to produce roster-relevant entities (permanent until fixed).
+    EmptyRosterTypes,
+}
+
+/// Snapshot of the canonical domain roster used for extraction-time
+/// constraint. Fetched once per `extract_pending` batch (#1158).
+#[derive(Debug, Clone)]
+pub struct RosterSnapshot {
+    /// Set of `(type, lowercase_name)` pairs, one per canonical entity
+    /// of a roster-constrained type.
+    members: HashSet<(String, String)>,
+    /// Rendered prompt section, ready to interpolate into
+    /// `build_extraction_prompt`. Empty when `members.is_empty()`.
+    rendered_section: String,
+    /// Why the roster looks the way it does.
+    load_state: RosterLoadState,
+}
+
+impl RosterSnapshot {
+    /// Create an empty roster snapshot (used as fallback when roster loading fails).
+    /// Extraction proceeds without roster enforcement when this is used.
+    pub fn empty() -> Self {
+        Self {
+            members: HashSet::new(),
+            rendered_section: String::new(),
+            load_state: RosterLoadState::UnbuiltGraph,
+        }
+    }
+
+    /// Check if a `(type, name)` pair is in the roster (case-insensitive on name).
+    pub fn contains(&self, entity_type: &str, name: &str) -> bool {
+        self.members
+            .contains(&(entity_type.to_string(), name.to_lowercase()))
+    }
+
+    /// True when the roster has zero members.
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// Number of roster entries.
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Pre-rendered prompt section for injection into `build_extraction_prompt`.
+    pub fn rendered_section(&self) -> &str {
+        &self.rendered_section
+    }
+
+    /// The load state discriminant.
+    pub fn load_state(&self) -> RosterLoadState {
+        self.load_state
+    }
+
+    /// True when the roster is safe to use for extraction.
+    pub fn is_extractable(&self) -> bool {
+        self.load_state == RosterLoadState::Populated
+    }
+
+    /// Build the rendered prompt section from the member set.
+    fn render_section(members: &HashSet<(String, String)>) -> String {
+        if members.is_empty() {
+            return String::new();
+        }
+
+        let mut sorted: Vec<_> = members.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut section = String::from(
+            "\nCanonical entity roster — the live set of entities present in this agent's \
+             domain graph. When the document references an entity of one of the roster-constrained \
+             types (skill, tool, agent, problem_type), the entity's name MUST match exactly \
+             one roster entry (case-insensitive). If the document references an entity \
+             of these types whose name is NOT in the roster, emit it with \
+             \"discovered\": true and a \"discovery_reason\" explaining why it should \
+             be added to the canonical set. If you are uncertain, omit the entity.\n\
+             \nEntities of type concept, solution_path, failure_mode, pattern \
+             are NOT roster-constrained — emit them freely.\n\
+             \nRoster:\n",
+        );
+
+        for (entity_type, name) in &sorted {
+            section.push_str(&format!("  {entity_type}: {name}\n"));
+        }
+
+        section
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SubjectExtractor (Units 2, 4, 5)
 // ---------------------------------------------------------------------------
 
@@ -431,14 +610,68 @@ impl SubjectExtractor {
         &self.docs_root_hash
     }
 
+    /// Load a snapshot of the canonical domain entity roster from `kg_entities`.
+    ///
+    /// Queries `kg_entities` for roster-constrained types and returns a
+    /// `RosterSnapshot` with a `RosterLoadState` discriminant that drives
+    /// empty-roster handling at the call site.
+    pub async fn load_roster_snapshot(&self) -> Result<RosterSnapshot> {
+        let db = self.db.clone();
+
+        db.with_db(move |db| {
+            // Fetch roster-constrained entities.
+            let mut stmt = db.conn.prepare(
+                "SELECT type, name FROM kg_entities \
+                 WHERE type IN ('skill', 'tool', 'agent', 'problem_type') \
+                 ORDER BY type, name",
+            )?;
+            let members: HashSet<(String, String)> = stmt
+                .query_map([], |row| {
+                    let entity_type: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    Ok((entity_type, name.to_lowercase()))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let load_state = if !members.is_empty() {
+                RosterLoadState::Populated
+            } else {
+                // Discriminate between UnbuiltGraph and EmptyRosterTypes.
+                let total_entities: i64 = db
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM kg_entities", [], |r| r.get(0))
+                    .unwrap_or(0);
+                if total_entities == 0 {
+                    RosterLoadState::UnbuiltGraph
+                } else {
+                    RosterLoadState::EmptyRosterTypes
+                }
+            };
+
+            let rendered_section = RosterSnapshot::render_section(&members);
+
+            Ok(RosterSnapshot {
+                members,
+                rendered_section,
+                load_state,
+            })
+        })
+        .await
+    }
+
     /// Core extraction entry point — invocation-context-agnostic.
     ///
     /// Reads the full doc from disk, builds a prompt with chunk markers,
     /// calls the LLM, validates output, and writes to DB in a single transaction.
+    ///
+    /// `roster`: pre-fetched roster snapshot from `load_roster_snapshot()`.
+    /// Passed by `extract_pending` once per batch (not per doc).
     pub async fn extract_document(
         &self,
         doc_path: &str,
         previous_state: Option<PreviousState>,
+        roster: &RosterSnapshot,
     ) -> Result<ExtractionStats> {
         let agent_id = self.db.agent_id.clone();
 
@@ -468,7 +701,7 @@ impl SubjectExtractor {
 
         // 3. Build prompt with chunk boundary markers.
         let annotated_text = self.build_annotated_text(&doc_text, &chunks);
-        let prompt = self.build_extraction_prompt(&annotated_text);
+        let prompt = self.build_extraction_prompt(&annotated_text, roster);
 
         // 4. LLM call with C2.2 retry taxonomy.
         let extraction_result = self.call_llm_with_retry(&prompt).await?;
@@ -482,8 +715,13 @@ impl SubjectExtractor {
             }
         };
 
-        let validated = match validate_extraction_output(&extraction_result.output, max_chunk_index)
-        {
+        let validated = match validate_extraction_output(
+            &extraction_result.output,
+            max_chunk_index,
+            roster,
+            &agent_id,
+            doc_path,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 warn!(
@@ -644,6 +882,43 @@ impl SubjectExtractor {
             return Ok(stats);
         }
 
+        // Load the domain roster once per batch (#1158). The roster is
+        // identical across all docs in a batch (rebuilt only at server boot).
+        let roster = self.load_roster_snapshot().await?;
+
+        match roster.load_state() {
+            RosterLoadState::Populated => {
+                info!(
+                    trace_id = %self.trace_id,
+                    agent_id = %agent_id,
+                    roster_entries = roster.member_count(),
+                    event = "extraction_roster_loaded",
+                    "loaded domain roster for extraction constraint"
+                );
+            }
+            RosterLoadState::UnbuiltGraph => {
+                warn!(
+                    trace_id = %self.trace_id,
+                    agent_id = %agent_id,
+                    event = "extraction_roster_unbuilt",
+                    "kg_entities is empty; domain_builder has not yet populated — skipping extraction batch"
+                );
+                stats.duration_ms = start.elapsed().as_millis() as u64;
+                return Ok(stats);
+            }
+            RosterLoadState::EmptyRosterTypes => {
+                error!(
+                    trace_id = %self.trace_id,
+                    agent_id = %agent_id,
+                    event = "extraction_roster_failed",
+                    "kg_entities has rows but zero of roster types (skill, tool, agent, problem_type); \
+                     domain_builder likely failed — skipping extraction batch"
+                );
+                stats.duration_ms = start.elapsed().as_millis() as u64;
+                return Ok(stats);
+            }
+        }
+
         for (i, doc_path) in pending_docs.iter().enumerate() {
             // Budget guard: abort cleanly once we've made `budget` LLM calls.
             if stats.llm_calls >= budget {
@@ -665,7 +940,7 @@ impl SubjectExtractor {
             // atomically with the extraction results (#757 review P1). No
             // separate record_extraction call here — on Err, no marker is
             // written and the doc stays pending (budget-bounded retry).
-            match self.extract_document(doc_path, None).await {
+            match self.extract_document(doc_path, None, &roster).await {
                 Ok(doc_stats) => {
                     stats.docs_extracted += 1;
                     stats.total_entities += doc_stats.entities_upserted;
@@ -823,7 +1098,21 @@ impl SubjectExtractor {
     }
 
     /// Build the extraction prompt.
-    fn build_extraction_prompt(&self, annotated_text: &str) -> (String, String) {
+    ///
+    /// When the roster is populated, it is injected between the approved-types
+    /// section and the Rules section. The schema example gains optional
+    /// `discovered` and `discovery_reason` fields.
+    fn build_extraction_prompt(
+        &self,
+        annotated_text: &str,
+        roster: &RosterSnapshot,
+    ) -> (String, String) {
+        let roster_section = if roster.is_extractable() {
+            roster.rendered_section().to_string()
+        } else {
+            String::new()
+        };
+
         let system = format!(
             r#"You are a knowledge graph extraction agent. Extract named entities and fact triples from the following document.
 
@@ -837,7 +1126,9 @@ Return ONLY valid JSON matching this schema:
       "name": "<lowercase_underscore_name>",
       "description": "<brief description>",
       "chunk_indices": [<int>, ...],
-      "confidence": <0.0-1.0>
+      "confidence": <0.0-1.0>,
+      "discovered": <bool, optional, default false>,
+      "discovery_reason": "<reason, required when discovered=true>"
     }}
   ],
   "relationships": [
@@ -855,7 +1146,7 @@ Return ONLY valid JSON matching this schema:
 
 Approved entity types: {approved_entity_types}
 Approved relationship types: {approved_rel_types}
-
+{roster_section}
 Relationship type constraints:
 - SOLVED_BY: from problem_type to solution_path
 - USES: from solution_path to skill
@@ -878,6 +1169,7 @@ Rules:
                 .map(|c| c.rel_type)
                 .collect::<Vec<_>>()
                 .join(", "),
+            roster_section = roster_section,
         );
 
         (system, annotated_text.to_string())
@@ -1159,14 +1451,17 @@ Rules:
                         .description
                         .as_ref()
                         .map(|d| format!(r#"{{"description":{}}}"#, serde_json::to_string(d).unwrap_or_default()));
+                    let discovered_int: i64 = if entity.discovered { 1 } else { 0 };
 
                     tx.execute(
-                        "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence, properties_json, trace_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                        "INSERT INTO kg_subject_entities (docs_root_hash, docs_root, entity_key, type, name, confidence, properties_json, trace_id, discovered, discovery_reason)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                          ON CONFLICT(docs_root_hash, entity_key) DO UPDATE SET
                             confidence = MAX(excluded.confidence, kg_subject_entities.confidence),
                             properties_json = COALESCE(excluded.properties_json, kg_subject_entities.properties_json),
-                            trace_id = excluded.trace_id",
+                            trace_id = excluded.trace_id,
+                            discovered = MAX(excluded.discovered, kg_subject_entities.discovered),
+                            discovery_reason = COALESCE(excluded.discovery_reason, kg_subject_entities.discovery_reason)",
                         rusqlite::params![
                             docs_root_hash,
                             docs_root_display,
@@ -1176,6 +1471,8 @@ Rules:
                             entity.confidence,
                             props,
                             trace_id,
+                            discovered_int,
+                            entity.discovery_reason,
                         ],
                     )?;
 
@@ -1651,13 +1948,54 @@ fn extract_first_json_object(text: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    /// Helper: build a populated roster for testing.
+    fn test_roster() -> RosterSnapshot {
+        let mut members = HashSet::new();
+        members.insert(("tool".to_string(), "run_gh".to_string()));
+        members.insert(("tool".to_string(), "search_memory".to_string()));
+        members.insert(("skill".to_string(), "self_dev".to_string()));
+        members.insert(("skill".to_string(), "dev_pilot".to_string()));
+        members.insert(("agent".to_string(), "mika_dev".to_string()));
+        members.insert(("agent".to_string(), "mika_arch".to_string()));
+        members.insert(("problem_type".to_string(), "ci_failure".to_string()));
+        members.insert(("problem_type".to_string(), "fabrication".to_string()));
+        let rendered_section = RosterSnapshot::render_section(&members);
+        RosterSnapshot {
+            members,
+            rendered_section,
+            load_state: RosterLoadState::Populated,
+        }
+    }
+
+    /// Helper: validate with an empty roster (roster enforcement disabled).
+    fn validate_no_roster(
+        output: &ExtractionOutput,
+        max_chunk_index: usize,
+    ) -> Result<ExtractionOutput, ValidationError> {
+        let roster = RosterSnapshot::empty();
+        validate_extraction_output(output, max_chunk_index, &roster, "test-agent", "test.md")
+    }
+
+    /// Helper: create a basic entity for testing.
+    fn entity(entity_type: &str, name: &str) -> ExtractedEntity {
+        ExtractedEntity {
+            entity_type: entity_type.to_string(),
+            name: name.to_string(),
+            description: None,
+            chunk_indices: vec![0],
+            confidence: 0.8,
+            discovered: false,
+            discovery_reason: None,
+        }
+    }
+
     #[test]
     fn validate_empty_output() {
         let output = ExtractionOutput {
             entities: vec![],
             relationships: vec![],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert!(validated.entities.is_empty());
@@ -1673,10 +2011,12 @@ mod tests {
                 description: Some("LLM generates ungrounded content".to_string()),
                 chunk_indices: vec![0, 2],
                 confidence: 0.9,
+                discovered: false,
+                discovery_reason: None,
             }],
             relationships: vec![],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().entities.len(), 1);
     }
@@ -1690,10 +2030,12 @@ mod tests {
                 description: None,
                 chunk_indices: vec![0],
                 confidence: 0.8,
+                discovered: false,
+                discovery_reason: None,
             }],
             relationships: vec![],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         // All entities rejected → error
         assert!(result.is_err());
     }
@@ -1707,10 +2049,12 @@ mod tests {
                 description: None,
                 chunk_indices: vec![0],
                 confidence: 0.8,
+                discovered: false,
+                discovery_reason: None,
             }],
             relationships: vec![],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_err());
     }
 
@@ -1723,10 +2067,12 @@ mod tests {
                 description: None,
                 chunk_indices: vec![],
                 confidence: 0.8,
+                discovered: false,
+                discovery_reason: None,
             }],
             relationships: vec![],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_err());
     }
 
@@ -1739,10 +2085,12 @@ mod tests {
                 description: None,
                 chunk_indices: vec![0],
                 confidence: 1.5,
+                discovered: false,
+                discovery_reason: None,
             }],
             relationships: vec![],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_err());
     }
 
@@ -1756,6 +2104,8 @@ mod tests {
                     description: None,
                     chunk_indices: vec![0],
                     confidence: 0.9,
+                    discovered: false,
+                    discovery_reason: None,
                 },
                 ExtractedEntity {
                     entity_type: "solution_path".to_string(),
@@ -1763,6 +2113,8 @@ mod tests {
                     description: None,
                     chunk_indices: vec![1],
                     confidence: 0.85,
+                    discovered: false,
+                    discovery_reason: None,
                 },
             ],
             relationships: vec![ExtractedRelationship {
@@ -1775,7 +2127,7 @@ mod tests {
                 confidence: 0.85,
             }],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert_eq!(validated.relationships.len(), 1);
@@ -1791,6 +2143,8 @@ mod tests {
                     description: None,
                     chunk_indices: vec![0],
                     confidence: 0.9,
+                    discovered: false,
+                    discovery_reason: None,
                 },
                 ExtractedEntity {
                     entity_type: "solution_path".to_string(),
@@ -1798,6 +2152,8 @@ mod tests {
                     description: None,
                     chunk_indices: vec![1],
                     confidence: 0.85,
+                    discovered: false,
+                    discovery_reason: None,
                 },
             ],
             relationships: vec![ExtractedRelationship {
@@ -1811,7 +2167,7 @@ mod tests {
                 confidence: 0.85,
             }],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_ok());
         // Relationship filtered, entities survive
         let validated = result.unwrap();
@@ -1828,6 +2184,8 @@ mod tests {
                 description: None,
                 chunk_indices: vec![0],
                 confidence: 0.9,
+                discovered: false,
+                discovery_reason: None,
             }],
             relationships: vec![ExtractedRelationship {
                 from_type: "problem_type".to_string(),
@@ -1839,7 +2197,7 @@ mod tests {
                 confidence: 0.85,
             }],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert_eq!(validated.entities.len(), 1);
@@ -1856,6 +2214,8 @@ mod tests {
                     description: None,
                     chunk_indices: vec![0],
                     confidence: 0.9,
+                    discovered: false,
+                    discovery_reason: None,
                 },
                 ExtractedEntity {
                     entity_type: "bad_type".to_string(),
@@ -1863,11 +2223,13 @@ mod tests {
                     description: None,
                     chunk_indices: vec![1],
                     confidence: 0.8,
+                    discovered: false,
+                    discovery_reason: None,
                 },
             ],
             relationships: vec![],
         };
-        let result = validate_extraction_output(&output, 5);
+        let result = validate_no_roster(&output, 5);
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert_eq!(validated.entities.len(), 1);
@@ -2000,5 +2362,205 @@ mod tests {
         // The extracted JSON is schema-invalid (missing "relationships")
         let parse_result: Result<ExtractionOutput, _> = serde_json::from_str(result.unwrap());
         assert!(parse_result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Roster constraint tests (#1158)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn roster_matched_entity_validates() {
+        // AC-4: roster-constrained entity matching (type, name) validates.
+        let output = ExtractionOutput {
+            entities: vec![entity("problem_type", "fabrication")],
+            relationships: vec![],
+        };
+        let roster = test_roster();
+        let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().entities.len(), 1);
+    }
+
+    #[test]
+    fn roster_mismatch_without_discovered_drops_entity() {
+        // AC-5: non-roster entity without discovered=true is rejected.
+        let output = ExtractionOutput {
+            entities: vec![entity("agent", "vincent")],
+            relationships: vec![],
+        };
+        let roster = test_roster();
+        let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
+        // All entities rejected → error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn roster_discovered_without_reason_fails() {
+        // AC-6: discovered=true with empty reason fails.
+        let mut e = entity("tool", "tailwind");
+        e.discovered = true;
+        // no discovery_reason
+
+        let output = ExtractionOutput {
+            entities: vec![e],
+            relationships: vec![],
+        };
+        let roster = test_roster();
+        let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn roster_discovered_with_empty_reason_fails() {
+        // AC-6: discovered=true with whitespace-only reason fails.
+        let mut e = entity("tool", "tailwind");
+        e.discovered = true;
+        e.discovery_reason = Some("   ".to_string());
+
+        let output = ExtractionOutput {
+            entities: vec![e],
+            relationships: vec![],
+        };
+        let roster = test_roster();
+        let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn roster_discovered_with_reason_validates() {
+        // AC-7: discovered=true with non-empty reason validates (even non-roster).
+        let mut e = entity("tool", "tailwind");
+        e.discovered = true;
+        e.discovery_reason = Some("CSS framework referenced in doc".to_string());
+
+        let output = ExtractionOutput {
+            entities: vec![e],
+            relationships: vec![],
+        };
+        let roster = test_roster();
+        let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
+        assert!(result.is_ok());
+        let validated = result.unwrap();
+        assert_eq!(validated.entities.len(), 1);
+        assert!(validated.entities[0].discovered);
+    }
+
+    #[test]
+    fn non_roster_constrained_types_unaffected_by_roster() {
+        // AC-8: concept, solution_path, failure_mode, pattern are NOT
+        // roster-constrained.
+        let output = ExtractionOutput {
+            entities: vec![
+                entity("solution_path", "grounding_validation"),
+                entity("failure_mode", "phantom_entity"),
+                entity("pattern", "defensive_check"),
+                // concept would fail the colon-check if it had colons,
+                // but flat concept names pass through.
+                entity("concept", "test_concept"),
+            ],
+            relationships: vec![],
+        };
+        let roster = test_roster();
+        let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().entities.len(), 4);
+    }
+
+    #[test]
+    fn empty_roster_skips_roster_enforcement() {
+        // AC-9: empty roster (UnbuiltGraph) means roster enforcement is off.
+        let output = ExtractionOutput {
+            entities: vec![entity("agent", "vincent")], // not in any roster
+            relationships: vec![],
+        };
+        let empty_roster = RosterSnapshot::empty();
+        let result = validate_extraction_output(&output, 5, &empty_roster, "test-agent", "test.md");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().entities.len(), 1);
+    }
+
+    #[test]
+    fn roster_case_insensitive_match() {
+        // Roster matching is case-insensitive on name.
+        let output = ExtractionOutput {
+            entities: vec![entity("problem_type", "Fabrication")],
+            relationships: vec![],
+        };
+        let roster = test_roster();
+        let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn roster_snapshot_render_section() {
+        let roster = test_roster();
+        let section = roster.rendered_section();
+        assert!(section.contains("Canonical entity roster"));
+        assert!(section.contains("agent: mika_dev"));
+        assert!(section.contains("tool: run_gh"));
+        assert!(section.contains("skill: self_dev"));
+        assert!(section.contains("problem_type: fabrication"));
+    }
+
+    #[test]
+    fn roster_snapshot_contains() {
+        let roster = test_roster();
+        assert!(roster.contains("tool", "run_gh"));
+        assert!(roster.contains("tool", "RUN_GH")); // case-insensitive
+        assert!(!roster.contains("tool", "nonexistent"));
+        assert!(!roster.contains("concept", "anything")); // concept not in roster
+    }
+
+    #[test]
+    fn roster_load_state_extractable() {
+        let roster = test_roster();
+        assert!(roster.is_extractable());
+        assert!(!roster.is_empty());
+
+        let empty = RosterSnapshot::empty();
+        assert!(!empty.is_extractable());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn discovered_fields_serde_default() {
+        // Forward-compatible: old LLM outputs without discovered/discovery_reason
+        // parse correctly with defaults.
+        let json = r#"{"type": "tool", "name": "run_gh", "chunk_indices": [0], "confidence": 0.9}"#;
+        let entity: ExtractedEntity = serde_json::from_str(json).unwrap();
+        assert!(!entity.discovered);
+        assert!(entity.discovery_reason.is_none());
+    }
+
+    #[test]
+    fn discovered_fields_serde_roundtrip() {
+        let e = ExtractedEntity {
+            entity_type: "tool".to_string(),
+            name: "tailwind".to_string(),
+            description: None,
+            chunk_indices: vec![0],
+            confidence: 0.8,
+            discovered: true,
+            discovery_reason: Some("CSS framework".to_string()),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: ExtractedEntity = serde_json::from_str(&json).unwrap();
+        assert!(parsed.discovered);
+        assert_eq!(parsed.discovery_reason.as_deref(), Some("CSS framework"));
+    }
+
+    #[test]
+    fn non_roster_type_discovered_without_reason_fails() {
+        // Even for non-roster-constrained types, discovered=true requires reason.
+        let mut e = entity("solution_path", "my_solution");
+        e.discovered = true;
+
+        let output = ExtractionOutput {
+            entities: vec![e],
+            relationships: vec![],
+        };
+        let roster = test_roster();
+        let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
+        assert!(result.is_err());
     }
 }

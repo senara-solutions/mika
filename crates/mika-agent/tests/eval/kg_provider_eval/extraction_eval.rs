@@ -334,6 +334,8 @@ mod tests {
                 description: None,
                 chunk_indices: vec![0],
                 confidence: 0.9,
+                discovered: false,
+                discovery_reason: None,
             }],
             relationships: vec![],
         };
@@ -349,6 +351,8 @@ mod tests {
                 description: None,
                 chunk_indices: vec![0],
                 confidence: 0.9,
+                discovered: false,
+                discovery_reason: None,
             }],
             relationships: vec![],
         };

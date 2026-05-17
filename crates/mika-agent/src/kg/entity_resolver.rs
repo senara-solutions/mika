@@ -61,6 +61,7 @@ mod outcome {
     pub const NO_MATCH: &str = "no_match";
     pub const NO_CANDIDATE_OF_TYPE: &str = "no_candidate_of_type";
     pub const SKIPPED_DISCOVERED_TYPE: &str = "skipped_discovered_type";
+    pub const SKIPPED_DISCOVERED_SUBJECT: &str = "skipped_discovered_subject";
     pub const SKIPPED_NO_LLM: &str = "skipped_no_llm";
     pub const ERROR: &str = "error";
 }
@@ -84,6 +85,9 @@ struct PendingEntity {
     /// meaning its prior `no_match` resolution log row was deleted by
     /// domain-graph rebuild invalidation (#960).
     was_invalidated: bool,
+    /// True when the subject was flagged as `discovered` by the extractor (#1158).
+    /// Discovered subjects skip resolution entirely — no domain counterpart.
+    discovered: bool,
 }
 
 /// A domain entity candidate for disambiguation.
@@ -128,6 +132,9 @@ enum ResolutionResult {
     NoCandidateOfType,
     /// Discovered type — no domain counterpart.
     SkippedDiscoveredType,
+    /// Discovered subject — the extractor flagged this entity as `discovered=true`
+    /// (not in the canonical roster). No domain counterpart (#1158).
+    SkippedDiscoveredSubject,
     /// No LLM configured and exact match failed.
     SkippedNoLlm,
     /// Per-batch LLM budget exhausted — entity stays pending for next run (#757).
@@ -519,6 +526,17 @@ impl SubjectEntityResolver {
                 .await;
                 stats.skipped_discovered += 1;
             }
+            ResolutionResult::SkippedDiscoveredSubject => {
+                self.write_log(
+                    entity.id,
+                    outcome::SKIPPED_DISCOVERED_SUBJECT,
+                    extraction_trace_id,
+                    None,
+                    Some(duration_ms),
+                )
+                .await;
+                stats.skipped_discovered += 1;
+            }
             ResolutionResult::SkippedNoLlm => {
                 self.write_log(
                     entity.id,
@@ -572,6 +590,11 @@ impl SubjectEntityResolver {
         // D8: Discovered types skip resolution entirely.
         if !KG_DOMAIN_ENTITY_TYPES.contains(&entity.entity_type.as_str()) {
             return (ResolutionResult::SkippedDiscoveredType, false);
+        }
+
+        // #1158: Discovered subjects (flagged by the extractor) skip resolution.
+        if entity.discovered {
+            return (ResolutionResult::SkippedDiscoveredSubject, false);
         }
 
         // Stage 1: Exact match (D1).
@@ -933,7 +956,7 @@ impl SubjectEntityResolver {
                     docs_root_hashes.iter().map(|_| "?".to_string()).collect();
                 let id_placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
                 let sql = format!(
-                    "SELECT id, entity_key, type, name, confidence, docs_root_hash
+                    "SELECT id, entity_key, type, name, confidence, docs_root_hash, discovered
                      FROM kg_subject_entities
                      WHERE docs_root_hash IN ({}) AND id IN ({})",
                     hash_placeholders.join(","),
@@ -959,6 +982,7 @@ impl SubjectEntityResolver {
                             // Compound-hook path resolves freshly extracted
                             // entities, not invalidation reattempts (#961).
                             was_invalidated: false,
+                            discovered: row.get::<_, i64>(6)? != 0,
                         })
                     })?
                     .filter_map(|r| r.ok())
@@ -1087,7 +1111,8 @@ impl SubjectEntityResolver {
             .with_db(move |db| {
                 let sql =
                     "SELECT e.id, e.entity_key, e.type, e.name, e.confidence, e.docs_root_hash,
-                            (inv.subject_entity_id IS NOT NULL) AS was_invalidated
+                            (inv.subject_entity_id IS NOT NULL) AS was_invalidated,
+                            e.discovered
                      FROM kg_subject_entities e
                      LEFT JOIN kg_resolutions_log r
                          ON r.subject_entity_id = e.id AND r.agent_id = ?1
@@ -1117,6 +1142,7 @@ impl SubjectEntityResolver {
                             confidence: row.get(4)?,
                             docs_root_hash: row.get(5)?,
                             was_invalidated: row.get::<_, i64>(6)? != 0,
+                            discovered: row.get::<_, i64>(7)? != 0,
                         })
                     })?
                     .filter_map(|r| r.ok())
@@ -1832,6 +1858,7 @@ mod tests {
             confidence: 0.85,
             docs_root_hash: "0000000000000000".to_string(),
             was_invalidated: false,
+            discovered: false,
         };
 
         let candidates = vec![

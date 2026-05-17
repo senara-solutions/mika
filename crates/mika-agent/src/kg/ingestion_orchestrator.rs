@@ -132,7 +132,43 @@ impl IngestionOrchestrator {
                 Some(&self.trace_id),
             );
 
-            match extractor.extract_document(&rel_path, None).await {
+            // Load roster for extraction-time constraint (#1158).
+            // On load failure or non-Populated state, skip extraction entirely
+            // (mirrors extract_pending's safety guard — never extract against
+            // an untrusted roster).
+            let roster = match extractor.load_roster_snapshot().await {
+                Ok(r) if r.is_extractable() => r,
+                Ok(r) => {
+                    warn!(
+                        trace_id = %self.trace_id,
+                        agent_id = %agent_id,
+                        doc = %rel_path,
+                        load_state = ?r.load_state(),
+                        event = "compound_roster_not_extractable",
+                        "roster not extractable for compound extraction — skipping"
+                    );
+                    return Ok(CompoundResult {
+                        ingest_stats,
+                        extraction_stats: None,
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        trace_id = %self.trace_id,
+                        agent_id = %agent_id,
+                        doc = %rel_path,
+                        error = %e,
+                        event = "compound_roster_load_failed",
+                        "failed to load roster for compound extraction — skipping"
+                    );
+                    return Ok(CompoundResult {
+                        ingest_stats,
+                        extraction_stats: None,
+                    });
+                }
+            };
+
+            match extractor.extract_document(&rel_path, None, &roster).await {
                 Ok(stats) => {
                     // extract_document writes the kg_extractions marker
                     // atomically with the extraction results (#757 review P1),
@@ -211,7 +247,43 @@ impl IngestionOrchestrator {
                     Some(&self.trace_id),
                 );
 
-                match extractor.extract_document(&rel_path, Some(prev)).await {
+                // Load roster for extraction-time constraint (#1158).
+                // On load failure or non-Populated state, skip re-extraction
+                // (mirrors extract_pending's safety guard).
+                let roster = match extractor.load_roster_snapshot().await {
+                    Ok(r) if r.is_extractable() => r,
+                    Ok(r) => {
+                        warn!(
+                            trace_id = %self.trace_id,
+                            doc = %rel_path,
+                            load_state = ?r.load_state(),
+                            event = "compound_roster_not_extractable",
+                            "roster not extractable for reingest extraction — skipping"
+                        );
+                        return Ok(CompoundResult {
+                            ingest_stats,
+                            extraction_stats: None,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(
+                            trace_id = %self.trace_id,
+                            doc = %rel_path,
+                            error = %e,
+                            event = "compound_roster_load_failed",
+                            "failed to load roster for reingest extraction — skipping"
+                        );
+                        return Ok(CompoundResult {
+                            ingest_stats,
+                            extraction_stats: None,
+                        });
+                    }
+                };
+
+                match extractor
+                    .extract_document(&rel_path, Some(prev), &roster)
+                    .await
+                {
                     Ok(stats) => {
                         // extract_document writes the kg_extractions marker
                         // atomically with the extraction results (#757 review P1).
