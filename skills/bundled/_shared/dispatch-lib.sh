@@ -9,10 +9,14 @@
 # Callers MUST NOT set their own EXIT trap (it would be overwritten silently —
 # bash trap is process-scoped, not function-scoped).
 #
-# One host skill (dev-pilot) owns the `run_claude_pilot` tool with a union-enum
-# `skill` parameter. Sibling skills in the self-dev family extend the enum and
-# add a case in this lib's skill→entry mapping. Sibling skills do not register
-# their own `run_claude_pilot`. See mika#932 for context.
+# Per-skill tool ownership (mika#1173 restored after the prompt-only design
+# regressed 5 times since #934): each dispatch skill registers its OWN tool —
+# dev-pilot owns `run_claude_pilot` (skill enum: ["dev-pilot"], entry /mika),
+# dev-groom owns `run_claude_pilot_groom` (skill enum: ["dev-groom"], entry
+# /mika-groom-ticket). Both handlers source this lib and call
+# dispatch_claude_pilot; the case switch on $SKILL routes to the right entry
+# command. The skill field stays required on both tools for engine
+# dispatch-class derivation (executor.rs derive_dispatch_class).
 
 # --- Internal helpers (underscore-prefixed, not part of the API contract) ---
 
@@ -354,6 +358,22 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         mkdir -p "$WORKTREE_DIR/.claude"
         cp "$PLATFORM_DIR/.claude/claude-pilot.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
         cp "$PLATFORM_DIR/.claude/settings.local.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+        # Copy slash commands so the inner Claude Code session can resolve
+        # /mika, /mika-groom-ticket, /ce:plan-adjacent commands, etc. Without
+        # this, --command "/mika-groom-ticket" arrives as raw text in the
+        # inner session and the LLM has to improvise (mika#1173).
+        #
+        # Snapshot semantics: the cp is taken at worktree-creation time. If a
+        # command file at the platform root is edited after worktree creation
+        # but before the inner session completes, the inner session sees the
+        # pre-edit version. Acceptable because worktrees are short-lived
+        # (per-task, <2h typical) and mid-session edits to /mika or
+        # /mika-groom-ticket violate the slug-immutability principle (mika#844).
+        # Matches dispatch-lib's other worktree-prep behavior (claude-pilot.json
+        # and settings.local.json are also snapshotted).
+        if [ -d "$PLATFORM_DIR/.claude/commands" ]; then
+            cp -r "$PLATFORM_DIR/.claude/commands" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+        fi
 
         CWD_ARGS="--cwd $WORKTREE_DIR"
         if [ -f "$WORKTREE_DIR/.claude/claude-pilot.json" ]; then
@@ -698,15 +718,21 @@ dispatch_claude_pilot() {
 
     _validate_inputs
 
-    # SIBLING SKILL DISPATCH MAPPING (mika#932)
-    # Each arm maps a sibling skill to its slash-command entry point.
-    # Adding a sibling requires:
-    #   1. Add a new arm here.
-    #   2. Widen dev-pilot/tools.json `skill.enum` to include the new value.
-    #   3. Update self-dev/system_prompt.md to teach mika-dev when to dispatch.
-    # Threshold for refactor: if N>5 siblings, escalate to skill-scoped tool
-    # registries (Option C from mika#932). Until then, this case switch is
-    # the contract.
+    # PER-SKILL DISPATCH MAPPING (mika#932 origin, mika#1173 per-tool revert)
+    # Each arm maps a SKILL value to its slash-command entry point. After the
+    # mika#1173 revert, each dispatch skill owns its own tool (dev-pilot →
+    # run_claude_pilot, dev-groom → run_claude_pilot_groom), so a given arm
+    # fires only when the matching tool's handler sources this lib.
+    # Adding a new dispatch sibling requires:
+    #   1. Create the skill's tools.json registering its own tool name.
+    #   2. Create the skill's handlers/run.sh that sources this lib and calls
+    #      dispatch_claude_pilot.
+    #   3. Add a new arm below mapping its SKILL value → ENTRY_COMMAND.
+    #   4. Add the skill to the relevant well-known agent allowlist
+    #      (well_known_agents.rs MIKA_*_IDENTITY).
+    #   5. Update self-dev/system_prompt.md to teach mika-dev when to dispatch.
+    # Threshold for refactor: if N>5 dispatch skills, consider engine-side
+    # routing helpers. Until then, the case switch is the contract.
     local ENTRY_COMMAND
     case "$SKILL" in
       dev-pilot)

@@ -1,6 +1,7 @@
 ---
 title: Shared dispatch library for claude-pilot skills
 date: 2026-04-29
+last_updated: 2026-05-17
 category: best-practices
 module: skills
 problem_type: best_practice
@@ -23,6 +24,26 @@ tags:
 
 # Shared dispatch library for claude-pilot skills
 
+> **SUPERSEDED IN PART (2026-05-17, mika#1173).** The union-enum-on-host
+> tool registration described below ("dev-pilot owns the only `run_claude_pilot`
+> tool with `skill.enum = ["dev-pilot", "dev-groom"]`; dev-groom is prompt-only,
+> no `tools.json`, no handler") regressed five times between 2026-05-02 and
+> 2026-05-17. It was reverted to per-skill tool registration in mika#1173.
+>
+> Current guidance for **tool registration**: see
+> `per-skill-tool-registration-for-dispatch-family-2026-05-17.md`. Each dispatch
+> skill owns its own tool (`run_claude_pilot` for dev-pilot,
+> `run_claude_pilot_groom` for dev-groom). Adding a new sibling now requires
+> creating that sibling's own `tools.json` + `handlers/run.sh` (still a thin
+> 6-line wrapper).
+>
+> The rest of this doc — the **shared library itself** (`_shared/dispatch-lib.sh`),
+> centralized slug derivation, env scrubbing, EXIT trap, callback delivery,
+> worktree reuse — remains correct and load-bearing. Only the tool-registration
+> shape changed. The case switch on `$SKILL` inside the lib still routes both
+> tools' handlers; per-skill ownership is about the surface mika-dev sees, not
+> the plumbing.
+
 ## Context
 
 dev-pilot and dev-groom are conceptually the same dispatch shape: both wrap a headless Claude Code session via claude-pilot, both create/reuse a worktree on a derived branch, both pass operator-supplied context as the entry prompt. The only meaningful difference is the slash command claude-pilot enters with: `/mika` (dev-pilot) vs `/mika-groom-ticket` (dev-groom).
@@ -34,7 +55,12 @@ Before this refactoring (#893), they were maintained as independent copies. dev-
 
 ## Guidance
 
-All claude-pilot dispatch skills share a single library at `skills/bundled/_shared/dispatch-lib.sh`. One host skill (dev-pilot) owns the `run_claude_pilot` tool with a union-enum `skill` parameter (`["dev-pilot", "dev-groom"]`). Sibling skills (dev-groom) are prompt-only — they provide `skill.toml` + `system_prompt.md` but no `tools.json` or handlers. The host skill's handler sources the library and calls the single entrypoint:
+> **Tool registration shape changed in mika#1173** — see banner above and
+> the superseding doc. The description below reflects the pre-2026-05-17
+> design (union-enum on host). The shared library plumbing it describes
+> is still current; only the tool-ownership model changed.
+
+All claude-pilot dispatch skills share a single library at `skills/bundled/_shared/dispatch-lib.sh`. (Pre-mika#1173:) One host skill (dev-pilot) owned the `run_claude_pilot` tool with a union-enum `skill` parameter (`["dev-pilot", "dev-groom"]`); sibling skills (dev-groom) were prompt-only — they provided `skill.toml` + `system_prompt.md` but no `tools.json` or handlers. The host skill's handler sourced the library and called the single entrypoint:
 
 ```bash
 #!/bin/bash

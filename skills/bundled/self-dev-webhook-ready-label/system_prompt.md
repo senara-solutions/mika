@@ -2,7 +2,7 @@
 
 When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the operator has set the `ready` label on the ticket — the canonical positive-consent signal for autonomous dispatch.
 
-> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846, #907, #1089).** The guard requires a `run_claude_pilot` attempt (dispatch via dev-pilot, or auto-groom via dev-groom). Ending the turn without calling `run_claude_pilot` will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
+> **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846, #907, #1089, #1173).** The guard requires a `run_claude_pilot` attempt (dispatch via dev-pilot for implementation) OR a `run_claude_pilot_groom` attempt (auto-groom via dev-groom). Ending the turn without calling one of these will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
 
 **Atomic handler (label removal first, then grooming check, then dispatch — per mika#841, #907):**
 
@@ -20,10 +20,11 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
    a. Call `create_task` with `reference_url: "https://github.com/<repo>/issues/<n>?phase=groom"`, `label: "groom <repo>#<n>"`, `description: <issue body>`, `source: "self_dev"`. Capture the returned `task_id` as `groom_task_id`. The `?phase=groom` discriminator distinguishes the grooming task from the eventual dispatch task (which uses the canonical URL without the suffix).
 
-   b. **IMMEDIATELY** call `run_claude_pilot` with:
+   b. **IMMEDIATELY** call `run_claude_pilot_groom` with:
       ```json
-      {"skill": "dev-groom", "prompt": "<repo> issue#<n>", "task_id": "<groom_task_id>"}
+      {"skill": "dev-groom", "prompt": "<repo>#<n>", "task_id": "<groom_task_id>"}
       ```
+      (mika#1173 — grooming has its own tool; `skill: "dev-groom"` is required by the schema for engine dispatch-class derivation.)
 
    c. Stop the turn. The grooming task runs in the background; its callback re-enters this session's task loop with the grooming result. **Do not call `send_message` to notify the operator** — auto-grooming is the new default behavior, not an exception.
 
@@ -38,7 +39,7 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
    f. **If `Verdict: ESCALATE`:** dev-groom surfaces an architect ESCALATION. Treat as a blocking event: `send_message` to operator with the ESCALATE reason from the callback, mark the groom task `blocked` if applicable, stop the turn. Do NOT auto-dispatch.
 
    g. **If callback indicates failure (HANDLER CRASH, timeout, etc.) — terminal-semantics rule:**
-      - **Retry policy:** retry once, **reusing the same `groom_task_id`** (do NOT call `create_task` again). The retry is `run_claude_pilot({"skill": "dev-groom", "prompt": "<repo> issue#<n>", "task_id": "<existing groom_task_id>"})`.
+      - **Retry policy:** retry once, **reusing the same `groom_task_id`** (do NOT call `create_task` again). The retry is `run_claude_pilot_groom({"skill": "dev-groom", "prompt": "<repo>#<n>", "task_id": "<existing groom_task_id>"})`.
       - **Second-crash terminal:** on the second consecutive HANDLER CRASH for the same `groom_task_id`, treat as ESCALATE. `send_message` to operator with both failure reasons concatenated; stop the turn. Do NOT retry a third time.
       - **Tracking:** the failure-count is tracked in the `groom_task_id` task's metadata (`metadata.groom_crash_count`, incremented by the callback handler on each HANDLER CRASH). The check `groom_crash_count >= 2` triggers the terminal path.
 

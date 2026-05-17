@@ -74,7 +74,7 @@ Call `run_claude_pilot` with `skill="dev-pilot"` and the issue reference:
 
 Example: `{"skill": "dev-pilot", "prompt": "mika-skills#8", "task_id": "15383984-a3e7-41bf-ac6f-630ba9a89d63"}`
 
-> **Note:** Use `skill="dev-pilot"` for implementation work. For grooming work, see the **Grooming Dispatch** section which uses `skill="dev-groom"`.
+> **Note:** Use `skill="dev-pilot"` for implementation work. For grooming work, see the **Grooming Dispatch** section which uses the separate `run_claude_pilot_groom` tool.
 
 The handler derives everything else (branch, worktree, pipeline command).
 
@@ -216,9 +216,9 @@ This workflow dispatches a grooming session via claude-pilot. Grooming produces 
 
 **Step G2 — Launch claude-pilot for grooming (MANDATORY — do not skip, do not defer)**
 
-> **IMMEDIATELY after Step G1, call `run_claude_pilot`.** No other tool calls permitted between G1 and this call.
+> **IMMEDIATELY after Step G1, call `run_claude_pilot_groom`.** No other tool calls permitted between G1 and this call.
 
-Call `run_claude_pilot` with `skill="dev-groom"`:
+Call `run_claude_pilot_groom`:
 
 ```json
 {
@@ -230,10 +230,10 @@ Call `run_claude_pilot` with `skill="dev-groom"`:
 
 Example: `{"skill": "dev-groom", "prompt": "mika#214", "task_id": "15383984-a3e7-41bf-ac6f-630ba9a89d63"}`
 
-The handler derives everything else (branch, worktree, `/mika-groom-ticket` pipeline command).
+The tool name itself routes to the grooming pipeline (`/mika-groom-ticket`); the handler derives branch, worktree, and entry command. `skill: "dev-groom"` is required by the schema for engine dispatch-class derivation — it has only one valid value for this tool, so it is not a decision knob but the example shows it for schema validity.
 
 **Rules:**
-- **Always pass `skill: "dev-groom"`** — this routes to the grooming pipeline (`/mika-groom-ticket`), not the implementation pipeline.
+- **Always pass `skill: "dev-groom"`** — required by the schema (single valid value, not a decision).
 - **Always pass `task_id`** — the task UUID from Step G1 (36-char format).
 - **One session per issue** — the handler runs the full grooming pipeline.
 - **Wait for the callback** — results arrive via callback when claude-pilot finishes. Do NOT poll.
@@ -460,7 +460,7 @@ For each `child_task_id` in `child_wis` (in order):
 
    b. **Launch dev-groom:**
       ```json
-      run_claude_pilot({"skill": "dev-groom", "prompt": "<repo> issue#<issue_number>", "task_id": "<child_task_id>"})
+      run_claude_pilot_groom({"skill": "dev-groom", "prompt": "<repo>#<issue_number>", "task_id": "<child_task_id>"})
       ```
 
    c. **Wait for the dev-groom callback.** This is a normal post-callback turn. Handle per the existing callback flow but recognize the `dev-groom` skill output:
@@ -468,7 +468,7 @@ For each `child_task_id` in `child_wis` (in order):
       - If callback indicates `Verdict: ESCALATE`, treat as `blocked` per M4 Step 3 (PAUSE milestone, notify Vincent).
       - **If callback indicates failure (HANDLER CRASH, timeout, etc.) — terminal-semantics rule:** same shape as the webhook path (Ready-Label Dispatch Step 3g). Retry once with the **same `child_task_id`** (no new `create_task`); on second consecutive HANDLER CRASH for the same `child_task_id`, treat as `blocked` per M4 Step 3 (PAUSE milestone, notify operator, stop). Do NOT retry a third time. The `groom_crash_count` metadata is tracked on the child task itself (the milestone child, NOT a separate groom task — milestone-cascade reuses the child task across grooming + dispatch phases per step a).
 
-   d. **Engine-guard implications:** the milestone-cascade path does not flow through `webhook_ready_label_dispatch`. No new guard is needed; M4's existing dispatch-readiness checks already accept `dev-groom` as a valid `run_claude_pilot` skill.
+   d. **Engine-guard implications:** the milestone-cascade path does not flow through `webhook_ready_label_dispatch`. No new guard is needed; M4's existing dispatch-readiness checks accept the separate `run_claude_pilot_groom` tool (which derives dispatch_class = "groom" from its required `skill: "dev-groom"` input field).
 
 2. **Execute per-issue flow (Steps 1-6 from main workflow):**
    - Read GitHub issue
