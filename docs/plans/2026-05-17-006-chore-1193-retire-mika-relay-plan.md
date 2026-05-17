@@ -247,7 +247,7 @@ Migration is non-reversible. PR description still includes the backup-snapshot r
 
 ## Acceptance criteria
 
-- **C-AC1.** `rg -i "mika-relay" mika/ claude-pilot-py/ mika-skills/ mika-cloud/ -t rust -t python -t toml -t json` returns zero hits. Doc-only (`.md`) references retained with deprecation callouts.
+- **C-AC1.** `rg -i "mika-relay" mika/ claude-pilot-py/ mika-skills/ mika-cloud/ mika-platform/ -t rust -t python -t toml -t json -t sh` returns zero hits. Doc-only (`.md`) references retained with deprecation callouts. (Per architect NF3: `mika-platform/` added — covers `.sh` scripts, CLAUDE.md references, and `.claude/commands/` mentions.)
 - **C-AC2.** `cd mika && cargo test -p mika-agent` passes. `cd claude-pilot-py && uv run pytest` passes. No broken test fixtures or eval-harness references.
 - **C-AC3.** 7-day post-deploy soak: `sqlite3 ~/.mika/data/mika.db "SELECT count(*) FROM messages WHERE agent_id='mika-relay' AND created_at > '<deploy-date>'"` → 0. No fabrication-class failures in autonomous-loop runs (original milestone-level AC4).
 - **C-AC4.** DB cleanup migration runs idempotently on operator's `mika.db`; row counts for `mika-relay` agent rows = 0 across all referencing tables post-run. Schema version increments to v36 (or next available).
@@ -256,6 +256,7 @@ Migration is non-reversible. PR description still includes the backup-snapshot r
 ## Risks
 
 - **Consumer outside claude-pilot still calls `mika-relay`.** Before merging, grep all repos for `--agent mika-relay` and `agent_id='mika-relay'`. Any hit is a blocker — route caller to tier1 + policy or escalate.
+- **`MIKA_PILOT_POLICY_DISABLED` set in production (per architect NF4).** Phase B's emergency rollback lever may be set on some deployed instance. Before merging Phase C, run `grep -r 'MIKA_PILOT_POLICY_DISABLED' /etc /home /var` (or operator-equivalent) on every deployed mika instance. If set, the flag's removal becomes a blocker requiring operator coordination: unset the flag, verify autonomous-loop still works on tier1 + policy, then merge Phase C. PR description must confirm grep result before merge.
 - **DB cascade misses a table.** Schema v35 has 30+ tables; some may reference `agent_id` without FK. Mitigation: dry-run on production-data copy; PR description enumerates affected tables.
 - **`build.rs` build cache.** After deleting `permission-policy/`, dev environments may need `cargo clean` to regenerate `BUNDLED_SKILL_MANIFESTS`. CI builds from scratch — production unaffected.
 - **Multi-repo config drift between Phase B and Phase C.** Phase B leaves the 5 `claude-pilot.json` files in place. If someone edits one during the 7-day soak, Phase C's PR notices and surfaces the diff.
