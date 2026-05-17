@@ -760,7 +760,7 @@ use crate::github_graphql::fetch_open_blockers;
 /// Used by the per-class dispatch slot split to determine which concurrency
 /// slot a dispatch occupies. `"groom"` class allows grooming to run concurrently
 /// with implementation; all other skills are `"implement"` class.
-fn derive_dispatch_class(skill: Option<&str>) -> &'static str {
+pub(crate) fn derive_dispatch_class(skill: Option<&str>) -> &'static str {
     match skill {
         Some("dev-groom") => "groom",
         _ => "implement", // dev-pilot, deploy_mika, and all others

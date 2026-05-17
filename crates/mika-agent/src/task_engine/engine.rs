@@ -29,6 +29,15 @@ const DB_SCAN_INTERVAL_TICKS: u64 = 60;
 /// queue clears within one tick-cycle after grace expires. See #871.
 const REAPER_GRACE_SECONDS: i64 = 600;
 
+/// The two currently-defined dispatch classes (per `derive_dispatch_class` at
+/// `skills/executor.rs`). Iteration order is `implement` first because pre-v34
+/// NULL-class wrappers fall into this bucket via `COALESCE` — promote those
+/// before grooming wrappers when both classes are idle. Ordering is cosmetic —
+/// both classes process independently in a single tick. The `Test 5` shape
+/// test in this crate pins this slice against `derive_dispatch_class` to catch
+/// drift when a new class is added to the executor (mika#1175).
+const DISPATCH_CLASSES: &[&str] = &["implement", "groom"];
+
 /// The unified task engine: a min-heap BinaryHeap backed by SQLite, driven by a
 /// 1-second tick loop that fires tasks whose `next_fire_at <= now`.
 ///
@@ -420,24 +429,32 @@ impl TaskEngine {
         }
     }
 
-    /// Engine-level backstop for deferred-dispatch promotion (mika#1070).
+    /// Engine-level backstop for deferred-dispatch promotion (mika#1070, mika#1175).
     ///
-    /// Runs every `DB_SCAN_INTERVAL_TICKS`. If pending deferred wrappers exist
-    /// AND no active non-deferred callback exists for the agent, promotes the
-    /// oldest wrapper. This recovers from any scenario where the inline
-    /// promotion at `dispatch_resume_agent` (dispatcher.rs) fails to fire.
+    /// Runs every `DB_SCAN_INTERVAL_TICKS`. For each `dispatch_class`, if pending
+    /// deferred wrappers of that class exist AND no active non-deferred callback
+    /// exists in that class, promotes the oldest wrapper of that class. Per-class
+    /// iteration (mika#1175) prevents cross-class throughput halving when wrappers
+    /// from multiple classes are pending. This recovers from any scenario where
+    /// the inline promotion at `dispatch_resume_agent` (dispatcher.rs) fails to fire.
     async fn promote_pending_deferred_if_idle(&self) {
-        // Check if any non-deferred callback is currently in-flight
-        match self.db.has_any_active_callback().await {
-            Ok(true) => return, // Dispatch slot occupied — don't promote
-            Ok(false) => {}     // Slot free — check for promotable wrappers
-            Err(e) => {
-                warn!(error = %e, "failed to check active callbacks for deferred promotion");
-                return; // Fail-closed
+        for class in DISPATCH_CLASSES {
+            match self.db.has_any_active_callback_for_class(class).await {
+                Ok(true) => continue, // Class slot occupied — skip this class
+                Ok(false) => {}       // Class slot free — try to promote one wrapper
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dispatch_class = class,
+                        "failed to check active callbacks for deferred promotion"
+                    );
+                    continue; // Fail-closed for this class — try the others
+                }
             }
+            self.dispatcher
+                .dispatch_next_deferred_callback_for_class(class)
+                .await;
         }
-        // Promote the oldest pending deferred wrapper
-        self.dispatcher.dispatch_next_deferred_callback().await;
     }
 
     /// Detect dead subprocesses for active callback tasks (#959).
@@ -1898,5 +1915,206 @@ mod tests {
             p_reaper.status, "failed",
             "parent without pr_url goes to reaper"
         );
+    }
+
+    // -- promote_pending_deferred_if_idle per-class iteration tests (mika#1175) --
+
+    /// Seed a parent manual task + a `:deferred` callback wrapper child of the
+    /// given `dispatch_class`. Returns `(parent_id, wrapper_id)`.
+    async fn seed_deferred_wrapper(
+        db: &AsyncDatabase,
+        parent_label: &str,
+        dispatch_class: Option<&str>,
+    ) -> (String, String) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: parent_label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        let wrapper = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        let wrapper_id = db.create_task(wrapper).await.unwrap();
+        (parent_id, wrapper_id)
+    }
+
+    /// Seed a parent manual task + an active (pending, non-deferred) callback
+    /// child of the given `dispatch_class`. Used to simulate a busy slot.
+    async fn seed_active_non_deferred(
+        db: &AsyncDatabase,
+        parent_label: &str,
+        dispatch_class: Option<&str>,
+    ) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: parent_label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        let child = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        db.create_task(child).await.unwrap();
+    }
+
+    /// R1: two cross-class deferred wrappers, both class slots idle → both
+    /// promote in the same backstop tick.
+    #[tokio::test]
+    async fn test_promote_pending_deferred_if_idle_iterates_per_class() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        let (_, w_groom) = seed_deferred_wrapper(&db, "p_groom", Some("groom")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        let t_groom = db.get_task(&w_groom).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "completed",
+            "implement wrapper must promote on a single tick when both classes idle"
+        );
+        assert_eq!(
+            t_groom.status, "completed",
+            "groom wrapper must promote in the same tick — per-class iteration \
+             prevents the mika#1175 cross-class halving"
+        );
+    }
+
+    /// R3: cross-class deferred wrappers, implement slot busy, groom slot idle
+    /// → only the groom wrapper promotes.
+    #[tokio::test]
+    async fn test_promote_pending_deferred_if_idle_skips_busy_class() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        let (_, w_groom) = seed_deferred_wrapper(&db, "p_groom", Some("groom")).await;
+        seed_active_non_deferred(&db, "p_busy_impl", Some("implement")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        let t_groom = db.get_task(&w_groom).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "pending",
+            "implement wrapper must NOT promote when implement slot is busy"
+        );
+        assert_eq!(
+            t_groom.status, "completed",
+            "groom wrapper must promote — its class slot is independent of \
+             the implement slot (mika#1175 per-class gate)"
+        );
+    }
+
+    /// Drift detector for the `DISPATCH_CLASSES` slice. Every value returned by
+    /// `derive_dispatch_class` for the currently-known skills must be in
+    /// `DISPATCH_CLASSES`. If a new class is added to `derive_dispatch_class`
+    /// (e.g., a third skill maps to a new class), this test surfaces the gap
+    /// before the periodic backstop silently loses promotion for that class.
+    #[test]
+    fn test_dispatch_classes_universe_matches_derive_fn() {
+        use crate::skills::executor::derive_dispatch_class;
+
+        for skill in [
+            Some("dev-groom"),
+            Some("dev-pilot"),
+            Some("deploy_mika"),
+            None,
+        ] {
+            let class = derive_dispatch_class(skill);
+            assert!(
+                DISPATCH_CLASSES.contains(&class),
+                "derive_dispatch_class({skill:?}) = {class:?} not in DISPATCH_CLASSES \
+                 = {DISPATCH_CLASSES:?}. If a new dispatch_class was added, update \
+                 DISPATCH_CLASSES in engine.rs to include it (mika#1175)."
+            );
+        }
     }
 }
