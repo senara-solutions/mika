@@ -517,11 +517,42 @@ For each `child_task_id` in `child_wis` (in order):
 When all children processed:
 1. Gather stats from child tasks via `list_tasks` filtered by `parent_task_id=<milestone_wi>`. Count how many children reached `completed` status.
 2. **Build + deploy (gated on >=1 completed child):** If at least one child completed successfully, trigger a build (`build_mika` if available, or `run_shell` with `cargo build --release --features telemetry`) then deploy (`deploy_mika` with `task_id=<milestone_wi>`). This is part of the close-out — every milestone with successful work produces deployed artifacts, not just merged code. If zero children completed (all failed/blocked/cancelled), **skip build+deploy** and note in the summary: "No deploy — no children completed successfully."
-3. Transition parent: `update_task_status(task_id=<milestone_wi>, status="completed")`
-4. **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> completed. Completed: {N}, Failed: {N}, Blocked: {N}. Total cost: ${total_cost}.")`
-5. Notify Vincent with summary:
+3. **Close the GitHub milestone (REQUIRED before marking the parent task complete):**
+
+   3a. Issue the close PATCH:
+       run_gh({
+         "command": ["api", "-X", "PATCH",
+                     "/repos/senara-solutions/<repo>/milestones/<n>",
+                     "-f", "state=closed"]
+       })
+
+   3b. Read back the state:
+       run_gh({
+         "command": ["api",
+                     "/repos/senara-solutions/<repo>/milestones/<n>",
+                     "--jq", ".state"]
+       })
+
+   3c. Branch on the readback:
+   - Output is exactly `"closed"` (with quotes — `--jq .state` emits JSON): proceed to step 4.
+   - Output is `"open"` or anything else: STOP. Do NOT call `update_task_status(completed)`.
+     Notify Vincent: "Milestone <repo> milestone#<n> close PATCH returned 2xx but
+     readback shows state=<value>. GitHub-side divergence; not marking local task complete."
+     `update_task_status(task_id=<milestone_wi>, status="blocked",
+     note="GitHub milestone close readback mismatch — got state=<value>")`.
+   - 3a returns a non-2xx error: STOP. Notify Vincent with the gh error. Mark task `blocked`
+     with the error in the note. Do NOT claim success.
+
+   This step is load-bearing for the verify-before-claiming discipline. Engine-side guard
+   (mika#797 part D) will reject EndTurn responses claiming "milestone closed" that did not
+   invoke step 3a.
+
+4. Transition parent: `update_task_status(task_id=<milestone_wi>, status="completed")`
+5. **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> completed. Completed: {N}, Failed: {N}, Blocked: {N}. Total cost: ${total_cost}.")`
+6. Notify Vincent with summary:
    ```
    Milestone <repo> milestone#<n> complete.
+   Milestone closed on GitHub: ✓
    ✅ Completed: {N} | ❌ Failed: {N} | ⏸️ Blocked: {N}
    Total cost: ${total_cost} | Total turns: {total_turns}
    Build + deploy: done.
@@ -598,6 +629,8 @@ Same as Milestone Step M4.
 ### Step P5 — Project completion
 
 Same as Milestone Step M5.
+
+> **NOTE:** The milestone close step (M5 step 3) is REST-specific to `/milestones/<n>`. GitHub Projects v2 closes via GraphQL `closeProjectV2` mutation and is OUT OF SCOPE for this ticket — see mika#TBD.
 
 ---
 
