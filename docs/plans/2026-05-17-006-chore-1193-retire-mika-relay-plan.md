@@ -121,52 +121,123 @@ Remove every active reference to `mika-relay` after Phase B has proven the deter
 - Delete `MIKA_RELAY_CONFIG` const (line 847 + multi-line body).
 - Remove `&MIKA_RELAY` from `WELL_KNOWN_AGENTS` array (line 386). New form: `&[&MIKA_DEV, &MIKA_QA, &MIKA_ARCH]`.
 - Update or delete the 5 test sites at lines 1421, 1437, 1521, 1737, 1738. Use `cargo test -p mika-agent well_known_agents` to flush all referencing tests.
-- The sentinel comment at lines 388-396 about `INTRA_PLATFORM_AGENTS` cross-language duplication stays — that contract still applies to mika-arch/mika-dev/mika-qa.
+- The sentinel comment at lines 388-396 about `INTRA_PLATFORM_AGENTS` cross-language duplication stays — that contract still applies to mika-arch/mika-dev/mika-qa. **Per architect NF1: drop the stale `mika-relay` mention from the comment prose.** The duplication-sentinel contract (5-entry threshold, codegen escalation) is unchanged; only the prose mention of mika-relay is updated. Change "claude-pilot and mika-relay should structurally allow" → "claude-pilot should structurally allow."
 
 ### Change 2 — `mika/skills/bundled/permission-policy/`
 
 - `git rm -r mika/skills/bundled/permission-policy/`.
 - `build.rs` walks the directory at build time; no code change needed. Re-build verifies absence from `BUNDLED_SKILL_MANIFESTS`.
 
-### Change 3 — `disabled_skills` / identity allowlists in `well_known_agents.rs`
+### Change 3 — `permission-policy` references in non-relay code
 
-Grep for `permission-policy` in the file. Expected hits beyond the deleted blocks:
-- `MIKA_DEV_IDENTITY`, `MIKA_QA_IDENTITY`, `MIKA_ARCH` identity allowlists may explicitly list or exclude `permission-policy`. Audit and remove the references (skill no longer exists; mention triggers warn at startup).
-- Pre-implementation diff in PR description must enumerate every site.
+**Per architect NF6: Phase 0 grep result pinned at base SHA.**
+
+Grep at base SHA `72021b78` produces these hits in `well_known_agents.rs`:
+
+| Line | Context | Disposition in Phase C |
+|---|---|---|
+| 127 | Inside `MIKA_DEV_IDENTITY` or similar — verify by full slice at `/ce:work` | Audit, likely remove |
+| 199 | Doc-comment inside MIKA_RELAY block | Deleted in Change 1 |
+| 219 | Doc-comment inside MIKA_RELAY_IDENTITY block | Deleted in Change 1 |
+| 226 | Inside `MIKA_RELAY_IDENTITY` string body | Deleted in Change 1 |
+| 836 | Inside `MIKA_RELAY_SOUL` string body | Deleted in Change 1 |
+| 841 | Inside `MIKA_RELAY_SOUL` string body | Deleted in Change 1 |
+| 1088 | Inside a write-capable skills `const` list used for read-only-agent invariant check | **Remove this entry** |
+| 1216 | Test assertion: `relay_identity.contains("\"permission-policy\"")` | Deleted with the test in Change 1 |
+| 1217 | Test assertion: error message | Deleted with the test in Change 1 |
+| 1419 | Comment inside a deleted test | Deleted with the test in Change 1 |
+
+The non-trivial hit is **line 1088** — `"permission-policy"` is listed in a write-capable-skills const used to enforce the read-only-agent invariant. After Phase C, the skill no longer exists, so this entry is dead code. Remove it.
+
+All other hits are either inside MIKA_RELAY_* blocks (deleted in Change 1) or inside relay-specific tests (deleted in Change 1).
+
+Verbatim slice for line 1088 context (`well_known_agents.rs:1085-1095`):
+
+```rust
+        "resolve-pr-conflicts",
+        "self-check",
+        // QA skills that front pr_merge/run_gh-write
+        "qa-review",
+        "qa-review-build-callback",
+        // Skill management
+        "skill-review",
+        // Permission policy executes side-effects
+        "permission-policy",
+    ];
+```
+
+Remove the `// Permission policy executes side-effects` comment and the `"permission-policy"` entry. Pre-implementation diff in PR description enumerates this and confirms no other unaccounted hits emerged between base SHA and merge-time.
 
 ### Change 4 — `.claude/claude-pilot.json` (5 copies)
 
 Delete in all five locations. Phase B verified `transport.py` handles missing config gracefully (B-AC5). If any of the 5 files diverged during Phase B's soak window (unlikely but possible), the PR description must enumerate the diff before deletion.
 
-### Change 5 — `claude-pilot-py/src/claude_pilot/transport.py` and `permissions.py`
+### Change 5 — Delete `claude-pilot-py/src/claude_pilot/transport.py`
 
-Two paths:
+**Per architect F2: committed to full deletion (was 5b in the original plan's fork).**
 
-- **(5a) Conservative.** Leave `transport.py`'s `invoke_command` in place as dead code. Remove only the call site in `permissions.py`. Test: grep `permissions.py` for `transport.invoke_command` → zero hits.
-- **(5b) Aggressive.** Delete `transport.py` entirely (the file's only purpose was relay subprocess invocation). Tests in `tests/test_transport.py` go with it.
+- `git rm claude-pilot-py/src/claude_pilot/transport.py`.
+- `git rm claude-pilot-py/tests/test_transport.py` (and any other test referencing transport directly).
+- Remove the import of `transport` from `permissions.py`. After Phase B, the call to `transport.invoke_command` was already gated behind `MIKA_PILOT_POLICY_DISABLED`; Phase C removes both the gate and the dead-code branch.
+- Remove `MIKA_PILOT_POLICY_DISABLED` env-var reading (Phase B's emergency rollback lever). Phase C is itself the irreversible step — the lever has nowhere to roll back to. If someone tries to set the var post-deploy, ignore silently (no-op env vars don't warrant warning noise).
 
-Recommend (5a) for the initial PR — defensive — then file a follow-up "delete transport.py" if it's clearly unused after another soak window. The `MIKA_PILOT_POLICY_DISABLED` emergency flag from Phase B is also removed in this PR; if (5a), it becomes a no-op (logged at WARN if set).
+Reasoning for full deletion (the architect's F2 explicit ratification):
+- Phase C's purpose is "remove every active reference to mika-relay." `transport.py` is the entire relay-invocation surface.
+- The `[claude-pilot] ` payload prefix and the comment citing "relay's parsing convention" in `transport.py` would fail C-AC1's grep (`rg -i "mika-relay" ... -t python` → zero hits).
+- The dead-code defensive-keep argument was valid during Phase B's soak. After 7+ days post-Phase-B without rollback, the file is provably unused.
+- Future subprocess transports (hypothetical non-relay consumers) can reintroduce a transport module then — YAGNI handles that.
+
+C-AC1's grep now passes by construction.
 
 ### Change 6 — DB cleanup migration
 
-Provide a Rust migration under `mika/crates/mika-agent/src/db/migrations/` (or `mika/migrations/`, per workspace convention — verify at `/ce:work` time). Idempotent SQL:
+Provide a Rust migration under `mika/crates/mika-agent/src/db/migrations/` (or `mika/migrations/`, per workspace convention — verify at `/ce:work` time). Schema version v36 (next after v35 KG outcome expansion at #1154).
+
+**Per architect F1: explicit per-table DELETEs in reverse-dependency order — not cascading.**
+
+SQLite's `ON DELETE CASCADE` requires `PRAGMA foreign_keys = ON` per-connection, off by default. Rather than depending on the migration runner's connection settings (which would need to be pinned in Phase 0), the migration is self-contained and correct regardless of pragma state:
 
 ```sql
--- v36 (next schema version after the v35 KG outcome expansion at #1154)
--- mika#1193: retire mika-relay agent.
+-- v36: mika#1193 retire mika-relay agent.
+-- Self-contained: explicit deletes in reverse-dependency order. Correctness does
+-- NOT depend on PRAGMA foreign_keys being ON.
 
-DELETE FROM agents WHERE id = 'mika-relay';
--- Cascades (per schema v35 FK definitions):
---   sessions.agent_id → cascade delete
---   messages.session_id (via sessions cascade)
---   tool_calls.session_id (via sessions cascade)
---   llm_calls.session_id (via sessions cascade)
---   tasks.agent_id → cascade delete
+DELETE FROM tool_calls
+  WHERE session_id IN (SELECT id FROM sessions WHERE agent_id = 'mika-relay');
+
+DELETE FROM llm_calls
+  WHERE session_id IN (SELECT id FROM sessions WHERE agent_id = 'mika-relay');
+
+DELETE FROM messages
+  WHERE session_id IN (SELECT id FROM sessions WHERE agent_id = 'mika-relay');
+
+DELETE FROM tasks
+  WHERE agent_id = 'mika-relay';
+
+DELETE FROM sessions
+  WHERE agent_id = 'mika-relay';
+
+DELETE FROM agents
+  WHERE id = 'mika-relay';
 ```
 
-Migration is non-reversible. PR description must include a backup-snapshot reminder for operators.
+Order matters: descendants before ancestors. Each statement is idempotent (no-op if rows are already gone).
 
-Verify cascade coverage by running on a copy of production data BEFORE the migration ships. List of tables holding `agent_id` is captured by `pragma_foreign_key_list` for each table; the migration's PR includes this enumeration.
+Verify table coverage at `/ce:work` time by running `pragma_foreign_key_list` for each table that has an `agent_id` or `session_id` column; the PR description must include the enumeration as evidence the reverse-dependency list above is exhaustive at base SHA.
+
+**Migration runtime safety gate (per architect NF7):** before executing the DELETEs, the migration prints:
+
+```
+WARN: This migration deletes all mika-relay data (sessions, messages, tool_calls,
+llm_calls, tasks, agents). This is non-reversible. Back up ~/.mika/data/mika.db
+before proceeding.
+
+Set MIKA_MIGRATION_CONFIRMED=1 to continue.
+```
+
+If `MIKA_MIGRATION_CONFIRMED` is not set, the migration exits non-zero without modifying data. Operator must explicitly opt in. This is a one-time gate; the env var is read in the migration body, not at process startup. Five lines of code; converts the PR-description backup-reminder into a runtime safety net.
+
+Migration is non-reversible. PR description still includes the backup-snapshot reminder, redundant with the runtime gate by design.
 
 ### Change 7 — Documentation updates
 
