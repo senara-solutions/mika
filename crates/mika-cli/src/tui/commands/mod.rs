@@ -132,6 +132,13 @@ pub const COMMANDS: &[SlashCommand] = &[
         completer: Some(completers::complete_switch),
     },
     SlashCommand {
+        name: "restart",
+        aliases: &[],
+        description: "Restart the agent worker after a crash",
+        args_hint: None,
+        completer: None,
+    },
+    SlashCommand {
         name: "agents",
         aliases: &[],
         description: "List all agents",

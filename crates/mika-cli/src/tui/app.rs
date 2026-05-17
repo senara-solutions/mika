@@ -309,13 +309,24 @@ pub enum AgentRequest {
     Quit,
 }
 
-pub struct AgentResponse {
-    pub content: String,
-    pub is_error: bool,
-    pub thinking: Option<String>,
-    pub input_tokens: Option<u32>,
-    /// If skills were hot-reloaded during this turn, contains the new registry.
-    pub updated_skills: Option<Arc<SkillRegistry>>,
+/// Events flowing from the agent worker (and its supervisor) back to the TUI.
+///
+/// `Reply` is emitted by the worker for normal `run_agent` outcomes; the
+/// supervisor task in `commands::chat` emits `WorkerCrashed` when the worker
+/// terminates unexpectedly (panic, or `Ok(())` exit without an `AgentRequest::Quit`).
+pub enum AgentResponse {
+    /// Normal agent reply (success or controlled error).
+    Reply {
+        content: String,
+        is_error: bool,
+        thinking: Option<String>,
+        input_tokens: Option<u32>,
+        /// If skills were hot-reloaded during this turn, contains the new registry.
+        updated_skills: Option<Arc<SkillRegistry>>,
+    },
+    /// The agent worker terminated unexpectedly. The TUI shows a crash line
+    /// and accepts `/restart` (and only `/restart`) until a fresh worker is spawned.
+    WorkerCrashed { reason: String },
 }
 
 /// Shell-like input history with draft saving and optional disk persistence.
@@ -562,6 +573,14 @@ pub struct App<'a> {
     /// If set, the chat loop should switch to this agent after the current worker stops.
     pub pending_switch: Option<String>,
 
+    /// Reason from the supervisor when the agent worker terminated unexpectedly.
+    /// Cleared by `/restart` once a fresh worker is spawned.
+    pub worker_crashed: Option<String>,
+
+    /// Signal to the main loop that the user has invoked `/restart`; the loop
+    /// respawns `spawn_agent_worker` and rebinds `agent_tx`/`agent_rx`.
+    pub pending_restart: bool,
+
     // Image attachments pending send
     pub pending_images: Vec<ImageAttachment>,
 
@@ -678,6 +697,8 @@ impl<'a> App<'a> {
             agent_name,
             global_home,
             pending_switch: None,
+            worker_crashed: None,
+            pending_restart: false,
             pending_images: Vec::new(),
             thinking_level: None,
             context_tokens: None,
@@ -765,6 +786,8 @@ impl<'a> App<'a> {
             agent_name: String::new(),
             global_home,
             pending_switch: None,
+            worker_crashed: None,
+            pending_restart: false,
             pending_images: Vec::new(),
             thinking_level: None,
             context_tokens: None,
@@ -1232,28 +1255,34 @@ impl<'a> App<'a> {
     /// Tick handler for agent mode: poll agent_rx for responses.
     async fn tick_agent_mode(&mut self) {
         match self.agent_rx.try_recv() {
-            Ok(response) => {
+            Ok(AgentResponse::Reply {
+                content,
+                is_error,
+                thinking,
+                input_tokens,
+                updated_skills,
+            }) => {
                 // Update skills if hot-reloaded during this turn
-                if let Some(new_skills) = response.updated_skills {
+                if let Some(new_skills) = updated_skills {
                     self.skills = new_skills;
                 }
 
                 // Update context token tracking
-                if let Some(tokens) = response.input_tokens {
+                if let Some(tokens) = input_tokens {
                     self.context_tokens = Some(tokens);
                 }
 
-                if response.is_error {
+                if is_error {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
-                        content: format!("Error: {}", response.content),
+                        content: format!("Error: {content}"),
                         rendered: None,
                         channel: None,
                     });
                     self.status = AgentStatus::Idle;
                 } else {
                     // Show thinking block (instantly, not progressively revealed)
-                    if let Some(thinking) = response.thinking {
+                    if let Some(thinking) = thinking {
                         let rendered = Self::render_thinking(&thinking);
                         self.messages.push(ChatMessage {
                             role: ChatRole::Thinking,
@@ -1263,7 +1292,7 @@ impl<'a> App<'a> {
                         });
                     }
 
-                    if response.content.is_empty() {
+                    if content.is_empty() {
                         // Agent responded with tool-use only (no text) — show feedback
                         self.messages.push(ChatMessage {
                             role: ChatRole::System,
@@ -1273,16 +1302,48 @@ impl<'a> App<'a> {
                         });
                         self.status = AgentStatus::Idle;
                     } else {
-                        self.pending_response = Some(response.content);
+                        self.pending_response = Some(content);
                         self.reveal_index = 0;
                         self.status = AgentStatus::Responding(0);
                     }
                 }
                 self.needs_redraw = true;
             }
+            Ok(AgentResponse::WorkerCrashed { reason }) => {
+                // mika#850: surface what is currently a silent drop — record
+                // the failure state, render a visible chat line, and arm /restart.
+                self.messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: format!(
+                        "\u{26A0} Agent worker crashed: {reason}. Use /restart to recover."
+                    ),
+                    rendered: None,
+                    channel: None,
+                });
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        &self.session_id,
+                        "system",
+                        "agent_worker_crashed",
+                        None,
+                        Some(&reason),
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to log agent_worker_crashed audit event");
+                }
+                self.worker_crashed = Some(reason);
+                self.status = AgentStatus::Idle;
+                self.needs_redraw = true;
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
-                // Agent worker crashed or exited unexpectedly
-                if self.status == AgentStatus::Thinking {
+                // Agent worker channel closed without an explicit WorkerCrashed
+                // event (e.g., supervisor task itself was cancelled). Only show
+                // the legacy message when we have no richer reason already on screen.
+                if self.worker_crashed.is_none() && self.status == AgentStatus::Thinking {
                     self.messages.push(ChatMessage {
                         role: ChatRole::System,
                         content: "Agent worker stopped unexpectedly.".to_string(),

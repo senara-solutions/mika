@@ -57,6 +57,7 @@ pub async fn dispatch(app: &mut App<'_>, input: &str) -> Option<String> {
         "skills" => Some(handle_skills(app)),
         "skill" => Some(handle_skill(app, args)),
         "switch" | "agent" => Some(handle_switch(app, args)),
+        "restart" => Some(handle_restart(app)),
         "agents" => Some(handle_agents(app)),
         "teams" => Some(handle_teams(app)),
         "team" => {
@@ -826,6 +827,22 @@ fn handle_skills(app: &App<'_>) -> String {
     }
 
     out
+}
+
+/// `/restart` — respawn the agent worker after `WorkerCrashed`.
+///
+/// Refuses unless `worker_crashed` is set. Use `/clear` for normal session reset.
+/// On success, signals the main loop via `pending_restart`; the loop calls
+/// `spawn_agent_worker` and rebinds the App's channels.
+fn handle_restart(app: &mut App<'_>) -> String {
+    if app.worker_crashed.is_none() {
+        return "Worker is healthy. Use /clear to reset the session.".to_string();
+    }
+    if app.pending_restart {
+        return "Restart already in flight.".to_string();
+    }
+    app.pending_restart = true;
+    "Restarting agent worker...".to_string()
 }
 
 fn handle_switch(app: &mut App<'_>, args: &str) -> String {
