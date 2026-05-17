@@ -51,6 +51,72 @@ def is_tier1_auto_approve(tool_name: str, tool_input: dict[str, Any], cwd: str) 
 - `is_safe_bash_command` function starts at `tier1.py:111`.
 - File length: ~300 lines.
 
+Compound-command splitter (`tier1.py:101-108`) — load-bearing for compound-safety inheritance claim (Change 1):
+
+```python
+_COMPOUND_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||[;|])\s*")
+
+
+def _split_compound_command(command: str) -> list[str]:
+    """Naive split on shell operators. Not quote-aware — unsafe splits inside
+    quoted strings simply won't match any safe pattern and fall through to
+    relay. Safe by design."""
+    return [s for s in (part.strip() for part in _COMPOUND_SPLIT_RE.split(command)) if s]
+```
+
+Sub-command safety OR-chain (`tier1.py:122-128`) — exact insertion site for `is_safe_mika_dispatch`:
+
+```python
+def _is_safe_sub_command(sub: str) -> bool:
+    return (
+        is_safe_git_command(sub)
+        or is_safe_build_command(sub)
+        or is_safe_shell_command(sub)
+        or is_safe_gh_command(sub)
+    )
+```
+
+`is_safe_bash_command` body (`tier1.py:111-119`):
+
+```python
+def is_safe_bash_command(command: str) -> bool:
+    if is_tier3_dangerous(command):
+        return False
+
+    sub_commands = _split_compound_command(command)
+    if not sub_commands:
+        return False
+
+    return all(_is_safe_sub_command(sub) for sub in sub_commands)
+```
+
+Confirms: TIER 3 check runs FIRST (on full command), THEN split, THEN per-segment safety. Insertion of `is_safe_mika_dispatch` in the OR chain of `_is_safe_sub_command` correctly inherits compound-safety because `_split_compound_command` already produced the list before the OR chain evaluates.
+
+`is_safe_gh_command` (`tier1.py:260-274`) — dispatches by SAFE_GH_SUBCOMMANDS dict lookup; adding to the frozenset is sufficient:
+
+```python
+_GH_DOMAIN_RE = re.compile(r"^\s*gh\s+(\S+)\s+(\S+)")
+_GH_API_RE = re.compile(r"^\s*gh\s+api\b")
+_GH_API_MUTATION_RE = re.compile(r"-(X|method)\b|-(f|F|field|raw-field)\b|--input\b")
+
+
+def is_safe_gh_command(sub: str) -> bool:
+    match = _GH_DOMAIN_RE.match(sub)
+    if match:
+        allowed = SAFE_GH_SUBCOMMANDS.get(match.group(1))
+        if allowed is not None:
+            return match.group(2) in allowed
+
+    if _GH_API_RE.match(sub):
+        if _GH_API_MUTATION_RE.search(sub):
+            return False
+        return True
+
+    return False
+```
+
+Confirmed: `is_safe_gh_command` resolves subcommand strings by `SAFE_GH_SUBCOMMANDS.get(domain)` then membership test. Adding `"edit"` and `"comment"` to the `"issue"` frozenset is sufficient — no additional dispatch code needed.
+
 ### `mika/skills/bundled/permission-policy/system_prompt.md` (mika @ 72021b78)
 
 TIER 1 rules (`system_prompt.md:13-22`):
@@ -128,7 +194,7 @@ Extend `is_safe_bash_command(command)` so the Bash allow-list covers every TIER 
 
 For `is_tier3_dangerous(command)` add coverage for:
 
-- `git push <remote> (main|master)` if not already covered — verify against `TIER3_PATTERNS` line `re.compile(r"git\s+push\s+\S+\s+(main|master)\b")` at `tier1.py:74`. **Pre-implementation diff** required: compare the existing TIER3_PATTERNS tuple to the `system_prompt.md:39-44` list and add anything missing. Expected delta: zero (current TIER3_PATTERNS already mirrors that list); if non-zero, surface in the PR description.
+- `git push <remote> (main|master)` if not already covered — verify against `TIER3_PATTERNS` line `re.compile(r"git\s+push\s+\S+\s+(main|master)\b")` at `tier1.py:74`. **Pre-implementation diff** required: compare the existing TIER3_PATTERNS tuple to the `system_prompt.md:39-44` list and add anything missing. Expected delta: zero (current TIER3_PATTERNS already mirrors that list). **Per NF2:** if delta is non-zero, fold into Change 1 — do NOT spin out a sibling ticket. TIER 3 patterns live in the same file, same change class, same test scope. The pre-implementation diff is the decision point, not grooming.
 
 ### Change 2 — `claude-pilot-py/src/claude_pilot/permissions.py`
 
@@ -154,6 +220,7 @@ Add cases (target ≥10 new tests):
 | `test_gh_issue_comment_approved` | Bash | `gh issue comment 123 --body "..."` | True |
 | `test_gh_issue_create_not_in_tier1` | Bash | `gh issue create --repo ... --title ...` | False (relay) |
 | `test_gh_issue_edit_compound_denied_if_unsafe_part` | Bash | `gh issue edit 123 && rm -rf /tmp` | False (TIER3 trips) |
+| `test_mika_dispatch_compound_denied_if_unsafe_part` | Bash | `mika ask --agent mika-arch "..." && rm -rf /tmp` | False (TIER3 trips) — NF4 negative case |
 | `test_compact_safe_question_auto_answered` | PilotEvent | question containing "compact-safe" | PilotResponseAnswer with "compact-safe" |
 
 Add reciprocal tests for TIER 3 deny-list coverage (any pattern from `system_prompt.md:39-44` not already in `TIER3_PATTERNS` — expected zero deltas, but tests pin parity).
@@ -172,24 +239,38 @@ Contract:
   "events_total": 42,
   "events_replayable": 38,    # excludes malformed JSON, missing fields
   "events_unreplayable": 4,   # reported, NOT silently dropped — anti-NF5 safeguard
-  "resolved_by_tier1": 30,    # local allow/deny without relay
+  "resolved_locally": 30,     # tier1 allow + tier3 deny (no relay invocation)
   "still_needs_relay": 8,
-  "disagreement_vs_relay": [  # cases where tier1 says allow but relay said deny (or vice versa)
-    {"event_id": "...", "tool": "Bash", "input": "...", "tier1": "allow", "relay": "deny"}
+  "disagreement_vs_relay": [  # cases where local-resolve disagrees with relay's actual response
+    {"event_id": "...", "tool": "Bash", "input": "...", "local": "allow", "relay": "deny"}
   ],
-  "tier1_resolution_pct": 78.9  # resolved_by_tier1 / events_replayable
+  "local_resolution_pct": 78.9  # resolved_locally / events_replayable
 }
 ```
 
-Anti-NF5 safeguard: any event the harness can't replay (malformed payload, missing tool_input field, schema mismatch) is reported separately as `events_unreplayable` — never silently dropped or counted as "eliminated by tier1." A-AC3 measures `tier1_resolution_pct` against `events_replayable`, not against `events_total`.
+Anti-NF5 safeguards (TWO):
+
+1. Events the harness can't replay (malformed payload, missing tool_input field, schema mismatch) are reported separately as `events_unreplayable` — never silently dropped or counted as "eliminated by tier1." A-AC3 measures `local_resolution_pct` against `events_replayable`, not against `events_total`.
+2. **Hard floor (NF3):** harness asserts `events_unreplayable / events_total < 0.30`. If unreplayable ratio exceeds 30%, the harness exits non-zero with a "harness may be broken — too many events couldn't be replayed" message. Prevents the vacuous-truth case where a broken harness marks 99% of events unreplayable and the remaining 1% trivially passes the 80% threshold.
+
+**Naming (NF5):** the key is `resolved_locally` (tier1 allow + tier3 deny — both are local-without-relay) NOT `resolved_by_tier1`. The 80% AC counts every event that doesn't invoke the relay, including TIER 3 denials.
 
 ## Acceptance criteria
 
 - **A-AC1.** Every rule from `system_prompt.md:13-22` (TIER 1) is encoded in `tier1.py` as a deterministic pattern. Rule-parity diff against `system_prompt.md` documented in PR description; any rule that does NOT port (with reason) is enumerated. Cross-check against `mika/crates/mika-agent/src/server/permission_pre_classifier.rs` (per NF6) to flag any rule the Rust pre-classifier handles differently — divergence is OK if explained, but must be visible.
 - **A-AC2.** TIER 1.5 "compact-safe" question auto-answered by claude-pilot without invoking the relay. End-to-end: replay one historical compact-safe event; `transport.invoke_command` is not called.
-- **A-AC3.** Replay of last 7 days of `mika-relay` invocations (n ≥ 30 events) shows `tier1_resolution_pct` ≥ 80% on the **replayable** subset. Unreplayable events reported separately.
+- **A-AC3.** Replay of last 7 days of `mika-relay` invocations (n ≥ 30 events) shows `local_resolution_pct` ≥ 80% on the **replayable** subset. Unreplayable events reported separately, AND `events_unreplayable / events_total < 0.30` (NF3 hard floor — prevents vacuous-truth case where a broken harness skips most events and the remainder trivially passes).
 - **A-AC4.** Existing `test_tier1.py` cases unchanged in pass count. New cases: ≥10.
-- **A-AC5.** Median permission-event latency for tier1-resolved events drops by ≥5× vs. pre-change baseline. Measurement: instrument `permissions.py` with `time.perf_counter()` around the tier1 + transport paths; emit p50/p95 latency at session end. Compare against a pre-deploy baseline captured on the same workload.
+- **A-AC5.** Median permission-event latency for tier1-resolved events drops by ≥5× vs. pre-change baseline. Measurement: instrument `permissions.py` with `time.perf_counter()` around the dispatch decision (tier1-fast-path vs. transport-relay path) — `permissions.py` is the correct instrumentation site because it owns the dispatch decision; `transport.py` would measure only the relay leg.
+
+  **Baseline capture mechanism (per architect F2):** the pre-change baseline is captured from `~/.mika/data/mika.db` historical ground truth — `mika-relay` events already have timestamps. The replay harness from Change 4 reads each historical event's `messages.created_at` (request) and the corresponding assistant response `created_at` (response) to compute pre-change relay latency directly. This avoids the "can't measure post-merge because the fast-path is already active" trap: we don't need a pre-merge tagged run because the DB already contains the baseline data.
+
+  Verification procedure:
+  1. Pre-merge: run `replay_relay_decisions.py --days 7 --emit-latency` against current `mika.db`. Compute pre-change p50/p95 from `messages` timestamps.
+  2. Post-merge + 1 autonomous-loop dispatch: query `messages` table for events handled by the new tier1 fast-path; compute post-change p50/p95.
+  3. Compare: median ≥ 5× drop, target p50 < 100ms.
+
+  The instrumentation in `permissions.py` is logged as `tracing::info!` events (so they land in `~/.mika/agents/<name>/logs/`) AND optionally written to a new `permission_decision_latency_ms` column on a new `permission_decisions` table — but the AC verification uses message timestamps from `mika.db`, not the new column. The column is a follow-up improvement, not a Phase A blocker.
 
 ## Risks
 
