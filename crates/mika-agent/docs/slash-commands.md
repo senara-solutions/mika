@@ -374,6 +374,25 @@ Errors: `Usage: /switch <agent_name>` or `Failed to switch agent: ...`
 
 ---
 
+### /restart
+
+Respawn the agent worker after it has crashed (mika#850). The supervisor task
+surfaces panics or unexpected exits as a system line (`⚠ Agent worker crashed:
+<reason>. Use /restart to recover.`) and arms `/restart` as the only path back
+to a working chat. The current session_id is preserved — conversation context
+survives — but any in-flight prompt at crash time is lost and must be re-typed.
+
+Refuses (`Worker is healthy. Use /clear to reset the session.`) when no crash
+has been recorded; use `/clear` for a normal session reset.
+
+While the worker is in the crashed state, `send_message` refuses to dispatch
+new prompts and renders `Agent worker has crashed. Run /restart before sending
+more messages.` instead of silently routing through the dead channel.
+
+**Aliases:** None | **Arguments:** None
+
+---
+
 ### /agents
 
 List all available agents (subdirectories of `~/.mika/agents/`).
@@ -571,7 +590,7 @@ to a safe subset. Agent-specific commands are disabled:
 
 | Available | Disabled |
 |-----------|----------|
-| `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch` |
+| `/help`, `/clear`, `/exit`, `/quit` | `/model`, `/think`, `/agent`, `/switch`, `/restart` |
 | `/export`, `/teams`, `/agents` | `/memory`, `/reminders`, `/compact`, `/soul` |
 | `/status`, `/team`, `/verbose`, `/inbox` | `/config`, `/skills`, `/skill`, `/attach`, `/tasks` |
 |  | `/undo`, `/rewind` |
