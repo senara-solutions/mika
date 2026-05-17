@@ -1321,6 +1321,27 @@ async fn run_loop(
                         continue;
                     }
 
+                    // Observability for the milestone-close guard's single-retry
+                    // budget (#797). If the guard already fired once this run_loop
+                    // AND the agent's second EndTurn still emits a close-claim
+                    // without a satisfying PATCH, we let it through (per the
+                    // single-retry contract shared with the completion-claim
+                    // guard #483), but emit a structured warn so the operator can
+                    // grep for "repeat-fabrication" patterns that justify
+                    // widening the budget or escalating.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && milestone_close_claim_retry_done
+                        && detect_milestone_close_claim_without_patch(&text, &all_tool_summaries)
+                            .is_some()
+                    {
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            "Milestone close claim guard already fired this turn — accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
                     // Fabricated action-claim guard: if the agent claims to have
                     // performed an action (posted, commented, etc.) with a GitHub URL
                     // but made zero tool calls in this turn, reject and re-prompt.
@@ -4646,6 +4667,14 @@ fn detect_completion_claim(text: &str) -> Option<&str> {
 /// Regex matching "milestone" followed within 80 chars by "closed" or "close".
 /// Used by the milestone-close-claim guard (#797) to detect when the agent claims
 /// a GitHub milestone was closed without actually calling the close PATCH.
+///
+/// The 80-char window was sized to cover the canonical incident phrasings
+/// ("Milestone#17 closed, tasks reconciled", "milestone <repo>/milestone#<n> is
+/// now closed") plus typical sentence-level decoration without spanning a
+/// paragraph break. Widening risks false-positive matches across unrelated
+/// clauses; narrowing risks missing phrasings like "Milestone <repo> milestone
+/// #<n> has been closed on GitHub". The `_future_tense_overmatches_intentionally`
+/// test documents the accepted false-positive surface (planning-shape text).
 static MILESTONE_CLOSE_CLAIM_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)\bmilestone\b.{0,80}\b(closed|close)\b")
@@ -4665,8 +4694,14 @@ static MILESTONE_API_PATH_RE: std::sync::LazyLock<regex::Regex> = std::sync::Laz
 /// - The text does not claim a milestone close, OR
 /// - A qualifying `run_gh` PATCH call exists in `all_tool_summaries`.
 ///
-/// A qualifying call has `input_summary` containing: `"api"` AND `"PATCH"` AND
-/// a milestones API path.
+/// A qualifying call has `input_summary` containing all four substrings:
+/// `"api"`, `"PATCH"`, `state=closed`, AND a milestones API path. The
+/// `state=closed` requirement narrows the surface against milestones PATCH
+/// calls that mutate non-state fields (e.g., `-f title=...`). This is a
+/// substring-shape check; the coupling to `ToolCallSummary.input_summary`
+/// JSON serialization is documented and cross-locked with
+/// `skills/bundled/self-dev/system_prompt.md` § M5 step 3a. A structural
+/// argv-parse rewrite is tracked as follow-up.
 fn detect_milestone_close_claim_without_patch<'a>(
     text: &'a str,
     all_tool_summaries: &[ToolCallSummary],
@@ -4685,6 +4720,7 @@ fn detect_milestone_close_claim_without_patch<'a>(
         s.name == "run_gh"
             && s.input_summary.contains("\"api\"")
             && s.input_summary.contains("\"PATCH\"")
+            && s.input_summary.contains("state=closed")
             && MILESTONE_API_PATH_RE.is_match(&s.input_summary)
     });
 
@@ -7817,14 +7853,19 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_milestone_close_claim_future_tense_still_caught() {
-        // "milestone ... close" uses "close" which is guarded.
+    fn test_detect_milestone_close_claim_future_tense_overmatches_intentionally() {
+        // Documents a deliberate false-positive trade-off: "milestone ... close"
+        // in a future-tense planning context (e.g., "ready to close now") still
+        // triggers the guard. The cost — one extra LLM turn on a planning
+        // emission — is accepted because the cost of missing the milestone#17
+        // close-divergence class (silent local-vs-GitHub state drift) is
+        // higher. Maintainers tightening the regex to past-tense only should
+        // first widen the eval coverage for the missed cases.
         let summaries = vec![];
         let result = detect_milestone_close_claim_without_patch(
             "The milestone is ready to close now",
             &summaries,
         );
-        // "milestone" followed by "close" within 80 chars → triggers.
         assert!(result.is_some());
     }
 
