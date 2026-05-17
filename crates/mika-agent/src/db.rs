@@ -196,6 +196,11 @@ pub struct OrphanedParentTask {
 /// delivered WITH a `pr_url` (success indicator). Used by the success-side
 /// engine backstop (mika#1162) — sibling shape to `OrphanedParentTask`.
 /// Returned by `find_completable_parent_tasks_on_pr_url`.
+///
+/// Why this is a separate type from `OrphanedParentTask` despite near-identical
+/// fields: the `pr_url` field is included in the SELECT so the completer can
+/// build its audit-event reason string without a second DB round-trip (see plan
+/// docs/plans/2026-05-17-001-fix-1162-...md, decision D1).
 #[derive(Debug, Clone)]
 pub struct CompletableParentTask {
     pub id: String,
@@ -5495,6 +5500,12 @@ impl Database {
     /// Groom-class callbacks (mika#1001) are NOT reaped here — their expected
     /// artifact is a plan commit pushed to the branch, not a PR url. Groom-class
     /// leak detection is a separate follow-up (mika#1118 Option B).
+    ///
+    /// **Coupled pair:** `find_completable_parent_tasks_on_pr_url` is the
+    /// success-side sibling (mika#1162). Any filter change here (agent_id,
+    /// status, source, trigger_type, dispatch_class, sibling guard, grace
+    /// window) MUST be applied symmetrically there. The two queries differ
+    /// only on the `pr_url` predicate (`IS NULL` here vs `IS NOT NULL` there).
     pub fn find_orphaned_parent_tasks(
         &self,
         agent_id: &str,
@@ -12522,6 +12533,51 @@ mod tests {
             .find_completable_parent_tasks_on_pr_url("agent_a", 600)
             .unwrap();
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_find_completable_parent_tasks_stale_parent_class_doesnt_drive_selection() {
+        // mika#1162 v2 — symmetric to test_find_orphaned_parent_tasks_stale_parent_class_*.
+        // mika#920 task-reuse pattern means a parent's dispatch_class can be
+        // stale relative to the most recent child callback. The selection MUST
+        // key off the CHILD's dispatch_class, not the parent's. Set parent class
+        // to 'groom' (stale, would have caused false-negative if we keyed off
+        // parent) and child to 'implement' (the fresh dispatch). Parent must be
+        // selected.
+        let db = db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, child_id) = create_completable_parent_setup(&db, pr_url);
+
+        // Set PARENT class to 'groom' (stale data from a prior dispatch)
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'groom' WHERE id = ?1",
+                params![parent_id],
+            )
+            .unwrap();
+        // Set CHILD class to 'implement' (the fresh per-dispatch authority)
+        db.conn
+            .execute(
+                "UPDATE tasks SET dispatch_class = 'implement' WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                params![child_id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .find_completable_parent_tasks_on_pr_url("mika", 600)
+            .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "stale parent class must not override the fresh child class — must select on child.dispatch_class"
+        );
+        assert_eq!(candidates[0].id, parent_id);
     }
 
     #[test]

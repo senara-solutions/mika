@@ -820,6 +820,14 @@ impl TaskEngine {
             }
         };
 
+        // Asymmetry with reaper (mika#1126 AC-3): the reaper performs a kill-time
+        // re-fetch of all children and re-verifies dispatch_class because a
+        // groom-class child masquerading as implement could falsely trigger
+        // `failed`. The completer skips this re-check because the `pr_url IS NOT
+        // NULL` predicate is an independent guard — groom-class callbacks never
+        // emit `PR:` lines, so a parent with pr_url in metadata cannot be in the
+        // class-race scenario mika#1126 protects against. Concurrent operator
+        // races are caught by `update_task_completed`'s `status IN (...)` guard.
         for parent in candidates {
             let trace_id = mika_common::trace::generate_trace_id();
             let system_session = format!("system-{}", parent.agent_id);

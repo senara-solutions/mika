@@ -2831,6 +2831,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_try_complete_parent_on_callback_success_parent_cancelled_noop() {
+        // mika#1162 plan Unit 2 scenario 5 — cancelled parent must not be
+        // resurrected by the auto-completer. The early-return guard
+        // (`status == "in_progress"`) catches this before `update_task_completed`
+        // would (the DB-level guard only allows `pending` and `in_progress`
+        // through). Test both layers of defense by ensuring the result string
+        // is not overwritten with the auto-complete reason.
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, callback_id) = create_success_callback_pair(&db, Some(pr_url)).await;
+
+        // Cancel the parent via direct status flip — the cancel_task tool path
+        // would do the same thing.
+        let pid = parent_id.clone();
+        db.with_db(move |inner| {
+            inner.conn.execute(
+                "UPDATE tasks SET status = 'cancelled', result = 'operator_cancel' WHERE id = ?1",
+                rusqlite::params![pid],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_complete_parent_on_callback_success(&db, &task).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "cancelled");
+        assert_eq!(
+            parent.result.as_deref(),
+            Some("operator_cancel"),
+            "operator's cancel reason must not be overwritten"
+        );
+    }
+
+    #[tokio::test]
     async fn test_try_complete_parent_on_callback_success_non_self_dev_noop() {
         // Mirror the reaper's source guard: only self_dev parents are in scope.
         let db = test_db();
