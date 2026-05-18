@@ -1175,18 +1175,22 @@ async fn run_loop(
                                         ),
                                     ),
                                 });
-                                // Inject a correction telling the model which tools it must call
+                                // Inject a correction telling the model which tools it must call.
+                                // `[mika-engine]` trusted-marker prefix + state-machine framing
+                                // distinguishes engine control flow from adversarial user input
+                                // (mika#1168 — co-cause 1, model self-classification refusal).
                                 request.messages.push(LlmMessage {
                                     role: LlmRole::User,
                                     content: LlmContent::Text(format!(
-                                        "[Your response was rejected because you did not call the \
-                                         required tool(s): {}. You MUST call these tools with real \
-                                         data before producing your response. Do not fabricate or \
-                                         assume results — call the tools now. When you produce \
-                                         your corrected response, restate the full content — do \
-                                         not reference your prior turn. Only the final response \
-                                         is persisted to the conversation log; prior turns exist \
-                                         only in the in-memory loop context.]",
+                                        "[mika-engine] The previous response did not call the \
+                                         required tool(s): {}. The engine expects these tools \
+                                         to be invoked with real data before the corrected \
+                                         response. Tool results are how the engine confirms \
+                                         work; results come from actual calls, not synthesis. \
+                                         The corrected response should restate the full content \
+                                         — only the final response reaches the conversation \
+                                         log; prior turns exist only in the in-memory loop \
+                                         context.",
                                         missing_names.join(", ")
                                     )),
                                 });
@@ -4940,17 +4944,18 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
         satisfied: ready_label_dispatch_satisfied,
-        correction_message: "[Your response was rejected. The `ready` label has been \
-             removed but you did not call run_claude_pilot or run_claude_pilot_groom. \
-             The Ready-Label Dispatch handler requires you to: \
+        correction_message: "[mika-engine] The `ready` label has been removed but neither \
+             run_claude_pilot nor run_claude_pilot_groom was called this turn. The \
+             Ready-Label Dispatch handler expects: \
              (1) run_gh `issue view <n> --json title,body --repo <repo>` to fetch \
              the issue, (2) check the issue body for the grooming marker \
-             `> - **Plan:**`. If the marker is PRESENT: call create_task then \
-             run_claude_pilot with skill=dev-pilot, prompt=\"<repo>#<n>\", and \
-             task_id=<UUID>. If the marker is ABSENT: call create_task then \
-             run_claude_pilot_groom with skill=dev-groom (mika#1173 — grooming \
-             uses its own tool) to auto-groom the ticket. \
-             Do not end this turn until you have called the appropriate dispatch tool.]",
+             `> - **Plan:**`. If the marker is PRESENT, the engine expects \
+             create_task followed by run_claude_pilot with skill=dev-pilot, \
+             prompt=\"<repo>#<n>\", and task_id=<UUID>. If the marker is ABSENT, \
+             the engine expects create_task followed by run_claude_pilot_groom \
+             with skill=dev-groom (mika#1173 — grooming uses its own tool) to \
+             auto-groom the ticket. The turn continues until the appropriate \
+             dispatch tool is called.",
     },
     // #910 — non-ready [GitHub] webhook turns must NOT call run_claude_pilot.
     // Per mika#841 Layer 1 source-check, only `[GitHub] Issue labeled ready on`
@@ -4986,12 +4991,12 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "webhook_zero_tools",
         trigger: |msg| msg.starts_with("[GitHub]"),
         satisfied: |summaries| summaries.iter().any(|s| s.success),
-        correction_message: "[Your response was rejected because you received a GitHub \
-             webhook event but responded with text only and zero tool calls. \
-             Webhook events require action — you MUST call at least one tool \
+        correction_message: "[mika-engine] A GitHub webhook event was received but the \
+             response was text-only with zero tool calls. Webhook events require \
+             action — the engine expects at least one tool call \
              (send_message, update_task_status, list_tasks, check_task, etc.) \
              to process the event. Re-read the webhook payload above and use \
-             the appropriate tools to handle it.]",
+             the appropriate tools to handle it.",
     },
     // #702 — resume/continue intent for milestones/projects requires
     // reconciliation via check_task or list_tasks before EndTurn.
@@ -5027,11 +5032,12 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "deferred_dispatch_action",
         trigger: deferred_dispatch_trigger,
         satisfied: deferred_dispatch_satisfied,
-        correction_message: "[Your response was rejected. This is a deferred-dispatch \
-             retry — the prior run_claude_pilot was rejected with global_dispatch_active. \
-             The dispatch slot is now free. You MUST re-invoke run_claude_pilot with the \
-             original arguments to complete the deferred dispatch. Do not call \
-             update_task_status, send_message, or any other tool first.]",
+        correction_message: "[mika-engine] This is a deferred-dispatch retry — the prior \
+             run_claude_pilot was rejected with global_dispatch_active. The dispatch \
+             slot is now free. The engine expects run_claude_pilot to be re-invoked \
+             with the original arguments to complete the deferred dispatch. \
+             update_task_status, send_message, and other tools should not be called \
+             before run_claude_pilot.",
     },
 ];
 
