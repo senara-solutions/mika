@@ -75,6 +75,9 @@ mod eval {
     mod test_webhook_queue;
     mod test_webhook_zero_tools_guard;
 
+    // qa-review skill-scoped run_gh validator wiring test (mika#1196)
+    mod test_qa_review_run_gh_scope_validator;
+
     // Multi-agent corpus parity: regression guard for #1155 search_content gap
     mod kg_multi_agent_corpus_parity;
 }
