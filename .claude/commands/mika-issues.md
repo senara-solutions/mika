@@ -1,10 +1,10 @@
 ---
 name: mika-issues
-description: Create multiple GitHub issues in batch, aligned with repo issue templates
+description: Create multiple GitHub issues across any repos in the mika-platform workspace
 argument-hint: "<list of issues to create>"
 ---
 
-Create multiple GitHub issues for the Mika project based on the user's description below.
+Create multiple GitHub issues for the Mika platform based on the user's description below.
 
 ## Input
 
@@ -13,26 +13,23 @@ $ARGUMENTS
 ## Instructions
 
 1. **Parse** the input into individual issues
-2. **For each issue**, classify and draft it following the same rules as `/mika-issue`:
-   - Classify as `bug`, `enhancement`, `documentation`, or `question`
-   - Write a clear, concise title
-   - Write the body using the appropriate template (Bug, Enhancement, or Documentation/Question — see `/mika-issue` for formats)
-   - Select labels from `.github/labels.yml` (canonical source): type + priority (`p0-critical` / `p1-important` / `p2-normal` / `p3-nice-to-have`) + component (`agent-core` / `tui` / `team-engine` / `skill` / `gateway` / `infrastructure` / `dashboard`)
-   - Assign a milestone if a matching open one exists
-3. **Present a numbered summary table** for review:
+2. **For each issue**, determine the target repo using the same rules as `/mika-issue`:
+   - Explicit prefix: `mika-cloud: add health endpoint` → mika-cloud
+   - Keyword inference: "helm", "deploy" → mika-cloud; "skill", "manifest" → mika-skills; else → mika
+   - Each issue in the batch can target a different repo
+3. **Classify and draft** each issue following `/mika-issue` rules (type, title, body template, labels)
+4. **Present a numbered summary table** for review:
 
-   | # | Title | Type | Priority | Component |
-   |---|-------|------|----------|-----------|
-   | 1 | ... | enhancement | p2-normal | agent-core |
-   | 2 | ... | bug | p1-important | tui |
+   | # | Repo | Title | Type | Priority |
+   |---|------|-------|------|----------|
+   | 1 | mika | ... | enhancement | p2-normal |
+   | 2 | mika-cloud | ... | bug | p1-important |
 
-4. **After approval**, create the issues sequentially using `gh issue create` with HEREDOC bodies (same format as `/mika-issue`)
-5. **After all issues are created**, print a summary with issue numbers and URLs
+5. **After approval**, create issues sequentially using `gh issue create --repo senara-solutions/<repo>` with HEREDOC bodies
+6. **Print a summary** with issue numbers and URLs grouped by repo
 
-## Branch References
+Wait for approval before creating any issues.
 
-If a branch is associated with an issue, always link it as a clickable GitHub URL using `[branch-name](https://github.com/senara-solutions/mika/tree/branch-name)` format in a `## Branch` section at the bottom of the body.
+## Ticket vocabulary and sub-issue relationships
 
-If the issues share a theme, suggest grouping them under a milestone.
-
-Wait for my approval before creating any issues.
+Use the standardized **milestone / project / sub-issue** vocabulary — canonical definitions are in `mika-issue.md § Ticket vocabulary`. The same rules apply to batch filing. If any created issue has children that should be linked, add sub-issue relationships after creation via the GraphQL `addSubIssue` mutation (see `mika-issue.md § Sub-issue relationships` for the exact API call).
