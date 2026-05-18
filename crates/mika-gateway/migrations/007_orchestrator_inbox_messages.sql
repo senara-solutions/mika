@@ -21,8 +21,16 @@ CREATE TABLE orchestrator_inbox_messages (
 CREATE INDEX orchestrator_inbox_messages_recv_idx
     ON orchestrator_inbox_messages (orchestrator_id, id);
 
--- Retention sweep: partial index on undelivered rows lets the cleanup task
--- find candidates without scanning the full table.
+-- Diagnostic index on undelivered rows. Supports queries like
+-- `SELECT * FROM orchestrator_inbox_messages WHERE orchestrator_id = $1
+--    AND delivered_at IS NULL ORDER BY created_at` for operator inspection
+-- and future "what hasn't been seen by the SSE subscriber yet?" tooling.
+--
+-- NOT used by the hourly retention sweep: `purge_old_rows` deletes by
+-- `created_at < cutoff` regardless of `delivered_at` (see
+-- `orchestrator_inbox.rs::purge_old_rows`) — the partial predicate
+-- doesn't match that query. Adding a plain `(created_at)` index for the
+-- retention DELETE is tracked as a follow-up (review finding ADV-005).
 CREATE INDEX orchestrator_inbox_messages_undelivered_idx
     ON orchestrator_inbox_messages (orchestrator_id, created_at)
     WHERE delivered_at IS NULL;

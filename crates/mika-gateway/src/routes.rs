@@ -111,6 +111,12 @@ pub struct AppState {
     /// When `false`, both `/orchestrator/inbox/{id}/message` and `.../stream`
     /// return 404 — preserves the pre-1189 filesystem-inbox-only behavior.
     pub orchestrator_inbox_enabled: bool,
+    /// Cap on concurrent SSE subscribers for `/orchestrator/inbox/{id}/stream`.
+    /// Each subscriber runs an independent Postgres poll loop; the pool is
+    /// shared with webhook delivery and the DLQ worker, so unbounded
+    /// subscribers can cascade into webhook failures. Default 10 permits
+    /// (see `orchestrator_inbox::ORCHESTRATOR_INBOX_DEFAULT_SUBSCRIBER_CAP`).
+    pub inbox_subscriber_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for AppState {

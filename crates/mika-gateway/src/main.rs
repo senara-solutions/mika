@@ -112,12 +112,16 @@ async fn main() -> Result<()> {
         }
     };
 
+    let raw_orchestrator_inbox_flag = settings.orchestrator_inbox_enabled.as_deref();
     let orchestrator_inbox_enabled =
-        settings::orchestrator_inbox_is_enabled(settings.orchestrator_inbox_enabled.as_deref());
+        settings::orchestrator_inbox_is_enabled(raw_orchestrator_inbox_flag);
     if orchestrator_inbox_enabled {
         info!("orchestrator inbox endpoints enabled (MIKA_ORCHESTRATOR_INBOX_ENABLED=1)");
     } else {
-        info!("orchestrator inbox endpoints disabled (MIKA_ORCHESTRATOR_INBOX_ENABLED unset or 0)");
+        info!(
+            raw_value = ?raw_orchestrator_inbox_flag,
+            "orchestrator inbox endpoints disabled (MIKA_ORCHESTRATOR_INBOX_ENABLED unset, empty, '0', '2', or unrecognized; only '1' or 'true' enables)"
+        );
     }
 
     // Build app state
@@ -139,14 +143,19 @@ async fn main() -> Result<()> {
         github_app,
         github_api_base_url: None,
         orchestrator_inbox_enabled,
+        inbox_subscriber_semaphore: orchestrator_inbox::default_inbox_subscriber_semaphore(),
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)
     tokio::spawn(dlq::run_dlq_worker(state.clone()));
 
     // Spawn orchestrator inbox retention task (mika#1189) — purges rows older
-    // than `ORCHESTRATOR_INBOX_RETENTION_DAYS` once an hour.
-    tokio::spawn(orchestrator_inbox::run_retention_task(state.pool.clone()));
+    // than `ORCHESTRATOR_INBOX_RETENTION_DAYS` once an hour. Gated on the
+    // feature flag so a gateway running without the migration applied
+    // doesn't error-log a DELETE against a non-existent table every hour.
+    if orchestrator_inbox_enabled {
+        tokio::spawn(orchestrator_inbox::run_retention_task(state.pool.clone()));
+    }
 
     let app = build_router(state);
 
