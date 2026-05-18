@@ -234,6 +234,31 @@ See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, 
 
 **Run:** `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval`
 
+## Evaluation — Model Calibration (#1190)
+
+`src/calibration/` — Pre-swap calibration gate for agent model changes. Role-scoped scenario suites with structural assertions (no LLM-as-judge). Framework lives in the library crate; the `calibrate` binary (`src/bin/calibrate.rs`) provides the operator-facing CLI.
+
+**Two role suites (v1):**
+- **mika-dev** (5 scenarios): refusal_regression (#1168), contract_dev_groom (#1166), golden_path_dispatch, required_tools_gate, plan_callout_recognition
+- **mika-arch** (5 scenarios): groom_ticket_basic, groom_milestone, citation_discipline, disposition_keyword_discipline, required_finding_list
+
+**Fixtures:** Markdown inputs at `tests/eval/calibration_fixtures/<role>/<scenario>.md` + YAML manifests at `tests/eval/calibration_fixtures/<role>/manifest.yaml`.
+
+**Run:** `make calibrate-mika-dev MODEL=anthropic/claude-sonnet-4-6` or `make calibrate-mika-arch MODEL=anthropic/claude-opus-4-6`. The binary accepts `--baseline <path>` for pass-rate comparison and `--output <path>` for artifact location.
+
+**Module structure:**
+- `calibration/artifact.rs` — CalibrationArtifact JSON schema, diff tool (promoted from `tests/eval/calibration.rs`)
+- `calibration/scenario.rs` — ScenarioOutcome, Scenario types (promoted from `tests/eval/scenarios.rs`)
+- `calibration/providers.rs` — Provider construction helpers (promoted from `tests/eval/providers.rs`)
+- `calibration/role.rs` — RoleScenario, RoleScoreReport, RoleManifest, YAML manifest schema
+- `calibration/failure.rs` — FailureClass enum (Refusal, Fabrication, EmptyResponse, Timeout, TransportError, ContractViolation, Other)
+- `calibration/roles/mika_dev.rs` — mika-dev scenario implementations
+- `calibration/roles/mika_arch.rs` — mika-arch scenario implementations
+
+**Baselines:** `docs/eval/calibration/baselines/`. Every model-swap PR must include the calibration report.
+
+**Pre-swap discipline:** See root `CLAUDE.md` — no model swap merged without a passing calibration run.
+
 ## Evaluation — Grounding Regressions (#741, #862, #863, #864, #890, #894, #901, #1059)
 
 `tests/eval/grounding_regressions/` — 31 fabrication-detection scenarios. Scenarios 1–5 from the KG milestone #14 retrospective (#741), scenarios 6–7 from the gate-evasion compound doc (#862), scenario 8 (3 tests) from the elided-copula regex extension (#894), scenarios 9–11 from the quoted-resource pre-fetch guard (#863), scenarios 12–16 from the required-suffix-line verdict-ghosting guard (#864), scenarios 17–19 from the required-tools-gate transport-contract fix (#890), scenarios 20–21 from the qa-review per-AC enumeration fix (#1059, mika-skills#159), scenarios 22–29 from the required-finding-list conditional-disclosure-evasion guard (#901). Each tests a concrete fabrication class with hard assertions (forbidden-word, required-tool, contains-in-order, contains, per-element-enumeration, absence-grounding). No LLM-judge gating — each class has objectively checkable signals.
