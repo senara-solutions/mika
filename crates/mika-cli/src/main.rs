@@ -281,6 +281,9 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Could not resolve agent home directory"))?;
             commands::logs::run(&agent_name, &ah, &args.format)
         }
+        Some(Commands::Notify(ref args)) => {
+            commands::notify::run(&args.text, &args.channel, &args.severity).await
+        }
         // Handled by early-exit above — unreachable, but listed for exhaustive match.
         Some(Commands::Token(_) | Commands::CredentialHelper(_)) => unreachable!(),
     }
@@ -490,6 +493,7 @@ mod tests {
             "model",
             "credential-helper",
             "kg",
+            "notify",
         ] {
             assert!(
                 markdown.contains(name),
