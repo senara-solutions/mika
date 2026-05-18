@@ -1033,6 +1033,47 @@ async fn run_loop(
             LlmStopReason::EndTurn | LlmStopReason::MaxTokens | LlmStopReason::ContentFilter => {
                 let text = mika_common::llm::strip_internal_tags(&response.text());
 
+                // mika#1168 — refusal-detection telemetry (Phase C Step 10).
+                //
+                // When the model self-classifies a prior engine-injected
+                // correction message as prompt-injection-pattern, it emits a
+                // refusal of literal shape "Prompt injection. Rejected. ..."
+                // with no tool calls. This is the failure mode behind the
+                // 2026-05-17/18 dispatch losses. Per-gate retry flags
+                // already bound the inner loop (no gate fires more than
+                // once per run_loop), so this branch is observability-only:
+                // log the gate id + bounded excerpt so the operator can
+                // audit recurrences and catch classifier drift. The
+                // structured event name is `classifier_refusal` so a
+                // future `EngineError::ClassifierRefusal` upgrade keeps
+                // logs greppable across the boundary.
+                //
+                // The match is anchored to the first 60 chars of the
+                // stripped response and requires both `prompt injection`
+                // and `reject` in close succession — refusals lead with
+                // the verdict, while legitimate prose discussing the
+                // injection pattern (e.g., mika-arch reviewing this PR
+                // or a docs page describing the failure) buries the term
+                // deeper in the text. The excerpt is scrubbed via
+                // `secret_scrubber::scrub_secrets()` to match the
+                // project's convention for LLM-output persistence sinks.
+                if !text.is_empty()
+                    && !response.has_tool_calls()
+                    && step > 0
+                    && looks_like_classifier_refusal(&text)
+                {
+                    let raw_excerpt: String = text.chars().take(200).collect();
+                    let scrubbed = crate::secret_scrubber::scrub_secrets(&raw_excerpt);
+                    warn!(
+                        step,
+                        label = mode.label(),
+                        event = "classifier_refusal",
+                        excerpt = %scrubbed,
+                        "model self-classified an engine correction as prompt-injection-pattern \
+                         (mika#1168 refusal-detection) — no further retry will fire this turn"
+                    );
+                }
+
                 if !text.is_empty() {
                     // Text-based tool call detection: if the LLM output XML tool calls
                     // as text instead of using the structured API, re-prompt once.
@@ -1057,10 +1098,11 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(
-                                "[Your response contained tool calls as text (e.g., <function=...>) \
-                                 instead of using the structured tool calling API. Do NOT output \
-                                 tool calls as text. Use the tool calling mechanism provided to \
-                                 you. Call the tool now using the proper API.]"
+                                "[mika-engine] The previous response contained tool calls \
+                                 as text (e.g., <function=...>) instead of using the \
+                                 structured tool calling API. The engine expects tool \
+                                 calls via the structured mechanism — calling the tool \
+                                 via the proper API now satisfies this gate."
                                     .to_string(),
                             ),
                         });
@@ -1093,12 +1135,12 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(format!(
-                                "[Your response contained a prose-style tool call for \
-                                 '{tool_name}' (e.g., {tool_name}({{...}})) instead of \
-                                 using the structured tool calling API. Do NOT output \
-                                 tool calls as text. Use the tool calling mechanism \
-                                 provided to you. Call {tool_name} now using the proper \
-                                 API.]",
+                                "[mika-engine] The previous response contained a \
+                                 prose-style tool call for '{tool_name}' \
+                                 (e.g., {tool_name}({{...}})) instead of using the \
+                                 structured tool calling API. The engine expects tool \
+                                 calls via the structured mechanism — invoking \
+                                 {tool_name} via the proper API now satisfies this gate.",
                             )),
                         });
                         continue;
@@ -1175,18 +1217,22 @@ async fn run_loop(
                                         ),
                                     ),
                                 });
-                                // Inject a correction telling the model which tools it must call
+                                // Inject a correction telling the model which tools it must call.
+                                // `[mika-engine]` trusted-marker prefix + state-machine framing
+                                // distinguishes engine control flow from adversarial user input
+                                // (mika#1168 — co-cause 1, model self-classification refusal).
                                 request.messages.push(LlmMessage {
                                     role: LlmRole::User,
                                     content: LlmContent::Text(format!(
-                                        "[Your response was rejected because you did not call the \
-                                         required tool(s): {}. You MUST call these tools with real \
-                                         data before producing your response. Do not fabricate or \
-                                         assume results — call the tools now. When you produce \
-                                         your corrected response, restate the full content — do \
-                                         not reference your prior turn. Only the final response \
-                                         is persisted to the conversation log; prior turns exist \
-                                         only in the in-memory loop context.]",
+                                        "[mika-engine] The previous response did not call the \
+                                         required tool(s): {}. The engine expects these tools \
+                                         to be invoked with real data before the corrected \
+                                         response. Tool results are how the engine confirms \
+                                         work; results come from actual calls, not synthesis. \
+                                         The corrected response should restate the full content \
+                                         — only the final response reaches the conversation \
+                                         log; prior turns exist only in the in-memory loop \
+                                         context.",
                                         missing_names.join(", ")
                                     )),
                                 });
@@ -1265,12 +1311,13 @@ async fn run_loop(
                                 request.messages.push(LlmMessage {
                                     role: LlmRole::User,
                                     content: LlmContent::Text(format!(
-                                        "[Your response was rejected because you claimed completion \
-                                         (matched: \"{keyword}\") but did not call update_task_status. \
-                                         You have {} active task(s):\n{item_list}\n\n\
-                                         Call update_task_status for each relevant task, \
-                                         or retract the completion claim if the work is not actually done. \
-                                         Do not fabricate or assume results — verify with tools first.]",
+                                        "[mika-engine] The previous response claimed completion \
+                                         (matched: \"{keyword}\") without calling update_task_status. \
+                                         There are {} active task(s):\n{item_list}\n\n\
+                                         The engine expects update_task_status for each relevant \
+                                         task, or a retraction of the completion claim if the work \
+                                         is not actually done. Tool results are how the engine \
+                                         confirms work; results come from actual calls, not synthesis.",
                                         active_items.len(),
                                     )),
                                 });
@@ -1305,19 +1352,20 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(format!(
-                                "[Your response was rejected because you claimed a GitHub \
-                                 milestone was closed (matched: \"{keyword}\") but did not \
-                                 invoke `run_gh` with the close PATCH. Closing a milestone \
-                                 locally is not the same as closing it on GitHub — the \
-                                 previous incident (milestone#17, 2026-04-24) left local \
-                                 state and GitHub state divergent for hours.\n\
-                                 Call `run_gh` with the close PATCH (subcommand `api`, \
-                                 method `-X PATCH`, path \
+                                "[mika-engine] The previous response claimed a GitHub \
+                                 milestone was closed (matched: \"{keyword}\") without \
+                                 invoking `run_gh` with the close PATCH. Closing a \
+                                 milestone locally is not the same as closing it on \
+                                 GitHub — the previous incident (milestone#17, \
+                                 2026-04-24) left local state and GitHub state \
+                                 divergent for hours.\n\
+                                 The engine expects `run_gh` with the close PATCH \
+                                 (subcommand `api`, method `-X PATCH`, path \
                                  `/repos/<owner>/<repo>/milestones/<n>`, field \
-                                 `-f state=closed`) AND verify via readback before claiming \
-                                 the milestone is closed, OR retract the claim if the close \
-                                 was not actually performed. See self-dev system prompt M5 \
-                                 step 3 for the canonical call shape.]",
+                                 `-f state=closed`) AND a readback-verified state, \
+                                 OR a retraction of the claim if the close was not \
+                                 actually performed. See self-dev system prompt M5 \
+                                 step 3 for the canonical call shape.",
                             )),
                         });
                         continue;
@@ -1372,12 +1420,14 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(format!(
-                                "[Your response was rejected because you claimed to have \
-                                 {verb} a resource ({url}) but you did not call any tool \
-                                 in this turn. You MUST use tools (e.g., run_gh) to perform \
-                                 actions — do not fabricate URLs or assume actions happened. \
-                                 Call the appropriate tool now to actually perform the action, \
-                                 or explain that you cannot perform it.]",
+                                "[mika-engine] The previous response claimed to have \
+                                 {verb} a resource ({url}) without calling any tool \
+                                 in this turn. The engine expects actions to be \
+                                 performed via tools (e.g., run_gh); URLs and action \
+                                 results come from actual calls, not synthesis. \
+                                 Calling the appropriate tool now performs the action, \
+                                 or the response should state that the action cannot be \
+                                 performed.",
                             )),
                         });
                         continue;
@@ -1502,16 +1552,17 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(format!(
-                                "[Your response was rejected because you claimed \
+                                "[mika-engine] The previous response claimed \
                                  {tool_name} is unavailable, but {tool_name} is in \
-                                 your active tool registry for this session. Attempt \
-                                 the call directly. If it fails (auth, rate limit, \
+                                 the active tool registry for this session. \
+                                 Attempting the call directly is the engine's \
+                                 expectation. If it fails (auth, rate limit, \
                                  network, permission), surface the actual failure — \
                                  that is a real signal. 'Not callable' without an \
                                  attempt is a fabrication. See docs/solutions/\
                                  best-practices/\
                                  required-tools-gate-evasion-patterns-2026-04-28.md \
-                                 Rule 2.]",
+                                 Rule 2.",
                             )),
                         });
                         continue;
@@ -1613,16 +1664,16 @@ async fn run_loop(
                             request.messages.push(LlmMessage {
                                 role: LlmRole::User,
                                 content: LlmContent::Text(format!(
-                                    "[Your response must end with one of these literal lines \
-                                     (any of the last 3 non-empty lines, after whitespace \
-                                     trim, will satisfy):\n{}\n\
-                                     Re-emit the same response with one of the required lines \
-                                     appended verbatim on its own line at the end. Do not \
-                                     paraphrase — the suffix is a structural contract parsed \
-                                     by downstream consumers.\n\n\
-                                     (Required by skill [output].required_suffix_lines. \
+                                    "[mika-engine] The previous response must end with one of \
+                                     these literal lines (any of the last 3 non-empty \
+                                     lines, after whitespace trim, will satisfy):\n{}\n\
+                                     Re-emitting the same response with one of the required \
+                                     lines appended verbatim on its own line at the end \
+                                     satisfies this gate. Paraphrases do not — the suffix \
+                                     is a structural contract parsed by downstream consumers.\n\n\
+                                     (Declared via skill [output].required_suffix_lines. \
                                      See feedback_prompt_enforcement_fragile.md for why \
-                                     prompt-level \"MUST\" doesn't bind here.)]",
+                                     prompt-level \"MUST\" doesn't bind here.)",
                                     lines_display.join("\n"),
                                 )),
                             });
@@ -1678,24 +1729,24 @@ async fn run_loop(
                             request.messages.push(LlmMessage {
                                 role: LlmRole::User,
                                 content: LlmContent::Text(
-                                    "[Your response was rejected because it does not contain \
-                                     the required F-list emission per the skill's \
+                                    "[mika-engine] The previous response does not contain the \
+                                     required F-list emission per the skill's \
                                      `[output] required_finding_list_prefixes` contract.\n\n\
-                                     When disposition is ITERATE or ESCALATE (or verdict \
-                                     ESCALATE), the final assistant message MUST emit \
-                                     findings as `F1:`, `F2:`, etc., in the message body. \
-                                     Each finding needs: (a) **Concern** — the concrete \
-                                     issue, (b) **Change required** — what the plan must \
+                                     On disposition ITERATE or ESCALATE (or verdict \
+                                     ESCALATE), the final assistant message emits findings \
+                                     as `F1:`, `F2:`, etc., in the message body. Each \
+                                     finding needs: (a) **Concern** — the concrete issue, \
+                                     (b) **Change required** — what the plan must \
                                      address, (c) **Citation** — the source grounding the \
                                      concern.\n\n\
                                      Persisting findings to memory (`store_fact` / \
                                      `update_core_memory`) is encouraged as defense-in-depth, \
                                      but the in-band emission is the contract the operator \
-                                     depends on. Re-emit the response with the F-list \
-                                     before EndTurn.\n\n\
-                                     (Required by skill [output].required_finding_list_prefixes. \
+                                     depends on. Re-emitting the response with the F-list \
+                                     before EndTurn satisfies this gate.\n\n\
+                                     (Declared via skill [output].required_finding_list_prefixes. \
                                      See feedback_prompt_enforcement_fragile.md for why \
-                                     prompt-level \"MUST\" doesn't bind here.)]"
+                                     prompt-level \"MUST\" doesn't bind here.)"
                                         .to_string(),
                                 ),
                             });
@@ -4847,6 +4898,23 @@ fn detect_persistable_output(text: &str) -> Option<&str> {
     PERSISTABLE_OUTPUT_RE.find(text).map(|m| m.as_str())
 }
 
+/// mika#1168 — detect the literal classifier-refusal shape the model emits
+/// when it self-classifies an engine correction as a prompt-injection
+/// attempt. Anchored to the first 60 chars of the stripped response and
+/// requires both `prompt injection` and `reject` to keep legitimate prose
+/// that merely *mentions* the failure mode (e.g., mika-arch reviewing this
+/// fix, or a docs page describing the pattern) from tripping the
+/// observability log. Refusals lead with the verdict; mentions bury it.
+fn looks_like_classifier_refusal(text: &str) -> bool {
+    let head_end = text
+        .char_indices()
+        .nth(60)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let head = text[..head_end].to_lowercase();
+    head.contains("prompt injection") && head.contains("reject")
+}
+
 fn detect_text_based_tool_call(text: &str) -> bool {
     if !text.contains('<') {
         return false;
@@ -4940,17 +5008,18 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
         satisfied: ready_label_dispatch_satisfied,
-        correction_message: "[Your response was rejected. The `ready` label has been \
-             removed but you did not call run_claude_pilot or run_claude_pilot_groom. \
-             The Ready-Label Dispatch handler requires you to: \
+        correction_message: "[mika-engine] The `ready` label has been removed but neither \
+             run_claude_pilot nor run_claude_pilot_groom was called this turn. The \
+             Ready-Label Dispatch handler expects: \
              (1) run_gh `issue view <n> --json title,body --repo <repo>` to fetch \
              the issue, (2) check the issue body for the grooming marker \
-             `> - **Plan:**`. If the marker is PRESENT: call create_task then \
-             run_claude_pilot with skill=dev-pilot, prompt=\"<repo>#<n>\", and \
-             task_id=<UUID>. If the marker is ABSENT: call create_task then \
-             run_claude_pilot_groom with skill=dev-groom (mika#1173 — grooming \
-             uses its own tool) to auto-groom the ticket. \
-             Do not end this turn until you have called the appropriate dispatch tool.]",
+             `> - **Plan:**`. If the marker is PRESENT, the engine expects \
+             create_task followed by run_claude_pilot with skill=dev-pilot, \
+             prompt=\"<repo>#<n>\", and task_id=<UUID>. If the marker is ABSENT, \
+             the engine expects create_task followed by run_claude_pilot_groom \
+             with skill=dev-groom (mika#1173 — grooming uses its own tool) to \
+             auto-groom the ticket. The turn continues until the appropriate \
+             dispatch tool is called.",
     },
     // #910 — non-ready [GitHub] webhook turns must NOT call run_claude_pilot.
     // Per mika#841 Layer 1 source-check, only `[GitHub] Issue labeled ready on`
@@ -4974,24 +5043,24 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "webhook_no_unauthorized_dispatch",
         trigger: webhook_no_unauthorized_dispatch_trigger,
         satisfied: webhook_no_unauthorized_dispatch_satisfied,
-        correction_message: "[Your response was rejected. You called \
-             run_claude_pilot or run_claude_pilot_groom on a [GitHub] webhook \
-             turn that was NOT a 'ready' label event. Per Layer 1 source-check \
-             (mika#841), only '[GitHub] Issue labeled ready on' webhooks may \
-             dispatch. All other [GitHub] events (comments, other labels, edits) \
-             must use Webhook Fallthrough: acknowledge without dispatching.]",
+        correction_message: "[mika-engine] The previous response called run_claude_pilot or \
+             run_claude_pilot_groom on a [GitHub] webhook turn that was NOT a \
+             'ready' label event. Per Layer 1 source-check (mika#841), only \
+             '[GitHub] Issue labeled ready on' webhooks may dispatch. All other \
+             [GitHub] events (comments, other labels, edits) use Webhook \
+             Fallthrough: the engine expects acknowledgement without dispatching.",
     },
     // #696 — webhook events require at least one successful tool call.
     IntentPrecondition {
         label: "webhook_zero_tools",
         trigger: |msg| msg.starts_with("[GitHub]"),
         satisfied: |summaries| summaries.iter().any(|s| s.success),
-        correction_message: "[Your response was rejected because you received a GitHub \
-             webhook event but responded with text only and zero tool calls. \
-             Webhook events require action — you MUST call at least one tool \
+        correction_message: "[mika-engine] A GitHub webhook event was received but the \
+             response was text-only with zero tool calls. Webhook events require \
+             action — the engine expects at least one tool call \
              (send_message, update_task_status, list_tasks, check_task, etc.) \
              to process the event. Re-read the webhook payload above and use \
-             the appropriate tools to handle it.]",
+             the appropriate tools to handle it.",
     },
     // #702 — resume/continue intent for milestones/projects requires
     // reconciliation via check_task or list_tasks before EndTurn.
@@ -4999,12 +5068,12 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "resume_reconcile",
         trigger: detect_resume_intent,
         satisfied: resume_reconcile_satisfied,
-        correction_message: "[Your response was rejected because you received a resume/continue \
-             instruction for a milestone or project but did not call any reconciliation \
-             tools. You MUST call check_task or list_tasks (with success) to reconcile \
-             the current state before ending your turn. Follow the Resume Semantics \
-             section in the self-dev skill prompt to find the parent task, locate the \
-             next child, and resume execution.]",
+        correction_message: "[mika-engine] A resume/continue instruction was received for a \
+             milestone or project but no reconciliation tools were called. The \
+             engine expects check_task or list_tasks (with success) to reconcile \
+             the current state before EndTurn. Follow the Resume Semantics section \
+             in the self-dev skill prompt to find the parent task, locate the next \
+             child, and resume execution.",
     },
     // #870 — callback turns must update parent task AND notify operator before
     // EndTurn.  Without this guard, the callback session can run diagnostic
@@ -5027,11 +5096,12 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "deferred_dispatch_action",
         trigger: deferred_dispatch_trigger,
         satisfied: deferred_dispatch_satisfied,
-        correction_message: "[Your response was rejected. This is a deferred-dispatch \
-             retry — the prior run_claude_pilot was rejected with global_dispatch_active. \
-             The dispatch slot is now free. You MUST re-invoke run_claude_pilot with the \
-             original arguments to complete the deferred dispatch. Do not call \
-             update_task_status, send_message, or any other tool first.]",
+        correction_message: "[mika-engine] This is a deferred-dispatch retry — the prior \
+             run_claude_pilot was rejected with global_dispatch_active. The dispatch \
+             slot is now free. The engine expects run_claude_pilot to be re-invoked \
+             with the original arguments to complete the deferred dispatch. \
+             update_task_status, send_message, and other tools should not be called \
+             before run_claude_pilot.",
     },
 ];
 
@@ -5039,14 +5109,14 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
 /// action guard.  Used by both the INTENT_GUARDS registry entry (non-empty
 /// text path) and the inline empty-text guard in the Silent mode exit path.
 const CALLBACK_TERMINAL_ACTION_LABEL: &str = "callback_terminal_action";
-const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[Your response was rejected because \
-     this callback turn ended without the required terminal actions. Callback turns MUST: \
-     (1) call `update_task_status` to mark the parent self_dev task terminal \
+const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[mika-engine] This callback turn ended \
+     without the required terminal actions. Callback turns require both: \
+     (1) `update_task_status` to mark the parent self_dev task terminal \
      (`failed`/`pending`/`completed` based on the callback result), AND \
-     (2) call `send_message` to notify the operator of the result. \
-     Optionally call `create_task` to relaunch claude-pilot if the failure mode \
-     is retry-safe. EndTurn without (1) AND (2) will be rejected. \
-     Re-read the callback framing and produce both terminal actions before EndTurn.]";
+     (2) `send_message` to notify the operator of the result. \
+     Optionally `create_task` to relaunch claude-pilot if the failure mode \
+     is retry-safe. EndTurn without both (1) and (2) re-enters this gate. \
+     Re-read the callback framing and produce both terminal actions before EndTurn.";
 
 /// Re-export from `webhook_dispatch` module — single source of truth for the
 /// ready-label marker prefix (mika#933).
@@ -5274,14 +5344,14 @@ fn callback_milestone_advance_satisfied(
 }
 
 /// #991 — Correction message for the callback milestone advance guard.
-const CALLBACK_MILESTONE_ADVANCE_CORRECTION: &str = "[Your response was rejected. This is a \
-     callback turn for a milestone/project child task. Per mika#991 you MUST either: \
+const CALLBACK_MILESTONE_ADVANCE_CORRECTION: &str = "[mika-engine] This is a callback turn for \
+     a milestone/project child task. Per mika#991 the engine expects either: \
      (1) dispatch the next pending child via run_claude_pilot, OR \
      (2) mark the milestone/project parent as `blocked` (with a reason in the note field) \
      or `completed` via update_task_status. Posting a confirmation question or summary \
      without one of these two tool calls is the deliberation-stall pattern documented \
      in mika#991. Re-read the callback result and either advance the queue or halt \
-     the milestone explicitly via update_task_status.]";
+     the milestone explicitly via update_task_status.";
 
 // ---------------------------------------------------------------------------
 // #862 — Asserted-unavailability guard

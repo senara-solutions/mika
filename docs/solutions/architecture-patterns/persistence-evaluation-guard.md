@@ -44,7 +44,7 @@ Added a 5th post-condition guard to `run_loop()` in `agent.rs`, following the ex
 
 ## Key Design Decisions
 
-- **Nudge vs rejection:** Unlike guards 1-4 which say "Your response was rejected," this guard uses softer language. The model can legitimately decide nothing is worth persisting. The guard removes the "I didn't think to persist" failure mode without becoming a semantic judge.
+- **Nudge vs rejection:** Unlike guards 1-4 whose corrections lead with `[mika-engine]` + state-machine framing ("The engine expects ...") to signal hard control flow, this guard uses softer language. The model can legitimately decide nothing is worth persisting. The guard removes the "I didn't think to persist" failure mode without becoming a semantic judge.
 - **Conservative write-tool set:** Only `store_fact`, `update_fact`, `update_core_memory`. Workflow tools (`create_task`, `update_task_status`) don't indicate knowledge persistence.
 - **No tool-availability gate:** All three persistence tools are in `default_tools()` and always available.
 - **Conversation-mode only:** Silent/team modes are background tasks where persistence evaluation adds no value.

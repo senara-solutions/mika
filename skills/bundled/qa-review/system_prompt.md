@@ -129,7 +129,7 @@ or, when no worktree is available (manual PR, externally opened, worktree cleane
 ```
 run_shell("git -C $MIKA_PLATFORM_DIR/<repo>/ show <branch>:<path>")
 ```
-**Do NOT use `run_gh("api ...")`** — `gh api` is not in the `run_gh` allowlist (see Constraints section at end of this prompt). If neither route can read the plan, emit `block[pipeline]` — "Cannot read plan file: no local worktree and remote git read failed" — rather than retrying.
+**Do NOT use `run_gh("api ...")` to read the plan file** — even though `gh api` is available via the global `run_gh` builtin (mika#1168 b2), it is not the right tool here: it returns a JSON envelope around base64-encoded content and is fragile under file moves. Stick to the local worktree (`run_shell cat`) or `git show` paths above. If neither route can read the plan, emit `block[pipeline]` — "Cannot read plan file: no local worktree and remote git read failed" — rather than retrying.
 
 **2.5.2. Extract acceptance criteria.**
 
