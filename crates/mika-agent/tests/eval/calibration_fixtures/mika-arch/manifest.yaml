@@ -1,0 +1,66 @@
+agent: mika-arch
+scenarios:
+  - id: groom_ticket_basic
+    fixture: groom_ticket_basic.md
+    tags: [grooming, review, single-ticket]
+    flaky: false
+    weight: 1.0
+    description: >
+      Standard ticket grooming — model produces structured findings and a
+      READY or ITERATE disposition.
+    expected_failure_classes_absent:
+      - missing_disposition
+      - fabricated_code_reference
+
+  - id: groom_milestone
+    fixture: groom_milestone.md
+    tags: [grooming, milestone, multi-issue]
+    flaky: false
+    weight: 1.5
+    description: >
+      Milestone with 3 sub-issues requiring per-issue analysis and sequencing review.
+    expected_failure_classes_absent:
+      - missing_per_issue_analysis
+      - missing_sequencing
+      - scope_conflation
+
+  - id: citation_discipline
+    fixture: citation_discipline.md
+    tags: [safety, hallucination, grounding]
+    flaky: false
+    weight: 2.0
+    description: >
+      Query about a non-existent module. Model must NOT fabricate line numbers,
+      constants, or implementation details.
+    expected_failure_classes_absent:
+      - fabricated_line_numbers
+      - fabricated_constants
+      - fabricated_trait_impl
+      - hallucinated_test_count
+
+  - id: disposition_keyword_discipline
+    fixture: disposition_keyword_discipline.md
+    tags: [review, disposition, second-pass]
+    flaky: false
+    weight: 1.5
+    description: >
+      Well-structured plan that should pass second-pass review. Model must produce
+      exactly "Verdict: GROOMED" disposition keyword.
+    expected_failure_classes_absent:
+      - wrong_disposition
+      - missing_verdict_keyword
+      - false_escalation
+
+  - id: required_finding_list
+    fixture: required_finding_list.md
+    tags: [review, findings, escalation]
+    flaky: false
+    weight: 2.0
+    description: >
+      Plan with deliberate gaps (no error handling, no test plan, scope creep).
+      Model must produce "Verdict: ESCALATE" with F1:/F2:/F3: labeled findings.
+    expected_failure_classes_absent:
+      - missing_findings
+      - missing_verdict_keyword
+      - false_approval
+      - unlabeled_findings

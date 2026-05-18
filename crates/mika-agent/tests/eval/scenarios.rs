@@ -1,51 +1,20 @@
 //! Scenario definitions for the multi-provider eval matrix.
 //!
-//! Each scenario is an `async fn` that takes a provider and returns a `ScenarioOutcome`.
-//! Scenarios are authored once and invoked from both the matrix runner and
-//! per-provider convenience tests.
+//! Re-exports promoted types from `src/calibration/scenario.rs` and provides
+//! the provider-level scenario implementations.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use mika_common::llm::LlmProvider;
 use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
-use serde::{Deserialize, Serialize};
 
-/// Outcome of running a single scenario against a single provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScenarioOutcome {
-    /// Name of the scenario.
-    pub scenario: String,
-    /// Provider name.
-    pub provider: String,
-    /// Model used.
-    pub model: String,
-    /// Whether the scenario succeeded.
-    pub success: bool,
-    /// Error message if the scenario failed.
-    pub error: Option<String>,
-    /// The response text from the LLM.
-    pub response_text: Option<String>,
-    /// Input token count (if reported by the provider).
-    pub input_tokens: Option<u64>,
-    /// Output token count (if reported by the provider).
-    pub output_tokens: Option<u64>,
-    /// Wall-clock latency in milliseconds.
-    pub latency_ms: u64,
-}
+// Re-export promoted types
+pub use mika_agent::calibration::scenario::{Scenario, ScenarioOutcome};
 
-/// Registry of all available scenarios.
+/// Registry of all available scenarios (test-local, not promoted).
 pub struct ScenarioRegistry {
     pub scenarios: Vec<Scenario>,
-}
-
-/// A boxed async future returning a `ScenarioOutcome`.
-type ScenarioFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ScenarioOutcome> + Send>>;
-
-pub struct Scenario {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub run: fn(Arc<dyn LlmProvider>) -> ScenarioFuture,
 }
 
 impl ScenarioRegistry {

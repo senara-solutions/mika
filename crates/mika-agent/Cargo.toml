@@ -16,6 +16,10 @@ readme = "../../README.md"
 name = "mika-server"
 path = "src/bin/mika-server.rs"
 
+[[bin]]
+name = "calibrate"
+path = "src/bin/calibrate.rs"
+
 [features]
 telemetry = ["mika-common/telemetry"]
 
@@ -53,6 +57,8 @@ dashmap.workspace = true
 url.workspace = true
 regex.workspace = true
 sha2.workspace = true
+clap.workspace = true
+serde_yaml.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
