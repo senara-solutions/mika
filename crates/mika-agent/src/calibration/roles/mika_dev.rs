@@ -356,12 +356,9 @@ async fn run_required_tools_gate(
                 );
             }
 
-            // Must reference the required tool
+            // Must reference the required tool by name
             let lower = text.to_lowercase();
-            if !lower.contains("run_claude_pilot")
-                && !lower.contains("claude_pilot")
-                && !lower.contains("dispatch")
-            {
+            if !lower.contains("run_claude_pilot") && !lower.contains("claude_pilot") {
                 return RoleScenarioResult::fail(
                     "required_tools_gate",
                     FailureClass::ContractViolation,
@@ -432,13 +429,17 @@ async fn run_plan_callout_recognition(
                 );
             }
 
-            // Must reference the plan
+            // Must reference the specific plan path or plan-on-branch concept
             let lower = text.to_lowercase();
-            if !lower.contains("plan") {
+            let recognizes_plan = lower.contains("docs/plans/")
+                || lower.contains("plan-on-branch")
+                || lower.contains("plan file")
+                || (lower.contains("plan") && lower.contains("contract"));
+            if !recognizes_plan {
                 return RoleScenarioResult::fail(
                     "plan_callout_recognition",
                     FailureClass::ContractViolation,
-                    "Response does not acknowledge the plan-on-branch".to_string(),
+                    "Response does not acknowledge the plan-on-branch (requires referencing docs/plans/ path, 'plan-on-branch', 'plan file', or 'plan' + 'contract')".to_string(),
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,

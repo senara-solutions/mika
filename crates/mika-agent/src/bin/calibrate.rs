@@ -39,13 +39,13 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Maximum cost budget in USD. Aborts if exceeded mid-suite.
+    /// Maximum cost budget in USD. v1: reported only (DR-7). v2 will enforce mid-suite abort.
     #[arg(long, default_value = "5.0")]
-    max_cost_usd: f64,
+    _max_cost_usd: f64,
 
-    /// Number of times to run each scenario (default 1, v2 will support N≥3).
+    /// Number of times to run each scenario. v1: always 1 (DR-8). v2 will support N≥3 averaging.
     #[arg(long, default_value = "1")]
-    runs_per_scenario: u32,
+    _runs_per_scenario: u32,
 }
 
 #[tokio::main]
@@ -193,7 +193,8 @@ async fn main() {
                         }
                     }
 
-                    // Check pass rate against baseline
+                    // Check pass rate against baseline (unweighted for both —
+                    // artifact does not carry weights per DR-7)
                     let baseline_pass_count = baseline
                         .providers
                         .values()
@@ -211,17 +212,20 @@ async fn main() {
                         0.0
                     };
 
-                    if report.pass_rate < baseline_rate {
+                    // Use unweighted pass rate for comparison (consistent with baseline)
+                    let current_unweighted_rate =
+                        report.passed as f64 / report.total_scenarios.max(1) as f64;
+                    if current_unweighted_rate < baseline_rate {
                         eprintln!(
                             "\n  ❌ FAIL: pass rate {:.1}% < baseline {:.1}%",
-                            report.pass_rate * 100.0,
+                            current_unweighted_rate * 100.0,
                             baseline_rate * 100.0
                         );
                         std::process::exit(1);
                     } else {
                         println!(
                             "\n  ✓ PASS: pass rate {:.1}% >= baseline {:.1}%",
-                            report.pass_rate * 100.0,
+                            current_unweighted_rate * 100.0,
                             baseline_rate * 100.0
                         );
                     }
