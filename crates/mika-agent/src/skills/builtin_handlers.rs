@@ -1620,6 +1620,9 @@ const GH_ALLOWED_SUBCOMMANDS: &[&str] = &[
     "pr", "issue", "run", "workflow", "release", "repo", "search", "label", "api",
 ];
 
+/// Canonical skill name for the qa-review scope gate (mika#1196).
+const QA_REVIEW_SKILL_NAME: &str = "qa-review";
+
 /// qa-review's narrow gh subcommand+verb scope (mika#1196).
 /// Mirrors the pre-mika#1168-b2 handler at d011773f:skills/bundled/qa-review/handlers/run_gh.sh.
 const QA_REVIEW_GH_ALLOWED: &[(&str, &str)] = &[
@@ -1809,7 +1812,7 @@ fn validate_qa_review_gh_scope(args: &[String], ctx: &ToolContext<'_>) -> Result
     let qa_review_active = ctx
         .active_skill_paths
         .iter()
-        .any(|info| info.skill_name == "qa-review");
+        .any(|info| info.skill_name == QA_REVIEW_SKILL_NAME);
     if !qa_review_active {
         return Ok(());
     }
@@ -6124,7 +6127,7 @@ mod tests {
         }]
     }
 
-    fn args(strs: &[&str]) -> Vec<String> {
+    fn str_args(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()
     }
 
@@ -6134,7 +6137,7 @@ mod tests {
         let paths = qa_review_skill_paths();
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
-        let result = validate_qa_review_gh_scope(&args(&["pr", "merge", "123"]), &ctx);
+        let result = validate_qa_review_gh_scope(&str_args(&["pr", "merge", "123"]), &ctx);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.content.contains("qa-review's scope"));
@@ -6148,7 +6151,7 @@ mod tests {
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
         let result = validate_qa_review_gh_scope(
-            &args(&["api", "-X", "PATCH", "/repos/o/r/milestones/1"]),
+            &str_args(&["api", "-X", "PATCH", "/repos/o/r/milestones/1"]),
             &ctx,
         );
         assert!(result.is_err());
@@ -6161,7 +6164,7 @@ mod tests {
         let paths = qa_review_skill_paths();
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
-        let result = validate_qa_review_gh_scope(&args(&["issue", "close", "123"]), &ctx);
+        let result = validate_qa_review_gh_scope(&str_args(&["issue", "close", "123"]), &ctx);
         assert!(result.is_err());
     }
 
@@ -6171,8 +6174,10 @@ mod tests {
         let paths = qa_review_skill_paths();
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
-        let result =
-            validate_qa_review_gh_scope(&args(&["pr", "edit", "123", "--add-label", "x"]), &ctx);
+        let result = validate_qa_review_gh_scope(
+            &str_args(&["pr", "edit", "123", "--add-label", "x"]),
+            &ctx,
+        );
         assert!(result.is_err());
     }
 
@@ -6183,7 +6188,7 @@ mod tests {
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
         let result =
-            validate_qa_review_gh_scope(&args(&["pr", "review", "123", "--approve"]), &ctx);
+            validate_qa_review_gh_scope(&str_args(&["pr", "review", "123", "--approve"]), &ctx);
         assert!(result.is_ok());
     }
 
@@ -6193,7 +6198,7 @@ mod tests {
         let paths = qa_review_skill_paths();
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
-        let result = validate_qa_review_gh_scope(&args(&["pr", "diff", "123"]), &ctx);
+        let result = validate_qa_review_gh_scope(&str_args(&["pr", "diff", "123"]), &ctx);
         assert!(result.is_ok());
     }
 
@@ -6203,7 +6208,7 @@ mod tests {
         let paths = qa_review_skill_paths();
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
-        let result = validate_qa_review_gh_scope(&args(&["pr", "list"]), &ctx);
+        let result = validate_qa_review_gh_scope(&str_args(&["pr", "list"]), &ctx);
         assert!(result.is_ok());
     }
 
@@ -6213,7 +6218,7 @@ mod tests {
         let paths = qa_review_skill_paths();
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
-        let result = validate_qa_review_gh_scope(&args(&["issue", "view", "123"]), &ctx);
+        let result = validate_qa_review_gh_scope(&str_args(&["issue", "view", "123"]), &ctx);
         assert!(result.is_ok());
     }
 
@@ -6224,7 +6229,7 @@ mod tests {
         let mut ctx = harness.ctx();
         ctx.active_skill_paths = &paths;
         let result = validate_qa_review_gh_scope(
-            &args(&["issue", "edit", "123", "--remove-label", "ready"]),
+            &str_args(&["issue", "edit", "123", "--remove-label", "ready"]),
             &ctx,
         );
         assert!(result.is_ok());
@@ -6234,7 +6239,7 @@ mod tests {
     fn test_validate_qa_review_gh_scope_not_active_accepts_pr_merge() {
         let harness = TestHarness::new();
         let ctx = harness.ctx(); // active_skill_paths: &[]
-        let result = validate_qa_review_gh_scope(&args(&["pr", "merge", "123"]), &ctx);
+        let result = validate_qa_review_gh_scope(&str_args(&["pr", "merge", "123"]), &ctx);
         assert!(result.is_ok());
     }
 }
