@@ -1,7 +1,7 @@
 ---
 ticket: mika#1200
 type: bug
-status: planning
+status: active
 branch: bug/1200/dev-groom-pilot-session-exits-empty
 groomed_by: orchestrator-Claude
 date: 2026-05-18

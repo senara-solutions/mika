@@ -710,6 +710,29 @@ dispatch_claude_pilot() {
     command -v mika >/dev/null 2>&1 || { echo "Error: mika CLI is required but not in PATH" >&2; exit 1; }
     command -v claude-pilot >/dev/null 2>&1 || { echo "Error: claude-pilot CLI is required but not in PATH" >&2; exit 1; }
 
+    # claude-pilot venv smoke test (mika#1200): force the import chain that imports
+    # yaml (and all other dependencies) to actually execute. Relies on cli.py keeping
+    # its imports at module top level — if cli.py is ever refactored to lazy-import
+    # .agent / .permissions inside main(), THIS smoke test silently stops detecting
+    # the failure class. See
+    # mika/docs/plans/2026-05-18-001-bug-dev-groom-pilot-empty-handed-plan.md
+    # § Phase 0 Pin / cli.py invariant.
+    if ! timeout 15 claude-pilot --help >/dev/null 2>&9; then
+        cat >&2 <<'EOF'
+Error: claude-pilot venv is broken — `claude-pilot --help` exited non-zero.
+Most likely cause: pyproject.toml changed in claude-pilot-py without an
+accompanying `uv tool install` to re-sync dependencies. Editable installs pick
+up new source automatically but do NOT auto-install new declared dependencies.
+
+To restore the loop:
+    cd <mika-platform-root> && uv tool install --force --editable ./claude-pilot-py
+
+Reference: mika#1200 +
+mika/docs/plans/2026-05-18-001-bug-dev-groom-pilot-empty-handed-plan.md
+EOF
+        exit 1
+    fi
+
     # mika-platform root — base for sub-repo resolution
     PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
     PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
