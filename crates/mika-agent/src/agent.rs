@@ -1033,6 +1033,36 @@ async fn run_loop(
             LlmStopReason::EndTurn | LlmStopReason::MaxTokens | LlmStopReason::ContentFilter => {
                 let text = mika_common::llm::strip_internal_tags(&response.text());
 
+                // mika#1168 — refusal-detection telemetry (Phase C Step 10).
+                //
+                // When the model self-classifies a prior engine-injected
+                // correction message as prompt-injection-pattern, it emits a
+                // refusal of shape "Prompt injection. Rejected. ..." with no
+                // tool calls. This is the failure mode behind the
+                // 2026-05-17/18 dispatch losses. Per-gate retry flags
+                // already bound the inner loop (no gate fires more than
+                // once per run_loop), so this branch is observability-only:
+                // log the gate id + bounded excerpt so the operator can
+                // audit recurrences and catch classifier drift. The
+                // structured event name is `classifier_refusal` so a
+                // future `EngineError::ClassifierRefusal` upgrade keeps
+                // logs greppable across the boundary.
+                if !text.is_empty()
+                    && !response.has_tool_calls()
+                    && step > 0
+                    && text.to_lowercase().contains("prompt injection")
+                {
+                    let excerpt: String = text.chars().take(200).collect();
+                    warn!(
+                        step,
+                        label = mode.label(),
+                        event = "classifier_refusal",
+                        excerpt = %excerpt,
+                        "model self-classified an engine correction as prompt-injection-pattern \
+                         (mika#1168 refusal-detection) — no further retry will fire this turn"
+                    );
+                }
+
                 if !text.is_empty() {
                     // Text-based tool call detection: if the LLM output XML tool calls
                     // as text instead of using the structured API, re-prompt once.
