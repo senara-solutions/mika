@@ -1620,6 +1620,15 @@ const GH_ALLOWED_SUBCOMMANDS: &[&str] = &[
     "pr", "issue", "run", "workflow", "release", "repo", "search", "label", "api",
 ];
 
+/// qa-review's narrow gh subcommand+verb scope (mika#1196).
+/// Mirrors the pre-mika#1168-b2 handler at d011773f:skills/bundled/qa-review/handlers/run_gh.sh.
+const QA_REVIEW_GH_ALLOWED: &[(&str, &str)] = &[
+    ("pr", "review"),
+    ("pr", "diff"),
+    ("pr", "list"),
+    ("issue", "view"),
+];
+
 // ---------------------------------------------------------------------------
 // Logical-key → argv-extractor table (mika#899)
 // ---------------------------------------------------------------------------
@@ -1791,6 +1800,35 @@ fn validate_gh_input(input: &serde_json::Value) -> Result<GhArgs, ToolOutput> {
     Ok(GhArgs { args, repo })
 }
 
+/// Skill-scoped argv validator for qa-review (mika#1196).
+///
+/// When qa-review is in the active skill set, restricts `run_gh` to the
+/// historical narrow allowlist: `pr review`, `pr diff`, `pr list`, `issue view`.
+/// Other skills (always-on or active) get the global allowlist as before.
+fn validate_qa_review_gh_scope(args: &[String], ctx: &ToolContext<'_>) -> Result<(), ToolOutput> {
+    let qa_review_active = ctx
+        .active_skill_paths
+        .iter()
+        .any(|info| info.skill_name == "qa-review");
+    if !qa_review_active {
+        return Ok(());
+    }
+    let subcommand = args.first().map(String::as_str).unwrap_or("");
+    let verb = args.get(1).map(String::as_str).unwrap_or("");
+    if QA_REVIEW_GH_ALLOWED
+        .iter()
+        .any(|(s, v)| *s == subcommand && *v == verb)
+    {
+        return Ok(());
+    }
+    Err(ToolOutput::error(format!(
+        "gh subcommand '{subcommand} {verb}' is not in qa-review's scope. \
+         Permitted (qa-review): pr review, pr diff, pr list, issue view. \
+         Source: skills/bundled/qa-review/skill.toml (always_on=true) + \
+         builtin_handlers.rs::validate_qa_review_gh_scope (mika#1196)."
+    )))
+}
+
 /// Extract the HTTP method from a `gh api` argv.
 ///
 /// Scans for `--method X` or `--method=X` (also `-X` shorthand). Defaults to `"GET"`
@@ -1821,6 +1859,12 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         Ok(args) => args,
         Err(err) => return err,
     };
+
+    // Skill-scoped scope check (mika#1196): when qa-review is in the active
+    // skill set, restrict to the narrow allowlist before any side effects.
+    if let Err(err) = validate_qa_review_gh_scope(&gh_args.args, ctx) {
+        return err;
+    }
 
     // Compute PR dedup key for `pr review` commands.
     let pr_dedup_key = if is_pr_review_command(&gh_args.args) {
@@ -6061,5 +6105,136 @@ mod tests {
     #[test]
     fn test_extractor_for_unknown_key() {
         assert!(extractor_for_key("nonexistent_key").is_none());
+    }
+
+    // -- validate_qa_review_gh_scope tests (mika#1196) --
+
+    fn qa_review_skill_paths() -> Vec<crate::tools::SkillPathInfo> {
+        vec![crate::tools::SkillPathInfo {
+            skill_name: "qa-review".to_string(),
+            prompt_relative_path: "skills/qa-review/system_prompt.md".to_string(),
+        }]
+    }
+
+    fn non_qa_review_skill_paths() -> Vec<crate::tools::SkillPathInfo> {
+        vec![crate::tools::SkillPathInfo {
+            skill_name: "self-dev-webhook-ready-label".to_string(),
+            prompt_relative_path: "skills/self-dev-webhook-ready-label/system_prompt.md"
+                .to_string(),
+        }]
+    }
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_rejects_pr_merge() {
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result = validate_qa_review_gh_scope(&args(&["pr", "merge", "123"]), &ctx);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("qa-review's scope"));
+        assert!(err.content.contains("mika#1196"));
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_rejects_api_patch() {
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result = validate_qa_review_gh_scope(
+            &args(&["api", "-X", "PATCH", "/repos/o/r/milestones/1"]),
+            &ctx,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("qa-review's scope"));
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_rejects_issue_close() {
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result = validate_qa_review_gh_scope(&args(&["issue", "close", "123"]), &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_rejects_pr_edit() {
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result =
+            validate_qa_review_gh_scope(&args(&["pr", "edit", "123", "--add-label", "x"]), &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_accepts_pr_review() {
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result =
+            validate_qa_review_gh_scope(&args(&["pr", "review", "123", "--approve"]), &ctx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_accepts_pr_diff() {
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result = validate_qa_review_gh_scope(&args(&["pr", "diff", "123"]), &ctx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_accepts_pr_list() {
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result = validate_qa_review_gh_scope(&args(&["pr", "list"]), &ctx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_accepts_issue_view() {
+        let harness = TestHarness::new();
+        let paths = qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result = validate_qa_review_gh_scope(&args(&["issue", "view", "123"]), &ctx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_not_active_accepts_issue_edit() {
+        let harness = TestHarness::new();
+        let paths = non_qa_review_skill_paths();
+        let mut ctx = harness.ctx();
+        ctx.active_skill_paths = &paths;
+        let result = validate_qa_review_gh_scope(
+            &args(&["issue", "edit", "123", "--remove-label", "ready"]),
+            &ctx,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_qa_review_gh_scope_not_active_accepts_pr_merge() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx(); // active_skill_paths: &[]
+        let result = validate_qa_review_gh_scope(&args(&["pr", "merge", "123"]), &ctx);
+        assert!(result.is_ok());
     }
 }
