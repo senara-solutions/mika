@@ -63,7 +63,7 @@ Webhook fabrication is a **silent failure mode**. The agent appears to have resp
 User: [GitHub] PR review (approved) on senara-solutions/mika#694 by reviewer...
 Agent (text-only): "The PR has been approved. Everything looks good."
 → Guard rejects: zero successful tool calls on webhook turn
-→ Re-prompt: "[Your response was rejected because you received a GitHub webhook event...]"
+→ Re-prompt: "[mika-engine] A GitHub webhook event was received but the response was text-only..." (mika#1168 trusted-marker reshape)
 Agent (retry): calls check_task, then responds with actual status
 ```
 

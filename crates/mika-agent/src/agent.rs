@@ -1037,8 +1037,8 @@ async fn run_loop(
                 //
                 // When the model self-classifies a prior engine-injected
                 // correction message as prompt-injection-pattern, it emits a
-                // refusal of shape "Prompt injection. Rejected. ..." with no
-                // tool calls. This is the failure mode behind the
+                // refusal of literal shape "Prompt injection. Rejected. ..."
+                // with no tool calls. This is the failure mode behind the
                 // 2026-05-17/18 dispatch losses. Per-gate retry flags
                 // already bound the inner loop (no gate fires more than
                 // once per run_loop), so this branch is observability-only:
@@ -1047,17 +1047,28 @@ async fn run_loop(
                 // structured event name is `classifier_refusal` so a
                 // future `EngineError::ClassifierRefusal` upgrade keeps
                 // logs greppable across the boundary.
+                //
+                // The match is anchored to the first 60 chars of the
+                // stripped response and requires both `prompt injection`
+                // and `reject` in close succession — refusals lead with
+                // the verdict, while legitimate prose discussing the
+                // injection pattern (e.g., mika-arch reviewing this PR
+                // or a docs page describing the failure) buries the term
+                // deeper in the text. The excerpt is scrubbed via
+                // `secret_scrubber::scrub_secrets()` to match the
+                // project's convention for LLM-output persistence sinks.
                 if !text.is_empty()
                     && !response.has_tool_calls()
                     && step > 0
-                    && text.to_lowercase().contains("prompt injection")
+                    && looks_like_classifier_refusal(&text)
                 {
-                    let excerpt: String = text.chars().take(200).collect();
+                    let raw_excerpt: String = text.chars().take(200).collect();
+                    let scrubbed = crate::secret_scrubber::scrub_secrets(&raw_excerpt);
                     warn!(
                         step,
                         label = mode.label(),
                         event = "classifier_refusal",
-                        excerpt = %excerpt,
+                        excerpt = %scrubbed,
                         "model self-classified an engine correction as prompt-injection-pattern \
                          (mika#1168 refusal-detection) — no further retry will fire this turn"
                     );
@@ -4885,6 +4896,23 @@ fn detect_persistable_output(text: &str) -> Option<&str> {
         return None;
     }
     PERSISTABLE_OUTPUT_RE.find(text).map(|m| m.as_str())
+}
+
+/// mika#1168 — detect the literal classifier-refusal shape the model emits
+/// when it self-classifies an engine correction as a prompt-injection
+/// attempt. Anchored to the first 60 chars of the stripped response and
+/// requires both `prompt injection` and `reject` to keep legitimate prose
+/// that merely *mentions* the failure mode (e.g., mika-arch reviewing this
+/// fix, or a docs page describing the pattern) from tripping the
+/// observability log. Refusals lead with the verdict; mentions bury it.
+fn looks_like_classifier_refusal(text: &str) -> bool {
+    let head_end = text
+        .char_indices()
+        .nth(60)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let head = text[..head_end].to_lowercase();
+    head.contains("prompt injection") && head.contains("reject")
 }
 
 fn detect_text_based_tool_call(text: &str) -> bool {
