@@ -71,6 +71,8 @@ async-trait = "0.1"
 
 # Streaming
 tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = { version = "0.3", default-features = false }
+async-stream = "0.3"
 
 # HTTP
 http = "1"

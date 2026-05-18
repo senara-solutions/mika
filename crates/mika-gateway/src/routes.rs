@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::a2a_routes;
 use crate::github;
+use crate::orchestrator_inbox;
 use crate::telegram::{
     ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate, parse_agent_prefix,
     parse_update,
@@ -106,6 +107,10 @@ pub struct AppState {
     pub github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
     /// Override for GitHub API base URL (testing only). Defaults to `https://api.github.com`.
     pub github_api_base_url: Option<String>,
+    /// Whether the orchestrator inbox endpoints serve requests (mika#1189).
+    /// When `false`, both `/orchestrator/inbox/{id}/message` and `.../stream`
+    /// return 404 — preserves the pre-1189 filesystem-inbox-only behavior.
+    pub orchestrator_inbox_enabled: bool,
 }
 
 impl std::fmt::Debug for AppState {
@@ -176,6 +181,24 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/webhook/dlq/replay-all",
             post(handle_dlq_replay_all).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
+        )
+        // Orchestrator inbox (mika#1189) — bidirectional SSE channel for
+        // spawn→orchestrator coordination. Bearer-token auth (same as /send).
+        .route(
+            "/orchestrator/inbox/{orchestrator_id}/message",
+            post(orchestrator_inbox::handle_post_message)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(256 * 1024)),
+        )
+        .route(
+            "/orchestrator/inbox/{orchestrator_id}/stream",
+            get(orchestrator_inbox::handle_stream).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_bearer_token,
             )),

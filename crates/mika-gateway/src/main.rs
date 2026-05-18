@@ -3,6 +3,7 @@ mod a2a_routes;
 pub(crate) mod dlq;
 pub mod github;
 pub mod openapi;
+pub(crate) mod orchestrator_inbox;
 mod routes;
 mod settings;
 mod telegram;
@@ -111,6 +112,14 @@ async fn main() -> Result<()> {
         }
     };
 
+    let orchestrator_inbox_enabled =
+        settings::orchestrator_inbox_is_enabled(settings.orchestrator_inbox_enabled.as_deref());
+    if orchestrator_inbox_enabled {
+        info!("orchestrator inbox endpoints enabled (MIKA_ORCHESTRATOR_INBOX_ENABLED=1)");
+    } else {
+        info!("orchestrator inbox endpoints disabled (MIKA_ORCHESTRATOR_INBOX_ENABLED unset or 0)");
+    }
+
     // Build app state
     let state = AppState {
         pool,
@@ -129,10 +138,15 @@ async fn main() -> Result<()> {
         github_delivery_cache: github::new_delivery_cache(),
         github_app,
         github_api_base_url: None,
+        orchestrator_inbox_enabled,
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)
     tokio::spawn(dlq::run_dlq_worker(state.clone()));
+
+    // Spawn orchestrator inbox retention task (mika#1189) — purges rows older
+    // than `ORCHESTRATOR_INBOX_RETENTION_DAYS` once an hour.
+    tokio::spawn(orchestrator_inbox::run_retention_task(state.pool.clone()));
 
     let app = build_router(state);
 

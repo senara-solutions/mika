@@ -6,6 +6,7 @@
 use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 
+use crate::orchestrator_inbox;
 use crate::routes;
 
 #[derive(OpenApi)]
@@ -21,12 +22,16 @@ use crate::routes;
         routes::handle_readiness,
         routes::handle_liveness,
         routes::handle_version,
+        orchestrator_inbox::handle_post_message,
+        orchestrator_inbox::handle_stream,
         // github::handle_github_webhook is excluded from OpenAPI because it
         // consumes raw Bytes for HMAC validation (not JSON-schema-describable).
     ),
     components(schemas(
         routes::SendPayload,
         routes::VersionInfo,
+        orchestrator_inbox::PostMessagePayload,
+        orchestrator_inbox::PostMessageResponse,
     )),
     modifiers(&SecurityAddon),
 )]
@@ -73,6 +78,14 @@ mod tests {
         assert!(yaml.contains("/send"), "missing /send endpoint");
         assert!(yaml.contains("/readyz"), "missing /readyz endpoint");
         assert!(yaml.contains("/livez"), "missing /livez endpoint");
+        assert!(
+            yaml.contains("/orchestrator/inbox/{orchestrator_id}/message"),
+            "missing orchestrator inbox POST endpoint"
+        );
+        assert!(
+            yaml.contains("/orchestrator/inbox/{orchestrator_id}/stream"),
+            "missing orchestrator inbox SSE endpoint"
+        );
     }
 
     #[test]
