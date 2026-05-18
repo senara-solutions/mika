@@ -1868,6 +1868,8 @@ mod tests {
             github_delivery_cache: new_delivery_cache(),
             github_app: None,
             github_api_base_url: None,
+            orchestrator_inbox_enabled: false,
+            inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
         };
 
         axum::Router::new()
@@ -1980,6 +1982,8 @@ mod tests {
             github_delivery_cache: delivery_cache.clone(),
             github_app: None,
             github_api_base_url: None,
+            orchestrator_inbox_enabled: false,
+            inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
         };
 
         let app = axum::Router::new()
@@ -2329,6 +2333,8 @@ mod tests {
             github_delivery_cache: new_delivery_cache(),
             github_app: None,
             github_api_base_url: None,
+            orchestrator_inbox_enabled: false,
+            inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
         }
     }
 
@@ -3007,6 +3013,8 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             github_delivery_cache: new_delivery_cache(),
             github_app,
             github_api_base_url: Some(github_api_base_url.to_string()),
+            orchestrator_inbox_enabled: false,
+            inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
         };
 
         axum::Router::new()

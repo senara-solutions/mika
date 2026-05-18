@@ -16,6 +16,8 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 | `/webhook/dlq/replay-all` | POST | Internal token | Replay all dead DLQ entries |
 | `/a2a/{customer_id}/{agent_name}` | POST | API key | A2A protocol proxy (2MB limit) |
 | `/a2a/{customer_id}/{agent_name}/agent.json` | GET | None | Agent Card proxy |
+| `/orchestrator/inbox/{orchestrator_id}/message` | POST | Internal token | Persist spawn→orchestrator message (256KB limit, mika#1189) |
+| `/orchestrator/inbox/{orchestrator_id}/stream` | GET | Internal token | SSE stream of inbox messages with cursor replay (mika#1189) |
 
 ## GitHub Webhook Integration
 
@@ -65,6 +67,7 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 - Migration 004: creates `github_repos` table (maps `repo_full_name` -> `customer_id` for multi-tenant GitHub webhook routing)
 - Migration 005: adds `agent_mapping JSONB NOT NULL DEFAULT '{}'` to `github_repos` for per-repo agent name overrides (keys are default agent names from `route_event()`, values are customer's replacement names; `apply_agent_mapping()` validates names via `is_valid_agent_name()` and falls back to defaults for invalid values)
 - Migration 006: creates `webhook_deliveries` table for dead-letter queue (delivery_id PK, event_type, target_agent, repo_full_name, payload, request_id, status CHECK IN pending/delivered/dead, attempts, last_attempt_at, last_error). Partial indexes on `(status, last_attempt_at) WHERE status='pending'` and `(created_at DESC) WHERE status='dead'`.
+- Migration 007: creates `orchestrator_inbox_messages` table for the orchestrator inbox v2 channel (mika#1189). Columns: `id BIGSERIAL PK`, `orchestrator_id TEXT NOT NULL`, `spawn_id TEXT` (nullable), `kind TEXT NOT NULL CHECK IN ('handoff','update','ack')`, `body JSONB NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`, `delivered_at TIMESTAMPTZ`. Indexes: `(orchestrator_id, id)` for cursor replay; partial `(orchestrator_id, created_at) WHERE delivered_at IS NULL` for diagnostic queries on undelivered rows (retention sweeps purge by `created_at` alone and don't use this partial index — see migration comment).
 
 ## build.rs
 
@@ -83,3 +86,14 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 - `MIKA_GITHUB_APP_ID` — GitHub App ID (u64). Required for the synchronize no-diff guard (#886).
 - `MIKA_GITHUB_APP_PRIVATE_KEY` — GitHub App private key (base64-encoded PEM). Required for the synchronize no-diff guard (#886). Encode with: `base64 -w0 < your-app.pem`.
 - `MIKA_GITHUB_APP_INSTALLATION_ID` — GitHub App installation ID (u64). Required for the synchronize no-diff guard (#886). All 3 GitHub App vars must be set; when incomplete, the no-diff guard is disabled (fail-open).
+- `MIKA_ORCHESTRATOR_INBOX_ENABLED` — Orchestrator inbox feature flag (mika#1189). Default off — `/orchestrator/inbox/*` endpoints return 404. Set `1` (or `true`, case-insensitive) to enable dual-write with the mika-platform#100 filesystem inbox. `2` (gateway-only cutover) is reserved for a future ticket and currently treated as disabled. Note: bearer auth gates the endpoints by token; orchestrator/spawn distinction is carried by path (`orchestrator_id`) and `spawn_id` field, not by separate tokens — multi-operator deployments will need per-operator scoping before exposure beyond a solo operator.
+
+## Orchestrator Inbox (mika#1189)
+
+Real-time spawn→orchestrator coordination channel. Spawned Claude Code tenants POST handoff messages addressed to their parent orchestrator's id; the orchestrator subscribes via SSE and surfaces messages in-session. Replaces the operator-mediated paste cycle of mika-platform#100 (filesystem-inbox protocol remains operational during dual-write migration).
+
+- Persistence: Postgres table `orchestrator_inbox_messages` (migration 007). `id BIGSERIAL` is the SSE cursor — clients reconnect with `Last-Event-Id: <last-seen>` and the server replays rows with `id > cursor`. `delivered_at` is observational; cursor replay is authoritative.
+- Wire shape: POST returns `201 {"id": <bigserial>}`. SSE events emit `id: <n>` + `event: message` + `data: <JSON envelope>`. KeepAlive pings every 30s. Long-poll loop reads rows every `ORCHESTRATOR_INBOX_POLL_INTERVAL` (1.5s by default).
+- Retention: background tokio task (spawned in `main.rs`) purges rows older than `ORCHESTRATOR_INBOX_RETENTION_DAYS` (7 days) once an hour. Constants live at the top of `orchestrator_inbox.rs` — code-edit-tunable per plan NF3.
+- Validation: `orchestrator_id` path segment must be 1-128 chars `[A-Za-z0-9_-]`; `kind` must be one of `handoff`, `update`, `ack` (mirrors the migration CHECK constraint).
+- Structured log events: `orchestrator_inbox_message_received`, `orchestrator_inbox_subscriber_connected`, `orchestrator_inbox_retention_purged`.

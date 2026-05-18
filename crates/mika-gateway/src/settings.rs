@@ -64,6 +64,13 @@ pub struct GatewaySettings {
     /// GitHub App installation ID for the org (u64).
     #[serde(default)]
     pub github_app_installation_id: Option<u64>,
+
+    /// Orchestrator inbox feature flag (mika#1189).
+    /// Default: off (`/orchestrator/inbox/*` returns 404). Set `1` to enable
+    /// dual-write with the filesystem inbox (`mika-platform#100`). `2`
+    /// (gateway-only cutover) is reserved for a future ticket.
+    #[serde(default)]
+    pub orchestrator_inbox_enabled: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -182,7 +189,25 @@ impl std::fmt::Debug for GatewaySettings {
                 "github_app_installation_id",
                 &self.github_app_installation_id,
             )
+            .field(
+                "orchestrator_inbox_enabled",
+                &self.orchestrator_inbox_enabled,
+            )
             .finish()
+    }
+}
+
+/// Parse `MIKA_ORCHESTRATOR_INBOX_ENABLED`. Treats `1` / `true` (case-insensitive)
+/// as enabled; everything else (unset, empty, `0`, `false`, or any other value)
+/// as disabled. The `2` (gateway-only) value is reserved for a future ticket
+/// and currently treated as disabled to avoid silent partial cutover.
+pub fn orchestrator_inbox_is_enabled(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some(v) => {
+            let lower = v.to_ascii_lowercase();
+            lower == "1" || lower == "true"
+        }
+        None => false,
     }
 }
 
@@ -251,6 +276,7 @@ mod tests {
                 github_app_id: Some(12345),
                 github_app_private_key: Some(SecretString::from("super-secret-pem")),
                 github_app_installation_id: Some(67890),
+                orchestrator_inbox_enabled: None,
             }
         );
         assert!(!debug.contains("pass"));
@@ -259,5 +285,43 @@ mod tests {
         assert!(!debug.contains("gh-webhook-secret"));
         assert!(!debug.contains("super-secret-pem"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_orchestrator_inbox_enabled_default_off() {
+        assert!(!orchestrator_inbox_is_enabled(None));
+        assert!(!orchestrator_inbox_is_enabled(Some("")));
+    }
+
+    #[test]
+    fn test_orchestrator_inbox_enabled_accepts_one() {
+        assert!(orchestrator_inbox_is_enabled(Some("1")));
+    }
+
+    #[test]
+    fn test_orchestrator_inbox_enabled_accepts_true_case_insensitive() {
+        assert!(orchestrator_inbox_is_enabled(Some("true")));
+        assert!(orchestrator_inbox_is_enabled(Some("True")));
+        assert!(orchestrator_inbox_is_enabled(Some("TRUE")));
+    }
+
+    #[test]
+    fn test_orchestrator_inbox_enabled_rejects_zero() {
+        // Plan: unset / `0` are equivalently disabled.
+        assert!(!orchestrator_inbox_is_enabled(Some("0")));
+        assert!(!orchestrator_inbox_is_enabled(Some("false")));
+    }
+
+    #[test]
+    fn test_orchestrator_inbox_enabled_rejects_two() {
+        // `2` (gateway-only) is reserved and currently treated as disabled.
+        // Prevents partial-cutover silent enable.
+        assert!(!orchestrator_inbox_is_enabled(Some("2")));
+    }
+
+    #[test]
+    fn test_orchestrator_inbox_enabled_handles_whitespace() {
+        assert!(orchestrator_inbox_is_enabled(Some(" 1 ")));
+        assert!(orchestrator_inbox_is_enabled(Some("\ttrue\n")));
     }
 }

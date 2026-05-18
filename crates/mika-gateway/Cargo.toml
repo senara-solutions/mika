@@ -39,6 +39,8 @@ hex.workspace = true
 lru.workspace = true
 rand = { workspace = true }
 chrono = { workspace = true }
+async-stream = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
