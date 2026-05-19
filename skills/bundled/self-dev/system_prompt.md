@@ -433,6 +433,13 @@ For **each** issue number in `milestone_issues` (ALL of them, in the topo-sorted
 
 **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> initialized with {N} child issues: #X, #Y, #Z (topo-sorted). Parent task: <milestone_wi>.")`
 
+**Memory (current_priorities):** After creating the milestone parent task:
+```
+update_core_memory(section="current_priorities", action="rewrite",
+  content="Milestone <repo> milestone#<n> (<milestone_title>): in_progress. <one-line purpose from milestone description>. Issues (dependency order): #X, #Y, #Z.",
+  reasoning="Milestone initialized — update current_priorities to reflect active work")
+```
+
 Notify Vincent: "Milestone <repo> milestone#<n> initialized with {N} issues (dependency-sorted). Starting sequential execution."
 
 ### Step M4 — Serial execution loop
@@ -476,6 +483,24 @@ For each `child_task_id` in `child_wis` (in order):
    - Wait for completion callback
    - Handle QA verdict webhook
    - Close out child task
+
+2.5. **Merge verification gate (verify-post-state):**
+
+   After the QA webhook handler processes a `pass` verdict for this child's PR:
+
+   - If `pr_merge_with_gate` returned `"merged"` or `"already_merged"`: **verify before advancing.** Call `run_gh(["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")` and confirm `state == "MERGED"`. Only then proceed to step 3 with outcome `completed`. If state is not MERGED (race condition), treat as HOLD.
+   - If `pr_merge_with_gate` returned `"auto_merge_enabled"`: the PR is NOT yet merged. This is a **HOLD state** — the child task stays `in_progress`. Do NOT advance to step 3. Do NOT dispatch the next child. Wait for the `pull_request.closed(merged: true)` webhook to arrive (handled by `self-dev-webhook-qa` → "Webhook Entry Point — PR Closed"). When the webhook arrives and the task transitions to `completed`, **verify before re-entering M4:** call `run_gh(["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")` and treat only `state == "MERGED"` as merge success. Only then re-enter M4 step 3 for this child.
+   - If `pr_merge_with_gate` returned `"blocked"` or `"gate_errored"`: the webhook handler already routed to the appropriate block/error path. M4 step 3 will see the child as `blocked`.
+
+   **Literal verification command** (per committed decision — do NOT re-derive):
+   ```
+   run_gh(command=["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")
+   ```
+   Treat only `state == "MERGED"` as merge success. Any other state → HOLD.
+
+   **Rule:** `auto_merge_enabled` is an intent signal, not a completion signal. The child stays in the serial execution slot until the merge webhook confirms actual merge AND `run_gh pr view` verifies `state == "MERGED"`. This prevents dispatching the next ticket against code not yet on main.
+
+   **Incident:** mika#727 — KG milestone #14, PR #726 had auto-merge enabled but CI failed; next ticket #689 was dispatched against missing code.
 
 3. **Check child outcome:**
    | Child outcome | Milestone action |
@@ -549,6 +574,14 @@ When all children processed:
 
 4. Transition parent: `update_task_status(task_id=<milestone_wi>, status="completed")`
 5. **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> completed. Completed: {N}, Failed: {N}, Blocked: {N}. Total cost: ${total_cost}.")`
+
+   **Memory (current_priorities):** After recording milestone completion:
+   ```
+   update_core_memory(section="current_priorities", action="rewrite",
+     content="No active milestone. Last completed: <repo> milestone#<n> (<milestone_title>).",
+     reasoning="Milestone completed — clear current_priorities to prevent stale prompt state")
+   ```
+
 6. Notify Vincent with summary:
    ```
    Milestone <repo> milestone#<n> complete.
