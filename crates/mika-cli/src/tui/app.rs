@@ -847,6 +847,26 @@ impl<'a> App<'a> {
             return;
         }
 
+        // Post-crash guard (mika#1150 cohort): once `WorkerCrashed` has been
+        // surfaced the worker's `user_rx` is gone. Without this guard
+        // `let _ = self.agent_tx.send(...)` below swallows the resulting
+        // `SendError`, the user message is still persisted/rendered, and the
+        // "Thinking" spinner is set — recreating the silent-drop UX that
+        // mika#1149's supervisor was meant to surface. Refuse the send and
+        // point the operator at the recovery affordance.
+        if self.worker_crashed {
+            self.messages.push(ChatMessage {
+                role: ChatRole::System,
+                content: "Agent worker has crashed. Run /restart before sending more messages."
+                    .to_string(),
+                rendered: None,
+                channel: None,
+            });
+            self.reset_textarea();
+            self.needs_redraw = true;
+            return;
+        }
+
         // Save to history
         self.history.push(text.clone());
 
@@ -1321,6 +1341,36 @@ impl<'a> App<'a> {
                 self.status = AgentStatus::Idle;
                 self.worker_crashed = true;
                 self.needs_redraw = true;
+
+                // Persist the crash to audit_events for post-incident triage
+                // (mika#1150 cohort). Fire-and-forget on a fresh task: the
+                // tick loop is the input path, and AsyncDatabase is most
+                // likely to back-pressure precisely on this code path (the
+                // worker may have crashed mid-DB-closure). The structured
+                // `agent_worker_silenced` log event from the supervisor
+                // (chat.rs) remains the primary observability surface; this
+                // audit row complements it with session-scoped grep.
+                let db = self.db.clone();
+                let session = self.session_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = db
+                        .log_audit_event(
+                            &session,
+                            "system",
+                            "agent_worker_crashed",
+                            None,
+                            Some(&reason),
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to log agent_worker_crashed audit event"
+                        );
+                    }
+                });
             }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 // Channel closed without a WorkerCrashed event in flight. With

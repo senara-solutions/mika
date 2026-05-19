@@ -1222,6 +1222,55 @@ mod tests {
         assert!(app.should_quit);
     }
 
+    /// mika#1150 cohort: once the supervisor surfaces `WorkerCrashed`, App
+    /// must refuse new prompts rather than silently route them through the
+    /// dead `agent_tx`. Without this guard every subsequent keystroke
+    /// recreates the silent-drop UX that mika#1149 was meant to surface.
+    #[tokio::test]
+    async fn test_send_after_crash_surfaces_system_line_and_does_not_send() {
+        let (mut app, mut rx, _tmp) = test_app().await;
+        app.worker_crashed = true;
+        app.textarea.insert_str("hello");
+
+        app.send_message();
+
+        // No AgentRequest leaks onto the dead channel.
+        assert!(rx.try_recv().is_err(), "must not send while worker_crashed");
+        // The last message rendered must explain why the send was refused.
+        let last = app
+            .messages
+            .last()
+            .expect("a system line must be rendered after a refused send");
+        assert!(
+            last.content.contains("worker has crashed"),
+            "refusal line missing crash explanation: {:?}",
+            last.content
+        );
+        assert!(
+            last.content.contains("/restart"),
+            "refusal line must point at the recovery affordance: {:?}",
+            last.content
+        );
+    }
+
+    /// Healthy worker accepts the same send path the guard above rejects.
+    /// Pairs with the test above so a regression that flips the guard
+    /// polarity is caught in either direction.
+    #[tokio::test]
+    async fn test_send_while_healthy_dispatches_to_worker() {
+        let (mut app, mut rx, _tmp) = test_app().await;
+        assert!(!app.worker_crashed);
+        app.textarea.insert_str("hello");
+
+        app.send_message();
+
+        let req = rx.try_recv().expect("healthy worker must receive the send");
+        match req {
+            AgentRequest::Message { text, .. } => assert_eq!(text, "hello"),
+            _ => panic!("expected AgentRequest::Message"),
+        }
+    }
+
     #[test]
     fn test_try_load_image_file_nonexistent() {
         assert!(try_load_image_file("/tmp/nonexistent-mika-test.png").is_none());
