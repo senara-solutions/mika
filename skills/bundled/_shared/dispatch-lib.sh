@@ -207,6 +207,76 @@ _verify_and_write_body_callout() {
     fi
 
     local plan_relpath="${plan_file#"$worktree_dir/"}"
+
+    # Class D drift fix (mika#1204): verify the plan file is actually in HEAD's
+    # tree before stamping a SHA claim. If not (pilot exited before committing),
+    # auto-commit the plan so the SHA is truthful.
+    if ! git -C "$worktree_dir" cat-file -e "HEAD:${plan_relpath}" 2>/dev/null; then
+        echo "post_flight_class_d_recovery: plan file exists on disk but not in HEAD — committing (mika#1204)" >&2
+        # Pathspec-limited commit: only the plan file, not the full index.
+        # Prevents capturing any other staged files from a partial pilot run.
+        if ! git -C "$worktree_dir" commit -m "wip(${repo}#${issue_num}): plan staged by post-flight recovery" -- "$plan_relpath"; then
+            echo "WARN: post_flight_class_d_commit_failed for $repo#$issue_num — stamping as uncommitted" >&2
+            # Fall through to approach (b): stamp as uncommitted.
+            # The (uncommitted ...) format deliberately does NOT match the
+            # "committed on branch @" regex — downstream parsers
+            # (check_grooming_markers, _detect_plan_on_branch) skip gracefully.
+            local callout_block
+            callout_block=$(cat <<CALLOUT_EOF
+> - **Branch:** \`${branch}\`
+> - **Plan:** \`${plan_relpath}\` (uncommitted on branch \`${branch}\`, see worktree)
+> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
+CALLOUT_EOF
+            )
+            local new_body
+            new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
+            local tmpfile
+            tmpfile=$(mktemp /tmp/body-callout-recover-XXXXXX.md)
+            printf '%s' "$new_body" > "$tmpfile"
+            if gh issue edit "$issue_num" --repo "senara-solutions/$repo" \
+                --body-file "$tmpfile" 2>/dev/null; then
+                echo "body_callout_drift_recovered: wrote UNCOMMITTED callout to $repo#$issue_num (plan on disk, commit failed)" >&2
+            else
+                echo "WARN: body_callout_drift_recovery_failed for $repo#$issue_num" >&2
+            fi
+            rm -f "$tmpfile"
+            return 0
+        fi
+        # Push the recovery commit so SHA is reachable from origin.
+        # On push failure, fall through to approach (b) — a locally-valid
+        # but remotely-unreachable SHA is the same fabrication class we're fixing.
+        local push_err
+        push_err=$(mktemp /tmp/push-err-XXXXXX)
+        if ! git -C "$worktree_dir" push origin "$branch" 2>"$push_err"; then
+            echo "WARN: post_flight_class_d_push_failed for $repo#$issue_num — falling back to uncommitted callout" >&2
+            cat "$push_err" >&2
+            rm -f "$push_err"
+            # Commit succeeded but push failed — SHA is local-only.
+            # Fall through to approach (b).
+            local callout_block
+            callout_block=$(cat <<CALLOUT_EOF
+> - **Branch:** \`${branch}\`
+> - **Plan:** \`${plan_relpath}\` (committed locally, push failed — see worktree)
+> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
+CALLOUT_EOF
+            )
+            local new_body
+            new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
+            local tmpfile
+            tmpfile=$(mktemp /tmp/body-callout-recover-XXXXXX.md)
+            printf '%s' "$new_body" > "$tmpfile"
+            if gh issue edit "$issue_num" --repo "senara-solutions/$repo" \
+                --body-file "$tmpfile" 2>/dev/null; then
+                echo "body_callout_drift_recovered: wrote LOCAL-ONLY callout to $repo#$issue_num (committed but push failed)" >&2
+            else
+                echo "WARN: body_callout_drift_recovery_failed for $repo#$issue_num" >&2
+            fi
+            rm -f "$tmpfile"
+            return 0
+        fi
+        rm -f "$push_err"
+    fi
+
     local head_sha
     head_sha=$(git -C "$worktree_dir" rev-parse --short HEAD 2>/dev/null)
 
