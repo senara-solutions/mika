@@ -39,9 +39,26 @@ If guard (0) is bypassed for a task that has a pending deferred-callback child, 
 
 The correct semantic for the LLM's retry on a deferred-pending task is **idempotent acknowledgement**: "Your prior dispatch is queued and will fire automatically; do nothing." That semantic already exists at `executor.rs:316` for the callback-turn entry path (after `register_deferred_callback` succeeds). The fix is to surface the same idempotent semantic on the long-running-context path *before* any guard rejection that might confuse the LLM.
 
+## Authorization scope decision — PER-AGENT (operator ruling, 2026-05-20)
+
+The intercept's existence-based authorization signal is **scoped per-agent**: the deferred-callback child must satisfy `child.agent_id == ctx.db.agent_id()` for the intercept to fire. This was a pass-2 architect blocker (F1, ESCALATE) because team-task trees host children with heterogeneous `agent_id`s (per `db::get_child_tasks` doc comment) and the plan acknowledged the semantics were undefined.
+
+**Operator ruling (2026-05-20): per-agent.** Rationale:
+
+- **Composes with the positive-consent contract (mika#841 / mika#933).** The contract is per-turn-per-agent: each agent's `originating_message` is gated independently at guard (0). The intercept's authorization signal — "a prior turn on *this agent* registered a deferred dispatch and so passed guard (0)" — preserves that per-agent gate. A per-tree relaxation would let agent B inherit agent A's positive consent for free, which the contract does not grant elsewhere.
+- **Composes with the identity allowlist (mika#815).** Skills are gated per-agent via `[skills].allowlist` in identity. Two agents in the same task tree may have disjoint allowlists; one agent's dispatch authorization is not transferable across that boundary. Per-agent scope on the intercept matches the per-agent scope of the underlying skill gate.
+- **Least-privilege.** Per-agent is the strictly narrower scope. If team-collab semantics later require a different model, lifting the filter is a forward-compatible change; tightening it after a per-tree leak would not be.
+- **Orthogonality.** Guard (0) and this intercept both gate `run_claude_pilot` per-agent. Mixing scopes (per-tree intercept on per-agent guard) introduces a coupling the call graph does not need.
+
+**Behavior under team-task trees:** if agent A registered a deferred dispatch and agent B retries `run_claude_pilot` on the same parent, B does NOT receive A's idempotent ack — B's call goes through normal guard processing (guard 0 still rejects an unauthorized turn, guard 2 still detects an active sibling, etc.). Each agent's authorization stays its own.
+
+### Future work — team-token modeling (milestone#15)
+
+When team-collab (milestone#15 Team orchestration) introduces explicit cross-agent dispatch coordination, that work will need to model an explicit *team-token* — an authorization handle that one agent can present to act on behalf of another within a defined trust boundary. The team-token will be its own typed object (not a side-effect of guard-0 history), with its own lifecycle, audit trail, and revocation semantics. At that point the intercept may grow a second branch (`if team-token present, check the team's pending deferred children`), but the per-agent branch added in this fix stays as the default. Filed as **out-of-scope** for mika#1205; will be referenced from milestone#15's grooming when team-token design starts.
+
 ## Fix Approach
 
-**Adopt the existence-based authorization signal (mika-arch first-pass F3):** the presence of a pending `deferred_dispatch` child task on the parent is itself proof that a prior turn passed guard (0) (since `register_deferred_callback` is downstream of guard 0). When `execute_long_running` is invoked on a task that has such a child, short-circuit with the same idempotent `status: "deferred"` success already returned by `executor.rs:316` — do not enter `validate_dispatch_readiness` at all.
+**Adopt the existence-based authorization signal (mika-arch first-pass F3):** the presence of a pending `deferred_dispatch` child task on the parent is itself proof that a prior turn passed guard (0) (since `register_deferred_callback` is downstream of guard 0). When `execute_long_running` is invoked on a task that has such a child, short-circuit with the same idempotent `status: "deferred"` success already returned by `executor.rs:316` — do not enter `validate_dispatch_readiness` at all. The existence check is scoped per-agent (see Authorization scope decision above).
 
 **Why this over the issue body's "Option 1" metadata-marker design:**
 - No new DB infrastructure required (the marker approach calls `update_task_metadata_merge` which does not exist; only full-replace `update_task_metadata` scoped to `trigger_type='manual'` exists).
@@ -462,6 +479,7 @@ The intercept's authorization signal is the *existence* of a pending deferred-ca
 - **Relaxing the positive-consent contract:** mika#841 is load-bearing security; the intercept does not relax it. Guard (0) still fires for all unauthorized turns on tasks without a pending deferred-callback child.
 - **The Class D body callout drift (mika#1204):** Separate ticket.
 - **A new `update_task_metadata_merge` DB method:** Not needed under the existence-based design.
+- **Cross-agent / team-token authorization in team-task trees:** Deferred to milestone#15 (Team orchestration). The per-agent scope chosen here is forward-compatible — a future team-token branch can be added without modifying the per-agent branch. See Authorization scope decision above for the design forward link.
 
 ## Risks
 
@@ -471,7 +489,7 @@ The intercept's authorization signal is the *existence* of a pending deferred-ca
 
 3. **Race: deferred child fires between intercept check and dispatch attempt.** In execute_long_running, after the intercept query returns "no pending deferred child," the existing guards still run. If DeferredDispatch fires concurrently and creates a callback child during this window, guard (2) `task_active_dispatch` catches it. No double-dispatch is possible.
 
-4. **Team-task trees with shared parent.** If multiple agents share a parent task tree, the per-agent filter on the intercept means each agent's authorization is independent. If agent A registered a deferred dispatch and agent B retries on the same parent, B does NOT get A's idempotent ack — B gets normal guard treatment. This preserves per-agent authorization semantics. (If the desired semantic is the opposite, that's a design decision for mika#1205's follow-up, not this fix.)
+4. **Team-task trees with shared parent.** Settled by the per-agent operator ruling above (see Authorization scope decision). If agent A registered a deferred dispatch and agent B retries on the same parent, B does NOT get A's idempotent ack — B gets normal guard treatment. Per-agent authorization is preserved. Future cross-agent team-token modeling is tracked under milestone#15, not in this fix.
 
 ## Acceptance Criteria
 
@@ -488,4 +506,7 @@ The intercept's authorization signal is the *existence* of a pending deferred-ca
   - F1 (BLOCKING) — Phase 0 Pin absent.
   - F2 (BLOCKING) — `update_task_metadata_merge` does not exist; plan must resolve DB-layer gap.
   - F3 (BLOCKING) — Adopt existence-based design or explicitly reject.
-  Plus four non-blocking findings (NF1-NF4). This revision adopts F3 (existence-based design via early intercept in `execute_long_running`), which eliminates F2 entirely. Phase 0 added per F1. NF2-NF4 addressed inline.
+  Plus four non-blocking findings (NF1-NF4). This revision adopted F3 (existence-based design via early intercept in `execute_long_running`), which eliminated F2 entirely. Phase 0 added per F1. NF2-NF4 addressed inline.
+- 2026-05-19: Second pass via `/mika-groom-ticket`. Architect returned `Verdict: ESCALATE` on one blocking finding:
+  - F1 (BLOCKING) — Team-task per-agent scoping semantics undefined; security-gate bypass cannot be groomed while the intended model is ambiguous.
+- 2026-05-20: Operator ruling: PER-AGENT scope. Plan revised to name the decision explicitly, cite mika#841 (positive-consent contract) and mika#815 (identity allowlist composition), and add a "Future work — team-token modeling (milestone#15)" note. Risk #4 and Out of Scope section updated to reflect the settled decision. Third-pass architect review pending on session `22011146-0da2-4925-a02e-d8720cd2cf5d` for READY/GROOMED disposition.
