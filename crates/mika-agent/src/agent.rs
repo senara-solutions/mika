@@ -4720,35 +4720,64 @@ fn detect_completion_claim(text: &str) -> Option<&str> {
     COMPLETION_CLAIM_RE.find(text).map(|m| m.as_str())
 }
 
-/// Regex matching "milestone" followed within 80 chars by "closed" or "close".
-/// Used by the milestone-close-claim guard (#797) to detect when the agent claims
-/// a GitHub milestone was closed without actually calling the close PATCH.
+/// Regex matching first-person claims that a milestone was closed (#797, #1207).
+/// Requires a first-person subject (I/we/i've/we've) followed by a past-tense
+/// close verb, then "milestone" within 40 chars. The 40-char window covers
+/// canonical claim shapes ("I closed milestone#14" = 15 chars, "we completed
+/// milestone#15 today" = 24 chars, "I've closed out the milestone for mika#789"
+/// = 30 chars) without spanning unrelated clauses.
 ///
-/// The 80-char window was sized to cover the canonical incident phrasings
-/// ("Milestone#17 closed, tasks reconciled", "milestone <repo>/milestone#<n> is
-/// now closed") plus typical sentence-level decoration without spanning a
-/// paragraph break. Widening risks false-positive matches across unrelated
-/// clauses; narrowing risks missing phrasings like "Milestone <repo> milestone
-/// #<n> has been closed on GitHub". The `_future_tense_overmatches_intentionally`
-/// test documents the accepted false-positive surface (planning-shape text).
+/// #1207 tightened this from the original `\bmilestone\b.{0,80}\b(closed|close)\b`
+/// which matched third-person planning prose (e.g., "the plan proposes mika-dev
+/// close the milestone"), causing false-positive guard fires on mika-arch review
+/// turns. The first-person constraint eliminates that class while preserving
+/// detection of actual hallucinated close claims.
 static MILESTONE_CLOSE_CLAIM_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\bmilestone\b.{0,80}\b(closed|close)\b")
-            .expect("milestone close claim regex must compile")
+        regex::Regex::new(
+            r"(?i)\b(I|we|i've|we've)\s+(closed out|closed|completed)\b.{0,40}\bmilestone\b",
+        )
+        .expect("milestone close claim regex must compile")
     });
 
-/// Regex matching the milestones API path pattern in run_gh argv.
+/// Regex matching the milestones API path pattern in run_gh argv, with a named
+/// capture for the milestone number (#797, #1207).
 static MILESTONE_API_PATH_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"/repos/[^/]+/[^/]+/milestones/\d+")
+    regex::Regex::new(r"/repos/[^/]+/[^/]+/milestones/(?P<num>\d+)")
         .expect("milestone api path regex must compile")
 });
+
+/// Regex for extracting a milestone number from claim text (#1207).
+/// Matches "milestone" followed by optional `#` and digits.
+static MILESTONE_NUMBER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)milestone\s*#?\s*(\d+)").expect("milestone number regex must compile")
+});
+
+/// Extracts the milestone number from a claim region of assistant text (#1207).
+///
+/// Searches for `milestone#N` (or `milestone N`, `milestone # N`) in the given
+/// text slice and returns the first matched number. Returns `None` when no
+/// parseable milestone number appears.
+fn extract_claimed_milestone_number(claim_text: &str) -> Option<u64> {
+    MILESTONE_NUMBER_RE
+        .captures(claim_text)
+        .and_then(|caps| caps.get(1))
+        .and_then(|m| m.as_str().parse::<u64>().ok())
+}
 
 /// Detects whether assistant text claims a GitHub milestone was closed without
 /// invoking the required `run_gh` PATCH call.
 ///
 /// Returns the matched keyword for the correction message, or `None` if:
-/// - The text does not claim a milestone close, OR
+/// - The text does not claim a milestone close (first-person verb required), OR
 /// - A qualifying `run_gh` PATCH call exists in `all_tool_summaries`.
+///
+/// Discrimination granularity (#1207): when the claim contains a parseable
+/// milestone number, suppress only if that specific number appears in a PATCH
+/// URL within the turn; otherwise fall back to presence/absence. This is a
+/// deliberate divergence from #483's presence/absence pattern, justified by
+/// mika-arch's multi-milestone review surface — a single turn may legitimately
+/// PATCH one milestone while writing prose about another.
 ///
 /// A qualifying call has `input_summary` containing all four substrings:
 /// `"api"`, `"PATCH"`, `state=closed`, AND a milestones API path. The
@@ -4768,19 +4797,56 @@ fn detect_milestone_close_claim_without_patch<'a>(
         return None;
     }
 
+    // AC1: first-person verb + "milestone" regex. Single captures() call
+    // subsumes find() — avoids redundant double-scan.
     let caps = MILESTONE_CLOSE_CLAIM_RE.captures(text)?;
-    let keyword = caps.get(1).map(|m| m.as_str())?;
+    let keyword = caps.get(2).map(|k| k.as_str())?;
+    let match_start = caps
+        .get(0)
+        .expect("full match always present when captures succeeds")
+        .start();
 
-    // Check if any run_gh call in this turn has the required PATCH shape.
-    let has_patch_call = all_tool_summaries.iter().any(|s| {
-        s.name == "run_gh"
-            && s.input_summary.contains("\"api\"")
-            && s.input_summary.contains("\"PATCH\"")
-            && s.input_summary.contains("state=closed")
-            && MILESTONE_API_PATH_RE.is_match(&s.input_summary)
-    });
+    // AC3: extract milestone number from the claim region (starting at match).
+    // Searches from match start forward so the helper finds the milestone
+    // number adjacent to the matched "milestone" keyword (e.g., "milestone#14").
+    // The match ends at \bmilestone\b — the number follows immediately after.
+    let claimed_num = extract_claimed_milestone_number(&text[match_start..]);
 
-    if has_patch_call { None } else { Some(keyword) }
+    // AC2+AC4: collect PATCH milestone numbers from tool summaries.
+    let patched_set: HashSet<u64> = all_tool_summaries
+        .iter()
+        .filter(|s| {
+            s.name == "run_gh"
+                && s.input_summary.contains("\"api\"")
+                && s.input_summary.contains("\"PATCH\"")
+                && s.input_summary.contains("state=closed")
+        })
+        .filter_map(|s| {
+            MILESTONE_API_PATH_RE
+                .captures(&s.input_summary)
+                .and_then(|c| c.name("num"))
+                .and_then(|n| n.as_str().parse::<u64>().ok())
+        })
+        .collect();
+
+    // AC4: set-membership check with fallback to presence/absence.
+    match claimed_num {
+        Some(num) => {
+            if patched_set.contains(&num) {
+                None // Suppress: claimed number was actually PATCHed.
+            } else {
+                Some(keyword) // Fire: claimed number not in PATCH set.
+            }
+        }
+        None => {
+            // No parseable number — fall back to presence/absence.
+            if patched_set.is_empty() {
+                Some(keyword)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Regex matching GitHub resource URLs that look like created resources:
@@ -7951,7 +8017,7 @@ mod tests {
         );
     }
 
-    // -- detect_milestone_close_claim_without_patch tests (#797) --
+    // -- detect_milestone_close_claim_without_patch tests (#797, #1207) --
 
     /// Helper: build a ToolCallSummary for run_gh with the given input.
     fn run_gh_summary(input: &str) -> ToolCallSummary {
@@ -7967,22 +8033,25 @@ mod tests {
 
     #[test]
     fn test_detect_milestone_close_claim_with_patch_passes() {
-        // Text has claim AND argv has PATCH → returns None (no violation).
+        // First-person claim AND matching PATCH → returns None (no violation).
         let summaries = vec![run_gh_summary(
             r#"{"command":["api","-X","PATCH","/repos/senara-solutions/mika/milestones/17","-f","state=closed"]}"#,
         )];
         assert!(
-            detect_milestone_close_claim_without_patch("Milestone#17 is now closed", &summaries,)
-                .is_none()
+            detect_milestone_close_claim_without_patch(
+                "I closed milestone#17 on GitHub",
+                &summaries,
+            )
+            .is_none()
         );
     }
 
     #[test]
     fn test_detect_milestone_close_claim_without_patch_caught() {
-        // Text has claim AND no PATCH argv → returns the matched keyword.
+        // First-person claim AND no PATCH argv → returns the matched keyword.
         let summaries = vec![];
         let result = detect_milestone_close_claim_without_patch(
-            "Milestone#17 closed, tasks reconciled, memory updated",
+            "I closed milestone#17, tasks reconciled, memory updated",
             &summaries,
         );
         assert!(result.is_some());
@@ -7991,10 +8060,10 @@ mod tests {
 
     #[test]
     fn test_detect_milestone_close_claim_case_insensitive() {
-        // "MILESTONE CLOSED" caught regardless of case.
+        // "I CLOSED MILESTONE" caught regardless of case.
         let summaries = vec![];
         let result = detect_milestone_close_claim_without_patch(
-            "MILESTONE #17 CLOSED successfully",
+            "I CLOSED MILESTONE #17 successfully",
             &summaries,
         );
         assert!(result.is_some());
@@ -8002,7 +8071,7 @@ mod tests {
 
     #[test]
     fn test_detect_milestone_close_claim_no_match_on_unrelated_close() {
-        // "PR closed" alone does NOT trigger — no "milestone" keyword.
+        // "PR closed" alone does NOT trigger — no first-person + milestone.
         let summaries = vec![];
         assert!(
             detect_milestone_close_claim_without_patch("PR closed successfully", &summaries)
@@ -8017,7 +8086,7 @@ mod tests {
             r#"{"command":["api","/repos/senara-solutions/mika/milestones/17","--jq",".state"]}"#,
         )];
         let result = detect_milestone_close_claim_without_patch(
-            "Milestone#17 has been closed on GitHub",
+            "I closed milestone#17 on GitHub",
             &summaries,
         );
         assert!(result.is_some());
@@ -8030,82 +8099,261 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_milestone_close_claim_future_tense_overmatches_intentionally() {
-        // Documents a deliberate false-positive trade-off: "milestone ... close"
-        // in a future-tense planning context (e.g., "ready to close now") still
-        // triggers the guard. The cost — one extra LLM turn on a planning
-        // emission — is accepted because the cost of missing the milestone#17
-        // close-divergence class (silent local-vs-GitHub state drift) is
-        // higher. Maintainers tightening the regex to past-tense only should
-        // first widen the eval coverage for the missed cases.
+    fn test_detect_milestone_close_claim_third_person_no_longer_matches() {
+        // #1207: third-person planning prose no longer triggers the guard.
+        // This replaces the old `_future_tense_overmatches_intentionally` test.
+        let summaries = vec![];
+        assert!(
+            detect_milestone_close_claim_without_patch(
+                "The milestone is ready to close now",
+                &summaries,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_planning_prose_no_match() {
+        // #1207: the incident text — mika-arch reviewing a brief about
+        // milestone workflows. Third-person planning shape must not fire.
+        let summaries = vec![];
+        assert!(detect_milestone_close_claim_without_patch(
+            "the plan proposes mika-dev call gh api PATCH /repos/owner/repo/milestones/789 to close the milestone",
+            &summaries,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_planning_prose_no_number_no_match() {
+        // #1207 C3b: third-person without API path or number.
+        let summaries = vec![];
+        assert!(
+            detect_milestone_close_claim_without_patch(
+                "the plan proposes mika-dev close the milestone after merge",
+                &summaries,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_dual_trigger_completion_and_milestone_close_both_detect() {
+        // When text contains both "completed" and first-person milestone claim,
+        // both detection functions fire — but the post-condition chain's
+        // sequential ordering means only #4 (completion-claim) fires first.
+        let text = "I completed milestone#17 and closed it";
+        let summaries: Vec<ToolCallSummary> = vec![];
+
+        // Completion-claim detector: fires on "completed".
+        assert!(detect_completion_claim(text).is_some());
+        // Milestone-close detector: fires on first-person "completed...milestone".
+        assert!(detect_milestone_close_claim_without_patch(text, &summaries).is_some());
+    }
+
+    #[test]
+    fn test_milestone_close_fires_after_completion_claim_satisfied() {
+        // Agent called update_task_status (satisfies guard #4) but no PATCH.
+        let text = "I completed milestone#17 and closed it";
+        let summaries: Vec<ToolCallSummary> = vec![ToolCallSummary {
+            step: 1,
+            name: "update_task_status".to_string(),
+            input_summary: r#"{"task_id":"abc","status":"completed"}"#.to_string(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }];
+
+        assert!(detect_completion_claim(text).is_some());
+        // Milestone-close: still fires because no PATCH call in summaries.
+        assert!(detect_milestone_close_claim_without_patch(text, &summaries).is_some());
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_ive_form() {
+        // "I've closed" should match.
         let summaries = vec![];
         let result = detect_milestone_close_claim_without_patch(
-            "The milestone is ready to close now",
+            "I've closed milestone#14 on GitHub",
             &summaries,
         );
         assert!(result.is_some());
     }
 
     #[test]
-    fn test_dual_trigger_completion_and_milestone_close_both_detect() {
-        // When text contains both "completed" and "milestone ... closed",
-        // both detection functions fire — but the post-condition chain's
-        // sequential ordering means only #4 (completion-claim) fires first.
-        // This test verifies both detectors independently trigger on the
-        // same text — the chain's `continue` on first match is structural.
-        let text = "Milestone#17 completed and closed";
-        let summaries: Vec<ToolCallSummary> = vec![];
-
-        // Completion-claim detector: fires on "completed".
-        assert!(detect_completion_claim(text).is_some());
-        // Milestone-close detector: fires on "milestone ... closed".
-        assert!(detect_milestone_close_claim_without_patch(text, &summaries).is_some());
-        // In the chain, #4 fires first because it's evaluated before #4b.
-        // After #4's retry, if the agent adds update_task_status but still
-        // omits the PATCH, #4b fires on the next EndTurn (see next test).
-    }
-
-    #[test]
-    fn test_milestone_close_fires_after_completion_claim_satisfied() {
-        // Same text, but update_task_status IS in tools_called and
-        // completion_claim_retry_done = true. The completion-claim guard
-        // (#4) would NOT fire because its inner condition checks
-        // `!tools_called.contains("update_task_status")`. The milestone-
-        // close guard (#4b) fires because no PATCH call exists.
-        let text = "Milestone#17 completed and closed";
-        let summaries: Vec<ToolCallSummary> = vec![
-            // Agent called update_task_status (satisfies guard #4)
-            ToolCallSummary {
-                step: 1,
-                name: "update_task_status".to_string(),
-                input_summary: r#"{"task_id":"abc","status":"completed"}"#.to_string(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-        ];
-
-        // Completion-claim: text matches, but in the real chain the guard
-        // would skip because tools_called contains "update_task_status".
-        // The detector itself only checks text — the guard's inner condition
-        // does the tools_called check. So completion_claim detects the text:
-        assert!(detect_completion_claim(text).is_some());
-
-        // Milestone-close: still fires because no PATCH call in summaries.
-        assert!(detect_milestone_close_claim_without_patch(text, &summaries).is_some());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_close_before_milestone_no_match() {
-        // "close" appearing BEFORE "milestone" does not trigger (regex requires
-        // milestone first).
+    fn test_detect_milestone_close_claim_we_form() {
+        // "We completed" should match.
         let summaries = vec![];
+        let result = detect_milestone_close_claim_without_patch(
+            "We completed milestone#15 today",
+            &summaries,
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_weve_form() {
+        // "We've closed out" should match.
+        let summaries = vec![];
+        let result =
+            detect_milestone_close_claim_without_patch("We've closed out milestone#20", &summaries);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_closed_out_form() {
+        // "I closed out" should match.
+        let summaries = vec![];
+        let result = detect_milestone_close_claim_without_patch(
+            "I closed out the milestone for mika#789",
+            &summaries,
+        );
+        assert!(result.is_some());
+    }
+
+    // -- extract_claimed_milestone_number tests (#1207) --
+
+    #[test]
+    fn test_extract_claimed_milestone_number_with_hash() {
+        assert_eq!(
+            extract_claimed_milestone_number("I closed milestone#14"),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn test_extract_claimed_milestone_number_without_hash() {
+        assert_eq!(
+            extract_claimed_milestone_number("I closed milestone 14"),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn test_extract_claimed_milestone_number_with_space_hash() {
+        assert_eq!(extract_claimed_milestone_number("milestone # 14"), Some(14));
+    }
+
+    #[test]
+    fn test_extract_claimed_milestone_number_no_number() {
+        assert_eq!(
+            extract_claimed_milestone_number("I closed the milestone"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_claimed_milestone_number_multiple_takes_first() {
+        assert_eq!(
+            extract_claimed_milestone_number("I closed milestone#14 not milestone#789"),
+            Some(14)
+        );
+    }
+
+    // -- PATCH set extraction tests (#1207) --
+
+    #[test]
+    fn test_patch_set_single_patch() {
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/17","-f","state=closed"]}"#,
+        )];
+        // Claim matches the PATCH number → suppressed.
+        assert!(
+            detect_milestone_close_claim_without_patch("I closed milestone#17", &summaries,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_patch_set_multiple_patches() {
+        let summaries = vec![
+            run_gh_summary(
+                r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/14","-f","state=closed"]}"#,
+            ),
+            run_gh_summary(
+                r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/789","-f","state=closed"]}"#,
+            ),
+        ];
+        // Claimed #14, #14 is in the PATCH set → suppressed.
+        assert!(
+            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_patch_set_no_patches() {
+        let summaries = vec![];
+        // No patches, first-person claim → fires.
+        assert!(
+            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_patch_set_malformed_url_skipped() {
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","-X","PATCH","/repos/milestones/notanumber","-f","state=closed"]}"#,
+        )];
+        // Malformed URL doesn't contribute to PATCH set → fires.
+        assert!(
+            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_patch_set_non_milestones_path_skipped() {
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","-X","PATCH","/repos/o/r/issues/14","-f","state=closed"]}"#,
+        )];
+        // PATCH to issues, not milestones → fires.
+        assert!(
+            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
+                .is_some()
+        );
+    }
+
+    // -- Cross-milestone discrimination tests (#1207) --
+
+    #[test]
+    fn test_cross_milestone_claim_different_number_fires() {
+        // AC5 from #1207: claim milestone#14 but PATCH milestone#789 → fires.
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/789","-f","state=closed"]}"#,
+        )];
+        assert!(
+            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_no_number_claim_with_patch_suppressed() {
+        // Claim without number + any PATCH → suppressed (presence/absence fallback).
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/17","-f","state=closed"]}"#,
+        )];
         assert!(
             detect_milestone_close_claim_without_patch(
-                "Next I will close the milestone on GitHub",
+                "I closed the milestone on GitHub",
                 &summaries,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn test_no_number_claim_without_patch_fires() {
+        // Claim without number + no PATCH → fires.
+        let summaries = vec![];
+        assert!(
+            detect_milestone_close_claim_without_patch(
+                "I closed the milestone on GitHub",
+                &summaries,
+            )
+            .is_some()
         );
     }
 
