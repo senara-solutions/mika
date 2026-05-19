@@ -49,17 +49,26 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         Some(SkillsCommand::Disable { name }) => {
             toggle_skill(&global_home, &skills_dir, agent_name, &name, false)?;
         }
-        Some(SkillsCommand::Install { source, name, link }) => {
-            // Resolve GitHub token only for git operations (App preferred, PAT fallback)
-            let github_token = resolve_github_token_for_git(&global_home, &agent_home).await;
-            install_skill(
-                &agent_home,
-                &skills_dir,
-                &source,
-                name.as_deref(),
-                link,
-                github_token.as_deref(),
-            )?;
+        Some(SkillsCommand::Install {
+            source,
+            name,
+            link,
+            copy,
+        }) => {
+            if copy {
+                install_bundled_copy(&global_home, &skills_dir, &source)?;
+            } else {
+                // Resolve GitHub token only for git operations (App preferred, PAT fallback)
+                let github_token = resolve_github_token_for_git(&global_home, &agent_home).await;
+                install_skill(
+                    &agent_home,
+                    &skills_dir,
+                    &source,
+                    name.as_deref(),
+                    link,
+                    github_token.as_deref(),
+                )?;
+            }
         }
         Some(SkillsCommand::Uninstall { name, remove_deps }) => {
             uninstall_skill(&agent_home, &skills_dir, &name, remove_deps)?;
@@ -67,6 +76,7 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         Some(SkillsCommand::Update { name }) => {
             let github_token = resolve_github_token_for_git(&global_home, &agent_home).await;
             update_skills(
+                &global_home,
                 &agent_home,
                 &skills_dir,
                 name.as_deref(),
@@ -799,6 +809,31 @@ fn toggle_skill(
     Ok(())
 }
 
+/// Materialize a real per-agent directory copy of a bundled skill from the
+/// canonical library (mika#1213 `--copy` opt-out). Writes a `.copy-managed`
+/// marker so library sync leaves the directory alone — the operator owns
+/// the lifecycle. `source` must be a bundled skill name (not a path / URL).
+fn install_bundled_copy(global_home: &Path, skills_dir: &Path, source: &str) -> Result<()> {
+    if !bundled_skills::is_bundled_skill(source) {
+        bail!(
+            "`--copy` expects a bundled skill name; '{source}' is not in the binary's bundled manifest"
+        );
+    }
+    let library_dir = home::library_skills_dir(global_home);
+    bundled_skills::copy_bundled_skill_to_agent_dir(&library_dir, skills_dir, source)
+        .with_context(|| {
+            format!(
+                "failed to copy bundled skill '{source}' to {}",
+                skills_dir.display()
+            )
+        })?;
+    println!(
+        "\n  Copied bundled skill '{source}' to {} (`.copy-managed` marker written; library sync will not touch this directory).\n",
+        skills_dir.display()
+    );
+    Ok(())
+}
+
 fn install_skill(
     agent_home: &Path,
     skills_dir: &Path,
@@ -1237,6 +1272,7 @@ fn uninstall_skill(
 }
 
 fn update_skills(
+    global_home: &Path,
     agent_home: &Path,
     skills_dir: &Path,
     name: Option<&str>,
@@ -1244,10 +1280,29 @@ fn update_skills(
 ) -> Result<()> {
     use mika_agent::skills::install::UpdateResult;
 
+    // Refresh bundled-skill symlinks first (mika#1213): walk the agent's
+    // identity allowlist and (re)materialize `<skills_dir>/<skill>` as a
+    // symlink into the canonical library at `<global_home>/skills/<skill>`.
+    // Idempotent — no-op when symlinks are already correct. Runs even
+    // when no marketplace skills are installed.
+    if name.is_none() {
+        let library_dir = home::library_skills_dir(global_home);
+        let identity = mika_agent::prompt::load_identity(agent_home);
+        let allowlist = identity.skills.allowlist.as_deref();
+        bundled_skills::materialize_agent_skill_links(&library_dir, skills_dir, allowlist);
+        println!("\n  Refreshed bundled-skill symlinks.");
+    }
+
     let lock = marketplace::read_lock(agent_home);
 
     if lock.skills.is_empty() {
-        println!("\n  No marketplace skills installed.\n");
+        if name.is_some() {
+            // User asked to update a specific skill but no marketplace skills
+            // exist. Surface the empty marketplace state.
+            println!("\n  No marketplace skills installed.\n");
+        } else {
+            println!();
+        }
         return Ok(());
     }
 
