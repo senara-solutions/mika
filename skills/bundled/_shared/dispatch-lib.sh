@@ -9,10 +9,14 @@
 # Callers MUST NOT set their own EXIT trap (it would be overwritten silently —
 # bash trap is process-scoped, not function-scoped).
 #
-# One host skill (dev-pilot) owns the `run_claude_pilot` tool with a union-enum
-# `skill` parameter. Sibling skills in the self-dev family extend the enum and
-# add a case in this lib's skill→entry mapping. Sibling skills do not register
-# their own `run_claude_pilot`. See mika#932 for context.
+# Per-skill tool ownership (mika#1173 restored after the prompt-only design
+# regressed 5 times since #934): each dispatch skill registers its OWN tool —
+# dev-pilot owns `run_claude_pilot` (skill enum: ["dev-pilot"], entry /mika),
+# dev-groom owns `run_claude_pilot_groom` (skill enum: ["dev-groom"], entry
+# /mika-groom-ticket). Both handlers source this lib and call
+# dispatch_claude_pilot; the case switch on $SKILL routes to the right entry
+# command. The skill field stays required on both tools for engine
+# dispatch-class derivation (executor.rs derive_dispatch_class).
 
 # --- Internal helpers (underscore-prefixed, not part of the API contract) ---
 
@@ -203,6 +207,76 @@ _verify_and_write_body_callout() {
     fi
 
     local plan_relpath="${plan_file#"$worktree_dir/"}"
+
+    # Class D drift fix (mika#1204): verify the plan file is actually in HEAD's
+    # tree before stamping a SHA claim. If not (pilot exited before committing),
+    # auto-commit the plan so the SHA is truthful.
+    if ! git -C "$worktree_dir" cat-file -e "HEAD:${plan_relpath}" 2>/dev/null; then
+        echo "post_flight_class_d_recovery: plan file exists on disk but not in HEAD — committing (mika#1204)" >&2
+        # Pathspec-limited commit: only the plan file, not the full index.
+        # Prevents capturing any other staged files from a partial pilot run.
+        if ! git -C "$worktree_dir" commit -m "wip(${repo}#${issue_num}): plan staged by post-flight recovery" -- "$plan_relpath"; then
+            echo "WARN: post_flight_class_d_commit_failed for $repo#$issue_num — stamping as uncommitted" >&2
+            # Fall through to approach (b): stamp as uncommitted.
+            # The (uncommitted ...) format deliberately does NOT match the
+            # "committed on branch @" regex — downstream parsers
+            # (check_grooming_markers, _detect_plan_on_branch) skip gracefully.
+            local callout_block
+            callout_block=$(cat <<CALLOUT_EOF
+> - **Branch:** \`${branch}\`
+> - **Plan:** \`${plan_relpath}\` (uncommitted on branch \`${branch}\`, see worktree)
+> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
+CALLOUT_EOF
+            )
+            local new_body
+            new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
+            local tmpfile
+            tmpfile=$(mktemp /tmp/body-callout-recover-XXXXXX.md)
+            printf '%s' "$new_body" > "$tmpfile"
+            if gh issue edit "$issue_num" --repo "senara-solutions/$repo" \
+                --body-file "$tmpfile" 2>/dev/null; then
+                echo "body_callout_drift_recovered: wrote UNCOMMITTED callout to $repo#$issue_num (plan on disk, commit failed)" >&2
+            else
+                echo "WARN: body_callout_drift_recovery_failed for $repo#$issue_num" >&2
+            fi
+            rm -f "$tmpfile"
+            return 0
+        fi
+        # Push the recovery commit so SHA is reachable from origin.
+        # On push failure, fall through to approach (b) — a locally-valid
+        # but remotely-unreachable SHA is the same fabrication class we're fixing.
+        local push_err
+        push_err=$(mktemp /tmp/push-err-XXXXXX)
+        if ! git -C "$worktree_dir" push origin "$branch" 2>"$push_err"; then
+            echo "WARN: post_flight_class_d_push_failed for $repo#$issue_num — falling back to uncommitted callout" >&2
+            cat "$push_err" >&2
+            rm -f "$push_err"
+            # Commit succeeded but push failed — SHA is local-only.
+            # Fall through to approach (b).
+            local callout_block
+            callout_block=$(cat <<CALLOUT_EOF
+> - **Branch:** \`${branch}\`
+> - **Plan:** \`${plan_relpath}\` (committed locally, push failed — see worktree)
+> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
+CALLOUT_EOF
+            )
+            local new_body
+            new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
+            local tmpfile
+            tmpfile=$(mktemp /tmp/body-callout-recover-XXXXXX.md)
+            printf '%s' "$new_body" > "$tmpfile"
+            if gh issue edit "$issue_num" --repo "senara-solutions/$repo" \
+                --body-file "$tmpfile" 2>/dev/null; then
+                echo "body_callout_drift_recovered: wrote LOCAL-ONLY callout to $repo#$issue_num (committed but push failed)" >&2
+            else
+                echo "WARN: body_callout_drift_recovery_failed for $repo#$issue_num" >&2
+            fi
+            rm -f "$tmpfile"
+            return 0
+        fi
+        rm -f "$push_err"
+    fi
+
     local head_sha
     head_sha=$(git -C "$worktree_dir" rev-parse --short HEAD 2>/dev/null)
 
@@ -361,6 +435,22 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         mkdir -p "$WORKTREE_DIR/.claude"
         cp "$PLATFORM_DIR/.claude/claude-pilot.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
         cp "$PLATFORM_DIR/.claude/settings.local.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+        # Copy slash commands so the inner Claude Code session can resolve
+        # /mika, /mika-groom-ticket, /ce:plan-adjacent commands, etc. Without
+        # this, --command "/mika-groom-ticket" arrives as raw text in the
+        # inner session and the LLM has to improvise (mika#1173).
+        #
+        # Snapshot semantics: the cp is taken at worktree-creation time. If a
+        # command file at the platform root is edited after worktree creation
+        # but before the inner session completes, the inner session sees the
+        # pre-edit version. Acceptable because worktrees are short-lived
+        # (per-task, <2h typical) and mid-session edits to /mika or
+        # /mika-groom-ticket violate the slug-immutability principle (mika#844).
+        # Matches dispatch-lib's other worktree-prep behavior (claude-pilot.json
+        # and settings.local.json are also snapshotted).
+        if [ -d "$PLATFORM_DIR/.claude/commands" ]; then
+            cp -r "$PLATFORM_DIR/.claude/commands" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
+        fi
 
         CWD_ARGS="--cwd $WORKTREE_DIR"
         if [ -f "$WORKTREE_DIR/.claude/claude-pilot.json" ]; then
@@ -690,6 +780,29 @@ dispatch_claude_pilot() {
     command -v mika >/dev/null 2>&1 || { echo "Error: mika CLI is required but not in PATH" >&2; exit 1; }
     command -v claude-pilot >/dev/null 2>&1 || { echo "Error: claude-pilot CLI is required but not in PATH" >&2; exit 1; }
 
+    # claude-pilot venv smoke test (mika#1200): force the import chain that imports
+    # yaml (and all other dependencies) to actually execute. Relies on cli.py keeping
+    # its imports at module top level — if cli.py is ever refactored to lazy-import
+    # .agent / .permissions inside main(), THIS smoke test silently stops detecting
+    # the failure class. See
+    # mika/docs/plans/2026-05-18-001-bug-dev-groom-pilot-empty-handed-plan.md
+    # § Phase 0 Pin / cli.py invariant.
+    if ! timeout 15 claude-pilot --help >/dev/null 2>&9; then
+        cat >&2 <<'EOF'
+Error: claude-pilot venv is broken — `claude-pilot --help` exited non-zero.
+Most likely cause: pyproject.toml changed in claude-pilot-py without an
+accompanying `uv tool install` to re-sync dependencies. Editable installs pick
+up new source automatically but do NOT auto-install new declared dependencies.
+
+To restore the loop:
+    cd <mika-platform-root> && uv tool install --force --editable ./claude-pilot-py
+
+Reference: mika#1200 +
+mika/docs/plans/2026-05-18-001-bug-dev-groom-pilot-empty-handed-plan.md
+EOF
+        exit 1
+    fi
+
     # mika-platform root — base for sub-repo resolution
     PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
     PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
@@ -705,15 +818,21 @@ dispatch_claude_pilot() {
 
     _validate_inputs
 
-    # SIBLING SKILL DISPATCH MAPPING (mika#932)
-    # Each arm maps a sibling skill to its slash-command entry point.
-    # Adding a sibling requires:
-    #   1. Add a new arm here.
-    #   2. Widen dev-pilot/tools.json `skill.enum` to include the new value.
-    #   3. Update self-dev/system_prompt.md to teach mika-dev when to dispatch.
-    # Threshold for refactor: if N>5 siblings, escalate to skill-scoped tool
-    # registries (Option C from mika#932). Until then, this case switch is
-    # the contract.
+    # PER-SKILL DISPATCH MAPPING (mika#932 origin, mika#1173 per-tool revert)
+    # Each arm maps a SKILL value to its slash-command entry point. After the
+    # mika#1173 revert, each dispatch skill owns its own tool (dev-pilot →
+    # run_claude_pilot, dev-groom → run_claude_pilot_groom), so a given arm
+    # fires only when the matching tool's handler sources this lib.
+    # Adding a new dispatch sibling requires:
+    #   1. Create the skill's tools.json registering its own tool name.
+    #   2. Create the skill's handlers/run.sh that sources this lib and calls
+    #      dispatch_claude_pilot.
+    #   3. Add a new arm below mapping its SKILL value → ENTRY_COMMAND.
+    #   4. Add the skill to the relevant well-known agent allowlist
+    #      (well_known_agents.rs MIKA_*_IDENTITY).
+    #   5. Update self-dev/system_prompt.md to teach mika-dev when to dispatch.
+    # Threshold for refactor: if N>5 dispatch skills, consider engine-side
+    # routing helpers. Until then, the case switch is the contract.
     local ENTRY_COMMAND
     case "$SKILL" in
       dev-pilot)

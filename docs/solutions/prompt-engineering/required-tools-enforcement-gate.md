@@ -49,13 +49,29 @@ required_tools = ["run_gh"]
 
 ## Correction Message
 
-When the enforcement triggers, the injected message is:
+When the enforcement triggers, the injected user-role message is:
 
 ```
-[Your response was rejected because you did not call the required tool(s): {missing_names}.
-You MUST call these tools with real data before producing your response. Do not fabricate
-or assume results — call the tools now.]
+[mika-engine] The previous response did not call the required tool(s): {missing_names}.
+The engine expects these tools to be invoked with real data before the corrected
+response. Tool results are how the engine confirms work; results come from actual
+calls, not synthesis. The corrected response should restate the full content — only
+the final response reaches the conversation log; prior turns exist only in the
+in-memory loop context.
 ```
+
+**Trusted-marker convention (mika#1168):** The `[mika-engine]` prefix and
+state-machine framing ("the engine expects ...") replace the prior
+mandate-shaped wording (`[Your response was rejected...]` + `You MUST call`).
+The reshape addresses model-self-classification refusal: when the model's
+anti-injection conditioning interprets user-role mandate-shaped corrections as
+adversarial prompt-injection attempts, it emits `Prompt injection. Rejected.`
+with zero tool calls and dispatch is silently lost. The trusted-marker prefix
+makes engine control-flow messages distinguishable from real adversarial user
+input. The same convention applies to all 16 user-role correction sites in
+`agent.rs`. Sibling silent-trigger sites that route through the *system*
+prompt (`prompt::build_silent_prompt`) retain their original phrasing — the
+classifier does not flag system-prompt content as injection patterns.
 
 ## Terminal Failure Bypass (#516)
 

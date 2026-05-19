@@ -43,6 +43,7 @@ mod eval {
     mod test_callback_turn;
     mod test_completion_claim_guard;
     mod test_context_summary_inject;
+    mod test_correction_message_classifier_guard;
     mod test_deadline_in_flight_llm_call;
     mod test_di_builders;
     mod test_dispatch_no_grooming_marker_guard;
@@ -73,6 +74,9 @@ mod eval {
     mod test_webhook_no_unauthorized_dispatch_guard;
     mod test_webhook_queue;
     mod test_webhook_zero_tools_guard;
+
+    // qa-review skill-scoped run_gh validator wiring test (mika#1196)
+    mod test_qa_review_run_gh_scope_validator;
 
     // Multi-agent corpus parity: regression guard for #1155 search_content gap
     mod kg_multi_agent_corpus_parity;

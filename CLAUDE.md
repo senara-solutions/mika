@@ -54,6 +54,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Naming:** snake_case for functions/variables, PascalCase for types, SCREAMING_SNAKE for constants
 - **Edition 2024:** `unsafe` blocks required for `std::env::set_var` etc.
 - **Testing:** `#[cfg(test)] mod tests` inline in each module, `cargo test` to run. Integration tests for the agent loop live in `crates/mika-agent/tests/eval/` — these use `MockLlmProvider` (sequence-based, no network) via the `EvalHarness` builder to exercise the full `run_agent()` path deterministically. `EvalHarness` supports optional dependency injection via builder methods: `.embedding_client()`, `.brave_api_key()`, `.github_token()`, `.mcp_manager()` (all default `None`). `MockLlmProvider` is in `mika-common::llm::mock`, gated behind `#[cfg(any(test, feature = "test-utils"))]`. `Settings::test_defaults()` in `mika-common` provides a canonical test `Settings` constructor (also `test-utils` gated). Real-provider eval matrix tests are gated behind `#[ignore]` + `MIKA_EVAL_REAL_PROVIDERS` env var — run with `cargo test -p mika-agent --test eval -- --ignored` after setting `MIKA_EVAL_REAL_PROVIDERS=anthropic,openai,kimi,groq` (comma-separated, or `all`). Calibration mode (`MIKA_EVAL_CALIBRATE=1`) writes ephemeral artifacts to `target/eval-calibration/`. KG provider comparison eval (#762) lives at `tests/eval/kg_provider_eval/` and is gated separately behind `#[ignore]` + `MIKA_EVAL_KG_PROVIDERS` (comma-separated `provider/model` strings, or `default` for the four-provider minimum set) — run with `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval`. Fixtures live in `docs/solutions/kg/eval-fixtures-2026-04-24/`; decision matrix in `docs/solutions/kg/kg-provider-evaluation-2026-04-24.md`.
+- **Model calibration (#1190):** Never swap an agent's base model or skill-override model without a passing `make calibrate-<role>` run. The calibration framework at `crates/mika-agent/src/calibration/` provides role-scoped scenario suites (mika-dev: 5 scenarios anchored on #1168/#1166/#1173; mika-arch: 5 scenarios for disposition/citation/finding-list contracts). Run: `make calibrate-mika-dev MODEL=anthropic/claude-sonnet-4-6` or `make calibrate-mika-arch MODEL=anthropic/claude-opus-4-6`. The `calibrate` binary produces JSON artifacts + markdown reports. Baselines live at `docs/eval/calibration/baselines/`. Every model-swap PR must include the calibration report and update the baseline.
 - **No framework:** The agent loop is a plain Rust async function, not a framework
 - **Doc sync:** `docs/` is the single source of truth. `crates/mika-agent/build.rs` copies docs into `OUT_DIR` at build time via `include_str!(concat!(env!("OUT_DIR"), ...))`. Crate-local copies in `crates/mika-agent/docs/` are fallbacks for crates.io; sync them with `scripts/sync-agent-docs.sh` before publishing. CI enforces sync via the `docs-sync` job in `ci.yml` — PRs that modify `docs/` without running the sync script will fail.
 - **Proactive state checking:** The system prompt instructs the agent to check existing state before any write operation to prevent duplicates after compaction. New write tools should have a corresponding query tool.
@@ -97,7 +98,7 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 
 - **One container per customer** — per-customer isolation with SQLite
 - **Three-layer memory model** — core memory (system prompt) + structured facts + hybrid search (FTS5 + vector). See `crates/mika-agent/CLAUDE.md`.
-- **Agent loop** — max 20 tool steps, 5-min timeout, 9 post-condition guards on EndTurn (includes intent-precondition registry, required-suffix-line guard, and required-finding-list guard). See `crates/mika-agent/CLAUDE.md`.
+- **Agent loop** — max 20 tool steps, 5-min timeout, 10 post-condition guards on EndTurn (includes intent-precondition registry, required-suffix-line guard, required-finding-list guard, and milestone-close-claim guard). See `crates/mika-agent/CLAUDE.md`.
 - **Skills marketplace** — git-based distribution, per-provider/model prompt variants, dependency resolution. See `crates/mika-agent/CLAUDE.md`.
 - **Unified task engine** — SQLite-backed scheduler, callback/resume lifecycle, team suspend/resume. See `crates/mika-agent/CLAUDE.md`.
 - **HTTP server (mika-server)** — Axum, two auth layers, embedded dashboard. See `crates/mika-agent/CLAUDE.md`.
@@ -252,7 +253,7 @@ skills/bundled/
 ├── self-dev-webhook-ci/   # CI webhook handler for self-dev
 ├── self-dev-webhook-ready-label/ # Ready-label dispatch handler for GitHub issue labeled ready (#1106)
 ├── dev-pilot/             # Claude Code implementation dispatch (thin wrapper → _shared/dispatch-lib.sh, entry: /mika)
-├── dev-groom/             # Two-pass grooming dispatch — operator or autonomous (prompt-only sibling — host: dev-pilot via run_claude_pilot, entry: /mika-groom-ticket)
+├── dev-groom/             # Two-pass grooming dispatch — operator or autonomous (own tool: run_claude_pilot_groom, entry: /mika-groom-ticket; mika#1173)
 ├── qa-review/             # PR review skill
 ├── qa-review-build-callback/ # Build callback handler for QA review
 ├── permission-policy/     # Permission handler for claude-pilot sessions
@@ -289,7 +290,7 @@ Skills are loaded at runtime from this generated constant — no filesystem acce
    ```
 3. Add `system_prompt.md` with the skill's system prompt
 4. **Add to well-known agent allowlists** — all four well-known agents use identity-driven `[skills].allowlist` in their identity templates (`well_known_agents.rs`). New bundled skills are **denied by default** unless explicitly added to an agent's allowlist. Add the skill name to each agent's identity const that should have access:
-   - `MIKA_DEV_IDENTITY` (25 skills) — development workflow skills
+   - `MIKA_DEV_IDENTITY` (26 skills) — development workflow skills
    - `MIKA_QA_IDENTITY` (17 skills) — review and quality skills
    - `MIKA_RELAY_IDENTITY` (1 skill) — only `permission-policy`; rarely needs new skills
    - `MIKA_ARCH` uses a computed identity via `build_mika_arch_identity()` (3 skills) — read-only review skills only

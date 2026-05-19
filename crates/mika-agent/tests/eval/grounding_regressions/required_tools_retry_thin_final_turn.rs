@@ -264,20 +264,31 @@ async fn test_correction_message_contains_self_contained_instruction() -> anyhow
 
     // The second request's messages should contain the User correction
     let second_request = &trace.captured_requests[1];
+    // mika#1168 reshape (Phase A Step 3) updated the correction text to
+    // use `[mika-engine]` trusted-marker framing + dropped the "You MUST"
+    // mandate phrasing. The self-contained-response invariant is
+    // preserved in different words: "only the final response reaches the
+    // conversation log" semantically equals the prior "Only the final
+    // response is persisted to the conversation log." Both shapes also
+    // include "restate the full content" and "in-memory loop context."
     let has_self_contained_instruction = second_request.messages.iter().any(|msg| {
         let text = match &msg.content {
             mika_common::llm::LlmContent::Text(t) => t.as_str(),
             _ => "",
         };
-        text.contains("restate the full content")
-            && text.contains("Only the final response is persisted")
+        let lowered = text.to_lowercase();
+        lowered.contains("restate the full content")
+            && lowered.contains("only the final response")
+            && lowered.contains("conversation log")
+            && lowered.contains("in-memory loop context")
     });
 
     assert!(
         has_self_contained_instruction,
         "Expected the correction message to contain the self-contained-response \
-         instruction ('restate the full content' + 'Only the final response is \
-         persisted'), but it was not found in the second request's messages"
+         instruction ('restate the full content' + 'only the final response' + \
+         'conversation log' + 'in-memory loop context'), but it was not found in \
+         the second request's messages"
     );
 
     Ok(())

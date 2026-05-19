@@ -10,6 +10,7 @@ pub mod logs;
 pub mod mcp;
 pub mod memory;
 pub mod model;
+pub mod notify;
 pub mod provider;
 pub mod reminders;
 pub mod setup;

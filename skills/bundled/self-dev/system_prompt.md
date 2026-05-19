@@ -74,7 +74,7 @@ Call `run_claude_pilot` with `skill="dev-pilot"` and the issue reference:
 
 Example: `{"skill": "dev-pilot", "prompt": "mika-skills#8", "task_id": "15383984-a3e7-41bf-ac6f-630ba9a89d63"}`
 
-> **Note:** Use `skill="dev-pilot"` for implementation work. For grooming work, see the **Grooming Dispatch** section which uses `skill="dev-groom"`.
+> **Note:** Use `skill="dev-pilot"` for implementation work. For grooming work, see the **Grooming Dispatch** section which uses the separate `run_claude_pilot_groom` tool.
 
 The handler derives everything else (branch, worktree, pipeline command).
 
@@ -216,9 +216,9 @@ This workflow dispatches a grooming session via claude-pilot. Grooming produces 
 
 **Step G2 — Launch claude-pilot for grooming (MANDATORY — do not skip, do not defer)**
 
-> **IMMEDIATELY after Step G1, call `run_claude_pilot`.** No other tool calls permitted between G1 and this call.
+> **IMMEDIATELY after Step G1, call `run_claude_pilot_groom`.** No other tool calls permitted between G1 and this call.
 
-Call `run_claude_pilot` with `skill="dev-groom"`:
+Call `run_claude_pilot_groom`:
 
 ```json
 {
@@ -230,10 +230,10 @@ Call `run_claude_pilot` with `skill="dev-groom"`:
 
 Example: `{"skill": "dev-groom", "prompt": "mika#214", "task_id": "15383984-a3e7-41bf-ac6f-630ba9a89d63"}`
 
-The handler derives everything else (branch, worktree, `/mika-groom-ticket` pipeline command).
+The tool name itself routes to the grooming pipeline (`/mika-groom-ticket`); the handler derives branch, worktree, and entry command. `skill: "dev-groom"` is required by the schema for engine dispatch-class derivation — it has only one valid value for this tool, so it is not a decision knob but the example shows it for schema validity.
 
 **Rules:**
-- **Always pass `skill: "dev-groom"`** — this routes to the grooming pipeline (`/mika-groom-ticket`), not the implementation pipeline.
+- **Always pass `skill: "dev-groom"`** — required by the schema (single valid value, not a decision).
 - **Always pass `task_id`** — the task UUID from Step G1 (36-char format).
 - **One session per issue** — the handler runs the full grooming pipeline.
 - **Wait for the callback** — results arrive via callback when claude-pilot finishes. Do NOT poll.
@@ -433,6 +433,13 @@ For **each** issue number in `milestone_issues` (ALL of them, in the topo-sorted
 
 **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> initialized with {N} child issues: #X, #Y, #Z (topo-sorted). Parent task: <milestone_wi>.")`
 
+**Memory (current_priorities):** After creating the milestone parent task:
+```
+update_core_memory(section="current_priorities", action="replace",
+  content="Milestone <repo> milestone#<n> (<milestone_title>): in_progress. <one-line purpose from milestone description>. Issues (dependency order): #X, #Y, #Z.",
+  reasoning="Milestone initialized — update current_priorities to reflect active work")
+```
+
 Notify Vincent: "Milestone <repo> milestone#<n> initialized with {N} issues (dependency-sorted). Starting sequential execution."
 
 ### Step M4 — Serial execution loop
@@ -460,7 +467,7 @@ For each `child_task_id` in `child_wis` (in order):
 
    b. **Launch dev-groom:**
       ```json
-      run_claude_pilot({"skill": "dev-groom", "prompt": "<repo> issue#<issue_number>", "task_id": "<child_task_id>"})
+      run_claude_pilot_groom({"skill": "dev-groom", "prompt": "<repo>#<issue_number>", "task_id": "<child_task_id>"})
       ```
 
    c. **Wait for the dev-groom callback.** This is a normal post-callback turn. Handle per the existing callback flow but recognize the `dev-groom` skill output:
@@ -468,7 +475,7 @@ For each `child_task_id` in `child_wis` (in order):
       - If callback indicates `Verdict: ESCALATE`, treat as `blocked` per M4 Step 3 (PAUSE milestone, notify Vincent).
       - **If callback indicates failure (HANDLER CRASH, timeout, etc.) — terminal-semantics rule:** same shape as the webhook path (Ready-Label Dispatch Step 3g). Retry once with the **same `child_task_id`** (no new `create_task`); on second consecutive HANDLER CRASH for the same `child_task_id`, treat as `blocked` per M4 Step 3 (PAUSE milestone, notify operator, stop). Do NOT retry a third time. The `groom_crash_count` metadata is tracked on the child task itself (the milestone child, NOT a separate groom task — milestone-cascade reuses the child task across grooming + dispatch phases per step a).
 
-   d. **Engine-guard implications:** the milestone-cascade path does not flow through `webhook_ready_label_dispatch`. No new guard is needed; M4's existing dispatch-readiness checks already accept `dev-groom` as a valid `run_claude_pilot` skill.
+   d. **Engine-guard implications:** the milestone-cascade path does not flow through `webhook_ready_label_dispatch`. No new guard is needed; M4's existing dispatch-readiness checks accept the separate `run_claude_pilot_groom` tool (which derives dispatch_class = "groom" from its required `skill: "dev-groom"` input field).
 
 2. **Execute per-issue flow (Steps 1-6 from main workflow):**
    - Read GitHub issue
@@ -476,6 +483,24 @@ For each `child_task_id` in `child_wis` (in order):
    - Wait for completion callback
    - Handle QA verdict webhook
    - Close out child task
+
+2.5. **Merge verification gate (verify-post-state):**
+
+   After the QA webhook handler processes a `pass` verdict for this child's PR:
+
+   - If `pr_merge_with_gate` returned `"merged"` or `"already_merged"`: **verify before advancing.** Call `run_gh(["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")` and confirm `state == "MERGED"`. Only then proceed to step 3 with outcome `completed`. If state is not MERGED (race condition), treat as HOLD.
+   - If `pr_merge_with_gate` returned `"auto_merge_enabled"`: the PR is NOT yet merged. This is a **HOLD state** — the child task stays `in_progress`. Do NOT advance to step 3. Do NOT dispatch the next child. Wait for the `pull_request.closed(merged: true)` webhook to arrive (handled by `self-dev-webhook-qa` → "Webhook Entry Point — PR Closed"). When the webhook arrives and the task transitions to `completed`, **verify before re-entering M4:** call `run_gh(["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")` and treat only `state == "MERGED"` as merge success. Only then re-enter M4 step 3 for this child.
+   - If `pr_merge_with_gate` returned `"blocked"` or `"gate_errored"`: the webhook handler already routed to the appropriate block/error path. M4 step 3 will see the child as `blocked`.
+
+   **Literal verification command** (per committed decision — do NOT re-derive):
+   ```
+   run_gh(command=["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")
+   ```
+   Treat only `state == "MERGED"` as merge success. Any other state → HOLD.
+
+   **Rule:** `auto_merge_enabled` is an intent signal, not a completion signal. The child stays in the serial execution slot until the merge webhook confirms actual merge AND `run_gh pr view` verifies `state == "MERGED"`. This prevents dispatching the next ticket against code not yet on main.
+
+   **Incident:** mika#727 — KG milestone #14, PR #726 had auto-merge enabled but CI failed; next ticket #689 was dispatched against missing code.
 
 3. **Check child outcome:**
    | Child outcome | Milestone action |
@@ -517,11 +542,50 @@ For each `child_task_id` in `child_wis` (in order):
 When all children processed:
 1. Gather stats from child tasks via `list_tasks` filtered by `parent_task_id=<milestone_wi>`. Count how many children reached `completed` status.
 2. **Build + deploy (gated on >=1 completed child):** If at least one child completed successfully, trigger a build (`build_mika` if available, or `run_shell` with `cargo build --release --features telemetry`) then deploy (`deploy_mika` with `task_id=<milestone_wi>`). This is part of the close-out — every milestone with successful work produces deployed artifacts, not just merged code. If zero children completed (all failed/blocked/cancelled), **skip build+deploy** and note in the summary: "No deploy — no children completed successfully."
-3. Transition parent: `update_task_status(task_id=<milestone_wi>, status="completed")`
-4. **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> completed. Completed: {N}, Failed: {N}, Blocked: {N}. Total cost: ${total_cost}.")`
-5. Notify Vincent with summary:
+3. **Close the GitHub milestone (REQUIRED before marking the parent task complete):**
+
+   3a. Issue the close PATCH:
+       run_gh({
+         "command": ["api", "-X", "PATCH",
+                     "/repos/senara-solutions/<repo>/milestones/<n>",
+                     "-f", "state=closed"]
+       })
+
+   3b. Read back the state:
+       run_gh({
+         "command": ["api",
+                     "/repos/senara-solutions/<repo>/milestones/<n>",
+                     "--jq", ".state"]
+       })
+
+   3c. Branch on the readback:
+   - Output is exactly `"closed"` (with quotes — `--jq .state` emits JSON): proceed to step 4.
+   - Output is `"open"` or anything else: STOP. Do NOT call `update_task_status(completed)`.
+     Notify Vincent: "Milestone <repo> milestone#<n> close PATCH returned 2xx but
+     readback shows state=<value>. GitHub-side divergence; not marking local task complete."
+     `update_task_status(task_id=<milestone_wi>, status="blocked",
+     note="GitHub milestone close readback mismatch — got state=<value>")`.
+   - 3a returns a non-2xx error: STOP. Notify Vincent with the gh error. Mark task `blocked`
+     with the error in the note. Do NOT claim success.
+
+   This step is load-bearing for the verify-before-claiming discipline. Engine-side guard
+   (mika#797 part D) will reject EndTurn responses claiming "milestone closed" that did not
+   invoke step 3a.
+
+4. Transition parent: `update_task_status(task_id=<milestone_wi>, status="completed")`
+5. **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> completed. Completed: {N}, Failed: {N}, Blocked: {N}. Total cost: ${total_cost}.")`
+
+   **Memory (current_priorities):** After recording milestone completion:
+   ```
+   update_core_memory(section="current_priorities", action="replace",
+     content="No active milestone. Last completed: <repo> milestone#<n> (<milestone_title>).",
+     reasoning="Milestone completed — clear current_priorities to prevent stale prompt state")
+   ```
+
+6. Notify Vincent with summary:
    ```
    Milestone <repo> milestone#<n> complete.
+   Milestone closed on GitHub: ✓
    ✅ Completed: {N} | ❌ Failed: {N} | ⏸️ Blocked: {N}
    Total cost: ${total_cost} | Total turns: {total_turns}
    Build + deploy: done.
@@ -598,6 +662,8 @@ Same as Milestone Step M4.
 ### Step P5 — Project completion
 
 Same as Milestone Step M5.
+
+> **NOTE:** The milestone close step (M5 step 3) is REST-specific to `/milestones/<n>`. GitHub Projects v2 closes via GraphQL `closeProjectV2` mutation and is OUT OF SCOPE for this ticket — see mika#TBD.
 
 ---
 

@@ -16,28 +16,5 @@
       "type": "exec",
       "command": "handlers/qa_pr_view.sh"
     }
-  },
-  {
-    "name": "run_gh",
-    "description": "Run a GitHub CLI command. Restricted to: pr review, pr diff, pr list, issue view. Use qa_pr_view for PR metadata instead of pr view.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "command": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Command arguments for gh CLI (e.g., [\"pr\", \"review\", \"455\", \"--approve\", \"--body\", \"VERDICT: pass\"])"
-        },
-        "repo": {
-          "type": "string",
-          "description": "GitHub repository in owner/repo format (e.g., senara-solutions/mika)"
-        }
-      },
-      "required": ["command"]
-    },
-    "handler": {
-      "type": "exec",
-      "command": "handlers/run_gh.sh"
-    }
   }
 ]

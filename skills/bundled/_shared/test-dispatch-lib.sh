@@ -294,6 +294,196 @@ SKIP_BLOCK=$(printf '%s\n' "$VERIFY_FUNC" | sed -n '/if \[ -z "\$plan_file" \]/,
 assert_contains "Skip block returns 0" "return 0" "$SKIP_BLOCK"
 assert_contains "Skip block logs to stderr" '>&2' "$SKIP_BLOCK"
 
+# --- Test 9: claude-pilot venv smoke test structure (mika#1200) ---
+
+echo ""
+echo "Test 9: claude-pilot venv smoke test (mika#1200)"
+echo "-------------------------------------------------"
+
+# Verify the smoke test block exists in dispatch_claude_pilot
+DISPATCH_BODY=$(sed -n '/^dispatch_claude_pilot()/,/^}/p' "$DISPATCH_LIB")
+
+# (a) Smoke test fires: `claude-pilot --help` check is present
+assert_contains "Smoke test runs claude-pilot --help" \
+    'claude-pilot --help' "$DISPATCH_BODY"
+
+# (b) Smoke test aborts with diagnostic on failure
+assert_contains "Smoke test error mentions venv is broken" \
+    'claude-pilot venv is broken' "$DISPATCH_BODY"
+assert_contains "Smoke test error mentions uv tool install restoration command" \
+    'uv tool install --force --editable ./claude-pilot-py' "$DISPATCH_BODY"
+assert_contains "Smoke test error references mika#1200" \
+    'mika#1200' "$DISPATCH_BODY"
+
+# (c) Smoke test fires BEFORE worktree mutation — verify ordering:
+#     The smoke test (claude-pilot --help) must appear before _set_up_worktree
+#     in the function body. Extract line numbers to confirm ordering.
+SMOKE_LINE=$(printf '%s\n' "$DISPATCH_BODY" | grep -n 'claude-pilot --help' | head -1 | cut -d: -f1)
+WORKTREE_LINE=$(printf '%s\n' "$DISPATCH_BODY" | grep -n '_set_up_worktree' | head -1 | cut -d: -f1)
+if [ -n "$SMOKE_LINE" ] && [ -n "$WORKTREE_LINE" ] && [ "$SMOKE_LINE" -lt "$WORKTREE_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Smoke test (line $SMOKE_LINE) fires before _set_up_worktree (line $WORKTREE_LINE)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Smoke test must fire before _set_up_worktree"
+    echo "    smoke_line=$SMOKE_LINE worktree_line=$WORKTREE_LINE"
+fi
+
+# (c2) Smoke test fires AFTER command -v claude-pilot — ordering:
+COMMAND_V_LINE=$(printf '%s\n' "$DISPATCH_BODY" | grep -n 'command -v claude-pilot' | head -1 | cut -d: -f1)
+if [ -n "$COMMAND_V_LINE" ] && [ -n "$SMOKE_LINE" ] && [ "$COMMAND_V_LINE" -lt "$SMOKE_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ command -v claude-pilot (line $COMMAND_V_LINE) fires before smoke test (line $SMOKE_LINE)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ command -v claude-pilot must fire before smoke test"
+    echo "    command_v_line=$COMMAND_V_LINE smoke_line=$SMOKE_LINE"
+fi
+
+# (b2) Smoke test uses exit 1 (not return 1) — matches surrounding control flow
+SMOKE_BLOCK=$(printf '%s\n' "$DISPATCH_BODY" | sed -n '/claude-pilot --help/,/fi/p' | head -20)
+assert_contains "Smoke test uses exit 1 on failure" 'exit 1' "$SMOKE_BLOCK"
+
+# (b3) Smoke test writes to stderr (lands in task result via EXIT trap)
+assert_contains "Smoke test error goes to stderr" '>&2' "$SMOKE_BLOCK"
+
+# (b4) Smoke test suppresses stdout and routes stderr to trace fd
+assert_contains "Smoke test suppresses stdout" '>/dev/null' "$SMOKE_BLOCK"
+assert_contains "Smoke test routes stderr to trace fd 9" '2>&9' "$SMOKE_BLOCK"
+
+# (b5) Smoke test has a timeout guard against hung venvs
+assert_contains "Smoke test has timeout guard" 'timeout' "$SMOKE_BLOCK"
+
+# --- Test 10: cli.py top-level import guard (mika#1200 Phase 2d) ---
+
+echo ""
+echo "Test 10: cli.py top-level import regression guard (mika#1200)"
+echo "--------------------------------------------------------------"
+
+# The dispatch-lib smoke test relies on cli.py keeping .agent and .permissions
+# imports at module top level (not lazy-imported inside main() or any function).
+# If a future refactor moves these imports into a function body, the smoke test
+# silently stops detecting the import-time failure class.
+#
+# This test checks that the imports are at the module top level via grep.
+# It uses PLATFORM_DIR to find claude-pilot-py, matching how dispatch-lib resolves it.
+
+TEST_PLATFORM_DIR="${MIKA_PLATFORM_DIR:-}"
+if [ -z "$TEST_PLATFORM_DIR" ]; then
+    # Walk up from SCRIPT_DIR to find mika-platform root
+    # SCRIPT_DIR is inside mika/skills/bundled/_shared/
+    _candidate="$SCRIPT_DIR/../../../.."
+    if [ -f "$_candidate/claude-pilot-py/src/claude_pilot/cli.py" ]; then
+        TEST_PLATFORM_DIR=$(cd "$_candidate" && pwd -P)
+    fi
+fi
+
+CLI_PY="${TEST_PLATFORM_DIR:+$TEST_PLATFORM_DIR/claude-pilot-py/src/claude_pilot/cli.py}"
+
+if [ -n "$CLI_PY" ] && [ -f "$CLI_PY" ]; then
+    # Check: `from .agent import` appears at column 0 (top-level, not indented)
+    AGENT_IMPORT=$(grep -c '^from \.agent import' "$CLI_PY" || true)
+    if [ "$AGENT_IMPORT" -ge 1 ]; then
+        PASS=$((PASS + 1))
+        echo "  ✓ cli.py has top-level 'from .agent import' ($AGENT_IMPORT occurrence(s))"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ cli.py MISSING top-level 'from .agent import' — smoke test in dispatch-lib.sh"
+        echo "    will silently stop detecting import-time failures. See mika#1200 Phase 0 Pin."
+    fi
+
+    # Check: `from .permissions import` appears at column 0 (top-level, not indented)
+    PERMS_IMPORT=$(grep -c '^from \.permissions import' "$CLI_PY" || true)
+    if [ "$PERMS_IMPORT" -ge 1 ]; then
+        PASS=$((PASS + 1))
+        echo "  ✓ cli.py has top-level 'from .permissions import' ($PERMS_IMPORT occurrence(s))"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ cli.py MISSING top-level 'from .permissions import' — smoke test in"
+        echo "    dispatch-lib.sh will silently stop detecting import-time failures."
+        echo "    See mika#1200 Phase 0 Pin."
+    fi
+else
+    echo "  ⊘ cli.py not found at expected path (skipped — set MIKA_PLATFORM_DIR or run from mika-platform root)"
+    echo "    tried: ${CLI_PY:-<empty>}"
+fi
+
+# --- Test 11: Class D drift fix — cat-file guard and fallback callouts (mika#1204) ---
+
+echo ""
+echo "Test 11: Class D drift fix — cat-file guard and fallback callouts (mika#1204)"
+echo "-------------------------------------------------------------------------------"
+
+VERIFY_FUNC=$(sed -n '/_verify_and_write_body_callout()/,/^}/p' "$DISPATCH_LIB")
+
+# (a) cat-file -e guard exists — the core fix. HEAD's tree is checked before
+# stamping a SHA, so a plan-on-disk-but-not-in-HEAD state is detected.
+assert_contains "cat-file -e guard present" \
+    'cat-file -e "HEAD:${plan_relpath}"' "$VERIFY_FUNC"
+
+# (b) Recovery commit uses pathspec-limited commit (not git add + git commit).
+# This prevents capturing other staged files from a partial pilot run.
+assert_contains "Recovery commit is pathspec-limited" \
+    'git -C "$worktree_dir" commit -m' "$VERIFY_FUNC"
+# Check for pathspec separator followed by plan_relpath in the commit command.
+# Cannot use assert_contains here because the needle starts with '--' which
+# grep interprets as an option. Use a direct grep -F with -- end-of-options.
+if printf '%s\n' "$VERIFY_FUNC" | grep -qF -- '-- "$plan_relpath"'; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Pathspec targets plan file only"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Pathspec targets plan file only"
+fi
+
+# (c) Recovery commit message follows wip() convention with issue reference.
+assert_contains "Recovery commit message has wip() prefix" \
+    'wip(${repo}#${issue_num})' "$VERIFY_FUNC"
+
+# (d) Commit failure fallback stamps as uncommitted, not with a fabricated SHA.
+# The (uncommitted ...) format does NOT match "committed on branch @" — safe for
+# downstream parsers (check_grooming_markers, _detect_plan_on_branch).
+assert_contains "Commit-failure fallback uses uncommitted callout" \
+    '(uncommitted on branch' "$VERIFY_FUNC"
+
+# (e) Push failure fallback stamps differently from commit failure — operator
+# can distinguish the two states.
+assert_contains "Push-failure fallback uses committed-locally callout" \
+    '(committed locally, push failed' "$VERIFY_FUNC"
+
+# (f) head_sha capture is AFTER the cat-file guard — not before. This ensures
+# the SHA is only stamped when the plan is verifiably in HEAD.
+# Strategy: extract line numbers and confirm ordering.
+CATFILE_LINE=$(printf '%s\n' "$VERIFY_FUNC" | grep -n 'cat-file -e "HEAD:${plan_relpath}"' | head -1 | cut -d: -f1)
+HEADSHA_LINE=$(printf '%s\n' "$VERIFY_FUNC" | grep -n 'head_sha=$(git -C "$worktree_dir" rev-parse --short HEAD' | head -1 | cut -d: -f1)
+if [ -n "$CATFILE_LINE" ] && [ -n "$HEADSHA_LINE" ] && [ "$CATFILE_LINE" -lt "$HEADSHA_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ cat-file guard (line $CATFILE_LINE) fires before head_sha capture (line $HEADSHA_LINE)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ cat-file guard must fire before head_sha capture"
+    echo "    catfile_line=$CATFILE_LINE headsha_line=$HEADSHA_LINE"
+fi
+
+# (g) Push of recovery commit is present — SHA must be reachable from origin.
+assert_contains "Recovery commit is pushed to origin" \
+    'git -C "$worktree_dir" push origin "$branch"' "$VERIFY_FUNC"
+
+# (h) Both fallback paths return 0 (recovery is best-effort, not fatal).
+# Use a wider capture (30 lines) since fallback blocks include heredoc + gh issue edit.
+COMMIT_FAIL_BLOCK=$(printf '%s\n' "$VERIFY_FUNC" | sed -n '/post_flight_class_d_commit_failed/,/return 0/p' | head -30)
+assert_contains "Commit-failure fallback returns 0" "return 0" "$COMMIT_FAIL_BLOCK"
+PUSH_FAIL_BLOCK=$(printf '%s\n' "$VERIFY_FUNC" | sed -n '/post_flight_class_d_push_failed/,/return 0/p' | head -30)
+assert_contains "Push-failure fallback returns 0" "return 0" "$PUSH_FAIL_BLOCK"
+
+# (i) Stderr diagnostic keys are present for observability.
+assert_contains "Class D recovery start log key" \
+    'post_flight_class_d_recovery' "$VERIFY_FUNC"
+assert_contains "Commit failure log key" \
+    'post_flight_class_d_commit_failed' "$VERIFY_FUNC"
+assert_contains "Push failure log key" \
+    'post_flight_class_d_push_failed' "$VERIFY_FUNC"
+
 # --- Summary ---
 
 echo ""

@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-server mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install test lint fmt check check-ngrok clean help
+.PHONY: build build-dashboard deploy stop restart install test lint fmt check check-ngrok clean help calibrate-mika-dev calibrate-mika-arch
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -52,6 +52,14 @@ check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
 		echo "  Start ngrok: ngrok http 8080"; \
 		echo ""; \
 	fi
+
+calibrate-mika-dev: ## Pre-swap calibration gate for mika-dev (MODEL=provider/model required)
+	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-dev MODEL=anthropic/claude-sonnet-4-6" >&2; exit 1; fi
+	cargo run --bin calibrate --release -- --role mika-dev --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
+
+calibrate-mika-arch: ## Pre-swap calibration gate for mika-arch (MODEL=provider/model required)
+	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-arch MODEL=anthropic/claude-opus-4-6" >&2; exit 1; fi
+	cargo run --bin calibrate --release -- --role mika-arch --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
 
 test: ## Run all tests
 	cargo test

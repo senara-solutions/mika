@@ -836,6 +836,9 @@ async fn run_loop(
     // Whether we already injected a completion-claim correction. Only allow one retry.
     // Guards against fabricated completion claims without update_task_status calls (#483).
     let mut completion_claim_retry_done = false;
+    // Whether we already injected a milestone-close-claim correction. Only allow one retry.
+    // Guards against claiming milestone closed without the PATCH call (#797).
+    let mut milestone_close_claim_retry_done = false;
     // Whether we already injected a fabricated-action correction. Only allow one retry.
     // Guards against fabricated action claims with URLs but zero tool calls (#308).
     let mut fabricated_action_retry_done = false;
@@ -1030,6 +1033,47 @@ async fn run_loop(
             LlmStopReason::EndTurn | LlmStopReason::MaxTokens | LlmStopReason::ContentFilter => {
                 let text = mika_common::llm::strip_internal_tags(&response.text());
 
+                // mika#1168 — refusal-detection telemetry (Phase C Step 10).
+                //
+                // When the model self-classifies a prior engine-injected
+                // correction message as prompt-injection-pattern, it emits a
+                // refusal of literal shape "Prompt injection. Rejected. ..."
+                // with no tool calls. This is the failure mode behind the
+                // 2026-05-17/18 dispatch losses. Per-gate retry flags
+                // already bound the inner loop (no gate fires more than
+                // once per run_loop), so this branch is observability-only:
+                // log the gate id + bounded excerpt so the operator can
+                // audit recurrences and catch classifier drift. The
+                // structured event name is `classifier_refusal` so a
+                // future `EngineError::ClassifierRefusal` upgrade keeps
+                // logs greppable across the boundary.
+                //
+                // The match is anchored to the first 60 chars of the
+                // stripped response and requires both `prompt injection`
+                // and `reject` in close succession — refusals lead with
+                // the verdict, while legitimate prose discussing the
+                // injection pattern (e.g., mika-arch reviewing this PR
+                // or a docs page describing the failure) buries the term
+                // deeper in the text. The excerpt is scrubbed via
+                // `secret_scrubber::scrub_secrets()` to match the
+                // project's convention for LLM-output persistence sinks.
+                if !text.is_empty()
+                    && !response.has_tool_calls()
+                    && step > 0
+                    && looks_like_classifier_refusal(&text)
+                {
+                    let raw_excerpt: String = text.chars().take(200).collect();
+                    let scrubbed = crate::secret_scrubber::scrub_secrets(&raw_excerpt);
+                    warn!(
+                        step,
+                        label = mode.label(),
+                        event = "classifier_refusal",
+                        excerpt = %scrubbed,
+                        "model self-classified an engine correction as prompt-injection-pattern \
+                         (mika#1168 refusal-detection) — no further retry will fire this turn"
+                    );
+                }
+
                 if !text.is_empty() {
                     // Text-based tool call detection: if the LLM output XML tool calls
                     // as text instead of using the structured API, re-prompt once.
@@ -1054,10 +1098,11 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(
-                                "[Your response contained tool calls as text (e.g., <function=...>) \
-                                 instead of using the structured tool calling API. Do NOT output \
-                                 tool calls as text. Use the tool calling mechanism provided to \
-                                 you. Call the tool now using the proper API.]"
+                                "[mika-engine] The previous response contained tool calls \
+                                 as text (e.g., <function=...>) instead of using the \
+                                 structured tool calling API. The engine expects tool \
+                                 calls via the structured mechanism — calling the tool \
+                                 via the proper API now satisfies this gate."
                                     .to_string(),
                             ),
                         });
@@ -1090,12 +1135,12 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(format!(
-                                "[Your response contained a prose-style tool call for \
-                                 '{tool_name}' (e.g., {tool_name}({{...}})) instead of \
-                                 using the structured tool calling API. Do NOT output \
-                                 tool calls as text. Use the tool calling mechanism \
-                                 provided to you. Call {tool_name} now using the proper \
-                                 API.]",
+                                "[mika-engine] The previous response contained a \
+                                 prose-style tool call for '{tool_name}' \
+                                 (e.g., {tool_name}({{...}})) instead of using the \
+                                 structured tool calling API. The engine expects tool \
+                                 calls via the structured mechanism — invoking \
+                                 {tool_name} via the proper API now satisfies this gate.",
                             )),
                         });
                         continue;
@@ -1172,18 +1217,22 @@ async fn run_loop(
                                         ),
                                     ),
                                 });
-                                // Inject a correction telling the model which tools it must call
+                                // Inject a correction telling the model which tools it must call.
+                                // `[mika-engine]` trusted-marker prefix + state-machine framing
+                                // distinguishes engine control flow from adversarial user input
+                                // (mika#1168 — co-cause 1, model self-classification refusal).
                                 request.messages.push(LlmMessage {
                                     role: LlmRole::User,
                                     content: LlmContent::Text(format!(
-                                        "[Your response was rejected because you did not call the \
-                                         required tool(s): {}. You MUST call these tools with real \
-                                         data before producing your response. Do not fabricate or \
-                                         assume results — call the tools now. When you produce \
-                                         your corrected response, restate the full content — do \
-                                         not reference your prior turn. Only the final response \
-                                         is persisted to the conversation log; prior turns exist \
-                                         only in the in-memory loop context.]",
+                                        "[mika-engine] The previous response did not call the \
+                                         required tool(s): {}. The engine expects these tools \
+                                         to be invoked with real data before the corrected \
+                                         response. Tool results are how the engine confirms \
+                                         work; results come from actual calls, not synthesis. \
+                                         The corrected response should restate the full content \
+                                         — only the final response reaches the conversation \
+                                         log; prior turns exist only in the in-memory loop \
+                                         context.",
                                         missing_names.join(", ")
                                     )),
                                 });
@@ -1262,18 +1311,85 @@ async fn run_loop(
                                 request.messages.push(LlmMessage {
                                     role: LlmRole::User,
                                     content: LlmContent::Text(format!(
-                                        "[Your response was rejected because you claimed completion \
-                                         (matched: \"{keyword}\") but did not call update_task_status. \
-                                         You have {} active task(s):\n{item_list}\n\n\
-                                         Call update_task_status for each relevant task, \
-                                         or retract the completion claim if the work is not actually done. \
-                                         Do not fabricate or assume results — verify with tools first.]",
+                                        "[mika-engine] The previous response claimed completion \
+                                         (matched: \"{keyword}\") without calling update_task_status. \
+                                         There are {} active task(s):\n{item_list}\n\n\
+                                         The engine expects update_task_status for each relevant \
+                                         task, or a retraction of the completion claim if the work \
+                                         is not actually done. Tool results are how the engine \
+                                         confirms work; results come from actual calls, not synthesis.",
                                         active_items.len(),
                                     )),
                                 });
                                 continue;
                             }
                         }
+                    }
+
+                    // Milestone-close-claim guard (#797): if the agent claims a
+                    // GitHub milestone was closed but did not invoke run_gh with the
+                    // close PATCH, reject and re-prompt once. Prevents local-only
+                    // milestone completion that leaves GitHub state divergent.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !milestone_close_claim_retry_done
+                        && let Some(keyword) =
+                            detect_milestone_close_claim_without_patch(&text, &all_tool_summaries)
+                    {
+                        milestone_close_claim_retry_done = true;
+                        warn!(
+                            step,
+                            keyword,
+                            label = mode.label(),
+                            "Milestone close claim detected without PATCH call — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[mika-engine] The previous response claimed a GitHub \
+                                 milestone was closed (matched: \"{keyword}\") without \
+                                 invoking `run_gh` with the close PATCH. Closing a \
+                                 milestone locally is not the same as closing it on \
+                                 GitHub — the previous incident (milestone#17, \
+                                 2026-04-24) left local state and GitHub state \
+                                 divergent for hours.\n\
+                                 The engine expects `run_gh` with the close PATCH \
+                                 (subcommand `api`, method `-X PATCH`, path \
+                                 `/repos/<owner>/<repo>/milestones/<n>`, field \
+                                 `-f state=closed`) AND a readback-verified state, \
+                                 OR a retraction of the claim if the close was not \
+                                 actually performed. See self-dev system prompt M5 \
+                                 step 3 for the canonical call shape.",
+                            )),
+                        });
+                        continue;
+                    }
+
+                    // Observability for the milestone-close guard's single-retry
+                    // budget (#797). If the guard already fired once this run_loop
+                    // AND the agent's second EndTurn still emits a close-claim
+                    // without a satisfying PATCH, we let it through (per the
+                    // single-retry contract shared with the completion-claim
+                    // guard #483), but emit a structured warn so the operator can
+                    // grep for "repeat-fabrication" patterns that justify
+                    // widening the budget or escalating.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && milestone_close_claim_retry_done
+                        && detect_milestone_close_claim_without_patch(&text, &all_tool_summaries)
+                            .is_some()
+                    {
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            "Milestone close claim guard already fired this turn — accepting EndTurn with second violation (budget exhausted)"
+                        );
                     }
 
                     // Fabricated action-claim guard: if the agent claims to have
@@ -1304,12 +1420,14 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(format!(
-                                "[Your response was rejected because you claimed to have \
-                                 {verb} a resource ({url}) but you did not call any tool \
-                                 in this turn. You MUST use tools (e.g., run_gh) to perform \
-                                 actions — do not fabricate URLs or assume actions happened. \
-                                 Call the appropriate tool now to actually perform the action, \
-                                 or explain that you cannot perform it.]",
+                                "[mika-engine] The previous response claimed to have \
+                                 {verb} a resource ({url}) without calling any tool \
+                                 in this turn. The engine expects actions to be \
+                                 performed via tools (e.g., run_gh); URLs and action \
+                                 results come from actual calls, not synthesis. \
+                                 Calling the appropriate tool now performs the action, \
+                                 or the response should state that the action cannot be \
+                                 performed.",
                             )),
                         });
                         continue;
@@ -1434,16 +1552,17 @@ async fn run_loop(
                         request.messages.push(LlmMessage {
                             role: LlmRole::User,
                             content: LlmContent::Text(format!(
-                                "[Your response was rejected because you claimed \
+                                "[mika-engine] The previous response claimed \
                                  {tool_name} is unavailable, but {tool_name} is in \
-                                 your active tool registry for this session. Attempt \
-                                 the call directly. If it fails (auth, rate limit, \
+                                 the active tool registry for this session. \
+                                 Attempting the call directly is the engine's \
+                                 expectation. If it fails (auth, rate limit, \
                                  network, permission), surface the actual failure — \
                                  that is a real signal. 'Not callable' without an \
                                  attempt is a fabrication. See docs/solutions/\
                                  best-practices/\
                                  required-tools-gate-evasion-patterns-2026-04-28.md \
-                                 Rule 2.]",
+                                 Rule 2.",
                             )),
                         });
                         continue;
@@ -1545,16 +1664,16 @@ async fn run_loop(
                             request.messages.push(LlmMessage {
                                 role: LlmRole::User,
                                 content: LlmContent::Text(format!(
-                                    "[Your response must end with one of these literal lines \
-                                     (any of the last 3 non-empty lines, after whitespace \
-                                     trim, will satisfy):\n{}\n\
-                                     Re-emit the same response with one of the required lines \
-                                     appended verbatim on its own line at the end. Do not \
-                                     paraphrase — the suffix is a structural contract parsed \
-                                     by downstream consumers.\n\n\
-                                     (Required by skill [output].required_suffix_lines. \
+                                    "[mika-engine] The previous response must end with one of \
+                                     these literal lines (any of the last 3 non-empty \
+                                     lines, after whitespace trim, will satisfy):\n{}\n\
+                                     Re-emitting the same response with one of the required \
+                                     lines appended verbatim on its own line at the end \
+                                     satisfies this gate. Paraphrases do not — the suffix \
+                                     is a structural contract parsed by downstream consumers.\n\n\
+                                     (Declared via skill [output].required_suffix_lines. \
                                      See feedback_prompt_enforcement_fragile.md for why \
-                                     prompt-level \"MUST\" doesn't bind here.)]",
+                                     prompt-level \"MUST\" doesn't bind here.)",
                                     lines_display.join("\n"),
                                 )),
                             });
@@ -1610,24 +1729,24 @@ async fn run_loop(
                             request.messages.push(LlmMessage {
                                 role: LlmRole::User,
                                 content: LlmContent::Text(
-                                    "[Your response was rejected because it does not contain \
-                                     the required F-list emission per the skill's \
+                                    "[mika-engine] The previous response does not contain the \
+                                     required F-list emission per the skill's \
                                      `[output] required_finding_list_prefixes` contract.\n\n\
-                                     When disposition is ITERATE or ESCALATE (or verdict \
-                                     ESCALATE), the final assistant message MUST emit \
-                                     findings as `F1:`, `F2:`, etc., in the message body. \
-                                     Each finding needs: (a) **Concern** — the concrete \
-                                     issue, (b) **Change required** — what the plan must \
+                                     On disposition ITERATE or ESCALATE (or verdict \
+                                     ESCALATE), the final assistant message emits findings \
+                                     as `F1:`, `F2:`, etc., in the message body. Each \
+                                     finding needs: (a) **Concern** — the concrete issue, \
+                                     (b) **Change required** — what the plan must \
                                      address, (c) **Citation** — the source grounding the \
                                      concern.\n\n\
                                      Persisting findings to memory (`store_fact` / \
                                      `update_core_memory`) is encouraged as defense-in-depth, \
                                      but the in-band emission is the contract the operator \
-                                     depends on. Re-emit the response with the F-list \
-                                     before EndTurn.\n\n\
-                                     (Required by skill [output].required_finding_list_prefixes. \
+                                     depends on. Re-emitting the response with the F-list \
+                                     before EndTurn satisfies this gate.\n\n\
+                                     (Declared via skill [output].required_finding_list_prefixes. \
                                      See feedback_prompt_enforcement_fragile.md for why \
-                                     prompt-level \"MUST\" doesn't bind here.)]"
+                                     prompt-level \"MUST\" doesn't bind here.)"
                                         .to_string(),
                                 ),
                             });
@@ -3203,7 +3322,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                  is firing this turn unconditionally.\n\n\
                  Parent task: {parent_task_id} (type: {parent_kind})\n\n\
                  You MUST either:\n\
-                 1. Dispatch the next pending child via run_claude_pilot, OR\n\
+                 1. Dispatch the next pending child via run_claude_pilot (implement) \
+                    or run_claude_pilot_groom (groom), OR\n\
                  2. Mark the {parent_kind} parent as `blocked` (with a reason in the note \
                     field) or `completed` via update_task_status.\n\n\
                  Do NOT narrate, summarize, or ask for confirmation. The engine enforces \
@@ -3217,13 +3337,15 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
             ..
         } => {
             format!(
-                "DEFERRED-DISPATCH RETRY (mika#1011). A previous run_claude_pilot call \
-                 was rejected with global_dispatch_active. The dispatch slot is now free. \
-                 Re-invoke run_claude_pilot with the original arguments to complete the \
-                 deferred dispatch.\n\n\
+                "DEFERRED-DISPATCH RETRY (mika#1011). A previous run_claude_pilot or \
+                 run_claude_pilot_groom call was rejected with global_dispatch_active. \
+                 The dispatch slot is now free. Re-invoke the same tool with the original \
+                 arguments to complete the deferred dispatch (read `Original dispatch \
+                 config` below to determine which tool — `skill: dev-groom` → \
+                 run_claude_pilot_groom; `skill: dev-pilot` → run_claude_pilot).\n\n\
                  Parent task: {parent_task_id}\n\
                  Original dispatch config: {action_config}\n\n\
-                 You MUST call run_claude_pilot. Do not call update_task_status, \
+                 You MUST call the matching dispatch tool. Do not call update_task_status, \
                  send_message, or any other tool first."
             )
         }
@@ -4598,6 +4720,69 @@ fn detect_completion_claim(text: &str) -> Option<&str> {
     COMPLETION_CLAIM_RE.find(text).map(|m| m.as_str())
 }
 
+/// Regex matching "milestone" followed within 80 chars by "closed" or "close".
+/// Used by the milestone-close-claim guard (#797) to detect when the agent claims
+/// a GitHub milestone was closed without actually calling the close PATCH.
+///
+/// The 80-char window was sized to cover the canonical incident phrasings
+/// ("Milestone#17 closed, tasks reconciled", "milestone <repo>/milestone#<n> is
+/// now closed") plus typical sentence-level decoration without spanning a
+/// paragraph break. Widening risks false-positive matches across unrelated
+/// clauses; narrowing risks missing phrasings like "Milestone <repo> milestone
+/// #<n> has been closed on GitHub". The `_future_tense_overmatches_intentionally`
+/// test documents the accepted false-positive surface (planning-shape text).
+static MILESTONE_CLOSE_CLAIM_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\bmilestone\b.{0,80}\b(closed|close)\b")
+            .expect("milestone close claim regex must compile")
+    });
+
+/// Regex matching the milestones API path pattern in run_gh argv.
+static MILESTONE_API_PATH_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"/repos/[^/]+/[^/]+/milestones/\d+")
+        .expect("milestone api path regex must compile")
+});
+
+/// Detects whether assistant text claims a GitHub milestone was closed without
+/// invoking the required `run_gh` PATCH call.
+///
+/// Returns the matched keyword for the correction message, or `None` if:
+/// - The text does not claim a milestone close, OR
+/// - A qualifying `run_gh` PATCH call exists in `all_tool_summaries`.
+///
+/// A qualifying call has `input_summary` containing all four substrings:
+/// `"api"`, `"PATCH"`, `state=closed`, AND a milestones API path. The
+/// `state=closed` requirement narrows the surface against milestones PATCH
+/// calls that mutate non-state fields (e.g., `-f title=...`). This is a
+/// substring-shape check; the coupling to `ToolCallSummary.input_summary`
+/// JSON serialization is documented and cross-locked with
+/// `skills/bundled/self-dev/system_prompt.md` § M5 step 3a. A structural
+/// argv-parse rewrite is tracked as follow-up.
+fn detect_milestone_close_claim_without_patch<'a>(
+    text: &'a str,
+    all_tool_summaries: &[ToolCallSummary],
+) -> Option<&'a str> {
+    // Fast path: skip regex if no likely substrings present.
+    let lower = text.to_lowercase();
+    if !lower.contains("milestone") {
+        return None;
+    }
+
+    let caps = MILESTONE_CLOSE_CLAIM_RE.captures(text)?;
+    let keyword = caps.get(1).map(|m| m.as_str())?;
+
+    // Check if any run_gh call in this turn has the required PATCH shape.
+    let has_patch_call = all_tool_summaries.iter().any(|s| {
+        s.name == "run_gh"
+            && s.input_summary.contains("\"api\"")
+            && s.input_summary.contains("\"PATCH\"")
+            && s.input_summary.contains("state=closed")
+            && MILESTONE_API_PATH_RE.is_match(&s.input_summary)
+    });
+
+    if has_patch_call { None } else { Some(keyword) }
+}
+
 /// Regex matching GitHub resource URLs that look like created resources:
 /// issue comments, review comments, PR review IDs, issues, and PRs.
 static GITHUB_RESOURCE_URL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -4713,6 +4898,23 @@ fn detect_persistable_output(text: &str) -> Option<&str> {
     PERSISTABLE_OUTPUT_RE.find(text).map(|m| m.as_str())
 }
 
+/// mika#1168 — detect the literal classifier-refusal shape the model emits
+/// when it self-classifies an engine correction as a prompt-injection
+/// attempt. Anchored to the first 60 chars of the stripped response and
+/// requires both `prompt injection` and `reject` to keep legitimate prose
+/// that merely *mentions* the failure mode (e.g., mika-arch reviewing this
+/// fix, or a docs page describing the pattern) from tripping the
+/// observability log. Refusals lead with the verdict; mentions bury it.
+fn looks_like_classifier_refusal(text: &str) -> bool {
+    let head_end = text
+        .char_indices()
+        .nth(60)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let head = text[..head_end].to_lowercase();
+    head.contains("prompt injection") && head.contains("reject")
+}
+
 fn detect_text_based_tool_call(text: &str) -> bool {
     if !text.contains('<') {
         return false;
@@ -4806,16 +5008,18 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
         satisfied: ready_label_dispatch_satisfied,
-        correction_message: "[Your response was rejected. The `ready` label has been \
-             removed but you did not call run_claude_pilot. The Ready-Label \
-             Dispatch handler requires you to: \
+        correction_message: "[mika-engine] The `ready` label has been removed but neither \
+             run_claude_pilot nor run_claude_pilot_groom was called this turn. The \
+             Ready-Label Dispatch handler expects: \
              (1) run_gh `issue view <n> --json title,body --repo <repo>` to fetch \
              the issue, (2) check the issue body for the grooming marker \
-             `> - **Plan:**`. If the marker is PRESENT: call create_task then \
-             run_claude_pilot with skill=dev-pilot, prompt=\"<repo>#<n>\", and \
-             task_id=<UUID>. If the marker is ABSENT: call create_task then \
-             run_claude_pilot with skill=dev-groom to auto-groom the ticket. \
-             Do not end this turn until you have called run_claude_pilot.]",
+             `> - **Plan:**`. If the marker is PRESENT, the engine expects \
+             create_task followed by run_claude_pilot with skill=dev-pilot, \
+             prompt=\"<repo>#<n>\", and task_id=<UUID>. If the marker is ABSENT, \
+             the engine expects create_task followed by run_claude_pilot_groom \
+             with skill=dev-groom (mika#1173 — grooming uses its own tool) to \
+             auto-groom the ticket. The turn continues until the appropriate \
+             dispatch tool is called.",
     },
     // #910 — non-ready [GitHub] webhook turns must NOT call run_claude_pilot.
     // Per mika#841 Layer 1 source-check, only `[GitHub] Issue labeled ready on`
@@ -4839,24 +5043,24 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "webhook_no_unauthorized_dispatch",
         trigger: webhook_no_unauthorized_dispatch_trigger,
         satisfied: webhook_no_unauthorized_dispatch_satisfied,
-        correction_message: "[Your response was rejected. You called \
-             run_claude_pilot on a [GitHub] webhook turn that was NOT a 'ready' \
-             label event. Per Layer 1 source-check (mika#841), only '[GitHub] \
-             Issue labeled ready on' webhooks may dispatch. All other [GitHub] \
-             events (comments, other labels, edits) must use Webhook Fallthrough: \
-             acknowledge without calling run_claude_pilot.]",
+        correction_message: "[mika-engine] The previous response called run_claude_pilot or \
+             run_claude_pilot_groom on a [GitHub] webhook turn that was NOT a \
+             'ready' label event. Per Layer 1 source-check (mika#841), only \
+             '[GitHub] Issue labeled ready on' webhooks may dispatch. All other \
+             [GitHub] events (comments, other labels, edits) use Webhook \
+             Fallthrough: the engine expects acknowledgement without dispatching.",
     },
     // #696 — webhook events require at least one successful tool call.
     IntentPrecondition {
         label: "webhook_zero_tools",
         trigger: |msg| msg.starts_with("[GitHub]"),
         satisfied: |summaries| summaries.iter().any(|s| s.success),
-        correction_message: "[Your response was rejected because you received a GitHub \
-             webhook event but responded with text only and zero tool calls. \
-             Webhook events require action — you MUST call at least one tool \
+        correction_message: "[mika-engine] A GitHub webhook event was received but the \
+             response was text-only with zero tool calls. Webhook events require \
+             action — the engine expects at least one tool call \
              (send_message, update_task_status, list_tasks, check_task, etc.) \
              to process the event. Re-read the webhook payload above and use \
-             the appropriate tools to handle it.]",
+             the appropriate tools to handle it.",
     },
     // #702 — resume/continue intent for milestones/projects requires
     // reconciliation via check_task or list_tasks before EndTurn.
@@ -4864,12 +5068,12 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "resume_reconcile",
         trigger: detect_resume_intent,
         satisfied: resume_reconcile_satisfied,
-        correction_message: "[Your response was rejected because you received a resume/continue \
-             instruction for a milestone or project but did not call any reconciliation \
-             tools. You MUST call check_task or list_tasks (with success) to reconcile \
-             the current state before ending your turn. Follow the Resume Semantics \
-             section in the self-dev skill prompt to find the parent task, locate the \
-             next child, and resume execution.]",
+        correction_message: "[mika-engine] A resume/continue instruction was received for a \
+             milestone or project but no reconciliation tools were called. The \
+             engine expects check_task or list_tasks (with success) to reconcile \
+             the current state before EndTurn. Follow the Resume Semantics section \
+             in the self-dev skill prompt to find the parent task, locate the next \
+             child, and resume execution.",
     },
     // #870 — callback turns must update parent task AND notify operator before
     // EndTurn.  Without this guard, the callback session can run diagnostic
@@ -4892,11 +5096,12 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
         label: "deferred_dispatch_action",
         trigger: deferred_dispatch_trigger,
         satisfied: deferred_dispatch_satisfied,
-        correction_message: "[Your response was rejected. This is a deferred-dispatch \
-             retry — the prior run_claude_pilot was rejected with global_dispatch_active. \
-             The dispatch slot is now free. You MUST re-invoke run_claude_pilot with the \
-             original arguments to complete the deferred dispatch. Do not call \
-             update_task_status, send_message, or any other tool first.]",
+        correction_message: "[mika-engine] This is a deferred-dispatch retry — the prior \
+             run_claude_pilot was rejected with global_dispatch_active. The dispatch \
+             slot is now free. The engine expects run_claude_pilot to be re-invoked \
+             with the original arguments to complete the deferred dispatch. \
+             update_task_status, send_message, and other tools should not be called \
+             before run_claude_pilot.",
     },
 ];
 
@@ -4904,14 +5109,14 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
 /// action guard.  Used by both the INTENT_GUARDS registry entry (non-empty
 /// text path) and the inline empty-text guard in the Silent mode exit path.
 const CALLBACK_TERMINAL_ACTION_LABEL: &str = "callback_terminal_action";
-const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[Your response was rejected because \
-     this callback turn ended without the required terminal actions. Callback turns MUST: \
-     (1) call `update_task_status` to mark the parent self_dev task terminal \
+const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[mika-engine] This callback turn ended \
+     without the required terminal actions. Callback turns require both: \
+     (1) `update_task_status` to mark the parent self_dev task terminal \
      (`failed`/`pending`/`completed` based on the callback result), AND \
-     (2) call `send_message` to notify the operator of the result. \
-     Optionally call `create_task` to relaunch claude-pilot if the failure mode \
-     is retry-safe. EndTurn without (1) AND (2) will be rejected. \
-     Re-read the callback framing and produce both terminal actions before EndTurn.]";
+     (2) `send_message` to notify the operator of the result. \
+     Optionally `create_task` to relaunch claude-pilot if the failure mode \
+     is retry-safe. EndTurn without both (1) and (2) re-enters this gate. \
+     Re-read the callback framing and produce both terminal actions before EndTurn.";
 
 /// Re-export from `webhook_dispatch` module — single source of truth for the
 /// ready-label marker prefix (mika#933).
@@ -4939,7 +5144,12 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 /// after fabricated `check_task` pre-flights exploited the over-broad match to
 /// short-circuit dispatch via a hallucinated escalation that hit NoChannel.
 fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries.iter().any(|s| s.name == "run_claude_pilot")
+    // mika#1173: dev-groom owns its own tool (run_claude_pilot_groom) after the
+    // structural revert. Auto-groom path dispatches via the groom tool; both
+    // names satisfy the ready-label dispatch contract.
+    summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
 }
 
 /// #910, #1102 — Triggers on `[GitHub]` webhook turns that represent
@@ -4962,9 +5172,11 @@ fn webhook_no_unauthorized_dispatch_trigger(msg: &str) -> bool {
 /// ignored — the dispatch-readiness guard in `executor.rs` already blocked
 /// them structurally.
 fn webhook_no_unauthorized_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
+    // mika#1173: also reject the groom tool — unauthorized dispatch is
+    // unauthorized regardless of which claude-pilot tool was called.
     !summaries
         .iter()
-        .any(|s| s.name == "run_claude_pilot" && s.success)
+        .any(|s| (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom") && s.success)
 }
 
 /// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
@@ -5047,7 +5259,10 @@ fn deferred_dispatch_trigger(msg: &str) -> bool {
 
 /// mika#1011 — Satisfied when `run_claude_pilot` has been attempted (success or failure).
 fn deferred_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries.iter().any(|s| s.name == "run_claude_pilot")
+    // mika#1173: deferred replay may target either tool.
+    summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
 }
 
 /// #870 — Returns `true` when BOTH `update_task_status` AND `send_message`
@@ -5107,8 +5322,11 @@ fn callback_milestone_advance_satisfied(
     parent_task_id: &str,
     summaries: &[ToolCallSummary],
 ) -> bool {
-    // Path A: any run_claude_pilot call (advance to next child)
-    let has_advance = summaries.iter().any(|s| s.name == "run_claude_pilot");
+    // Path A: any run_claude_pilot or run_claude_pilot_groom call advances the queue
+    // (the latter is the milestone-cascade auto-groom path; mika#1173).
+    let has_advance = summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom");
 
     if has_advance {
         return true;
@@ -5126,14 +5344,14 @@ fn callback_milestone_advance_satisfied(
 }
 
 /// #991 — Correction message for the callback milestone advance guard.
-const CALLBACK_MILESTONE_ADVANCE_CORRECTION: &str = "[Your response was rejected. This is a \
-     callback turn for a milestone/project child task. Per mika#991 you MUST either: \
+const CALLBACK_MILESTONE_ADVANCE_CORRECTION: &str = "[mika-engine] This is a callback turn for \
+     a milestone/project child task. Per mika#991 the engine expects either: \
      (1) dispatch the next pending child via run_claude_pilot, OR \
      (2) mark the milestone/project parent as `blocked` (with a reason in the note field) \
      or `completed` via update_task_status. Posting a confirmation question or summary \
      without one of these two tool calls is the deliberation-stall pattern documented \
      in mika#991. Re-read the callback result and either advance the queue or halt \
-     the milestone explicitly via update_task_status.]";
+     the milestone explicitly via update_task_status.";
 
 // ---------------------------------------------------------------------------
 // #862 — Asserted-unavailability guard
@@ -7411,6 +7629,94 @@ mod tests {
         }]));
     }
 
+    // mika#1173: regression tests asserting intent-guard satisfied predicates
+    // accept both run_claude_pilot AND run_claude_pilot_groom. The structural
+    // revert split grooming onto its own tool; without these guards updated,
+    // the auto-groom path on ready-label/milestone-cascade/deferred-replay
+    // would all fail at the EndTurn guard layer.
+    // (Reuses the `make_summary(name, output, success)` helper defined later in
+    // this test module; passing "" for output as these guards key on name+success.)
+
+    #[test]
+    fn test_ready_label_dispatch_satisfied_accepts_both_tools() {
+        assert!(!ready_label_dispatch_satisfied(&[]));
+        assert!(ready_label_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot",
+            "",
+            true
+        )]));
+        assert!(ready_label_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot_groom",
+            "",
+            true
+        )]));
+        // Failed attempts still count as "attempted" per the guard's contract.
+        assert!(ready_label_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot_groom",
+            "",
+            false
+        )]));
+        assert!(!ready_label_dispatch_satisfied(&[make_summary(
+            "send_message",
+            "",
+            true
+        )]));
+    }
+
+    #[test]
+    fn test_deferred_dispatch_satisfied_accepts_groom_tool() {
+        assert!(deferred_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot_groom",
+            "",
+            true
+        )]));
+        assert!(!deferred_dispatch_satisfied(&[make_summary(
+            "update_task_status",
+            "",
+            true
+        )]));
+    }
+
+    #[test]
+    fn test_callback_milestone_advance_satisfied_path_a_accepts_groom_tool() {
+        let parent_id = "abc-123";
+        // Path A: groom-tool advance.
+        assert!(callback_milestone_advance_satisfied(
+            parent_id,
+            &[make_summary("run_claude_pilot_groom", "", true)]
+        ));
+        // Path A: implement-tool advance still works.
+        assert!(callback_milestone_advance_satisfied(
+            parent_id,
+            &[make_summary("run_claude_pilot", "", true)]
+        ));
+        // Neither path → not satisfied.
+        assert!(!callback_milestone_advance_satisfied(
+            parent_id,
+            &[make_summary("send_message", "", true)]
+        ));
+    }
+
+    #[test]
+    fn test_webhook_no_unauthorized_dispatch_satisfied_rejects_both_tools() {
+        // No tools called → satisfied (no unauthorized dispatch).
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&[]));
+        // Successful run_claude_pilot → unauthorized → NOT satisfied.
+        assert!(!webhook_no_unauthorized_dispatch_satisfied(&[
+            make_summary("run_claude_pilot", "", true)
+        ]));
+        // Successful run_claude_pilot_groom → also unauthorized → NOT satisfied.
+        assert!(!webhook_no_unauthorized_dispatch_satisfied(&[
+            make_summary("run_claude_pilot_groom", "", true)
+        ]));
+        // Failed dispatch attempts don't count (engine guards block them upstream).
+        assert!(webhook_no_unauthorized_dispatch_satisfied(&[make_summary(
+            "run_claude_pilot_groom",
+            "",
+            false
+        )]));
+    }
+
     // -- detect_text_based_tool_call tests --
 
     #[test]
@@ -7642,6 +7948,164 @@ mod tests {
         assert_eq!(
             detect_completion_claim("I've merged the PR and synced main. Everything looks good."),
             Some("merged")
+        );
+    }
+
+    // -- detect_milestone_close_claim_without_patch tests (#797) --
+
+    /// Helper: build a ToolCallSummary for run_gh with the given input.
+    fn run_gh_summary(input: &str) -> ToolCallSummary {
+        ToolCallSummary {
+            step: 1,
+            name: "run_gh".to_string(),
+            input_summary: input.to_string(),
+            output_summary: String::new(),
+            success: true,
+            non_zero_exit: false,
+        }
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_with_patch_passes() {
+        // Text has claim AND argv has PATCH → returns None (no violation).
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","-X","PATCH","/repos/senara-solutions/mika/milestones/17","-f","state=closed"]}"#,
+        )];
+        assert!(
+            detect_milestone_close_claim_without_patch("Milestone#17 is now closed", &summaries,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_without_patch_caught() {
+        // Text has claim AND no PATCH argv → returns the matched keyword.
+        let summaries = vec![];
+        let result = detect_milestone_close_claim_without_patch(
+            "Milestone#17 closed, tasks reconciled, memory updated",
+            &summaries,
+        );
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("closed"));
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_case_insensitive() {
+        // "MILESTONE CLOSED" caught regardless of case.
+        let summaries = vec![];
+        let result = detect_milestone_close_claim_without_patch(
+            "MILESTONE #17 CLOSED successfully",
+            &summaries,
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_no_match_on_unrelated_close() {
+        // "PR closed" alone does NOT trigger — no "milestone" keyword.
+        let summaries = vec![];
+        assert!(
+            detect_milestone_close_claim_without_patch("PR closed successfully", &summaries)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_readback_alone_not_sufficient() {
+        // Only readback argv (api ... --jq .state), no PATCH → still triggers.
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","/repos/senara-solutions/mika/milestones/17","--jq",".state"]}"#,
+        )];
+        let result = detect_milestone_close_claim_without_patch(
+            "Milestone#17 has been closed on GitHub",
+            &summaries,
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_no_match_on_empty_text() {
+        let summaries = vec![];
+        assert!(detect_milestone_close_claim_without_patch("", &summaries).is_none());
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_future_tense_overmatches_intentionally() {
+        // Documents a deliberate false-positive trade-off: "milestone ... close"
+        // in a future-tense planning context (e.g., "ready to close now") still
+        // triggers the guard. The cost — one extra LLM turn on a planning
+        // emission — is accepted because the cost of missing the milestone#17
+        // close-divergence class (silent local-vs-GitHub state drift) is
+        // higher. Maintainers tightening the regex to past-tense only should
+        // first widen the eval coverage for the missed cases.
+        let summaries = vec![];
+        let result = detect_milestone_close_claim_without_patch(
+            "The milestone is ready to close now",
+            &summaries,
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_dual_trigger_completion_and_milestone_close_both_detect() {
+        // When text contains both "completed" and "milestone ... closed",
+        // both detection functions fire — but the post-condition chain's
+        // sequential ordering means only #4 (completion-claim) fires first.
+        // This test verifies both detectors independently trigger on the
+        // same text — the chain's `continue` on first match is structural.
+        let text = "Milestone#17 completed and closed";
+        let summaries: Vec<ToolCallSummary> = vec![];
+
+        // Completion-claim detector: fires on "completed".
+        assert!(detect_completion_claim(text).is_some());
+        // Milestone-close detector: fires on "milestone ... closed".
+        assert!(detect_milestone_close_claim_without_patch(text, &summaries).is_some());
+        // In the chain, #4 fires first because it's evaluated before #4b.
+        // After #4's retry, if the agent adds update_task_status but still
+        // omits the PATCH, #4b fires on the next EndTurn (see next test).
+    }
+
+    #[test]
+    fn test_milestone_close_fires_after_completion_claim_satisfied() {
+        // Same text, but update_task_status IS in tools_called and
+        // completion_claim_retry_done = true. The completion-claim guard
+        // (#4) would NOT fire because its inner condition checks
+        // `!tools_called.contains("update_task_status")`. The milestone-
+        // close guard (#4b) fires because no PATCH call exists.
+        let text = "Milestone#17 completed and closed";
+        let summaries: Vec<ToolCallSummary> = vec![
+            // Agent called update_task_status (satisfies guard #4)
+            ToolCallSummary {
+                step: 1,
+                name: "update_task_status".to_string(),
+                input_summary: r#"{"task_id":"abc","status":"completed"}"#.to_string(),
+                output_summary: String::new(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+
+        // Completion-claim: text matches, but in the real chain the guard
+        // would skip because tools_called contains "update_task_status".
+        // The detector itself only checks text — the guard's inner condition
+        // does the tools_called check. So completion_claim detects the text:
+        assert!(detect_completion_claim(text).is_some());
+
+        // Milestone-close: still fires because no PATCH call in summaries.
+        assert!(detect_milestone_close_claim_without_patch(text, &summaries).is_some());
+    }
+
+    #[test]
+    fn test_detect_milestone_close_claim_close_before_milestone_no_match() {
+        // "close" appearing BEFORE "milestone" does not trigger (regex requires
+        // milestone first).
+        let summaries = vec![];
+        assert!(
+            detect_milestone_close_claim_without_patch(
+                "Next I will close the milestone on GitHub",
+                &summaries,
+            )
+            .is_none()
         );
     }
 

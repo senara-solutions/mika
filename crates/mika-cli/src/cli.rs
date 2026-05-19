@@ -77,6 +77,8 @@ pub enum Commands {
     Kg(KgArgs),
     /// Show resolved log file paths for an agent
     Logs(LogsArgs),
+    /// Send an operator notification (writes to notifications session, optionally to Telegram)
+    Notify(NotifyArgs),
     /// Git credential helper (used by git, not directly by users)
     #[command(name = "credential-helper")]
     CredentialHelper(CredentialHelperArgs),
@@ -108,6 +110,7 @@ impl Commands {
             | Commands::Dashboard(_)
             | Commands::Token(_)
             | Commands::Webhook(_)
+            | Commands::Notify(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -136,6 +139,7 @@ impl Commands {
             | Commands::Webhook(_)
             | Commands::Kg(_)
             | Commands::Logs(_)
+            | Commands::Notify(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -787,6 +791,41 @@ pub struct LogsArgs {
     /// Output format: text (default) or json
     #[arg(long, value_enum, default_value = "text")]
     pub format: OutputFormat,
+}
+
+#[derive(clap::Args)]
+pub struct NotifyArgs {
+    /// Notification message text
+    #[arg(long)]
+    pub text: String,
+
+    /// Delivery channel: cli (default, writes to DB only) or telegram (also sends via gateway)
+    #[arg(long, value_enum, default_value = "cli")]
+    pub channel: NotifyChannel,
+
+    /// Severity level for the notification
+    #[arg(long, value_enum, default_value = "info")]
+    pub severity: NotifySeverity,
+}
+
+#[derive(Clone, Default, ValueEnum)]
+pub enum NotifyChannel {
+    /// Write to notifications session only
+    #[default]
+    Cli,
+    /// Write to notifications session and send via Telegram gateway
+    Telegram,
+}
+
+#[derive(Clone, Default, ValueEnum)]
+pub enum NotifySeverity {
+    /// Informational notification
+    #[default]
+    Info,
+    /// Warning — operator attention recommended
+    Warn,
+    /// Escalation — operator action required
+    Escalate,
 }
 
 #[derive(clap::Args)]

@@ -19,6 +19,92 @@ paths:
       responses:
         '200':
           description: Process is alive
+  /orchestrator/inbox/{orchestrator_id}/message:
+    post:
+      tags:
+      - orchestrator_inbox
+      summary: '`POST /orchestrator/inbox/{orchestrator_id}/message`.'
+      description: |-
+        Bearer auth applied by `require_bearer_token` middleware. 256 KB body limit
+        applied at the route layer.
+      operationId: handle_post_message
+      parameters:
+      - name: orchestrator_id
+        in: path
+        description: Orchestrator session id, 1-128 chars [A-Za-z0-9_-]
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostMessagePayload'
+        required: true
+      responses:
+        '201':
+          description: Message persisted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostMessageResponse'
+        '400':
+          description: Invalid orchestrator_id, malformed body, or unknown kind
+        '401':
+          description: Missing or invalid Bearer token
+        '404':
+          description: Endpoint disabled (MIKA_ORCHESTRATOR_INBOX_ENABLED unset or 0)
+        '413':
+          description: Body exceeds 256KB
+        '500':
+          description: Database write failed
+      security:
+      - bearer: []
+  /orchestrator/inbox/{orchestrator_id}/stream:
+    get:
+      tags:
+      - orchestrator_inbox
+      summary: '`GET /orchestrator/inbox/{orchestrator_id}/stream`.'
+      description: |-
+        Returns `text/event-stream`. Each event:
+        ```text
+        id: <bigserial>
+        event: message
+        data: {"id":<n>,"orchestrator_id":"...","spawn_id":"...","kind":"...","body":{...},"created_at":"..."}
+        ```
+
+        Replay-from-cursor: client sends `Last-Event-Id: <last-seen-id>` and the
+        server emits all rows with `id > last-seen-id`. After replay, polls every
+        `ORCHESTRATOR_INBOX_POLL_INTERVAL` for new rows. `KeepAlive` emits a comment
+        ping every `ORCHESTRATOR_INBOX_KEEPALIVE_INTERVAL`.
+      operationId: handle_stream
+      parameters:
+      - name: orchestrator_id
+        in: path
+        description: Orchestrator session id, 1-128 chars [A-Za-z0-9_-]
+        required: true
+        schema:
+          type: string
+      - name: last-event-id
+        in: header
+        description: Resume cursor — server emits rows with id > this value
+        required: false
+        schema:
+          type:
+          - integer
+          - 'null'
+          format: int64
+      responses:
+        '200':
+          description: text/event-stream with replay + live tail
+        '400':
+          description: Invalid orchestrator_id
+        '401':
+          description: Missing or invalid Bearer token
+        '404':
+          description: Endpoint disabled (MIKA_ORCHESTRATOR_INBOX_ENABLED unset or 0)
+      security:
+      - bearer: []
   /readyz:
     get:
       tags:
@@ -126,6 +212,36 @@ components:
           type: integer
           format: int32
           minimum: 0
+    PostMessagePayload:
+      type: object
+      description: Body of `POST /orchestrator/inbox/{orchestrator_id}/message`.
+      required:
+      - kind
+      - body
+      properties:
+        body:
+          description: |-
+            Free-form JSON body. For `handoff`, mirrors the mika-platform#100
+            filesystem-inbox entry shape.
+        kind:
+          type: string
+          description: 'Message kind: `handoff`, `update`, or `ack`.'
+          example: handoff
+        spawn_id:
+          type:
+          - string
+          - 'null'
+          description: Spawn correlation id (null for orchestrator-originated messages — reserved for v2+).
+    PostMessageResponse:
+      type: object
+      description: 'Response from POST: persisted row id (monotonic, used as SSE cursor).'
+      required:
+      - id
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 42
     ReplyToMessage:
       type: object
       description: |-

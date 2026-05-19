@@ -640,6 +640,7 @@ variables are required:
 | `MIKA_AGENT_BASE_URL` | No | Override agent container URL for local E2E testing |
 | `MIKA_AGENTS_NAMESPACE` | No | K8s namespace where agent pods run (default: `mika-agents`). Used for FQDN construction in cross-namespace DNS resolution. |
 | `MIKA_GATEWAY_LOG_FILE` | No | Optional log file path |
+| `MIKA_ORCHESTRATOR_INBOX_ENABLED` | No | Enable orchestrator inbox v2 endpoints (mika#1189). `1`/`true` enables `/orchestrator/inbox/{id}/message` (POST) and `/orchestrator/inbox/{id}/stream` (SSE) under bearer auth, and spawns the hourly retention task. Unset / `0` / `2` → endpoints return 404 and retention task is not spawned. Dual-write with mika-platform#100 filesystem inbox during migration; `2` (gateway-only cutover) is reserved for a future ticket. |
 
 Both `MIKA_INTERNAL_TOKEN` and `MIKA_TELEGRAM_WEBHOOK_SECRET` must be exactly 64
 hexadecimal characters (32 bytes hex-encoded). Generate with `openssl rand -hex 32`.

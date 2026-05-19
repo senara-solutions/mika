@@ -121,6 +121,7 @@ allowlist = [\n\
   \"self-dev-webhook-ci\",\n\
   \"self-dev-webhook-ready-label\",\n\
   \"dev-pilot\",\n\
+  \"dev-groom\",\n\
   \"build-mika\",\n\
   \"deploy-mika\",\n\
   \"permission-policy\",\n\
@@ -1395,6 +1396,25 @@ mod tests {
     }
 
     #[test]
+    fn test_mika_dev_identity_allowlist_contains_dev_groom() {
+        // mika#1173: dev-groom owns its own tool (run_claude_pilot_groom) after the
+        // structural revert from prompt-only design. Identity allowlist must include
+        // dev-groom or the new tool will be denied at skill-registry assembly time
+        // (Phase -1 apply_identity_allowlist), and mika-dev will be unable to
+        // dispatch grooming sessions.
+        let identity: crate::prompt::Identity =
+            toml::from_str(MIKA_DEV_IDENTITY).expect("MIKA_DEV_IDENTITY must be valid TOML");
+        let allowlist = identity
+            .skills
+            .allowlist
+            .expect("mika-dev must have allowlist");
+        assert!(
+            allowlist.contains(&"dev-groom".to_string()),
+            "MIKA_DEV_IDENTITY allowlist must contain 'dev-groom' (mika#1173); got {allowlist:?}"
+        );
+    }
+
+    #[test]
     fn test_relay_allowlist_contains_only_permission_policy() {
         // Verify mika-relay's identity has exactly permission-policy in its allowlist.
         let identity: crate::prompt::Identity =
@@ -1463,6 +1483,7 @@ mod tests {
             "self-dev-webhook-ci",
             "self-dev-webhook-ready-label",
             "dev-pilot",
+            "dev-groom",
             "permission-policy",
             "agents-teams",
             "address-pr-comments",
@@ -1691,8 +1712,8 @@ mod tests {
             .expect("mika-dev must have allowlist");
         assert_eq!(
             allowlist.len(),
-            25,
-            "mika-dev allowlist should have 25 skills"
+            26,
+            "mika-dev allowlist should have 26 skills (dev-groom added mika#1173)"
         );
     }
 

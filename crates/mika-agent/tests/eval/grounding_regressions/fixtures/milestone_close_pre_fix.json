@@ -1,0 +1,8 @@
+{
+  "description": "Pre-fix milestone#17 response shape: agent claims milestone is closed without ever calling run_gh to PATCH the GitHub milestone API. This is the exact failure class from 2026-04-24 where local task state was updated but GitHub was left open.",
+  "assistant_text": "Milestone#17 closed, tasks reconciled, memory updated. All children completed successfully.\n\n✅ Completed: 5 | ❌ Failed: 0 | ⏸️ Blocked: 0\nTotal cost: $2.34 | Total turns: 47\nBuild + deploy: done.",
+  "tools_called": ["list_tasks", "update_task_status", "store_fact"],
+  "missing_tool": "run_gh with PATCH /repos/.../milestones/17",
+  "reference_issue": "mika#797",
+  "reference_incident": "milestone#17, 2026-04-24"
+}
