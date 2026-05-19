@@ -5,7 +5,7 @@ tags: [skills, bundled-skills, deletion, refactoring]
 date: 2026-03-14
 severity: low
 component: mika-agent
-related_issues: ["#154", "#598"]
+related_issues: ["#154", "#598", "#1213"]
 ---
 
 # Removing a Bundled Skill
@@ -44,14 +44,14 @@ No Rust-side registration changes are required — the `build.rs` directory walk
 
 - **Runtime discovery code:** `scan_skills_dir` is filesystem-driven, not registry-driven. No changes needed.
 - **`is_bundled_skill()` function:** Derives from both sources dynamically — removing the entry (legacy) or deleting the directory (directory-sourced) is sufficient.
-- **Seed/cleanup logic:** `seed_bundled_skills` only writes, never prunes. No changes needed.
+- **Library cleanup:** `seed_bundled_skill_library()` is sync-shaped (mika#1213) — after extraction, the library at `~/.mika/skills/` contains exactly the manifest set. Orphan directories for removed skills are automatically pruned on the next restart. Per-agent symlinks pointing at the removed library entry become dangling and are cleaned up by `materialize_agent_skill_links()`.
 - **Trust-critical classification:** `TRUST_CRITICAL_SKILLS` is hardcoded regardless of source — update it only if the removed skill was trust-critical.
 
 ## Orphaned directories on existing installs
 
-After removal, existing installs retain `~/.mika/skills/<name>/` on disk. The seeder won't touch it (no longer in `BUNDLED_SKILLS`), and `scan_skills_dir` will pick it up as a custom skill. This is harmless for non-functional skills. Users can clean up with `mika skills uninstall <name>` or `rm -rf ~/.mika/skills/<name>/`.
+After mika#1213, **no manual cleanup is needed.** The library sync is sync-shaped — orphan skill directories in `~/.mika/skills/` are automatically removed on the next `make deploy` / restart. Per-agent symlinks that pointed at the removed skill become dangling and are cleaned up by the symlink materialization pass.
 
-Document this migration step in the PR description per the pre-1.0 breaking changes policy.
+For skills added to `KNOWN_REMOVED_BUNDLED_SKILLS` (e.g., renames), the prune pass runs before library sync and handles the cleanup explicitly.
 
 ## Reference
 

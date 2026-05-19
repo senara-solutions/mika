@@ -18,6 +18,15 @@ pub fn container_db_path(home_dir: &Path) -> PathBuf {
     home_dir.join("data").join("mika.db")
 }
 
+/// Path to the canonical bundled-skill library: `{home_dir}/skills/`.
+///
+/// All bundled skills are extracted to this single shared location at agent
+/// startup; per-agent `{home_dir}/agents/<name>/skills/<skill>` entries are
+/// symlinks into this library. See `bundled_skills::seed_bundled_skill_library`.
+pub fn library_skills_dir(home_dir: &Path) -> PathBuf {
+    home_dir.join("skills")
+}
+
 /// Check if Mika has been initialized (container DB or agents exist).
 pub fn is_initialized(home_dir: &Path) -> bool {
     // Container DB exists (normal + legacy layout)

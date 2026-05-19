@@ -434,16 +434,25 @@ pub enum SkillsCommand {
         /// Skill name
         name: String,
     },
-    /// Install a skill from a Git repository or local path
+    /// Install a skill from a Git repository, local path, or the bundled-skill library.
     Install {
-        /// Git URL, GitHub shorthand (user/repo), or local path
+        /// Git URL, GitHub shorthand (user/repo), local path, or — with `--copy` —
+        /// a bundled skill name from the canonical library at `~/.mika/skills/`.
         source: String,
-        /// Install under a different name (alias)
+        /// Install under a different name (alias). Ignored when `--copy` is set.
         #[arg(long)]
         name: Option<String>,
-        /// Create symlink instead of copy (local sources only)
-        #[arg(long)]
+        /// Create symlink instead of copy (local sources only). Mutually exclusive
+        /// with `--copy`.
+        #[arg(long, conflicts_with = "copy")]
         link: bool,
+        /// Materialize a real per-agent directory copy of a bundled skill from
+        /// the library (mika#1213). The default install for bundled skills is
+        /// a symlink into `~/.mika/skills/<skill>`; `--copy` opts out so the
+        /// operator can hot-patch the deployed skill without bumping the
+        /// binary. Library sync will not touch `--copy`-managed directories.
+        #[arg(long)]
+        copy: bool,
     },
     /// Uninstall a marketplace-installed skill
     Uninstall {

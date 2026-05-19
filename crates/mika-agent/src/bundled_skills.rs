@@ -1,11 +1,35 @@
-//! Compile-time embedded skill templates, seeded into agent skill directories on startup.
+//! Compile-time embedded skill templates, seeded into a canonical runtime
+//! library on startup with per-agent symlinks materialized per allowlist.
 //!
 //! Each skill is a set of files (skill.toml, tools.json, optional system_prompt.md,
-//! optional handler scripts) embedded via `include_str!`. On startup, these are
-//! written (or updated) to `{agent_home}/skills/{skill_name}/`.
+//! optional handler scripts) embedded via `include_str!`. On startup,
+//! [`seed_bundled_skill_library`] extracts them to the canonical library at
+//! `{global_home}/skills/<skill>/` (sync-shaped, hash-gated), and
+//! [`materialize_agent_skill_links`] creates per-agent symlinks into the library
+//! under `{global_home}/agents/<name>/skills/<skill>` for each allowlisted bundled
+//! skill. Non-bundled (marketplace/custom) skills under the per-agent dir are
+//! never touched.
+//!
+//! The `--copy` opt-out (see [`copy_bundled_skill_to_agent_dir`]) writes a real
+//! directory copy with a `.copy-managed` marker so library sync leaves it alone —
+//! the operator who used `--copy` owns that lifecycle (mika#1213).
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use tracing::{debug, info, warn};
+
+/// Marker file written into per-agent skill directories materialized by
+/// `mika skills install <skill> --copy --agent <name>`. Library sync sees
+/// the marker and refuses to replace the directory with a symlink; library
+/// sync also refuses to remove the directory when the skill drops out of
+/// the agent's allowlist. The operator owns the lifecycle of `--copy` dirs.
+const COPY_MARKER_FILE: &str = ".copy-managed";
+
+/// Manifest-hash record written into the library root. Gates re-extraction —
+/// if the binary's manifest hash equals the on-disk value, the library is
+/// already in sync and extraction is skipped (idempotent across restarts).
+const MANIFEST_HASH_FILE: &str = ".manifest-hash";
 
 /// A single file within a bundled skill.
 struct SkillFile {
@@ -341,32 +365,77 @@ pub(crate) fn prune_known_removed_bundled_skills(skills_dir: &Path) -> usize {
     pruned
 }
 
-/// Seed bundled skills into the given skills directory.
-///
-/// Always writes bundled skill files, updating existing installs to match the
-/// current templates. This ensures template changes (e.g. removing a tool)
-/// propagate to existing installs. User-created skills (non-bundled) are never
-/// touched. Extra files in bundled skill directories that aren't part of the
-/// bundle are left in place.
-///
-/// On first-time creation failure, the partially created directory is removed.
-///
-/// **Invariant:** Marketplace skills can never have the same name as a bundled
-/// skill. The `mika skills install` command refuses installation when a name
-/// collision with a bundled skill is detected. Therefore this function will
-/// never overwrite a marketplace-installed skill.
-pub fn seed_bundled_skills(skills_dir: &Path) {
-    // Support directories are also seeded unconditionally from startup.rs
-    // (before the disabled guard). This call ensures seed_bundled_skills()
-    // is self-contained when called directly (e.g., by create_agent tool
-    // or tests). The second write on the normal startup path is idempotent.
-    seed_support_dirs(skills_dir);
+/// Compute the binary's bundled-skill manifest hash over the names and
+/// per-skill content hashes in `all_bundled_skills()`. The order is fixed by
+/// the static merge in [`all_bundled_skills`], so the result is deterministic
+/// across runs of the same binary. A different binary (added skill, removed
+/// skill, edited content) produces a different value, which triggers
+/// re-extraction in [`seed_bundled_skill_library`].
+fn compute_manifest_hash() -> String {
+    let mut hasher = DefaultHasher::new();
+    for skill in all_bundled_skills() {
+        skill.name.hash(&mut hasher);
+        skill.content_hash.hash(&mut hasher);
+        // Hash file paths too so legacy skills (empty content_hash) still
+        // contribute structure — otherwise adding a file to a legacy skill
+        // would not bump the hash.
+        for file in skill.files {
+            file.path.hash(&mut hasher);
+            file.executable.hash(&mut hasher);
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
 
-    // Prune known-removed orphans BEFORE the write loop. Order matters:
-    // if a future PR ever reuses a removed name, we want the prune to
-    // happen first so the subsequent write_skill is a clean create rather
-    // than an update over stale content.
-    let pruned = prune_known_removed_bundled_skills(skills_dir);
+/// Seed the canonical bundled-skill library at `library_dir`.
+///
+/// Sync-shape (mika#1213): after this returns, `library_dir` contains exactly
+/// the set of skill directories in the current binary's bundled manifest set
+/// — extracts new/changed skills, removes orphan directories for skills no
+/// longer in the manifest set.
+///
+/// Hash-gated: when the on-disk `.manifest-hash` matches the binary's manifest
+/// hash, no extraction work runs (idempotent across restarts). The hash gate
+/// is skipped if the library directory is missing or empty, so a fresh install
+/// always extracts.
+///
+/// Support directories (`_shared/`) are seeded alongside skills — same library
+/// shape; they back the dispatch pipeline.
+///
+/// User-created skills (non-bundled) are never written to the library —
+/// marketplace/custom skills live under per-agent skill dirs, not here.
+pub fn seed_bundled_skill_library(library_dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(library_dir) {
+        warn!(
+            library = %library_dir.display(),
+            error = %e,
+            "failed to create bundled-skill library directory; aborting seed"
+        );
+        return;
+    }
+
+    let target_hash = compute_manifest_hash();
+    let hash_path = library_dir.join(MANIFEST_HASH_FILE);
+    let on_disk_hash = std::fs::read_to_string(&hash_path).ok();
+    if let Some(prev) = on_disk_hash.as_deref()
+        && prev.trim() == target_hash
+        && library_dir.join(MANIFEST_HASH_FILE).exists()
+    {
+        debug!(
+            library = %library_dir.display(),
+            hash = %target_hash,
+            "bundled-skill library is in sync with binary manifest; skipping extraction"
+        );
+        return;
+    }
+
+    // Support directories first — dispatch plumbing needed by sibling skills.
+    seed_support_dirs(library_dir);
+
+    // Prune known-removed orphans before sync-shape pruning so a future PR
+    // that reuses a removed name lands as a clean create. Sync-shape prune
+    // below covers any other orphans.
+    let pruned = prune_known_removed_bundled_skills(library_dir);
     if pruned > 0 {
         info!(
             count = pruned,
@@ -374,8 +443,9 @@ pub fn seed_bundled_skills(skills_dir: &Path) {
         );
     }
 
+    let mut wrote = 0usize;
     for skill in all_bundled_skills() {
-        let skill_dir = skills_dir.join(skill.name);
+        let skill_dir = library_dir.join(skill.name);
         let is_update = skill_dir.exists();
 
         if let Err(e) = write_skill(&skill_dir, skill) {
@@ -383,12 +453,447 @@ pub fn seed_bundled_skills(skills_dir: &Path) {
             if !is_update {
                 let _ = std::fs::remove_dir_all(&skill_dir);
             }
-        } else if is_update {
-            debug!(skill = skill.name, "updated bundled skill");
         } else {
-            info!(skill = skill.name, "seeded bundled skill");
+            wrote += 1;
+            if is_update {
+                debug!(skill = skill.name, "updated bundled skill");
+            } else {
+                info!(skill = skill.name, "seeded bundled skill");
+            }
         }
     }
+
+    // Sync-shape: remove any skill directory in the library that isn't in
+    // the current manifest set. Symlinks, support dirs (`_`-prefixed),
+    // dotfiles, and the manifest-hash file itself are preserved.
+    let orphans = prune_library_orphans(library_dir);
+    if orphans > 0 {
+        info!(
+            count = orphans,
+            "pruned orphan directories from bundled-skill library"
+        );
+    }
+
+    // Record the new manifest hash last so a partial extraction failure
+    // (some skill failed to write) does not mask a stale on-disk state on
+    // the next restart — the gate will re-run.
+    if wrote > 0
+        && let Err(e) = std::fs::write(&hash_path, &target_hash)
+    {
+        warn!(
+            path = %hash_path.display(),
+            error = %e,
+            "failed to write bundled-skill manifest hash record"
+        );
+    }
+}
+
+/// Remove directories in `library_dir` whose names are not in the current
+/// bundled manifest set. Preserves symlinks, `_`-prefixed support dirs,
+/// `.`-prefixed dotfiles (incl. the manifest-hash record), and any
+/// non-directory entries.
+///
+/// Returns the number of directories actually removed.
+fn prune_library_orphans(library_dir: &Path) -> usize {
+    let entries = match std::fs::read_dir(library_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "failed to read library_dir for orphan prune");
+            return 0;
+        }
+    };
+
+    let manifest_names: Vec<&'static str> = all_bundled_skills().iter().map(|s| s.name).collect();
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        // Never follow / remove symlinks; never touch support or dot dirs.
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if name.starts_with('_') || name.starts_with('.') {
+            continue;
+        }
+
+        let in_manifest = manifest_names.iter().any(|m| m.eq_ignore_ascii_case(name));
+        if in_manifest {
+            continue;
+        }
+
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                info!(
+                    skill = name,
+                    "removed orphan bundled-skill library directory (sync-shape)"
+                );
+                removed += 1;
+            }
+            Err(e) => {
+                warn!(
+                    skill = name,
+                    error = %e,
+                    "failed to remove orphan library directory"
+                );
+            }
+        }
+    }
+    removed
+}
+
+/// Materialize per-agent symlinks under `agent_skills_dir` for each
+/// allowlisted bundled skill (`<agent_skills_dir>/<skill>` →
+/// `<library_dir>/<skill>`). Replaces legacy per-agent copies with symlinks.
+///
+/// - When `allowlist` is `Some` and non-empty, only the listed skills are
+///   materialized; symlinks for bundled skills NOT in the list are removed.
+/// - When `allowlist` is `None` or empty, every bundled skill from the
+///   binary's manifest set is materialized (matches the historical "all
+///   bundled skills enabled" default for user-defined agents).
+/// - Non-bundled (marketplace/custom) directories under `agent_skills_dir`
+///   are never touched.
+/// - `--copy`-managed directories (those containing a `.copy-managed`
+///   marker file) are never touched — the operator owns their lifecycle.
+/// - `.disabled` marker files alongside skill dirs are preserved.
+///
+/// Idempotent: re-running over an already-materialized agent is a no-op.
+pub fn materialize_agent_skill_links(
+    library_dir: &Path,
+    agent_skills_dir: &Path,
+    allowlist: Option<&[String]>,
+) {
+    if let Err(e) = std::fs::create_dir_all(agent_skills_dir) {
+        warn!(
+            agent_skills_dir = %agent_skills_dir.display(),
+            error = %e,
+            "failed to create agent skills directory"
+        );
+        return;
+    }
+
+    let bundled_names: Vec<&'static str> = all_bundled_skills().iter().map(|s| s.name).collect();
+
+    // Resolve the set of bundled skills this agent should have linked.
+    let allowed: Vec<&str> = match allowlist {
+        Some(list) if !list.is_empty() => bundled_names
+            .iter()
+            .copied()
+            .filter(|b| list.iter().any(|a| a.eq_ignore_ascii_case(b)))
+            .collect(),
+        _ => bundled_names.clone(),
+    };
+
+    // Pass 1: create / refresh symlinks for allowed bundled skills. Each
+    // entry under agent_skills_dir/<skill> ends up as a symlink into the
+    // library, replacing legacy copies. --copy-managed dirs are skipped.
+    for skill_name in &allowed {
+        let target = library_dir.join(skill_name);
+        let link = agent_skills_dir.join(skill_name);
+
+        if !target.exists() {
+            // Library not seeded yet (or skill missing). Skip rather than
+            // dangle — the next restart's library seed pass will create it.
+            warn!(
+                skill = skill_name,
+                library = %target.display(),
+                "library skill missing; skipping symlink creation"
+            );
+            continue;
+        }
+
+        if is_copy_managed(&link) {
+            debug!(
+                skill = skill_name,
+                "agent skill dir is --copy-managed; skipping symlink"
+            );
+            continue;
+        }
+
+        if symlink_points_to(&link, &target) {
+            // Already correctly linked.
+            continue;
+        }
+
+        // Replace existing entry (legacy copy or stale link) with a fresh
+        // symlink. remove handles both file and directory cases.
+        if let Err(e) = remove_link_or_dir(&link) {
+            warn!(
+                skill = skill_name,
+                error = %e,
+                "failed to remove existing agent skill entry before symlinking"
+            );
+            continue;
+        }
+
+        #[cfg(unix)]
+        if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
+            warn!(
+                skill = skill_name,
+                target = %target.display(),
+                link = %link.display(),
+                error = %e,
+                "failed to create per-agent skill symlink"
+            );
+            continue;
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-Unix hosts fall back to a directory copy. The runtime is
+            // Linux/macOS in production; this branch keeps the build green
+            // on Windows dev hosts.
+            if let Err(e) = copy_dir(&target, &link) {
+                warn!(
+                    skill = skill_name,
+                    error = %e,
+                    "failed to copy bundled skill into agent dir (non-unix host)"
+                );
+                continue;
+            }
+        }
+
+        info!(
+            skill = skill_name,
+            agent_dir = %link.display(),
+            "materialized per-agent bundled-skill symlink"
+        );
+    }
+
+    // Pass 2: remove symlinks for bundled skills no longer in the
+    // agent's allowlist. Only symlinks pointing at the library are removed
+    // — regular dirs (marketplace, --copy-managed) are untouched.
+    let allowed_set: std::collections::HashSet<&str> = allowed.iter().copied().collect();
+    for bundled_name in &bundled_names {
+        if allowed_set.contains(*bundled_name) {
+            continue;
+        }
+        let link = agent_skills_dir.join(bundled_name);
+        if !link.exists() && link.symlink_metadata().is_err() {
+            continue;
+        }
+        // Skip --copy-managed dirs even when de-allowlisted.
+        if is_copy_managed(&link) {
+            debug!(
+                skill = bundled_name,
+                "de-allowlisted bundled skill is --copy-managed; preserving"
+            );
+            continue;
+        }
+        let meta = match link.symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.file_type().is_symlink() {
+            // Regular dir — could be a legacy copy left behind from a
+            // version that copied without a marker. We do NOT remove
+            // these here because they predate the marker contract; leave
+            // them in place. The operator can clean up manually if needed.
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&link) {
+            warn!(
+                skill = bundled_name,
+                error = %e,
+                "failed to remove symlink for de-allowlisted bundled skill"
+            );
+            continue;
+        }
+        info!(
+            skill = bundled_name,
+            "removed per-agent symlink for de-allowlisted bundled skill"
+        );
+    }
+
+    // Pass 3: materialize support-dir symlinks (e.g. `_shared/`). Support
+    // dirs are dispatch plumbing — sibling skill handlers source them via
+    // relative path (`$(dirname "$0")/../../_shared/dispatch-lib.sh`), so
+    // they must be present under the agent's skills dir whether the agent
+    // is symlink-mode or `--copy`-mode. Always materialized; never gated
+    // by allowlist. See mika#923 + mika#1213.
+    for support in SUPPORT_DIRS {
+        let target = library_dir.join(support.name);
+        let link = agent_skills_dir.join(support.name);
+        if !target.exists() {
+            continue;
+        }
+        if symlink_points_to(&link, &target) {
+            continue;
+        }
+        if let Err(e) = remove_link_or_dir(&link) {
+            warn!(
+                support_dir = support.name,
+                error = %e,
+                "failed to remove existing agent support-dir entry before symlinking"
+            );
+            continue;
+        }
+        #[cfg(unix)]
+        if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
+            warn!(
+                support_dir = support.name,
+                target = %target.display(),
+                link = %link.display(),
+                error = %e,
+                "failed to create per-agent support-dir symlink"
+            );
+            continue;
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(e) = copy_dir(&target, &link) {
+                warn!(
+                    support_dir = support.name,
+                    error = %e,
+                    "failed to copy support dir into agent dir (non-unix host)"
+                );
+                continue;
+            }
+        }
+        info!(
+            support_dir = support.name,
+            agent_dir = %link.display(),
+            "materialized per-agent support-dir symlink"
+        );
+    }
+}
+
+/// Materialize a `--copy` opt-out: copy a bundled skill from the library to
+/// the agent's skill dir as a real directory and write a `.copy-managed`
+/// marker. Library sync ([`materialize_agent_skill_links`]) leaves
+/// `--copy`-managed dirs alone — the operator owns their lifecycle.
+///
+/// Returns an error if `skill_name` is not in the binary's bundled manifest
+/// set, or if the library entry is missing on disk (e.g., the library has
+/// not been seeded yet).
+pub fn copy_bundled_skill_to_agent_dir(
+    library_dir: &Path,
+    agent_skills_dir: &Path,
+    skill_name: &str,
+) -> std::io::Result<()> {
+    if !is_bundled_skill(skill_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{skill_name}' is not a bundled skill"),
+        ));
+    }
+    let src = library_dir.join(skill_name);
+    if !src.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "bundled-skill library entry missing at {}; run a deploy / agent restart first",
+                src.display()
+            ),
+        ));
+    }
+    std::fs::create_dir_all(agent_skills_dir)?;
+    let dst = agent_skills_dir.join(skill_name);
+
+    // Replace whatever is currently there — symlink, legacy copy, or empty.
+    remove_link_or_dir(&dst)?;
+    copy_dir(&src, &dst)?;
+    std::fs::write(dst.join(COPY_MARKER_FILE), b"copy-managed\n")?;
+    Ok(())
+}
+
+/// True iff `path` is a directory containing the `.copy-managed` marker.
+fn is_copy_managed(path: &Path) -> bool {
+    let meta = match path.symlink_metadata() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if meta.file_type().is_symlink() {
+        return false;
+    }
+    if !meta.is_dir() {
+        return false;
+    }
+    path.join(COPY_MARKER_FILE).is_file()
+}
+
+/// True iff `link` is a symlink whose target resolves to the same path as
+/// `target` (canonicalized). False on read errors.
+fn symlink_points_to(link: &Path, target: &Path) -> bool {
+    let meta = match link.symlink_metadata() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let resolved = match std::fs::read_link(link) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    // Compare absolute paths when possible — read_link returns whatever the
+    // symlink stores, which is absolute in our seed path but resilient to
+    // relative-target forms a future tool might write.
+    let resolved_abs = if resolved.is_absolute() {
+        resolved
+    } else {
+        link.parent().unwrap_or(Path::new("")).join(resolved)
+    };
+    let canon_resolved = std::fs::canonicalize(&resolved_abs).unwrap_or(resolved_abs);
+    let canon_target = std::fs::canonicalize(target).unwrap_or(target.to_path_buf());
+    canon_resolved == canon_target
+}
+
+/// Remove `path` whether it is a file, symlink, or directory. No-op when
+/// the path does not exist.
+fn remove_link_or_dir(path: &Path) -> std::io::Result<()> {
+    let meta = match path.symlink_metadata() {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::remove_dir_all(path)
+    }
+}
+
+/// Recursively copy `src` to `dst`. Used by the `--copy` opt-out and as a
+/// non-unix fallback for [`materialize_agent_skill_links`].
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&from)?.permissions().mode();
+                std::fs::set_permissions(&to, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Legacy compatibility wrapper for tests and out-of-tree callers that
+/// still treat a single directory as the canonical seed location.
+/// Equivalent to [`seed_bundled_skill_library`].
+pub fn seed_bundled_skills(skills_dir: &Path) {
+    seed_bundled_skill_library(skills_dir);
 }
 
 /// Write a set of files into the given directory.
@@ -599,18 +1104,42 @@ mod tests {
         let skills_dir = tmp.path();
 
         // Seed once
-        seed_bundled_skills(skills_dir);
+        seed_bundled_skill_library(skills_dir);
 
-        // Modify a bundled file
+        // Modify a bundled file in the library
         let marker = skills_dir.join("tmux").join("skill.toml");
         std::fs::write(&marker, "custom content").unwrap();
 
-        // Seed again — should overwrite with bundled content
-        seed_bundled_skills(skills_dir);
+        // Hash gate (mika#1213): re-seeding the same binary is a no-op —
+        // manual edits to the library are not overwritten until the
+        // binary's manifest hash changes. Simulate a binary update by
+        // invalidating the hash record before re-seeding.
+        let hash_path = skills_dir.join(MANIFEST_HASH_FILE);
+        std::fs::write(&hash_path, "deadbeef-stale-hash").unwrap();
+        seed_bundled_skill_library(skills_dir);
 
         let content = std::fs::read_to_string(&marker).unwrap();
         assert_ne!(content, "custom content", "bundled file should be updated");
         assert!(!content.is_empty(), "bundled file should have content");
+    }
+
+    #[test]
+    fn test_seed_is_hash_gated_idempotent() {
+        // Repeated seed calls on the same binary do no work after the
+        // first — the on-disk hash matches the binary's manifest hash.
+        let tmp = tempfile::tempdir().unwrap();
+        let library_dir = tmp.path();
+
+        seed_bundled_skill_library(library_dir);
+        let marker = library_dir.join("tmux").join("skill.toml");
+        // Mutate the file; re-seed must NOT overwrite (hash-gated).
+        std::fs::write(&marker, "user edit persists").unwrap();
+        seed_bundled_skill_library(library_dir);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "user edit persists",
+            "hash gate must skip re-extraction when binary hash matches on-disk record"
+        );
     }
 
     #[test]
@@ -1249,6 +1778,374 @@ mod tests {
                 "KNOWN_REMOVED_BUNDLED_SKILLS contains '{name}', which is also in the \
                  current bundle. Either remove it from KNOWN_REMOVED_BUNDLED_SKILLS \
                  (if you intend to re-bundle it), or rename the new bundled skill."
+            );
+        }
+    }
+
+    // --- mika#1213: library sync + per-agent symlink tests ---
+
+    /// AC1 — sync-shape: library contains exactly the manifest set after seed.
+    #[test]
+    fn library_sync_removes_orphans_outside_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path();
+
+        // Seed once so manifest skills + hash exist.
+        seed_bundled_skill_library(library);
+
+        // Plant an orphan bundled-style directory that is not in the manifest.
+        let orphan = library.join("ghost-skill");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("skill.toml"), "[skill]\nname = \"ghost-skill\"").unwrap();
+
+        // Invalidate hash so the next seed actually runs.
+        std::fs::write(library.join(MANIFEST_HASH_FILE), "stale").unwrap();
+        seed_bundled_skill_library(library);
+
+        assert!(
+            !orphan.exists(),
+            "sync-shape extraction must remove directories outside the manifest set"
+        );
+        // Manifest skills must still be present.
+        for skill in all_bundled_skills() {
+            assert!(
+                library.join(skill.name).is_dir(),
+                "manifest skill '{}' missing after sync",
+                skill.name
+            );
+        }
+    }
+
+    /// AC1 — sync-shape preserves support dirs and dotfiles.
+    #[test]
+    fn library_sync_preserves_support_and_dotfiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path();
+        seed_bundled_skill_library(library);
+
+        // _shared/ is a support dir, preserved across sync.
+        assert!(library.join("_shared").is_dir());
+        // .manifest-hash dotfile is preserved.
+        assert!(library.join(MANIFEST_HASH_FILE).is_file());
+
+        // Plant a dot-prefixed orphan and a _-prefixed orphan; sync must leave both.
+        std::fs::create_dir_all(library.join(".cache")).unwrap();
+        std::fs::create_dir_all(library.join("_extra")).unwrap();
+        std::fs::write(library.join(MANIFEST_HASH_FILE), "stale").unwrap();
+        seed_bundled_skill_library(library);
+
+        assert!(
+            library.join(".cache").is_dir(),
+            "dotfile dir must be preserved"
+        );
+        assert!(
+            library.join("_extra").is_dir(),
+            "_-prefixed dir must be preserved"
+        );
+    }
+
+    /// AC2 — symlinks created for allowlisted skills, removed when de-allowlisted.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_creates_symlinks_for_allowlist_and_removes_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        let allowlist = vec!["tmux".to_string(), "shell-exec".to_string()];
+        materialize_agent_skill_links(&library, &agent, Some(&allowlist));
+
+        // Allowlisted: symlinks present, pointing at library.
+        for name in &allowlist {
+            let link = agent.join(name);
+            assert!(
+                link.symlink_metadata().unwrap().file_type().is_symlink(),
+                "expected symlink at {}",
+                link.display()
+            );
+            let target = std::fs::read_link(&link).unwrap();
+            assert!(
+                target.ends_with(name),
+                "symlink target should end in '{name}', got {}",
+                target.display()
+            );
+        }
+        // Non-allowlisted bundled skill should NOT have an entry.
+        let other = agent.join("web-search");
+        assert!(!other.exists() && other.symlink_metadata().is_err());
+
+        // Tighten allowlist: drop tmux. Re-materialize — the tmux symlink
+        // must be removed.
+        let tighter = vec!["shell-exec".to_string()];
+        materialize_agent_skill_links(&library, &agent, Some(&tighter));
+        let tmux_link = agent.join("tmux");
+        assert!(
+            !tmux_link.exists() && tmux_link.symlink_metadata().is_err(),
+            "symlink for de-allowlisted skill must be removed"
+        );
+        // Remaining allowlisted skill still linked.
+        assert!(
+            agent
+                .join("shell-exec")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// AC2 — None allowlist materializes all bundled skills.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_with_none_allowlist_links_all_bundled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        materialize_agent_skill_links(&library, &agent, None);
+
+        for skill in all_bundled_skills() {
+            let link = agent.join(skill.name);
+            let meta = link.symlink_metadata().expect("link must exist");
+            assert!(
+                meta.file_type().is_symlink(),
+                "expected symlink for {}",
+                skill.name
+            );
+        }
+    }
+
+    /// AC3 — legacy per-agent COPY of a bundled skill is replaced with a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_replaces_legacy_copy_with_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        // Plant a legacy per-agent copy of `tmux` with non-bundled content.
+        let legacy = agent.join("tmux");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("skill.toml"), "stale copy content").unwrap();
+
+        materialize_agent_skill_links(&library, &agent, None);
+
+        let meta = legacy.symlink_metadata().unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "legacy copy must be replaced with a symlink"
+        );
+        // Reads through the symlink should now return library content.
+        let content = std::fs::read_to_string(legacy.join("skill.toml")).unwrap();
+        assert_ne!(
+            content, "stale copy content",
+            "symlink should resolve to library file, not the legacy copy"
+        );
+        assert!(!content.is_empty());
+    }
+
+    /// AC3 — non-bundled (marketplace) directories under the agent skills
+    /// dir must not be touched by the materialize pass.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_does_not_touch_non_bundled_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        // Marketplace-style skill: name not in bundled manifest.
+        let marketplace = agent.join("my-custom-skill");
+        std::fs::create_dir_all(&marketplace).unwrap();
+        std::fs::write(
+            marketplace.join("skill.toml"),
+            "[skill]\nname = \"my-custom-skill\"",
+        )
+        .unwrap();
+        std::fs::write(marketplace.join("data.txt"), "operator-owned content").unwrap();
+
+        materialize_agent_skill_links(&library, &agent, None);
+
+        assert!(marketplace.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(marketplace.join("data.txt")).unwrap(),
+            "operator-owned content",
+            "non-bundled dir must be preserved verbatim"
+        );
+    }
+
+    /// AC4 — `--copy` opt-out materializes a real directory and writes a
+    /// `.copy-managed` marker; library sync does not touch `--copy`'d dirs.
+    #[cfg(unix)]
+    #[test]
+    fn copy_opt_out_writes_marker_and_resists_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        copy_bundled_skill_to_agent_dir(&library, &agent, "tmux").unwrap();
+
+        let dst = agent.join("tmux");
+        let meta = dst.symlink_metadata().unwrap();
+        assert!(meta.is_dir(), "--copy must produce a real directory");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "--copy must not produce a symlink"
+        );
+        assert!(
+            dst.join(COPY_MARKER_FILE).is_file(),
+            ".copy-managed marker must be written"
+        );
+        // The original bundled file should be present in the copied dir.
+        assert!(dst.join("skill.toml").is_file());
+
+        // Now run a library-sync materialize pass — the dir must stay as a
+        // real directory; the marker must persist; content untouched.
+        std::fs::write(dst.join("hot-patch.md"), "operator hot-patch").unwrap();
+        materialize_agent_skill_links(&library, &agent, None);
+
+        let meta_after = dst.symlink_metadata().unwrap();
+        assert!(
+            !meta_after.file_type().is_symlink(),
+            "--copy-managed dir must NOT be replaced with a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("hot-patch.md")).unwrap(),
+            "operator hot-patch",
+            "operator hot-patch must survive a library sync pass"
+        );
+    }
+
+    /// AC4 — `--copy`-managed dir survives de-allowlisting.
+    #[cfg(unix)]
+    #[test]
+    fn copy_opt_out_survives_de_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        copy_bundled_skill_to_agent_dir(&library, &agent, "tmux").unwrap();
+
+        // Allowlist that excludes tmux — sync should NOT touch the
+        // --copy-managed directory.
+        let allowlist = vec!["shell-exec".to_string()];
+        materialize_agent_skill_links(&library, &agent, Some(&allowlist));
+
+        let dst = agent.join("tmux");
+        assert!(
+            dst.is_dir(),
+            "--copy-managed dir must persist after de-allowlisting"
+        );
+        assert!(dst.join(COPY_MARKER_FILE).is_file());
+    }
+
+    /// `--copy` rejects names that are not bundled skills.
+    #[test]
+    fn copy_opt_out_rejects_non_bundled_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        let err = copy_bundled_skill_to_agent_dir(&library, &agent, "not-a-bundled-skill")
+            .expect_err("must reject non-bundled name");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// Support-dir symlinks (`_shared/`) are materialized regardless of
+    /// allowlist — handlers source `../../_shared/dispatch-lib.sh` via
+    /// relative path, so the agent's skills dir must contain the link.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_creates_support_dir_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        // Tight allowlist that excludes every support-dir consumer. _shared
+        // must STILL be linked because it is dispatch plumbing, not a skill.
+        let allowlist = vec!["tmux".to_string()];
+        materialize_agent_skill_links(&library, &agent, Some(&allowlist));
+
+        for support in SUPPORT_DIRS {
+            let link = agent.join(support.name);
+            let meta = link
+                .symlink_metadata()
+                .unwrap_or_else(|e| panic!("missing support-dir link {}: {e}", support.name));
+            assert!(
+                meta.file_type().is_symlink(),
+                "support dir '{}' must be a symlink",
+                support.name
+            );
+            // Reads through the symlink must surface library content.
+            assert!(link.is_dir());
+        }
+    }
+
+    /// Support-dir symlinks survive an empty allowlist and a None allowlist.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_support_dirs_with_none_and_empty_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        for label in &["none", "empty"] {
+            let agent = tmp.path().join(format!("agent_{label}"));
+            let allowlist: Option<&[String]> = if *label == "none" { None } else { Some(&[]) };
+            materialize_agent_skill_links(&library, &agent, allowlist);
+
+            for support in SUPPORT_DIRS {
+                let link = agent.join(support.name);
+                assert!(
+                    link.symlink_metadata().unwrap().file_type().is_symlink(),
+                    "support dir '{}' must be linked for allowlist={label}",
+                    support.name
+                );
+            }
+        }
+    }
+
+    /// Materialize is idempotent — re-running over the same state is a no-op.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let agent = tmp.path().join("agent_skills");
+        std::fs::create_dir_all(&library).unwrap();
+        seed_bundled_skill_library(&library);
+
+        let allowlist = vec!["tmux".to_string(), "shell-exec".to_string()];
+        materialize_agent_skill_links(&library, &agent, Some(&allowlist));
+        let first_meta = agent.join("tmux").symlink_metadata().unwrap();
+
+        materialize_agent_skill_links(&library, &agent, Some(&allowlist));
+        let second_meta = agent.join("tmux").symlink_metadata().unwrap();
+        assert!(second_meta.file_type().is_symlink());
+        // Same inode (no recreate).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                first_meta.ino(),
+                second_meta.ino(),
+                "idempotent materialize must not recreate the symlink"
             );
         }
     }
