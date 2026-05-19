@@ -73,7 +73,7 @@ After M1's `create_task` call and `store_fact`, add:
 
 > **Memory (current_priorities):** After creating the milestone parent task:
 > ```
-> update_core_memory(section="current_priorities", action="rewrite",
+> update_core_memory(section="current_priorities", action="replace",
 >   content="Milestone <repo> milestone#<n> (<milestone_title>): in_progress. <one-line purpose from milestone description>. Issues (dependency order): #X, #Y, #Z.",
 >   reasoning="Milestone initialized — update current_priorities to reflect active work")
 > ```
@@ -92,7 +92,7 @@ After M5 step 5 (the existing `store_fact` call), before step 6 (Notify Vincent)
 
 > **Memory (current_priorities):** After recording milestone completion:
 > ```
-> update_core_memory(section="current_priorities", action="rewrite",
+> update_core_memory(section="current_priorities", action="replace",
 >   content="No active milestone. Last completed: <repo> milestone#<n> (<milestone_title>).",
 >   reasoning="Milestone completed — clear current_priorities to prevent stale prompt state")
 > ```
