@@ -540,6 +540,7 @@ async fn attempt_continuation_turn(
                     None,
                     latency_ms,
                     prompt_variant,
+                    Some(system_prompt_original_len as i64),
                 )
                 .await;
             }
@@ -575,6 +576,7 @@ async fn attempt_continuation_turn(
                     Some(&e.to_string()),
                     latency_ms,
                     prompt_variant,
+                    Some(system_prompt_original_len as i64),
                 )
                 .await;
             }
@@ -606,6 +608,7 @@ async fn attempt_continuation_turn(
                     )),
                     latency_ms,
                     prompt_variant,
+                    Some(system_prompt_original_len as i64),
                 )
                 .await;
             }
@@ -634,6 +637,7 @@ async fn save_continuation_llm_call(
     error: Option<&str>,
     latency_ms: u64,
     prompt_variant: Option<&str>,
+    system_prompt_bytes: Option<i64>,
 ) {
     let id = uuid::Uuid::new_v4().to_string();
     let (input, output, cache_read, cache_write) = match usage {
@@ -664,6 +668,7 @@ async fn save_continuation_llm_call(
             prompt_variant,
             None,
             None,
+            system_prompt_bytes,
         )
         .await
     {
@@ -981,6 +986,7 @@ async fn run_loop(
                             prompt_variant,
                             response_text.as_deref(),
                             reasoning_text.as_deref(),
+                            Some(system_prompt_len as i64),
                         )
                         .await
                     {
@@ -1007,6 +1013,7 @@ async fn run_loop(
                             prompt_variant,
                             None,
                             None,
+                            Some(system_prompt_len as i64),
                         )
                         .await
                     {
@@ -2287,7 +2294,7 @@ async fn run_agent_inner(
 
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
-    let (mut skill_tool_defs, prompt_variant) = inject_skills_and_resolve_tools(
+    let (mut skill_tool_defs, prompt_variant, per_skill_bytes) = inject_skills_and_resolve_tools(
         &matched_entries,
         tools,
         &mut system,
@@ -2295,6 +2302,15 @@ async fn run_agent_inner(
         model,
         &resolved_context,
         &ctx.identity.tools.disabled,
+    );
+    let _ = emit_system_prompt_assembled(
+        &system,
+        &per_skill_bytes,
+        &db.agent_id,
+        session_id,
+        trace_id,
+        "conversation",
+        None,
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
@@ -3422,7 +3438,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
     let provider = llm.provider_name();
     let model = llm.model_name();
     let no_context = HashMap::new();
-    let (skill_tool_defs, prompt_variant) = inject_skills_and_resolve_tools(
+    let (skill_tool_defs, prompt_variant, per_skill_bytes) = inject_skills_and_resolve_tools(
         &matched,
         tools,
         &mut system,
@@ -3494,6 +3510,24 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         .trace_id
         .clone()
         .unwrap_or_else(mika_common::trace::generate_trace_id);
+    let emit_trigger_label = match &params.trigger {
+        SilentTrigger::Heartbeat => "heartbeat",
+        SilentTrigger::Reflection => "reflection",
+        SilentTrigger::Callback { .. } => "callback",
+        SilentTrigger::SkillRun { .. } => "skill_run",
+        SilentTrigger::Reminder { .. } => "reminder",
+        SilentTrigger::PostCallbackAdvance { .. } => "post_callback_advance",
+        SilentTrigger::DeferredDispatch { .. } => "deferred_dispatch",
+    };
+    let _ = emit_system_prompt_assembled(
+        &system,
+        &per_skill_bytes,
+        db.agent_id(),
+        params.session_id,
+        &trace_id,
+        "silent",
+        Some(emit_trigger_label),
+    );
 
     // Resolve GitHub token: prefer GitHub App installation token, fall back to PAT.
     let resolved_github_token = if let Some(settings) = params.settings {
@@ -3919,7 +3953,7 @@ async fn run_team_agent_inner_impl(
 
     let provider = effective_llm.provider_name();
     let model = effective_llm.model_name();
-    let (mut skill_tool_defs, prompt_variant) = inject_skills_and_resolve_tools(
+    let (mut skill_tool_defs, prompt_variant, per_skill_bytes) = inject_skills_and_resolve_tools(
         &matched_entries,
         tools,
         &mut system,
@@ -3955,6 +3989,15 @@ async fn run_team_agent_inner_impl(
         .trace_id
         .clone()
         .unwrap_or_else(mika_common::trace::generate_trace_id);
+    let _ = emit_system_prompt_assembled(
+        &system,
+        &per_skill_bytes,
+        params.db.agent_id(),
+        params.session_id,
+        &trace_id,
+        "team",
+        None,
+    );
 
     let core_memory_edit_count = AtomicU32::new(0);
     let pr_review_posted = AtomicBool::new(false);
@@ -4627,7 +4670,11 @@ fn inject_skills_and_resolve_tools(
     model_name: &str,
     resolved_context: &HashMap<String, context::ContextBlock>,
     disabled_tools: &[String],
-) -> (Vec<mika_common::claude::ToolDefinition>, Option<String>) {
+) -> (
+    Vec<mika_common::claude::ToolDefinition>,
+    Option<String>,
+    HashMap<String, usize>,
+) {
     // Always include ALL builtin tools
     let mut tool_defs = tools.definitions().to_vec();
     // Apply per-agent visibility filter BEFORE skill tools are added — this
@@ -4638,6 +4685,8 @@ fn inject_skills_and_resolve_tools(
 
     // Collect variant descriptors per skill for observability (#481).
     let mut variant_map: HashMap<String, String> = HashMap::new();
+    // Per-skill prompt bytes for context-budget observability (mika#1217).
+    let mut per_skill_bytes: HashMap<String, usize> = HashMap::new();
 
     // Add skill prompt snippets and skill-defined tools from matched skills
     for entry in matched {
@@ -4662,6 +4711,7 @@ fn inject_skills_and_resolve_tools(
                 entry.manifest.skill.name.clone(),
                 resolved.variant_descriptor(),
             );
+            per_skill_bytes.insert(entry.manifest.skill.name.clone(), prompt.len());
             write!(
                 system,
                 "\n<context type=\"skill\" trust=\"local\">\n## {} Skill\n{}\n</context>\n",
@@ -4683,7 +4733,41 @@ fn inject_skills_and_resolve_tools(
         serde_json::to_string(&variant_map).ok()
     };
 
-    (tool_defs, prompt_variant)
+    (tool_defs, prompt_variant, per_skill_bytes)
+}
+
+/// Emit a structured `system_prompt_assembled` INFO log event with the
+/// assembled system prompt's byte count and per-skill prompt bytes
+/// (mika#1217). Returns `total_bytes` as `Some(i64)` for storage in
+/// `llm_calls.system_prompt_bytes`.
+fn emit_system_prompt_assembled(
+    system: &str,
+    per_skill_bytes: &HashMap<String, usize>,
+    agent_id: &str,
+    session_id: &str,
+    trace_id: &str,
+    mode: &str,
+    trigger: Option<&str>,
+) -> Option<i64> {
+    let total_bytes = system.len();
+    let total_chars = system.chars().count();
+    let active_skill_count = per_skill_bytes.len();
+    let per_skill_json = serde_json::to_string(per_skill_bytes).ok();
+    info!(
+        target: "mika::otel",
+        event = "system_prompt_assembled",
+        agent_id = %agent_id,
+        session_id = %session_id,
+        trace_id = %trace_id,
+        mode = %mode,
+        trigger = trigger.unwrap_or(""),
+        total_bytes = total_bytes,
+        total_chars = total_chars,
+        active_skill_count = active_skill_count,
+        per_skill_bytes = per_skill_json.as_deref().unwrap_or("{}"),
+        "system prompt assembled"
+    );
+    Some(total_bytes as i64)
 }
 
 /// Detect whether text contains XML-formatted tool call patterns.
@@ -5812,7 +5896,7 @@ mod tests {
 
         let no_ctx = HashMap::new();
         let no_disabled: Vec<String> = vec![];
-        let (defs, variant) = inject_skills_and_resolve_tools(
+        let (defs, variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -5869,7 +5953,7 @@ mod tests {
 
         let no_ctx = HashMap::new();
         let no_disabled: Vec<String> = vec![];
-        let (defs, _variant) = inject_skills_and_resolve_tools(
+        let (defs, _variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -5949,7 +6033,7 @@ mod tests {
         let mut system = "Base.".to_string();
 
         let no_ctx = HashMap::new();
-        let (_defs, variant) = inject_skills_and_resolve_tools(
+        let (_defs, variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -5976,7 +6060,7 @@ mod tests {
 
         // No model variant — should fall back to root
         let no_ctx = HashMap::new();
-        let (_defs, _variant) = inject_skills_and_resolve_tools(
+        let (_defs, _variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -5998,7 +6082,7 @@ mod tests {
         let mut system = "Base.".to_string();
 
         let no_ctx = HashMap::new();
-        let (_defs, variant) = inject_skills_and_resolve_tools(
+        let (_defs, variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -6026,7 +6110,7 @@ mod tests {
         let mut system = String::new();
 
         let no_ctx = HashMap::new();
-        let (_defs, variant) = inject_skills_and_resolve_tools(
+        let (_defs, variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -6061,7 +6145,7 @@ mod tests {
         let mut system = String::new();
 
         let no_ctx = HashMap::new();
-        let (_defs, variant) = inject_skills_and_resolve_tools(
+        let (_defs, variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -6088,7 +6172,7 @@ mod tests {
         let mut system = String::new();
 
         let no_ctx = HashMap::new();
-        let (_defs, _variant) = inject_skills_and_resolve_tools(
+        let (_defs, _variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -6115,7 +6199,7 @@ mod tests {
 
         // Model name contains a slash — sanitize_model_dir_name should match
         let no_ctx = HashMap::new();
-        let (_defs, variant) = inject_skills_and_resolve_tools(
+        let (_defs, variant, _) = inject_skills_and_resolve_tools(
             &matched,
             &tools,
             &mut system,
@@ -7640,6 +7724,93 @@ mod tests {
         assert!(
             resolve_skill_llm_override(&matched, None, &mock).is_none(),
             "dependency skills with DB override should still not impose [llm] override"
+        );
+    }
+
+    /// mika#1217 / mika#1011 — override-scope contract for SilentTrigger::Callback
+    /// and SilentTrigger::DeferredDispatch.
+    ///
+    /// Silent-mode trigger semantics for AlwaysOn + DB-sourced LLM overrides: the
+    /// matched-skill set returned by `callback_safe_skills()` is wrapped with
+    /// `MatchReason::AlwaysOn`. Under the mika#1011 carve-out, an AlwaysOn skill
+    /// with `from_db_override = true` MUST qualify for override resolution —
+    /// otherwise the autonomous-loop callback turn runs on the agent's base
+    /// model instead of the operator-set per-skill override (e.g., mika-dev
+    /// base = kimi-k2.5, self-dev override = sonnet-4-6).
+    ///
+    /// This test exercises both `SilentTrigger::Callback` and
+    /// `SilentTrigger::DeferredDispatch` shapes via the matched-skill construction
+    /// they share (`callback_safe_skills`). The carve-out fires identically.
+    ///
+    /// Note (mika#1217 F3): `run_silent_inner` does not currently invoke
+    /// `resolve_skill_llm_override` on the silent path. The carve-out shape is
+    /// correct at the function level (this test verifies that); the call-site
+    /// wiring is the residual gap. Tracked in the follow-up ticket cited in the
+    /// mika#1217 PR description.
+    #[test]
+    fn test_resolve_skill_llm_override_silent_callback_and_deferred_dispatch_carve_out() {
+        use mika_common::llm::mock::MockLlmProvider;
+        let mock = MockLlmProvider::builder()
+            .provider_name("moonshotai")
+            .model_name("kimi-k2.5")
+            .build();
+        let self_dev =
+            make_skill_entry_with_db_llm("self-dev", Some("anthropic"), Some("claude-sonnet-4-6"));
+
+        // Shape A — SilentTrigger::Callback: matched set wraps callback_safe_skills
+        // with MatchReason::AlwaysOn. The carve-out must qualify the entry.
+        let matched_callback = vec![MatchedSkill {
+            entry: &self_dev,
+            reason: MatchReason::AlwaysOn,
+        }];
+        let qualifies_callback = matched_callback.iter().any(|ms| match ms.reason {
+            MatchReason::Keyword => true,
+            MatchReason::AlwaysOn => ms.entry.manifest.llm.from_db_override,
+            MatchReason::Dependency => false,
+        });
+        assert!(
+            qualifies_callback,
+            "Callback turn: AlwaysOn skill with from_db_override=true must qualify for override"
+        );
+        // Resolution returns None because Settings is None (cannot construct provider),
+        // but the early-exit at overrides.is_empty() is NOT taken — proving the
+        // carve-out lets the entry through.
+        let _ = resolve_skill_llm_override(&matched_callback, None, &mock);
+
+        // Shape B — SilentTrigger::DeferredDispatch: identical matched-skill
+        // construction to Callback. Same carve-out behavior expected.
+        let matched_deferred = vec![MatchedSkill {
+            entry: &self_dev,
+            reason: MatchReason::AlwaysOn,
+        }];
+        let qualifies_deferred = matched_deferred.iter().any(|ms| match ms.reason {
+            MatchReason::Keyword => true,
+            MatchReason::AlwaysOn => ms.entry.manifest.llm.from_db_override,
+            MatchReason::Dependency => false,
+        });
+        assert!(
+            qualifies_deferred,
+            "DeferredDispatch turn: AlwaysOn skill with from_db_override=true must qualify for override"
+        );
+        let _ = resolve_skill_llm_override(&matched_deferred, None, &mock);
+
+        // Negative control — same skill without from_db_override (developer-time
+        // skill.toml [llm] source) must NOT qualify. #463 protection holds for
+        // both Callback and DeferredDispatch shapes.
+        let self_dev_dev_time =
+            make_skill_entry_with_llm("self-dev", Some("anthropic"), Some("claude-sonnet-4-6"));
+        let matched_dev_time = [MatchedSkill {
+            entry: &self_dev_dev_time,
+            reason: MatchReason::AlwaysOn,
+        }];
+        let qualifies_dev_time = matched_dev_time.iter().any(|ms| match ms.reason {
+            MatchReason::Keyword => true,
+            MatchReason::AlwaysOn => ms.entry.manifest.llm.from_db_override,
+            MatchReason::Dependency => false,
+        });
+        assert!(
+            !qualifies_dev_time,
+            "AlwaysOn skill without from_db_override (skill.toml [llm]) must NOT qualify (#463)"
         );
     }
 
