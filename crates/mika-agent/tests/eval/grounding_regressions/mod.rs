@@ -34,6 +34,7 @@ pub mod asserted_unavailability_elided_copula;
 pub mod asserted_unavailability_genuine;
 pub mod auto_merge_vs_merged;
 pub mod current_priorities_drift;
+pub mod engine_correction_rejection;
 pub mod fabricated_shell_errors;
 pub mod graphql_field_fabrication;
 pub mod kg_result_ignored;
