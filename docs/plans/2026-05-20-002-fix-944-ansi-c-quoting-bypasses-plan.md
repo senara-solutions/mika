@@ -41,6 +41,126 @@ review surfaced it (adversarial reviewer P1, confidence 0.88).
 - **AC2.** Negative fixture: `mika ask --agent mika-arch $'literal'` also rejected (the syntax is uniformly suspicious in dispatch context).
 - **AC3.** Positive sanity: plain `$` (e.g., `$HOME`) NOT rejected — only `$'` two-byte sequence triggers.
 
+## Phase 0 — Pin current state at base SHA `3a39bd31`
+
+Base SHA for all pins: `3a39bd31e01fa9ee881d20899ca4e4bd39e988d6` (worktree HEAD, branch `fix/944/server-ansi-c-quoting-xnn-bypasses-both`). All inserts described below are *relative to these pinned slices*; if rebase/sibling work shifts the line ranges, the slices remain the load-bearing anchor.
+
+### Pin 1 — Rust `contains_unquoted_metacharacter` docstring (`crates/mika-agent/src/server/permission_pre_classifier.rs:158-176`)
+
+```rust
+/// Check if a command contains shell-expansion metacharacters outside quoted regions.
+///
+/// Walks the command bytes left-to-right, tracking quote state (none / single / double).
+/// Returns `true` on first occurrence of `$(`, `` ` ``, `>(`, or `<(` while in no-quote
+/// state. The four characters cover bash command substitution (`$()`, backticks) and
+/// process substitution (`>()`, `<()`) — all four cause shell expansion that would
+/// execute arbitrary embedded commands.
+/// Per Decision 1 Option C (mika#938): metacharacters inside either single or double
+/// quoted regions are treated as literal (allowed).
+///
+/// Escape handling (mika#938 F1): `\"` inside double-quoted regions does NOT toggle quote
+/// state — the scanner advances past the escape pair atomically. Inside single-quoted
+/// regions, backslash is NOT an escape character (POSIX semantics): `'\''` is the literal
+/// 2-char string `\` followed by the closing quote. The scanner mirrors bash here so that
+/// `'foo\' \`evil\`` correctly closes the single quote at the second `'` and detects the
+/// unquoted backtick that follows.
+///
+/// Unterminated quotes: if a quote opens and never closes, the scanner treats all remaining
+/// bytes as inside the quote (conservative — falls through to LLM on malformed input).
+```
+
+This is Change 1.4's target — the docstring must enumerate `$'` alongside `$(`, `` ` ``, `>(`, `<(` after the change, and mention "ANSI-C quoting" as the bypass class.
+
+### Pin 2 — Rust `Some(q)` quote-state arm (`crates/mika-agent/src/server/permission_pre_classifier.rs:186-201`)
+
+```rust
+match quote_state {
+    Some(q) => {
+        // Inside a quoted region — advance past escapes (double-quoted only)
+        // and look for close. POSIX: backslash has no special meaning inside
+        // single-quoted strings, so `\` + `'` closes the quote.
+        if q == b'"' && bytes[i] == b'\\' && i + 1 < len {
+            // Escaped character inside double-quoted region — skip the pair atomically
+            i += 2;
+            continue;
+        }
+        if bytes[i] == q {
+            // Closing quote — return to unquoted state
+            quote_state = None;
+        }
+        i += 1;
+    }
+```
+
+This is the load-bearing surface for the Q2 carve-out claim (`$'` inside `"..."` is literal). The `q == b'"' && bytes[i] == b'\\'` arm advances `i += 2` for any escape pair (including `\$` and `\'`), and `bytes[i] == q` only closes on an unescaped matching quote byte. Therefore, inside `"..."`, when the scanner encounters `$`, it falls through both branches (neither escape nor close), increments `i += 1`, and the `$` is never re-evaluated in the `None` (unquoted) arm where the new `$'` check lives. The carve-out is structurally correct without changes to this arm. mika#944 does NOT modify this arm.
+
+### Pin 3 — Rust `None` (unquoted) branch metacharacter cluster (`crates/mika-agent/src/server/permission_pre_classifier.rs:202-226`)
+
+```rust
+None => {
+    // Unquoted region — check for metacharacters or quote openers
+    if bytes[i] == b'\'' || bytes[i] == b'"' {
+        quote_state = Some(bytes[i]);
+        i += 1;
+        continue;
+    }
+    // Check for backtick
+    if bytes[i] == b'`' {
+        return true;
+    }
+    // Check for `$(`
+    if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
+        return true;
+    }
+    // Check for `>(` (process substitution — output)
+    if bytes[i] == b'>' && i + 1 < len && bytes[i + 1] == b'(' {
+        return true;
+    }
+    // Check for `<(` (process substitution — input)
+    if bytes[i] == b'<' && i + 1 < len && bytes[i + 1] == b'(' {
+        return true;
+    }
+    i += 1;
+}
+```
+
+This is Change 1.1's insertion site. The new `$'` check is inserted between the existing `$(` check (currently lines 214-216) and the existing `>(` check (currently lines 217-220) so the four `$<x>` / process-substitution checks cluster contiguously.
+
+### Pin 4 — Python `contains_unquoted_metacharacter` unquoted branch (`claude-pilot-py/src/claude_pilot/tier1.py:145-168`)
+
+```python
+    while i < n:
+        ch = command[i]
+        if quote_state is not None:
+            # Inside a quoted region — handle escape (double-quoted only) then close.
+            if quote_state == '"' and ch == '\\' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote_state:
+                quote_state = None
+            i += 1
+            continue
+
+        # Unquoted region — open a quote or check for metacharacters.
+        if ch == "'" or ch == '"':
+            quote_state = ch
+            i += 1
+            continue
+        if ch == "`":
+            return True
+        if ch == "$" and i + 1 < n and command[i + 1] == "(":
+            return True
+        i += 1
+
+    return False
+```
+
+This is Change 3.1's insertion site. The new `$'` check is inserted after the existing `$(` check (currently lines 164-165), before the final `i += 1`. The Python arm has no separate `>(` / `<(` checks because those are handled blanket-style by `TIER3_PATTERNS` (the documented N=1 divergence — see plan § Out of scope and `tier1.py:98-99`). The Q2 quote-state carve-out logic for the Python side is structurally analogous to Pin 2's Rust arm: inside `"..."`, the escape branch `ch == '\\' and i + 1 < n` advances `i += 2`, and the close branch `ch == quote_state` only fires on an unescaped matching quote. `$` inside `"..."` is bypassed without re-evaluation in the unquoted branch.
+
+### Mika#943 cross-reference
+
+mika#943 (sibling, open, GROOMED, branch `fix/943/...` pushed at SHA `8d1ac201`) modifies `contains_unquoted_metacharacter` in the same file. Per the architect's first-pass note: mika#943's commit could shift the line numbers of the `$(`, `>(`, `<(` arm cluster. The pinned slices above are SHA-anchored, so the change locations remain anchor-stable even if mika#943 merges first and shifts line numbers; the implementer reads at base SHA + applies the patch to the *named* arm cluster, not the line-numbered one. If mika#943 introduces a *new* meta-character check between `$(` and `>(`, the implementer keeps the four `$<x>` checks contiguous by placing `$'` immediately after `$(` and before any new check.
+
 ## Deliverables
 
 | # | File                                                                              | Change                                                                                                  |
