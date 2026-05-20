@@ -82,6 +82,194 @@ The skill manifest pattern delineation — dispatcher vs producer — is
 implicit in the codebase but undocumented. The post-fix `CLAUDE.md`
 update names it.
 
+## Phase 0 — Verbatim pins
+
+**Base SHA:** `9c2d5635` (`main` HEAD at plan time; immediate parent of the
+plan-init commit on this branch).
+
+The fix touches four load-bearing sites in the engine + bundled-skill tree.
+Implementer must verify these slices match the current source before applying
+F1–F4; any drift since the base SHA requires re-pinning before editing.
+
+### Pin 1 — `skills/bundled/dev-groom/skill.toml` (full file at base)
+
+```toml
+[skill]
+name = "dev-groom"
+description = "Two-pass grooming flow (operator or autonomous) — takes a ticket from open to GROOMED plan-on-branch via /ce:plan and mika-arch architect review"
+version = "0.1.0"
+always_on = false
+timeout_secs = 600
+
+[triggers]
+keywords = [
+    "groom",
+    "groom ticket",
+    "/mika-groom-ticket",
+    "groom issue",
+]
+
+[output]
+required_suffix_lines = [
+    "Verdict: GROOMED",
+    "Verdict: ESCALATE",
+]
+```
+
+The bug surface is concentrated in lines 16-20: `[output] required_suffix_lines`
+without a sibling `[constraints] required_tools`. F1 removes lines 16-20 and
+adds the `[constraints]` block.
+
+### Pin 2 — `skills/bundled/self-dev/skill.toml` lines 1-25 (mirror pattern)
+
+```toml
+[skill]
+name = "self-dev"
+description = "Orchestrator: delegates implementation work to Claude Code via claude-pilot"
+version = "0.2.0"
+always_on = true
+timeout_secs = 30
+max_prompt_size = 65536
+dependencies = [
+    "build-mika",
+    "deploy-mika",
+    "dev-pilot",
+    "browser-control",
+    "resolve-pr-conflicts",
+]
+
+[constraints]
+required_tools = ["run_claude_pilot"]
+
+[triggers]
+keywords = [
+    "add feature",
+    "implement",
+    "develop yourself",
+    "build",
+    ...
+]
+```
+
+This is the canonical dispatcher manifest shape that F1 mirrors. Note: `self-dev`
+declares `[constraints] required_tools` AND has no `[output]` block. F1 brings
+`dev-groom` to the same shape (with `run_claude_pilot_groom` as the required tool
+instead of `run_claude_pilot`).
+
+### Pin 3 — `crates/mika-agent/src/agent.rs` lines 1402-1441 (#5 fabricated-action guard)
+
+This is the **insertion landmark for F3** (position 5b, immediately after this
+guard). Verbatim slice at base SHA:
+
+```rust
+                    // Fabricated action-claim guard: if the agent claims to have
+                    // performed an action (posted, commented, etc.) with a GitHub URL
+                    // but made zero tool calls in this turn, reject and re-prompt.
+                    // This catches hallucinated tool results where the agent fabricates
+                    // resource URLs without executing any tool. See #308.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !fabricated_action_retry_done
+                        && tools_called.is_empty()
+                        && let Some((verb, url)) = detect_fabricated_action_claim(&text)
+                    {
+                        fabricated_action_retry_done = true;
+                        warn!(
+                            step,
+                            verb,
+                            url,
+                            label = mode.label(),
+                            "Fabricated action claim detected with zero tool calls — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[mika-engine] The previous response claimed to have \
+                                 {verb} a resource ({url}) without calling any tool \
+                                 in this turn. The engine expects actions to be \
+                                 performed via tools (e.g., run_gh); URLs and action \
+                                 results come from actual calls, not synthesis. \
+                                 Calling the appropriate tool now performs the action, \
+                                 or the response should state that the action cannot be \
+                                 performed.",
+                            )),
+                        });
+                        continue;
+                    }
+
+                    // Intent-precondition registry (#702): iterate INTENT_GUARDS
+```
+
+F3 inserts a new guard block AFTER line 1441 and BEFORE line 1443's `Intent-precondition
+registry` comment. Following the existing shape pattern (gate condition, retry flag flip,
+warn log, push assistant content, push corrective user message, `continue`).
+
+### Pin 4 — `crates/mika-agent/src/agent.rs` lines 1631-1689 (#864 suffix-line guard, for chain-position context)
+
+This is the existing #864 suffix-line guard. F3 does **not** go here (per
+architect F2 finding — fabrication guards belong in the fabrication cluster
+at positions 4b/5, not the manifest-driven output-validation cluster at
+positions 8/9). Pinned to confirm chain ordering and to anchor the rationale
+for moving F3 upstream:
+
+```rust
+                    // #864 — Required-suffix-line guard. Skills can declare an exhaustive
+                    // accept-set for their final line; missing match rejects EndTurn once.
+                    // Position: END of the chain — other guards' rejections take precedence
+                    // so a turn rejected for a more fundamental reason doesn't waste a
+                    // suffix-line check.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !required_suffix_line_retry_done
+                        && !required_suffix_lines.is_empty()
+                    {
+                        let last_3_non_empty: Vec<&str> = text
+                            .lines()
+                            ...
+```
+
+Once F1 removes `dev-groom`'s `[output]` block, `required_suffix_lines` is empty
+for dev-groom keyword-match turns, and this guard becomes inert for the dev-groom
+case. Other producer skills (`mika-arch-groom-ticket`, `mika-arch-second-review`,
+`mika-arch-groom-milestone`) still drive this guard correctly — F1's manifest
+change is single-skill scoped.
+
+### Pin 5 — `skills/bundled/dev-groom/system_prompt.md` lines 15-21 (F2 insertion target)
+
+```markdown
+### Important
+- **Always pass `skill: "dev-groom"`** — required by the schema for engine dispatch-class derivation
+- **Always pass the task UUID as `task_id`** (36-char format) when a task exists. Do NOT pass issue references — pass the UUID returned by `create_task`. This ensures logs land at `/var/log/claude-pilot/{uuid}.log`
+- **Do NOT do the work inline** — never read source files, analyze the ticket, or write a plan yourself. The grooming workflow runs in the inner session via `/mika-groom-ticket`. Always use `run_claude_pilot_groom`
+- Do NOT call `run_claude_pilot_groom` again for the same task while one is already running
+- On `Verdict: GROOMED`, the issue body now carries `Branch:` + `Plan:` + `Grooming history:` callouts — the ticket is ready for dispatch via `run_claude_pilot` (dev-pilot)
+- On `Verdict: ESCALATE`, surface the architect's reasoning to the operator and halt — do not retry without operator instruction
+```
+
+F2 inserts ONE new bullet between bullets 3 and 4 (after the "Do NOT do the work
+inline" bullet), and qualifies bullets 5-6 with "On `Verdict: GROOMED` **callback**"
+and "On `Verdict: ESCALATE` **callback**". The exact insertion text is in F2 below.
+
+### Pin 6 — `tests/eval/grounding_regressions/` cluster reference
+
+Confirmed from `crates/mika-agent/CLAUDE.md` § "Evaluation — Grounding Regressions
+(#741, #862, #863, #864, #890, #894, #901, #1059)":
+
+> 31 fabrication-detection scenarios. ... scenarios 22-29 from the required-finding-list
+> conditional-disclosure-evasion guard (#901).
+
+F4's two new scenarios (`dev_groom_fabricated_verdict_caught` and
+`dev_groom_dispatched_no_verdict`) belong in this cluster at positions 30-31.
+The dispatcher-manifest parity test (per architect F3 finding) does NOT belong
+in this cluster — it goes in `crates/mika-agent/src/skills/manifest.rs` next to
+`test_builtin_tool_names_parity` (the existing manifest-invariant test).
+
 ## Fix
 
 Five files; smallest-surface fix that mirrors the canonical dispatcher pattern.
@@ -154,12 +342,23 @@ operator-readable documentation, not for primary enforcement.
 
 ### F3 — Structural fabrication guard (defense-in-depth, AC2)
 
-**File:** `crates/mika-agent/src/agent.rs` (new post-condition guard at ~line 1690)
+**File:** `crates/mika-agent/src/agent.rs` (new post-condition guard at position 5b — after #5 fabricated-action guard, before #6 intent-precondition registry; insertion point at ~line 1442)
 
 After F1, the LLM has no `required_suffix_lines` pressure to emit Verdict. But
 it might still emit one by training pattern. AC2 asks the engine to verify
-groundedness. Add a post-condition guard immediately after the #864
-suffix-line guard (position ~1690) and before the #901 finding-list guard.
+groundedness. F3 is a **claim-legitimacy guard** (semantic sibling of #4b
+milestone-close-claim and #5 fabricated-action-claim), not a manifest-driven
+output-shape validator (#864 / #901). It therefore belongs in the
+fabrication-guard cluster at the top of the chain, NOT in the
+output-validation tail. Insert immediately after #5 (`agent.rs:1441`,
+`continue` of fabricated-action guard) and before #6 (`agent.rs:1443`,
+Intent-precondition registry comment) — position 5b.
+
+This placement is the architect's directed correction (first-pass finding F2):
+positioning F3 with the output-shape validators would misclassify it for
+future chain readers. The guard is mechanically equivalent at either position
+because F1 makes #864 inert for dev-groom turns, but semantic placement matters
+for cluster integrity.
 
 ```rust
 // #1133 — dev-groom fabrication guard. Detects "Verdict: GROOMED" /
@@ -231,15 +430,26 @@ adjacent):
 let mut dev_groom_fabrication_retry_done = false;
 ```
 
-Position rationale: after #864 (which fires on missing suffix), before #901
-(which fires on terminal-disposition finding-list checks). The composition
-order matters because if both #864 and #1133 could fire, #864 takes
-precedence — but with F1 applied, dev-groom has no suffix_lines so #864
-is inert for this skill, and #1133 is the operative guard.
+Position rationale: position 5b (after #5 fabricated-action, before #6
+intent-precondition registry). F3 is a claim-legitimacy guard, same family
+as #4b and #5 — it checks whether the response's grooming claim is grounded
+in a tool call this turn, not whether the response satisfies a manifest
+output-shape contract. The fabrication cluster (positions 4b–5) is where
+"the response claims X without doing X" guards live; F3 fits exactly that
+shape (response claims `Verdict: GROOMED` without calling
+`run_claude_pilot_groom`).
 
 Mode gating (`!mode.is_silent()`) is critical: callback turns deliver Verdict
 text from the inner session as their primary payload. Firing the guard there
 would block legitimate callback delivery.
+
+Composition with downstream guards: with F1 applied, `dev-groom` contributes
+no entries to `required_suffix_lines`, so #864 is inert for dev-groom keyword
+turns. Producer skills (`mika-arch-*`) still drive #864 correctly — F3 and
+#864 do not conflict because the trigger sets are disjoint (F3 fires on
+"claims Verdict without tool call"; #864 fires on "missing required suffix
+when tool was called and a producer skill matched"). Both can in principle
+fire on the same turn, but in practice the manifest separation prevents it.
 
 ### F4 — Regression tests (AC3)
 
@@ -258,11 +468,23 @@ Two new scenarios mirroring the #864 pattern:
    grooming for mika#1133, task <id>"`. Assertion: no guard fires,
    EndTurn accepted, `assert_response_contains(&["Dispatched", "task"])`.
 
-Also add a manifest parity test in
-`crates/mika-agent/src/skills/manifest.rs` (or wherever the existing
-`test_builtin_tool_names_parity` lives — mika#1217 follow-up) that
-asserts dispatcher skills (`self-dev`, `dev-pilot`, `dev-groom`) all carry
-`required_tools` and none carry `required_suffix_lines`:
+Also add a **dispatcher-manifest parity test** as a static manifest invariant
+in the skills unit-test layer, **not** in `grounding_regressions/`. Per the
+architect's first-pass F3 finding: `grounding_regressions/` tests runtime LLM
+behavior under specific inputs; the parity test is a build-time/static
+assertion on manifest files. Mixing the two would violate the cluster's
+semantic boundary and reduce discoverability for future contributors looking
+for manifest invariants.
+
+**Placement:** colocate with `test_builtin_tool_names_parity` (mika#1217),
+which currently lives in `crates/mika-agent/src/tools/mod.rs` per the
+mika#1217 commit. If `test_builtin_tool_names_parity` has been moved by the
+time of implementation, follow it — the rule is "next to the existing
+manifest-invariant parity test," wherever that ends up. Implementer should
+grep for `test_builtin_tool_names_parity` at the base SHA to confirm the
+location.
+
+Test shape:
 
 ```rust
 #[test]
@@ -384,12 +606,12 @@ Post-deploy:
 ```
 skills/bundled/dev-groom/skill.toml                              # F1: manifest fix
 skills/bundled/dev-groom/system_prompt.md                        # F2: prompt update
-crates/mika-agent/src/agent.rs                                   # F3: fabrication guard + retry flag
-crates/mika-agent/tests/eval/grounding_regressions/dev_groom_fabricated_verdict_caught.rs  # F4
-crates/mika-agent/tests/eval/grounding_regressions/dev_groom_dispatched_no_verdict.rs      # F4
-crates/mika-agent/tests/eval/grounding_regressions/mod.rs        # F4: register modules
-crates/mika-agent/tests/eval/grounding_regressions/README.md     # F4: vocabulary update
-crates/mika-agent/src/skills/manifest.rs                         # F4: dispatcher parity test (or appropriate test module)
+crates/mika-agent/src/agent.rs                                   # F3: fabrication guard at position 5b + retry flag
+crates/mika-agent/tests/eval/grounding_regressions/dev_groom_fabricated_verdict_caught.rs  # F4: runtime scenario
+crates/mika-agent/tests/eval/grounding_regressions/dev_groom_dispatched_no_verdict.rs      # F4: runtime scenario
+crates/mika-agent/tests/eval/grounding_regressions/mod.rs        # F4: register two new modules
+crates/mika-agent/tests/eval/grounding_regressions/README.md     # F4: vocabulary + scenario-count update (30-31)
+crates/mika-agent/src/tools/mod.rs                               # F4: dispatcher-manifest parity test next to test_builtin_tool_names_parity (or wherever that test currently lives at base SHA)
 crates/mika-agent/CLAUDE.md                                      # document new post-condition #8b
 docs/solutions/agent-quirks/dev-groom-fabricated-verdict-2026-05-20.md  # F5: compound doc
 ```
