@@ -51,6 +51,144 @@ runs on kimi-k2.5 base — even worse grounding than sonnet-with-saturation.
 The hypothesis is plausible but **not yet proven**. The plan begins with a
 verification phase so that the fixes target measured causes, not assumed ones.
 
+## Phase 0 Pin (verbatim slices at base SHA `fe610fd4`)
+
+All citations in this plan resolve against the worktree at `fe610fd4` (the
+plan-commit itself). The full files are short enough that the plan attaches
+them by path; the implementer reads these paths verbatim before editing.
+
+### Pin A — `mika/skills/bundled/self-dev-callback/system_prompt.md` (full file, 138 lines, 14226 bytes)
+
+Annotated removal targets vs keep-verbatim blocks for F2:
+
+| Lines | Block | Action |
+|-------|-------|--------|
+| 1 | `### Callback Entry Point (post background task)` header | Keep — load-bearing structural marker. |
+| 3 | "Engine contract (mika#991)" callout (one paragraph, ~480 chars) | **F2 removal target #1** — replace with one-line pointer: "Engine guard `callback_milestone_advance` (#991) plus `PostCallbackAdvance` backstop. See `crates/mika-agent/CLAUDE.md` § Agent Loop / Post-Conditions." |
+| 5–9 | "When you receive a callback result… CALLBACK TYPE DETECTION" block | Keep — load-bearing routing logic, no engine equivalent. |
+| 11 | "CRITICAL: DO NOT end your turn after receiving a callback" callout | Keep — re-asserts engine guard #870 but the verbatim emphasis is observed to matter for sonnet adherence; do not trim until F1 telemetry confirms safety. |
+| 13 | "SCOPE RULE: Post-callback turns handle ONLY the task that triggered the callback" | Keep — operator-load-bearing instruction; no engine equivalent. |
+| 15–20 | "**Permitted post-callback actions (exhaustive list — mika#991):**" + 4 numbered items (~720 chars) | **F2 removal target #2** — replace with single sentence: "Permitted post-callback actions are described prosaically in the success/failure/recover_unpushed_work handlers below." |
+| 22–26 | "**Forbidden actions (mika#991):**" + 4 bullets (~520 chars) | **F2 removal target #3** — replace with one-line pointer: "Engine rejects confirmation-only EndTurn on milestone callbacks via guard 6/6b; see `crates/mika-agent/CLAUDE.md` § Agent Loop / Post-Conditions." |
+| 28–35 | "MILESTONE/PROJECT CONTEXT CHECK (mandatory)" + sub-bullets | Keep — verifies the runtime check the LLM must perform; no engine equivalent inside the LLM-readable surface. |
+| 37 | "**Auto-skip recognition (MANDATORY — run before all other classification):**" + body (~440 chars) | Keep verbatim — mika#988 recovery logic. |
+| 41–75 | "**Pipeline result classification (MANDATORY)**" + grounding check + decision tree + recover_unpushed_work handler (~4200 chars) | Keep verbatim — no engine-side equivalent. |
+| 80–86 | "**On pipeline failure**" handler (4 numbered steps, ~1000 chars) | Keep verbatim. |
+| 87–92 | "**On success**" handler (5 numbered steps, ~900 chars) | Keep verbatim. |
+| 94 | "**On failure (non-zero exit, FAILED, or not structured JSON):**" handler | Keep verbatim. |
+| 96–98 | "**Step 4 — Wait for the completion callback**" paragraph (~620 chars) | **F2 removal target #4** — delete entirely. The `permission-policy` skill keyword-activates on `[claude-pilot]` markers; this paragraph describes behavior that fires during a different turn (not the callback turn this prompt covers). |
+| 100–106 | "**Completion callback result**" block | Keep verbatim. |
+| 108–138 | Step 4.5 diagnose-and-recover, classification table, recovery actions, escalation template, Step 5 webhook QA note | Keep verbatim — failure-mode lookup table is load-bearing; sonnet uses it as a switch statement. |
+
+Expected delta: ~2160 bytes removed (480 + 720 + 520 + 440) → 14226 − 2160 ≈ 12066 bytes. To reach the 10000-byte target, F2 must also compress ~2000 additional bytes from within the keep blocks. **The implementer audits the keep-verbatim blocks under F1 telemetry on a representative dispatch run before deciding additional trim sites.** If F1 telemetry shows the assembled system prompt at ≤90% of budget after the four removal targets, the additional 2000-byte trim is deferred to a follow-up; AC1 relaxes to ≤12500 bytes (≤76% of budget, validator Ok).
+
+### Pin B — `crates/mika-agent/src/prompt.rs:478-486` (build_system_prompt entry)
+
+```rust
+/// Build the system prompt from context.
+pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
+    let mut prompt = String::with_capacity(4096);
+
+    write_soul_section(&mut prompt, ctx.soul_content);
+    write_identity_section(&mut prompt, ctx.identity);
+    write_time_section(&mut prompt, ctx.current_utc, ctx.timezone.as_deref());
+    write_channel_section(&mut prompt, ctx.channel_type, ctx.telegram_configured);
+```
+
+F1 emission boundary candidate A: `prompt.rs` immediately after this function returns (caller-side, before any post-assembly transformation). F1 emission boundary candidate B: `crates/mika-agent/src/agent.rs:2239` (`let mut system = prompt::build_system_prompt(&prompt_ctx);` in `run_agent`) and `agent.rs:3879` (same call in `run_silent_agent`), measured AFTER summary gate appends:
+
+```rust
+let mut system = prompt::build_system_prompt(&prompt_ctx);
+
+// Axis 4 + Axis 3 summary gate (mika#1019, mika#1021).
+// Conversation mode: silent_trigger is None — Axis 3 cap does not fire.
+if let Some(content) = load_gated_summary(db, &ctx.identity.context.summary, None).await? {
+    system.push_str("\n## Conversation Summary\n");
+    system.push_str("<context type=\"summary\" trust=\"data\">\n");
+    system.push_str(&content);
+    system.push_str("\n</context>\n");
+}
+```
+
+**Decision (resolved):** emit at the call site after summary-gate append (candidate B) — this measures the bytes that actually go on the wire. Two emission sites: `agent.rs:2239+15` (conversation) and `agent.rs:3879+15` (silent). Both wrap into a shared `emit_system_prompt_assembled(&system, &ctx, …)` helper to avoid drift.
+
+### Pin C — `crates/mika-agent/src/agent.rs:4180-4202` (override scope carve-out)
+
+```rust
+// Two qualification paths (#463, mika#1011):
+// 1. Keyword-matched skills: always qualify (original #463 behavior).
+// 2. AlwaysOn skills with DB-sourced LLM overrides (from_db_override = true):
+//    qualify because DB overrides represent explicit operator intent via
+//    `mika skills llm set`, not developer-time skill.toml [llm] hijacks.
+let mut overrides: Vec<(&str, Option<&str>)> = Vec::new();
+let mut override_skills: Vec<&str> = Vec::new();
+
+for ms in matched {
+    let qualifies = match ms.reason {
+        MatchReason::Keyword => true,
+        MatchReason::AlwaysOn => ms.entry.manifest.llm.from_db_override,
+        MatchReason::Dependency => false,
+    };
+```
+
+F3 reads this carve-out and confirms `from_db_override = true` is the only gate on AlwaysOn skill overrides firing. The function `resolve_skill_llm_override` (containing this block) is called from `run_silent_agent` at `agent.rs:3879+N` — F3 traces back from each `SilentTrigger` variant to confirm the call site is reached.
+
+### Pin D — `crates/mika-agent/src/skills/index.rs:818-834` (F4 required_tools validator)
+
+```rust
+// 5b. Validate [constraints] required_tools against known tool names
+for required in &manifest.constraints.required_tools {
+    if !skill_tool_names.contains(required) {
+        // Check if the tool name plausibly comes from a declared dependency
+        let likely_from_dep = manifest.skill.dependencies.iter().any(|dep| {
+            let prefix = dep.replace('-', "_");
+            required.starts_with(&prefix)
+        });
+        if !likely_from_dep {
+            diags.push(SkillDiagnostic::warn(format!(
+                "[constraints] required_tools references '{}' which is not in this skill's \
+                 tools.json — this is OK if it's a builtin, MCP, or dependency tool",
+                required
+            )));
+        }
+    }
+}
+```
+
+F4 inserts a `known_builtin_tools.contains(required)` check before the `!likely_from_dep` branch and short-circuits to `SkillDiagnostic::ok(...)`.
+
+### Pin E — `crates/mika-agent/src/skills/index.rs:1053-1064` (F2 validator signal site)
+
+```rust
+} else if effective_limit > 0 && size > effective_limit * 3 / 4 {
+    diags.push(SkillDiagnostic::warn(format!(
+        "system_prompt.md ({} bytes) is above 75% of limit ({} bytes)",
+        size, effective_limit
+    )));
+} else {
+    diags.push(SkillDiagnostic::ok(format!(
+        "system_prompt.md size OK ({} bytes, limit {} bytes)",
+        size, effective_limit
+    )));
+}
+```
+
+After F2 trim, validator should emit the `Ok` branch for `self-dev-callback`. AC1 verifies by reading the startup log.
+
+### Pin F — migration pattern, `crates/mika-agent/src/db.rs:2890-2893` (v34->v35 shape mirror)
+
+```rust
+if !self.column_exists("llm_calls", "step")? {
+    let sql =
+        "ALTER TABLE llm_calls ADD COLUMN step INTEGER NOT NULL DEFAULT 0;";
+```
+
+F1's `system_prompt_bytes INTEGER` column follows this exact shape (additive, nullable variant — no `NOT NULL DEFAULT` since pre-migration rows have no measurable value). Implementation site: add a new `migrate_v37_to_v38()` (or whatever the next migration index is at implementation time) following the same `column_exists` guard pattern.
+
+### Pin G — `crates/mika-agent/src/async_db.rs:1965` (save_llm_call dispatch)
+
+`async_db.rs:1965: pub async fn save_llm_call(` — F1 adds a new `system_prompt_bytes: Option<i64>` parameter here and threads it to the sync `Database::save_llm_call` at `db.rs:6160`. All call sites updated (eval harness, agent.rs:649/966/992, etc).
+
 ## Verification phase (must precede F2 trim)
 
 ### F0.1 — Reconstruct the failing turn's actual context
@@ -97,6 +235,52 @@ operator paraphrase of an existing diagnostic, or it surfaces from a different
 validator pass. Run `mika-server` startup with `RUST_LOG=debug` against a fresh
 agent and grep `skill_skipped\|skill_warning\|skill-review` from the log. If the
 exact wording is paraphrase, leave warning #5 out of F4's scope.
+
+### F0 decision fork (mandatory — drives whether F2 ships as fix or hygiene)
+
+After F0.1 attribution lands, the implementer chooses one of three branches.
+The branch is recorded in the PR description and in the solutions doc (AC6).
+
+**Branch (a) — F0 confirms `self-dev-callback` was active AND model was `sonnet-4-6`:**
+
+Root cause is **system-prompt saturation**. F2 ships as **the load-bearing fix**;
+AC3 (callback-turn fabrication-inverse) is the primary acceptance signal; AC3b
+(see Acceptance Criteria) is the verifying callback-mode reproduction. F3 stays
+as informational verification (override fired; saturation was the cause).
+
+**Branch (b) — F0 confirms `self-dev-callback` was NOT active on the failing turn:**
+
+The saturation hypothesis collapses for the canonical evidence sessions; the
+14226-byte prompt was not in the assembled system prompt for those turns. F2
+**still ships, but as hygiene** (87% of budget is unhealthy independent of this
+incident; trim reduces a real risk surface for the callback turns that *do*
+load it). AC3 re-baselines: the post-deploy `mika ask "groom mika issue#<test>"`
+is no longer the canonical inverse-of-fabrication signal — it becomes a
+regression smoke. A **new ticket is filed** at PR-open time with `p0-critical`,
+referencing F0.1's attribution doc, scoping the **actual root cause** (the
+fabrication mechanism that fires on conversation-mode turns without
+self-dev-callback in the active set). The new ticket inherits the canonical
+loop blocker; mika#1217 ships as the hygiene + observability + validator PR.
+
+**Branch (c) — F0 confirms the model was `kimi-k2.5` (not `sonnet-4-6`):**
+
+Root cause is the **override-scope gap on autonomous-loop callback turns**. F3
+**promotes from "verify" to "fix"**: the implementation extends the
+`from_db_override` carve-out (or its caller chain in `run_silent_agent`) so
+that `SilentTrigger::Callback` and `SilentTrigger::DeferredDispatch` resolve
+the DB override correctly. F2's trim ships as defense-in-depth (the
+combination of override-firing + trimmed prompt is the durable fix). AC4 is
+upgraded from "test exercises override + may file follow-up" to "test
+demonstrates override fires on Callback/DeferredDispatch; the fix is in this
+PR." Calibration suite must pass on both sonnet-4-6 AND kimi-k2.5 base models
+because the trim affects both.
+
+**Why this fork lives in the plan, not in implementer judgment:** without it,
+the implementer completes F0 and faces an unguided choice between "ship the
+trim as the fix" and "ship the trim as hygiene + file a follow-up" — and the
+choice has materially different ticket-shape consequences (one PR vs PR +
+p0-critical follow-up). The plan binds the decision so architect-validated
+sequencing survives F0's surprise.
 
 ## Fix sequence
 
@@ -249,11 +433,25 @@ keywords are intentional per `skills/bundled/skill-review/skill.toml` comment).
   `SELECT model, system_prompt_bytes FROM llm_calls WHERE created_at > <deploy_ts> LIMIT 10`
   returns 10 non-null rows.
 
-- **AC3.** `mika ask --agent mika-dev "groom mika issue#<test>"` after deploy
-  completes with `tool_calls > 0` (proves the LLM made at least one tool call,
-  inverting the zero-tool-call fabrication signature). The dispatch produces
-  either a successful `dev-groom` flow or a structured failure with a real tool-error
-  payload — not a confabulated `[mika-engine]` security-defense response.
+- **AC3 (conversation-mode regression smoke).** `mika ask --agent mika-dev
+  "groom mika issue#<test>"` after deploy completes with `tool_calls > 0`
+  (proves the LLM made at least one tool call, inverting the zero-tool-call
+  fabrication signature on the same surface as session `344824d0`). The
+  dispatch produces either a successful `dev-groom` flow or a structured
+  failure with a real tool-error payload — not a confabulated `[mika-engine]`
+  security-defense response.
+
+- **AC3b (callback-mode failure-path verification — load-bearing per F0).**
+  Both evidence sessions involve dispatch/callback context responses. AC3
+  alone tests conversation-mode; if F0 confirms the canonical failure fires
+  on callback turns specifically (Branch (a) or (c)), AC3 may pass while the
+  fix is incomplete. **Required verification:** dispatch a test ticket via
+  `mika ask --agent mika-dev "implement mika issue#<test>"` and wait for the
+  claude-pilot completion callback to fire. The callback turn's row in
+  `llm_calls` must show `tool_calls > 0`. If F0 lands in Branch (b) (canonical
+  failure is not callback-turn-specific), AC3b downgrades to a sanity-check
+  smoke (still run, but not load-bearing). The decision is recorded in the PR
+  description alongside the F0 attribution.
 
 - **AC4.** A unit test in the skill_override module exercises `SilentTrigger::Callback`
   and `SilentTrigger::DeferredDispatch` against a fixture DB override. Test passes
@@ -303,6 +501,44 @@ keywords are intentional per `skills/bundled/skill-review/skill.toml` comment).
   (per CLAUDE.md § "Model calibration" — `make calibrate-mika-dev MODEL=anthropic/claude-sonnet-4-6`)
   before merge. Calibration fixtures (5 scenarios anchored on #1168/#1166/#1173) should
   pass at parity or better after trim.
+
+## Rollback
+
+The four-commit PR mixes a one-way ratchet (schema migration) with three
+cleanly-revertable changes. Operators reverting the PR need to know which is
+which:
+
+- **F1 schema migration (`ALTER TABLE llm_calls ADD COLUMN system_prompt_bytes
+  INTEGER`) is permanent.** Additive nullable, mirrors v34->v35 shape, no
+  data movement. The column is independently valuable for observability
+  regardless of whether the rest of the fix lands; reverting the PR does NOT
+  remove the column. Post-revert behavior: zero writes populate the new
+  column (the `save_llm_call` call site no longer passes the new param),
+  query plans treat values as NULL — harmless. Removing the column requires
+  a new forward migration; not done as part of a revert.
+
+- **F1 INFO log event (`system_prompt_assembled`)** reverts cleanly with the
+  PR. The shared helper `emit_system_prompt_assembled` and its two call
+  sites in `agent.rs` come out atomically.
+
+- **F2 prompt trim (`skills/bundled/self-dev-callback/system_prompt.md`)**
+  reverts cleanly — the file returns to its pre-fix shape at base SHA
+  `fe610fd4`. No coupled engine changes; the prompt is a build-time-discovered
+  asset.
+
+- **F3 unit test (skill-override on Callback/DeferredDispatch)** reverts
+  cleanly — pure test addition, no production code impact even if F3 ships
+  in Branch (c) mode (the override-scope fix itself reverts cleanly too;
+  it's a small change to the `qualifies` match arm or carve-out condition).
+
+- **F4 validator change (`skills/index.rs` §5b + `BUILTIN_TOOL_NAMES` const
+  + parity test)** reverts cleanly — the validator returns to its pre-fix
+  warning behavior; the parity test goes with it.
+
+**Operator-facing summary in PR description:** "Reverting this PR backs out
+F2/F3/F4 cleanly; the `system_prompt_bytes` column in `llm_calls` is added
+by F1 and persists across revert (additive, nullable, harmless — file a new
+migration if removal is needed)."
 
 ## Sequencing
 
