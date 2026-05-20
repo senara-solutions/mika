@@ -15,11 +15,15 @@ use super::manifest::{
 const MAX_SKILL_TOML_SIZE: u64 = 64 * 1024;
 
 /// Default maximum size for system_prompt.md snippets (16 KB).
-pub(super) const MAX_PROMPT_SNIPPET_SIZE: u64 = 16 * 1024;
+/// Exposed as `pub` for the integration test gate in
+/// `tests/bundled_skills_load.rs` (mika#852).
+pub const MAX_PROMPT_SNIPPET_SIZE: u64 = 16 * 1024;
 
 /// Hard ceiling for per-skill `max_prompt_size` override (80 KB).
 /// Prevents marketplace skills from loading arbitrarily large prompts.
-pub(super) const MAX_PROMPT_SIZE_CEILING: u64 = 80 * 1024;
+/// Exposed as `pub` for the integration test gate in
+/// `tests/bundled_skills_load.rs` (mika#852).
+pub const MAX_PROMPT_SIZE_CEILING: u64 = 80 * 1024;
 
 /// Maximum size for tools.json files (256 KB).
 const MAX_TOOLS_JSON_SIZE: u64 = 256 * 1024;
