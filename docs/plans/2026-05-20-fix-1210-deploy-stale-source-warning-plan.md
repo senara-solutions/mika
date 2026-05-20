@@ -9,9 +9,81 @@ groomed-via: /mika-groom-ticket (/ce:plan → mika-arch first-pass → revisions
 
 `make deploy` builds from the local clone without surfacing what SHA is being built or whether the local checkout is stale relative to `origin/main`. When `git pull` is skipped or fails silently, the build completes, services restart, `check-ngrok` passes, and the operator believes the new code is live when it isn't. Discovery requires a manual `git log --oneline origin/main` comparison. The exact gap fired twice in the last two days — 2026-05-18 (the originally documented incident, 4 commits behind) and 2026-05-19 (the deploy described in the 2026-05-19 handsoff log, 8 commits behind because `fetch origin main:main` refused while main was checked out, so the local main never advanced). Operator wastes wall-clock hours diagnosing "why isn't the fix live?"
 
+## Phase 0 — Pin (base SHAs and verbatim slices)
+
+Base SHAs at grooming time:
+- `mika` HEAD: `498c536a18de83f69216aefc330d321f22277163` (`fix(agent): tighten milestone-close-claim guard to first-person + number cross-ref (#1207) (#1216)`)
+- `mika-platform` HEAD: `5393379946754e49e1033ba38b0ec48b40eeee1f` (`docs(logs): mika backlog triage report 2026-05-20`)
+
+All implementation must be applied against these SHAs. Line numbers below refer to file state at these SHAs.
+
+### Pin 1 — `mika/Makefile:4` (`.PHONY` declaration, single-line)
+
+```make
+.PHONY: build build-dashboard deploy stop restart install test lint fmt check check-ngrok clean help calibrate-mika-dev calibrate-mika-arch
+```
+
+The `.PHONY` list is a single line. AC1's new target `deploy-info` is appended to this line (one token before `clean help`, alphabetical isn't enforced — placement is "next to other deploy-adjacent targets," e.g. between `check-ngrok` and `clean`).
+
+### Pin 2 — `mika/Makefile:45` (current `deploy` line)
+
+```make
+deploy: build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
+```
+
+AC3 inserts `deploy-info` as the first prerequisite (before `build-dashboard`). The `## ` help comment must stay byte-identical so `make help` output doesn't change.
+
+### Pin 3 — `mika/Makefile:47-54` (`check-ngrok` recipe — fail-soft warning precedent)
+
+```make
+check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
+	@if ! curl -sf http://localhost:4040/api/tunnels > /dev/null 2>&1; then \
+		echo ""; \
+		echo "  ⚠  WARNING: ngrok is not running!"; \
+		echo "  Telegram webhooks will not reach the gateway."; \
+		echo "  Start ngrok: ngrok http 8080"; \
+		echo ""; \
+	fi
+```
+
+Shape constraint for AC2/AC6: the new `deploy-info` recipe mirrors `check-ngrok`'s pattern — `@`-prefixed multiline `if` block, no `&&`/`||` chains relying on shell short-circuit, no `; exit 0` workaround. The conditional itself controls the exit code: a Bourne `if … fi` without `set -e` ends at zero regardless of which branch fired, so the recipe's exit code is the exit code of the final `fi`. Implementer must NOT introduce `set -e` inside the recipe body.
+
+### Pin 4 — `mika/Makefile:64-66` (`test` target — AC8 wiring precedent)
+
+```make
+test: ## Run all tests
+	cargo test
+	@bash scripts/test-dispatch-symmetry.sh
+```
+
+The `test` target EXISTS and already delegates to a bash script with the `@bash scripts/<name>.sh` shape. AC8's wiring is feasible as a one-line append: a third recipe line `@bash scripts/deploy-info-test.sh`. No new target creation needed.
+
+### Pin 5 — `mika-platform/Makefile:1-2` (`.PHONY` declaration, multi-line) and `:42` (`deploy` alias)
+
+```make
+.PHONY: build install restart deploy check-ngrok \
+       build-mika install-mika install-claude-pilot install-skills restart-mika
+```
+
+```make
+deploy: build install restart check-ngrok ## Build, install, restart, and verify ngrok
+```
+
+The meta-repo `.PHONY` is multi-line with backslash continuation; AC4's new `deploy-info` token is appended to the continued second line (after `restart-mika`). The `deploy` alias at `:42` (NOT `:46` — earlier draft had wrong line number) is a pure-prereq chain target; AC4 inserts `deploy-info` as the first prerequisite, recipe body stays absent.
+
+## Spec deviation from issue body
+
+The issue body's "Proposed Solution" inlines the SHA print + fetch + warn block directly into the `deploy` recipe (single-target, recipe-body shape). This plan promotes that block to a separate `deploy-info` prerequisite target on both Makefiles. The deviation is intentional and structurally justified:
+
+1. **DRY across both Makefiles.** The meta-repo `make deploy` and the `mika/` direct `make -C mika deploy` are two operator-facing invocation paths that hit the same failure mode. An inline recipe in `mika/Makefile`'s `deploy` only catches the direct path; the meta-repo path needs the same recipe duplicated, or — cleaner — needs to delegate to a reusable target. `deploy-info` is that reusable target.
+2. **Standalone-queryable.** An operator who wants to ask "what would deploy build right now, and am I current?" without running the full deploy pipeline can run `make -C mika deploy-info` and get the answer in <2s. The inline shape doesn't expose that query path.
+3. **Help-listable.** A separate target with a `## ` help comment shows up in `make help`, surfacing the freshness check as a first-class operator verb. Inline recipe bodies aren't help-listable.
+
+This deviation will be recorded in the PR description, and the issue body's "Proposed Solution" section will be updated at PR time with an edit notice citing this plan. Per the issue-as-versioned-contract doctrine (audit trail = body edit + edit-notice comment + closure annotation in plan), the deviation must be visible — not assumed.
+
 ## Context
 
-- **Two `Makefile`s have a `deploy` target.** `mika/Makefile:45` is `deploy: build-dashboard build install restart check-ngrok` — a pure chain target with no recipe body. `mika-platform/Makefile`'s `deploy: build install restart check-ngrok` is the convenience alias the operator typically runs; it delegates to `$(MAKE) -C mika build-dashboard` and `$(MAKE) -C mika build` for the build step, NOT to `make -C mika deploy`. So a prelude attached only to `mika/Makefile`'s `deploy` target catches the literal repro path from the ticket but **not** the operator's typical invocation. The 2026-05-19 incident actually used the meta-repo path (`make deploy` from `/data/workspace/mika-platform/`). Both paths need the warning to make the fix felt.
+- **Two `Makefile`s have a `deploy` target.** `mika/Makefile:45` (Pin 2) is `deploy: build-dashboard build install restart check-ngrok` — a pure chain target with no recipe body. `mika-platform/Makefile:42` (Pin 5) is the convenience alias the operator typically runs; it delegates to `$(MAKE) -C mika build-dashboard` and `$(MAKE) -C mika build` for the build step, NOT to `make -C mika deploy`. So a prelude attached only to `mika/Makefile`'s `deploy` target catches the literal repro path from the ticket but **not** the operator's typical invocation. The 2026-05-19 incident actually used the meta-repo path (`make deploy` from `/data/workspace/mika-platform/`). Both paths need the warning to make the fix felt.
 
 - **`git fetch origin main:main` is refused when main is checked out.** Hit while creating this worktree from main moments ago, hit on the 2026-05-19 deploy, hit in every workflow that calls that exact refspec form. The fix is to fetch the remote ref WITHOUT updating the local branch — `git fetch -q origin main` (no `:main` refspec) lands the update on `FETCH_HEAD` and `refs/remotes/origin/main` without touching the local `main` ref. This is what the ticket's proposed solution already uses, and it works regardless of which branch is checked out.
 
@@ -31,7 +103,7 @@ groomed-via: /mika-groom-ticket (/ce:plan → mika-arch first-pass → revisions
   ```
   Building from: <abbrev-ref> @ <short-sha> (<commit-subject>)
   ```
-  using `git rev-parse --abbrev-ref HEAD`, `git rev-parse --short HEAD`, `git log -1 --pretty=format:'%s'`. The target must be `.PHONY` (added to the existing `.PHONY` declaration on `mika/Makefile:4`) and have a `## ` help comment so it appears in `make help` (the existing help target uses a grep-on-help-comment pattern).
+  using `git rev-parse --abbrev-ref HEAD`, `git rev-parse --short HEAD`, `git log -1 --pretty=format:'%s'`. The target must be `.PHONY` (added to the existing `.PHONY` declaration on Pin 1 — `mika/Makefile:4`) and have a `## ` help comment so it appears in `make help` (the existing help target uses a grep-on-help-comment pattern).
 
 - **AC2 — `deploy-info` performs an origin/main divergence check** with three observable outcomes:
   1. **Up-to-date:** `git fetch -q origin main` succeeds AND `git rev-list --count HEAD..origin/main` returns `0`. Print `origin/main: up to date`.
@@ -40,21 +112,21 @@ groomed-via: /mika-groom-ticket (/ce:plan → mika-arch first-pass → revisions
 
   None of the three outcomes exit the target non-zero — the target always succeeds, the operator reads the line. (Behind/unreachable are advisory signals, not deploy gates; AC3 anchors that posture.)
 
-- **AC3 — `deploy` target in `mika/Makefile` depends on `deploy-info` as its first prerequisite.** Rewrite `mika/Makefile:45` from:
+- **AC3 — `deploy` target in `mika/Makefile` depends on `deploy-info` as its first prerequisite.** Rewrite Pin 2 (`mika/Makefile:45`) from:
   ```
-  deploy: build-dashboard build install restart check-ngrok
+  deploy: build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
   ```
   to:
   ```
-  deploy: deploy-info build-dashboard build install restart check-ngrok
+  deploy: deploy-info build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
   ```
-  This guarantees the SHA line and divergence check run BEFORE any build/install/restart step, so the operator sees the freshness signal at the top of the deploy output. The `## ` help comment on `deploy` stays unchanged.
+  This guarantees the SHA line and divergence check run BEFORE any build/install/restart step, so the operator sees the freshness signal at the top of the deploy output. The `## ` help comment on `deploy` stays byte-identical.
 
-- **AC4 — `mika-platform/Makefile`'s `deploy` target also surfaces the mika freshness signal.** Add a `deploy-info` prerequisite (matching the convention) that delegates to `$(MAKE) -C mika deploy-info`. The meta-repo Makefile's PHONY list (`mika-platform/Makefile:1-2`) grows by one entry. Existing `deploy: build install restart check-ngrok` becomes `deploy: deploy-info build install restart check-ngrok`. The new `deploy-info` recipe is one line: `$(MAKE) -C mika deploy-info`. This covers the operator's typical invocation path (the 2026-05-19 incident).
+- **AC4 — `mika-platform/Makefile`'s `deploy` target also surfaces the mika freshness signal.** Add a `deploy-info` prerequisite (matching the convention) that delegates to `$(MAKE) -C mika deploy-info`. Per Pin 5: the meta-repo `.PHONY` list grows by one entry on the second continued line (after `restart-mika`). Existing line `:42` becomes `deploy: deploy-info build install restart check-ngrok ## Build, install, restart, and verify ngrok`. The new `deploy-info` recipe is one line: `$(MAKE) -C mika deploy-info`. This covers the operator's typical invocation path (the 2026-05-19 incident).
 
-- **AC5 — Recipes are quiet by default.** Use the `@` recipe prefix on every line of the new targets so make does not echo the commands themselves (only the resulting output lines are visible). Mirrors the existing `check-ngrok` style at `mika/Makefile:48-54`.
+- **AC5 — Recipes are quiet by default.** Use the `@` recipe prefix on every line of the new targets so make does not echo the commands themselves (only the resulting output lines are visible). Mirrors the `check-ngrok` precedent (Pin 3 — `mika/Makefile:47-54`).
 
-- **AC6 — `set -e` discipline inside the recipe.** Each shell command runs as its own `@` line; no multi-command line uses `&&` chains that depend on shell short-circuit logic to swallow failure. The exit code of the LAST command in the recipe must be zero. Pattern (illustrative — implementation may differ in surface syntax as long as exit-zero discipline holds):
+- **AC6 — Exit-zero discipline inside the recipe.** Mirrors the `check-ngrok` precedent (Pin 3): no `&&`/`||` chains that depend on shell short-circuit to swallow failure, no `set -e` introduced inside the recipe body. A Bourne `if … fi` block ends at exit zero on every branch (the conditional ITSELF carries the exit code, not the commands inside it), so the recipe is exit-safe by construction. Pattern (illustrative — implementation may differ in surface syntax as long as the if/fi-block-as-exit-control shape holds):
   ```make
   deploy-info: ## Print built SHA and warn if local HEAD is behind origin/main
   	@echo "Building from: $$(git rev-parse --abbrev-ref HEAD) @ $$(git rev-parse --short HEAD) ($$(git log -1 --pretty=format:'%s'))"
@@ -72,7 +144,7 @@ groomed-via: /mika-groom-ticket (/ce:plan → mika-arch first-pass → revisions
 
 - **AC7 — Existing targets unaffected.** No change to `build`, `build-dashboard`, `install`, `restart`, `check-ngrok`, `calibrate-*`, `test`, `lint`, `fmt`, `check`. The diff is additive: one new target on each Makefile, one prerequisite added to each `deploy` line. No reordering of existing prerequisites.
 
-- **AC8 — Verification script.** Add `scripts/deploy-info-test.sh` (executable, bash, follows the style of the existing `scripts/verify-pipeline-test.sh` / `scripts/check-byte-slices.sh`) that exercises the three AC2 paths via a disposable git fixture: (a) up-to-date — fresh clone of an in-test bare repo, `deploy-info` says `origin/main: up to date`; (b) behind — add commit to origin's main without pulling locally, `deploy-info` warns with the correct count and "behind origin/main" string; (c) unreachable — point `origin` URL to a nonexistent path, `deploy-info` prints the "could not reach origin" note and exits zero. Wire it into `make test` next to the existing `test-dispatch-symmetry` bash invocation. The fixture uses `mktemp -d`, sets up bare + worktree clones, runs the `deploy-info` recipe via `make -f <fixture-Makefile> deploy-info`, and asserts on grep matches; on exit (success or failure) it cleans up the temp dir. The fixture Makefile is a small file checked into `scripts/fixtures/deploy-info-Makefile` containing only the `deploy-info` target body verbatim — keeping the recipe text out of the test shell script preserves a single source of truth for the recipe and limits drift to one place. The fixture target must be kept byte-identical to the production recipe; the test script asserts this with a diff before running the behavior cases (so any drift fails the test immediately, not at deploy time).
+- **AC8 — Verification script.** Add `scripts/deploy-info-test.sh` (executable, bash, follows the style of the existing `scripts/verify-pipeline-test.sh` / `scripts/check-byte-slices.sh`) that exercises the three AC2 paths via a disposable git fixture: (a) up-to-date — fresh clone of an in-test bare repo, `deploy-info` says `origin/main: up to date`; (b) behind — add commit to origin's main without pulling locally, `deploy-info` warns with the correct count and "behind origin/main" string; (c) unreachable — point `origin` URL to a nonexistent path, `deploy-info` prints the "could not reach origin" note and exits zero. Wire it into `make test` (Pin 4 — `mika/Makefile:64-66`) by appending one line `@bash scripts/deploy-info-test.sh` after the existing `@bash scripts/test-dispatch-symmetry.sh` invocation; the `test` target already exists with the `@bash …` shape, so wiring is a one-line append. The fixture uses `mktemp -d`, sets up bare + worktree clones, runs the `deploy-info` recipe via `make -f <fixture-Makefile> deploy-info`, and asserts on grep matches; on exit (success or failure) it cleans up the temp dir. The fixture Makefile is a small file checked into `scripts/fixtures/deploy-info-Makefile` containing only the `deploy-info` target body verbatim — keeping the recipe text out of the test shell script preserves a single source of truth for the recipe and limits drift to one place. The fixture target must be kept byte-identical to the production recipe; the test script asserts this with a diff before running the behavior cases (so any drift fails the test immediately, not at deploy time).
 
 - **AC9 — Manual verification record.** Run `make -C mika deploy-info` in the current worktree (HEAD at `fix/1210/...` branched from main). Capture the output and paste it into the PR description under a "Verification" heading. Also: confirm in PR description that `make help` (mika repo) lists the new target with the help comment.
 
