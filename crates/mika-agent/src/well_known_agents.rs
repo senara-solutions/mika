@@ -70,6 +70,24 @@ pub struct WellKnownAgent {
     pub llm_overrides: &'static [LlmOverrideSpec],
 }
 
+/// mika-test agent specification (mika#963).
+///
+/// Minimal test agent with no skills for engine validation and debugging.
+/// Uses identity-driven `[skills].allowlist` with a sentinel value to deny
+/// all skills. KG disabled. Default LLM provider/model from `Settings`.
+pub static MIKA_TEST: WellKnownAgent = WellKnownAgent {
+    name: "mika-test",
+    display_name: "Test",
+    emoji: "🧪",
+    soul: MIKA_TEST_SOUL,
+    // Empty: mika-test uses identity allowlist, not denylist (#815).
+    disabled_skills: &[],
+    config_toml: None,
+    // KG disabled (#963): mika-test is a bare engine exerciser — no KG noise.
+    identity_source: Some(IdentitySource::Static(MIKA_TEST_IDENTITY)),
+    llm_overrides: &[],
+};
+
 /// mika-dev agent specification.
 ///
 /// Uses identity-driven `[skills].allowlist` (D2 cross-cutting, #815).
@@ -383,7 +401,8 @@ allowlist = ["mika-arch-groom-ticket", "mika-arch-groom-milestone", "mika-arch-s
 }
 
 /// All well-known agents.
-pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] = &[&MIKA_DEV, &MIKA_QA, &MIKA_RELAY, &MIKA_ARCH];
+pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] =
+    &[&MIKA_DEV, &MIKA_TEST, &MIKA_QA, &MIKA_RELAY, &MIKA_ARCH];
 
 /// Identity-toml section paths that the reconciler owns from the static spec.
 ///
@@ -1064,6 +1083,35 @@ llm_max_tokens = 1024
 log_level = "info"
 "#;
 
+const MIKA_TEST_SOUL: &str = r#"# Mika Test — Minimal Test Agent
+
+## Role
+You are Mika Test, a minimal test agent for engine validation and debugging.
+You have no skills enabled. Your purpose is to exercise the core agent loop
+(LLM calls, memory, tools) without skill-system interference.
+
+## Communication style
+- Respond directly and helpfully
+- You are a plain conversational agent with no special workflows
+"#;
+
+/// mika-test identity.toml — no skills, KG disabled per mika#963.
+///
+/// The allowlist uses a sentinel value `__mika_test_no_skills__` that matches
+/// no real skill. An empty `allowlist = []` would be treated as a no-op by
+/// `apply_identity_allowlist()` (which early-returns on empty), so we need a
+/// non-empty list with a value that cannot match any bundled or custom skill.
+/// This follows the same pattern as `__fail_closed_no_skills__` in `prompt.rs`.
+const MIKA_TEST_IDENTITY: &str = "\
+name = \"Test\"\n\
+emoji = \"🧪\"\n\
+\n\
+[kg]\n\
+enabled = false\n\
+\n\
+[skills]\n\
+allowlist = [\"__mika_test_no_skills__\"]\n";
+
 const MIKA_ARCH_SOUL: &str = r#"# Mika Architect — Plan Review Agent
 
 ## Role
@@ -1140,6 +1188,11 @@ mod tests {
     fn test_find_well_known_agent_found() {
         assert!(find_well_known_agent("mika-dev").is_some());
         assert_eq!(find_well_known_agent("mika-dev").unwrap().name, "mika-dev");
+        assert!(find_well_known_agent("mika-test").is_some());
+        assert_eq!(
+            find_well_known_agent("mika-test").unwrap().name,
+            "mika-test"
+        );
         assert!(find_well_known_agent("mika-qa").is_some());
         assert_eq!(find_well_known_agent("mika-qa").unwrap().name, "mika-qa");
         assert!(find_well_known_agent("mika-relay").is_some());
@@ -1975,6 +2028,35 @@ mod tests {
         }
     }
 
+    // -- mika-test tests --
+
+    #[test]
+    fn test_find_well_known_agent_mika_test() {
+        let agent = find_well_known_agent("mika-test").unwrap();
+        assert_eq!(agent.name, "mika-test");
+        assert_eq!(agent.display_name, "Test");
+        assert_eq!(agent.emoji, "🧪");
+        assert!(agent.disabled_skills.is_empty());
+        assert!(agent.config_toml.is_none());
+        assert!(agent.llm_overrides.is_empty());
+    }
+
+    #[test]
+    fn test_mika_test_identity_valid_toml() {
+        let identity: crate::prompt::Identity =
+            toml::from_str(MIKA_TEST_IDENTITY).expect("MIKA_TEST_IDENTITY should be valid TOML");
+        assert_eq!(identity.name, "Test");
+        assert_eq!(identity.emoji, "🧪");
+        assert!(!identity.kg.enabled, "mika-test should have KG disabled");
+        let allowlist = identity.skills.allowlist.as_ref().unwrap();
+        assert_eq!(
+            allowlist.len(),
+            1,
+            "mika-test should have sentinel-only allowlist"
+        );
+        assert_eq!(allowlist[0], "__mika_test_no_skills__");
+    }
+
     // -- mika-arch tests --
 
     #[test]
@@ -2184,7 +2266,7 @@ mod tests {
 
     #[test]
     fn test_well_known_agents_includes_mika_arch() {
-        assert_eq!(WELL_KNOWN_AGENTS.len(), 4);
+        assert_eq!(WELL_KNOWN_AGENTS.len(), 5);
         assert!(
             WELL_KNOWN_AGENTS.iter().any(|a| a.name == "mika-arch"),
             "WELL_KNOWN_AGENTS should include mika-arch"
