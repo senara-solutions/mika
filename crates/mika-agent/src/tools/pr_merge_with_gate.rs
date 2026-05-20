@@ -7,9 +7,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{Tool, ToolContext, ToolOutput};
+use crate::async_db::AsyncDatabase;
 
 /// Maximum bytes to read from a `gh` subprocess stdout/stderr (256 KB).
 const MAX_OUTPUT_LEN: usize = 256 * 1024;
@@ -196,6 +197,15 @@ impl Tool for PrMergeWithGateTool {
 
                 match auto_result {
                     Ok(_output) => {
+                        // mika#1211: persist pr_url on supervisor so the orphan
+                        // reaper (#871) doesn't flip it to `failed` and the
+                        // parent-completer (mika#1162) can promote it to
+                        // `completed` once the dispatch callback ages past
+                        // REAPER_GRACE_SECONDS. Mirrors the metadata-write
+                        // pattern in dispatcher::try_extract_callback_metadata.
+                        let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
+                        write_auto_merge_pr_url_to_supervisor(ctx, &pr_url).await;
+
                         let pending: Vec<CheckInfo> = checks
                             .iter()
                             .filter(|c| c.bucket == "pending")
@@ -660,6 +670,112 @@ pub(crate) async fn run_gh_subprocess(args: &[&str], token: &str) -> Result<Stri
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Persist the supervisor's `$.claude_pilot.pr_url` after auto-merge is
+/// enabled (mika#1211). Mirror of `dispatcher::try_extract_callback_metadata`
+/// — resolves the supervisor via `ToolContext.callback_task_id → parent`,
+/// gates on `trigger_type='manual' && source='self_dev'`, performs a
+/// two-level shallow merge with existing metadata, and persists via
+/// `update_task_metadata`. Fire-and-forget: errors are logged but never
+/// propagated into the tool result.
+///
+/// Skip cases (silently): no callback context (conversation mode / mika-arch
+/// dispatch), callback not found, callback has no parent, parent is not a
+/// manual self_dev supervisor (milestone/project parent, operator task,
+/// etc.).
+async fn write_auto_merge_pr_url_to_supervisor(ctx: &ToolContext<'_>, pr_url: &str) {
+    // 1. Conversation mode and other non-callback turns have no identifiable
+    //    supervisor — skip without logging (expected, not anomalous).
+    let callback_id = match ctx.callback_task_id {
+        Some(id) => id,
+        None => return,
+    };
+
+    // 2. Look up the callback task to find its parent.
+    let callback = match ctx.db.get_task_unscoped(callback_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            warn!(
+                callback_task_id = %callback_id,
+                "pr_merge_with_gate: callback task not found for pr_url write"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                callback_task_id = %callback_id,
+                error = %e,
+                "pr_merge_with_gate: failed to load callback task for pr_url write"
+            );
+            return;
+        }
+    };
+    let parent_id = match callback.parent_task_id {
+        Some(id) => id,
+        None => return,
+    };
+
+    // 3. Verify parent is a manual self_dev supervisor — mirror the reaper's
+    //    guard set (find_orphaned_parent_tasks WHERE trigger_type='manual'
+    //    AND source='self_dev'). Skip milestone/project/operator parents.
+    let parent = match ctx.db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t)) if t.trigger_type == "manual" && t.source.as_deref() == Some("self_dev") => t,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "pr_merge_with_gate: failed to load supervisor task for pr_url write"
+            );
+            return;
+        }
+    };
+
+    // 4. Build patch object and two-level shallow merge with existing metadata
+    //    via the shared helper that update_task_status and
+    //    try_extract_callback_metadata also use (see #489).
+    let patch = serde_json::json!({"claude_pilot": {"pr_url": pr_url}});
+    let merged = match &parent.metadata {
+        Some(existing) => {
+            if let Ok(mut base) = serde_json::from_str::<serde_json::Value>(existing) {
+                crate::task_metadata::merge_metadata(&mut base, &patch);
+                base
+            } else {
+                patch
+            }
+        }
+        None => patch,
+    };
+
+    // 5. Persist via update_task_metadata (manual-only by SQL guard).
+    persist_supervisor_metadata(ctx.db, &parent_id, &merged.to_string(), pr_url).await;
+}
+
+/// Tiny helper isolated for unit-test of the persist arm. Same three-arm
+/// match shape as `try_extract_callback_metadata`.
+async fn persist_supervisor_metadata(
+    db: &AsyncDatabase,
+    parent_id: &str,
+    merged_json: &str,
+    pr_url: &str,
+) {
+    match db.update_task_metadata(parent_id, merged_json).await {
+        Ok(true) => info!(
+            supervisor_task_id = %parent_id,
+            pr_url = %pr_url,
+            "pr_merge_with_gate: wrote pr_url to supervisor metadata on auto_merge_enabled"
+        ),
+        Ok(false) => warn!(
+            supervisor_task_id = %parent_id,
+            "pr_merge_with_gate: supervisor task not found for pr_url write"
+        ),
+        Err(e) => warn!(
+            supervisor_task_id = %parent_id,
+            error = %e,
+            "pr_merge_with_gate: failed to persist pr_url to supervisor metadata"
+        ),
+    }
+}
 
 /// Try to extract an exit code integer from an error string like "gh exit code 1: ..."
 fn parse_exit_code_from_error(err: &str) -> i32 {
@@ -1318,5 +1434,331 @@ mod tests {
         let required = def.input_schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("pr_number")));
         assert!(required.contains(&json!("repo")));
+    }
+
+    // -- mika#1211: supervisor pr_url write tests --
+    //
+    // These tests exercise `write_auto_merge_pr_url_to_supervisor` directly
+    // instead of `tool.execute(...)` — the full execute path requires `gh`
+    // CLI subprocess calls. The helper is the entire surface this fix adds,
+    // so direct unit coverage is sufficient.
+
+    use crate::async_db::AsyncDatabase;
+    use crate::db::{Database, NewTask};
+    use crate::tools::ToolContext;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    /// Seed a manual self_dev supervisor task and a callback child for it.
+    /// Returns (supervisor_id, callback_id).
+    async fn seed_supervisor_and_callback(db: &AsyncDatabase) -> (String, String) {
+        seed_supervisor_and_callback_with(db, Some("self_dev"), "manual", None).await
+    }
+
+    async fn seed_supervisor_and_callback_with(
+        db: &AsyncDatabase,
+        source: Option<&str>,
+        trigger: &str,
+        initial_metadata: Option<&str>,
+    ) -> (String, String) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement mika#1211".to_string(),
+            trigger_type: trigger.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: source.map(String::from),
+            metadata: initial_metadata.map(String::from),
+            r#type: None,
+            dispatch_class: None,
+        };
+        let supervisor_id = db.create_task(parent).await.unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(supervisor_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        (supervisor_id, callback_id)
+    }
+
+    fn make_ctx<'a>(
+        db: &'a AsyncDatabase,
+        counter: &'a AtomicU32,
+        skills_dirty: &'a AtomicBool,
+        pr_review_posted: &'a AtomicBool,
+        tool_arg_suffix_rejected: &'a AtomicBool,
+        callback_task_id: Option<&'a str>,
+    ) -> ToolContext<'a> {
+        ToolContext {
+            db,
+            session_id: "test-session",
+            trace_id: "00000000000000000000000000000000",
+            home_dir: Path::new("/tmp/mika-test"),
+            global_home_dir: None,
+            core_memory_edit_count: counter,
+            is_onboarding: false,
+            message_sender: None,
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            skills_dirty,
+            is_reflection: false,
+            is_task_context: false,
+            is_callback_turn: callback_task_id.is_some(),
+            provider_name: "anthropic",
+            model_name: "claude-sonnet-4-6",
+            active_skill_paths: &[],
+            max_tasks_per_session: 25,
+            pr_review_posted,
+            pr_reviews_posted: None,
+            callback_task_id,
+            required_tool_arg_suffixes: &[],
+            tool_arg_suffix_rejected,
+        }
+    }
+
+    async fn read_pr_url(db: &AsyncDatabase, supervisor_id: &str) -> Option<String> {
+        let parent = db.get_task_unscoped(supervisor_id).await.unwrap().unwrap();
+        parent.metadata.and_then(|m| {
+            let v: serde_json::Value = serde_json::from_str(&m).ok()?;
+            v.get("claude_pilot")?
+                .get("pr_url")?
+                .as_str()
+                .map(String::from)
+        })
+    }
+
+    #[tokio::test]
+    async fn write_pr_url_writes_to_supervisor_when_callback_context_present() {
+        let db = AsyncDatabase::new({
+            let d = Database::open_in_memory().unwrap();
+            d.create_session("test-session", "mika", "cli").unwrap();
+            d
+        });
+        let (sup_id, cb_id) = seed_supervisor_and_callback(&db).await;
+
+        let counter = AtomicU32::new(0);
+        let sd = AtomicBool::new(false);
+        let pr = AtomicBool::new(false);
+        let tas = AtomicBool::new(false);
+        let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
+
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1206";
+        write_auto_merge_pr_url_to_supervisor(&ctx, pr_url).await;
+
+        assert_eq!(read_pr_url(&db, &sup_id).await.as_deref(), Some(pr_url));
+    }
+
+    #[tokio::test]
+    async fn write_pr_url_skips_when_no_callback_context() {
+        let db = AsyncDatabase::new({
+            let d = Database::open_in_memory().unwrap();
+            d.create_session("test-session", "mika", "cli").unwrap();
+            d
+        });
+        let (sup_id, _cb_id) = seed_supervisor_and_callback(&db).await;
+
+        let counter = AtomicU32::new(0);
+        let sd = AtomicBool::new(false);
+        let pr = AtomicBool::new(false);
+        let tas = AtomicBool::new(false);
+        let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, None);
+
+        write_auto_merge_pr_url_to_supervisor(
+            &ctx,
+            "https://github.com/senara-solutions/mika/pull/1206",
+        )
+        .await;
+
+        assert!(read_pr_url(&db, &sup_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_pr_url_skips_when_supervisor_source_not_self_dev() {
+        let db = AsyncDatabase::new({
+            let d = Database::open_in_memory().unwrap();
+            d.create_session("test-session", "mika", "cli").unwrap();
+            d
+        });
+        // Operator-sourced parent (not self_dev) — must be skipped.
+        let (sup_id, cb_id) =
+            seed_supervisor_and_callback_with(&db, Some("operator"), "manual", None).await;
+
+        let counter = AtomicU32::new(0);
+        let sd = AtomicBool::new(false);
+        let pr = AtomicBool::new(false);
+        let tas = AtomicBool::new(false);
+        let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
+
+        write_auto_merge_pr_url_to_supervisor(
+            &ctx,
+            "https://github.com/senara-solutions/mika/pull/9",
+        )
+        .await;
+
+        assert!(read_pr_url(&db, &sup_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_pr_url_skips_when_supervisor_trigger_not_manual() {
+        let db = AsyncDatabase::new({
+            let d = Database::open_in_memory().unwrap();
+            d.create_session("test-session", "mika", "cli").unwrap();
+            d
+        });
+        // Callback-typed parent (chained callback) — must be skipped.
+        let (sup_id, cb_id) =
+            seed_supervisor_and_callback_with(&db, Some("self_dev"), "callback", None).await;
+
+        let counter = AtomicU32::new(0);
+        let sd = AtomicBool::new(false);
+        let pr = AtomicBool::new(false);
+        let tas = AtomicBool::new(false);
+        let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
+
+        write_auto_merge_pr_url_to_supervisor(
+            &ctx,
+            "https://github.com/senara-solutions/mika/pull/9",
+        )
+        .await;
+
+        assert!(read_pr_url(&db, &sup_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_pr_url_preserves_existing_claude_pilot_fields() {
+        let db = AsyncDatabase::new({
+            let d = Database::open_in_memory().unwrap();
+            d.create_session("test-session", "mika", "cli").unwrap();
+            d
+        });
+        let initial = r#"{"claude_pilot":{"session_id":"abc","cost_usd":"1.50","turns":42}}"#;
+        let (sup_id, cb_id) =
+            seed_supervisor_and_callback_with(&db, Some("self_dev"), "manual", Some(initial)).await;
+
+        let counter = AtomicU32::new(0);
+        let sd = AtomicBool::new(false);
+        let pr = AtomicBool::new(false);
+        let tas = AtomicBool::new(false);
+        let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
+
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1206";
+        write_auto_merge_pr_url_to_supervisor(&ctx, pr_url).await;
+
+        let parent = db.get_task_unscoped(&sup_id).await.unwrap().unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(parent.metadata.as_ref().unwrap()).unwrap();
+        let cp = &metadata["claude_pilot"];
+        assert_eq!(cp["session_id"], "abc");
+        assert_eq!(cp["cost_usd"], "1.50");
+        assert_eq!(cp["turns"], 42);
+        assert_eq!(cp["pr_url"], pr_url);
+    }
+
+    #[tokio::test]
+    async fn write_pr_url_is_idempotent() {
+        let db = AsyncDatabase::new({
+            let d = Database::open_in_memory().unwrap();
+            d.create_session("test-session", "mika", "cli").unwrap();
+            d
+        });
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1206";
+        let initial = format!(r#"{{"claude_pilot":{{"pr_url":"{pr_url}"}}}}"#);
+        let (sup_id, cb_id) =
+            seed_supervisor_and_callback_with(&db, Some("self_dev"), "manual", Some(&initial))
+                .await;
+
+        let counter = AtomicU32::new(0);
+        let sd = AtomicBool::new(false);
+        let pr = AtomicBool::new(false);
+        let tas = AtomicBool::new(false);
+        let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
+
+        write_auto_merge_pr_url_to_supervisor(&ctx, pr_url).await;
+        write_auto_merge_pr_url_to_supervisor(&ctx, pr_url).await;
+
+        assert_eq!(read_pr_url(&db, &sup_id).await.as_deref(), Some(pr_url));
+    }
+
+    #[tokio::test]
+    async fn write_pr_url_skips_when_callback_has_no_parent() {
+        let db = AsyncDatabase::new({
+            let d = Database::open_in_memory().unwrap();
+            d.create_session("test-session", "mika", "cli").unwrap();
+            d
+        });
+        // Orphan callback — no parent_task_id.
+        let orphan = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let cb_id = db.create_task(orphan).await.unwrap();
+
+        let counter = AtomicU32::new(0);
+        let sd = AtomicBool::new(false);
+        let pr = AtomicBool::new(false);
+        let tas = AtomicBool::new(false);
+        let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
+
+        // Should not panic or error — just returns early.
+        write_auto_merge_pr_url_to_supervisor(
+            &ctx,
+            "https://github.com/senara-solutions/mika/pull/9",
+        )
+        .await;
     }
 }
