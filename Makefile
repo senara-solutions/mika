@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-server mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install test lint fmt check check-ngrok clean help calibrate-mika-dev calibrate-mika-arch
+.PHONY: build build-dashboard deploy stop restart install test lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -42,7 +42,7 @@ install: ## Copy release binaries to INSTALL_DIR (safe while services run)
 		echo "Installed $$bin -> $(INSTALL_DIR)/$$bin"; \
 	done
 
-deploy: build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
+deploy: deploy-info build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
 
 check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
 	@if ! curl -sf http://localhost:4040/api/tunnels > /dev/null 2>&1; then \
@@ -51,6 +51,19 @@ check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
 		echo "  Telegram webhooks will not reach the gateway."; \
 		echo "  Start ngrok: ngrok http 8080"; \
 		echo ""; \
+	fi
+
+deploy-info: ## Print built SHA and warn if local HEAD is behind origin/main
+	@echo "Building from: $$(git rev-parse --abbrev-ref HEAD) @ $$(git rev-parse --short HEAD) ($$(git log -1 --pretty=format:'%s'))"
+	@if git fetch -q origin main 2>/dev/null; then \
+	  AHEAD=$$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0); \
+	  if [ "$$AHEAD" -gt 0 ]; then \
+	    echo "WARNING: HEAD is $$AHEAD commits behind origin/main. Run 'git pull --ff-only' if you intended to deploy origin/main."; \
+	  else \
+	    echo "origin/main: up to date"; \
+	  fi; \
+	else \
+	  echo "NOTE: could not reach origin (network/auth) — skipping freshness check."; \
 	fi
 
 calibrate-mika-dev: ## Pre-swap calibration gate for mika-dev (MODEL=provider/model required)
@@ -64,6 +77,7 @@ calibrate-mika-arch: ## Pre-swap calibration gate for mika-arch (MODEL=provider/
 test: ## Run all tests
 	cargo test
 	@bash scripts/test-dispatch-symmetry.sh
+	@bash scripts/deploy-info-test.sh
 
 test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structurally symmetric (mika#893 R5)
 	@bash scripts/test-dispatch-symmetry.sh

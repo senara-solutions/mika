@@ -1,0 +1,12 @@
+deploy-info: ## Print built SHA and warn if local HEAD is behind origin/main
+	@echo "Building from: $$(git rev-parse --abbrev-ref HEAD) @ $$(git rev-parse --short HEAD) ($$(git log -1 --pretty=format:'%s'))"
+	@if git fetch -q origin main 2>/dev/null; then \
+	  AHEAD=$$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0); \
+	  if [ "$$AHEAD" -gt 0 ]; then \
+	    echo "WARNING: HEAD is $$AHEAD commits behind origin/main. Run 'git pull --ff-only' if you intended to deploy origin/main."; \
+	  else \
+	    echo "origin/main: up to date"; \
+	  fi; \
+	else \
+	  echo "NOTE: could not reach origin (network/auth) — skipping freshness check."; \
+	fi
