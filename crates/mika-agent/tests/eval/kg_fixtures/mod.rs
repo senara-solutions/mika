@@ -23,7 +23,7 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 /// Current schema version this fixture module is pinned to.
 /// Bump this when updating fixtures for a new schema version.
 /// Type is i64 to match db.rs::CURRENT_SCHEMA_VERSION source of truth.
-const PINNED_SCHEMA_VERSION: i64 = 37;
+const PINNED_SCHEMA_VERSION: i64 = 38;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,

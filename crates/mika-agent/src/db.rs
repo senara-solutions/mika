@@ -24,7 +24,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 37;
+pub const CURRENT_SCHEMA_VERSION: i64 = 38;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1152,6 +1152,11 @@ impl Database {
             info!(version = 37, "database migrated to v37");
         }
 
+        if (3..=37).contains(&version) {
+            self.migrate_v37_to_v38()?;
+            info!(version = 38, "database migrated to v38");
+        }
+
         Ok(())
     }
 
@@ -1206,7 +1211,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (37);
+            INSERT INTO schema_version (version) VALUES (38);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1581,7 +1586,8 @@ impl Database {
                 prompt_variant TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 response_text TEXT,
-                reasoning TEXT
+                reasoning TEXT,
+                system_prompt_bytes INTEGER
             );
             CREATE INDEX idx_llm_calls_trace ON llm_calls(trace_id);
             CREATE INDEX idx_llm_calls_session ON llm_calls(session_id);
@@ -4110,6 +4116,33 @@ impl Database {
         Ok(())
     }
 
+    /// v37→v38: Add `system_prompt_bytes` column to `llm_calls` (mika#1217).
+    ///
+    /// Per-call assembled-system-prompt byte count for context-budget
+    /// observability. Nullable; pre-v38 rows stay NULL. Mirrors v30→v31's
+    /// additive-nullable shape and the `column_exists` guard pattern.
+    fn migrate_v37_to_v38(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 38 {
+            return Ok(());
+        }
+
+        let has_column = self.column_exists("llm_calls", "system_prompt_bytes")?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !has_column {
+            tx.execute_batch("ALTER TABLE llm_calls ADD COLUMN system_prompt_bytes INTEGER;")?;
+        }
+        tx.execute("INSERT INTO schema_version (version) VALUES (38)", [])?;
+        tx.commit()?;
+
+        info!("v37→v38: added system_prompt_bytes column to llm_calls (mika#1217)");
+
+        Ok(())
+    }
+
     /// v27 startup guard: refuse to open the database if the coalesce step
     /// from #787 has not run. Pins to `schema_version == 27` — future v28
     /// should carry its own guard, not inherit v27's.
@@ -6177,13 +6210,14 @@ impl Database {
         prompt_variant: Option<&str>,
         response_text: Option<&str>,
         reasoning: Option<&str>,
+        system_prompt_bytes: Option<i64>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO llm_calls (id, agent_id, session_id, trace_id, provider, model,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
              latency_ms, stop_reason, status, error_message, step, prompt_variant,
-             response_text, reasoning)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             response_text, reasoning, system_prompt_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 id,
                 agent_id,
@@ -6203,6 +6237,7 @@ impl Database {
                 prompt_variant,
                 response_text,
                 reasoning,
+                system_prompt_bytes,
             ],
         )?;
         Ok(())
@@ -15331,6 +15366,7 @@ mod tests {
         db2.migrate_v34_to_v35().unwrap();
         db2.migrate_v35_to_v36().unwrap();
         db2.migrate_v36_to_v37().unwrap();
+        db2.migrate_v37_to_v38().unwrap();
 
         let final_version: i64 = db2
             .conn

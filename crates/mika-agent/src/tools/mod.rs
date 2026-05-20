@@ -660,6 +660,74 @@ pub fn team_tools(workspace_dir: &Path, reference_dir: Option<&Path>) -> Vec<Box
 }
 
 /// Create a registry with all built-in tools.
+/// Names of all engine-registered builtin tools (default + management +
+/// handler-builtin) used by the skill validator to suppress false-positive
+/// `[constraints] required_tools` warnings (mika#1217 F4).
+///
+/// Parity with `default_tools()` + `management_tools_if_needed()` (the
+/// engine tools added to `ToolRegistry`) plus `skills::builtin_handlers::
+/// KNOWN_BUILTINS` (handler-builtins dispatched by name) is enforced by the
+/// `test_builtin_tool_names_parity` unit test below.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    // default_tools() — registered for every agent
+    "a2a_call",
+    "update_core_memory",
+    "store_fact",
+    "search_memory",
+    "update_fact",
+    "create_reminder",
+    "list_reminders",
+    "cancel_reminder",
+    "cancel_task",
+    "complete_task",
+    "get_task",
+    "send_message",
+    "create_skill",
+    "delete_skill",
+    "list_skills",
+    "toggle_skill",
+    "update_skill",
+    "get_config",
+    "set_config",
+    "write_agent_file",
+    "read_agent_file",
+    "list_agent_files",
+    "list_scheduled_tasks",
+    "list_tasks",
+    "check_task",
+    "pr_merge_with_gate",
+    "resolve_issue_order",
+    "query_knowledge_graph",
+    "query_timeline",
+    "get_session_messages",
+    "list_audit_events",
+    "search_tool_history",
+    // management_tools_if_needed() — always-added management tools
+    "create_agent",
+    "create_team",
+    "list_agents",
+    // management_tools_if_needed() — conditionally-added (N>1 agents or teams)
+    "list_teams",
+    "run_team",
+    "delegate_task",
+    "get_team_status",
+    "get_team_history",
+    "delete_team",
+    "update_team",
+    "add_team_member",
+    "remove_team_member",
+    "create_task",
+    "update_task_status",
+    // skills::builtin_handlers::KNOWN_BUILTINS — handler-builtins
+    "get_documentation",
+    "gh_read",
+    "git_ops",
+    "review_skill",
+    "run_gh",
+    "run_gws",
+    "web_search",
+];
+
 pub fn default_tools() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(a2a_call::A2aCallTool));
@@ -770,6 +838,68 @@ pub fn management_tools_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    /// mika#1217 F4 — `BUILTIN_TOOL_NAMES` must list every engine-registered
+    /// tool name (default_tools + management_tools_if_needed + KNOWN_BUILTINS).
+    /// The skill validator (`validate_skill` §5b) uses the const to suppress
+    /// false-positive warnings on `[constraints] required_tools` references.
+    /// Drift between this const and the real registries silently mis-handles
+    /// new builtins, so this parity test enforces sync.
+    #[test]
+    fn test_builtin_tool_names_parity() {
+        // Collect default_tools() names.
+        let registry = default_tools();
+        let mut engine_tools: HashSet<String> = registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+
+        // Add management_tools_if_needed names — both always-added and
+        // conditionally-added. Conditional set fires when N>1 agents or
+        // teams exist; we list both for the const because the validator
+        // does not know agent count at scan time.
+        for name in &[
+            "create_agent",
+            "create_team",
+            "list_agents",
+            "list_teams",
+            "run_team",
+            "delegate_task",
+            "get_team_status",
+            "get_team_history",
+            "delete_team",
+            "update_team",
+            "add_team_member",
+            "remove_team_member",
+            "create_task",
+            "update_task_status",
+        ] {
+            engine_tools.insert((*name).to_string());
+        }
+
+        // Add KNOWN_BUILTINS (handler-builtins dispatched by name in
+        // skills::builtin_handlers::execute).
+        for name in crate::skills::builtin_handlers::KNOWN_BUILTINS {
+            engine_tools.insert((*name).to_string());
+        }
+
+        let const_tools: HashSet<String> = BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        let missing_from_const: Vec<&String> = engine_tools.difference(&const_tools).collect();
+        let extra_in_const: Vec<&String> = const_tools.difference(&engine_tools).collect();
+
+        assert!(
+            missing_from_const.is_empty() && extra_in_const.is_empty(),
+            "BUILTIN_TOOL_NAMES out of sync with engine registries\n  \
+             missing (add to const): {missing_from_const:?}\n  \
+             extra (remove from const): {extra_in_const:?}"
+        );
+    }
 
     // === validate_uuid tests ===
 

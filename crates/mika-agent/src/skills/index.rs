@@ -816,20 +816,38 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
     }
 
     // 5b. Validate [constraints] required_tools against known tool names
+    //
+    // Suppression order (mika#1217 F4):
+    //   1. Tool is in this skill's own tools.json → silently OK.
+    //   2. Tool name matches a registered engine builtin (default_tools +
+    //      management_tools_if_needed + KNOWN_BUILTINS) → emit Ok diagnostic.
+    //   3. Tool name plausibly matches a declared dependency (prefix heuristic) → silently OK.
+    //   4. Otherwise → Warn (could be MCP tool that connects at startup, a
+    //      dependency tool whose name doesn't follow the prefix convention,
+    //      or a legitimate skill misconfig).
     for required in &manifest.constraints.required_tools {
-        if !skill_tool_names.contains(required) {
-            // Check if the tool name plausibly comes from a declared dependency
-            let likely_from_dep = manifest.skill.dependencies.iter().any(|dep| {
-                let prefix = dep.replace('-', "_");
-                required.starts_with(&prefix)
-            });
-            if !likely_from_dep {
-                diags.push(SkillDiagnostic::warn(format!(
-                    "[constraints] required_tools references '{}' which is not in this skill's \
-                     tools.json — this is OK if it's a builtin, MCP, or dependency tool",
-                    required
-                )));
-            }
+        if skill_tool_names.contains(required) {
+            continue;
+        }
+        if crate::tools::BUILTIN_TOOL_NAMES.contains(&required.as_str()) {
+            diags.push(SkillDiagnostic::ok(format!(
+                "[constraints] required_tools references '{}' — registered engine builtin",
+                required
+            )));
+            continue;
+        }
+        // Check if the tool name plausibly comes from a declared dependency
+        let likely_from_dep = manifest.skill.dependencies.iter().any(|dep| {
+            let prefix = dep.replace('-', "_");
+            required.starts_with(&prefix)
+        });
+        if !likely_from_dep {
+            diags.push(SkillDiagnostic::warn(format!(
+                "[constraints] required_tools references '{}' which is not in this skill's \
+                 tools.json — this is OK if it's an MCP tool or a dependency tool whose name \
+                 does not follow the dep-prefix convention",
+                required
+            )));
         }
     }
 
