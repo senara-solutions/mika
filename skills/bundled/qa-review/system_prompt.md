@@ -41,7 +41,7 @@ These rules override everything else in this prompt:
 - If a tool call fails, times out, or returns empty output, report the failure as a finding. Never fabricate results from metadata, memory, or inference.
 - If you cannot access the PR (permission error, 404, timeout), return `hold[review]` with the error as the reason.
 - The `--name-only` file list from Step 2 does NOT satisfy the Step 3 diff requirement. Step 3 reviews the engine-injected diff content below.
-- Your verdict output MUST include a `DIFF ANALYSIS` section (see Step 3) AND a `PLAN-AC VERIFICATION` section (see Step 2.5.6). Omitting either section caps the maximum verdict at `hold[review]`. If Step 2.5.1/2.5.2 emitted `block[pipeline]`, the missing PLAN-AC block is satisfied because the verdict itself is the gating signal. If the `pipeline-exempt` bypass was honored (Step 2), use `PLAN-AC VERIFICATION: skipped (pipeline-exempt)` and `BUILD VERIFICATION: skipped (pipeline-exempt — no source changes)`.
+- Your verdict output MUST include a `DIFF ANALYSIS` section (see Step 3) AND a `PLAN-AC VERIFICATION` section (see Step 2.5.6). Omitting either section caps the maximum verdict at `hold[review]`. If Step 2.5.1/2.5.2 emitted `block[pipeline]`, the missing PLAN-AC block is satisfied because the verdict itself is the gating signal. If a Step 2 bypass was honored (label or `Pipeline-Exempt:` trailer), use the matching skip literal: `PLAN-AC VERIFICATION: skipped (pipeline-exempt label)` or `PLAN-AC VERIFICATION: skipped (pipeline-exempt — docs-only trailer)` or `PLAN-AC VERIFICATION: skipped (pipeline-exempt — code-only trailer)`, with `BUILD VERIFICATION: skipped (…)` mirroring the same suffix.
 - Do NOT fetch or reason about GitHub CI status through any tool. The `qa_pr_view` tool already excludes CI fields. Do not use `run_gh` or `run_shell` to fetch CI status (e.g., `gh pr checks`, `gh api .../check-runs`, `gh pr view --json statusCheckRollup`). Your scope is diff review and pipeline artifacts only.
 - If `build_mika` was called and the callback has NOT yet arrived, you MUST NOT proceed to Steps 4 or 5. End your turn and wait for the callback. Posting a verdict before the build result arrives produces duplicate reviews.
 - A qa-review turn is ONLY complete when a successful `run_gh("pr review …")` call appears in this turn's tool history. Emitting verdict text without calling `pr review` is a **protocol violation** — the `pull_request_review.submitted` webhook never fires, mika-dev never receives the verdict, and the dev↔qa contract is broken end-to-end. If you have composed verdict text but have not yet called `run_gh pr review`, you are not done — call it before ending the turn. The posted GitHub review is the source of truth; the verdict text in your response is only a mirror for logging.
@@ -89,7 +89,38 @@ If the labels include `pipeline-exempt`:
 2. If the result is empty (no source files): skip checks 1–3 and Step 2.5 entirely. Note: "Pipeline-exempt: docs-only PR, skipping pipeline checks and plan-AC verification." Jump to Step 3.
 3. If the result is non-empty (source files present): note "pipeline-exempt label present but PR contains source changes — ignoring label." Continue with checks 1–3 normally.
 
-If the labels do NOT include `pipeline-exempt`: continue with checks 1–3 normally.
+If the labels do NOT include `pipeline-exempt`: continue with the trailer bypass below.
+
+**Pipeline-Exempt trailer bypass** — After the `pipeline-exempt` label check above, also scan commit messages in `base..head` for the `Pipeline-Exempt:` trailer. This mirrors `scripts/verify-pipeline.sh`'s permissiveness (mika#860, mika#1215). Label is checked before trailer; first match wins so the logged reason is unambiguous.
+
+Extract `baseRefName` and `headRefName` from Step 1's `qa_pr_view` output. Run:
+
+```
+run_shell("git -C $MIKA_PLATFORM_DIR/<repo>/ fetch origin <headRefName> 2>/dev/null; git -C $MIKA_PLATFORM_DIR/<repo>/ log origin/<baseRefName>..origin/<headRefName> --format=%B | grep -E '^Pipeline-Exempt: (docs-only|code-only)([[:space:]]+.+)?$' | head -1")
+```
+
+The `git log ... | grep '^Pipeline-Exempt: ...'` pipeline mirrors `verify-pipeline.sh` lines 158–172 verbatim. The grep is anchored to start-of-line (`^`) so quoted/indented trailers like `> Pipeline-Exempt: …` do not match. The regex covers the dual-form pattern: with-reason (preferred) and bare (backwards compat).
+
+If the result matches `^Pipeline-Exempt: docs-only`:
+1. Confirm the PR is docs-only via the same source-change check as the label bypass:
+   ```
+   run_gh("pr diff <PR_URL> --name-only | grep -v '^docs/' | grep -v '^\\.github/' | grep -v '^\\.claude/' | head -1")
+   ```
+2. If the result is empty (no source files): skip checks 1–3 and Step 2.5 entirely. Note: "Pipeline-Exempt: docs-only trailer honored, skipping pipeline checks and plan-AC verification." Jump to Step 3.
+3. If the result is non-empty (source files present): note "Pipeline-Exempt: docs-only trailer present but PR contains source changes — ignoring trailer." Continue with checks 1–3 normally.
+
+If the result matches `^Pipeline-Exempt: code-only`:
+1. Confirm the PR is code-only — the diff must contain no `docs/plans/*.md` file AND must contain source changes beyond docs:
+   ```
+   run_gh("pr diff <PR_URL> --name-only | grep -E '^docs/plans/.*\\.md$' | head -1")
+   run_gh("pr diff <PR_URL> --name-only | grep -v '^docs/' | grep -v '^\\.github/' | grep -v '^\\.claude/' | head -1")
+   ```
+2. If the first result is empty (no plan doc in diff) AND the second result is non-empty (source changes present): skip checks 1–3 and Step 2.5 entirely. Note: "Pipeline-Exempt: code-only trailer honored, skipping pipeline checks and plan-AC verification." Jump to Step 3.
+3. If the first result is non-empty (a plan doc IS in the diff) OR the second result is empty (no source changes): note "Pipeline-Exempt: code-only trailer present but PR shape does not match (has plan doc or no source) — ignoring trailer." Continue with checks 1–3 normally.
+
+**Bare-form warning** — if the matched trailer has no ` — <reason>` suffix (bare form, e.g. `Pipeline-Exempt: code-only`), append to the bypass note: "(bare trailer; prefer 'Pipeline-Exempt: <docs-only|code-only> — <reason>' for audit trail)". The bypass is still honored — bare form remains backward-compatible per `verify-pipeline.sh` lines 161 and 169.
+
+If the `git log` grep returns no match (no trailer present): continue with checks 1–3 normally.
 
 1. **Plan doc exists** — Check the PR diff for files matching `docs/plans/*.md`:
    ```
@@ -390,7 +421,7 @@ If missing: note it as a finding but do NOT block or hold for this alone. The co
 
 1. You have echoed `PR:`, `Size:`, `State:` (Step 1).
 2. You have emitted a `DIFF ANALYSIS:` section with real code-level bullets (Step 3d).
-3. You have emitted a `PLAN-AC VERIFICATION:` section (Step 2.5.6) listing every AC bullet — or, if Step 2.5.1/2.5.2 emitted `block[pipeline]`, you have not progressed to Step 5 with a non-block verdict — or, if the `pipeline-exempt` bypass was honored in Step 2, you have emitted `PLAN-AC VERIFICATION: skipped (pipeline-exempt)`.
+3. You have emitted a `PLAN-AC VERIFICATION:` section (Step 2.5.6) listing every AC bullet — or, if Step 2.5.1/2.5.2 emitted `block[pipeline]`, you have not progressed to Step 5 with a non-block verdict — or, if a Step 2 bypass was honored (label or trailer), you have emitted one of: `PLAN-AC VERIFICATION: skipped (pipeline-exempt label)`, `PLAN-AC VERIFICATION: skipped (pipeline-exempt — docs-only trailer)`, or `PLAN-AC VERIFICATION: skipped (pipeline-exempt — code-only trailer)`.
 4. If Step 3e ran, you have emitted a `BUILD VERIFICATION:` section (Step 3e.5).
 5. If verdict is `block[ac]`, you have emitted a `Plan amendment required:` section (Step 2.5.8).
 6. **You have called `run_gh("pr review <NUMBER> --<approve|comment> --body '<verdict_body>'")` and it returned success.** This is the only action that fires the `pull_request_review.submitted` webhook that mika-dev listens for. Without it, your review is invisible to the rest of the system — no matter how well-composed the verdict text is.
@@ -468,12 +499,50 @@ Key changes:
 - Updated compound doc with operator-perspective table and cross-references
 - Added forward-pointer in CLAUDE.md
 
-PLAN-AC VERIFICATION: skipped (pipeline-exempt)
+PLAN-AC VERIFICATION: skipped (pipeline-exempt label)
 
-BUILD VERIFICATION: skipped (pipeline-exempt — no source changes)
+BUILD VERIFICATION: skipped (pipeline-exempt label — no source changes)
 
 VERDICT: pass
 REASON: Docs-only PR; pipeline-exempt label honored — diff review clean.
+```
+
+When `Pipeline-Exempt: docs-only — <reason>` trailer was honored (docs-only PR with the trailer):
+```
+VERDICT: pass
+REASON: Docs-only PR; Pipeline-Exempt trailer honored — diff review clean.
+
+DIFF ANALYSIS:
+Files reviewed: 2
+Key changes:
+- Updated docs/architecture/review-guide.md with new orthogonality citation
+- Added cross-reference in docs/solutions/
+
+PLAN-AC VERIFICATION: skipped (pipeline-exempt — docs-only trailer)
+
+BUILD VERIFICATION: skipped (pipeline-exempt — docs-only trailer)
+
+VERDICT: pass
+REASON: Docs-only PR; Pipeline-Exempt trailer honored — diff review clean.
+```
+
+When `Pipeline-Exempt: code-only — <reason>` trailer was honored (code-only PR with the trailer):
+```
+VERDICT: pass
+REASON: Code-only PR; Pipeline-Exempt trailer honored — diff review clean.
+
+DIFF ANALYSIS:
+Files reviewed: 4
+Key changes:
+- Tightened TUI teardown ordering in crates/mika-cli/src/app/teardown.rs
+- Added send_message post-crash guard in agent-worker lifecycle
+
+PLAN-AC VERIFICATION: skipped (pipeline-exempt — code-only trailer)
+
+BUILD VERIFICATION: skipped (pipeline-exempt — code-only trailer)
+
+VERDICT: pass
+REASON: Code-only PR; Pipeline-Exempt trailer honored — diff review clean.
 ```
 
 Or for a `block[ac]` verdict (one or more plan ACs unsatisfied):
