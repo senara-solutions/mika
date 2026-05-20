@@ -847,6 +847,11 @@ async fn run_loop(
     // Whether we already injected a fabricated-action correction. Only allow one retry.
     // Guards against fabricated action claims with URLs but zero tool calls (#308).
     let mut fabricated_action_retry_done = false;
+    // Whether we already injected a dev-groom fabrication correction. Only allow one retry.
+    // Guards against "Verdict: GROOMED/ESCALATE" in conversation-mode text without a
+    // successful run_claude_pilot_groom call in the turn. dev-groom is a dispatcher —
+    // verdicts arrive via callback, not from the dispatcher LLM's turn. See #1133.
+    let mut dev_groom_fabrication_retry_done = false;
     // Whether we already injected a prose-style tool call correction. Only allow one retry.
     // Guards against prose-style tool call leaks like `tool_name({"key": "val"})` (#569).
     let mut prose_tool_call_retry_done = false;
@@ -1438,6 +1443,72 @@ async fn run_loop(
                             )),
                         });
                         continue;
+                    }
+
+                    // #1133 — dev-groom fabrication guard (position 5b). Detects
+                    // "Verdict: GROOMED" / "Verdict: ESCALATE" in conversation-mode
+                    // mika-dev text without a satisfying run_claude_pilot_groom tool
+                    // call in the turn. dev-groom is a dispatcher — verdicts arrive
+                    // via callback, not from this turn.
+                    //
+                    // Gating:
+                    //   - Only when `run_claude_pilot_groom` is in the agent's tool
+                    //     set (the dev-groom skill is loaded). Producer skills like
+                    //     mika-arch-second-review legitimately emit Verdict lines —
+                    //     they don't have this tool and bypass the guard entirely.
+                    //   - Conversation mode only (`mode.is_conversation()`). Callback
+                    //     turns legitimately carry Verdict lines from the inner session
+                    //     and must pass through unaffected.
+                    //   - EndTurn only (don't fire mid-tool).
+                    //   - Single-retry (mirror of #864 retry pattern).
+                    if !skip_remaining_guards
+                        && enabled_tool_names.contains("run_claude_pilot_groom")
+                        && mode.is_conversation()
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !dev_groom_fabrication_retry_done
+                    {
+                        let claims_verdict = text.lines().any(|line| {
+                            let t = line.trim();
+                            t == "Verdict: GROOMED" || t == "Verdict: ESCALATE"
+                        });
+                        let dispatched = all_tool_summaries
+                            .iter()
+                            .any(|s| s.name == "run_claude_pilot_groom" && s.success);
+                        if claims_verdict && !dispatched {
+                            dev_groom_fabrication_retry_done = true;
+                            warn!(
+                                step,
+                                label = mode.label(),
+                                "dev-groom fabrication guard: response claims Verdict \
+                                 without a successful run_claude_pilot_groom call — \
+                                 re-prompting (#1133)"
+                            );
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::Assistant,
+                                content: LlmContent::Blocks(
+                                    mika_common::llm::response_content_to_blocks(&response.content),
+                                ),
+                            });
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::User,
+                                content: LlmContent::Text(
+                                    "[mika-engine] Your response contains `Verdict: GROOMED` \
+                                     or `Verdict: ESCALATE` but you did not call \
+                                     `run_claude_pilot_groom` in this turn. The dev-groom \
+                                     skill is a dispatcher — verdicts arrive via callback \
+                                     from claude-pilot, never from your turn.\n\n\
+                                     If grooming dispatch is genuinely needed: call \
+                                     `run_claude_pilot_groom` now and re-emit a dispatch \
+                                     acknowledgement (no Verdict line).\n\
+                                     If grooming dispatch is not needed (e.g., ticket is \
+                                     already groomed and you're just answering a status \
+                                     question): re-emit your response with the Verdict \
+                                     line removed."
+                                        .to_string(),
+                                ),
+                            });
+                            continue;
+                        }
                     }
 
                     // Intent-precondition registry (#702): iterate INTENT_GUARDS

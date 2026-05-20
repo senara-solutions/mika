@@ -1,7 +1,7 @@
 [skill]
 name = "dev-groom"
 description = "Two-pass grooming flow (operator or autonomous) — takes a ticket from open to GROOMED plan-on-branch via /ce:plan and mika-arch architect review"
-version = "0.1.0"
+version = "0.2.0"
 always_on = false
 timeout_secs = 600
 
@@ -13,8 +13,11 @@ keywords = [
     "groom issue",
 ]
 
-[output]
-required_suffix_lines = [
-    "Verdict: GROOMED",
-    "Verdict: ESCALATE",
-]
+[constraints]
+required_tools = ["run_claude_pilot_groom"]
+
+# [output] block intentionally removed — dev-groom is a dispatcher.
+# The verdict is produced by the inner Claude Code session and arrives
+# via callback. mika-dev's conversation-mode response should not emit
+# Verdict: GROOMED — the structural guard in agent.rs enforces this.
+# See mika#1133.
