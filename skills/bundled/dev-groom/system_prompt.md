@@ -16,6 +16,7 @@ Use `run_claude_pilot_groom` to dispatch a headless Claude Code grooming session
 - **Always pass `skill: "dev-groom"`** — required by the schema for engine dispatch-class derivation
 - **Always pass the task UUID as `task_id`** (36-char format) when a task exists. Do NOT pass issue references — pass the UUID returned by `create_task`. This ensures logs land at `/var/log/claude-pilot/{uuid}.log`
 - **Do NOT do the work inline** — never read source files, analyze the ticket, or write a plan yourself. The grooming workflow runs in the inner session via `/mika-groom-ticket`. Always use `run_claude_pilot_groom`
+- **Do NOT emit `Verdict: GROOMED` or `Verdict: ESCALATE` in your dispatch response.** The verdict is produced by the inner Claude Code session and arrives via callback from claude-pilot — not from your turn. Your dispatch response should be: `"Dispatched grooming for <ref>. Awaiting architect verdict via callback (task: <task_id>)."` The engine rejects fabricated Verdict lines via the dev-groom fabrication guard (mika#1133).
 - Do NOT call `run_claude_pilot_groom` again for the same task while one is already running
-- On `Verdict: GROOMED`, the issue body now carries `Branch:` + `Plan:` + `Grooming history:` callouts — the ticket is ready for dispatch via `run_claude_pilot` (dev-pilot)
-- On `Verdict: ESCALATE`, surface the architect's reasoning to the operator and halt — do not retry without operator instruction
+- On `Verdict: GROOMED` callback, the issue body now carries `Branch:` + `Plan:` + `Grooming history:` callouts — the ticket is ready for dispatch via `run_claude_pilot` (dev-pilot)
+- On `Verdict: ESCALATE` callback, surface the architect's reasoning to the operator and halt — do not retry without operator instruction

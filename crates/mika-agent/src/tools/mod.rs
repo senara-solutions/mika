@@ -901,6 +901,45 @@ mod tests {
         );
     }
 
+    /// Dispatcher skills (skills that forward work to claude-pilot and receive
+    /// verdicts via callback) must NOT declare `[output] required_suffix_lines`.
+    /// That config is for **producer** skills whose LLM emits the verdict text
+    /// directly. Putting it on a dispatcher creates fabrication pressure: the
+    /// suffix-line guard (#864) rejects EndTurn for missing Verdict, the
+    /// corrective re-prompt names the accept-set, and the LLM rationalizes by
+    /// fabricating `Verdict: GROOMED`. See mika#1133.
+    #[test]
+    fn test_dispatcher_skills_dont_declare_required_suffix_lines() {
+        use crate::skills::manifest::SkillManifest;
+
+        let dispatchers = ["self-dev", "dev-pilot", "dev-groom"];
+        let skills_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bundled");
+
+        for name in dispatchers {
+            let manifest_path = skills_dir.join(name).join("skill.toml");
+            assert!(
+                manifest_path.exists(),
+                "Dispatcher skill {} not found at {}",
+                name,
+                manifest_path.display()
+            );
+
+            let content = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", manifest_path.display(), e));
+            let manifest: SkillManifest = toml::from_str(&content)
+                .unwrap_or_else(|e| panic!("Failed to parse {}: {}", manifest_path.display(), e));
+
+            assert!(
+                manifest.output.required_suffix_lines.is_empty(),
+                "Dispatcher skill {} must not declare required_suffix_lines. \
+                 Dispatchers forward to claude-pilot; verdicts arrive via \
+                 callback, not from the dispatcher LLM's turn. See mika#1133.",
+                name
+            );
+        }
+    }
+
     // === validate_uuid tests ===
 
     #[test]
