@@ -165,8 +165,15 @@ async fn deferred_ack_does_not_trigger_supervisor_blocked_transition() {
     assert_tool_output_contains(&trace1, "run_claude_pilot", 0, "already_deferred");
 
     // Turn 2: unauthorized comment fallthrough — stub still returns deferred
-    // ack (the mika#1205 intercept's contract). LLM should acknowledge and
-    // NOT mark the supervisor blocked.
+    // ack (the mika#1205 intercept's contract). LLM calls run_claude_pilot,
+    // but the webhook_no_unauthorized_dispatch guard (#910) fires because
+    // comment webhooks must not dispatch. The guard injects a correction and
+    // the LLM retries — this time acknowledging without dispatching. The
+    // critical assertion is that the supervisor task stays in_progress (the
+    // LLM never calls update_task_status(blocked)).
+    //
+    // Three responses: (1) tool call, (2) guard-rejected text with dispatch,
+    // (3) post-correction acknowledgement without dispatch.
     let trace2 = harness
         .run_turn(
             "[GitHub] New comment on senara-solutions/mika#1205",
@@ -180,6 +187,11 @@ async fn deferred_ack_does_not_trigger_supervisor_blocked_transition() {
                     }),
                 ),
                 text_response("Prior dispatch already queued. Leaving supervisor in_progress."),
+                // Post-correction response after webhook_no_unauthorized_dispatch
+                // guard rejects the turn (comment webhook must not dispatch).
+                text_response(
+                    "Acknowledged comment webhook. Prior dispatch is queued as deferred callback.",
+                ),
             ],
         )
         .await
