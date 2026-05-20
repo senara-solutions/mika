@@ -15,6 +15,27 @@ mika-dev's `run_gh` calls are being blocked by `validate_qa_review_gh_scope`, sc
 
 The ticket's initial framing (qa-review in `MIKA_DEV_IDENTITY` allowlist) is **wrong by inspection** — the static const at `crates/mika-agent/src/well_known_agents.rs:108-143` does NOT contain `qa-review`. The actual root cause is one layer deeper.
 
+## Phase 0 Pin — load-bearing sites
+
+Concrete anchors the implementer must read before writing any code. All paths are relative to the mika repo root.
+
+| # | Site | What it does | Why it matters |
+|---|------|--------------|----------------|
+| 1 | `crates/mika-agent/src/well_known_agents.rs:437-522` (`provision_well_known_agents`) | Iterates `WELL_KNOWN_AGENTS`; for each, calls `agent_exists` and `continue`s on hit (line 448-453) | This is where the bug lives — the `continue` short-circuits drift propagation. Reconciliation replaces this `continue`. |
+| 2 | `crates/mika-agent/src/well_known_agents.rs:108-143` (`MIKA_DEV_IDENTITY`) | Static const template for mika-dev identity.toml — contains `[skills].allowlist` with 26 entries | Source of truth for mika-dev's allowlist. Reconciler reads it via `render_identity_content` (line 410-422). |
+| 3 | `crates/mika-agent/src/well_known_agents.rs:168-194` (`MIKA_QA_IDENTITY`) | Same shape for mika-qa — 17-entry allowlist | Same role as #2. |
+| 4 | `crates/mika-agent/src/well_known_agents.rs:220-227` (`MIKA_RELAY_IDENTITY`) | mika-relay — 1-entry allowlist (`permission-policy`) | Same role as #2. |
+| 5 | `crates/mika-agent/src/well_known_agents.rs:333-383` (`build_mika_arch_identity`) | Computed identity for mika-arch — runtime-resolved `[kg].docs_roots` + `[skills].allowlist` + `[tools].disabled` + `[context.summary] inject = false` | mika-arch's expected identity is COMPUTED, not static. Reconciler invokes `render_identity_content(spec, settings)` (which dispatches to this function) rather than reading a const directly. |
+| 6 | `crates/mika-agent/src/well_known_agents.rs:295-325` (`MIKA_ARCH_DISABLED_TOOLS`) | The `[tools].disabled` array for mika-arch — 22 platform-mutational tools | Reconciler must overwrite the on-disk `[tools].disabled` to match this const. |
+| 7 | `crates/mika-agent/src/well_known_agents.rs:410-422` (`render_identity_content`) | Resolves the spec's `identity_source` to a string (Static / Computed / default) | Existing function the reconciler calls to get the canonical expected content per agent. |
+| 8 | `crates/mika-agent/src/skills/mod.rs:390-426` (`apply_identity_allowlist`) | Phase -1 of the skill registry filter — evicts non-allowlisted skills when `allowlist` is non-empty | The wedge: when on-disk identity has no `[skills]` block, `identity.skills.allowlist` is `None` and this function is never called (per `if let Some(...)` in callers). |
+| 9 | `crates/mika-agent/src/server/mod.rs:374-410` (`init_agent` skill setup) | Loads identity, conditionally applies allowlist, applies DB overrides | The downstream consumer that depends on the reconciler having run first. |
+| 10 | `crates/mika-agent/src/server/mod.rs:579-597` (`run_server` entry) | Calls `provision_well_known_agents` on dev_mode startup | Where reconciliation lifecycle starts. Reconciliation is internal to #1, so no new call site here. |
+| 11 | `crates/mika-agent/src/skills/builtin_handlers.rs:1806-1833` (`validate_qa_review_gh_scope`) | The validator that fires on `run_gh` when qa-review is in `active_skill_paths` | The observable wedge. Post-fix, qa-review is evicted from mika-dev's registry → never reaches `active_skill_paths` → validator no-ops. Direct correctness signal. |
+| 12 | `crates/mika-agent/src/well_known_agents.rs:618-786` (`seed_well_known_skill_overrides`) | The DB-side reconciler for `disabled_skills` and `llm_overrides` drift (mika#1041) | **Pattern precedent.** New identity reconciler mirrors this shape (idempotent, reconcile-on-restart, info-log on changes). |
+| 13 | `skills/bundled/qa-review/skill.toml` (`always_on = true`) | Marks qa-review as always-on for matching | Confirmed: this is why qa-review fires without keyword match. No change here — fix is in identity allowlist enforcement. |
+| 14 | `~/.mika/agents/<name>/identity.toml` (on host) | Empirical state of the four well-known agents | Verified: mika-dev/qa/relay missing `[skills]`; mika-arch missing `mika-arch-groom-milestone` + `[context.summary]`. |
+
 ## Root cause
 
 `provision_well_known_agents()` (line 437 of `well_known_agents.rs`) short-circuits on `mika_common::agent::agent_exists(home_dir, spec.name)` and skips the agent entirely (line 448-453: `continue`). Once a well-known agent has been provisioned on this host, its on-disk `identity.toml` is **frozen** — subsequent changes to the static `MIKA_*_IDENTITY` templates (e.g., the addition of `[skills].allowlist` in #815) never reach the file.
@@ -42,15 +63,46 @@ Add a reconciliation step that runs on every server startup (same gate as `provi
 
 ### Reconciled sections (code-owned)
 
-| Section | Why code-owned |
-|---------|----------------|
-| `[skills].allowlist` | Security contract — `crates/mika-agent/CLAUDE.md` "Adding a New Bundled Skill" step 4 names the static const as the source of truth; operators add skills via PR, not by editing identity.toml |
-| `[tools].disabled` | Same — defense-in-depth for read-only agent invariant (mika-arch); operators do not edit |
-| `[context.summary]` (`inject` + `max_tokens`) | mika#1009 leak protection; code-owned per mika-arch's spec |
+| Section path | Why code-owned |
+|--------------|----------------|
+| `skills.allowlist` | Security contract — `crates/mika-agent/CLAUDE.md` "Adding a New Bundled Skill" step 4 names the static const as the source of truth; operators add skills via PR, not by editing identity.toml |
+| `tools.disabled` | Same — defense-in-depth for read-only agent invariant (mika-arch); operators do not edit |
+| `context.summary` (both `inject` and `max_tokens` fields) | mika#1009 leak protection; code-owned per mika-arch's spec |
 
 ### Preserved sections (operator-owned)
 
 `name`, `emoji`, `[reflection]`, `[kg]`. Operators legitimately customize these per host (e.g., mika-dev sets `[kg].enabled = true` on this host where the spec defaults to `false`; mika-dev has `name = "Mika Dev"` with the Sparkles emoji where the spec says `name = "Dev"`, `emoji = "🛠"`).
+
+### Structural enforcement of the boundary (`const CODE_OWNED_IDENTITY_SECTIONS`)
+
+To prevent prose-only drift on what's code-owned, the reconciler is driven by a single explicit constant in `well_known_agents.rs`:
+
+```rust
+/// Identity-toml section paths that the reconciler owns from the static spec.
+///
+/// **Each entry is a dotted path** from the root of `identity.toml`. The reconciler
+/// walks each path in both the expected (spec-rendered) tree and the on-disk tree;
+/// when they differ, the expected subtree replaces the on-disk subtree.
+///
+/// Adding a new code-owned section to `WellKnownAgent`'s identity templates requires
+/// adding an entry here AND adding a unit test in `tests` below — the
+/// `test_code_owned_sections_have_reconciler_coverage` test iterates this constant
+/// and fails the build if any entry is not exercised by a test.
+///
+/// Sections NOT listed here are preserved verbatim from the on-disk file (operator-owned:
+/// `name`, `emoji`, `[reflection]`, `[kg]`).
+pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] = &[
+    "skills.allowlist",
+    "tools.disabled",
+    "context.summary",
+];
+```
+
+The reconciler iterates this constant rather than open-coding the three paths. Adding a future code-owned section is a one-line append (plus a test) — no logic change needed.
+
+A complementary build-time invariant test (in the same module's `tests` block) asserts that each path in `CODE_OWNED_IDENTITY_SECTIONS` corresponds to a section that at least one well-known agent's rendered identity actually emits — catches typos in the constant. Specifically: for each path `P`, walk the rendered identity of every `WELL_KNOWN_AGENTS` entry; assert that at least one produces a non-empty value at `P`. This catches the case where someone adds `"foo.bar"` to the constant but no spec ever emits `[foo].bar`.
+
+A second test asserts the negative direction: for every dotted path the rendered specs emit beyond `name`/`emoji`/`reflection`/`kg`, the path is present in `CODE_OWNED_IDENTITY_SECTIONS`. This catches the dual case where someone adds `[security]` to `MIKA_ARCH_DISABLED_TOOLS`-shape spec but forgets to add `"security"` to the constant — silent drift returns. Both tests together close the loop. (See "Test plan" below for exact test names.)
 
 ### Algorithm
 
@@ -59,12 +111,16 @@ For each agent in `WELL_KNOWN_AGENTS` where `agent_exists(home_dir, spec.name)`:
 1. Render the **expected** identity content via `render_identity_content(spec, settings)` (already exists).
 2. Parse the **on-disk** identity content via `toml::from_str::<toml::Value>`.
 3. Parse the expected content the same way.
-4. For each reconciled section above:
-   - If expected has the section AND on-disk differs (missing OR not equal):
-     - Replace the on-disk section with the expected one in the parsed `toml::Value` tree
-     - Mark `changed = true`
-5. If `changed`, serialize the merged value with `toml::to_string` and write to identity.toml.
-6. Emit `info!` per agent with the list of reconciled sections and `warn!` per skipped agent (parse failure, write failure).
+4. **For each dotted path in `CODE_OWNED_IDENTITY_SECTIONS`:**
+   - Resolve the path in the expected tree (`get_path(&expected, "skills.allowlist")`)
+   - Resolve the path in the on-disk tree
+   - If expected exists AND (on-disk missing OR on-disk != expected):
+     - Set the path in the on-disk tree to the expected value (`set_path(&mut on_disk, "skills.allowlist", value.clone())`)
+     - Record the path in a `reconciled_paths: Vec<&str>` for logging
+5. If `reconciled_paths` is non-empty, serialize the merged on-disk tree with `toml::to_string` and atomic-write to identity.toml (`.tmp` + rename).
+6. Emit one `info!` per agent: `agent=<name> reconciled_paths=[skills.allowlist, ...]` (empty array → in-sync log). Emit `warn!` on parse failure / write failure / spec render failure, skipping THAT agent only.
+
+Helper: `get_path(value: &toml::Value, dotted_path: &str) -> Option<&toml::Value>` and `set_path(value: &mut toml::Value, dotted_path: &str, new: toml::Value)`. Path syntax is dot-separated table keys; e.g., `"context.summary"` resolves `value["context"]["summary"]`. No array indexing needed — none of the code-owned sections are arrays at the top level (they may CONTAIN arrays, but the path itself targets a table or scalar). `set_path` creates intermediate empty tables when the parent doesn't exist on-disk (the missing-section case).
 
 ### Failure isolation
 
@@ -107,7 +163,7 @@ The new function lives in the same module (`well_known_agents.rs`).
 
 ### Unit tests in `well_known_agents.rs`
 
-Add tests in the existing `#[cfg(test)] mod tests` block:
+Add 11 tests in the existing `#[cfg(test)] mod tests` block (9 reconciliation tests + 2 constant-coverage invariant tests):
 
 1. `test_reconcile_adds_missing_allowlist_for_mika_dev` — provision an agent with a pre-#815-shape identity.toml (no `[skills]` block), run the reconciler, assert the file now contains `[skills].allowlist` matching the static const.
 
@@ -126,6 +182,10 @@ Add tests in the existing `#[cfg(test)] mod tests` block:
 8. `test_reconcile_disabled_via_env` — set `disable_agent_provisioning = true`, run reconciler, assert no writes (matches `provision_well_known_agents()` behavior).
 
 9. `test_reconcile_handles_malformed_identity` — write garbage to identity.toml, run reconciler, assert it logs warn and continues (no panic, no partial write).
+
+10. `test_code_owned_sections_have_reconciler_coverage` — for each path in `CODE_OWNED_IDENTITY_SECTIONS`, assert at least one `WELL_KNOWN_AGENTS` entry's rendered identity (via `render_identity_content` with `test_settings_with_kg_roots`) has a non-None value at that path. Catches typos like adding `"skils.allowlist"` to the constant.
+
+11. `test_no_code_owned_drift_outside_constant` — for each `WELL_KNOWN_AGENTS` entry's rendered identity, walk every dotted path at depth ≤ 2 (top-level tables and one level of nesting). For any path that is NOT one of the operator-owned roots (`name`, `emoji`, `reflection.*`, `kg.*`), assert the path appears in `CODE_OWNED_IDENTITY_SECTIONS` (or has a prefix that does, e.g., `skills.allowlist` covers `skills.allowlist` exactly; `tools.disabled` covers `tools.disabled` exactly; `context.summary` covers both `context.summary.inject` and `context.summary.max_tokens`). Catches the silent-regression case where someone adds `[security]` to a future spec but forgets to add it to the constant. Implementation: a small recursive helper that produces a flat list of dotted paths from a `toml::Value::Table`, then `paths.iter().filter(|p| !is_operator_owned(p)).for_each(|p| assert!(is_under_code_owned(p)))`.
 
 ### Integration test
 
@@ -158,14 +218,16 @@ After the binary lands on the host:
 
 Single PR, single commit (or a small commit chain — reconciler + tests + compound doc).
 
-1. Add `reconcile_well_known_identity()` function in `well_known_agents.rs`
-2. Wire into the existing `agent_exists` branch of `provision_well_known_agents()`
-3. Add the 9 unit tests
-4. Add the integration test in `tests/eval/test_qa_review_run_gh_scope_validator.rs`
-5. `cargo test -p mika-agent` and `cargo clippy` pass
-6. `make deploy` → cat the identity files → confirm reconciliation took effect
-7. Trigger a real webhook on a test issue and confirm `gh issue edit` succeeds
-8. Compound doc in `docs/solutions/best-practices/identity-toml-drift-from-static-spec-2026-05-20.md`
+1. Add `CODE_OWNED_IDENTITY_SECTIONS` constant in `well_known_agents.rs`
+2. Add `get_path` / `set_path` helpers (private)
+3. Add `reconcile_well_known_identity(home_dir, spec, settings)` function in `well_known_agents.rs`
+4. Wire into the existing `agent_exists` branch of `provision_well_known_agents()`
+5. Add the 11 unit tests (9 reconciliation tests + 2 constant-coverage invariant tests)
+6. Add the integration test in `tests/eval/test_qa_review_run_gh_scope_validator.rs`
+7. `cargo test -p mika-agent` and `cargo clippy` pass
+8. `make deploy` → cat the identity files → confirm reconciliation took effect
+9. Trigger a real webhook on a test issue and confirm `gh issue edit` succeeds
+10. Compound doc in `docs/solutions/best-practices/identity-toml-drift-from-static-spec-2026-05-20.md`
 
 ## Compound notes
 
@@ -176,7 +238,7 @@ This is the **second** time identity-drift has bitten the autonomous loop:
 
 The compound pattern is: **any code-owned configuration of a long-lived per-agent artifact requires explicit reconciliation, not just first-creation seeding.** The `agent_exists` short-circuit is structurally hostile to evolving the static spec. Future identity-template changes (next year's #815-class restructure) will hit the same shape unless reconciler keeps pace.
 
-Out of scope for this PR but worth filing as a follow-up: a startup-time invariant test that **fails the build** if the spec contains a section that the reconciler doesn't cover. Today the reconciler covers `[skills]`, `[tools]`, `[context.summary]` — if a future spec adds `[security]` and reconciler isn't updated, drift returns silently. A test that iterates over the spec's section names and asserts each is either reconciled or whitelisted-as-operator-owned would catch this at CI time.
+The structural mechanism added in this PR (`CODE_OWNED_IDENTITY_SECTIONS` + the two coverage-invariant tests `test_code_owned_sections_have_reconciler_coverage` and `test_no_code_owned_drift_outside_constant`) closes the loop: any future spec change that adds a code-owned section either (a) gets added to the constant and reconciled, or (b) trips the negative-direction test at CI time. Operator-owned roots (`name`, `emoji`, `reflection.*`, `kg.*`) stay explicitly excluded — extending the operator-owned set is an explicit code change in the test helper, also visible at review time.
 
 ## Cross-repo impact
 
