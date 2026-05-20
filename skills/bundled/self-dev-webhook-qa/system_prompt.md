@@ -167,8 +167,6 @@ When you receive a GitHub webhook event for `pull_request.closed`:
 
 5.5. **Milestone/project advance gate (parity with self-dev-callback § Permitted post-callback actions item 2):**
 
-   ⚠ **ENGINE GUARD PENDING mika#1218** — this gate is prompt-prose-only until mika#1218 lands a `webhook_milestone_advance` INTENT_GUARD symmetric to `callback_milestone_advance` (mika#991). Until then, the contract below is enforced only by this prompt. mika#1218's AC3 removes this warning when the engine guard lands.
-
    Call `check_task(parent_task_id)`. If `parent_task_id` is null OR the parent's `type` is neither `"milestone"` nor `"project"`, proceed to step 6 (notify and stop — non-milestone task, no advance needed).
 
    Otherwise, the completed child is a milestone/project child. You MUST advance per M4 step 3 (or P4 step 3 for projects). Execute the following steps in order:

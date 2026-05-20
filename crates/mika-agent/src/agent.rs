@@ -1592,6 +1592,42 @@ async fn run_loop(
                         continue;
                     }
 
+                    // #1218 — Webhook milestone advance guard. Mirrors
+                    // callback_milestone_advance for `pull_request.closed(merged:true)`
+                    // webhook turns whose correlated task has a milestone/project
+                    // parent. Inline rather than in INTENT_GUARDS because the
+                    // satisfied predicate needs the parent_task_id (injected as a
+                    // marker by server::milestone_context_handler).
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(WEBHOOK_MILESTONE_ADVANCE_LABEL)
+                        && webhook_milestone_advance_trigger(&user_input_text)
+                        && let Some(parent_id) = extract_milestone_parent_id(&user_input_text)
+                        && !webhook_milestone_advance_satisfied(parent_id, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(WEBHOOK_MILESTONE_ADVANCE_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            parent_task_id = parent_id,
+                            intent_guard = WEBHOOK_MILESTONE_ADVANCE_LABEL,
+                            "Webhook milestone advance guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                WEBHOOK_MILESTONE_ADVANCE_CORRECTION.to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
                     // #862 — Asserted-unavailability guard. Catches assistant text
                     // claiming a tool is unavailable ("X is not callable", "I don't
                     // have access to X", "X is skill-scoped") when X is in the
@@ -1958,6 +1994,37 @@ async fn run_loop(
                             role: LlmRole::User,
                             content: LlmContent::Text(
                                 CALLBACK_MILESTONE_ADVANCE_CORRECTION.to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // #1218 — Webhook milestone advance guard for empty-text exits.
+                    // Mirror of the inline guard in the non-empty text path.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(WEBHOOK_MILESTONE_ADVANCE_LABEL)
+                        && webhook_milestone_advance_trigger(&user_input_text)
+                        && let Some(parent_id) = extract_milestone_parent_id(&user_input_text)
+                        && !webhook_milestone_advance_satisfied(parent_id, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(WEBHOOK_MILESTONE_ADVANCE_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            parent_task_id = parent_id,
+                            intent_guard = WEBHOOK_MILESTONE_ADVANCE_LABEL,
+                            "Webhook milestone advance guard fired on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                WEBHOOK_MILESTONE_ADVANCE_CORRECTION.to_string(),
                             ),
                         });
                         continue;
@@ -5598,6 +5665,73 @@ const CALLBACK_MILESTONE_ADVANCE_CORRECTION: &str = "[mika-engine] This is a cal
      without one of these two tool calls is the deliberation-stall pattern documented \
      in mika#991. Re-read the callback result and either advance the queue or halt \
      the milestone explicitly via update_task_status.";
+
+// ---------------------------------------------------------------------------
+// #1218 — Webhook milestone advance guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the webhook milestone
+/// advance guard (#1218). Inline guard (not in `INTENT_GUARDS` const array)
+/// because the satisfied predicate needs the parent_task_id from the user
+/// message — identical shape to `callback_milestone_advance` (#991).
+const WEBHOOK_MILESTONE_ADVANCE_LABEL: &str = "webhook_milestone_advance";
+
+/// #1218 — Returns `true` when the user message indicates a milestone/project-
+/// context PR-closed webhook turn. Uses `contains` for both checks for
+/// resilience to handler-chain reordering AND symmetry with the callback
+/// precedent's `contains(MILESTONE_PARENT_MARKER)` usage (Pin A line 5544).
+/// Mutually exclusive triggers with `callback_milestone_advance` on user
+/// message content (no callback prefix on webhook turns).
+fn webhook_milestone_advance_trigger(msg: &str) -> bool {
+    msg.contains(MILESTONE_PARENT_MARKER) && msg.contains("[GitHub] PR closed:")
+}
+
+/// #1218 — Returns `true` when the webhook milestone advance obligation is satisfied.
+/// Three valid paths (mirrors #991 plus deploy-hook path from mika#1208 plan §Phase 2
+/// step 5.5.b):
+/// - **Path A (advance):** `run_claude_pilot` or `run_claude_pilot_groom` was called.
+/// - **Path B (halt/finish):** `update_task_status` targeting the parent task ID
+///   with status `blocked` or `completed`.
+/// - **Path C (deploy hook):** BOTH `deploy_mika` AND `send_message` were called
+///   (deploy-hook ack to operator per the 5.5.b prompt contract).
+fn webhook_milestone_advance_satisfied(
+    parent_task_id: &str,
+    summaries: &[ToolCallSummary],
+) -> bool {
+    // Path A — reuse the same predicate as callback (#991).
+    let has_advance = summaries
+        .iter()
+        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom");
+    if has_advance {
+        return true;
+    }
+    // Path B — parent-targeting update_task_status with terminal status.
+    let has_halt = summaries.iter().any(|s| {
+        s.name == "update_task_status"
+            && s.input_summary.contains(parent_task_id)
+            && (s.input_summary.contains("blocked") || s.input_summary.contains("completed"))
+    });
+    if has_halt {
+        return true;
+    }
+    // Path C — deploy-hook ack: BOTH deploy_mika AND send_message.
+    let has_deploy = summaries.iter().any(|s| s.name == "deploy_mika");
+    let has_notify = summaries.iter().any(|s| s.name == "send_message");
+    has_deploy && has_notify
+}
+
+/// #1218 — Correction message for the webhook milestone advance guard.
+const WEBHOOK_MILESTONE_ADVANCE_CORRECTION: &str = "[mika-engine] This is a \
+     `pull_request.closed(merged:true)` webhook turn for a milestone/project child task. \
+     Per mika#1218 the engine expects exactly one of: \
+     (1) dispatch the next pending child via run_claude_pilot, OR \
+     (2) mark the milestone/project parent as `blocked` (with a reason) or `completed` \
+     via update_task_status, OR \
+     (3) deploy_mika + send_message (the deploy-hook ack path from self-dev-webhook-qa \
+     step 5.5.b). \
+     Posting a confirmation or summary without one of these three tool calls is the \
+     deliberation-stall pattern documented in mika#991. Re-read the webhook event and \
+     either advance the queue, halt the milestone explicitly, or trigger the deploy hook.";
 
 // ---------------------------------------------------------------------------
 // #862 — Asserted-unavailability guard

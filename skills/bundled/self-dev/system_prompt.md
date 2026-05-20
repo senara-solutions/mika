@@ -493,7 +493,6 @@ For each `child_task_id` in `child_wis` (in order):
 
    *(M4 HOLD ≠ QA verdict `hold[*]`. The latter is a verdict class for blocked-but-fixable PRs handled in `self-dev-webhook-qa` § Verdict class `hold[*]`. Same word, different machinery.)*
 
-   > ⚠ **ENGINE GUARD PENDING mika#1218** — the "advance OR halt" obligation in the webhook handler (step 5.5 of `self-dev-webhook-qa` § Webhook Entry Point — PR Closed) is enforced by prompt prose only until mika#1218 lands a `webhook_milestone_advance` INTENT_GUARD. This is the same against-gradient-behavior class as `callback_milestone_advance` (mika#991): the LLM's trained default is "acknowledge and close the turn" rather than "advance the queue." See `docs/solutions/architecture-patterns/engine-guards-vs-prompt-rules-for-agent-behavior-2026-04-19.md` for the doctrine. mika#1218's AC3 removes this warning when the engine guard lands.
    - If `pr_merge_with_gate` returned `"blocked"` or `"gate_errored"`: the webhook handler already routed to the appropriate block/error path. M4 step 3 will see the child as `blocked`.
 
    **Literal verification command** (per committed decision — do NOT re-derive):
