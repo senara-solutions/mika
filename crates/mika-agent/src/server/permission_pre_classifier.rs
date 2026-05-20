@@ -64,14 +64,13 @@ struct BashToolInput {
 /// If the pattern set grows beyond 10 entries OR Python and Rust drift, escalate
 /// to build-time codegen.
 ///
-/// ## Branch 5 divergence (mika#938)
+/// ## Branch 5 quote-aware on both sides (mika#946 resolved mika#938 follow-up)
 ///
-/// Branch 5 (backtick/`$(` rejection) now uses quote-aware scanning in this Rust
-/// module via `contains_unquoted_metacharacter()`, while `tier1.py` retains blanket
-/// `String::contains` rejection. This is intentional asymmetry at N=1 divergence —
-/// codegen escalation threshold NOT crossed. Companion fix:
-/// `fix(security): quote-aware metacharacter rejection in tier1.py to match
-/// permission_pre_classifier.rs (mika#938 follow-up)`
+/// Branch 5 (backtick/`$(` rejection) uses quote-aware scanning on both the Rust
+/// side (here, via `contains_unquoted_metacharacter()`) and the Python side
+/// (`tier1.py::contains_unquoted_metacharacter`). The POSIX single-quote
+/// backslash-literal contract is mirrored across both. Divergence count: 0.
+/// Companion PR: senara-solutions/claude-pilot-py#16.
 const TIER3_PATTERNS: &[&str] = &[
     "rm -rf",
     "rm -fr",
