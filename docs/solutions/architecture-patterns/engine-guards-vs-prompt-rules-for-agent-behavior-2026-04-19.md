@@ -176,6 +176,8 @@ Result: ships deterministic enforcement. Model gets a synthetic prompt before `E
 
 - mika#645 — structural guard against core_memory mis-access via `read_agent_file` (the first engine guard shipped on 2026-04-18 validating this pattern)
 - mika#648 — engine-level turn-end persistence evaluation hook (second engine guard, same shape)
+- mika#991 — `callback_milestone_advance` inline guard (against-gradient: LLM's trained default is "acknowledge and close the turn" rather than "advance the queue")
+- mika#1218 — `webhook_milestone_advance` inline guard (per-event-source symmetry with #991 for PR-closed webhook turns; a unified `MilestoneAdvance` SilentTrigger consolidating both event sources remains a follow-up)
 - mika#647 — engine pre-tool context-redundancy check (extends #645's pattern, sibling structural fix)
 - mika#650 — `send_message` `chat_id == 0` handling (agent-side typed result instead of gateway 400 — similar pattern: structural fix at the right layer)
 - Memory: `feedback_prompt_enforcement_fragile.md` (earlier hint of this principle — "Don't use prompt-level budgets/limits; LLMs rationalize crossing them. Use structural constraints.") (auto memory [claude])

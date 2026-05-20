@@ -1147,3 +1147,528 @@ async fn hold_reentry_pr_state_race_not_merged() {
         json!({"task_id": "child-hold-id", "status": "in_progress"}),
     );
 }
+
+// ===========================================================================
+// Webhook milestone advance guard cohort (#1218).
+//
+// Mirrors the callback milestone advance guard (#991) but fires on
+// `[GitHub] PR closed:` webhook turns instead of `[callback:` callback turns.
+// The guard triggers when the user message contains BOTH
+// `[milestone-parent: <id>]` AND `[GitHub] PR closed:`.
+//
+// Satisfaction has 3 paths:
+// - Path A: `run_claude_pilot` or `run_claude_pilot_groom` called.
+// - Path B: `update_task_status` targeting the parent with `blocked`/`completed`.
+// - Path C: BOTH `deploy_mika` AND `send_message` called (deploy-hook ack).
+//
+// Tests 16–27.
+// ===========================================================================
+
+/// A webhook PR-closed user message WITH the milestone-parent marker
+/// (as enriched by milestone_context_handler in production).
+fn webhook_milestone_pr_closed_msg() -> String {
+    format!(
+        "[milestone-parent: {PARENT_TASK_ID}]\n\
+         [GitHub] PR closed: senara-solutions/mika#1050 — feat: add health endpoint (branch: feat/health)\n\
+         https://github.com/senara-solutions/mika/pull/1050\n\
+         Merged: true"
+    )
+}
+
+/// Stub `run_claude_pilot_groom` that always succeeds — simulates grooming
+/// dispatch on a milestone child.
+struct StubRunClaudePilotGroomTool;
+
+#[async_trait]
+impl Tool for StubRunClaudePilotGroomTool {
+    fn name(&self) -> &str {
+        "run_claude_pilot_groom"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "run_claude_pilot_groom".to_string(),
+            description: "Stub run_claude_pilot_groom for webhook milestone advance guard tests"
+                .to_string(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::success(
+            "claude-pilot grooming dispatched.".to_string(),
+        ))
+    }
+}
+
+/// Tool registry with milestone stubs + run_claude_pilot_groom for webhook tests.
+fn tools_with_webhook_milestone_stubs() -> mika_agent::tools::ToolRegistry {
+    let mut tools = default_tools();
+    tools.register(Box::new(StubUpdateTaskStatusTool));
+    tools.register(Box::new(StubRunClaudePilotTool));
+    tools.register(Box::new(StubRunClaudePilotGroomTool));
+    tools.register(Box::new(StubCheckTaskTool));
+    tools.register(Box::new(StubDeployMikaTool));
+    tools
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: Webhook Path A — run_claude_pilot satisfies guard (AC2a).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_path_a_accepts_run_claude_pilot() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent dispatches next child — satisfies Path A
+            tool_call_response(
+                "run_claude_pilot",
+                json!({"skill": "dev-pilot", "prompt": "mika#1051", "task_id": "next-child-id"}),
+            ),
+            // Step 2: Final text
+            text_response("Webhook: dispatched next milestone child."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "dispatched next milestone child");
+    assert_tools_include(&trace, &["run_claude_pilot"]);
+    // 2 steps — guard does NOT fire (Path A satisfied)
+    assert_exact_steps(&trace, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: Webhook Path A — run_claude_pilot_groom satisfies guard (AC2a).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_path_a_accepts_run_claude_pilot_groom() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent dispatches grooming — satisfies Path A
+            tool_call_response(
+                "run_claude_pilot_groom",
+                json!({"skill": "dev-groom", "prompt": "mika#1051", "task_id": "next-child-id"}),
+            ),
+            // Step 2: Final text
+            text_response("Webhook: grooming dispatched for next child."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "grooming dispatched");
+    assert_tools_include(&trace, &["run_claude_pilot_groom"]);
+    // 2 steps — guard does NOT fire (Path A satisfied)
+    assert_exact_steps(&trace, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: Webhook Path B — update_task_status(parent, blocked) (AC2b).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_path_b_accepts_halt_blocked() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent halts the milestone — Path B
+            tool_call_response(
+                "update_task_status",
+                json!({
+                    "task_id": PARENT_TASK_ID,
+                    "status": "blocked",
+                    "note": "All children completed or blocked"
+                }),
+            ),
+            // Step 2: Agent notifies operator
+            tool_call_response(
+                "send_message",
+                json!({"text": "Milestone blocked after webhook."}),
+            ),
+            // Step 3: Final text
+            text_response("Milestone halted via webhook path."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "halted");
+    assert_tools_include(&trace, &["update_task_status"]);
+    // 3 steps — guard does NOT fire (Path B satisfied)
+    assert_exact_steps(&trace, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: Webhook Path B — update_task_status(parent, completed) (AC2b).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_path_b_accepts_halt_completed() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent completes the milestone — Path B
+            tool_call_response(
+                "update_task_status",
+                json!({
+                    "task_id": PARENT_TASK_ID,
+                    "status": "completed",
+                    "note": "All milestone children merged"
+                }),
+            ),
+            // Step 2: Agent notifies operator
+            tool_call_response(
+                "send_message",
+                json!({"text": "Milestone completed — all children merged."}),
+            ),
+            // Step 3: Final text
+            text_response("Milestone completed via webhook."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "completed");
+    assert_tools_include(&trace, &["update_task_status"]);
+    // 3 steps — guard does NOT fire (Path B satisfied)
+    assert_exact_steps(&trace, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: Webhook Path C — deploy_mika + send_message satisfies guard.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_path_c_accepts_deploy_with_send_message_any_text() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent calls deploy_mika
+            tool_call_response("deploy_mika", json!({"task_id": PARENT_TASK_ID})),
+            // Step 2: Agent calls send_message — completes Path C
+            tool_call_response(
+                "send_message",
+                json!({"text": "Deploy triggered for webhook PR merge."}),
+            ),
+            // Step 3: Final text
+            text_response("Deploy hook ack complete."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "Deploy hook ack");
+    assert_tools_include(&trace, &["deploy_mika", "send_message"]);
+    // 3 steps — guard does NOT fire (Path C satisfied)
+    assert_exact_steps(&trace, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: Webhook Path C rejection — deploy_mika alone (no send_message).
+//
+// deploy_mika without send_message does NOT satisfy Path C. Guard fires,
+// then on retry the agent calls run_claude_pilot (Path A) to recover.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_path_c_rejects_deploy_only_no_send_message() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent calls deploy_mika only
+            tool_call_response("deploy_mika", json!({"task_id": PARENT_TASK_ID})),
+            // Step 2: Text EndTurn — guard fires (deploy_mika alone is not Path C)
+            text_response("Deploy kicked off."),
+            // Step 3 (after re-prompt): Agent dispatches via run_claude_pilot (Path A)
+            tool_call_response(
+                "run_claude_pilot",
+                json!({"skill": "dev-pilot", "prompt": "mika#1051", "task_id": "next-child-id"}),
+            ),
+            // Step 4: Final text — guard satisfied
+            text_response("Corrected: dispatched next child after guard."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "Corrected");
+    assert_tools_include(&trace, &["deploy_mika", "run_claude_pilot"]);
+    // 4 steps: deploy → rejected text → run_claude_pilot → final text
+    assert_exact_steps(&trace, 4);
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: Webhook Path C rejection — send_message alone (no deploy_mika).
+//
+// send_message without deploy_mika does NOT satisfy any path. Guard fires,
+// then on retry the agent calls run_claude_pilot (Path A) to recover.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_path_c_rejects_send_message_only_no_deploy() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent calls send_message only
+            tool_call_response(
+                "send_message",
+                json!({"text": "PR merged for milestone child."}),
+            ),
+            // Step 2: Text EndTurn — guard fires (send_message alone is not any path)
+            text_response("Notified operator."),
+            // Step 3 (after re-prompt): Agent dispatches via run_claude_pilot (Path A)
+            tool_call_response(
+                "run_claude_pilot",
+                json!({"skill": "dev-pilot", "prompt": "mika#1051", "task_id": "next-child-id"}),
+            ),
+            // Step 4: Final text — guard satisfied
+            text_response("Corrected: dispatched next child."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "Corrected");
+    assert_tools_include(&trace, &["send_message", "run_claude_pilot"]);
+    // 4 steps: send_message → rejected text → run_claude_pilot → final text
+    assert_exact_steps(&trace, 4);
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: Webhook text-only rejection then retry succeeds (AC2c).
+//
+// Agent emits text-only on first EndTurn (no tools at all). Guard fires,
+// re-prompts. Agent calls run_claude_pilot on second try.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_silent_text_rejection_then_retry_succeeds() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Text-only EndTurn — guard fires
+            text_response("I see the PR was merged. Let me review the milestone."),
+            // Step 2 (after re-prompt): Agent dispatches next child (Path A)
+            tool_call_response(
+                "run_claude_pilot",
+                json!({"skill": "dev-pilot", "prompt": "mika#1051", "task_id": "next-child-id"}),
+            ),
+            // Step 3: Final text — guard satisfied
+            text_response("Dispatched next child after guard correction."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "Dispatched next child");
+    assert_tools_include(&trace, &["run_claude_pilot"]);
+    // 3 steps: rejected text → run_claude_pilot → final text
+    assert_exact_steps(&trace, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Test 24: Webhook single retry exhaustion — guard fires once, then accepts.
+//
+// Agent fails to satisfy the guard on both attempts (two text-only EndTurns).
+// The guard fires on the first violation, inserts the label into
+// intent_guard_retries. On the second text-only EndTurn, the label is already
+// in the set, so the guard does NOT fire again — EndTurn is accepted.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_single_retry_semantics() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Text-only EndTurn — guard fires
+            text_response("The PR was merged for the milestone child."),
+            // Step 2 (after re-prompt): Still text-only — guard already
+            // retried, so it accepts EndTurn this time.
+            text_response("I cannot dispatch right now."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness
+        .run(&webhook_milestone_pr_closed_msg())
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "cannot dispatch");
+    // No dispatch tools called — agent failed both attempts
+    assert_tools_exclude(&trace, &["run_claude_pilot", "run_claude_pilot_groom"]);
+    // 2 steps: rejected text (guard fires) → accepted text (guard exhausted)
+    assert_exact_steps(&trace, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Test 25: No milestone-parent marker — guard does NOT fire.
+//
+// A webhook PR-closed message without [milestone-parent:] should not trigger
+// the webhook_milestone_advance guard, even on a zero-tool EndTurn.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_no_marker_no_fire() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Text-only EndTurn — webhook_milestone_advance guard
+            // should NOT fire (no marker). However, the `webhook_zero_tools`
+            // INTENT_GUARD (entry c) WILL fire on `[GitHub]` messages with
+            // zero tool calls. After that single retry:
+            text_response("PR merged. No milestone context."),
+            // Step 2: After webhook_zero_tools re-prompt, agent calls a tool
+            // and responds. Still no milestone advance guard fire because
+            // there's no [milestone-parent:] marker.
+            tool_call_response(
+                "update_task_status",
+                json!({"task_id": "some-task", "status": "completed"}),
+            ),
+            // Step 3: Final text
+            text_response("Task updated after webhook zero-tools correction."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    // Webhook PR-closed WITHOUT milestone-parent marker
+    let trace = harness
+        .run(
+            "[GitHub] PR closed: senara-solutions/mika#1050 — feat: add health endpoint (branch: feat/health)\n\
+             https://github.com/senara-solutions/mika/pull/1050\n\
+             Merged: true",
+        )
+        .await
+        .unwrap();
+
+    assert_has_output(&trace);
+    // 3 steps — webhook_zero_tools fires once, but webhook_milestone_advance
+    // does NOT fire (no milestone-parent marker present).
+    assert_exact_steps(&trace, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Test 26: Callback marker triggers callback guard, NOT webhook guard.
+//
+// A callback turn with [milestone-parent:] should trigger the existing
+// callback_milestone_advance guard (#991), not the webhook guard (#1218).
+// This verifies mutual exclusivity — the webhook guard checks for
+// `[GitHub] PR closed:` which is absent in callback messages.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_milestone_advance_callback_marker_does_not_trigger_webhook_guard() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent calls update_task_status for the child
+            tool_call_response(
+                "update_task_status",
+                json!({"task_id": "child-task-id", "status": "completed"}),
+            ),
+            // Step 2: Agent calls send_message (satisfies callback_terminal_action)
+            tool_call_response("send_message", json!({"text": "Child completed."})),
+            // Step 3: Agent dispatches next child — satisfies callback_milestone_advance Path A
+            tool_call_response(
+                "run_claude_pilot",
+                json!({"skill": "dev-pilot", "prompt": "mika#1051", "task_id": "next-child-id"}),
+            ),
+            // Step 4: Final text
+            text_response("Callback: dispatched next child."),
+        ])
+        .tools(tools_with_webhook_milestone_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    // Callback message with milestone-parent marker — no [GitHub] PR closed:
+    let trace = harness.run(&milestone_callback_msg()).await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "Callback: dispatched next child");
+    assert_tools_include(&trace, &["run_claude_pilot", "update_task_status"]);
+    // 4 steps — callback guard path, not webhook guard
+    assert_exact_steps(&trace, 4);
+}
+
+// ---------------------------------------------------------------------------
+// Test 27: Predicate coverage note (empty-text branch mirror).
+//
+// The webhook_milestone_advance guard has both a non-empty-text branch
+// (guard #6c in the EndTurn chain) and an empty-text exit mirror guard
+// (same pattern as callback_milestone_advance). In conversation mode,
+// `follow_up_on_empty()` returns true, so the empty-text branch is never
+// taken — the LLM is re-prompted for content instead.
+//
+// Tests 16–26 above collectively cover the trigger and satisfaction
+// predicate logic through the harness:
+// - Trigger: tests 16–24 (marker present → guard evaluates),
+//   test 25 (no marker → guard skips), test 26 (callback marker → wrong guard).
+// - Path A: tests 16, 17 (run_claude_pilot, run_claude_pilot_groom).
+// - Path B: tests 18, 19 (blocked, completed targeting parent).
+// - Path C: test 20 (both deploy_mika + send_message), tests 21–22
+//   (partial Path C rejected).
+// - Single-retry semantics: test 24 (fires once, accepts on exhaustion).
+//
+// No additional harness test is needed for the empty-text branch — it is
+// structurally identical to the non-empty path and is tested implicitly
+// by the conversation-mode re-prompt behavior.
+// ---------------------------------------------------------------------------
