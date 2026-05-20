@@ -6,8 +6,23 @@ date: 2026-05-20
 ticket: mika#946
 parent_ticket: mika#938
 parent_pr: senara-solutions/mika#945
-target_repo: claude-pilot-py
-target_file: src/claude_pilot/tier1.py
+milestone: 23  # Permission pre-classifier hardening
+duplicate_of: mika#948  # closed as duplicate of mika#946
+target_repos:
+  - claude-pilot-py  # primary code change (tier1.py + tests)
+  - mika  # docs-only F5 sentinel update on permission_pre_classifier.rs
+base_shas:
+  mika: 498c536a18de83f69216aefc330d321f22277163  # main HEAD at grooming time
+  claude-pilot-py: 8e9eeecc1f6ab7c1130ebb2cce8111683c6c95f5  # main HEAD at grooming time
+pin_targets:
+  - claude-pilot-py/src/claude_pilot/tier1.py:70-92  # TIER3_PATTERNS
+  - claude-pilot-py/src/claude_pilot/tier1.py:111-119  # is_safe_bash_command (insertion site for Decision 2)
+  - claude-pilot-py/tests/test_tier1.py:1-73  # test module entry + test_tier3_denies fixture set
+  - mika/crates/mika-agent/src/server/permission_pre_classifier.rs:58-85  # F5 sentinel block (Step 8 target)
+sibling_dependencies:
+  - mika#942  # process substitution gap — milestone#23 sibling, sequenced AFTER mika#946
+  - mika#943  # file-redirect gap — milestone#23 sibling, sequenced AFTER mika#946
+  - mika#944  # ANSI-C quoting gap — milestone#23 sibling, sequenced AFTER mika#946
 ---
 
 # fix(security): quote-aware metacharacter rejection in tier1.py
@@ -19,6 +34,149 @@ mika-side fix (mika#938 / PR #945). The actual code change happens entirely in t
 `claude-pilot-py` repository at `src/claude_pilot/tier1.py`. The grooming branch lives on
 `mika` (where the ticket is); the implementation PR will target `claude-pilot-py`. The
 plan committed here documents what the implementer will do in the sibling repo.
+
+## Sequencing — milestone#23
+
+This ticket sits under **milestone#23** ("Permission pre-classifier hardening"). Per the
+milestone description (verified in mika#942's plan at `origin/fix/942/server-pre-classifier-misses-process`):
+
+> Sequencing: #946 (parity contract) first, then #942/#943/#944 in parallel. Milestone
+> closes when all four ship + parity test enforces divergence detection in CI.
+
+**This ticket (#946) is the parity-contract foundation** — it ports the Rust quote-aware
+scanner to Python and establishes the post-port symmetry that the CI parity test (filed
+under the milestone but not in this plan's scope) is meant to enforce. Once #946 ships,
+#942/#943/#944 unblock for parallel work. mika#948 was closed as duplicate of mika#946
+during grooming (verified during first-pass architect review).
+
+## Phase 0 — Pin (verbatim slices at base SHAs)
+
+Pinned against `mika @ 498c536a18de83f69216aefc330d321f22277163` (main HEAD at branch
+creation) and `claude-pilot-py @ 8e9eeecc1f6ab7c1130ebb2cce8111683c6c95f5` (main HEAD at
+grooming time). All line numbers below are at those SHAs.
+
+### Pin 1 — tier1.py `TIER3_PATTERNS` (`tier1.py:70-92`)
+
+```python
+TIER3_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"rm\s+(-\w*r\w*f|-\w*f\w*r)\b"),           # rm -rf, rm -fr, rm -rfi
+    re.compile(r"git\s+push\s+.*--force\b"),                # git push --force
+    re.compile(r"git\s+push\s+.*-\w*f\b"),                  # git push -f
+    re.compile(r"git\s+push\s+\S+\s+(main|master)\b"),      # git push origin main/master
+    re.compile(r"git\s+reset\s+--hard\b"),                  # git reset --hard
+    re.compile(r"git\s+branch\s+.*-\w*D\b"),                # git branch -D
+    re.compile(r"\bDROP\s+TABLE\b", re.IGNORECASE),
+    re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE),
+    re.compile(r"\bcargo\s+publish\b"),
+    re.compile(r"\bsed\s+(-\w*i|-i\w*)\b"),                 # sed -i
+    re.compile(r"\bgh\s+label\s+(delete|edit)\b"),
+    re.compile(r"\bbash\s+-c\b"),
+    re.compile(r"\bsh\s+-c\b"),
+    re.compile(r"\beval\s"),
+    re.compile(r"\bxargs\b"),
+    re.compile(r"\bfind\s.*-(exec|execdir|delete)\b"),
+    re.compile(r"\$\("),                                    # $(...)             <- REMOVE
+    re.compile(r"`[^`]*`"),                                 # backticks          <- REMOVE
+    re.compile(r"<\("),                                     # <(...)             <- KEEP
+    re.compile(r">\("),                                     # >(...)             <- KEEP
+    re.compile(r"(?:^|[^<])>{1,2}(?!\()"),                  # > or >> (not psub) <- KEEP
+)
+```
+
+Lines 87 (`re.compile(r"\$\(")`) and 88 (`re.compile(r"`[^`]*`")`) are the two patterns
+this plan removes. Lines 89-91 stay blanket-rejected in Python — they are owned by the
+mika#942/#943 quote-aware extensions on the Rust side (see Decision 3 rationale).
+
+### Pin 2 — tier1.py `is_safe_bash_command` (`tier1.py:111-119`)
+
+```python
+def is_safe_bash_command(command: str) -> bool:
+    if is_tier3_dangerous(command):
+        return False
+
+    sub_commands = _split_compound_command(command)
+    if not sub_commands:
+        return False
+
+    return all(_is_safe_sub_command(sub) for sub in sub_commands)
+```
+
+The new `contains_unquoted_metacharacter` check is wired in BEFORE the
+`is_tier3_dangerous` call (Decision 2). The compound-split + per-sub-command check at
+lines 115-119 is unchanged.
+
+### Pin 3 — tier1.py existing test module head (`tests/test_tier1.py:1-73`)
+
+```python
+"""Tier 1 auto-approval tests. Covers the highest-risk rules from
+the TS test suite (test/tier1.test.ts, 597 lines); not exhaustive —
+follow-up work ports the full TS suite.
+"""
+
+# ... imports at lines 10-23 ...
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf /tmp/foo",
+        # ...
+        "echo hi > /tmp/out",
+        "echo hi >> /tmp/out",
+        "echo `whoami`",       # <- currently denies via TIER3_PATTERNS
+        "cat <(echo hi)",      # <- stays in TIER3 (mika#942's territory, not this plan)
+    ],
+)
+def test_tier3_denies(command: str) -> None:
+    assert is_tier3_dangerous(command) is True, command
+    assert is_safe_bash_command(command) is False, command
+```
+
+Two fixture-level changes needed (Step 5 of Implementation Sketch):
+1. The ``"echo `whoami`"`` entry currently asserts `is_tier3_dangerous(command) is True`.
+   After the port, the backtick pattern is no longer in TIER3, so this fixture must
+   move into a new parametrized test that asserts the deny via
+   `contains_unquoted_metacharacter`, OR the existing fixture's assertion shape relaxes
+   to only require `is_safe_bash_command(command) is False`.
+2. ``"cat <(echo hi)"`` is preserved as-is — `<(` remains a TIER3 blanket pattern
+   under Decision 3.
+
+### Pin 4 — F5 sentinel block (`permission_pre_classifier.rs:58-85`)
+
+```rust
+/// TIER 3 dangerous patterns that always deny regardless of dispatch shape.
+///
+/// # Sentinel — cross-language duplication (mika#935, architect F5)
+///
+/// These patterns are mirrored from `claude-pilot-py/src/claude_pilot/tier1.py`.
+/// `tier1.py` is the canonical source; this Rust module mirrors for defense-in-depth.
+/// If the pattern set grows beyond 10 entries OR Python and Rust drift, escalate
+/// to build-time codegen.
+///
+/// ## Branch 5 divergence (mika#938)
+///
+/// Branch 5 (backtick/`$(` rejection) now uses quote-aware scanning in this Rust
+/// module via `contains_unquoted_metacharacter()`, while `tier1.py` retains blanket
+/// `String::contains` rejection. This is intentional asymmetry at N=1 divergence —
+/// codegen escalation threshold NOT crossed. Companion fix:
+/// `fix(security): quote-aware metacharacter rejection in tier1.py to match
+/// permission_pre_classifier.rs (mika#938 follow-up)`
+const TIER3_PATTERNS: &[&str] = &[
+    "rm -rf",
+    "rm -fr",
+    "git push --force",
+    "git push -f",
+    "git reset --hard",
+    "DROP TABLE",
+    "cargo publish",
+    "gh label delete",
+    "gh label edit",
+];
+```
+
+Step 8 of Implementation Sketch updates lines 67-74 (the "## Branch 5 divergence
+(mika#938)" paragraph) to mark the divergence resolved. The surrounding sentinel doctrine
+(lines 60-66) is preserved. The `const TIER3_PATTERNS` array (lines 75-85) is not touched
+by this plan — mika#942 will reach for it from the Rust side as part of milestone#23.
 
 ## Overview
 
@@ -105,10 +263,13 @@ content inside `"..."` and `'...'` becomes safe to pass.
   no behavior change). The sentinel update lives in the same PR as the Python port
   to keep the cross-language coupling visible in a single review surface.
 - `$(`, backtick are the only patterns moved out of `TIER3_PATTERNS`. The other
-  TIER3 patterns (`rm -rf`, `git push --force`, `<(`, `>(`, redirect `>`, etc.)
-  remain blanket regex by design — they are real dangerous patterns whose blanket
-  scope is correct (process substitution, file redirection, force-push) and the
-  Rust counterpart does not quote-aware-handle them either.
+  TIER3 patterns (`rm -rf`, `git push --force`, redirect `>`, etc.) remain blanket
+  regex because they are real dangerous patterns whose blanket scope is correct.
+  Process substitution `<(`/`>(` also stays in Python TIER3 — but as the
+  **deliberate complementary layer** to mika#942's Rust-side quote-aware extension
+  (see Decision 3 for the cross-language split table). The "Rust has no counterpart"
+  framing is incorrect post-#942 and must not be used as justification for keeping
+  these patterns in Python TIER3.
 - The Python compound-command splitter `_split_compound_command` is NOT modified.
   It remains the existing naive regex split — the comment already calls out that
   it's deliberately quote-unaware (line 105-107), and the new metacharacter check
@@ -218,33 +379,63 @@ then the broader blanket-pattern matches") and mirrors the Rust structure
   in the un-split form but be elided after a wrong split — checking on the raw
   command is safer.
 
-### Decision 3: Remove `$(` and backtick patterns from `TIER3_PATTERNS`
+### Decision 3: Remove ONLY `$(` and backtick patterns from `TIER3_PATTERNS`
 
-**Decision:** Delete the two lines:
+**Decision:** Delete exactly these two lines from `TIER3_PATTERNS`:
 
 ```python
-re.compile(r"\$\("),
-re.compile(r"`[^`]*`"),
+re.compile(r"\$\("),                                    # $(...)
+re.compile(r"`[^`]*`"),                                 # backticks
 ```
 
-from `TIER3_PATTERNS`. Keep all other patterns including `<(`, `>(`, the redirect
-pattern, `bash -c`, `sh -c`, `eval`, `xargs`, `find -exec`, etc.
+Keep all other patterns including `<(`, `>(`, the bare-redirect pattern, `bash -c`,
+`sh -c`, `eval`, `xargs`, `find -exec`, etc. The `<(` and `>(` retention is **load-bearing
+for milestone#23**, not a default-conservative choice.
 
-**Rationale:** The two removed patterns are subsumed by the new quote-aware check.
-Leaving them in TIER3 would re-introduce the blanket false-rejection. The `<(`
-and `>(` patterns (process substitution) remain blanket because:
-1. They have no Rust counterpart to match against (Rust's structural pre-classifier
-   targets `mika ask` dispatch only; process substitution is irrelevant there).
-2. Process substitution is rarely a legitimate inline-content concept (no markdown
-   brief contains `<(` as literal text in a way that a stricter check would harm).
-3. AC R3 says "matching Rust semantics" for backtick/`$(` specifically; the AC
-   doesn't ask for process substitution to be quote-aware.
+**Rationale (corrected post-first-pass review):**
+
+The two removed patterns (`$(` and backtick) are subsumed by the new
+`contains_unquoted_metacharacter` scanner — leaving them in TIER3 would re-introduce
+the blanket false-rejection that this ticket exists to fix.
+
+The `<(` and `>(` patterns stay in Python's `TIER3_PATTERNS` as the **deliberate
+complementary layer** to mika#942's Rust-side quote-aware extension. The split, verified
+against mika#942's GROOMED plan at `origin/fix/942/server-pre-classifier-misses-process`:
+
+| Metacharacter   | Rust side (post-#942)                     | Python side (post-this-plan) |
+| --------------- | ----------------------------------------- | ---------------------------- |
+| `` ` ``         | Quote-aware (`contains_unquoted_metacharacter`, mika#938) | Quote-aware (this plan, mika#946) |
+| `$(`            | Quote-aware (`contains_unquoted_metacharacter`, mika#938) | Quote-aware (this plan, mika#946) |
+| `<(`            | Quote-aware (`contains_unquoted_metacharacter`, mika#942 GROOMED) | Blanket TIER3 (UNCHANGED — this plan keeps it)   |
+| `>(`            | Quote-aware (`contains_unquoted_metacharacter`, mika#942 GROOMED) | Blanket TIER3 (UNCHANGED — this plan keeps it)   |
+| `>` / `>>`      | (not in either side's quote-aware scanner)                       | Blanket TIER3 (UNCHANGED — mika#943 territory)   |
+
+These are NOT "no Rust counterpart" gaps — they are intentionally split across the
+two layers under milestone#23. Do not remove `<(`/`>(` from Python TIER3 until both
+layers are quote-aware (a future ticket filed after the milestone closes, if user
+impact emerges). The previous draft of this rationale incorrectly described
+`<(`/`>(` as having "no Rust counterpart"; that framing risks a future "consistency"
+pass removing them post-#942 and silently dropping the Python-side protection.
+
+AC R3 ("matching Rust semantics") is scoped explicitly to backtick/`$(` in the AC
+text. The R3 expansion to `<(`/`>(` is mika#942's territory, not this plan's. AC R3
+is satisfied by this plan's scope as written.
 
 **Alternatives considered:**
-- Move `<(` and `>(` to quote-aware scanning too. Deferred — out of scope per
-  the AC. If a future ticket finds a legitimate use case (e.g., a brief that
-  happens to contain `<(` as literal markdown), the same pattern can be applied
-  then. Filing this as a deferred task is unwarranted at N=0 user-impact.
+- Extend `contains_unquoted_metacharacter` in Python to also catch `<(`/`>(` now
+  (one-PR symmetry with mika#942's Rust changes). Rejected: AC R3 is scoped to
+  backtick/`$(`. Adding `<(`/`>(` would (a) expand scope past the ticket, (b)
+  force #942's Python-side patch to be a no-op (or net-deletion if `<(`/`>(` are
+  removed from TIER3), creating a confusing diff hierarchy across the milestone,
+  and (c) couple two tickets that the milestone sequencing explicitly keeps
+  decoupled. The right primitive (Python quote-aware scanner) is in place after
+  this plan ships; extending its coverage in a follow-up is one-line cheap.
+- File a follow-up ticket NOW to track Python `<(`/`>(` quote-aware coverage.
+  Deferred: filing speculative follow-ups when no user impact exists is the
+  category of pre-emptive ticket-creation the team has discouraged. mika#942
+  shipping with its sequencing intent intact carries the cross-language context
+  forward; a follow-up can be filed if/when user impact appears (markdown briefs
+  containing literal `<(` or `>(`).
 
 ### Decision 4: Add a tier1-side comment that documents the cross-language coupling
 
