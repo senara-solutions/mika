@@ -121,15 +121,13 @@ fn extract_pr_url(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("https://github.com/") && trimmed.contains("/pull/") {
-            // Validate the URL shape more precisely:
-            // https://github.com/<owner>/<repo>/pull/<number>
-            let parts: Vec<&str> = trimmed
-                .strip_prefix("https://github.com/")?
-                .splitn(4, '/')
-                .collect();
-            if parts.len() >= 3 && parts[2].starts_with("pull/")
-                || (parts.len() >= 4 && parts[2] == "pull" && !parts[3].is_empty())
-            {
+            // Validate the URL shape: https://github.com/<owner>/<repo>/pull/<number>
+            let Some(suffix) = trimmed.strip_prefix("https://github.com/") else {
+                continue;
+            };
+            let parts: Vec<&str> = suffix.splitn(4, '/').collect();
+            // Require exactly 4 segments: owner, repo, "pull", number
+            if parts.len() >= 4 && parts[2] == "pull" && !parts[3].is_empty() {
                 return Some(trimmed.to_string());
             }
         }
