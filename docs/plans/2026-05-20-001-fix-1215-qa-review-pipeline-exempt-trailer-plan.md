@@ -24,6 +24,72 @@ The asymmetry surfaced on mika PR #1185 (TUI lifecycle hardening cohort, 2026-05
 
 The trailer mechanism (mika#860) exists *because* some code-only changes legitimately don't need a plan/solution doc. When qa-review enforces a stricter gate than CI, the trailer's intent is negated and the operator pays a tax in throwaway plan docs.
 
+## Phase 0 — Pin load-bearing sources
+
+Verbatim slices at base SHA `498c536a18de83f69216aefc330d321f22277163` (current `origin/main`). These are the three sites the plan modifies or mirrors; pinning them locks the shape so the implementer cannot drift from them under churn.
+
+### Pin A — existing `pipeline-exempt` label bypass (the shape to extend)
+
+`skills/bundled/qa-review/system_prompt.md` lines 82–92 (within Step 2, before checks 1–3):
+
+```
+**Pipeline-exempt label bypass** — Before running checks 1–3, check the PR labels from Step 1's `qa_pr_view` output:
+
+If the labels include `pipeline-exempt`:
+1. Confirm the PR is docs-only by running the same source-change check as check 2:
+   ```
+   run_gh("pr diff <PR_URL> --name-only | grep -v '^docs/' | grep -v '^\\.github/' | grep -v '^\\.claude/' | head -1")
+   ```
+2. If the result is empty (no source files): skip checks 1–3 and Step 2.5 entirely. Note: "Pipeline-exempt: docs-only PR, skipping pipeline checks and plan-AC verification." Jump to Step 3.
+3. If the result is non-empty (source files present): note "pipeline-exempt label present but PR contains source changes — ignoring label." Continue with checks 1–3 normally.
+
+If the labels do NOT include `pipeline-exempt`: continue with checks 1–3 normally.
+```
+
+**What this pins for the implementation.** The trailer bypass must be a **sibling** of the label bypass (a new "Pipeline-Exempt trailer bypass" sub-section), not a nested sub-case inside the label block — the two mechanisms run independently (label is read from `qa_pr_view` output, trailer is read from `git log`). They share the same source-files guard pattern (`run_gh("pr diff … | grep -v …")`). Insertion point: immediately after line 92, before "Run these checks using `run_gh`..." (line 80's intro paragraph continues to the numbered checks 1, 2, 3 starting at lines 94, 100, 106).
+
+### Pin B — pre-termination self-check invariant 3 (the invariant to extend)
+
+`skills/bundled/qa-review/system_prompt.md` line 393:
+
+```
+3. You have emitted a `PLAN-AC VERIFICATION:` section (Step 2.5.6) listing every AC bullet — or, if Step 2.5.1/2.5.2 emitted `block[pipeline]`, you have not progressed to Step 5 with a non-block verdict — or, if the `pipeline-exempt` bypass was honored in Step 2, you have emitted `PLAN-AC VERIFICATION: skipped (pipeline-exempt)`.
+```
+
+**What this pins for the implementation.** The invariant is a single sentence with three OR-clauses. The trailer bypass needs a fourth clause (or, equivalently, the existing third clause must be generalized to cover both label and trailer paths). The new clauses cover the docs-only-trailer and code-only-trailer cases with distinct `skipped (…)` literals so the operator can read the verdict body and tell which mechanism allowed the bypass. Generalizing to a single clause "if any Step 2 bypass was honored, you have emitted `PLAN-AC VERIFICATION: skipped (pipeline-exempt — <mechanism>)`" is acceptable and shorter; the implementation will use this shape.
+
+### Pin C — reference trailer-grep implementation in `verify-pipeline.sh`
+
+`scripts/verify-pipeline.sh` lines 150–172 (the trailer-detection block):
+
+```
+# --- Exempt trailers: scan commit messages in base..HEAD ---
+COMMIT_BODIES=$(git log --format=%B "${MERGE_BASE}..HEAD" 2>/dev/null || true)
+EXEMPT_DOCS_ONLY=0
+EXEMPT_CODE_ONLY=0
+EXEMPT_DOCS_REASON=""
+EXEMPT_CODE_REASON=""
+
+# Dual-form matching: with-reason (preferred) vs bare (backwards compat, warns)
+if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only[[:space:]]+.+$'; then
+  EXEMPT_DOCS_ONLY=1
+  EXEMPT_DOCS_REASON=$(echo "$COMMIT_BODIES" | grep -oE '^Pipeline-Exempt: docs-only[[:space:]]+.+$' | head -1 | sed 's/^Pipeline-Exempt: docs-only[[:space:]]*//')
+elif echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: docs-only[[:space:]]*$'; then
+  EXEMPT_DOCS_ONLY=1
+  EXEMPT_DOCS_REASON=""
+fi
+
+if echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only[[:space:]]+.+$'; then
+  EXEMPT_CODE_ONLY=1
+  EXEMPT_CODE_REASON=$(echo "$COMMIT_BODIES" | grep -oE '^Pipeline-Exempt: code-only[[:space:]]+.+$' | head -1 | sed 's/^Pipeline-Exempt: code-only[[:space:]]*//')
+elif echo "$COMMIT_BODIES" | grep -qE '^Pipeline-Exempt: code-only[[:space:]]*$'; then
+  EXEMPT_CODE_ONLY=1
+  EXEMPT_CODE_REASON=""
+fi
+```
+
+**What this pins for the implementation.** The exact regex `^Pipeline-Exempt: (docs-only|code-only)[[:space:]]+.+$` (with-reason form) and `^Pipeline-Exempt: (docs-only|code-only)[[:space:]]*$` (bare form). The base-to-head range is `${MERGE_BASE}..HEAD` (CI side) or its equivalent `origin/<baseRefName>..origin/<headRefName>` (qa-review side, since qa-review operates against the fetched remote refs, not a local merge-base). The grep is anchored to start-of-line (`^`) which defends against quoted/indented trailers. The implementer will inline this regex shape into the new prompt section verbatim — no clever consolidation, no different anchor, no whitespace permissivity beyond `[[:space:]]+`.
+
 ## Scope
 
 **In scope:**
