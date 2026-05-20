@@ -17,9 +17,9 @@ Add a structural engine-side guard that enforces "advance OR halt" on webhook tu
 
 ## Phase 0 — Code pins (verbatim slices at base SHA `3a39bd31`)
 
-Source pins are read-only; the implementer must compare these against `git show 3a39bd31:<path>` before editing to confirm no upstream drift.
+Source pins are read-only; the implementer must compare these against `git show 3a39bd31:<path>` before editing to confirm no upstream drift. Each critical pin below shows the FULL slice at base SHA — no elision, no placeholder. F1 (first-pass blocking) explicitly required this expansion to ensure the implementer has the exact code to mirror.
 
-### Pin A — `crates/mika-agent/src/agent.rs` lines 5524-5600 (the callback precedent this plan transplants)
+### Pin A — `crates/mika-agent/src/agent.rs` lines 5524-5600 (callback precedent module — FULL verbatim)
 
 ```rust
 // ---------------------------------------------------------------------------
@@ -47,23 +47,42 @@ fn callback_milestone_advance_trigger(msg: &str) -> bool {
 
 /// #991 — Extracts the parent task ID from the milestone-parent marker in the
 /// user message. Returns `None` if the marker is absent or malformed.
-fn extract_milestone_parent_id(msg: &str) -> Option<&str> { /* ... */ }
+fn extract_milestone_parent_id(msg: &str) -> Option<&str> {
+    let start = msg.find(MILESTONE_PARENT_MARKER)?;
+    let rest = &msg[start + MILESTONE_PARENT_MARKER.len()..];
+    let end = rest.find(']')?;
+    let id = rest[..end].trim();
+    if id.is_empty() { None } else { Some(id) }
+}
 
 /// #991 — Returns `true` when the milestone advance obligation is satisfied.
 /// Two valid paths:
 /// - **Path A (advance):** `run_claude_pilot` was called (any attempt, success or failure).
 /// - **Path B (halt or finish):** `update_task_status` was called with the parent
 ///   task ID in the input AND a terminal status (`blocked` or `completed`).
+///
+/// The `parent_task_id` parameter is extracted from the user message's
+/// `[milestone-parent: ...]` marker. This is why the guard is inline rather
+/// than in the `INTENT_GUARDS` const array — the satisfied predicate needs
+/// dynamic context from the user message.
 fn callback_milestone_advance_satisfied(
     parent_task_id: &str,
     summaries: &[ToolCallSummary],
 ) -> bool {
     // Path A: any run_claude_pilot or run_claude_pilot_groom call advances the queue
+    // (the latter is the milestone-cascade auto-groom path; mika#1173).
     let has_advance = summaries
         .iter()
         .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom");
-    if has_advance { return true; }
+
+    if has_advance {
+        return true;
+    }
+
     // Path B: update_task_status targeting the parent with blocked/completed.
+    // Check input_summary for the parent task ID AND a terminal status.
+    // The input_summary contains the JSON tool input, e.g.:
+    // {"task_id": "<uuid>", "status": "blocked", "note": "..."}
     summaries.iter().any(|s| {
         s.name == "update_task_status"
             && s.input_summary.contains(parent_task_id)
@@ -71,83 +90,210 @@ fn callback_milestone_advance_satisfied(
     })
 }
 
+/// #991 — Correction message for the callback milestone advance guard.
 const CALLBACK_MILESTONE_ADVANCE_CORRECTION: &str = "[mika-engine] This is a callback turn for \
      a milestone/project child task. Per mika#991 the engine expects either: \
      (1) dispatch the next pending child via run_claude_pilot, OR \
      (2) mark the milestone/project parent as `blocked` (with a reason in the note field) \
-     or `completed` via update_task_status. ...";
+     or `completed` via update_task_status. Posting a confirmation question or summary \
+     without one of these two tool calls is the deliberation-stall pattern documented \
+     in mika#991. Re-read the callback result and either advance the queue or halt \
+     the milestone explicitly via update_task_status.";
 ```
 
-**Pinpoint claim being mirrored:** the inline guard at `agent.rs:1565-1593` (non-empty text branch) and `agent.rs:1937-1962` (empty-text branch). New constants/functions for webhook live next to the callback ones at `agent.rs:5524-5600`. New inline fire sites mirror the callback ones immediately after them in `run_loop`.
+**Pinpoint claim being mirrored:** `MILESTONE_PARENT_MARKER` and `extract_milestone_parent_id` (lines 5535-5555) are **shared** by the new webhook guard — no duplication. The new webhook module (`WEBHOOK_MILESTONE_ADVANCE_LABEL`, `webhook_milestone_advance_trigger`, `webhook_milestone_advance_satisfied`, `WEBHOOK_MILESTONE_ADVANCE_CORRECTION`) is inserted immediately AFTER line 5600 with its own section header (`// #1218 — Webhook milestone advance guard`).
 
-### Pin B — `crates/mika-agent/src/agent.rs` lines 1557-1593 (inline guard fire site — non-empty text branch)
+### Pin B — `crates/mika-agent/src/agent.rs` lines 1557-1593 (non-empty-text fire site — FULL verbatim)
 
 ```rust
-// #991 — Callback milestone advance guard. For milestone/project-
-// context callbacks, requires the agent to either advance the
-// queue (run_claude_pilot) or explicitly halt/finish the milestone
-// (update_task_status on parent with blocked/completed). Inline
-// rather than in INTENT_GUARDS because the satisfied predicate
-// needs the parent_task_id extracted from the user message.
-// Composes with callback_terminal_action (entry e): a milestone-
-// context callback must satisfy BOTH guards.
-if !skip_remaining_guards
-    && matches!(response.stop_reason, LlmStopReason::EndTurn)
-    && !intent_guard_retries.contains(CALLBACK_MILESTONE_ADVANCE_LABEL)
-    && callback_milestone_advance_trigger(&user_input_text)
-    && let Some(parent_id) = extract_milestone_parent_id(&user_input_text)
-    && !callback_milestone_advance_satisfied(parent_id, &all_tool_summaries)
-{
-    intent_guard_retries.insert(CALLBACK_MILESTONE_ADVANCE_LABEL);
-    warn!(/* ... */);
-    request.messages.push(/* ... assistant block ... */);
-    request.messages.push(LlmMessage {
-        role: LlmRole::User,
-        content: LlmContent::Text(CALLBACK_MILESTONE_ADVANCE_CORRECTION.to_string()),
-    });
-    continue;
-}
+                    // #991 — Callback milestone advance guard. For milestone/project-
+                    // context callbacks, requires the agent to either advance the
+                    // queue (run_claude_pilot) or explicitly halt/finish the milestone
+                    // (update_task_status on parent with blocked/completed). Inline
+                    // rather than in INTENT_GUARDS because the satisfied predicate
+                    // needs the parent_task_id extracted from the user message.
+                    // Composes with callback_terminal_action (entry e): a milestone-
+                    // context callback must satisfy BOTH guards.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(CALLBACK_MILESTONE_ADVANCE_LABEL)
+                        && callback_milestone_advance_trigger(&user_input_text)
+                        && let Some(parent_id) = extract_milestone_parent_id(&user_input_text)
+                        && !callback_milestone_advance_satisfied(parent_id, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(CALLBACK_MILESTONE_ADVANCE_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            parent_task_id = parent_id,
+                            intent_guard = CALLBACK_MILESTONE_ADVANCE_LABEL,
+                            "Callback milestone advance guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                CALLBACK_MILESTONE_ADVANCE_CORRECTION.to_string(),
+                            ),
+                        });
+                        continue;
+                    }
 ```
 
-**Insertion site for the new webhook guard:** immediately AFTER this block in both fire sites (non-empty text and empty-text), preserving fire order callback → webhook (alphabetical within `intent_guard_retries` labels: `callback_milestone_advance` → `webhook_milestone_advance`). Composition with `callback_milestone_advance` is impossible by construction — the triggers are mutually exclusive on the user message's prefix (`[callback:` vs `[GitHub] PR closed:`).
+**Insertion site for the new webhook guard (non-empty branch):** immediately AFTER the closing `}` of this block at line 1593, before the next guard (the `#862` asserted-unavailability guard at line 1605). Fire order is therefore: callback → webhook → asserted-unavailability. The webhook and callback triggers are mutually exclusive on the user message contents (callback prefix `[callback:` vs no callback prefix on webhook turns), so they cannot both fire in one turn.
 
-### Pin C — `crates/mika-agent/src/server/handlers.rs` lines 770-850 (handler chain dispatch — webhook handler insertion site)
+### Pin C — `crates/mika-agent/src/agent.rs` lines 1935-1964 (empty-text fire site mirror — FULL verbatim)
 
 ```rust
-// Structural verdict handler: intercept pull_request_review.submitted webhooks (#524).
-let action = try_handle_pr_review_verdict(/* ... */).await;
-match action { /* ... */ }
+                    // #991 — Callback milestone advance guard for empty-text exits.
+                    // Mirror of the inline guard in the non-empty text path.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(CALLBACK_MILESTONE_ADVANCE_LABEL)
+                        && callback_milestone_advance_trigger(&user_input_text)
+                        && let Some(parent_id) = extract_milestone_parent_id(&user_input_text)
+                        && !callback_milestone_advance_satisfied(parent_id, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(CALLBACK_MILESTONE_ADVANCE_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            parent_task_id = parent_id,
+                            intent_guard = CALLBACK_MILESTONE_ADVANCE_LABEL,
+                            "Callback milestone advance guard fired on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                CALLBACK_MILESTONE_ADVANCE_CORRECTION.to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+```
 
-// Structural CI success handler: intercept check_suite.completed(success) (#571).
-let ci_action = ci_success_handler::try_handle_ci_success(/* ... */).await;
-match ci_action { /* ... */ }
+**Insertion site for the new webhook guard (empty-text branch):** immediately AFTER the closing `}` of this block at line 1964, before the `LoopResult::Done` return at line 1966. Same trigger-mutual-exclusion guarantee as Pin B applies.
 
-// Structural CI failure handler: intercept check_suite.completed(failure|timed_out) (#594).
-let ci_failure_action = ci_failure_handler::try_handle_ci_failure(/* ... */).await;
-match ci_failure_action {
-    VerdictAction::Handled { pre_digest } => { req.text = pre_digest; }
-    VerdictAction::Passthrough { enrichment: Some(e) } => {
-        req.text = format!("{e}{}", req.text);
+### Pin D — `crates/mika-agent/src/server/handlers.rs` lines 773-850 (handler chain — FULL verbatim)
+
+```rust
+    if req.channel == "github" {
+        // Resolve per-agent GitHub token (PAT > App > None),
+        // matching run_agent() pattern at agent.rs:1243 (#561).
+        let verdict_github_token = a
+            .settings
+            .resolve_github_token(a.github_app.as_deref())
+            .await;
+        let action = try_handle_pr_review_verdict(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            Some(&sender_arc),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match action {
+            VerdictAction::Handled { pre_digest } => {
+                req.text = pre_digest;
+            }
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+        }
+
+        // Structural CI success handler: intercept check_suite.completed(success)
+        // webhooks and re-evaluate merge eligibility for PRs with pending QA pass (#571).
+        // Order-independent — each handler self-selects on event type.
+        let ci_action = ci_success_handler::try_handle_ci_success(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            Some(&sender_arc),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match ci_action {
+            VerdictAction::Handled { pre_digest } => {
+                req.text = pre_digest;
+            }
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+        }
+
+        // Structural CI failure handler: intercept check_suite.completed(failure|timed_out)
+        // webhooks, gather failure context, and prepare dispatch pre-digest (#594).
+        // Order-independent — self-selects on failure/timed_out conclusions.
+        let ci_failure_action = ci_failure_handler::try_handle_ci_failure(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            Some(&sender_arc),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match ci_failure_action {
+            VerdictAction::Handled { pre_digest } => {
+                req.text = pre_digest;
+            }
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+        }
     }
-    VerdictAction::Passthrough { enrichment: None } => {}
-}
 ```
 
-**Insertion site for the new milestone-context handler:** immediately after the CI failure handler block, before `agent::AgentParams` is constructed. Same `VerdictAction::Passthrough { enrichment }` shape — only the `Passthrough` arm is used; the new handler never short-circuits the LLM turn (the milestone-advance decision is the LLM's, the engine just supplies the parent ID).
-
-### Pin D — `crates/mika-gateway/src/github.rs` line 386 (PR-closed message format — what the handler matches)
+**Insertion site for the new milestone-context handler:** new `match milestone_action { ... }` block inserted immediately after line 849 (the closing `}` of the `ci_failure_action` match), still inside the `if req.channel == "github"` body (so the handler does not run for non-github channels). Construction:
 
 ```rust
-if action == "closed" {
-    // emitted as: "[GitHub] PR closed: {repo}#{number} — {title} (branch: {branch})\n{url}"
-}
+        // Milestone-context marker injector (mika#1218): for `pull_request.closed`
+        // webhooks whose correlated task has a milestone/project parent, prepend
+        // a `[milestone-parent: <id>]` marker so the inline webhook_milestone_advance
+        // guard in agent.rs can fire. Never returns Handled (LLM still owns the
+        // advance/halt decision).
+        let milestone_action = milestone_context_handler::try_handle_pr_closed_milestone_context(
+            &req.text,
+            &a.db,
+        )
+        .await;
+        match milestone_action {
+            VerdictAction::Passthrough { enrichment: Some(e) } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+            VerdictAction::Handled { .. } => {
+                unreachable!("milestone_context handler never handles");
+            }
+        }
 ```
 
-**Pinpoint claim:** PR-closed webhooks arrive with prefix `[GitHub] PR closed:` and the PR URL on the second line. The new handler matches both, extracts the URL, and correlates via `db.find_active_task_by_pr_url(pr_url)` (existing query, used by `find_task_for_verdict` at `server/verdict_handler.rs:1046-1081`).
-
-### Pin E — `crates/mika-agent/src/server/verdict_handler.rs:1046-1081` (task correlation helper to reuse)
+### Pin E — `crates/mika-agent/src/server/verdict_handler.rs` lines 1044-1081 (task correlation helper — FULL verbatim)
 
 ```rust
+/// Look up an active in_progress task by PR URL. Returns None if not found
+/// or task is not in_progress.
 async fn find_task_for_verdict(
     db: &AsyncDatabase,
     pr_url: &str,
@@ -155,18 +301,74 @@ async fn find_task_for_verdict(
 ) -> Option<crate::db::Task> {
     match db.find_active_task_by_pr_url(pr_url).await {
         Ok(Some(t)) if t.status == "in_progress" => Some(t),
-        /* ... */
+        Ok(Some(t)) => {
+            info!(
+                task_id = %t.id,
+                status = %t.status,
+                pr_url = %pr_url,
+                "Verdict handler: task found but not in_progress (status: {})",
+                t.status
+            );
+            None
+        }
+        Ok(None) => {
+            info!(
+                pr_number = event.pr_number,
+                repo = %event.repo,
+                pr_url = %pr_url,
+                "Verdict handler: no active task found for PR"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                pr_url = %pr_url,
+                "Failed to look up task by PR URL"
+            );
+            None
+        }
     }
 }
 ```
 
-**Pinpoint claim:** task correlation by PR URL is an existing, tested DB path. The new handler reuses `db.find_active_task_by_pr_url` directly (the `find_task_for_verdict` wrapper takes a `PrReviewEvent` shape, not a PR-closed event, so we lift the wrapper or call `find_active_task_by_pr_url` directly).
+**Reuse claim:** the new milestone-context handler calls `db.find_active_task_by_pr_url` directly (not via `find_task_for_verdict`, which takes a `PrReviewEvent` shape this handler does not have). The status-gating logic (`t.status == "in_progress"`) is replicated inline in the new handler — it's a one-liner, not worth a shared helper given the different event shapes.
 
-### Pin F — `crates/mika-agent/src/agent.rs` lines 5345-5400 (`run_silent_agent` marker emission — the symmetry source)
+### Pin F — `crates/mika-gateway/src/github.rs` lines 383-389 (PR-closed message format — FULL verbatim)
 
-The callback `[milestone-parent: <id>]` marker is emitted by `run_silent_agent` (referenced in `crates/mika-agent/CLAUDE.md` § Post-Conditions step 6b) after a DB lookup of the parent task type. The webhook handler proposed here is the **webhook-side mirror** of that emission: same DB lookup (`get_task` on `parent_task_id`, check `type IN ('milestone', 'project')`), same marker format, different injection point (server handler chain vs silent-agent invocation).
+```rust
+            let mut text = format!(
+                "[GitHub] PR {action}: {repo_name}#{number} — {title} (branch: {branch})\n{url}"
+            );
+            if action == "closed" {
+                let merged = pr.and_then(|p| p.merged).unwrap_or(false);
+                text.push_str(&format!("\nMerged: {merged}"));
+            }
+```
 
-### Pin G — `skills/bundled/self-dev/system_prompt.md` § M4 step 2.5 — current `⚠ ENGINE GUARD PENDING mika#1218` warning (to be removed per AC3)
+**Pinpoint claim — IMPORTANT, expands earlier draft:** for `pull_request.closed` events the gateway appends a THIRD line `\nMerged: {merged}`. The full emitted shape is:
+
+```
+[GitHub] PR closed: senara-solutions/mika#1000 — title (branch: foo)
+https://github.com/senara-solutions/mika/pull/1000
+Merged: true
+```
+
+This third line is load-bearing for the Phase 1 milestone-context handler: **the handler must gate on `text.contains("\nMerged: true")` before injecting the marker.** Non-merge closes also emit `[GitHub] PR closed:` but with `Merged: false` — those do NOT advance the milestone and MUST NOT receive the marker. The Phase 1 detection algorithm is updated below to include this check.
+
+### Pin G — `crates/mika-agent/src/agent.rs` lines 5215-5219 (`INTENT_GUARDS` const array shape — FULL verbatim of the signature)
+
+```rust
+/// Registry of intent-precondition guards.  Evaluated in order; each entry
+/// gets an independent single-retry flag.  Guards that don't fit the
+/// "trigger + tool-signature" pattern (e.g. persistence nudge, completion
+/// claim) remain as inline code outside this registry.
+const INTENT_GUARDS: &[IntentPrecondition] = &[
+```
+
+The `IntentPrecondition` struct (defined nearby in the same file) has `trigger: fn(&str) -> bool` and `satisfied: fn(&[ToolCallSummary]) -> bool` — both are pure function pointers over only the user message text and the tool summaries. **There is no dynamic-context channel in the signature** to pass `parent_task_id` or any other turn-local extracted value. This is the structural reason `callback_milestone_advance` is inline (Pin A's doc comment), and the same reason mika#1218's webhook variant ships inline. **F1/Q1 resolution citation: this signature is the load-bearing constraint.**
+
+### Pin H — `skills/bundled/self-dev/system_prompt.md` § M4 step 2.5 — `⚠ ENGINE GUARD PENDING mika#1218` warning (to be removed per AC3)
 
 From mika#1208 prompt diff (already merged on main):
 
@@ -174,15 +376,21 @@ From mika#1208 prompt diff (already merged on main):
 > ⚠ **ENGINE GUARD PENDING mika#1218** — the "advance OR halt" obligation in the webhook handler (Phase 2 below) is enforced by prompt prose only until mika#1218 lands a `webhook_milestone_advance` INTENT_GUARD. This is the same against-gradient-behavior class as `callback_milestone_advance` (mika#991): the LLM's trained default is "acknowledge and close the turn" rather than "advance the queue." See `docs/solutions/architecture-patterns/engine-guards-vs-prompt-rules-for-agent-behavior-2026-04-19.md` for the doctrine. mika#1218's AC3 removes this warning when the engine guard lands.
 ```
 
-**Locator:** the literal string `⚠ **ENGINE GUARD PENDING mika#1218**` appears twice on main — once in `skills/bundled/self-dev/system_prompt.md` (M4 step 2.5 `auto_merge_enabled` branch) and once in `skills/bundled/self-dev-webhook-qa/system_prompt.md` (Path A step 5.5 preamble). Both must be removed in the implementation PR (AC3).
+**Locator:** the literal string `⚠ **ENGINE GUARD PENDING mika#1218**` appears twice on main. F4 (first-pass non-blocking) requires an **exhaustive** verification command rather than relying on two named files — the implementer must run, from repo root:
 
-### Pin H — `crates/mika-agent/CLAUDE.md` § Post-Conditions step 6b — current text (to be updated per AC4)
+```bash
+grep -rn "ENGINE GUARD PENDING mika#1218" skills/ docs/ crates/ Makefile .github/
+```
+
+The PR is acceptable only if this command returns ZERO matches after Phase 4's edits land. Two named files (`skills/bundled/self-dev/system_prompt.md` and `skills/bundled/self-dev-webhook-qa/system_prompt.md`) are the known matches at base SHA; any others discovered are removed in the same PR.
+
+### Pin I — `crates/mika-agent/CLAUDE.md` § Post-Conditions step 6b — current text (to be updated per AC4)
 
 ```text
 6b. **Callback milestone advance guard (#991):** Inline guard (not in `INTENT_GUARDS` const array) that enforces queue advancement on milestone/project-context callback turns. [... existing description ...] **Webhook companion guard gap (mika#1218):** The webhook path (`self-dev-webhook-qa` Path A step 5.5) carries the same "advance OR halt" obligation via prompt prose only (mika#1208). The engine-layer `webhook_milestone_advance` INTENT_GUARD is filed as mika#1218; until it lands, the prompt-only contract carries the obligation. mika#1218's AC3 removes the warning prose added by mika#1208.
 ```
 
-**Locator:** the literal heading `**Callback milestone advance guard (#991):**` introduces this paragraph. The "Webhook companion guard gap (mika#1218):" sub-paragraph at the end is replaced with a fully-fledged description of the new `webhook_milestone_advance` guard's trigger, satisfaction, and composition behavior.
+**Locator:** the literal heading `**Callback milestone advance guard (#991):**` introduces this paragraph. The "Webhook companion guard gap (mika#1218):" sub-paragraph at the end is replaced with the fully-fledged description of the new guard (text in Phase 4 step 2).
 
 ## Scope
 
@@ -222,10 +430,11 @@ Returns `VerdictAction::Passthrough { enrichment: Some(format!("[milestone-paren
 ### Detection algorithm
 
 1. Match prefix: `text.starts_with("[GitHub] PR closed:")`. If false → `Passthrough { enrichment: None }`.
-2. Extract PR URL: scan `text` for the first line matching the URL regex `^https://github\.com/[^/]+/[^/]+/pull/\d+`. If absent → `Passthrough { enrichment: None }` + DEBUG log (malformed webhook; legitimate non-merge close events also have this shape).
-3. Correlate task: `db.find_active_task_by_pr_url(&pr_url).await`. If `None` → `Passthrough { enrichment: None }` + INFO log. If `Some(t)` but `t.parent_task_id.is_none()` → `Passthrough { enrichment: None }`.
-4. Fetch parent task: `db.get_task(parent_id).await`. If parent's `type` is `"milestone"` or `"project"` → emit the marker. Otherwise → `Passthrough { enrichment: None }`.
-5. Emit: `Passthrough { enrichment: Some(format!("[milestone-parent: {parent_id}]\n")) }`. INFO log with `pr_url`, `task_id`, `parent_id`, `parent_type` for observability.
+2. **Gate on merge truth (per Pin F).** Check `text.contains("\nMerged: true")`. If false (non-merge close OR malformed payload missing the line) → `Passthrough { enrichment: None }` + DEBUG log. Non-merge closes also emit `[GitHub] PR closed:` but never advance a milestone.
+3. Extract PR URL: scan `text` for the first line matching the URL regex `^https://github\.com/[^/]+/[^/]+/pull/\d+`. If absent → `Passthrough { enrichment: None }` + DEBUG log (malformed webhook).
+4. Correlate task: `db.find_active_task_by_pr_url(&pr_url).await`. If `None` → `Passthrough { enrichment: None }` + INFO log. If `Some(t)` but `t.parent_task_id.is_none()` → `Passthrough { enrichment: None }`.
+5. Fetch parent task: `db.get_task(parent_id).await`. If parent's `type` is `"milestone"` or `"project"` → emit the marker. Otherwise → `Passthrough { enrichment: None }`.
+6. Emit: `Passthrough { enrichment: Some(format!("[milestone-parent: {parent_id}]\n")) }`. INFO log with `pr_url`, `task_id`, `parent_id`, `parent_type` for observability.
 
 ### Reused helpers
 
@@ -276,17 +485,17 @@ Mirror the inline `callback_milestone_advance` guard at two sites, with trigger 
 const WEBHOOK_MILESTONE_ADVANCE_LABEL: &str = "webhook_milestone_advance";
 
 /// #1218 — Returns `true` when the user message indicates a milestone/project-
-/// context PR-closed webhook turn. Reuses the `[milestone-parent: ...]`
-/// marker from #991; the prefix check ensures we don't compose with the
-/// callback guard (mutually exclusive triggers).
+/// context PR-closed webhook turn. Uses `contains` for both checks for
+/// resilience to handler-chain reordering AND symmetry with the callback
+/// precedent's `contains(MILESTONE_PARENT_MARKER)` usage (Pin A line 5544).
+/// Mutually exclusive triggers with `callback_milestone_advance` on user
+/// message content (no callback prefix on webhook turns).
 fn webhook_milestone_advance_trigger(msg: &str) -> bool {
-    msg.starts_with("[milestone-parent: ")
-        && msg.contains("[GitHub] PR closed:")
-        || (msg.contains(MILESTONE_PARENT_MARKER) && msg.contains("[GitHub] PR closed:"))
+    msg.contains(MILESTONE_PARENT_MARKER) && msg.contains("[GitHub] PR closed:")
 }
 ```
 
-**Marker-position note:** the server-side handler (Phase 1) prepends `[milestone-parent: <id>]\n` to the message — so after enrichment, the message starts with the marker and the `[GitHub] PR closed:` prefix is on a later line. The trigger checks both orderings (marker-first OR marker-anywhere-with-PR-closed-prefix) to remain robust to gateway message-format changes. The implementer should pick the simplest valid form once they verify the exact post-enrichment shape; this plan presents both for the architect to choose.
+**F3 resolution note (single contains-form, mirrors callback):** the earlier `starts_with(MILESTONE_PARENT_MARKER)` form depended on the assumption that the Phase 1 handler always prepends the marker as the first line. If a future handler-chain reorder (e.g., a new pre-handler that prepends another enrichment) puts the marker mid-message, `starts_with` would silently miss. The `contains` form is identical in shape to the callback precedent (`msg.starts_with("[callback:") && msg.contains(MILESTONE_PARENT_MARKER)`) and follows the same resilience principle. The webhook prefix check uses `contains("[GitHub] PR closed:")` rather than `starts_with` because (a) enrichments from other handlers run before milestone_context_handler (verdict_handler / ci_success_handler / ci_failure_handler — see Pin D) could prepend their own enrichment text, so the `[GitHub] PR closed:` prefix is not guaranteed to be at byte-offset zero of the user message, and (b) `contains` is symmetric with the marker check, reducing trigger-shape drift.
 
 ```rust
 /// #1218 — Returns `true` when the webhook milestone advance obligation is satisfied.
@@ -384,17 +593,20 @@ if !skip_remaining_guards
 
 Extend `crates/mika-agent/tests/eval/test_callback_milestone_advance.rs` as a new cohort. Placement follows the mika#1208 plan's cohort-by-invariant decision (architect session `8288311f` NB2).
 
-### New cohort: `webhook_milestone_advance` (one test per AC2 sub-clause plus mirrors)
+### New cohort: `webhook_milestone_advance` (12 tests — AC2 sub-clauses plus mirrors plus F2 Path C isolation)
 
-1. **`webhook_milestone_advance_path_a_accepts_run_claude_pilot`** — webhook turn carries the `[milestone-parent: <id>]` marker; `run_claude_pilot` is called; assert guard does NOT fire, EndTurn accepted.
+1. **`webhook_milestone_advance_path_a_accepts_run_claude_pilot`** — webhook turn carries the `[milestone-parent: <id>]` marker; `run_claude_pilot` is called; assert guard does NOT fire, EndTurn accepted. **Maps to AC2(a).**
 2. **`webhook_milestone_advance_path_a_accepts_run_claude_pilot_groom`** — same but `run_claude_pilot_groom` (auto-groom path).
-3. **`webhook_milestone_advance_path_b_accepts_halt_blocked`** — `update_task_status(parent_id, status: "blocked")`. Assert guard does NOT fire.
+3. **`webhook_milestone_advance_path_b_accepts_halt_blocked`** — `update_task_status(parent_id, status: "blocked")`. Assert guard does NOT fire. **Maps to AC2(b).**
 4. **`webhook_milestone_advance_path_b_accepts_halt_completed`** — `update_task_status(parent_id, status: "completed")`. Assert guard does NOT fire.
-5. **`webhook_milestone_advance_path_c_accepts_deploy_hook`** — BOTH `deploy_mika` AND `send_message` called. Assert guard does NOT fire.
-6. **`webhook_milestone_advance_silent_text_rejection_then_retry_succeeds`** — webhook turn emits text-only (no tool calls). Assert guard fires once, re-prompt injected with `WEBHOOK_MILESTONE_ADVANCE_CORRECTION`; the second turn calls `run_claude_pilot`, EndTurn accepted.
-7. **`webhook_milestone_advance_single_retry_semantics`** — webhook turn fails to satisfy even after retry. Assert guard fires exactly once (label tracked in `intent_guard_retries`), then EndTurn is accepted on the second violation with WARN log.
-8. **`webhook_milestone_advance_no_marker_no_fire`** — webhook arrives but the milestone-context handler did NOT inject the marker (non-milestone task). Assert guard does NOT fire even on zero-tool EndTurn.
-9. **`webhook_milestone_advance_callback_marker_does_not_trigger_webhook_guard`** — composition isolation: a callback turn with `[milestone-parent: <id>]` triggers `callback_milestone_advance` (existing behavior), NOT `webhook_milestone_advance`. Asserts on the label tracked in `intent_guard_retries`.
+5. **`webhook_milestone_advance_path_c_accepts_deploy_with_send_message_any_text`** — BOTH `deploy_mika` AND `send_message("anything")` called. Assert guard does NOT fire. (Path C accepts text-unchecked per R6.c.) **F2 isolation test #3.**
+6. **`webhook_milestone_advance_path_c_rejects_deploy_only_no_send_message`** — `deploy_mika` alone, no `send_message`. Assert guard FIRES (Path C requires BOTH). **F2 isolation test #1.**
+7. **`webhook_milestone_advance_path_c_rejects_send_message_only_no_deploy`** — `send_message` alone, no `deploy_mika`. Assert guard FIRES (Path C requires BOTH). **F2 isolation test #2.**
+8. **`webhook_milestone_advance_silent_text_rejection_then_retry_succeeds`** — webhook turn emits text-only (no tool calls). Assert guard fires once, re-prompt injected with `WEBHOOK_MILESTONE_ADVANCE_CORRECTION`; the second turn calls `run_claude_pilot`, EndTurn accepted. **Maps to AC2(c).**
+9. **`webhook_milestone_advance_single_retry_semantics`** — webhook turn fails to satisfy even after retry. Assert guard fires exactly once (label tracked in `intent_guard_retries`), then EndTurn is accepted on the second violation with WARN log.
+10. **`webhook_milestone_advance_no_marker_no_fire`** — webhook arrives but the milestone-context handler did NOT inject the marker (non-milestone task). Assert guard does NOT fire even on zero-tool EndTurn.
+11. **`webhook_milestone_advance_callback_marker_does_not_trigger_webhook_guard`** — composition isolation: a callback turn with `[milestone-parent: <id>]` triggers `callback_milestone_advance` (existing behavior), NOT `webhook_milestone_advance`. Asserts on the label tracked in `intent_guard_retries`.
+12. **`webhook_milestone_advance_empty_text_branch_mirror`** — webhook turn with `EndTurn` and empty text. Assert empty-text branch fires the guard. (Mode requires `follow_up_on_empty() == false` — this test is gated on mode shape; if no current mode satisfies, asserts via direct unit test of the predicate functions only.)
 
 ### Mock harness shape
 
@@ -439,7 +651,20 @@ Use an in-memory `AsyncDatabase` (existing test pattern at `db::tests` / `task_e
 
 5. **R5 — `PostWebhookAdvance` SilentTrigger absence.** The callback path has `PostCallbackAdvance` (mika#991) which fires a second silent turn if the first callback turn did not advance, auto-blocking the milestone after a second miss. The webhook path has no equivalent today. **Disposition:** ticket open question Q3 (below). If the architect ratifies deferral, file a follow-up; if not, scope expands here.
 
-6. **R6 — Path C false positives (`deploy_mika` + `send_message` in unrelated turns).** The Phase 2 `webhook_milestone_advance_satisfied` Path C admits any turn that calls BOTH tools. A webhook turn that legitimately deploys for a NON-milestone-context reason and notifies in the same turn would pass. **Likelihood:** low (the trigger already restricts to milestone-context webhook turns, so any `deploy_mika` call in such a turn is the legitimate 5.5.b deploy-hook ack). **Mitigation:** acceptable. The guard's purpose is to enforce SOME action, not to police the action's correctness; the prompt prose owns the "deploy_mika in the context of the milestone parent" semantic.
+6. **R6 — Path C false-positive surface (F2 first-pass blocking, expanded).** The Phase 2 `webhook_milestone_advance_satisfied` Path C accepts any turn that calls BOTH `deploy_mika` AND `send_message`. Three distinct false-acceptance scenarios examined:
+
+   **R6.a — Deploy for the WRONG milestone child.** The webhook fires for milestone-child #X's PR-merge. The LLM, confused about which child is in HOLD, calls `deploy_mika({"task_id": "<some-other-milestone-child>"})` and notifies the operator. Path C accepts. Result: milestone advances by deploying a stale or wrong child. **Likelihood:** low — the milestone-context handler injects ONE `[milestone-parent: <id>]` marker per turn, and the prompt prose at `self-dev-webhook-qa` step 5.5.b explicitly names the metadata.labels source on THIS child's task. **Defense:** the LLM has the correct context (current child's metadata via `list_tasks(parent_task_id=<milestone>)`) and the marker pins the parent. **Disposition:** acceptable false-positive surface — bounded by prompt context, not eliminated by the guard alone.
+
+   **R6.b — Deploy-and-notify for an UNRELATED reason in the same turn.** The LLM calls `deploy_mika` for a non-5.5.b reason (e.g., it confuses the merge webhook with a CI-recovery prompt and triggers a redeploy of a previous child) AND calls `send_message` to inform the operator. Path C accepts. Result: the milestone-advance contract is satisfied by a side-effect that does not actually advance the queue. **Likelihood:** very low — the trigger restricts to milestone/project-parent webhook turns, and the prompt's step 5.5 dispatch table only names `deploy_mika` in the 5.5.b deploy-hook branch (no other named call to `deploy_mika` in the same prompt section). **Defense:** prompt-level discipline. **Disposition:** acceptable — would require LLM to call a tool the prompt does not name in this surface, which is itself a separate guard concern (#702 INTENT_GUARDS is the right family).
+
+   **R6.c — Send-message that does NOT actually notify a deploy.** The LLM calls `deploy_mika` followed by `send_message("acknowledging webhook")` — generic ack, not a deploy-hook ack with the canonical "Deploy hook triggered for <repo>#<issue>" phrasing from step 5.5.b. Path C accepts. Result: deploy fires, but the operator gets a generic message that does not surface the deploy-hook semantic. **Likelihood:** moderate — `send_message` text is unstructured. **Disposition:** the guard's purpose is "did the agent attempt an advance action?", not "did the agent communicate cleanly?" The semantic-quality of the notification is a prompt concern. The deploy_mika call itself IS the advance signal; send_message is the operator-loop courtesy. **Defense:** if operational logs show R6.c clouding the signal, file a precision follow-up to require a substring match in send_message text (fragile — see Q4 disposition).
+
+   **Aggregate disposition:** All three R6 sub-classes are bounded by the trigger gate (milestone-context webhook turn) and the prompt context (step 5.5.b naming). The guard does NOT police action correctness; it polices action presence. Precision tightening is deferred to follow-ups gated on operational signals.
+
+   **Test coverage for R6 (3 new isolated tests added in Phase 3 per F2):**
+   - `webhook_milestone_advance_path_c_rejects_deploy_only_no_send_message` — `deploy_mika` called WITHOUT `send_message`. Asserts guard fires (Path C requires BOTH).
+   - `webhook_milestone_advance_path_c_rejects_send_message_only_no_deploy` — `send_message` called WITHOUT `deploy_mika`. Asserts guard fires (Path C requires BOTH).
+   - `webhook_milestone_advance_path_c_accepts_deploy_with_send_message_any_text` — `deploy_mika` + `send_message("anything")` both called. Asserts guard does NOT fire (Path C semantic — text content unchecked by design, per R6.c disposition).
 
 ## Open questions
 
@@ -456,8 +681,8 @@ Use an in-memory `AsyncDatabase` (existing test pattern at `db::tests` / `task_e
 ## Acceptance criteria (mapped to ticket ACs)
 
 - **AC1** (ticket: "New INTENT_GUARDS entry `webhook_milestone_advance` added per the contract above"): NEW constants/functions in `agent.rs` (`WEBHOOK_MILESTONE_ADVANCE_LABEL`, `webhook_milestone_advance_trigger`, `webhook_milestone_advance_satisfied`, `WEBHOOK_MILESTONE_ADVANCE_CORRECTION`) + TWO new inline guard fire sites in `run_loop` mirroring the callback equivalents. Single-retry semantics via `intent_guard_retries`. **Wording note:** AC1 satisfied "by family, not by literal array entry" — see Q1.
-- **AC2** (ticket: "Eval test at `tests/eval/test_webhook_milestone_advance.rs` (or extension of `test_callback_milestone_advance.rs`) covering: (a) advance-via-`run_claude_pilot` satisfies the guard, (b) halt-via-`update_task_status(blocked)` satisfies, (c) silent-text rejection + single retry"): 9 new tests in the existing file (cohort placement per Q5), per Phase 3 above. Three explicitly map to AC2(a)/(b)/(c); the other six cover Path C, single-retry exhaustion, no-marker no-fire, callback-vs-webhook trigger isolation, and the empty-text branch.
-- **AC3** (ticket: "mika#1208 prompt diff's `⚠ ENGINE GUARD PENDING mika#<this>` warning is **removed** in the same PR (coupling)"): Phase 4 step 1 — remove both warnings (M4 step 2.5 in self-dev + Path A step 5.5 in self-dev-webhook-qa). Coupling enforced by file-level grep in the PR's manual verification step.
+- **AC2** (ticket: "Eval test at `tests/eval/test_webhook_milestone_advance.rs` (or extension of `test_callback_milestone_advance.rs`) covering: (a) advance-via-`run_claude_pilot` satisfies the guard, (b) halt-via-`update_task_status(blocked)` satisfies, (c) silent-text rejection + single retry"): 12 new tests in the existing file (cohort placement per Q5), per Phase 3 above. Three explicitly map to AC2(a)/(b)/(c); the other nine cover Path C three-way isolation (F2), single-retry exhaustion, no-marker no-fire, callback-vs-webhook trigger isolation, and the empty-text branch.
+- **AC3** (ticket: "mika#1208 prompt diff's `⚠ ENGINE GUARD PENDING mika#<this>` warning is **removed** in the same PR (coupling)"): Phase 4 step 1 — remove both warnings (M4 step 2.5 in self-dev + Path A step 5.5 in self-dev-webhook-qa). **Verification command (F4):** `grep -rn "ENGINE GUARD PENDING mika#1218" skills/ docs/ crates/ Makefile .github/` must return ZERO matches after Phase 4 lands. The implementer runs this from repo root as a final PR gate; any straggler matches discovered are removed in the same PR.
 - **AC4** (ticket: "`crates/mika-agent/CLAUDE.md` § Post-Conditions step 6b updated to describe both callback and webhook paths"): Phase 4 step 2 — replace the closing "Webhook companion guard gap" sub-paragraph with the full description of the new guard.
 - **AC5** (NEW, not in ticket): server-side `milestone_context_handler` module with the seven unit tests in Phase 3 sub-section "Server-side handler tests." **Justification:** the engine guard depends on marker injection; without the handler module the guard never fires on webhook paths. The ticket's Surface section names `crates/mika-agent/src/agent.rs` only; this plan expands to `crates/mika-agent/src/server/milestone_context_handler.rs` as the structural prerequisite. Surfaced to architect for ratification or split into a sibling ticket.
 
