@@ -385,6 +385,217 @@ allowlist = ["mika-arch-groom-ticket", "mika-arch-groom-milestone", "mika-arch-s
 /// All well-known agents.
 pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] = &[&MIKA_DEV, &MIKA_QA, &MIKA_RELAY, &MIKA_ARCH];
 
+/// Identity-toml section paths that the reconciler owns from the static spec.
+///
+/// **Each entry is a dotted path** from the root of `identity.toml`. The reconciler
+/// walks each path in both the expected (spec-rendered) tree and the on-disk tree;
+/// when they differ, the expected subtree replaces the on-disk subtree.
+///
+/// Adding a new code-owned section to `WellKnownAgent`'s identity templates requires
+/// adding an entry here AND adding a unit test below — the
+/// `test_code_owned_sections_have_reconciler_coverage` test iterates this constant
+/// and fails the build if any entry is not exercised by a spec.
+///
+/// Sections NOT listed here are preserved verbatim from the on-disk file (operator-owned:
+/// `name`, `emoji`, `[reflection]`, `[kg]`).
+pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] =
+    &["skills.allowlist", "tools.disabled", "context.summary"];
+
+/// Walk a dotted path through a `toml::Value` tree.
+///
+/// Returns `None` if any segment is missing or traverses a non-table value.
+fn get_path<'a>(value: &'a toml::Value, dotted: &str) -> Option<&'a toml::Value> {
+    let mut current = value;
+    for segment in dotted.split('.') {
+        current = current.as_table()?.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Set a value at a dotted path, creating intermediate empty tables as needed.
+///
+/// Returns `Err` if a non-table value blocks the path. Existing siblings at any
+/// intermediate level are preserved.
+fn set_path(value: &mut toml::Value, dotted: &str, new: toml::Value) -> Result<(), String> {
+    let segments: Vec<&str> = dotted.split('.').collect();
+    let (last, parents) = segments
+        .split_last()
+        .ok_or_else(|| "empty dotted path".to_string())?;
+    let mut current = value;
+    for segment in parents {
+        let table = current
+            .as_table_mut()
+            .ok_or_else(|| format!("path '{dotted}' traverses non-table at '{segment}'"))?;
+        if !table.contains_key(*segment) {
+            table.insert(
+                (*segment).to_string(),
+                toml::Value::Table(toml::Table::new()),
+            );
+        }
+        current = table
+            .get_mut(*segment)
+            .ok_or_else(|| format!("insertion failed at '{segment}'"))?;
+    }
+    let table = current.as_table_mut().ok_or_else(|| {
+        format!("path '{dotted}' parent is not a table at final segment '{last}'")
+    })?;
+    table.insert((*last).to_string(), new);
+    Ok(())
+}
+
+/// Reconcile the code-owned sections of a well-known agent's on-disk identity.toml
+/// against the static spec.
+///
+/// For each path in [`CODE_OWNED_IDENTITY_SECTIONS`], if the spec defines a value
+/// and the on-disk file differs (or is missing the section), the on-disk subtree
+/// is replaced with the expected subtree. Operator-owned sections (`name`, `emoji`,
+/// `[reflection]`, `[kg]`) are preserved verbatim.
+///
+/// Failure isolation: any error (parse, render, write) logs a `warn!` and skips
+/// THIS agent only. The existing fail-closed parse path in `prompt::load_identity()`
+/// protects the running agent from a malformed file.
+///
+/// Idempotent: when the on-disk file already matches the spec on every code-owned
+/// path, the function emits a single info log and writes nothing.
+///
+/// Atomic write: serialized content is written to `identity.toml.tmp` then renamed
+/// over `identity.toml` so a crash mid-write never leaves a partial file.
+pub fn reconcile_well_known_identity(home_dir: &Path, spec: &WellKnownAgent, settings: &Settings) {
+    let agent_home = mika_common::agent::agent_dir(home_dir, spec.name);
+    let identity_path = agent_home.join("identity.toml");
+
+    let expected_str = match render_identity_content(spec, settings) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                event = "identity_reconcile.skipped",
+                reason = "render_failed",
+                agent = spec.name,
+                error = %e,
+                "identity reconciliation skipped — failed to render expected identity"
+            );
+            return;
+        }
+    };
+
+    let on_disk_str = match std::fs::read_to_string(&identity_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                event = "identity_reconcile.skipped",
+                reason = "read_failed",
+                agent = spec.name,
+                error = %e,
+                "identity reconciliation skipped — failed to read on-disk identity.toml"
+            );
+            return;
+        }
+    };
+
+    let expected: toml::Value = match toml::from_str(&expected_str) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                event = "identity_reconcile.skipped",
+                reason = "expected_parse_failed",
+                agent = spec.name,
+                error = %e,
+                "identity reconciliation skipped — failed to parse expected identity"
+            );
+            return;
+        }
+    };
+
+    let mut on_disk: toml::Value = match toml::from_str(&on_disk_str) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                event = "identity_reconcile.skipped",
+                reason = "on_disk_parse_failed",
+                agent = spec.name,
+                error = %e,
+                "identity reconciliation skipped — on-disk identity.toml is malformed"
+            );
+            return;
+        }
+    };
+
+    let mut reconciled_paths: Vec<&str> = Vec::new();
+    for path in CODE_OWNED_IDENTITY_SECTIONS {
+        let expected_val = match get_path(&expected, path) {
+            Some(v) => v,
+            None => continue,
+        };
+        if get_path(&on_disk, path) != Some(expected_val) {
+            if let Err(e) = set_path(&mut on_disk, path, expected_val.clone()) {
+                warn!(
+                    event = "identity_reconcile.skipped",
+                    reason = "set_path_failed",
+                    agent = spec.name,
+                    path = %path,
+                    error = %e,
+                    "identity reconciliation failed at path"
+                );
+                return;
+            }
+            reconciled_paths.push(path);
+        }
+    }
+
+    if reconciled_paths.is_empty() {
+        info!(
+            event = "identity_reconcile.in_sync",
+            agent = spec.name,
+            "identity in sync — no reconciliation needed"
+        );
+        return;
+    }
+
+    let merged_str = match toml::to_string(&on_disk) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                event = "identity_reconcile.skipped",
+                reason = "serialize_failed",
+                agent = spec.name,
+                error = %e,
+                "identity reconciliation failed — TOML serialization"
+            );
+            return;
+        }
+    };
+
+    let tmp_path = identity_path.with_extension("toml.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, &merged_str) {
+        warn!(
+            event = "identity_reconcile.skipped",
+            reason = "tmp_write_failed",
+            agent = spec.name,
+            error = %e,
+            "identity reconciliation failed — could not write tmp file"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &identity_path) {
+        warn!(
+            event = "identity_reconcile.skipped",
+            reason = "rename_failed",
+            agent = spec.name,
+            error = %e,
+            "identity reconciliation failed — atomic rename"
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+
+    info!(
+        event = "identity_reconcile.complete",
+        agent = spec.name,
+        reconciled_paths = ?reconciled_paths,
+        "reconciled drifted identity sections for well-known agent"
+    );
+}
+
 /// Platform agents that can be dispatched via `mika ask --agent <peer>` without
 /// requiring LLM permission classification. These are intra-platform peers that
 /// claude-pilot and mika-relay should structurally allow.
@@ -446,10 +657,10 @@ pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disable
 
     for spec in WELL_KNOWN_AGENTS {
         if mika_common::agent::agent_exists(home_dir, spec.name) {
-            info!(
-                agent = spec.name,
-                "well-known agent already exists, skipping"
-            );
+            // Existing agent: reconcile code-owned identity sections so static-spec
+            // changes (e.g., new bundled skill added to MIKA_DEV_IDENTITY) propagate
+            // to on-disk identity.toml. See mika#1220.
+            reconcile_well_known_identity(home_dir, spec, settings);
             continue;
         }
 
@@ -1994,5 +2205,419 @@ mod tests {
             !DISPATCH_TRIGGER_ALLOWLIST.is_empty(),
             "dispatch trigger allowlist must not be empty"
         );
+    }
+
+    // -- Identity reconciliation tests (mika#1220) --
+
+    /// Pre-seed an agent on disk with a custom identity.toml content,
+    /// bypassing the spec-driven provisioner.
+    fn pre_seed_identity(home: &Path, agent_name: &str, content: &str) {
+        mika_common::home::bootstrap_agent(home, agent_name).unwrap();
+        let agent_dir = mika_common::agent::agent_dir(home, agent_name);
+        fs::write(agent_dir.join("identity.toml"), content).unwrap();
+    }
+
+    fn read_identity(home: &Path, agent_name: &str) -> String {
+        let agent_dir = mika_common::agent::agent_dir(home, agent_name);
+        fs::read_to_string(agent_dir.join("identity.toml")).unwrap()
+    }
+
+    #[test]
+    fn test_reconcile_adds_missing_allowlist_for_mika_dev() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Pre-#815 shape: no [skills] block on disk.
+        pre_seed_identity(
+            home,
+            "mika-dev",
+            "name = \"Dev\"\nemoji = \"🛠\"\n\n[kg]\nenabled = false\n",
+        );
+
+        reconcile_well_known_identity(home, &MIKA_DEV, &test_settings_with_kg_roots());
+
+        let after = read_identity(home, "mika-dev");
+        let identity: crate::prompt::Identity = toml::from_str(&after).unwrap();
+        let allowlist = identity
+            .skills
+            .allowlist
+            .expect("reconciler must add [skills].allowlist");
+        assert_eq!(
+            allowlist.len(),
+            26,
+            "mika-dev reconciled allowlist must contain all 26 spec skills"
+        );
+        assert!(allowlist.contains(&"self-dev".to_string()));
+        assert!(allowlist.contains(&"dev-pilot".to_string()));
+        assert!(allowlist.contains(&"dev-groom".to_string()));
+    }
+
+    #[test]
+    fn test_reconcile_preserves_operator_kg_and_reflection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Operator-customized identity: distinct name + emoji + [kg] + [reflection].
+        // Name and emoji must NOT equal spec defaults so a regression that rewrote
+        // them from the spec would be detected (operator-owned per the plan, AC3).
+        pre_seed_identity(
+            home,
+            "mika-dev",
+            "name = \"OperatorCustomDev\"\n\
+             emoji = \"⚙\"\n\
+             \n\
+             [kg]\n\
+             enabled = true\n\
+             docs_root = \"/operator/docs\"\n\
+             \n\
+             [reflection]\n\
+             enabled = true\n\
+             time = \"21:30\"\n",
+        );
+
+        reconcile_well_known_identity(home, &MIKA_DEV, &test_settings_with_kg_roots());
+
+        let after = read_identity(home, "mika-dev");
+        let value: toml::Value = toml::from_str(&after).unwrap();
+        // Operator-owned: preserved verbatim
+        assert_eq!(
+            value["name"].as_str(),
+            Some("OperatorCustomDev"),
+            "operator name must be preserved"
+        );
+        assert_eq!(
+            value["emoji"].as_str(),
+            Some("⚙"),
+            "operator emoji must be preserved"
+        );
+        assert_eq!(
+            value["kg"]["enabled"].as_bool(),
+            Some(true),
+            "operator [kg].enabled must be preserved"
+        );
+        assert_eq!(
+            value["kg"]["docs_root"].as_str(),
+            Some("/operator/docs"),
+            "operator [kg].docs_root must be preserved"
+        );
+        assert_eq!(
+            value["reflection"]["time"].as_str(),
+            Some("21:30"),
+            "operator [reflection].time must be preserved"
+        );
+        // Code-owned: added by reconciler
+        let allowlist = value["skills"]["allowlist"].as_array().unwrap();
+        assert!(!allowlist.is_empty(), "[skills].allowlist must be added");
+    }
+
+    #[test]
+    fn test_reconcile_overwrites_drifted_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Operator weakened the allowlist; reconciler must restore the spec.
+        pre_seed_identity(
+            home,
+            "mika-dev",
+            "name = \"Dev\"\n\
+             emoji = \"🛠\"\n\
+             \n\
+             [skills]\n\
+             allowlist = [\"only-self-dev\"]\n",
+        );
+
+        reconcile_well_known_identity(home, &MIKA_DEV, &test_settings_with_kg_roots());
+
+        let after = read_identity(home, "mika-dev");
+        let identity: crate::prompt::Identity = toml::from_str(&after).unwrap();
+        let allowlist = identity.skills.allowlist.unwrap();
+        assert!(
+            allowlist.contains(&"dev-pilot".to_string()),
+            "drifted allowlist must be reset to spec — dev-pilot must be present"
+        );
+        assert!(
+            !allowlist.contains(&"only-self-dev".to_string()),
+            "operator-weakened allowlist must be overwritten"
+        );
+        assert_eq!(allowlist.len(), 26);
+    }
+
+    #[test]
+    fn test_reconcile_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        pre_seed_identity(home, "mika-dev", "name = \"Dev\"\nemoji = \"🛠\"\n");
+
+        // First reconcile: writes the [skills] block.
+        reconcile_well_known_identity(home, &MIKA_DEV, &test_settings_with_kg_roots());
+        let after_first = read_identity(home, "mika-dev");
+
+        // Second reconcile: should be a no-op (file content unchanged).
+        reconcile_well_known_identity(home, &MIKA_DEV, &test_settings_with_kg_roots());
+        let after_second = read_identity(home, "mika-dev");
+
+        assert_eq!(
+            after_first, after_second,
+            "second reconcile must not modify the file"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_adds_mika_arch_missing_groom_milestone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Pre-seed mika-arch with an allowlist missing mika-arch-groom-milestone.
+        pre_seed_identity(
+            home,
+            "mika-arch",
+            "name = \"Architect\"\n\
+             emoji = \"🏛\"\n\
+             \n\
+             [kg]\n\
+             enabled = true\n\
+             docs_roots = [\"/tmp/test-kg-corpus-a\"]\n\
+             \n\
+             [context.summary]\n\
+             inject = false\n\
+             \n\
+             [skills]\n\
+             allowlist = [\"mika-arch-groom-ticket\", \"mika-arch-second-review\"]\n\
+             \n\
+             [tools]\n\
+             disabled = []\n",
+        );
+
+        reconcile_well_known_identity(home, &MIKA_ARCH, &test_settings_with_kg_roots());
+
+        let after = read_identity(home, "mika-arch");
+        let identity: crate::prompt::Identity = toml::from_str(&after).unwrap();
+        let allowlist = identity.skills.allowlist.unwrap();
+        assert!(
+            allowlist.contains(&"mika-arch-groom-milestone".to_string()),
+            "reconciler must add missing mika-arch-groom-milestone to allowlist"
+        );
+        assert_eq!(allowlist.len(), 3);
+    }
+
+    #[test]
+    fn test_reconcile_adds_mika_arch_missing_context_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Pre-seed mika-arch without [context.summary].
+        pre_seed_identity(
+            home,
+            "mika-arch",
+            "name = \"Architect\"\n\
+             emoji = \"🏛\"\n\
+             \n\
+             [kg]\n\
+             enabled = true\n\
+             docs_roots = [\"/tmp/test-kg-corpus-a\"]\n\
+             \n\
+             [skills]\n\
+             allowlist = [\"mika-arch-groom-ticket\", \"mika-arch-groom-milestone\", \"mika-arch-second-review\"]\n\
+             \n\
+             [tools]\n\
+             disabled = []\n",
+        );
+
+        reconcile_well_known_identity(home, &MIKA_ARCH, &test_settings_with_kg_roots());
+
+        let after = read_identity(home, "mika-arch");
+        let identity: crate::prompt::Identity = toml::from_str(&after).unwrap();
+        assert!(
+            !identity.context.summary.inject,
+            "reconciler must set [context.summary].inject = false (mika#1009 leak protection)"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_only_touches_specified_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Pre-seed a well-known target.
+        pre_seed_identity(home, "mika-dev", "name = \"Dev\"\nemoji = \"🛠\"\n");
+        // Pre-seed a user-defined agent with custom content the reconciler must not touch.
+        let custom_identity =
+            "name = \"Custom\"\nemoji = \"👤\"\n\n[skills]\nallowlist = [\"custom-only\"]\n";
+        pre_seed_identity(home, "operator-custom-agent", custom_identity);
+
+        reconcile_well_known_identity(home, &MIKA_DEV, &test_settings_with_kg_roots());
+
+        let after_custom = read_identity(home, "operator-custom-agent");
+        assert_eq!(
+            after_custom, custom_identity,
+            "reconciler must not modify a non-target agent's identity.toml"
+        );
+    }
+
+    #[test]
+    fn test_provision_disabled_skips_reconciliation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Pre-seed mika-dev with drifted (no [skills]) identity.
+        let pre_content = "name = \"Dev\"\nemoji = \"🛠\"\n";
+        pre_seed_identity(home, "mika-dev", pre_content);
+
+        // disabled=true must skip the entire provisioning loop, including reconciliation.
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), true);
+
+        let after = read_identity(home, "mika-dev");
+        assert_eq!(
+            after, pre_content,
+            "disabled provisioning must not invoke the reconciler"
+        );
+    }
+
+    #[test]
+    fn test_provision_isolates_one_malformed_agent_from_others() {
+        // Plan's central failure-isolation claim: a malformed identity for one
+        // well-known agent must not block reconciliation for the others.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // mika-dev gets garbage that fails TOML parse; mika-qa is left with the
+        // default bootstrap identity (no [skills] block, so it needs reconciling).
+        pre_seed_identity(home, "mika-dev", "this is = = not :: toml }}}");
+        pre_seed_identity(home, "mika-qa", "name = \"QA\"\nemoji = \"🔍\"\n");
+
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
+
+        // mika-dev's malformed file is preserved as-is (the existing fail-closed
+        // parse path in prompt::load_identity protects the running agent).
+        let dev_after = read_identity(home, "mika-dev");
+        assert_eq!(
+            dev_after, "this is = = not :: toml }}}",
+            "malformed mika-dev identity must not be overwritten"
+        );
+
+        // mika-qa was reconciled despite mika-dev's failure — the plan's
+        // failure-isolation claim holds at the loop level.
+        let qa_after = read_identity(home, "mika-qa");
+        let qa_identity: crate::prompt::Identity = toml::from_str(&qa_after).unwrap();
+        assert!(
+            qa_identity.skills.allowlist.is_some(),
+            "mika-qa must be reconciled even though mika-dev failed parse"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_handles_malformed_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Write garbage that fails toml::from_str.
+        let garbage = "this is = = not :: toml }}}";
+        pre_seed_identity(home, "mika-dev", garbage);
+
+        // Must not panic.
+        reconcile_well_known_identity(home, &MIKA_DEV, &test_settings_with_kg_roots());
+
+        // File is left as-is when on-disk parse fails (existing fail-closed parse
+        // path in prompt::load_identity protects the running agent).
+        let after = read_identity(home, "mika-dev");
+        assert_eq!(
+            after, garbage,
+            "malformed identity must not be overwritten by the reconciler"
+        );
+    }
+
+    #[test]
+    fn test_code_owned_sections_have_reconciler_coverage() {
+        // For every dotted path in CODE_OWNED_IDENTITY_SECTIONS, at least one
+        // WELL_KNOWN_AGENTS spec's rendered identity must produce a non-None value
+        // at that path. Catches typos like "skils.allowlist" landing in the const.
+        let settings = test_settings_with_kg_roots();
+        for path in CODE_OWNED_IDENTITY_SECTIONS {
+            let mut covered = false;
+            for spec in WELL_KNOWN_AGENTS {
+                let content = match render_identity_content(spec, &settings) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let value: toml::Value = match toml::from_str(&content) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if get_path(&value, path).is_some() {
+                    covered = true;
+                    break;
+                }
+            }
+            assert!(
+                covered,
+                "CODE_OWNED_IDENTITY_SECTIONS entry '{path}' is not emitted by any \
+                 WELL_KNOWN_AGENTS spec — likely a typo or stale entry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_code_owned_drift_outside_constant() {
+        // Inverse direction: for every dotted path emitted by a WELL_KNOWN_AGENTS
+        // spec at depth ≤ 2 that is NOT under an operator-owned root, assert it
+        // is exactly listed in CODE_OWNED_IDENTITY_SECTIONS or is a child of an
+        // entry there. Catches the silent-regression case where a new section
+        // is added to a spec but forgotten in the constant.
+        let settings = test_settings_with_kg_roots();
+
+        // Operator-owned root namespaces — paths starting with these are user-controlled.
+        fn is_operator_owned(path: &str) -> bool {
+            path == "name"
+                || path == "emoji"
+                || path == "reflection"
+                || path.starts_with("reflection.")
+                || path == "kg"
+                || path.starts_with("kg.")
+        }
+
+        // A path is "covered" by the constant if it equals an entry or is a
+        // descendant of one (so context.summary covers context.summary.inject).
+        fn is_under_code_owned(path: &str) -> bool {
+            for owned in CODE_OWNED_IDENTITY_SECTIONS {
+                if path == *owned || path.starts_with(&format!("{owned}.")) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // Enumerate leaf-ish paths at depth ≤ 2. Depth-1 scalars and depth-2
+        // entries (whether scalar or table) count as leaves. Deeper nesting is
+        // governed by the depth-2 entry's coverage.
+        fn enumerate_paths(value: &toml::Value) -> Vec<String> {
+            let mut paths = Vec::new();
+            if let Some(table) = value.as_table() {
+                for (k, v) in table {
+                    if let Some(sub) = v.as_table() {
+                        for (k2, _) in sub {
+                            paths.push(format!("{k}.{k2}"));
+                        }
+                    } else {
+                        paths.push(k.clone());
+                    }
+                }
+            }
+            paths
+        }
+
+        for spec in WELL_KNOWN_AGENTS {
+            let content = match render_identity_content(spec, &settings) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let value: toml::Value = match toml::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for path in enumerate_paths(&value) {
+                if is_operator_owned(&path) {
+                    continue;
+                }
+                assert!(
+                    is_under_code_owned(&path),
+                    "agent '{}' identity emits path '{path}' which is neither \
+                     operator-owned (name/emoji/reflection/kg) nor covered by \
+                     CODE_OWNED_IDENTITY_SECTIONS — add it to the constant or \
+                     justify exclusion in the operator-owned helper",
+                    spec.name
+                );
+            }
+        }
     }
 }
