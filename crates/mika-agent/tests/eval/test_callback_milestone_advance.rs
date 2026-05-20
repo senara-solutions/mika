@@ -1,4 +1,5 @@
-//! Integration tests: callback milestone advance guard (#991).
+//! Integration tests: callback milestone advance guard (#991) and HOLD
+//! re-entry semantics (#1208).
 //!
 //! Verifies that the inline guard `callback_milestone_advance` requires
 //! milestone/project-context callback turns to either:
@@ -28,6 +29,18 @@
 //! 8. Three-task chained advance: success path (Phase 6 Test 7a / AC#3).
 //! 9. Three-task chained advance: auto_skipped path (Phase 6 Test 7b / AC#3).
 //! 10. Three-task chained advance: failure path (Phase 6 Test 7c / AC#3).
+//!
+//! --- HOLD re-entry cohort (#1208) ---
+//! 11. Webhook PR-closed advances next child — HOLD child completes, run_gh
+//!     verifies MERGED, list_tasks finds next pending, run_claude_pilot dispatches.
+//! 12. Webhook PR-closed → operator notification on last child — no pending
+//!     children remain, operator surfaces M5 close-out prompt.
+//! 13. Webhook PR-closed → deploy-hook path — child has needs-deploy label,
+//!     deploy_mika called instead of run_claude_pilot.
+//! 14. Idempotent HOLD re-entry on PostCallbackAdvance — backstop fires while
+//!     child is HOLD, no re-dispatch, parent milestone blocked.
+//! 15. PR state race — webhook arrives but run_gh returns state != MERGED,
+//!     child re-set to HOLD.
 
 use async_trait::async_trait;
 use mika_agent::tools::{Tool, ToolContext, ToolOutput, default_tools};
@@ -674,4 +687,463 @@ async fn chained_advance_three_tasks_failure() {
         json!({"task_id": PARENT_TASK_ID}),
     );
     assert_exact_steps(&trace, 4);
+}
+
+// ===========================================================================
+// HOLD re-entry cohort (#1208) — Webhook-originated milestone advance tests.
+//
+// These tests verify the M4 HOLD re-entry semantics introduced by mika#1208:
+// - The `pull_request.closed(merged: true)` webhook handler must advance the
+//   milestone queue (step 5.5 in self-dev-webhook-qa).
+// - The PostCallbackAdvance backstop must detect HOLD state as a no-op.
+// - PR state races must be handled gracefully.
+//
+// The user message for webhook tests uses the `[GitHub] PR closed:` prefix
+// (matching the gateway's `format_event_text()` output), which is on the
+// qa-territory allowlist in `is_unauthorized_webhook_dispatch()`.
+// ===========================================================================
+
+/// Parameterized `run_gh` stub — returns MERGED or OPEN based on `merged` flag.
+struct StubRunGhTool {
+    merged: bool,
+}
+
+#[async_trait]
+impl Tool for StubRunGhTool {
+    fn name(&self) -> &str {
+        "run_gh"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "run_gh".to_string(),
+            description: "Stub run_gh for HOLD re-entry tests".to_string(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> anyhow::Result<ToolOutput> {
+        if self.merged {
+            Ok(ToolOutput::success(
+                r#"{"state": "MERGED", "mergedAt": "2026-05-20T10:00:00Z"}"#.to_string(),
+            ))
+        } else {
+            Ok(ToolOutput::success(
+                r#"{"state": "OPEN", "mergedAt": null}"#.to_string(),
+            ))
+        }
+    }
+}
+
+/// Stub `deploy_mika` that always succeeds.
+struct StubDeployMikaTool;
+
+#[async_trait]
+impl Tool for StubDeployMikaTool {
+    fn name(&self) -> &str {
+        "deploy_mika"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "deploy_mika".to_string(),
+            description: "Stub deploy_mika for HOLD re-entry deploy-hook tests".to_string(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::success("deploy_mika dispatched.".to_string()))
+    }
+}
+
+/// Stub `update_task_metadata` that always succeeds.
+struct StubUpdateTaskMetadataTool;
+
+#[async_trait]
+impl Tool for StubUpdateTaskMetadataTool {
+    fn name(&self) -> &str {
+        "update_task_metadata"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "update_task_metadata".to_string(),
+            description: "Stub update_task_metadata for HOLD note persistence".to_string(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::success("Metadata updated.".to_string()))
+    }
+}
+
+/// Base registry for HOLD re-entry tests — shared stubs without run_gh variant.
+fn hold_reentry_base_tools() -> mika_agent::tools::ToolRegistry {
+    let mut tools = default_tools();
+    tools.register(Box::new(StubUpdateTaskStatusTool));
+    tools.register(Box::new(StubRunClaudePilotTool));
+    tools.register(Box::new(StubCheckTaskTool));
+    tools.register(Box::new(StubListTasksTool));
+    tools.register(Box::new(StubUpdateTaskMetadataTool));
+    tools
+}
+
+/// HOLD re-entry tests with MERGED run_gh stub (happy path).
+fn tools_with_hold_reentry_stubs() -> mika_agent::tools::ToolRegistry {
+    let mut tools = hold_reentry_base_tools();
+    tools.register(Box::new(StubRunGhTool { merged: true }));
+    tools
+}
+
+/// HOLD re-entry tests with NOT-MERGED run_gh stub (race condition).
+fn tools_with_hold_reentry_not_merged_stubs() -> mika_agent::tools::ToolRegistry {
+    let mut tools = hold_reentry_base_tools();
+    tools.register(Box::new(StubRunGhTool { merged: false }));
+    tools
+}
+
+/// HOLD re-entry tests with deploy_mika for deploy-hook path.
+fn tools_with_hold_reentry_deploy_stubs() -> mika_agent::tools::ToolRegistry {
+    let mut tools = hold_reentry_base_tools();
+    tools.register(Box::new(StubRunGhTool { merged: true }));
+    tools.register(Box::new(StubDeployMikaTool));
+    tools
+}
+
+/// A webhook PR-closed user message (matching gateway `format_event_text` output).
+fn webhook_pr_closed_msg() -> String {
+    "[GitHub] PR closed: senara-solutions/mika#1050 — feat: add health endpoint (branch: feat/health)\nhttps://github.com/senara-solutions/mika/pull/1050".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: Webhook PR-closed advances next child (#1208 Phase 2 step 5.5.c).
+//
+// HOLD child completes via webhook. Agent verifies PR merged via run_gh,
+// checks milestone parent, finds next pending child, dispatches via
+// run_claude_pilot.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hold_reentry_webhook_advances_next_child() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Correlate — find task with verdict_merge: auto
+            tool_call_response(
+                "list_tasks",
+                json!({"status": "in_progress"}),
+            ),
+            // Step 2: Complete the HOLD child
+            tool_call_response(
+                "update_task_status",
+                json!({"task_id": "child-hold-id", "status": "completed"}),
+            ),
+            // Step 3: Verify PR actually merged (step 5.5.a)
+            tool_call_response(
+                "run_gh",
+                json!({"command": ["pr", "view", "1050", "--json", "state,mergedAt"], "repo": "senara-solutions/mika"}),
+            ),
+            // Step 4: Check parent to determine if milestone context
+            tool_call_response("check_task", json!({"task_id": PARENT_TASK_ID})),
+            // Step 5: Find next pending child (step 5.5.c)
+            tool_call_response(
+                "list_tasks",
+                json!({"parent_task_id": PARENT_TASK_ID}),
+            ),
+            // Step 6: Dispatch next child via run_claude_pilot
+            tool_call_response(
+                "run_claude_pilot",
+                json!({"skill": "dev-pilot", "prompt": "mika#1051", "task_id": "next-child-id"}),
+            ),
+            // Step 7: Final text
+            text_response("Webhook: PR merged, dispatched next milestone child."),
+        ])
+        .tools(tools_with_hold_reentry_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run(&webhook_pr_closed_msg()).await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "dispatched next milestone child");
+    assert_tools_include(
+        &trace,
+        &["run_gh", "run_claude_pilot", "update_task_status"],
+    );
+    // Verify dispatch targets the next child (not arbitrary)
+    assert_tool_args_contain(
+        &trace,
+        "run_claude_pilot",
+        0,
+        json!({"task_id": "next-child-id"}),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: Webhook PR-closed → last child, operator notification (#1208
+// Phase 2 step 5.5.c last-child branch).
+//
+// HOLD child is the last pending child. Agent completes it, verifies merge,
+// but finds no more pending children. Surfaces M5 close-out prompt to
+// operator instead of dispatching.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hold_reentry_webhook_last_child_operator_notification() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Correlate task
+            tool_call_response(
+                "list_tasks",
+                json!({"status": "in_progress"}),
+            ),
+            // Step 2: Complete the HOLD child
+            tool_call_response(
+                "update_task_status",
+                json!({"task_id": "child-hold-id", "status": "completed"}),
+            ),
+            // Step 3: Verify PR merged
+            tool_call_response(
+                "run_gh",
+                json!({"command": ["pr", "view", "1050", "--json", "state,mergedAt"], "repo": "senara-solutions/mika"}),
+            ),
+            // Step 4: Check parent (milestone)
+            tool_call_response("check_task", json!({"task_id": PARENT_TASK_ID})),
+            // Step 5: List children — no pending children remain
+            tool_call_response(
+                "list_tasks",
+                json!({"parent_task_id": PARENT_TASK_ID}),
+            ),
+            // Step 6: Update milestone parent status (operator resume needed)
+            tool_call_response(
+                "update_task_status",
+                json!({
+                    "task_id": PARENT_TASK_ID,
+                    "status": "in_progress",
+                    "note": "Auto-merge of mika issue#1050 completed via webhook — operator-resume needed to drive M5 close-out"
+                }),
+            ),
+            // Step 7: Notify operator
+            tool_call_response(
+                "send_message",
+                json!({"text": "Milestone mika milestone#19 last child auto-merged via webhook. Reply 'continue' to run M5 close-out."}),
+            ),
+            // Step 8: Final text
+            text_response("Last child merged. Awaiting operator to drive M5."),
+        ])
+        .tools(tools_with_hold_reentry_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run(&webhook_pr_closed_msg()).await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "M5");
+    // run_claude_pilot should NOT be called — no next child to dispatch
+    assert_tools_exclude(&trace, &["run_claude_pilot"]);
+    assert_tools_include(&trace, &["update_task_status", "send_message", "run_gh"]);
+    // Verify parent milestone update targets the correct task
+    // (update_task_status call 0 is the child completed; call 1 is the parent)
+    assert_tool_args_contain(
+        &trace,
+        "update_task_status",
+        1,
+        json!({"task_id": PARENT_TASK_ID}),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: Webhook PR-closed → deploy-hook path (#1208 Phase 2 step 5.5.b).
+//
+// HOLD child has `needs-deploy` label. Agent completes child, verifies
+// merge, detects deploy-hook label, calls deploy_mika instead of
+// run_claude_pilot.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hold_reentry_webhook_deploy_hook() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Correlate task
+            tool_call_response(
+                "list_tasks",
+                json!({"status": "in_progress"}),
+            ),
+            // Step 2: Complete the HOLD child
+            tool_call_response(
+                "update_task_status",
+                json!({"task_id": "child-hold-id", "status": "completed"}),
+            ),
+            // Step 3: Verify PR merged
+            tool_call_response(
+                "run_gh",
+                json!({"command": ["pr", "view", "1050", "--json", "state,mergedAt"], "repo": "senara-solutions/mika"}),
+            ),
+            // Step 4: Check parent (milestone)
+            tool_call_response("check_task", json!({"task_id": PARENT_TASK_ID})),
+            // Step 5: Notify about deploy hook
+            tool_call_response(
+                "send_message",
+                json!({"text": "Deploy hook triggered for mika#1050 via auto-merge webhook (label: needs-deploy). Running build+deploy before next ticket."}),
+            ),
+            // Step 6: Call deploy_mika (step 5.5.b)
+            tool_call_response(
+                "deploy_mika",
+                json!({"task_id": PARENT_TASK_ID}),
+            ),
+            // Step 7: Final text — turn ends, deploy callback drives next iteration
+            text_response("Deploy triggered. Callback will drive next milestone step."),
+        ])
+        .tools(tools_with_hold_reentry_deploy_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run(&webhook_pr_closed_msg()).await.unwrap();
+
+    assert_has_output(&trace);
+    assert_tools_include(&trace, &["deploy_mika", "run_gh"]);
+    // run_claude_pilot should NOT be called — deploy_mika takes over
+    assert_tools_exclude(&trace, &["run_claude_pilot"]);
+    // Verify deploy_mika targets the parent milestone (task_id == milestone_wi)
+    assert_tool_args_contain(&trace, "deploy_mika", 0, json!({"task_id": PARENT_TASK_ID}));
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: Idempotent HOLD re-entry on PostCallbackAdvance (#1208 Phase 1).
+//
+// A PostCallbackAdvance backstop fires while the child is still in HOLD
+// (webhook hasn't arrived yet). The agent should detect the HOLD state,
+// NOT re-dispatch, and block the parent milestone with an operator
+// notification.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hold_reentry_idempotent_postcallbackadvance() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Agent checks the child task — sees HOLD state
+            tool_call_response("check_task", json!({"task_id": "child-hold-id"})),
+            // Step 2: Agent blocks the parent milestone
+            tool_call_response(
+                "update_task_status",
+                json!({
+                    "task_id": PARENT_TASK_ID,
+                    "status": "blocked",
+                    "note": "HOLD child not yet merged after PostCallbackAdvance — auto-merge may be stuck; operator review"
+                }),
+            ),
+            // Step 3: Agent notifies operator
+            tool_call_response(
+                "send_message",
+                json!({"text": "PostCallbackAdvance fired but child is still in HOLD — auto-merge may be stuck. Blocking milestone for operator review."}),
+            ),
+            // Step 4: Final text
+            text_response("HOLD re-entry: no-op, milestone blocked for operator review."),
+        ])
+        .tools(tools_with_hold_reentry_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    // PostCallbackAdvance trigger message — same format as test 5 above
+    let trace = harness.run(&advance_trigger_msg()).await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "HOLD");
+    // run_claude_pilot should NOT be called — child is still HOLD
+    assert_tools_exclude(&trace, &["run_claude_pilot"]);
+    assert_tools_include(
+        &trace,
+        &["check_task", "update_task_status", "send_message"],
+    );
+    // Verify the block targeted the parent milestone
+    assert_tool_args_contain(
+        &trace,
+        "update_task_status",
+        0,
+        json!({"task_id": PARENT_TASK_ID, "status": "blocked"}),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: PR state race — webhook arrives but state != MERGED (#1208
+// Phase 2 step 5.5.a).
+//
+// The pull_request.closed webhook arrives but run_gh returns state=OPEN
+// (race condition or non-merge close). The agent should re-set the child
+// to HOLD, notify Vincent, and NOT advance the milestone.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hold_reentry_pr_state_race_not_merged() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            // Step 1: Correlate task
+            tool_call_response(
+                "list_tasks",
+                json!({"status": "in_progress"}),
+            ),
+            // Step 2: Complete the HOLD child (premature — will be reverted)
+            tool_call_response(
+                "update_task_status",
+                json!({"task_id": "child-hold-id", "status": "completed"}),
+            ),
+            // Step 3: Verify PR — returns OPEN (not merged!)
+            tool_call_response(
+                "run_gh",
+                json!({"command": ["pr", "view", "1050", "--json", "state,mergedAt"], "repo": "senara-solutions/mika"}),
+            ),
+            // Step 4: Re-set child to HOLD (step 5.5.a race handling)
+            tool_call_response(
+                "update_task_status",
+                json!({
+                    "task_id": "child-hold-id",
+                    "status": "in_progress",
+                    "note": "HOLD: webhook arrived but PR state != MERGED; awaiting confirmation"
+                }),
+            ),
+            // Step 5: Notify Vincent
+            tool_call_response(
+                "send_message",
+                json!({"text": "PR mika#1050 webhook fired but state is OPEN (not MERGED). Re-setting child to HOLD."}),
+            ),
+            // Step 6: Final text
+            text_response("PR state race detected. Child remains in HOLD."),
+        ])
+        .tools(tools_with_hold_reentry_not_merged_stubs())
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run(&webhook_pr_closed_msg()).await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "HOLD");
+    // run_claude_pilot should NOT be called — PR not actually merged
+    assert_tools_exclude(&trace, &["run_claude_pilot"]);
+    assert_tools_include(&trace, &["run_gh", "update_task_status", "send_message"]);
+    // Verify the HOLD re-set targets the correct child with in_progress status
+    // (update_task_status call 1 is the re-set; call 0 is the premature complete)
+    assert_tool_args_contain(
+        &trace,
+        "update_task_status",
+        1,
+        json!({"task_id": "child-hold-id", "status": "in_progress"}),
+    );
 }

@@ -164,6 +164,32 @@ When you receive a GitHub webhook event for `pull_request.closed`:
 3. **If no match found:** `send_message` to Vincent "Received merged webhook for {PR URL} but no matching task found. Manual check needed." Then stop.
 4. **Pull main:** `git_ops({"operation":"fetch","repo_path":"<platform_dir>/<repo>/"})` then `git_ops({"operation":"merge","base":"origin/main","repo_path":"<platform_dir>/<repo>/"})`
 5. **Complete task:** `update_task_status(status: "completed")`
+
+5.5. **Milestone/project advance gate (parity with self-dev-callback § Permitted post-callback actions item 2):**
+
+   ⚠ **ENGINE GUARD PENDING mika#1218** — this gate is prompt-prose-only until mika#1218 lands a `webhook_milestone_advance` INTENT_GUARD symmetric to `callback_milestone_advance` (mika#991). Until then, the contract below is enforced only by this prompt. mika#1218's AC3 removes this warning when the engine guard lands.
+
+   Call `check_task(parent_task_id)`. If `parent_task_id` is null OR the parent's `type` is neither `"milestone"` nor `"project"`, proceed to step 6 (notify and stop — non-milestone task, no advance needed).
+
+   Otherwise, the completed child is a milestone/project child. You MUST advance per M4 step 3 (or P4 step 3 for projects). Execute the following steps in order:
+
+   **5.5.a Verify PR actually merged (ALWAYS — prerequisite for 5.5.b/5.5.c).** Call `run_gh(["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")`. If `state != "MERGED"`, the webhook is racing (or fired for a non-merge close). Re-set the child to HOLD via `update_task_status(child_task_id, status="in_progress", note="HOLD: webhook arrived but PR state != MERGED; awaiting confirmation")`, notify Vincent via `send_message`, and end the turn. Do NOT advance. Do NOT proceed to 5.5.b or 5.5.c.
+
+   **5.5.b Deploy hook check** (mirrors M4 step 3b — `self-dev/system_prompt.md` § step 3b). Read the child task's `metadata.labels`. If `needs-build` or `needs-deploy` is present:
+   - Notify Vincent: "Deploy hook triggered for <repo>#<issue> via auto-merge webhook (label: <label>). Running build+deploy before next ticket."
+   - Call `deploy_mika({"task_id": "<milestone_wi>"})`.
+   - End the turn. The deploy callback drives the next iteration via `self-dev-callback` (which inherits the milestone-context advance contract).
+
+   If no deploy-hook label is present, continue to 5.5.c.
+
+   **5.5.c Find and dispatch the next pending child.** Call `list_tasks(parent_task_id=<milestone_wi>)`. Filter to `type="issue"` children with status `pending`. Order by `created_at` ascending (the topo-sorted dispatch order set at M3 time).
+
+   - **If a next pending child exists:** Transition it to `in_progress` via `update_task_status(<next_child>, status="in_progress")`, then call `run_claude_pilot(...)` with the next child's `task_id` per M4 step 1 + step 2. The `run_claude_pilot` call itself ends the turn (claude-pilot fires asynchronously; the next M4 iteration lands on the resulting callback turn). Guard (0) `unauthorized_webhook_dispatch` does NOT reject this call — `[GitHub] PR closed:` is on the qa-territory allowlist per `crates/mika-agent/src/webhook_dispatch.rs` (mika#933) and Row E test at `test_is_unauthorized_webhook_dispatch_predicate`.
+
+   - **If no pending children remain (this was the last):** This is the milestone-completion path. Update the milestone parent and surface to the operator: `update_task_status(parent_task_id=<milestone_wi>, status="in_progress", note="Auto-merge of <repo> issue#<issue> completed via webhook — operator-resume needed to drive M5 close-out")`, then `send_message`: "Milestone <repo> milestone#<n> last child auto-merged via webhook. Reply 'continue' to run M5 close-out."
+
+   **Forbidden actions in this turn:** Acknowledge-and-close ("PR #<num> merged. Task complete.") without one of 5.5.a, 5.5.b, or 5.5.c above. The engine `webhook_milestone_advance` guard (mika#1218) will reject this structurally when it lands; until then, this rule is prompt-only.
+
 6. **Notify:** `send_message`: "PR {repo}#{pr_number} auto-merged by GitHub. Task {label} complete. {PR URL}"
 
 ---
