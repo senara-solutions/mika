@@ -1842,6 +1842,21 @@ async fn run_loop(
                     {
                         let location = parse_ready_label_location(&user_input_text)
                             .unwrap_or_else(|| "<unknown>".to_string());
+                        // mika#852 — counter-friendly structured event (stable
+                        // name, suffix `_total` follows the tracing-counter
+                        // convention). Emitted alongside the human-readable
+                        // message below; both lines carry the same field shape
+                        // so log-readers tailing either one continue to work.
+                        // Future "do we need to debounce ready-label stalls?"
+                        // can answer via:
+                        //   jq 'select(.message == "ready_label_dispatch_stall_total")
+                        //       | .timestamp' < $MIKA_SERVER_LOG_FILE
+                        error!(
+                            trace_id = %tool_ctx.trace_id,
+                            location = %location,
+                            label = mode.label(),
+                            "ready_label_dispatch_stall_total"
+                        );
                         error!(
                             trace_id = %tool_ctx.trace_id,
                             location = %location,
@@ -5350,13 +5365,24 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
     crate::webhook_dispatch::is_ready_label_dispatch_marker(msg)
 }
 
-/// Returns `true` when `run_claude_pilot` was attempted in this turn
-/// (success or failure).
+/// Returns `true` when `run_claude_pilot` or `run_claude_pilot_groom` was
+/// attempted on this turn (success or failure). The
+/// `webhook_ready_label_dispatch` intent-guard satisfies on **attempts**, not
+/// **successes**, because the seven terminal rejections from
+/// `validate_dispatch_readiness` (`crates/mika-agent/src/skills/executor.rs`)
+/// are structural and not recoverable by re-prompting the LLM:
 ///
-/// #846, #907, #1089 — Requires `run_claude_pilot` attempted on ready-label
-/// webhook turns.  Attempts count regardless of success — terminal failures
-/// (global_dispatch_active, task_not_dispatchable, etc.) are structural and
-/// not recoverable by re-prompt.  See `INTENT_GUARDS` comment and #846.
+///   1. `unauthorized_webhook_dispatch` — non-ready webhook hit the prevention surface (mika#933)
+///   2. `task_not_dispatchable` — task in a terminal state (`blocked`/`completed`/`cancelled`)
+///   3. `task_active_dispatch` — same task already has an active callback child
+///   4. `global_dispatch_active` — another task of the same dispatch class has an active callback (mika#583, #1001)
+///   5. `dispatch_limit_exceeded` — per-turn dispatch counter already at the limit (mika#583)
+///   6. `dispatch_no_grooming_marker` — ungroomed issue rejected at the gate (mika#919)
+///   7. `dispatch_blocked_by` — open GitHub blockers remain (mika#713)
+///
+/// Re-prompting the LLM after any of these would loop (the LLM cannot dissolve
+/// a structural rejection); the operator-notification path
+/// (`agent.rs:1764-1791`) fires instead.
 ///
 /// History: #907 added an OR-shape (`run_claude_pilot || send_message`) to
 /// accept grooming-rejection notifications.  #996 replaced the rejection path
@@ -5364,10 +5390,9 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 /// obsolete for this guard.  #1089 removed `send_message` from the predicate
 /// after fabricated `check_task` pre-flights exploited the over-broad match to
 /// short-circuit dispatch via a hallucinated escalation that hit NoChannel.
+/// #1173 — dev-groom owns its own tool (`run_claude_pilot_groom`); both names
+/// satisfy the dispatch contract.
 fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    // mika#1173: dev-groom owns its own tool (run_claude_pilot_groom) after the
-    // structural revert. Auto-groom path dispatches via the groom tool; both
-    // names satisfy the ready-label dispatch contract.
     summaries
         .iter()
         .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")

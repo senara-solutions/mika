@@ -1693,6 +1693,20 @@ mod tests {
             after: None,
         };
         let text = format_event_text("issues", &event);
+
+        // Contract: the producer's output for label_name="ready" must start with
+        // the canonical READY_LABEL_DISPATCH_MARKER prefix shared via mika-common.
+        // Renaming the constant or the producer template breaks this assertion
+        // and surfaces the cross-crate drift at CI time (mika#852).
+        assert!(
+            text.starts_with(mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER),
+            "format_event_text drifted from READY_LABEL_DISPATCH_MARKER: \
+             expected prefix {:?}, got {:?}",
+            mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER,
+            text,
+        );
+
+        // Existing exact-shape assertion (regression: full output stays stable).
         assert_eq!(
             text,
             "[GitHub] Issue labeled ready on senara-solutions/mika#841 — Gate dispatch on ready label\nhttps://github.com/senara-solutions/mika/issues/841"

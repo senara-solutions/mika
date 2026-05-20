@@ -5,12 +5,10 @@
 //! prevents drift between the two guard layers.
 
 /// Marker prefix emitted by `mika_gateway::github::format_event_text` for
-/// `issues.labeled` events where the label name is `ready`. The
-/// authoritative format string lives at
-/// `crates/mika-gateway/src/github.rs` `format_event_text`.
-/// Drift between the two locations is a contract violation; the gateway
-/// side is the producer, this side is the consumer. See mika#842, mika#910.
-pub(crate) const READY_LABEL_DISPATCH_MARKER: &str = "[GitHub] Issue labeled ready on ";
+/// `issues.labeled` events where the label name is `ready`. Re-exported
+/// from `mika_common::github_event_format` for cross-crate single-source-of-
+/// truth coupling. See mika#852.
+pub(crate) use mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER;
 
 /// True when the message is a `[GitHub]` webhook event in the
 /// **Webhook Fallthrough** domain — i.e., a turn that MUST NOT call

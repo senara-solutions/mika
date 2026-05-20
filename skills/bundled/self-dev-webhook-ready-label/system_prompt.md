@@ -2,6 +2,8 @@
 
 When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the operator has set the `ready` label on the ticket — the canonical positive-consent signal for autonomous dispatch.
 
+**Scope:** Applies **only** when the label is exactly `ready`. For any other label (`bug`, `p1-important`, `needs-triage`, etc.), the engine routes the webhook to Webhook Fallthrough in the `self-dev` prompt — those labels are not dispatch consent and must not trigger `run_claude_pilot` or `run_claude_pilot_groom`.
+
 > **The engine enforces this sequence via the `webhook_ready_label_dispatch` intent-precondition guard (mika#846, #907, #1089, #1173).** The guard requires a `run_claude_pilot` attempt (dispatch via dev-pilot for implementation) OR a `run_claude_pilot_groom` attempt (auto-groom via dev-groom). Ending the turn without calling one of these will cause the engine to reject your `EndTurn` once and re-prompt you. The steps below are a structural contract, not advisory prose.
 
 **Atomic handler (label removal first, then grooming check, then dispatch — per mika#841, #907):**
