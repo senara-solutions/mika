@@ -19,6 +19,7 @@ use crate::task_engine::types::{task_status, trigger_type};
 use super::ci_failure_handler;
 use super::ci_success_handler;
 use super::json_extractor::JsonBody;
+use super::milestone_context_handler;
 use super::state::{AgentState, AppState};
 use super::types::{
     AcceptedResponse, HealthResponse, MessageRequest, TaskCancelRequest, TaskCancelResponse,
@@ -846,6 +847,26 @@ async fn run_agent_for_message(
                 req.text = format!("{e}{}", req.text);
             }
             VerdictAction::Passthrough { enrichment: None } => {}
+        }
+
+        // Milestone-context marker injector (mika#1218): for `pull_request.closed`
+        // webhooks whose correlated task has a milestone/project parent, prepend
+        // a `[milestone-parent: <id>]` marker so the inline webhook_milestone_advance
+        // guard in agent.rs can fire. Never returns Handled (LLM still owns the
+        // advance/halt decision).
+        let milestone_action =
+            milestone_context_handler::try_handle_pr_closed_milestone_context(&req.text, &a.db)
+                .await;
+        match milestone_action {
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+            VerdictAction::Handled { .. } => {
+                unreachable!("milestone_context handler never handles");
+            }
         }
     }
 
