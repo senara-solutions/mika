@@ -52,6 +52,110 @@ Trace through the current Rust pre-classifier:
 
 `>>` (append) has the same trace; `bytes[i + 1] == b'>'` is not checked anywhere either.
 
+### Phase 0 — Pin (verbatim slices at base SHA `3a39bd31`)
+
+Pinned against `3a39bd31e01fa9ee881d20899ca4e4bd39e988d6` (`main` HEAD at grooming time). Required by mika-arch first-pass review (F1 BLOCKING) — sibling mika#942 (commit `7a233603`) modified the same module, so Change 1.1's insertion point at lines 218-220 must be confirmed.
+
+#### Pin 1 — `contains_unquoted_metacharacter` unquoted-branch — existing `>(` arm (Change 1.1 insertion point)
+
+`crates/mika-agent/src/server/permission_pre_classifier.rs:215-224`:
+
+```rust
+                // Check for `$(`
+                if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
+                    return true;
+                }
+                // Check for `>(` (process substitution — output)
+                if bytes[i] == b'>' && i + 1 < len && bytes[i + 1] == b'(' {
+                    return true;
+                }
+                // Check for `<(` (process substitution — input)
+                if bytes[i] == b'<' && i + 1 < len && bytes[i + 1] == b'(' {
+                    return true;
+                }
+```
+
+Confirms: the `>(` arm exists at lines 218-220 (introduced by mika#942 commit `7a233603`). Change 1.1 replaces lines 217-220 with a consolidated `>` arm; the `<(` arm at 221-224 is untouched.
+
+#### Pin 2 — `TIER3_PATTERNS` const (confirms no `>` entry)
+
+`crates/mika-agent/src/server/permission_pre_classifier.rs:80-90`:
+
+```rust
+const TIER3_PATTERNS: &[&str] = &[
+    "rm -rf",
+    "rm -fr",
+    "git push --force",
+    "git push -f",
+    "git reset --hard",
+    "DROP TABLE",
+    "cargo publish",
+    "gh label delete",
+    "gh label edit",
+];
+```
+
+Confirms: 9 entries, none contain `>`. Plan does NOT modify this const; carve-out is implemented in the scanner instead.
+
+#### Pin 3 — module-level sentinel docstring (target of Change 1.2)
+
+`crates/mika-agent/src/server/permission_pre_classifier.rs:60-79`:
+
+```rust
+/// TIER 3 dangerous patterns that always deny regardless of dispatch shape.
+///
+/// # Sentinel — cross-language duplication (mika#935, architect F5)
+///
+/// These patterns are mirrored from `claude-pilot-py/src/claude_pilot/tier1.py`.
+/// `tier1.py` is the canonical source; this Rust module mirrors for defense-in-depth.
+/// If the pattern set grows beyond 10 entries OR Python and Rust drift, escalate
+/// to build-time codegen.
+///
+/// ## Branch 5 divergence (mika#938, mika#942, mika#946)
+///
+/// Branch 5 rejection uses quote-aware scanning in this Rust module via
+/// `contains_unquoted_metacharacter()` for four metacharacters (`$(`,
+/// backtick, `>(`, `<(`), while `tier1.py` uses quote-aware scanning for
+/// `$(` and backtick (mika#946) but retains blanket regex rejection for
+/// `>(` and `<(` (`tier1.py:89-90`). This is N=1 divergence (quote-awareness
+/// asymmetry on the process-substitution pair only). Codegen escalation
+/// threshold NOT crossed.
+```
+
+Change 1.2 updates the `## Branch 5 divergence` section to: bump issue list to include `mika#943`, bump metacharacter count from "four" to "six", document the fd-manipulation carve-out, and reflect that Python's regex at `tier1.py:91` adopts the same carve-out semantics.
+
+#### Pin 4 — current Python output-redirect regex (target of Change 3.1)
+
+`claude-pilot-py/src/claude_pilot/tier1.py:87-92`:
+
+```python
+    re.compile(r"\$\("),                                    # $(...)
+    re.compile(r"`[^`]*`"),                                 # backticks
+    re.compile(r"<\("),                                     # <(...)
+    re.compile(r">\("),                                     # >(...)
+    re.compile(r"(?:^|[^<])>{1,2}(?!\()"),                  # > or >> (not process sub)
+)
+```
+
+Confirms: the output-redirect regex at line 91 currently uses `(?:^|[^<])>{1,2}(?!\()` — blanket rejection of `>` / `>>` not preceded by `<` and not followed by `(`. This rejects `2>&1` (the `2` matches `[^<]`). Change 3.1 replaces this single line with `(?<!<)>{1,2}(?!\(|&[\d-])` to add the fd-manipulation carve-out, matching the Rust semantics. The `<\(` and `>\(` patterns at lines 89-90 are untouched (they remain blanket regex in Python — the existing quote-awareness divergence).
+
+#### Pin 5 — `test_pipe_to_tail` body (positive-test contract anchor)
+
+`crates/mika-agent/src/server/permission_pre_classifier.rs:656-663`:
+
+```rust
+    #[test]
+    fn test_pipe_to_tail() {
+        let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch \"Hello\" 2>&1 | tail -20""#);
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+```
+
+Confirms: existing positive test for `2>&1 | tail -20` workflow. This test MUST stay green after Change 1.1 — the fd-manipulation carve-out for `2>&1` is the load-bearing predicate.
+
 ### Why this matters in production
 
 The pre-classifier is the structural pre-filter for **claude-pilot-originated** PilotEvents on the mika-relay agent. A compromised claude-pilot session, or an injected prompt that drives the SDK to emit a malformed Bash request, could reach this surface. `>` redirect is one of the simplest exfil shapes (no `$(`, no `;` compounding) and the existing scanner happens to miss it.
@@ -100,6 +204,16 @@ Anything else triggers rejection. Concretely:
 | `>` inside `"..."` or `'...'` | allow (no scan) | literal in message content |
 
 The carve-out **does not** look at what precedes the `>` (so `2>&1` is allowed via the `>&1` suffix, not via the `2` prefix). This is intentional: prefix-based detection is harder to reason about (e.g., `2>foo` would be ambiguous as "fd-redirect" vs "file-write"), whereas suffix-based detection cleanly answers "does this `>` write to a file?"
+
+**Citation — how `&>foo` reaches the rejection arm (mika-arch F2 NON-BLOCKING):** The scanner has no `b'&'` arm in the unquoted-state match (see Pin 1 above — only `b'\''`, `b'"'`, `b'`'`, `b'$'`, `b'>'`, `b'<'` arms exist). When the scanner encounters `&>foo`:
+
+1. Position 0 byte `&` matches none of the unquoted-state arms; the bottom-of-match `i += 1` at `permission_pre_classifier.rs:225` advances past it.
+2. Position 1 byte `>` enters the new consolidated `>` arm (Change 1.1).
+3. `bytes[i + 1] = b'f'`, not `b'('` — process-sub check skipped.
+4. `after_arrows = i + 1 = 2` (no `>>` doubling). `bytes[2] = b'f'`, not `b'&'` — `is_fd_manipulation = false`.
+5. Returns `true` — rejected.
+
+So `&>foo` IS rejected by Change 1.1, *not* by a dedicated `&` arm. The rejection comes from the `>` arm seeing `>foo` (not `>&<digit>` / `>&-`). Same trace applies to `&>>foo` (where `bytes[i+1] = b'>'` triggers `>>` doubling, `after_arrows = i + 2 = 3`, `bytes[3] = b'f'`, not `b'&'`, still rejected). The decision table entry `&>foo → reject` is therefore implementation-backed; no separate `b'&'` arm is needed.
 
 ### Trade-off: `2>/dev/null` becomes deny
 
