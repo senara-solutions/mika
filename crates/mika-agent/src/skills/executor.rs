@@ -1490,6 +1490,24 @@ const MAX_PENDING_DEFERRED_CALLBACKS: i64 = 10;
 /// linked to the requesting parent task. When the blocking dispatch completes, the
 /// dispatcher promotes this to `in_progress` and fires a `SilentTrigger::DeferredDispatch`
 /// turn. Returns `true` if registered, `false` if cap exceeded or DB error (fail-open).
+///
+/// # Precondition (security-load-bearing, mika#1205)
+///
+/// All callers MUST be downstream of the `unauthorized_webhook_dispatch` guard
+/// (`validate_dispatch_readiness` guard 0). The deferred-callback child row
+/// created by this function is later read by `execute_long_running` as proof
+/// that a prior turn was authorized — that read uses the row's existence to
+/// short-circuit duplicate-retry rejection with an idempotent "deferred" success.
+///
+/// Current call sites (both verified downstream of guard 0):
+/// - Callback-turn entry path in `execute_skill_tool` — downstream of
+///   `check_lineage_cycle` on a turn already gated by callback semantics.
+/// - `validate_dispatch_readiness` `global_dispatch_active` branch — downstream
+///   of guards 0, 1, 2.
+///
+/// Adding a new call site that does NOT pass guard 0 first would let
+/// unauthorized dispatches forge authorization. If you add one, document the
+/// guard-0 equivalence at the call site and update this comment.
 async fn register_deferred_callback(
     db: &AsyncDatabase,
     task_id: &str,
@@ -1617,6 +1635,66 @@ async fn execute_long_running(
     let task_id = input.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
     if let Some(err) = crate::tools::validate_task(&ctx.db, task_id).await {
         return ToolOutput::error(err);
+    }
+
+    // mika#1205: Idempotent ack when a deferred-dispatch child is already pending
+    // for this task on this agent.
+    //
+    // When an LLM-conversation turn retries `run_claude_pilot` on a task that has
+    // a pending deferred-callback child (created by a prior turn that hit
+    // `global_dispatch_active`), short-circuit with the same `status: "deferred"`
+    // success that the callback-turn entry path returns when
+    // `register_deferred_callback` succeeds (see top of `execute_skill_tool`).
+    // Without this intercept, guard (0) `unauthorized_webhook_dispatch` can fire
+    // on the retry's fresh originating_message (issue comment, label change), and
+    // the LLM may hallucinate a supervisor → blocked transition (mika#716).
+    //
+    // Security: the deferred-callback child can only exist if a prior turn passed
+    // guard (0) — `register_deferred_callback` is downstream of guard (0) at both
+    // call sites (callback-turn entry path and `validate_dispatch_readiness`).
+    // The per-agent filter (`child.agent_id == self_agent`) prevents cross-agent
+    // authorization leakage in team-task trees where `db::get_child_tasks` returns
+    // children with heterogeneous `agent_id`s.
+    match ctx.db.get_child_tasks(task_id).await {
+        Ok(children) => {
+            let self_agent = ctx.db.agent_id();
+            let pending_deferred = children.iter().find(|c| {
+                c.label == crate::agent::DEFERRED_DISPATCH_LABEL
+                    && c.agent_id == self_agent
+                    && matches!(c.status.as_str(), "pending" | "in_progress")
+            });
+            if let Some(child) = pending_deferred {
+                info!(
+                    task_id,
+                    deferred_callback_id = %child.id,
+                    "deferred_dispatch_idempotent_ack — prior dispatch already queued (mika#1205)"
+                );
+                return ToolOutput::success(
+                    serde_json::json!({
+                        "status": "deferred",
+                        "already_deferred": true,
+                        "deferred_callback_id": child.id,
+                        "deferred_callback_status": child.status,
+                        "message": "Your prior dispatch for this task is queued as a \
+                                    deferred callback and will fire automatically when \
+                                    the dispatch slot is free. Do not retry; do not \
+                                    transition the supervisor task. (mika#1205)"
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        Err(e) => {
+            // Fail-closed on DB error: skip the intercept and let the existing
+            // guards apply. Worst case is reverting to current behavior (the bug
+            // we're fixing), not a security regression — guard (0) still rejects
+            // unauthorized retries.
+            warn!(
+                task_id,
+                error = %e,
+                "deferred_dispatch_intercept_check_failed — falling through to validate_dispatch_readiness"
+            );
+        }
     }
 
     // Dispatch-readiness guard (#525): stricter than validate_task() which also
@@ -4637,6 +4715,245 @@ mod tests {
             original_call.get("prompt"),
             Some(&serde_json::json!("mika#920"))
         );
+    }
+
+    // ===================================================================
+    // Idempotent-deferred intercept tests (mika#1205)
+    // ===================================================================
+    //
+    // These tests exercise the intercept inserted in `execute_long_running`
+    // between `validate_task` and `validate_dispatch_readiness`. The intercept
+    // short-circuits with `status: "deferred", already_deferred: true` when a
+    // per-agent pending deferred-callback child exists, so the LLM does not see
+    // the `unauthorized_webhook_dispatch` guard (0) rejection that triggers
+    // mika#716's hallucinated supervisor → blocked transition.
+
+    /// Helper: construct a LongRunningContext with an explicit originating_message.
+    fn make_lr_ctx_with_msg(
+        db: crate::async_db::AsyncDatabase,
+        originating_message: Option<String>,
+    ) -> LongRunningContext {
+        LongRunningContext {
+            db,
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message,
+        }
+    }
+
+    /// AC1: When the LLM retries `run_claude_pilot` on a task that has a pending
+    /// deferred-callback child for the same agent AND the originating_message is
+    /// unauthorized, the intercept returns `ToolOutput::success` with
+    /// `status: "deferred"` and `already_deferred: true`. No
+    /// `unauthorized_webhook_dispatch` error reaches the LLM.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_long_running_idempotent_ack_on_pending_deferred() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // Seed a pending deferred-callback child for the same agent.
+        let input = pilot_input("dev-pilot", "mika#1205", &wi_id);
+        let registered = register_deferred_callback(&async_db, &wi_id, &input).await;
+        assert!(registered, "deferred callback should register");
+
+        // Unauthorized originating_message (Webhook Fallthrough domain) — would
+        // normally trip guard (0). The intercept must fire BEFORE guard (0).
+        let ctx = make_lr_ctx_with_msg(
+            async_db,
+            Some("[GitHub] New comment on issue#789".to_string()),
+        );
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id, "skill": "dev-pilot", "prompt": "mika#1205"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            !output.is_error,
+            "intercept should return success, got error: {}",
+            output.content
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON success, got: {}", output.content));
+        assert_eq!(parsed["status"], "deferred");
+        assert_eq!(parsed["already_deferred"], true);
+        assert!(
+            !output.content.contains("unauthorized_webhook_dispatch"),
+            "intercept must not surface guard (0) rejection: {}",
+            output.content
+        );
+    }
+
+    /// AC2: When no pending deferred-callback child exists, `execute_long_running`
+    /// falls through to `validate_dispatch_readiness`. With an unauthorized
+    /// originating_message, guard (0) rejects with `unauthorized_webhook_dispatch`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_long_running_no_intercept_when_no_deferred_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // No deferred-callback child seeded.
+        let ctx = make_lr_ctx_with_msg(
+            async_db,
+            Some("[GitHub] New comment on issue#789".to_string()),
+        );
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id, "skill": "dev-pilot", "prompt": "mika#1205"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error, "guard (0) should reject the dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "unauthorized_webhook_dispatch");
+    }
+
+    /// AC3: When a pending deferred-callback child exists but belongs to a
+    /// different `agent_id`, the intercept does not fire (per-agent isolation).
+    /// Falls through to `validate_dispatch_readiness` which rejects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_long_running_intercept_scopes_per_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // Register the foreign agent so the FK constraint on tasks.agent_id holds.
+        async_db
+            .register_agent("other-agent", "Other Agent", "")
+            .await
+            .unwrap();
+
+        // Seed a deferred-callback child but with a DIFFERENT agent_id.
+        let foreign_child = crate::db::NewTask {
+            agent_id: "other-agent".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(wi_id.clone()),
+            depth: 0,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        async_db.create_task(foreign_child).await.unwrap();
+
+        let ctx = make_lr_ctx_with_msg(
+            async_db,
+            Some("[GitHub] New comment on issue#789".to_string()),
+        );
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id, "skill": "dev-pilot", "prompt": "mika#1205"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            output.is_error,
+            "intercept must not match across agents; guard (0) should reject"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "unauthorized_webhook_dispatch");
+    }
+
+    /// AC4: When a deferred-callback child has completed (or failed), the
+    /// intercept does not fire. Falls through to guard (0) which rejects.
+    /// Proves fail-closed after DeferredDispatch resumes and the child completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_long_running_intercept_skips_completed_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // Seed a deferred-callback child, then transition it to completed.
+        let input = pilot_input("dev-pilot", "mika#1205", &wi_id);
+        let registered = register_deferred_callback(&async_db, &wi_id, &input).await;
+        assert!(registered);
+        let children = async_db.get_child_tasks(&wi_id).await.unwrap();
+        let deferred = children
+            .iter()
+            .find(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL)
+            .expect("deferred callback should exist");
+        async_db
+            .update_task_status(&deferred.id, "completed")
+            .await
+            .unwrap();
+
+        let ctx = make_lr_ctx_with_msg(
+            async_db,
+            Some("[GitHub] New comment on issue#789".to_string()),
+        );
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id, "skill": "dev-pilot", "prompt": "mika#1205"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            output.is_error,
+            "completed deferred child must not authorize retry"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "unauthorized_webhook_dispatch");
     }
 
     // ===================================================================
