@@ -56,7 +56,267 @@ The fix is structurally identical to a metadata-write the tool already implies �
 - **Out of scope: investigating WHY `try_extract_callback_metadata` missed pr_url in the mika#1204 incident.** Code reading shows multiple plausible runtime failure modes for `dispatch-lib.sh:618-625` (`gh pr list` returns empty, branch not yet visible, `$BRANCH` unset on intermediate handlers, multiple successive callbacks where only the first emits `PR:`). Naming the specific cause for mika#1204 would require recovering DB and dispatch-lib log state from 2026-05-19. The structural fix closes the gap for every such cause at once.
 - **Out of scope: prompt-level changes to mika-dev's auto-merge handling.** The issue body's option (a) ("recognize 'auto-merge enabled' note as a heartbeat") is prompt-fragile. Today's `update_task_status` call includes the auto-merge fact in a `note` field as free text; tightening that to require a structured `auto_merge_pending` metadata key would couple the engine to mika-dev's prompt discipline. The tool-level write in this fix is structural — it fires regardless of what mika-dev writes.
 - **Out of scope: changing the reaper or the parent-completer.** Both backstops already behave correctly for `pr_url IS NOT NULL` (skip / promote, respectively). The fix records the missing signal at its source.
+- **Chained-dispatch topology (milestone / project parents):** In a milestone dispatch, the task hierarchy is `milestone parent (type='milestone', trigger_type='manual', source='self_dev') → milestone child (type='issue', trigger_type='manual', source='self_dev', parent_task_id=milestone_id) → callback child (trigger_type='callback', parent_task_id=milestone_child_id) → claude-pilot subprocess`. The resolution chain in this fix (`callback.parent_task_id → parent`) targets the **milestone child** — which IS the immediate supervisor for the per-issue dispatch. Writing pr_url there is the correct behavior: that task is the one whose status the reaper would otherwise flip to `failed`. The milestone parent (one level higher in the tree) is not directly affected by this metadata write; its completion is governed by separate orchestration logic that advances through milestone children one at a time (see `dispatcher.rs` `post_callback_advance` flow, mika#991). For project-typed parents the same shape applies. **This fix is correct for chained-dispatch topologies — the guard set (`trigger_type='manual' && source='self_dev'`) matches every per-issue supervisor in single-issue, milestone, and project dispatches identically.** If a future dispatch shape introduces a callback whose parent is NOT a per-issue supervisor (e.g., a callback whose parent is itself a callback in a chained-retry case), the parent's `trigger_type` would be `'callback'` not `'manual'`, the guard would correctly skip, and no metadata would be written to an unrelated task.
 - **Out of scope: `MergeGateResult::Merged` and `MergeGateResult::AlreadyMerged` paths.** In the `Merged` path, the supervisor is typically already promoted by `try_complete_parent_on_callback_success` (mika#1162) before the operator-callable merge happens, and `try_extract_callback_metadata` populated pr_url from the original dispatch. In the `AlreadyMerged` path, the supervisor is either already terminal or will be promoted on the next callback cycle. Both paths could benefit symmetrically from a metadata write, but neither is the canonical bug path for this ticket. Limiting the scope to `AutoMergeEnabled` keeps the patch surface minimal; symmetric extension is a clean follow-up if forensics show it matters.
+
+## Phase 0 — Pin (verbatim slices at base SHA `498c536a`)
+
+Five load-bearing sites are cited throughout the plan. Each is pinned here with the verbatim slice at the base SHA so the implementer can confirm the modification shape and the architect can confirm the load-bearing claims.
+
+**Base SHA:** `498c536a18de83f69216aefc330d321f22277163` (`main` at branch creation, 2026-05-20).
+
+### Pin 1 — `crates/mika-agent/src/tools/pr_merge_with_gate.rs:192-224` (modification site, the `HasPending` branch)
+
+```rust
+            CheckClassification::HasPending => {
+                // Enable auto-merge — GitHub merges when checks pass
+                let auto_result =
+                    run_gh_merge(pr_number, repo, merge_method, delete_branch, true, token).await;
+
+                match auto_result {
+                    Ok(_output) => {
+                        let pending: Vec<CheckInfo> = checks
+                            .iter()
+                            .filter(|c| c.bucket == "pending")
+                            .map(|c| CheckInfo {
+                                name: c.name.clone(),
+                                state: c.state.clone(),
+                                link: None,
+                            })
+                            .collect();
+
+                        let result = MergeGateResult::AutoMergeEnabled {
+                            pending_checks: pending,
+                        };
+                        Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    }
+                    Err(e) => {
+                        let result = MergeGateResult::GateError {
+                            kind: GateErrorKind::GhCliFailure {
+                                exit_code: parse_exit_code_from_error(&e),
+                            },
+                            detail: format!("Auto-merge failed: {e}"),
+                        };
+                        Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    }
+                }
+            }
+```
+
+**Insertion point:** between the `Ok(_output) => {` opener (line 198) and the `let pending: Vec<CheckInfo> = …` line (line 199), insert the supervisor-resolution + metadata-write helper call. The new write fires AFTER `run_gh_merge` confirms auto-merge was enabled (so we don't write on the `Err(e)` branch — that's `GateError`, not `AutoMergeEnabled`).
+
+### Pin 2 — `crates/mika-agent/src/task_engine/engine.rs:648-803` (the reaper function `reap_orphaned_parent_tasks`)
+
+The function delegates the candidate filtering entirely to the SQL query in Pin 3. The Rust side iterates the SQL result, applies a defense-in-depth TOCTOU guard (`children` snapshot + groom-class re-check), then writes `update_task_failed(&parent.id, "callback_delivered_without_pr_url")` on every surviving candidate. The pr_url-skip mechanism is in the SQL — there is no separate Rust-side predicate. Critical excerpt (engine.rs:648-731):
+
+```rust
+async fn reap_orphaned_parent_tasks(&self) {
+    let candidates = match self
+        .db
+        .find_orphaned_parent_tasks(REAPER_GRACE_SECONDS)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "task_engine_reaper: failed to query orphaned parents");
+            return;
+        }
+    };
+
+    for parent in candidates {
+        // … TOCTOU guards on dispatch_class …
+
+        // SOLE WRITER: callback_delivered_without_pr_url
+        match self
+            .db
+            .update_task_failed(&parent.id, "callback_delivered_without_pr_url")
+            .await
+        {
+            Ok(true) => { /* audit event */ }
+            // …
+        }
+    }
+}
+```
+
+**Load-bearing observation:** `reap_orphaned_parent_tasks` writes `failed` to every row returned by `find_orphaned_parent_tasks`. The skip mechanism is exclusively in the SQL — if a row is not returned, the parent is not touched. Therefore, the only way for our fix to prevent the reaper firing is to make the SQL query NOT return the supervisor. Pin 3 shows that the `pr_url IS NULL` predicate is the SQL conjunct under our control.
+
+### Pin 3 — `crates/mika-agent/src/db.rs:5509-5551` (`find_orphaned_parent_tasks` — THE load-bearing predicate)
+
+```rust
+pub fn find_orphaned_parent_tasks(
+    &self,
+    agent_id: &str,
+    grace_seconds: i64,
+) -> Result<Vec<OrphanedParentTask>> {
+    let grace_modifier = format!("-{grace_seconds} seconds");
+    let mut stmt = self.conn.prepare(
+        "SELECT parent.id, parent.agent_id, parent.created_at,
+                MIN(child.id) AS callback_task_id
+         FROM tasks parent
+         JOIN tasks child ON parent.id = child.parent_task_id
+         WHERE parent.agent_id = ?1
+           AND parent.status = 'in_progress'
+           AND parent.source = 'self_dev'
+           AND parent.trigger_type = 'manual'
+           AND COALESCE(child.dispatch_class, 'implement') = 'implement'
+           AND child.trigger_type = 'callback'
+           AND child.action_type = 'resume_agent'
+           AND child.status = 'delivered'
+           AND child.updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+           AND (parent.metadata IS NULL
+                OR json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NULL)
+           AND NOT EXISTS (
+             SELECT 1 FROM tasks sibling
+             WHERE sibling.parent_task_id = parent.id
+               AND sibling.id != child.id
+               AND sibling.status IN ('pending', 'in_progress')
+           )
+         GROUP BY parent.id
+         ORDER BY parent.id",
+    )?;
+    // …
+}
+```
+
+**Load-bearing predicate (verbatim from Pin 3):**
+
+```sql
+AND (parent.metadata IS NULL
+     OR json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NULL)
+```
+
+**Reaper firing requires ALL conjuncts true.** Writing `$.claude_pilot.pr_url` to a non-NULL string makes:
+- `parent.metadata IS NULL` → false (the metadata row exists)
+- `json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NULL` → false (the key exists and is a string)
+
+The parenthesized OR-clause becomes false. The reaper's filter no longer matches this parent on subsequent ticks. This is **the single load-bearing semantic** the fix depends on — verified verbatim above. No other conjunct in the WHERE clause is touched or weakened by the fix; all other guards (status=in_progress, source=self_dev, trigger_type=manual, child.dispatch_class=implement, child.status=delivered, grace, no active sibling) remain in force.
+
+### Pin 4 — `crates/mika-agent/src/task_engine/dispatcher.rs:1224-1283` (the mirror pattern — `try_extract_callback_metadata`)
+
+```rust
+async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
+    // 1. Check parent_task_id exists
+    let parent_id = match &task.parent_task_id {
+        Some(id) => id.clone(),
+        None => return,
+    };
+
+    // 2. Verify parent is a manual task
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t)) if t.trigger_type == "manual" => t,
+        _ => return,
+    };
+
+    // 3. Parse result text
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let extracted = extract_callback_fields(result);
+    if extracted.is_null() {
+        return;
+    }
+
+    // 4. Two-level shallow merge with existing metadata (see issue #489).
+    //    Shared helper guarantees identical semantics with the agent-facing
+    //    update_task_status tool.
+    let merged = match &parent.metadata {
+        Some(existing) => {
+            if let Ok(mut base) = serde_json::from_str::<serde_json::Value>(existing) {
+                crate::task_metadata::merge_metadata(&mut base, &extracted);
+                base
+            } else {
+                extracted
+            }
+        }
+        None => extracted,
+    };
+
+    // 5. Persist
+    match db
+        .update_task_metadata(&parent_id, &merged.to_string())
+        .await
+    {
+        Ok(true) => info!(
+            parent_task_id = %parent_id,
+            callback_task_id = %task.id,
+            "engine: persisted callback metadata to task"
+        ),
+        Ok(false) => warn!(
+            parent_task_id = %parent_id,
+            "engine: parent task not found for metadata write"
+        ),
+        Err(e) => warn!(
+            parent_task_id = %parent_id,
+            error = %e,
+            "engine: failed to persist callback metadata"
+        ),
+    }
+}
+```
+
+**Mirror invariants the new tool-side helper preserves:**
+- Resolve parent via `task.parent_task_id`, return early on None.
+- Read parent via `db.get_task_unscoped(&parent_id)`, gate on `trigger_type == "manual"` (and additionally on `source == Some("self_dev")` per F3 + Pin 3 alignment).
+- Build patch object, two-level shallow merge with existing metadata via `crate::task_metadata::merge_metadata`.
+- Persist via `db.update_task_metadata(&parent_id, &merged.to_string())`.
+- Three-arm match on the result: `Ok(true)` → `info!`; `Ok(false)` → `warn!` (parent not found); `Err(e)` → `warn!` (DB error).
+- Fire-and-forget: no error propagation to the tool result.
+
+The new helper differs only in input source — patch object built from `pr_number` + `repo` instead of `extract_callback_fields(callback.result)`.
+
+### Pin 5 — `crates/mika-agent/src/task_metadata.rs:1-50` (`merge_metadata` semantics)
+
+```rust
+//! Shared shallow-merge helper for task metadata.
+//!
+//! Both [`crate::tools::update_task_status`] (agent-facing) and
+//! [`crate::task_engine::dispatcher::try_extract_callback_metadata`]
+//! (engine-facing) merge incoming metadata into a task's existing
+//! `metadata` JSON. They MUST share the same semantics so the agent can
+//! enrich engine-injected fields without losing them.
+//!
+//! Semantics: **two-level shallow merge**
+//! - Top-level keys from `incoming` are inserted into `base`.
+//! - When both `base[k]` and `incoming[k]` are JSON objects, their inner
+//!   fields are shallow-merged (incoming wins on conflict). One level only —
+//!   no recursion past depth 1.
+//! - All other top-level conflicts (scalar/array/type mismatch) replace the
+//!   base value with the incoming value.
+//!
+//! See issue #489 for the bug this prevents: a single-level merge would
+//! cause `{"claude_pilot": {"pr_url": "..."}}` from a later turn to wipe out
+//! the engine-injected `cost_usd`, `duration_ms`, `session_id`, and `turns`
+//! fields under `claude_pilot`.
+
+use serde_json::{Map, Value};
+
+pub fn merge_metadata(base: &mut Value, incoming: &Value) {
+    let (Some(base_obj), Some(new_obj)) = (base.as_object_mut(), incoming.as_object()) else {
+        return;
+    };
+    for (k, v) in new_obj {
+        match (base_obj.get_mut(k), v) {
+            (Some(Value::Object(existing_inner)), Value::Object(new_inner)) => {
+                shallow_merge_object(existing_inner, new_inner);
+            }
+            _ => {
+                base_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+fn shallow_merge_object(base: &mut Map<String, Value>, incoming: &Map<String, Value>) {
+    for (k, v) in incoming {
+        base.insert(k.clone(), v.clone());
+    }
+}
+```
+
+**Merge depth and our patch:** our patch shape is `{"claude_pilot": {"pr_url": "<url>"}}`. If existing metadata is `{"claude_pilot": {"cost_usd": "...", "session_id": "...", ...}}` (the typical post-`try_extract_callback_metadata` state), the merge hits the `(Some(Object), Object)` arm at the `"claude_pilot"` key and shallow-merges the inner objects via `shallow_merge_object`. Result: `{"claude_pilot": {"cost_usd": "...", "session_id": "...", ..., "pr_url": "<url>"}}` — pr_url added, all sibling fields preserved. If existing metadata is `null` or has no `"claude_pilot"` key, the merge hits the `_` arm and inserts the patch verbatim. Idempotency holds: re-applying the same patch is a no-op (inner shallow-merge overwrites pr_url with the same value).
 
 ## Context & Research
 
@@ -186,13 +446,12 @@ The fix is structurally identical to a metadata-write the tool already implies �
 
 ## Implementation order
 
-1. Read `crates/mika-agent/src/tools/pr_merge_with_gate.rs` end-to-end. Locate the `AutoMergeEnabled` branch (`pr_merge_with_gate.rs:192-224`).
-2. Read `crates/mika-agent/src/task_engine/dispatcher.rs:1224-1283` (`try_extract_callback_metadata`) as the reference pattern for the metadata write.
-3. Implement the supervisor resolution + metadata write in the `AutoMergeEnabled` branch.
-4. Add the unit tests in `pr_merge_with_gate.rs`'s test module.
-5. Add the integration tests in `task_engine/engine.rs`'s test module.
-6. Run `cargo test -p mika-agent`. Iterate on failures.
-7. Run `cargo clippy -p mika-agent`. Address warnings.
-8. Update `crates/mika-agent/CLAUDE.md` § PR Merge Gate with the one-line note.
-9. Write the compound doc in `docs/solutions/best-practices/`.
-10. Stage commit. Hand off to /mika pipeline for /ce:review and PR.
+1. Re-read Phase 0 Pins 1, 4, and 5 in this plan; confirm the base SHA matches the branch's `main` ancestor (`git merge-base HEAD main`). The implementer should also `git show 498c536a:crates/mika-agent/src/db.rs | sed -n '5509,5551p'` to confirm Pin 3 (the load-bearing reaper predicate) matches verbatim — if the predicate has drifted at the base SHA, the fix's mechanism is invalidated and the implementer must halt and re-ground.
+2. Implement the supervisor resolution + metadata write in the `AutoMergeEnabled` branch of `pr_merge_with_gate.rs`. Mirror Pin 4's resolution chain, gate set, merge call, and persist call. Patch shape: `serde_json::json!({"claude_pilot": {"pr_url": pr_url}})`.
+3. Add the unit tests in `pr_merge_with_gate.rs`'s test module (six variants per Phase 2 step 1).
+4. Add the integration tests in `task_engine/engine.rs`'s test module (two scenarios per Phase 2 steps 2–3).
+5. Run `cargo test -p mika-agent`. Iterate on failures.
+6. Run `cargo clippy -p mika-agent`. Address warnings.
+7. Update `crates/mika-agent/CLAUDE.md` § PR Merge Gate with the one-line note.
+8. Write the compound doc in `docs/solutions/best-practices/`.
+9. Stage commit. Hand off to /mika pipeline for /ce:review and PR.
