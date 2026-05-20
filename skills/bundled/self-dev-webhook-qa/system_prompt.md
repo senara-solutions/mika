@@ -171,9 +171,9 @@ When you receive a GitHub webhook event for `pull_request.closed`:
 
    Call `check_task(parent_task_id)`. If `parent_task_id` is null OR the parent's `type` is neither `"milestone"` nor `"project"`, proceed to step 6 (notify and stop — non-milestone task, no advance needed).
 
-   Otherwise, the completed child is a milestone/project child. You MUST advance per M4 step 3 (or P4 step 3 for projects). Choose exactly one path:
+   Otherwise, the completed child is a milestone/project child. You MUST advance per M4 step 3 (or P4 step 3 for projects). Execute the following steps in order:
 
-   **5.5.a Verify PR actually merged.** Call `run_gh(["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")`. If `state != "MERGED"`, the webhook is racing (or fired for a non-merge close). Re-set the child to HOLD via `update_task_status(child_task_id, status="in_progress", note="HOLD: webhook arrived but PR state != MERGED; awaiting confirmation")`, notify Vincent via `send_message`, and end the turn. Do NOT advance.
+   **5.5.a Verify PR actually merged (ALWAYS — prerequisite for 5.5.b/5.5.c).** Call `run_gh(["pr", "view", "<num>", "--json", "state,mergedAt"], repo="senara-solutions/<repo>")`. If `state != "MERGED"`, the webhook is racing (or fired for a non-merge close). Re-set the child to HOLD via `update_task_status(child_task_id, status="in_progress", note="HOLD: webhook arrived but PR state != MERGED; awaiting confirmation")`, notify Vincent via `send_message`, and end the turn. Do NOT advance. Do NOT proceed to 5.5.b or 5.5.c.
 
    **5.5.b Deploy hook check** (mirrors M4 step 3b — `self-dev/system_prompt.md` § step 3b). Read the child task's `metadata.labels`. If `needs-build` or `needs-deploy` is present:
    - Notify Vincent: "Deploy hook triggered for <repo>#<issue> via auto-merge webhook (label: <label>). Running build+deploy before next ticket."

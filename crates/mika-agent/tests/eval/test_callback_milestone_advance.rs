@@ -703,39 +703,13 @@ async fn chained_advance_three_tasks_failure() {
 // qa-territory allowlist in `is_unauthorized_webhook_dispatch()`.
 // ===========================================================================
 
-/// Stub `run_gh` that returns a MERGED state by default.
-struct StubRunGhMergedTool;
-
-#[async_trait]
-impl Tool for StubRunGhMergedTool {
-    fn name(&self) -> &str {
-        "run_gh"
-    }
-
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "run_gh".to_string(),
-            description: "Stub run_gh returning MERGED state for HOLD re-entry tests".to_string(),
-            input_schema: json!({"type": "object"}),
-        }
-    }
-
-    async fn execute(
-        &self,
-        _input: serde_json::Value,
-        _ctx: &ToolContext<'_>,
-    ) -> anyhow::Result<ToolOutput> {
-        Ok(ToolOutput::success(
-            r#"{"state": "MERGED", "mergedAt": "2026-05-20T10:00:00Z"}"#.to_string(),
-        ))
-    }
+/// Parameterized `run_gh` stub — returns MERGED or OPEN based on `merged` flag.
+struct StubRunGhTool {
+    merged: bool,
 }
 
-/// Stub `run_gh` that returns OPEN state (PR not yet merged — race condition).
-struct StubRunGhNotMergedTool;
-
 #[async_trait]
-impl Tool for StubRunGhNotMergedTool {
+impl Tool for StubRunGhTool {
     fn name(&self) -> &str {
         "run_gh"
     }
@@ -743,7 +717,7 @@ impl Tool for StubRunGhNotMergedTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "run_gh".to_string(),
-            description: "Stub run_gh returning OPEN state for PR race tests".to_string(),
+            description: "Stub run_gh for HOLD re-entry tests".to_string(),
             input_schema: json!({"type": "object"}),
         }
     }
@@ -753,9 +727,15 @@ impl Tool for StubRunGhNotMergedTool {
         _input: serde_json::Value,
         _ctx: &ToolContext<'_>,
     ) -> anyhow::Result<ToolOutput> {
-        Ok(ToolOutput::success(
-            r#"{"state": "OPEN", "mergedAt": null}"#.to_string(),
-        ))
+        if self.merged {
+            Ok(ToolOutput::success(
+                r#"{"state": "MERGED", "mergedAt": "2026-05-20T10:00:00Z"}"#.to_string(),
+            ))
+        } else {
+            Ok(ToolOutput::success(
+                r#"{"state": "OPEN", "mergedAt": null}"#.to_string(),
+            ))
+        }
     }
 }
 
@@ -811,40 +791,36 @@ impl Tool for StubUpdateTaskMetadataTool {
     }
 }
 
-/// Build a tool registry with stubs for webhook HOLD re-entry tests.
+/// Base registry for HOLD re-entry tests — shared stubs without run_gh variant.
+fn hold_reentry_base_tools() -> mika_agent::tools::ToolRegistry {
+    let mut tools = default_tools();
+    tools.register(Box::new(StubUpdateTaskStatusTool));
+    tools.register(Box::new(StubRunClaudePilotTool));
+    tools.register(Box::new(StubCheckTaskTool));
+    tools.register(Box::new(StubListTasksTool));
+    tools.register(Box::new(StubUpdateTaskMetadataTool));
+    tools
+}
+
+/// HOLD re-entry tests with MERGED run_gh stub (happy path).
 fn tools_with_hold_reentry_stubs() -> mika_agent::tools::ToolRegistry {
-    let mut tools = default_tools();
-    tools.register(Box::new(StubUpdateTaskStatusTool));
-    tools.register(Box::new(StubRunClaudePilotTool));
-    tools.register(Box::new(StubCheckTaskTool));
-    tools.register(Box::new(StubListTasksTool));
-    tools.register(Box::new(StubRunGhMergedTool));
-    tools.register(Box::new(StubUpdateTaskMetadataTool));
+    let mut tools = hold_reentry_base_tools();
+    tools.register(Box::new(StubRunGhTool { merged: true }));
     tools
 }
 
-/// Build a tool registry with the NOT-MERGED run_gh stub for race tests.
+/// HOLD re-entry tests with NOT-MERGED run_gh stub (race condition).
 fn tools_with_hold_reentry_not_merged_stubs() -> mika_agent::tools::ToolRegistry {
-    let mut tools = default_tools();
-    tools.register(Box::new(StubUpdateTaskStatusTool));
-    tools.register(Box::new(StubRunClaudePilotTool));
-    tools.register(Box::new(StubCheckTaskTool));
-    tools.register(Box::new(StubListTasksTool));
-    tools.register(Box::new(StubRunGhNotMergedTool));
-    tools.register(Box::new(StubUpdateTaskMetadataTool));
+    let mut tools = hold_reentry_base_tools();
+    tools.register(Box::new(StubRunGhTool { merged: false }));
     tools
 }
 
-/// Build a tool registry with deploy_mika for deploy-hook tests.
+/// HOLD re-entry tests with deploy_mika for deploy-hook path.
 fn tools_with_hold_reentry_deploy_stubs() -> mika_agent::tools::ToolRegistry {
-    let mut tools = default_tools();
-    tools.register(Box::new(StubUpdateTaskStatusTool));
-    tools.register(Box::new(StubRunClaudePilotTool));
-    tools.register(Box::new(StubCheckTaskTool));
-    tools.register(Box::new(StubListTasksTool));
-    tools.register(Box::new(StubRunGhMergedTool));
+    let mut tools = hold_reentry_base_tools();
+    tools.register(Box::new(StubRunGhTool { merged: true }));
     tools.register(Box::new(StubDeployMikaTool));
-    tools.register(Box::new(StubUpdateTaskMetadataTool));
     tools
 }
 
@@ -907,6 +883,13 @@ async fn hold_reentry_webhook_advances_next_child() {
     assert_tools_include(
         &trace,
         &["run_gh", "run_claude_pilot", "update_task_status"],
+    );
+    // Verify dispatch targets the next child (not arbitrary)
+    assert_tool_args_contain(
+        &trace,
+        "run_claude_pilot",
+        0,
+        json!({"task_id": "next-child-id"}),
     );
 }
 
@@ -974,6 +957,14 @@ async fn hold_reentry_webhook_last_child_operator_notification() {
     // run_claude_pilot should NOT be called — no next child to dispatch
     assert_tools_exclude(&trace, &["run_claude_pilot"]);
     assert_tools_include(&trace, &["update_task_status", "send_message", "run_gh"]);
+    // Verify parent milestone update targets the correct task
+    // (update_task_status call 0 is the child completed; call 1 is the parent)
+    assert_tool_args_contain(
+        &trace,
+        "update_task_status",
+        1,
+        json!({"task_id": PARENT_TASK_ID}),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1020,8 @@ async fn hold_reentry_webhook_deploy_hook() {
     assert_tools_include(&trace, &["deploy_mika", "run_gh"]);
     // run_claude_pilot should NOT be called — deploy_mika takes over
     assert_tools_exclude(&trace, &["run_claude_pilot"]);
+    // Verify deploy_mika targets the parent milestone (task_id == milestone_wi)
+    assert_tool_args_contain(&trace, "deploy_mika", 0, json!({"task_id": PARENT_TASK_ID}));
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,4 +1138,12 @@ async fn hold_reentry_pr_state_race_not_merged() {
     // run_claude_pilot should NOT be called — PR not actually merged
     assert_tools_exclude(&trace, &["run_claude_pilot"]);
     assert_tools_include(&trace, &["run_gh", "update_task_status", "send_message"]);
+    // Verify the HOLD re-set targets the correct child with in_progress status
+    // (update_task_status call 1 is the re-set; call 0 is the premature complete)
+    assert_tool_args_contain(
+        &trace,
+        "update_task_status",
+        1,
+        json!({"task_id": "child-hold-id", "status": "in_progress"}),
+    );
 }
