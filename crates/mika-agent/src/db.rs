@@ -10300,6 +10300,94 @@ impl Database {
         Ok((count as u64, example))
     }
 
+    /// Rolling-window outcome stats from `kg_resolutions_log` (#1077).
+    ///
+    /// When `docs_root_hash` is `Some`, scopes to a single corpus via JOIN
+    /// through `kg_subject_entities`. When `None`, returns agent-wide stats
+    /// (no JOIN needed).
+    ///
+    /// The `attempted` denominator excludes structural skips and errors per
+    /// design decision D6 — only outcomes representing genuine resolution
+    /// attempts are counted.
+    pub fn kg_resolution_outcome_stats(
+        &self,
+        agent_id: &str,
+        docs_root_hash: Option<&str>,
+        window_days: u32,
+    ) -> Result<kg_schema::ResolutionOutcomeStats> {
+        let window_param = format!("-{window_days} days");
+
+        if let Some(hash) = docs_root_hash {
+            // Per-corpus: JOIN through kg_subject_entities for docs_root_hash filter.
+            // COALESCE guards against NULL when no rows match (SUM returns NULL on empty set).
+            let sql = r#"
+                SELECT
+                    COUNT(*) as total,
+                    COALESCE(SUM(CASE WHEN rl.outcome IN ('matched_exact','matched_llm','matched_llm_db_fallback','no_match','no_candidate_of_type') THEN 1 ELSE 0 END), 0) as attempted,
+                    COALESCE(SUM(CASE WHEN rl.outcome = 'no_match' THEN 1 ELSE 0 END), 0) as no_match,
+                    COALESCE(SUM(CASE WHEN rl.outcome = 'no_candidate_of_type' THEN 1 ELSE 0 END), 0) as no_candidate_of_type,
+                    COALESCE(SUM(CASE WHEN rl.outcome = 'matched_exact' THEN 1 ELSE 0 END), 0) as matched_exact,
+                    COALESCE(SUM(CASE WHEN rl.outcome = 'matched_llm' THEN 1 ELSE 0 END), 0) as matched_llm,
+                    COALESCE(SUM(CASE WHEN rl.outcome = 'matched_llm_db_fallback' THEN 1 ELSE 0 END), 0) as matched_llm_db_fallback,
+                    COALESCE(SUM(CASE WHEN rl.outcome IN ('skipped_no_llm','skipped_discovered_type','skipped_discovered_subject') THEN 1 ELSE 0 END), 0) as skipped,
+                    COALESCE(SUM(CASE WHEN rl.outcome = 'error' THEN 1 ELSE 0 END), 0) as errors
+                FROM kg_resolutions_log rl
+                JOIN kg_subject_entities se ON se.id = rl.subject_entity_id
+                WHERE rl.agent_id = ?1
+                  AND se.docs_root_hash = ?2
+                  AND rl.resolved_at >= datetime('now', ?3)
+            "#;
+            self.conn
+                .query_row(sql, params![agent_id, hash, window_param], |row| {
+                    Ok(kg_schema::ResolutionOutcomeStats {
+                        total: row.get::<_, i64>(0)? as u64,
+                        attempted: row.get::<_, i64>(1)? as u64,
+                        no_match: row.get::<_, i64>(2)? as u64,
+                        no_candidate_of_type: row.get::<_, i64>(3)? as u64,
+                        matched_exact: row.get::<_, i64>(4)? as u64,
+                        matched_llm: row.get::<_, i64>(5)? as u64,
+                        matched_llm_db_fallback: row.get::<_, i64>(6)? as u64,
+                        skipped: row.get::<_, i64>(7)? as u64,
+                        errors: row.get::<_, i64>(8)? as u64,
+                    })
+                })
+                .map_err(Into::into)
+        } else {
+            // Agent-wide: no JOIN needed.
+            // COALESCE guards against NULL when no rows match (SUM returns NULL on empty set).
+            let sql = r#"
+                SELECT
+                    COUNT(*) as total,
+                    COALESCE(SUM(CASE WHEN outcome IN ('matched_exact','matched_llm','matched_llm_db_fallback','no_match','no_candidate_of_type') THEN 1 ELSE 0 END), 0) as attempted,
+                    COALESCE(SUM(CASE WHEN outcome = 'no_match' THEN 1 ELSE 0 END), 0) as no_match,
+                    COALESCE(SUM(CASE WHEN outcome = 'no_candidate_of_type' THEN 1 ELSE 0 END), 0) as no_candidate_of_type,
+                    COALESCE(SUM(CASE WHEN outcome = 'matched_exact' THEN 1 ELSE 0 END), 0) as matched_exact,
+                    COALESCE(SUM(CASE WHEN outcome = 'matched_llm' THEN 1 ELSE 0 END), 0) as matched_llm,
+                    COALESCE(SUM(CASE WHEN outcome = 'matched_llm_db_fallback' THEN 1 ELSE 0 END), 0) as matched_llm_db_fallback,
+                    COALESCE(SUM(CASE WHEN outcome IN ('skipped_no_llm','skipped_discovered_type','skipped_discovered_subject') THEN 1 ELSE 0 END), 0) as skipped,
+                    COALESCE(SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END), 0) as errors
+                FROM kg_resolutions_log
+                WHERE agent_id = ?1
+                  AND resolved_at >= datetime('now', ?2)
+            "#;
+            self.conn
+                .query_row(sql, params![agent_id, window_param], |row| {
+                    Ok(kg_schema::ResolutionOutcomeStats {
+                        total: row.get::<_, i64>(0)? as u64,
+                        attempted: row.get::<_, i64>(1)? as u64,
+                        no_match: row.get::<_, i64>(2)? as u64,
+                        no_candidate_of_type: row.get::<_, i64>(3)? as u64,
+                        matched_exact: row.get::<_, i64>(4)? as u64,
+                        matched_llm: row.get::<_, i64>(5)? as u64,
+                        matched_llm_db_fallback: row.get::<_, i64>(6)? as u64,
+                        skipped: row.get::<_, i64>(7)? as u64,
+                        errors: row.get::<_, i64>(8)? as u64,
+                    })
+                })
+                .map_err(Into::into)
+        }
+    }
+
     /// Count kg_chunks rows with NULL source_doc_hash.
     pub fn kg_count_null_hash(&self) -> Result<u64> {
         let count = self.conn.query_row(
@@ -17126,5 +17214,188 @@ mod tests {
         let db = db();
         let result = db.count_agent_state("nonexistent-agent");
         assert!(result.is_err(), "Should fail for nonexistent agent");
+    }
+
+    // --- kg_resolution_outcome_stats integration tests (#1077) ---
+
+    /// Helper: seed a kg_subject_entity row and return its id.
+    fn seed_subject_entity(db: &Database, docs_root_hash: &str, name: &str) -> i64 {
+        let entity_key = format!("concept:{name}");
+        db.conn
+            .execute(
+                "INSERT INTO kg_subject_entities (name, type, entity_key, docs_root_hash, docs_root, confidence, created_at) \
+                 VALUES (?1, 'concept', ?2, ?3, '/test/path', 0.9, datetime('now'))",
+                params![name, entity_key, docs_root_hash],
+            )
+            .unwrap();
+        db.conn.last_insert_rowid()
+    }
+
+    /// Helper: seed a kg_resolutions_log row with a given outcome and age.
+    fn seed_resolution_log(
+        db: &Database,
+        agent_id: &str,
+        subject_entity_id: i64,
+        outcome: &str,
+        days_ago: i32,
+    ) {
+        let resolved_at = if days_ago == 0 {
+            "datetime('now')".to_string()
+        } else {
+            format!("datetime('now', '-{days_ago} days')")
+        };
+        db.conn
+            .execute(
+                &format!(
+                    "INSERT INTO kg_resolutions_log \
+                     (agent_id, subject_entity_id, outcome, resolved_at, source_extraction_trace_id, resolution_trace_id) \
+                     VALUES (?1, ?2, ?3, {resolved_at}, 'trace-test', 'trace-test')"
+                ),
+                params![agent_id, subject_entity_id, outcome],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_kg_outcome_stats_empty_returns_zeros() {
+        let db = db();
+        let stats = db.kg_resolution_outcome_stats("mika", None, 7).unwrap();
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.attempted, 0);
+        assert_eq!(stats.no_match, 0);
+        assert_eq!(stats.no_match_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_kg_outcome_stats_agent_wide() {
+        let db = db();
+        let hash = "testhash1234";
+        let agent = "mika"; // Default agent registered by schema init.
+
+        // Seed entities
+        let e1 = seed_subject_entity(&db, hash, "entity-1");
+        let e2 = seed_subject_entity(&db, hash, "entity-2");
+        let e3 = seed_subject_entity(&db, hash, "entity-3");
+        let e4 = seed_subject_entity(&db, hash, "entity-4");
+        let e5 = seed_subject_entity(&db, hash, "entity-5");
+
+        // Seed outcomes within 7-day window
+        seed_resolution_log(&db, agent, e1, "no_match", 1);
+        seed_resolution_log(&db, agent, e2, "matched_exact", 2);
+        seed_resolution_log(&db, agent, e3, "matched_llm", 3);
+        seed_resolution_log(&db, agent, e4, "skipped_no_llm", 1);
+        seed_resolution_log(&db, agent, e5, "error", 1);
+
+        let stats = db.kg_resolution_outcome_stats(agent, None, 7).unwrap();
+
+        assert_eq!(stats.total, 5);
+        assert_eq!(stats.attempted, 3); // no_match + matched_exact + matched_llm
+        assert_eq!(stats.no_match, 1);
+        assert_eq!(stats.matched_exact, 1);
+        assert_eq!(stats.matched_llm, 1);
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(stats.errors, 1);
+        // no_match_rate = 1/3 ≈ 0.333
+        assert!(
+            (stats.no_match_rate() - 1.0 / 3.0).abs() < 1e-10,
+            "Expected ~0.333, got {}",
+            stats.no_match_rate()
+        );
+    }
+
+    #[test]
+    fn test_kg_outcome_stats_per_corpus() {
+        let db = db();
+        let hash_a = "hash_corpus_a";
+        let hash_b = "hash_corpus_b";
+        let agent = "mika";
+
+        // Corpus A: 2 no_match, 1 matched
+        let a1 = seed_subject_entity(&db, hash_a, "a-entity-1");
+        let a2 = seed_subject_entity(&db, hash_a, "a-entity-2");
+        let a3 = seed_subject_entity(&db, hash_a, "a-entity-3");
+        seed_resolution_log(&db, agent, a1, "no_match", 1);
+        seed_resolution_log(&db, agent, a2, "no_match", 2);
+        seed_resolution_log(&db, agent, a3, "matched_exact", 1);
+
+        // Corpus B: 0 no_match, 2 matched
+        let b1 = seed_subject_entity(&db, hash_b, "b-entity-1");
+        let b2 = seed_subject_entity(&db, hash_b, "b-entity-2");
+        seed_resolution_log(&db, agent, b1, "matched_llm", 1);
+        seed_resolution_log(&db, agent, b2, "matched_exact", 3);
+
+        // Per-corpus A
+        let stats_a = db
+            .kg_resolution_outcome_stats(agent, Some(hash_a), 7)
+            .unwrap();
+        assert_eq!(stats_a.attempted, 3);
+        assert_eq!(stats_a.no_match, 2);
+        assert!((stats_a.no_match_rate() - 2.0 / 3.0).abs() < 1e-10);
+
+        // Per-corpus B
+        let stats_b = db
+            .kg_resolution_outcome_stats(agent, Some(hash_b), 7)
+            .unwrap();
+        assert_eq!(stats_b.attempted, 2);
+        assert_eq!(stats_b.no_match, 0);
+        assert_eq!(stats_b.no_match_rate(), 0.0);
+
+        // Agent-wide includes both corpora
+        let stats_all = db.kg_resolution_outcome_stats(agent, None, 7).unwrap();
+        assert_eq!(stats_all.attempted, 5);
+        assert_eq!(stats_all.no_match, 2);
+    }
+
+    #[test]
+    fn test_kg_outcome_stats_window_excludes_old_rows() {
+        let db = db();
+        let hash = "windowhash";
+        let agent = "mika";
+
+        // 3-day-old row — inside 7-day window
+        let e1 = seed_subject_entity(&db, hash, "recent-entity");
+        seed_resolution_log(&db, agent, e1, "no_match", 3);
+
+        // 8-day-old row — outside 7-day window
+        let e2 = seed_subject_entity(&db, hash, "old-entity");
+        seed_resolution_log(&db, agent, e2, "no_match", 8);
+
+        let stats = db.kg_resolution_outcome_stats(agent, None, 7).unwrap();
+        assert_eq!(stats.total, 1, "8-day-old row should be excluded");
+        assert_eq!(stats.no_match, 1);
+    }
+
+    #[test]
+    fn test_kg_outcome_stats_all_outcome_types() {
+        let db = db();
+        let hash = "alloutcomes";
+
+        let outcomes = [
+            "matched_exact",
+            "matched_llm",
+            "matched_llm_db_fallback",
+            "no_match",
+            "no_candidate_of_type",
+            "skipped_no_llm",
+            "skipped_discovered_type",
+            "skipped_discovered_subject",
+            "error",
+        ];
+        let agent = "mika";
+        for (i, outcome) in outcomes.iter().enumerate() {
+            let eid = seed_subject_entity(&db, hash, &format!("e-{i}"));
+            seed_resolution_log(&db, agent, eid, outcome, 1);
+        }
+
+        let stats = db.kg_resolution_outcome_stats(agent, None, 7).unwrap();
+        assert_eq!(stats.total, 9);
+        assert_eq!(stats.attempted, 5); // matched_exact + matched_llm + matched_llm_db_fallback + no_match + no_candidate_of_type
+        assert_eq!(stats.skipped, 3); // skipped_no_llm + skipped_discovered_type + skipped_discovered_subject
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.matched_exact, 1);
+        assert_eq!(stats.matched_llm, 1);
+        assert_eq!(stats.matched_llm_db_fallback, 1);
+        assert_eq!(stats.no_match, 1);
+        assert_eq!(stats.no_candidate_of_type, 1);
     }
 }
