@@ -84,6 +84,15 @@ struct AgentKgState {
     resolved: u64,
     pending: u64,
     last_extraction: Option<String>,
+    /// Rolling 7-day no_match rate (0.0–1.0). `None` when data unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_match_rate_7d: Option<f64>,
+    /// Count of no_match outcomes in the 7-day window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_match_count_7d: Option<u64>,
+    /// Total attempted resolutions in the 7-day window (denominator).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_resolutions_7d: Option<u64>,
     drift: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -241,11 +250,18 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
 
             // Per-agent detail table
             println!(
-                "  {:<20} {:<8} {:<36} {:>8} {:>10} {:>10} {:>8} last_extraction",
-                "Agent", "enabled", "docs_root", "chunks", "subjects", "resolved", "pending",
+                "  {:<20} {:<8} {:<36} {:>8} {:>10} {:>10} {:>8} {:>12} last_extraction",
+                "Agent",
+                "enabled",
+                "docs_root",
+                "chunks",
+                "subjects",
+                "resolved",
+                "pending",
+                "7d_no_match",
             );
             println!(
-                "  {:<20} {:<8} {:<36} {:>8} {:>10} {:>10} {:>8} {}",
+                "  {:<20} {:<8} {:<36} {:>8} {:>10} {:>10} {:>8} {:>12} {}",
                 "-".repeat(20),
                 "-".repeat(8),
                 "-".repeat(36),
@@ -253,6 +269,7 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                 "-".repeat(10),
                 "-".repeat(10),
                 "-".repeat(8),
+                "-".repeat(12),
                 "-".repeat(18)
             );
 
@@ -282,8 +299,21 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                 // Truncate docs_root for display (char-safe, no byte slicing)
                 let docs_display = truncate_docs_root(docs_root, 34);
 
+                // Format 7-day no_match rate column (#1077).
+                let no_match_display = match (state.no_match_rate_7d, state.total_resolutions_7d) {
+                    (Some(rate), Some(total)) if total > 0 => {
+                        let pct = format!("{:.1}%", rate * 100.0);
+                        if rate > 0.60 {
+                            format!("{} [!]", pct)
+                        } else {
+                            pct
+                        }
+                    }
+                    _ => "N/A".to_string(),
+                };
+
                 println!(
-                    "  {:<20} {:<8} {:<36} {:>8} {:>10} {:>10} {:>8} {}{}{}",
+                    "  {:<20} {:<8} {:<36} {:>8} {:>10} {:>10} {:>8} {:>12} {}{}{}",
                     agent_col,
                     enabled_str,
                     docs_display,
@@ -291,6 +321,7 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                     format_count(state.subjects),
                     format_count(state.resolved),
                     format_count(state.pending),
+                    no_match_display,
                     last_ext,
                     drift_tag,
                     error_tag,
@@ -332,6 +363,9 @@ fn build_agent_kg_states(
                 resolved: 0,
                 pending: 0,
                 last_extraction: None,
+                no_match_rate_7d: None,
+                no_match_count_7d: None,
+                total_resolutions_7d: None,
                 drift: false,
                 error: Some(format!("config error: {e}")),
             }];
@@ -352,6 +386,9 @@ fn build_agent_kg_states(
                 resolved: 0,
                 pending: 0,
                 last_extraction: None,
+                no_match_rate_7d: None,
+                no_match_count_7d: None,
+                total_resolutions_7d: None,
                 drift: false,
                 error: None,
             }]
@@ -378,6 +415,18 @@ fn build_agent_kg_states(
                     let last_extraction =
                         db.kg_last_extraction(&corpus.docs_root_hash).ok().flatten();
 
+                    // Compute 7-day no_match rate per corpus (#1077).
+                    let (no_match_rate_7d, no_match_count_7d, total_resolutions_7d) = match db
+                        .kg_resolution_outcome_stats(agent_name, Some(&corpus.docs_root_hash), 7)
+                    {
+                        Ok(stats) if stats.attempted > 0 => (
+                            Some(stats.no_match_rate()),
+                            Some(stats.no_match),
+                            Some(stats.attempted),
+                        ),
+                        _ => (None, None, None),
+                    };
+
                     AgentKgState {
                         agent_id: agent_name.to_string(),
                         enabled: true,
@@ -388,6 +437,9 @@ fn build_agent_kg_states(
                         resolved,
                         pending,
                         last_extraction,
+                        no_match_rate_7d,
+                        no_match_count_7d,
+                        total_resolutions_7d,
                         drift: false,
                         error: None,
                     }
@@ -410,6 +462,9 @@ fn build_agent_kg_states(
                 resolved: 0,
                 pending: 0,
                 last_extraction: None,
+                no_match_rate_7d: None,
+                no_match_count_7d: None,
+                total_resolutions_7d: None,
                 drift: false,
                 error: Some(format!("{e}")),
             }]
@@ -1195,6 +1250,9 @@ mod tests {
                 resolved: 8082,
                 pending: 22082,
                 last_extraction: Some("2026-04-29T12:00:00Z".to_string()),
+                no_match_rate_7d: Some(0.82),
+                no_match_count_7d: Some(1000),
+                total_resolutions_7d: Some(1220),
                 drift: false,
                 error: None,
             },
@@ -1208,6 +1266,9 @@ mod tests {
                 resolved: 4,
                 pending: 160,
                 last_extraction: Some("2026-04-29T12:00:00Z".to_string()),
+                no_match_rate_7d: Some(0.50),
+                no_match_count_7d: Some(50),
+                total_resolutions_7d: Some(100),
                 drift: false,
                 error: None,
             },
@@ -1267,6 +1328,9 @@ mod tests {
                 resolved: 10,
                 pending: 40,
                 last_extraction: None,
+                no_match_rate_7d: None,
+                no_match_count_7d: None,
+                total_resolutions_7d: None,
                 drift: false,
                 error: None,
             },
@@ -1280,6 +1344,9 @@ mod tests {
                 resolved: 5,
                 pending: 20,
                 last_extraction: None,
+                no_match_rate_7d: None,
+                no_match_count_7d: None,
+                total_resolutions_7d: None,
                 drift: false,
                 error: None,
             },
@@ -1293,6 +1360,9 @@ mod tests {
                 resolved: 10,
                 pending: 40,
                 last_extraction: None,
+                no_match_rate_7d: None,
+                no_match_count_7d: None,
+                total_resolutions_7d: None,
                 drift: false,
                 error: None,
             },

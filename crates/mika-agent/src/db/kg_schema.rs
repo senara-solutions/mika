@@ -223,6 +223,42 @@ pub fn record_invalidated_no_match(
     Ok(total)
 }
 
+/// Rolling-window outcome breakdown from `kg_resolutions_log`.
+///
+/// Used by `mika kg status` (AC1/AC2 of mika#1077) and the resolver tick
+/// alert (AC3). The `attempted` denominator excludes structural skips
+/// (`skipped_no_llm`, `skipped_discovered_type`, `skipped_discovered_subject`)
+/// and `error` — only outcomes that represent a genuine resolution attempt
+/// are counted. See plan design decision D6 for rationale.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ResolutionOutcomeStats {
+    /// All rows in window (informational — includes skips and errors).
+    pub total: u64,
+    /// Attempted resolution outcomes only (denominator for rate calculation).
+    /// = matched_exact + matched_llm + matched_llm_db_fallback + no_match + no_candidate_of_type
+    pub attempted: u64,
+    pub no_match: u64,
+    pub no_candidate_of_type: u64,
+    pub matched_exact: u64,
+    pub matched_llm: u64,
+    pub matched_llm_db_fallback: u64,
+    /// Structural skips (excluded from rate denominator).
+    pub skipped: u64,
+    /// Infrastructure failures (excluded from rate denominator).
+    pub errors: u64,
+}
+
+impl ResolutionOutcomeStats {
+    /// `no_match / attempted`. Returns 0.0 when no attempted resolutions exist.
+    pub fn no_match_rate(&self) -> f64 {
+        if self.attempted == 0 {
+            0.0
+        } else {
+            self.no_match as f64 / self.attempted as f64
+        }
+    }
+}
+
 /// Remove a single invalidation marker after the entity has been re-resolved.
 /// No-op if the marker does not exist (idempotent).
 ///
@@ -242,6 +278,63 @@ pub fn clear_invalidated_no_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ResolutionOutcomeStats unit tests (#1077) ---
+
+    #[test]
+    fn no_match_rate_zero_attempted_returns_zero() {
+        let stats = ResolutionOutcomeStats::default();
+        assert_eq!(stats.no_match_rate(), 0.0);
+    }
+
+    #[test]
+    fn no_match_rate_normal_calculation() {
+        let stats = ResolutionOutcomeStats {
+            total: 120,
+            attempted: 100,
+            no_match: 82,
+            no_candidate_of_type: 0,
+            matched_exact: 5,
+            matched_llm: 13,
+            matched_llm_db_fallback: 0,
+            skipped: 15,
+            errors: 5,
+        };
+        let rate = stats.no_match_rate();
+        assert!((rate - 0.82).abs() < 1e-10, "Expected 0.82, got {rate}");
+    }
+
+    #[test]
+    fn no_match_rate_all_matched() {
+        let stats = ResolutionOutcomeStats {
+            total: 50,
+            attempted: 50,
+            no_match: 0,
+            no_candidate_of_type: 0,
+            matched_exact: 30,
+            matched_llm: 20,
+            matched_llm_db_fallback: 0,
+            skipped: 0,
+            errors: 0,
+        };
+        assert_eq!(stats.no_match_rate(), 0.0);
+    }
+
+    #[test]
+    fn no_match_rate_all_no_match() {
+        let stats = ResolutionOutcomeStats {
+            total: 100,
+            attempted: 80,
+            no_match: 80,
+            no_candidate_of_type: 0,
+            matched_exact: 0,
+            matched_llm: 0,
+            matched_llm_db_fallback: 0,
+            skipped: 15,
+            errors: 5,
+        };
+        assert_eq!(stats.no_match_rate(), 1.0);
+    }
 
     #[test]
     fn format_entity_key_happy_path() {
