@@ -314,6 +314,12 @@ async fn tick_resolution(
                 per_corpus_attempted = %per_corpus_attempted,
                 event = "kg_resolver_tick.complete",
             );
+
+            // --- 7-day no_match rate alert (#1077) ---
+            // After each resolution tick, compute the rolling 7-day no_match
+            // rate. Emit WARN when the agent-wide rate exceeds 60% and the
+            // sample size is sufficient (>= 50 attempted) to avoid false alarms.
+            check_no_match_rate(agent_id, db, docs_root_hashes, trace_id).await;
         }
         Err(e) => {
             warn!(
@@ -380,6 +386,91 @@ async fn tick_coverage(
             event = "kg_extraction_coverage",
         );
     }
+}
+
+/// Minimum attempted resolutions required before the no_match rate alert
+/// fires. Prevents false alarms on cold-start or newly-provisioned agents.
+const NO_MATCH_RATE_MIN_SAMPLE: u64 = 50;
+
+/// Threshold above which the 7-day no_match rate triggers a WARN log.
+const NO_MATCH_RATE_THRESHOLD: f64 = 0.60;
+
+/// Rolling window in days for the no_match rate computation.
+const NO_MATCH_RATE_WINDOW_DAYS: u32 = 7;
+
+/// Check the rolling 7-day no_match rate after each resolution tick (#1077).
+///
+/// Computes the agent-wide rate first. If it exceeds the threshold (>60%)
+/// with a sufficient sample size (>=50 attempted), emits a WARN log with
+/// per-corpus breakdown so operators can identify which corpus is driving
+/// the rate.
+async fn check_no_match_rate(
+    agent_id: &str,
+    db: &AsyncDatabase,
+    docs_root_hashes: &[String],
+    trace_id: &str,
+) {
+    let aid = agent_id.to_string();
+    let agent_wide = db
+        .with_db(move |db| db.kg_resolution_outcome_stats(&aid, None, NO_MATCH_RATE_WINDOW_DAYS))
+        .await;
+
+    let stats = match agent_wide {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                target: "mika::otel",
+                trace_id = %trace_id,
+                agent_id = %agent_id,
+                error = %e,
+                event = "kg_no_match_rate_check.error",
+                "failed to compute 7-day no_match rate"
+            );
+            return;
+        }
+    };
+
+    let rate = stats.no_match_rate();
+    if rate <= NO_MATCH_RATE_THRESHOLD || stats.attempted < NO_MATCH_RATE_MIN_SAMPLE {
+        return;
+    }
+
+    // Agent-wide threshold exceeded — compute per-corpus breakdown for the
+    // WARN log so operators can see which corpus is contributing.
+    let mut per_corpus = serde_json::Map::new();
+    for hash in docs_root_hashes {
+        let aid = agent_id.to_string();
+        let h = hash.clone();
+        let corpus_stats = db
+            .with_db(move |db| {
+                db.kg_resolution_outcome_stats(&aid, Some(&h), NO_MATCH_RATE_WINDOW_DAYS)
+            })
+            .await;
+        if let Ok(cs) = corpus_stats {
+            per_corpus.insert(
+                hash.clone(),
+                serde_json::json!({
+                    "no_match_count": cs.no_match,
+                    "total": cs.attempted,
+                    "rate": (cs.no_match_rate() * 1000.0).round() / 1000.0,
+                }),
+            );
+        }
+    }
+    let per_corpus_json =
+        serde_json::to_string(&serde_json::Value::Object(per_corpus)).unwrap_or_default();
+
+    warn!(
+        target: "mika::otel",
+        trace_id = %trace_id,
+        agent_id = %agent_id,
+        no_match_rate = rate,
+        no_match_count = stats.no_match,
+        attempted_count = stats.attempted,
+        window_days = NO_MATCH_RATE_WINDOW_DAYS,
+        per_corpus = %per_corpus_json,
+        event = "kg_no_match_rate_high",
+    );
 }
 
 #[cfg(test)]
