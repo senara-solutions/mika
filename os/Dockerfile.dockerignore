@@ -1,0 +1,18 @@
+# Per-Dockerfile .dockerignore for os/Dockerfile (BuildKit feature)
+#
+# Root .dockerignore excludes docs/ and *.md — but os/Dockerfile needs both:
+#   - docs/ is embedded at build time via build.rs and copied for KG ingestion
+#   - *.md includes skills/bundled/*/system_prompt.md (embedded via build.rs)
+#
+# BuildKit resolves <Dockerfile>.dockerignore automatically when using
+# docker build -f os/Dockerfile .
+
+target/
+.git/
+.env
+.env.*
+todos/
+scripts/
+.claude/
+.github/
+docker-compose.yml
