@@ -273,6 +273,30 @@ Update to reflect the multi-stage build targets:
 4. `os/README.md` update (documentation)
 5. Build verification (both Dockerfiles)
 
+## Pre-decided for implementation (no clarifying questions needed)
+
+The implementing pilot MUST proceed without asking the operator. All design ambiguities are pre-resolved here:
+
+1. **Ollama checksum verification (AC7):** Pin to ollama `v0.6.0`. Derive the sha256 at build time from the official release URL:
+
+   ```dockerfile
+   ARG OLLAMA_VERSION=0.6.0
+   RUN ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64) && \
+       case "$ARCH" in amd64) OLLAMA_ARCH=amd64;; arm64) OLLAMA_ARCH=arm64;; *) echo "unsupported $ARCH"; exit 1;; esac && \
+       wget -qO "/tmp/ollama-linux-${OLLAMA_ARCH}" "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${OLLAMA_ARCH}" && \
+       wget -qO "/tmp/ollama-linux-${OLLAMA_ARCH}.sha256" "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${OLLAMA_ARCH}.sha256" && \
+       cd /tmp && sha256sum -c "ollama-linux-${OLLAMA_ARCH}.sha256" && \
+       install -m 755 "ollama-linux-${OLLAMA_ARCH}" /usr/local/bin/ollama && rm -f /tmp/ollama-linux-*
+   ```
+
+   If the upstream `.sha256` file format differs (some releases use `<hash>  <filename>` two-column shape, others raw hash), adapt by constructing the checksum line locally — but verify via the standard `sha256sum -c` pattern. Document the chosen pattern in the PR description.
+
+2. **emerge-webrsync timing:** Accept latest-at-build-time per Risk #3 (already settled in this plan — no re-litigation).
+
+3. **Phase 4 verification scope:** Build-only verification (`docker build --target mika-os` + `docker build --target mika-runtime` succeed). Runtime/functional testing is operator-manual, NOT pilot's responsibility. Do NOT attempt `docker run` or service starts.
+
+**Contract:** if the implementation surfaces a NEW ambiguity not pre-decided above (something genuinely undecided), default-decide using your best judgment and document the decision in the PR description. Do NOT end the turn asking the operator — claude-pilot has no operator-question relay, asking just triggers `pipeline_incomplete` and burns the dispatch.
+
 ## Tie-back to Acceptance Criteria
 
 - **AC1:** Phase 2 — exhaustive Dockerfile.agent audit, all instances fixed
