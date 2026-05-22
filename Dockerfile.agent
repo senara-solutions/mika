@@ -17,10 +17,13 @@ WORKDIR /app
 # Copy workspace manifests, lockfile, and source code
 COPY Cargo.toml Cargo.lock ./
 COPY crates/mika-common/ crates/mika-common/
+COPY crates/mika-a2a/ crates/mika-a2a/
 COPY crates/mika-agent/ crates/mika-agent/
 COPY crates/mika-gateway/Cargo.toml crates/mika-gateway/Cargo.toml
 RUN mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gateway/src/main.rs \
     && mkdir -p crates/mika-gateway/migrations && touch crates/mika-gateway/migrations/.keep
+COPY crates/mika-cli/Cargo.toml crates/mika-cli/Cargo.toml
+RUN mkdir -p crates/mika-cli/src && echo "fn main() {}" > crates/mika-cli/src/main.rs
 COPY --from=dashboard-builder /app/dashboard/dist dashboard/dist
 
 # Build with BuildKit cache mounts for incremental compilation
