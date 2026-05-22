@@ -56,7 +56,7 @@ The fix's only behavioral contract is "the build succeeds." A clean `docker buil
 
 ## Implementation Steps
 
-### Phase 1: Apply the fix
+### Phase 1: Apply the fix ✅
 
 **File:** `Dockerfile.agent`
 
