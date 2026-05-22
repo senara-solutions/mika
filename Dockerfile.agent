@@ -21,8 +21,6 @@ COPY crates/mika-agent/ crates/mika-agent/
 COPY crates/mika-gateway/Cargo.toml crates/mika-gateway/Cargo.toml
 RUN mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gateway/src/main.rs \
     && mkdir -p crates/mika-gateway/migrations && touch crates/mika-gateway/migrations/.keep
-COPY templates/ templates/
-COPY docs/ docs/
 COPY --from=dashboard-builder /app/dashboard/dist dashboard/dist
 
 # Build with BuildKit cache mounts for incremental compilation
