@@ -1,0 +1,42 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: Apache-2.0
+# OpenRC init script for mika-gateway (Telegram + GitHub webhook router)
+
+description="Mika webhook gateway (Telegram + GitHub routing)"
+
+command="/usr/local/bin/mika-gateway"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+command_user="mika:mika"
+
+supervise_daemon_args="--respawn-delay 5 --respawn-max 10 --respawn-period 60"
+
+output_log="/home/mika/.mika/logs/mika-gateway.log"
+error_log="/home/mika/.mika/logs/mika-gateway.log"
+
+depend() {
+    need net mika-server
+    after firewall
+}
+
+start_pre() {
+    # Source environment configuration
+    if [ -f "/etc/conf.d/mika-gateway" ]; then
+        . "/etc/conf.d/mika-gateway"
+        # Export required vars
+        [ -n "$MIKA_DATABASE_URL" ] && export MIKA_DATABASE_URL
+        [ -n "$MIKA_INTERNAL_TOKEN" ] && export MIKA_INTERNAL_TOKEN
+        [ -n "$MIKA_TELEGRAM_BOT_TOKEN" ] && export MIKA_TELEGRAM_BOT_TOKEN
+        [ -n "$MIKA_TELEGRAM_WEBHOOK_SECRET" ] && export MIKA_TELEGRAM_WEBHOOK_SECRET
+        [ -n "$MIKA_TELEGRAM_WEBHOOK_URL" ] && export MIKA_TELEGRAM_WEBHOOK_URL
+        [ -n "$MIKA_GATEWAY_PORT" ] && export MIKA_GATEWAY_PORT
+        [ -n "$MIKA_AGENT_BASE_URL" ] && export MIKA_AGENT_BASE_URL
+        [ -n "$MIKA_GATEWAY_LOG_FILE" ] && export MIKA_GATEWAY_LOG_FILE
+        [ -n "$MIKA_GITHUB_WEBHOOK_SECRET" ] && export MIKA_GITHUB_WEBHOOK_SECRET
+        [ -n "$MIKA_GITHUB_APP_ID" ] && export MIKA_GITHUB_APP_ID
+    fi
+
+    # Ensure log directory exists
+    checkpath -d -o mika:mika -m 0755 /home/mika/.mika/logs
+}

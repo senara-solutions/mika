@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Configuration for mika-gateway OpenRC service
+# Source: os/openrc/conf.d/mika-gateway
+#
+# This file is sourced by the mika-gateway init script.
+# Edit to configure runtime environment for the Mika webhook gateway.
+
+# ── Database (required) ──
+# Postgres connection string for the gateway's customer registry
+# MIKA_DATABASE_URL="postgres://mika:password@localhost:5432/mika"
+
+# ── Internal auth (required, must match mika-server) ──
+# MIKA_INTERNAL_TOKEN="<shared-secret — openssl rand -hex 32>"
+
+# ── Telegram (optional) ──
+# MIKA_TELEGRAM_BOT_TOKEN="<your Telegram bot token>"
+# MIKA_TELEGRAM_WEBHOOK_SECRET="<64 hex chars — openssl rand -hex 32>"
+# MIKA_TELEGRAM_WEBHOOK_URL="https://your-domain.com/webhook/telegram"
+
+# ── Gateway port ──
+# MIKA_GATEWAY_PORT="3001"
+
+# ── Agent routing (for local E2E testing) ──
+# MIKA_AGENT_BASE_URL="http://localhost:8080"
+
+# ── GitHub webhook (optional) ──
+# MIKA_GITHUB_WEBHOOK_SECRET="<your GitHub App webhook secret>"
+# MIKA_GITHUB_APP_ID="<GitHub App ID — for bot self-event filtering>"
+
+# ── Logging ──
+# MIKA_GATEWAY_LOG_FILE="/home/mika/.mika/logs/mika-gateway.log"
