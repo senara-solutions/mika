@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Mika OS — Default server configuration
+#
+# This file is installed to /home/mika/.mika/config.toml at image build time.
+# Override by volume-mounting your own config or editing via docker exec.
+#
+# Environment variables (MIKA_*) always take precedence over this file.
+
+# ── LLM Provider ──
+# Uncomment and set your provider + model. API key goes in .env, not here.
+# llm_provider = "anthropic"
+# anthropic_model = "claude-sonnet-4-6"
+
+# ── Server ──
+# log_format = "json"
+# server_port = 8080
+
+# ── Knowledge Graph ──
+# KG docs root inside the container (docs/ is copied to /app/ at build time)
+kg_docs_root = "/app/docs/solutions"

@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# Configuration for mika-server OpenRC service
+# Source: os/openrc/conf.d/mika-server
+#
+# This file is sourced by the mika-server init script.
+# Edit to configure runtime environment for the Mika agent server.
+
+# ── Core paths ──
+MIKA_HOME="/home/mika/.mika"
+MIKA_LOG_FORMAT="json"
+MIKA_SERVER_LOG_FILE="/home/mika/.mika/logs/mika-server.log"
+
+# ── Server mode ──
+# Required for server mode (gateway <-> agent communication)
+# MIKA_ROUTING_URL="http://mika-gateway:8080"
+# MIKA_INTERNAL_TOKEN="<shared-secret — openssl rand -hex 32>"
+
+# ── Provider API keys (set the one for your active provider) ──
+# MIKA_ANTHROPIC_API_KEY="sk-ant-..."
+# MIKA_OPENAI_API_KEY="sk-..."
+# MIKA_OPENROUTER_API_KEY="sk-or-..."
+# MIKA_GROQ_API_KEY="gsk_..."
+# MIKA_MISTRAL_API_KEY="..."
+# MIKA_GOOGLE_API_KEY="..."
+# MIKA_DEEPSEEK_API_KEY="..."
+
+# ── GitHub (optional) ──
+# MIKA_GITHUB_TOKEN="ghp_..."
+
+# ── Dev mode (auto-provisions well-known agents on startup) ──
+MIKA_DEV_MODE="false"
+
+# ── Knowledge Graph ──
+# MIKA_KG_DOCS_ROOT="/app/docs/solutions"
+# MIKA_KG_INGESTION_MODEL="openrouter/deepseek/deepseek-v3"
+
+# ── Telemetry (requires --features telemetry build) ──
+# MIKA_TELEMETRY_ENABLED="false"
+# MIKA_OTLP_ENDPOINT="https://cloud.langfuse.com/api/public/otel/v1/traces"
+# MIKA_OTLP_AUTH_HEADER="publicKey:secretKey"
