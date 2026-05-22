@@ -24,6 +24,16 @@ shutdown() {
 
 trap shutdown TERM INT
 
+# ── Seed default configs from /etc/mika/ if not already present (F4) ──
+# Copy-if-not-exists guard: preserves user-mounted configs on volume restart
+# and never overwrites operator customizations.
+if [ -n "$MIKA_HOME" ]; then
+    mkdir -p "$MIKA_HOME"
+    [ -f "$MIKA_HOME/config.toml" ] || cp /etc/mika/config.toml "$MIKA_HOME/config.toml" 2>/dev/null || true
+    [ -f "$MIKA_HOME/.env.template" ] || cp /etc/mika/mika.env.template "$MIKA_HOME/.env.template" 2>/dev/null || true
+    chown -R mika:mika "$MIKA_HOME" 2>/dev/null || true
+fi
+
 # ── Ensure OpenRC directories exist ──
 # Some container runtimes don't mount tmpfs at /run
 mkdir -p /run/openrc
@@ -39,10 +49,11 @@ echo "[mika-os-init] OpenRC boot complete. Services running."
 
 # ── Stay alive: tail log files (backgrounded so trap remains active) ──
 # Create log files if they don't exist yet (first boot)
-mkdir -p /home/mika/.mika/logs
-touch /home/mika/.mika/logs/mika-server.log /home/mika/.mika/logs/mika-gateway.log
+LOG_DIR="${MIKA_HOME:-/home/mika/.mika}/logs"
+mkdir -p "$LOG_DIR"
+touch "$LOG_DIR/mika-server.log" "$LOG_DIR/mika-gateway.log"
 
-tail -F /home/mika/.mika/logs/mika-server.log /home/mika/.mika/logs/mika-gateway.log &
+tail -F "$LOG_DIR/mika-server.log" "$LOG_DIR/mika-gateway.log" &
 TAIL_PID=$!
 
 # Wait for the tail process — trap will interrupt this on SIGTERM
