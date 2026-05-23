@@ -342,6 +342,55 @@ mod tests {
     }
 
     #[test]
+    fn test_dev_pilot_and_dev_groom_loader_symmetry_on_ready_label_webhook() {
+        // mika#1251 (follow-up to mika#1173): pins the exact path that broke.
+        //
+        // A keyword-less `[GitHub] Issue labeled ready` webhook message must
+        // still pull dev-groom into the matched set via the always-on
+        // self-dev → dev-groom dependency edge — exactly as it pulls in
+        // dev-pilot. Without the edge, run_claude_pilot_groom never enters the
+        // turn's tool map and the dispatcher falls through to "Unknown tool".
+        //
+        // Targets `match_skills` (the conversation-mode selector), NOT
+        // `callback_safe_skills`: the webhook ready-label turn is
+        // conversation-mode and routes through match_message → match_skills.
+        let skills = vec![
+            make_entry_with_deps(
+                "self-dev",
+                &["implement"],
+                true,
+                &["dev-pilot", "dev-groom"],
+            ),
+            make_entry("dev-pilot", &[], false),
+            make_entry("dev-groom", &["groom", "groom ticket"], false),
+        ];
+
+        // Webhook-shaped message containing none of dev-groom's keywords.
+        let matched = match_skills(
+            &skills,
+            "[GitHub] Issue labeled ready on senara-solutions/mika#9999 — fix the thing",
+        );
+
+        let dev_groom = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "dev-groom")
+            .expect("dev-groom must be matched via the self-dev dependency edge");
+        assert_eq!(
+            dev_groom.reason,
+            MatchReason::Dependency,
+            "dev-groom must arrive as a Dependency (no keyword hit on a webhook message)"
+        );
+
+        // dev-pilot is the sibling the mechanism already worked for — assert it
+        // too, so the test distinguishes the bug from a passing baseline.
+        let dev_pilot = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "dev-pilot")
+            .expect("dev-pilot must also be matched via the dependency edge");
+        assert_eq!(dev_pilot.reason, MatchReason::Dependency);
+    }
+
+    #[test]
     fn test_disabled_mid_chain_breaks_subtree() {
         // A depends on B, B depends on C. B is disabled → C is NOT loaded.
         let mut skill_b = make_entry_with_deps("skill-b", &[], false, &["skill-c"]);
