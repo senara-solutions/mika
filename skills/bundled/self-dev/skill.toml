@@ -8,7 +8,12 @@ max_prompt_size = 65536
 dependencies = [
     "build-mika",
     "deploy-mika",
+    # dev-pilot and dev-groom must BOTH be listed — the two dispatch siblings
+    # are loader-symmetric. self-dev (always_on) is the only edge that makes a
+    # non-always-on dispatch tool reachable on keyword-less webhook turns. See
+    # mika#1251 (the gap mika#1173 left) and the parity test in bundled_skills.rs.
     "dev-pilot",
+    "dev-groom",
     "browser-control",
     "resolve-pr-conflicts",
 ]

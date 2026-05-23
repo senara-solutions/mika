@@ -1361,6 +1361,46 @@ mod tests {
         assert!(!is_bundled_skill("definitely-not-a-skill"));
     }
 
+    #[test]
+    fn test_self_dev_declares_both_dispatch_siblings_as_dependencies() {
+        // Loader-symmetry invariant (mika#1251, follow-up to mika#1173).
+        //
+        // self-dev (always_on) is the only edge that makes a non-always-on
+        // dispatch tool reachable on keyword-less webhook turns — e.g. the
+        // `[GitHub] Issue labeled ready on …` marker, which contains none of
+        // dev-groom's keywords. dev-pilot and dev-groom are tool-symmetric
+        // dispatch siblings, so they MUST also be loader-symmetric here.
+        // mika#1173 restored dev-groom as a tool-owning skill but never added
+        // this dependency edge, leaving run_claude_pilot_groom unreachable on
+        // every github-webhook auto-groom turn.
+        //
+        // Parses the *embedded* (shipped) self-dev skill.toml — the bundled
+        // manifest is compiled in via build.rs — not a synthetic fixture.
+        let self_dev = all_bundled_skills()
+            .into_iter()
+            .find(|s| s.name.eq_ignore_ascii_case("self-dev"))
+            .expect("self-dev must be a bundled skill");
+
+        let manifest_toml = self_dev
+            .files
+            .iter()
+            .find(|f| f.path == "skill.toml")
+            .expect("self-dev must ship a skill.toml")
+            .content;
+
+        let manifest: crate::skills::manifest::SkillManifest =
+            toml::from_str(manifest_toml).expect("self-dev skill.toml must parse");
+
+        let deps = &manifest.skill.dependencies;
+        for required in ["dev-pilot", "dev-groom"] {
+            assert!(
+                deps.iter().any(|d| d.eq_ignore_ascii_case(required)),
+                "self-dev dependencies must include '{required}' (loader-symmetry \
+                 invariant, mika#1251); got {deps:?}"
+            );
+        }
+    }
+
     // Shared fixtures for merge-semantics tests — call `merge_skill_lists`
     // directly so the production merge function is the unit under test.
     // Previously the test re-implemented the merge algorithm locally, which
