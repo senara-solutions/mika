@@ -110,12 +110,12 @@ RUN ARCH=$(uname -m) && \
         aarch64) GWS_ARCH="aarch64-unknown-linux-gnu" ;; \
         *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac && \
-    wget -qO /tmp/gws.tar.gz \
+    wget -qO "/tmp/gws-${GWS_ARCH}.tar.gz" \
         "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/gws-${GWS_ARCH}.tar.gz" && \
-    wget -qO /tmp/gws.tar.gz.sha256 \
+    wget -qO "/tmp/gws-${GWS_ARCH}.tar.gz.sha256" \
         "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/gws-${GWS_ARCH}.tar.gz.sha256" && \
-    cd /tmp && echo "$(cat gws.tar.gz.sha256)  gws.tar.gz" | sha256sum -c - && \
-    tar -xzf /tmp/gws.tar.gz -C /tmp && \
+    cd /tmp && grep "gws-${GWS_ARCH}.tar.gz" "gws-${GWS_ARCH}.tar.gz.sha256" | sha256sum -c - && \
+    tar -xzf "/tmp/gws-${GWS_ARCH}.tar.gz" -C /tmp && \
     find /tmp -name gws -type f -executable -exec install -m 755 {} /usr/local/bin/gws \; && \
     rm -rf /tmp/gws*
 
