@@ -831,6 +831,13 @@ EOF
     #   4. Add the skill to the relevant well-known agent allowlist
     #      (well_known_agents.rs MIKA_*_IDENTITY).
     #   5. Update self-dev/system_prompt.md to teach mika-dev when to dispatch.
+    #   6. Update skills/bundled/self-dev/skill.toml `dependencies` array to
+    #      include the new skill. self-dev is always_on; non-always-on dispatch
+    #      skills only register their tool on a turn when self-dev pulls them in
+    #      via the dependency BFS. Webhook prompts (`[GitHub] Issue labeled ready
+    #      on …`) carry no dispatch keyword, so without this edge the tool returns
+    #      "Unknown tool" on every auto-dispatch turn (mika#1251 — dev-groom was
+    #      tool-restored in mika#1173 but this edge was missed).
     # Threshold for refactor: if N>5 dispatch skills, consider engine-side
     # routing helpers. Until then, the case switch is the contract.
     local ENTRY_COMMAND

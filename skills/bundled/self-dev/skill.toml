@@ -9,6 +9,7 @@ dependencies = [
     "build-mika",
     "deploy-mika",
     "dev-pilot",
+    "dev-groom",
     "browser-control",
     "resolve-pr-conflicts",
 ]

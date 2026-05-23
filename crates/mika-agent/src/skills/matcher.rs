@@ -424,4 +424,105 @@ mod tests {
         assert_eq!(matched[1].entry.manifest.skill.name, "skill-review");
         assert_eq!(matched[1].reason, MatchReason::Dependency);
     }
+
+    // --- Bundled dispatch-skill loader symmetry (mika#1251) ---
+
+    /// Build a `SkillEntry` from the *real* bundled `skill.toml` shipped in
+    /// `skills/bundled/<name>/`. Reads the source-tree file at test time via
+    /// `CARGO_MANIFEST_DIR` (mirroring `build.rs`, which resolves the same
+    /// `../../skills/bundled` root) so the assertion runs against the manifest
+    /// that actually ships — not a synthetic copy. That is what makes the
+    /// dependent test a regression guard for the self-dev → dev-groom edge: if
+    /// someone deletes the edge from `skill.toml`, this reflects it.
+    fn bundled_entry(name: &str) -> SkillEntry {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/bundled")
+            .join(name)
+            .join("skill.toml");
+        let toml_str = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read bundled skill.toml at {}: {e}",
+                path.display()
+            )
+        });
+        let manifest: crate::skills::manifest::SkillManifest = toml::from_str(&toml_str)
+            .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+        let keywords_lower = manifest
+            .triggers
+            .keywords
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        SkillEntry {
+            manifest,
+            dir: PathBuf::from(format!("/skills/{name}")),
+            keywords_lower,
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_overrides: std::collections::HashMap::new(),
+            model_prompts: std::collections::HashMap::new(),
+            model_overrides: std::collections::HashMap::new(),
+            generated_model_prompts: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_dev_pilot_and_dev_groom_loader_symmetry_on_ready_label_webhook() {
+        // Regression for mika#1251. The autonomous loop's auto-groom path went
+        // wedged on github-webhook turns: dev-groom (always_on=false, keywords
+        // ["groom", ...]) was unreachable, so its tool `run_claude_pilot_groom`
+        // returned "Unknown tool" on every dispatch. dev-pilot worked on the
+        // same turn only because self-dev (always_on=true) lists it in
+        // `dependencies`. mika#1173 restored dev-groom as a tool-owning skill
+        // but never added the dependency edge from self-dev.
+        //
+        // Both dispatch skills must be loader-symmetric: pulled into the matched
+        // set as `Dependency` (NOT `Keyword` — the webhook prompt carries no
+        // dispatch keyword) so their tools register on the turn.
+        let skills = vec![
+            bundled_entry("self-dev"),
+            bundled_entry("dev-pilot"),
+            bundled_entry("dev-groom"),
+        ];
+
+        // The exact webhook trigger shape. Carries none of the dispatch skills'
+        // keywords, so the only path that can include them is the dependency BFS.
+        let webhook_msg = "[GitHub] Issue labeled ready on senara-solutions/mika#1 — title here";
+
+        // Precondition: confirm no dev-pilot/dev-groom keyword is present in the
+        // prompt. If this ever fails, the test below would pass for the wrong
+        // reason (Keyword match instead of the Dependency edge under test).
+        let lower = webhook_msg.to_lowercase();
+        for entry in &skills[1..] {
+            for kw in &entry.keywords_lower {
+                assert!(
+                    !lower.contains(kw),
+                    "test precondition violated: webhook prompt contains dispatch keyword '{kw}'"
+                );
+            }
+        }
+
+        let matched = match_skills(&skills, webhook_msg);
+        let find = |name: &str| matched.iter().find(|m| m.entry.manifest.skill.name == name);
+
+        let pilot = find("dev-pilot")
+            .expect("dev-pilot must be matched on the webhook turn (dependency of self-dev)");
+        assert_eq!(
+            pilot.reason,
+            MatchReason::Dependency,
+            "dev-pilot must match via the self-dev dependency edge, not a keyword"
+        );
+
+        let groom = find("dev-groom").expect(
+            "dev-groom must be matched on the webhook turn — a missing edge in \
+             self-dev.dependencies wedges run_claude_pilot_groom (mika#1251)",
+        );
+        assert_eq!(
+            groom.reason,
+            MatchReason::Dependency,
+            "dev-groom must match via the self-dev dependency edge, not a keyword"
+        );
+    }
 }
