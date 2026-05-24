@@ -172,6 +172,16 @@ Options considered (kept for audit):
 | **B. mika-coord (new service)** | New K8s service or local daemon | Clean SoC; can be operator-machine-local | New service to operate; deferred multi-operator until deployed remotely |
 | **C. mika-server (agent HTTP server)** of a "personal" agent | Existing per-customer Axum server | Reuses agent infra | Still per-customer scoping; orchestrator is not a customer |
 
+### 3. Transport — HTTP/SSE assumed; D-Bus rejected
+
+The placement options above all assume HTTP/SSE as the wire transport. D-Bus (the native Linux desktop IPC bus) was raised later (operator, 2026-05-24) as a more-native alternative for same-machine spawn↔orchestrator messaging. **Rejected** for this use case:
+
+- **No durable replay.** D-Bus signals are fire-and-forget — a signal with no subscriber on the bus at emit time is lost. The inbox's core requirement is delivery to a receiver that was *not listening* at emit time (orchestrator compacted, restarted, or between turns). That durability is precisely what the Postgres table + `id` cursor + retention provide; a persistence/replay layer would have to be rebuilt on top of D-Bus anyway.
+- **Neither participant is a daemon.** D-Bus assumes a long-lived process holding a bus connection with an event loop. Both the orchestrator and the spawns are turn-based Claude Code sessions that hold no connection between turns — there is no resident process to own a subscription. An async durable drop-box fits turn-based agents; a live bus fits daemons. This disqualifier holds even on a single desktop.
+- **Desktop-only by construction.** The D-Bus session bus is per-login-session, one machine — incompatible with the ratified "multi-operator works for free" goal (Option A) and any future remote/cloud reach. (Weaker than the two reasons above, since the spawn-completion use case is desktop-local today.)
+
+Where D-Bus *would* fit is a different question — ephemeral orchestrator liveness/presence signalling — not the durable inbox. Not previously considered in this plan; recorded here for audit.
+
 ## Orchestrator-id discovery (F3 resolution — option (a'))
 
 Operator (Vincent, 2026-05-17) ratified option (a'): the orchestrator generates its id once at session start, caches it at `~/.mika/orchestrator/id`, and `scripts/mika-platform-spawn` exports `MIKA_ORCHESTRATOR_ID` to every child tenant alongside the existing `MIKA_SPAWN_ID`. Reasoning lives in the architect-retro exchange on session `9d81e315-4ba6-4995-9991-e941866bd3b2`.
