@@ -128,13 +128,23 @@ Methods on `Database`:
 
 - `insert_operational_item(&self, item: &NewOperationalItem) -> Result<String>` — INSERT with UUID generation, returns id.
 - `upsert_operational_item_by_source(&self, item: &NewOperationalItem) -> Result<String>` — INSERT OR REPLACE keyed on `(agent_id, source_table, source_id)`. This is the primary write-path method — idempotent for re-delivery.
-- `update_operational_item_status(&self, id: &str, status: OperationalStatus) -> Result<()>` — status transition with `updated_at` bump.
+- `update_operational_item_status(&self, id: &str, status: NonTerminalStatus) -> Result<()>` — status transition for non-terminal statuses only (`Now / Waiting / Delegated / Scheduled / AtRisk`). The type-level constraint via `NonTerminalStatus` enum prevents passing `Done` at compile time. `updated_at` bumped on success.
+- `complete_operational_item(&self, id: &str, evidence_ref: EvidenceRef) -> Result<()>` — the **only** path to write `status = Done`. Requires an Evidence reference so the terminal transition is always audit-traceable. Returns `Err(AlreadyTerminal)` if the item is already Done. Per foundation Decision G: "Done is terminal."
+- `reopen_operational_item(&self, id: &str, evidence_ref: EvidenceRef) -> Result<()>` — the **only** path out of `status = Done`. Transitions back to `Now` (re-derivation takes over on subsequent reads). Requires an Evidence reference per foundation §4 "explicit re-open with audit-trail Evidence link."
 - `update_operational_item_priority(&self, id: &str, priority: f32) -> Result<()>` — priority cache update (Layer 2 will call this).
 - `query_operational_items(&self, filter: &OperationalItemFilter) -> Result<Vec<OperationalItem>>` — the canonical read query.
 - `get_operational_item_by_source(&self, agent_id: &str, source_table: &str, source_id: &str) -> Result<Option<OperationalItem>>` — lookup for status-update paths.
 - `count_blocked_items(&self, blocked_by_id: &str) -> Result<u32>` — for dependency_risk scoring.
 
-All methods wrapped via `AsyncDatabase` channel dispatch following existing patterns.
+```rust
+// Type-level guard: prevents callers from passing `Done` to update_operational_item_status.
+pub enum NonTerminalStatus { Now, Waiting, Delegated, Scheduled, AtRisk }
+impl From<NonTerminalStatus> for OperationalStatus { /* trivial */ }
+```
+
+All methods wrapped via `AsyncDatabase` channel dispatch following existing patterns. Transaction-accepting variants (`*_tx` suffixed) added where atomicity per §5.2 requires the same `&Transaction` reference to be threaded through source-of-truth + operational writes in one closure.
+
+**EvidenceRefKind enum closure at the DB layer.** Foundation Decision F settles `EvidenceRefKind` as a closed enum (Rust-only). The SQL schema stores `evidence_refs` as `TEXT` (JSON-serialized array) for flexibility, but **all writes MUST go through the Rust `EvidenceRef` type via the methods above** — direct SQL writes that bypass the Rust serializer are not supported and are documented as a CLAUDE.md invariant. Adding a per-row SQLite CHECK constraint validating each JSON element's `kind` is rejected as scope creep (would need a JSON-aware constraint function in SQLite) — the Rust-type-as-only-writer contract is the simpler enforcement. CLAUDE.md § "Conventions" gets a new bullet: *"Writes to `operational_items.evidence_refs` MUST go through `crates/mika-agent/src/operational/types.rs::EvidenceRef`. Direct SQL writes that bypass the Rust type are unsupported and will break the closed-enum guarantee from foundation Decision F."*
 
 ---
 
@@ -236,18 +246,51 @@ pub fn write_team_run_item(db: &Database, agent_id: &str, run: &TeamRun) -> Resu
 Hook: `task_engine/dispatcher.rs` in `handle_task_complete()` after `try_extract_callback_metadata()`.
 
 ```rust
-pub fn write_callback_completion(db: &Database, agent_id: &str, task: &Task, has_pr_url: bool) -> Result<()> {
+pub fn write_callback_completion(db: &Database, agent_id: &str, task: &Task, has_pr_url: bool, pr_url: Option<&str>) -> Result<()> {
     if let Some(item) = db.get_operational_item_by_source(agent_id, "tasks", &task.id)? {
-        let new_status = if has_pr_url {
-            OperationalStatus::Done
+        if has_pr_url {
+            // Terminal transition — requires Evidence reference per Decision G.
+            let evidence = EvidenceRef {
+                kind: EvidenceRefKind::GithubPr,
+                id: pr_url.unwrap_or_default().to_string(),
+            };
+            db.complete_operational_item(&item.id, evidence)?;
         } else {
-            OperationalStatus::AtRisk
-        };
-        db.update_operational_item_status(&item.id, new_status)?;
+            // Non-terminal: keep available for next pilot run.
+            db.update_operational_item_status(&item.id, NonTerminalStatus::AtRisk)?;
+        }
     }
     Ok(())
 }
 ```
+
+### 3.8 mika-arch DECISION NEEDED → Decision (foundation §7)
+
+Hook: `tools/run_gh.rs` or wherever mika-arch's grooming output is consumed by the agent loop, on detection of a `DECISION NEEDED — <ID>` marker in the architect's response (the `mika-arch-groom-ticket` / `mika-arch-second-review` skills emit these as part of plan-doc reviews).
+
+```rust
+pub fn write_arch_decision_item(db: &Database, agent_id: &str, marker: &ArchDecisionMarker, session_id: &str) -> Result<String> {
+    let item = NewOperationalItem {
+        kind: OperationalKind::Decision,
+        title: format!("Stamp marker {} ({}) on {}", marker.id, marker.title, marker.doc_path),
+        status: OperationalStatus::Now,
+        owner: Owner::User,
+        evidence_refs: vec![EvidenceRef {
+            kind: EvidenceRefKind::External,
+            id: format!("mika-arch-session:{}", session_id),
+        }],
+        confidence: 1.0,  // architect explicitly surfaced this
+        source_table: Some("tool_calls".to_string()),
+        source_id: Some(marker.tool_call_id.clone()),
+        ..Default::default()
+    };
+    db.upsert_operational_item_by_source(&item)
+}
+```
+
+The `ArchDecisionMarker` struct captures `{ id: String, title: String, doc_path: String, tool_call_id: String }` parsed from the architect's response. Detection is via regex against the standard marker pattern `**DECISION NEEDED — <ID> (<title>):**` in the architect's response body.
+
+**Layer 1 / Layer 3 ownership split:** The detection regex and parser live in Layer 1 (this ticket) as part of the write-path module. The deeper integration — where in the agent loop the detection fires, and how the resulting Decision items surface back to the operator — is Layer 3's concern (`tool_execution/` module per foundation §6). Layer 1 ships the writer; Layer 3 wires the trigger.
 
 ### 3.7 Manual Task Creation (create_task tool) → Task
 
@@ -307,17 +350,26 @@ Documented as a stub in the module. Layer 2 will wire this up when the A2A surfa
 - **Writes:** Always-on once the migration lands. Every write path fires regardless of flag. This ensures the ledger is populated from day one.
 - **Reads:** Gated. The HTTP endpoint returns 404, the agent-prompt injection (Layer 2) is skipped, the CLI commands (`mika next`, `mika status` operational view) are hidden.
 
-### 5.2 Write-Path Atomicity (Decision D)
+### 5.2 Write-Path Atomicity (Decision D) — choice (a) true atomicity
 
-Per the foundation doc, writes are single-transaction with the source-of-truth table. For each hook site:
+Per foundation Decision D, writes are single-transaction with the source-of-truth table. Choosing **(a) true atomicity** per mika-arch's first-pass F1 framing:
 
-- **Reminders, manual tasks:** The `create_task()` call and the `upsert_operational_item_by_source()` call run inside the same `rusqlite::Transaction`. This requires adding a `Transaction`-accepting variant or using the existing `with_transaction` pattern.
-- **Webhooks, callbacks, team runs:** These already run inside the `AsyncDatabase` actor's closure. The operational write is appended to the same closure.
-- **Failure mode:** If the operational write fails, log a warning and continue. The source-of-truth write must not be blocked by a failure in the augmentation layer.
+- **Reminders, manual tasks:** The `create_task()` call and the `upsert_operational_item_by_source()` call run inside the same `rusqlite::Transaction`. Implementation: each subsystem's hook site is rewritten to use `Database::with_transaction(|tx| { ... })`, passing the same `&Transaction` reference to both the source-of-truth write and the operational write. New `with_transaction`-accepting variants are added to `db/operational.rs` methods where needed (e.g., `upsert_operational_item_by_source_tx`).
+- **Webhooks, callbacks, team runs:** These already run inside the `AsyncDatabase` actor's closure via `with_db`. The operational write is appended to the **same closure**, sharing the closure's `&mut Database` reference. SQLite's implicit transaction semantics ensure both writes commit or roll back together.
+- **Failure mode (revised):** If the operational write fails inside the transaction, **the entire transaction rolls back, including the source-of-truth write.** The caller surfaces the error to its caller (HTTP 500 for webhook handlers, error return for tool dispatch, etc.) and the operation is retried per the existing retry semantics of each source path. GitHub will redeliver webhooks on 5xx, scheduled tasks retry via the engine tick loop, and user-facing tools surface the error to the user. This is the canonical interpretation of Decision D ("correctness is the v1 priority") and respects the augmentation-not-replacement rule from foundation §3: if the augmentation can't be written, the source row shouldn't be either — otherwise the source becomes the only truth and the OperationalItem layer drifts behind silently.
 
-### 5.3 mika#1258 Sequencing (Decision D consideration)
+**Rejected interpretation (pilot's rev 1):** "Log a warning and continue" if the operational write fails. This makes the writes separable rather than atomic, contradicts Decision D, and produces a silent inconsistency between the source and the operational layer — exactly the dual-source-of-truth bug Decision D was settled to prevent.
 
-The foundation doc notes Layer 1 and mika#1258 (async_db backpressure) should land together. However, mika#1258 is still open and its fix (DB-as-actor pattern) is independent of Layer 1's schema. **Decision:** Layer 1 lands first with today's `sync_channel(512)` pattern. The operational writes are small (one INSERT per event) and won't meaningfully increase backpressure. When mika#1258 ships DB-as-actor, the operational writes route through it cleanly — the `with_db` closure interface is unchanged.
+### 5.3 mika#1258 Sequencing (Decision D consideration) — SETTLED
+
+Foundation Decision D notes Layer 1 and mika#1258 (async_db backpressure) should sequence together. This plan **explicitly settles the sequencing**: Layer 1 lands FIRST with the existing `sync_channel(512)` pattern; mika#1258 lands SECOND as a transparent transport migration.
+
+**Rationale:**
+- The operational writes are small (one INSERT or UPDATE per event) and add ~7 new write paths × ~10 events/day per typical agent = ~70 additional writes/day. Negligible relative to current `tool_calls` + `messages` write volume; will not meaningfully saturate the existing channel.
+- The `with_db` and `with_transaction` closure interfaces are stable across the sync_channel-vs-actor implementation change. Migration from sync_channel to DB-as-actor (when mika#1258 ships) is internal to `AsyncDatabase` and does not require Layer 1 code changes.
+- Atomicity per §5.2 is achieved by SQLite transaction semantics inside the `with_db` closure, not by the channel transport. Both transport implementations preserve transaction boundaries.
+
+**Sequencing implication for the project queue:** Layer 1 (this ticket) does NOT depend on mika#1258 landing first. mika#1258 can land before, during, or after Layer 1 with no impact on Layer 1's semantics or correctness.
 
 ---
 
@@ -382,3 +434,10 @@ Schema migration v38→v39 tested via the existing migration test pattern (in-me
 - **Low risk:** Schema is additive (new table, no existing table changes). Feature-flagged reads. Writes are fire-and-forget with log-and-continue on failure.
 - **Medium risk:** 7 hook sites across the codebase — each is a small change, but the surface area is broad. Mitigated by the fire-and-forget pattern and per-path unit tests.
 - **Dependency:** None blocking. mika#1258 is a post-hoc optimization, not a prerequisite.
+
+---
+
+## Changelog
+
+- **2026-05-24 (rev 2)** — CC resolved mika-arch first-pass findings (session `d2df893e`, Disposition: ITERATE). **F1 (BLOCKING):** §5.2 rewritten to choose option (a) true atomicity — log-and-continue failure mode removed; operational write failure rolls back the entire transaction; rejected interpretation explicitly noted. §5.3 strengthened to explicitly settle mika#1258 sequencing as "Layer 1 first, mika#1258 transparent transport migration after." **F2 (NON-BLOCKING):** Phase 2 documents `EvidenceRefKind` closure as Rust-only enforced via the type-as-only-writer contract; CLAUDE.md § Conventions gets a new invariant bullet. **F3 (NON-BLOCKING):** Phase 2 splits status updates into three terminal-aware methods — `update_operational_item_status(id, NonTerminalStatus)` for non-terminal transitions, `complete_operational_item(id, evidence)` for Done writes (the only path to Done; requires Evidence ref per Decision G), and `reopen_operational_item(id, evidence)` for the audit-trailed re-open path. Type-level guard via new `NonTerminalStatus` enum prevents passing `Done` at compile time. **F4 (NON-BLOCKING):** Added Phase 3.8 covering the mika-arch DECISION NEEDED → Decision write path, including the `ArchDecisionMarker` parser and the Layer 1 / Layer 3 ownership split. §3.6 callback completion updated to use the new `complete_operational_item` method with Evidence ref.
+- **2026-05-24 (rev 1)** — Initial plan by autonomous dev-groom session 741fa338. Pilot exited PIPELINE_INCOMPLETE before committing; CC recovered the uncommitted plan from the worktree for architect review.
