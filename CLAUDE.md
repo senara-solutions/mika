@@ -270,6 +270,8 @@ The `build.rs` walks `skills/bundled/` and generates `BUNDLED_SKILL_MANIFESTS` c
 
 Skills are loaded at runtime from this generated constant — no filesystem access required. Directories starting with `.` (dotfiles) or `_` (convention-reserved for shared support libraries like `_shared/`) are excluded from **skill** discovery. **Support directories** (underscore-prefixed) are discovered separately at build time and seeded unconditionally by `seed_bundled_skills_if_needed()` (even when `MIKA_DISABLE_BUNDLED_SKILLS=true`), so sibling skills can source them at runtime via relative path (mika#923). The `_shared/` directory contains `dispatch-lib.sh` — shared plumbing for claude-pilot dispatch skills (dev-pilot, dev-groom).
 
+- **Post-flight dirty-worktree recovery (#1282):** When dev-pilot exits with dirty worktree but zero commits, dispatch-lib auto-commits with `wip()` prefix, pushes, and opens a draft PR. Content is rescued; outcome remains PIPELINE_INCOMPLETE. Operator must review and promote the draft PR.
+
 ### Adding a New Bundled Skill
 
 1. Create `skills/bundled/<skill-name>/` directory
