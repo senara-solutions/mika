@@ -749,6 +749,73 @@ RESULT=""
 WORKTREE_DIR="" _escalate_groom "first-pass" "content" "sess-x" 2>/dev/null
 assert_contains "_escalate_groom populates RESULT even when WORKTREE_DIR unset" "PIPELINE FAILURE" "$RESULT"
 
+# ----------------------------------------------------------------------------
+# Phase D — canonical body-callout writer (mika#1271 sub-PR 6)
+# ----------------------------------------------------------------------------
+# _write_canonical_callout is the forward-path body-callout writer called on
+# GROOMED success. Distinct from _verify_and_write_body_callout (mika#1123)
+# which writes a RECOVERY callout that explicitly does NOT carry a GROOMED
+# marker. Tests below assert: definition exists, two call sites in
+# _iterate_groom_loop (one per GROOMED path), zero call sites on ESCALATE,
+# stage labels produce distinct Grooming-history shapes, unknown stage
+# returns 1, gh failure on idempotency check leaves no write.
+
+# Definition exists
+if declare -f _write_canonical_callout >/dev/null 2>&1; then
+    assert_eq "_write_canonical_callout is defined" "ok" "ok"
+else
+    assert_eq "_write_canonical_callout is defined" "ok" "missing"
+fi
+
+# Code-shape: _iterate_groom_loop has exactly 2 _write_canonical_callout call
+# sites (the two GROOMED success branches — one for READY-to-GROOMED and one
+# for ITERATE-to-GROOMED). Zero call sites on ESCALATE branches.
+CANONICAL_CALL_COUNT=$(printf '%s\n' "$ITERATE_NOW" | grep -c '_write_canonical_callout')
+assert_eq "_iterate_groom_loop has 2 _write_canonical_callout call sites" "2" "$CANONICAL_CALL_COUNT"
+
+# Stage labels match the GROOMED paths exactly
+assert_contains "READY-to-GROOMED branch uses ready-to-groomed stage" '_write_canonical_callout "ready-to-groomed"' "$ITERATE_NOW"
+assert_contains "ITERATE-to-GROOMED branch uses iterate-to-groomed stage" '_write_canonical_callout "iterate-to-groomed"' "$ITERATE_NOW"
+
+# Preservation invariant: writer is called BEFORE cleanup (so callout writes
+# even if cleanup fails) AND callout is non-fatal (|| true on failure).
+assert_contains "ready-to-groomed callout non-fatal on write failure" 'canonical callout write non-fatal failure' "$ITERATE_NOW"
+
+# Unknown stage label → returns 1 (defensive contract).
+RESULT=""
+unknown_rc=0
+(WORKTREE_DIR="/tmp" REPO="mika" ISSUE_NUM="999" BRANCH="test/branch" _write_canonical_callout "unknown-stage" "sess-unknown" 2>/dev/null) || unknown_rc=$?
+assert_eq "_write_canonical_callout: unknown stage returns non-zero" "1" "$unknown_rc"
+
+# Missing required env → returns 1 (defensive contract). WORKTREE_DIR unset.
+no_wd_rc=0
+(WORKTREE_DIR="" REPO="mika" ISSUE_NUM="999" BRANCH="test/branch" _write_canonical_callout "ready-to-groomed" "sess-x" 2>/dev/null) || no_wd_rc=$?
+assert_eq "_write_canonical_callout: missing WORKTREE_DIR returns non-zero" "1" "$no_wd_rc"
+
+# Missing REPO/ISSUE_NUM/BRANCH → returns 1
+CC_TMP=$(mktemp -d)
+no_repo_rc=0
+(WORKTREE_DIR="$CC_TMP" REPO="" ISSUE_NUM="999" BRANCH="test/branch" _write_canonical_callout "ready-to-groomed" "sess-x" 2>/dev/null) || no_repo_rc=$?
+assert_eq "_write_canonical_callout: missing REPO returns non-zero" "1" "$no_repo_rc"
+rm -rf "$CC_TMP"
+
+# Source-shape: writer source contains the canonical 3-line dispatch-gate shape
+# (matches the Pin B / check_grooming_markers regex in executor.rs).
+WRITER_SRC=$(declare -f _write_canonical_callout)
+assert_contains "writer source contains Branch line" '> - **Branch:**' "$WRITER_SRC"
+assert_contains "writer source contains Plan line with committed-on-branch" 'committed on branch @' "$WRITER_SRC"
+assert_contains "writer source contains second-pass (GROOMED) marker for dispatch gate" 'second-pass (GROOMED)' "$WRITER_SRC"
+assert_contains "writer source includes session_id in Grooming history" 'session-id: ${session_id}' "$WRITER_SRC"
+
+# Stage-label-driven history lines
+assert_contains "ready-to-groomed stage produces READY → GROOMED history" 'first-pass (READY) → second-pass (GROOMED)' "$WRITER_SRC"
+assert_contains "iterate-to-groomed stage produces ITERATE → revised → GROOMED history" 'first-pass (ITERATE) → revised → second-pass (GROOMED)' "$WRITER_SRC"
+
+# Idempotency check uses same three-signal pattern as _verify_and_write_body_callout (mika#1123)
+assert_contains "writer reuses Pin B has_branch signal" 'has_branch=' "$WRITER_SRC"
+assert_contains "writer reuses Pin B has_plan signal" 'has_plan=' "$WRITER_SRC"
+assert_contains "writer reuses Pin B has_verdict signal" 'has_verdict=' "$WRITER_SRC"
+
 # --- Summary ---
 
 echo ""
