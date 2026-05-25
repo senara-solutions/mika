@@ -924,6 +924,105 @@ Session: ${session_id}
 Architect findings preserved at: ${findings_file}"
 }
 
+_write_canonical_callout() {
+    # Phase D canonical body-callout writer (mika#1271). Called from
+    # _iterate_groom_loop on GROOMED success. Prepends the canonical 3-line
+    # callout block to the issue body so downstream dispatch gates (Pin B /
+    # check_grooming_markers in executor.rs) pass with a verified architect
+    # verdict — distinct from _verify_and_write_body_callout (mika#1123) which
+    # writes a RECOVERY callout that explicitly does NOT carry a GROOMED marker.
+    #
+    # Idempotent: if all three dispatch-gate signals are already in the body
+    # (branch line + plan path + second-pass GROOMED marker), skip writing.
+    # This honors the dual-write doc on _verify_and_write_body_callout — the
+    # organic LLM writer (dev-groom step 18) may have already done it under
+    # the existing pilot-owns-architect flow that this state machine is
+    # progressively replacing. Sub-PR 7 retires the organic writer.
+    #
+    # Args:
+    #   $1: stage label — "ready-to-groomed" | "iterate-to-groomed"
+    #   $2: architect session_id (for forensic correlation in the body)
+    local stage="$1" session_id="$2"
+
+    [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || {
+        echo "WARN: write_canonical_callout: WORKTREE_DIR unset or missing" >&2; return 1; }
+    [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ] && [ -n "$BRANCH" ] || {
+        echo "WARN: write_canonical_callout: REPO/ISSUE_NUM/BRANCH unset" >&2; return 1; }
+
+    # Compose the Grooming history line per stage. Both forms include
+    # "second-pass (GROOMED)" to satisfy the dispatch-gate has_verdict regex.
+    local history_line
+    case "$stage" in
+        ready-to-groomed)
+            history_line="> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: ${session_id}"
+            ;;
+        iterate-to-groomed)
+            history_line="> - **Grooming history:** first-pass (ITERATE) → revised → second-pass (GROOMED) — session-id: ${session_id}"
+            ;;
+        *)
+            echo "WARN: write_canonical_callout: unknown stage \"$stage\"" >&2
+            return 1
+            ;;
+    esac
+
+    # Find the issue-scoped plan file (same pattern as _iterate_groom_loop).
+    local plan_path
+    plan_path=$(find "$WORKTREE_DIR/docs/plans" -name "*-${ISSUE_NUM}-*-plan.md" -size +500c \
+        2>/dev/null | sort -r | head -1)
+    [ -n "$plan_path" ] || {
+        echo "WARN: write_canonical_callout: no issue-scoped plan file for $REPO#$ISSUE_NUM" >&2
+        return 1
+    }
+    local plan_relpath="${plan_path#"$WORKTREE_DIR/"}"
+
+    # Fetch current body for idempotency check.
+    local current_body
+    current_body=$(gh issue view "$ISSUE_NUM" --repo "senara-solutions/$REPO" \
+        --json body -q '.body' 2>/dev/null) || {
+        echo "WARN: write_canonical_callout: gh issue view failed for $REPO#$ISSUE_NUM" >&2
+        return 1
+    }
+
+    # Same three-signal check as _verify_and_write_body_callout (mika#1123).
+    local has_branch has_plan has_verdict
+    has_branch=$(printf '%s' "$current_body" | grep -cF '> - **Branch:**' || true)
+    has_plan=$(printf '%s' "$current_body" | grep -cF 'docs/plans/' || true)
+    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED\)|second-pass \(READY, paraphrased GROOMED' || true)
+
+    if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ]; then
+        echo "write_canonical_callout: dispatch-gate signals already present in $REPO#$ISSUE_NUM body — skipping (idempotent)" >&2
+        return 0
+    fi
+
+    local head_sha
+    head_sha=$(git -C "$WORKTREE_DIR" rev-parse --short HEAD 2>/dev/null)
+
+    local callout_block
+    callout_block=$(cat <<CALLOUT_EOF
+> - **Branch:** \`${BRANCH}\`
+> - **Plan:** \`${plan_relpath}\` (committed on branch @ \`${head_sha}\`)
+${history_line}
+CALLOUT_EOF
+    )
+
+    local new_body
+    new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
+    local tmpfile
+    tmpfile=$(mktemp /tmp/canonical-callout-XXXXXX.md)
+    printf '%s' "$new_body" > "$tmpfile"
+
+    if gh issue edit "$ISSUE_NUM" --repo "senara-solutions/$REPO" \
+        --body-file "$tmpfile" 2>/dev/null; then
+        echo "write_canonical_callout: wrote canonical callout to $REPO#$ISSUE_NUM (stage=$stage, session=$session_id)" >&2
+        rm -f "$tmpfile"
+        return 0
+    else
+        echo "WARN: write_canonical_callout: gh issue edit failed for $REPO#$ISSUE_NUM" >&2
+        rm -f "$tmpfile"
+        return 1
+    fi
+}
+
 _iterate_groom_loop() {
     # Phase D — the iterate-loop state machine (mika#1271 v1 cut).
     #
@@ -984,6 +1083,8 @@ _iterate_groom_loop() {
             case "$verdict" in
                 GROOMED)
                     echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    _write_canonical_callout "ready-to-groomed" "$session_id" || \
+                        echo "info: canonical callout write non-fatal failure — Class D recovery (mika#1123) still runs downstream" >&2
                     _cleanup_iterate_findings
                     return 0
                     ;;
@@ -1031,6 +1132,8 @@ _iterate_groom_loop() {
             case "$verdict_iter" in
                 GROOMED)
                     echo "iterate_groom_loop: revised plan converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    _write_canonical_callout "iterate-to-groomed" "$session_id" || \
+                        echo "info: canonical callout write non-fatal failure — Class D recovery (mika#1123) still runs downstream" >&2
                     _cleanup_iterate_findings
                     return 0
                     ;;
