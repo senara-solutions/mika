@@ -205,16 +205,6 @@ Gateway mode: See `crates/mika-gateway/CLAUDE.md` for gateway-specific env vars.
 - **Deployment:** Production deployment guide, Docker image CI, Kubernetes/cloud manifests
 - **Future features:** WhatsApp channel adapter, morning briefings, admin API
 
-## Reference Repositories
-
-Local clones of agent platforms to study for patterns and inspiration. Read freely when designing Mika features.
-
-- **OpenClaw** — `../openclaw/`
-  TypeScript monorepo. Study for: channel adapter architecture (hub-and-spoke gateway), skills system (Markdown/YAML definitions), multi-channel UX patterns, community marketplace model.
-
-- **LettaBot** — `../lettabot/`
-  TypeScript. Study for: memory hierarchy patterns (core/archival/recall from MemGPT), autonomous memory self-editing via tool calls, agent state persistence, channel integrations built on top of Letta's memory API.
-
 ## Workspace Context
 
 This repo is part of the [mika-platform](../CLAUDE.md) workspace. For cross-repo navigation, development workflow, and the autonomous development loop, see `../CLAUDE.md`.
