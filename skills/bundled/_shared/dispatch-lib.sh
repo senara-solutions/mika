@@ -159,156 +159,6 @@ _scrub_secrets_from_output() {
         | sed -E 's/gh[spu]_[A-Za-z0-9_]+/<REDACTED_TOKEN>/g'
 }
 
-_verify_and_write_body_callout() {
-    # Post-flight body-callout recovery (mika#1123): detect dev-groom drift where
-    # the plan is committed and pushed but the issue body never received the
-    # canonical callout block. If missing, write a recovery callout that surfaces
-    # the drift without fabricating an architect verdict.
-    #
-    # Dual-write documentation: body callouts can be written by two paths:
-    #   (1) the LLM in dev-groom step 18 (organic, passes dispatch gate)
-    #   (2) this structural recovery (partial, does NOT pass dispatch gate)
-    # When the issue-scoped plan file is missing (dev-groom drift produced no
-    # plan at all), this function logs body_callout_drift_recovery_skipped and
-    # exits without writing — the orchestrator's Class A path handles it
-    # (re-dispatch dev-groom). See mika#1144 for the Class C drift this guards
-    # against.
-    local repo="$1" issue_num="$2" worktree_dir="$3" branch="$4"
-
-    # 1. Fetch current issue body
-    local current_body
-    current_body=$(gh issue view "$issue_num" --repo "senara-solutions/$repo" \
-        --json body -q '.body' 2>/dev/null) || return 0
-
-    # 2. Check if all three callout signals are already present
-    #    (mirrors check_grooming_markers() in executor.rs — Pin B)
-    local has_branch has_plan has_verdict
-    has_branch=$(printf '%s' "$current_body" | grep -cF '> - **Branch:**' || true)
-    has_plan=$(printf '%s' "$current_body" | grep -cF 'docs/plans/' || true)
-    has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED\)|second-pass \(READY, paraphrased GROOMED' || true)
-
-    if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ]; then
-        return 0  # All present, nothing to do
-    fi
-
-    # 3. Find the plan file on the branch — scoped to issue number only.
-    # Class C drift fix (mika#1144): no fallback to "any plan file". A worktree
-    # branched from main carries every previously-merged plan in docs/plans/, so
-    # an unscoped `find | sort -r | head -1` reliably returns the most recent
-    # unrelated plan. A missing callout (Class A) is more recoverable than a
-    # wrong one (Class C).
-    local plan_file
-    plan_file=$(find "$worktree_dir/docs/plans" -name "*-${issue_num}-*-plan.md" -size +500c \
-        2>/dev/null | sort -r | head -1)
-
-    if [ -z "$plan_file" ]; then
-        echo "body_callout_drift_recovery_skipped: no issue-scoped plan file found for $repo#$issue_num (Class A — orchestrator will re-dispatch dev-groom)" >&2
-        return 0
-    fi
-
-    local plan_relpath="${plan_file#"$worktree_dir/"}"
-
-    # Class D drift fix (mika#1204): verify the plan file is actually in HEAD's
-    # tree before stamping a SHA claim. If not (pilot exited before committing),
-    # auto-commit the plan so the SHA is truthful.
-    if ! git -C "$worktree_dir" cat-file -e "HEAD:${plan_relpath}" 2>/dev/null; then
-        echo "post_flight_class_d_recovery: plan file exists on disk but not in HEAD — committing (mika#1204)" >&2
-        # Pathspec-limited commit: only the plan file, not the full index.
-        # Prevents capturing any other staged files from a partial pilot run.
-        if ! git -C "$worktree_dir" commit -m "wip(${repo}#${issue_num}): plan staged by post-flight recovery" -- "$plan_relpath"; then
-            echo "WARN: post_flight_class_d_commit_failed for $repo#$issue_num — stamping as uncommitted" >&2
-            # Fall through to approach (b): stamp as uncommitted.
-            # The (uncommitted ...) format deliberately does NOT match the
-            # "committed on branch @" regex — downstream parsers
-            # (check_grooming_markers, _detect_plan_on_branch) skip gracefully.
-            local callout_block
-            callout_block=$(cat <<CALLOUT_EOF
-> - **Branch:** \`${branch}\`
-> - **Plan:** \`${plan_relpath}\` (uncommitted on branch \`${branch}\`, see worktree)
-> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
-CALLOUT_EOF
-            )
-            local new_body
-            new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
-            local tmpfile
-            tmpfile=$(mktemp /tmp/body-callout-recover-XXXXXX.md)
-            printf '%s' "$new_body" > "$tmpfile"
-            if gh issue edit "$issue_num" --repo "senara-solutions/$repo" \
-                --body-file "$tmpfile" 2>/dev/null; then
-                echo "body_callout_drift_recovered: wrote UNCOMMITTED callout to $repo#$issue_num (plan on disk, commit failed)" >&2
-            else
-                echo "WARN: body_callout_drift_recovery_failed for $repo#$issue_num" >&2
-            fi
-            rm -f "$tmpfile"
-            return 0
-        fi
-        # Push the recovery commit so SHA is reachable from origin.
-        # On push failure, fall through to approach (b) — a locally-valid
-        # but remotely-unreachable SHA is the same fabrication class we're fixing.
-        local push_err
-        push_err=$(mktemp /tmp/push-err-XXXXXX)
-        if ! git -C "$worktree_dir" push origin "$branch" 2>"$push_err"; then
-            echo "WARN: post_flight_class_d_push_failed for $repo#$issue_num — falling back to uncommitted callout" >&2
-            cat "$push_err" >&2
-            rm -f "$push_err"
-            # Commit succeeded but push failed — SHA is local-only.
-            # Fall through to approach (b).
-            local callout_block
-            callout_block=$(cat <<CALLOUT_EOF
-> - **Branch:** \`${branch}\`
-> - **Plan:** \`${plan_relpath}\` (committed locally, push failed — see worktree)
-> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
-CALLOUT_EOF
-            )
-            local new_body
-            new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
-            local tmpfile
-            tmpfile=$(mktemp /tmp/body-callout-recover-XXXXXX.md)
-            printf '%s' "$new_body" > "$tmpfile"
-            if gh issue edit "$issue_num" --repo "senara-solutions/$repo" \
-                --body-file "$tmpfile" 2>/dev/null; then
-                echo "body_callout_drift_recovered: wrote LOCAL-ONLY callout to $repo#$issue_num (committed but push failed)" >&2
-            else
-                echo "WARN: body_callout_drift_recovery_failed for $repo#$issue_num" >&2
-            fi
-            rm -f "$tmpfile"
-            return 0
-        fi
-        rm -f "$push_err"
-    fi
-
-    local head_sha
-    head_sha=$(git -C "$worktree_dir" rev-parse --short HEAD 2>/dev/null)
-
-    # 4. Construct recovery callout.
-    #    IMPORTANT: The grooming-history line does NOT contain "second-pass (GROOMED)"
-    #    because we cannot verify the architect actually issued that verdict from
-    #    branch state alone. This callout surfaces the drift for operator visibility
-    #    but does NOT pass the dispatch gate — the operator must verify and dispatch
-    #    manually (or re-run dev-groom which will write the organic callout).
-    local callout_block
-    callout_block=$(cat <<CALLOUT_EOF
-> - **Branch:** \`${branch}\`
-> - **Plan:** \`${plan_relpath}\` (committed on branch @ \`${head_sha}\`)
-> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
-CALLOUT_EOF
-    )
-
-    # 5. Prepend callout to existing body and write
-    local new_body
-    new_body=$(printf '%s\n\n%s' "$callout_block" "$current_body")
-    local tmpfile
-    tmpfile=$(mktemp /tmp/body-callout-recover-XXXXXX.md)
-    printf '%s' "$new_body" > "$tmpfile"
-
-    if gh issue edit "$issue_num" --repo "senara-solutions/$repo" \
-        --body-file "$tmpfile" 2>/dev/null; then
-        echo "body_callout_drift_recovered: wrote missing callout to $repo#$issue_num (verdict NOT fabricated — operator dispatch required)" >&2
-    else
-        echo "WARN: body_callout_drift_recovery_failed for $repo#$issue_num" >&2
-    fi
-    rm -f "$tmpfile"
-}
 
 _setup_gh_auth() {
     # Suppress xtrace to prevent PAT from appearing in trace logs (mika#903).
@@ -606,14 +456,6 @@ ${RESULT}"
             fi
         fi
 
-        # Post-flight body-callout verification (mika#1123): detect dev-groom drift
-        # where the plan is committed and pushed but the issue body never received the
-        # canonical callout block. If missing, write a recovery callout that surfaces
-        # the drift without fabricating an architect verdict.
-        if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] && [ -n "$REPO" ] && [ -n "$ISSUE_NUM" ]; then
-            _verify_and_write_body_callout "$REPO" "$ISSUE_NUM" "$WORKTREE_DIR" "$BRANCH"
-        fi
-
         # Issue #138: Discover actual PR URL from the branch
         PR_URL=""
         if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
@@ -720,8 +562,8 @@ _push_branch() {
         [ "${ahead:-0}" -eq 0 ] && return 0
     fi
     # First-push case (no origin/$BRANCH ref) — always push.
-    # Class D push at line 250, if it ran, already updated origin/$BRANCH; the
-    # existing-remote branch above would catch that case with ahead=0 and return.
+    # (Sub-PR 7b retired the Class D recovery shim's first-push path;
+    # this helper is now the sole git-push site for dev-groom dispatches.)
 
     # Push with upstream tracking (-u sets upstream on first push).
     local push_err
@@ -929,15 +771,18 @@ _write_canonical_callout() {
     # _iterate_groom_loop on GROOMED success. Prepends the canonical 3-line
     # callout block to the issue body so downstream dispatch gates (Pin B /
     # check_grooming_markers in executor.rs) pass with a verified architect
-    # verdict — distinct from _verify_and_write_body_callout (mika#1123) which
-    # writes a RECOVERY callout that explicitly does NOT carry a GROOMED marker.
+    # verdict.
+    #
+    # Sole structural writer as of sub-PR 7b: the Class D recovery shim
+    # (_verify_and_write_body_callout, mika#1123) and its post-flight call site
+    # in _run_claude_pilot were retired now that the iterate loop's architect
+    # convergence provides the verified verdict directly.
     #
     # Idempotent: if all three dispatch-gate signals are already in the body
     # (branch line + plan path + second-pass GROOMED marker), skip writing.
-    # This honors the dual-write doc on _verify_and_write_body_callout — the
-    # organic LLM writer (dev-groom step 18) may have already done it under
-    # the existing pilot-owns-architect flow that this state machine is
-    # progressively replacing. Sub-PR 7 retires the organic writer.
+    # The organic LLM writer in the dev-groom skill prompt may still emit a
+    # callout until the dev-groom-prompt-update follow-up ships; the
+    # idempotency check absorbs that overlap cleanly.
     #
     # Args:
     #   $1: stage label — "ready-to-groomed" | "iterate-to-groomed"
@@ -983,7 +828,8 @@ _write_canonical_callout() {
         return 1
     }
 
-    # Same three-signal check as _verify_and_write_body_callout (mika#1123).
+    # Same three-signal check the dispatch gate uses in
+    # executor.rs::check_grooming_markers (Pin B).
     local has_branch has_plan has_verdict
     has_branch=$(printf '%s' "$current_body" | grep -cF '> - **Branch:**' || true)
     has_plan=$(printf '%s' "$current_body" | grep -cF 'docs/plans/' || true)
@@ -1037,20 +883,23 @@ _iterate_groom_loop() {
     # at the end of the success branch. ESCALATE paths PRESERVE findings for
     # operator forensic access (worktree TTL handles eventual sweep).
     #
-    # Always-on for the dev-groom skill as of sub-PR 7a. Non-zero return means
-    # the loop did not converge — caller continues to downstream Class D recovery
-    # (mika#1123) until sub-PR 7b retires the shim.
+    # Always-on for the dev-groom skill. As of sub-PR 7b the Class D recovery
+    # shim is retired; non-zero return from this loop means the dispatch gate
+    # may not be satisfied by a canonical writer block on this run, but the
+    # pilot's organic write in the dev-groom skill prompt remains a fallback
+    # until the dev-groom-prompt-update follow-up ships.
     #
     # Guards: requires WORKTREE_DIR, ISSUE_NUM, REPO; finds the plan file via
-    # the same issue-scoped pattern Class D uses. Returns 1 if any guard fails.
+    # issue-scoped pattern (`docs/plans/*-${ISSUE_NUM}-*-plan.md`, >500c).
+    # Returns 1 if any guard fails.
 
     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || {
         echo "WARN: iterate_groom_loop: WORKTREE_DIR unset or missing" >&2; return 1; }
     [ -n "$ISSUE_NUM" ] && [ -n "$REPO" ] || {
         echo "WARN: iterate_groom_loop: ISSUE_NUM or REPO unset" >&2; return 1; }
 
-    # Find the plan file. Same pattern as _verify_and_write_body_callout —
-    # issue-scoped, >500 byte (mika#1033), most-recent first.
+    # Find the plan file: issue-scoped (mika#1144), >500 byte (mika#1033),
+    # most-recent first.
     local plan_path
     plan_path=$(find "$WORKTREE_DIR/docs/plans" -name "*-${ISSUE_NUM}-*-plan.md" -size +500c \
         2>/dev/null | sort -r | head -1)
@@ -1089,7 +938,7 @@ _iterate_groom_loop() {
                 GROOMED)
                     echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
                     _write_canonical_callout "ready-to-groomed" "$session_id" || \
-                        echo "info: canonical callout write non-fatal failure — Class D recovery (mika#1123) still runs downstream" >&2
+                        echo "info: canonical callout write non-fatal failure — pilot's organic write in dev-groom skill prompt remains as fallback until prompt-update follow-up ships" >&2
                     _cleanup_iterate_findings
                     return 0
                     ;;
@@ -1138,7 +987,7 @@ _iterate_groom_loop() {
                 GROOMED)
                     echo "iterate_groom_loop: revised plan converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
                     _write_canonical_callout "iterate-to-groomed" "$session_id" || \
-                        echo "info: canonical callout write non-fatal failure — Class D recovery (mika#1123) still runs downstream" >&2
+                        echo "info: canonical callout write non-fatal failure — pilot's organic write in dev-groom skill prompt remains as fallback until prompt-update follow-up ships" >&2
                     _cleanup_iterate_findings
                     return 0
                     ;;
@@ -1324,16 +1173,19 @@ EOF
     _handle_dry_run
     _run_claude_pilot "$ENTRY_COMMAND"
 
-    # mika#1271 — iterate-loop state machine (always-on for dev-groom as of sub-PR 7a).
+    # mika#1271 — iterate-loop state machine (always-on for dev-groom).
     # Invokes mika-arch first-pass on the plan-on-branch, then second-pass on READY
     # or ITERATE-then-revise; on GROOMED writes the canonical body callout via
     # _write_canonical_callout (idempotent vs. the pilot's organic write); on ESCALATE
-    # appends a structured PIPELINE FAILURE marker to RESULT. Non-zero return means
-    # the loop did NOT converge — the downstream Class D recovery shim (mika#1123)
-    # inside _run_claude_pilot still catches drift cases as defense-in-depth until
-    # sub-PR 7b retires it. See docs/plans/2026-05-25-008-feat-1271-flag-removal-plan.md.
+    # appends a structured PIPELINE FAILURE marker to RESULT.
+    #
+    # As of sub-PR 7b the Class D recovery shim is retired — dispatch-lib's
+    # iterate loop + canonical writer is the sole structural authority for the
+    # body callout. The pilot's organic write in the dev-groom skill prompt
+    # remains as a fallback until the dev-groom-prompt-update follow-up
+    # ships. See docs/plans/2026-05-25-009-feat-1271-class-d-shim-retire-plan.md.
     if [ "$SKILL" = "dev-groom" ]; then
-        _iterate_groom_loop || echo "info: iterate_groom_loop did not converge — Class D recovery (mika#1123) downstream catches drift" >&2
+        _iterate_groom_loop || echo "info: iterate_groom_loop did not converge — pilot's organic write remains as fallback (dev-groom skill prompt)" >&2
     fi
 
     _push_branch
