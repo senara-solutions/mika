@@ -762,7 +762,7 @@ _arch_ask() {
     [ -n "$skill" ] && [ -n "$plan_path" ] || { echo "_arch_ask: missing skill or plan_path" >&2; return 2; }
     [ -r "$plan_path" ] || { echo "_arch_ask: plan_path not readable: $plan_path" >&2; return 2; }
 
-    local args=( ask --agent mika-arch --format json --verbose --skill "$skill" )
+    local args=( ask --agent mika-arch --format json --verbose --enable-skill "$skill" )
     [ -n "$session_id" ] && args+=( --session-id "$session_id" )
     args+=( "@${plan_path}" )
 
@@ -813,6 +813,89 @@ _trail_read() {
     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
     local trail_file="$WORKTREE_DIR/.claude/groom-verdict-trail.log"
     [ -r "$trail_file" ] && cat "$trail_file"
+}
+
+_iterate_groom_loop() {
+    # Phase D — the iterate-loop state machine (mika#1271 v1 cut).
+    #
+    # Invokes mika-arch first-pass on the plan-on-branch, then on Disposition:
+    # READY proceeds to second-pass. On Verdict: GROOMED returns 0 (success).
+    # All other paths return non-zero (caller falls through to existing flow).
+    #
+    # v1 scope: READY → second-pass → GROOMED finalize ONLY. ITERATE rounds
+    # and ESCALATE handling are out-of-v1; both emit WARN and return non-zero
+    # so the existing pilot-owns-architect path can still produce the canonical
+    # body callout via the Class D shim. See
+    # docs/plans/2026-05-25-004-feat-1271-iterate-loop-state-machine-wire-plan.md.
+    #
+    # Guards: requires WORKTREE_DIR, ISSUE_NUM, REPO; finds the plan file via
+    # the same issue-scoped pattern Class D uses. Returns 1 if any guard fails.
+
+    [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || {
+        echo "WARN: iterate_groom_loop: WORKTREE_DIR unset or missing" >&2; return 1; }
+    [ -n "$ISSUE_NUM" ] && [ -n "$REPO" ] || {
+        echo "WARN: iterate_groom_loop: ISSUE_NUM or REPO unset" >&2; return 1; }
+
+    # Find the plan file. Same pattern as _verify_and_write_body_callout —
+    # issue-scoped, >500 byte (mika#1033), most-recent first.
+    local plan_path
+    plan_path=$(find "$WORKTREE_DIR/docs/plans" -name "*-${ISSUE_NUM}-*-plan.md" -size +500c \
+        2>/dev/null | sort -r | head -1)
+    [ -n "$plan_path" ] && [ -r "$plan_path" ] || {
+        echo "WARN: iterate_groom_loop: no issue-scoped plan file for $REPO#$ISSUE_NUM" >&2
+        return 1
+    }
+
+    echo "iterate_groom_loop: invoking mika-arch first-pass on $(basename "$plan_path")" >&2
+
+    # Phase 1 — first-pass
+    local resp1; resp1=$(_arch_ask "mika-arch-groom-ticket" "$plan_path" 2>/dev/null) || {
+        echo "WARN: iterate_groom_loop: first-pass _arch_ask failed" >&2; return 1; }
+    local content1; content1=$(printf '%s' "$resp1" | jq -r '.content // empty' 2>/dev/null)
+    local session_id; session_id=$(printf '%s' "$resp1" | jq -r '.metadata.session_id // empty' 2>/dev/null)
+    [ -n "$content1" ] && [ -n "$session_id" ] || {
+        echo "WARN: iterate_groom_loop: first-pass response missing .content or .metadata.session_id" >&2
+        return 1
+    }
+    local disposition; disposition=$(printf '%s' "$content1" | _parse_disposition)
+    _trail_append "groom-ticket" "$session_id" "${disposition:-UNPARSED}"
+
+    case "$disposition" in
+        READY)
+            echo "iterate_groom_loop: first-pass READY; invoking mika-arch second-pass" >&2
+            # Phase 2 — second-pass, continuing the architect session
+            local resp2; resp2=$(_arch_ask "mika-arch-second-review" "$plan_path" "$session_id" 2>/dev/null) || {
+                echo "WARN: iterate_groom_loop: second-pass _arch_ask failed" >&2; return 1; }
+            local content2; content2=$(printf '%s' "$resp2" | jq -r '.content // empty' 2>/dev/null)
+            [ -n "$content2" ] || {
+                echo "WARN: iterate_groom_loop: second-pass response missing .content" >&2; return 1; }
+            local verdict; verdict=$(printf '%s' "$content2" | _parse_verdict)
+            _trail_append "second-review" "$session_id" "${verdict:-UNPARSED}"
+
+            case "$verdict" in
+                GROOMED)
+                    echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    return 0
+                    ;;
+                *)
+                    echo "WARN: iterate_groom_loop: second-pass returned ${verdict:-UNPARSED} for $REPO#$ISSUE_NUM" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        ITERATE)
+            echo "WARN: iterate_groom_loop: first-pass ITERATE — revise-payload relaunch is out-of-v1 (mika#1271 follow-up)" >&2
+            return 1
+            ;;
+        ESCALATE)
+            echo "WARN: iterate_groom_loop: first-pass ESCALATE for $REPO#$ISSUE_NUM" >&2
+            return 1
+            ;;
+        *)
+            echo "WARN: iterate_groom_loop: first-pass disposition unparsed (literal Disposition: line absent or paraphrased — see mika#1272)" >&2
+            return 1
+            ;;
+    esac
 }
 
 _deliver_callback() {
@@ -979,6 +1062,16 @@ EOF
     _detect_plan_on_branch
     _handle_dry_run
     _run_claude_pilot "$ENTRY_COMMAND"
+
+    # mika#1271 — iterate-loop state machine (v1 cut, READY → second-pass → GROOMED only).
+    # Gated by MIKA_DISPATCH_USE_ITERATE_LOOP=1. Default unset (existing pilot-owns-architect
+    # path remains authoritative). On success the existing Class D body-callout shim still
+    # writes the canonical callout downstream — the state machine validates the architect
+    # convergence; the callout write retires in a follow-up sub-PR.
+    if [ "$SKILL" = "dev-groom" ] && [ "${MIKA_DISPATCH_USE_ITERATE_LOOP:-0}" = "1" ]; then
+        _iterate_groom_loop || echo "info: iterate_groom_loop did not converge — falling through to existing path" >&2
+    fi
+
     _push_branch
     _deliver_callback
 }

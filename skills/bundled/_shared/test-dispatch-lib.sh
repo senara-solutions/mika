@@ -549,6 +549,75 @@ assert_eq "_arch_ask rejects missing plan_path" "2" \
 assert_eq "_arch_ask rejects unreadable plan_path" "2" \
     "$(_arch_ask "mika-arch-groom-ticket" "/nonexistent/path" 2>/dev/null; echo $?)"
 
+# _arch_ask — argv construction (stub `mika` to capture the args it receives).
+# This catches the --skill vs --enable-skill flag-name bug that was in PR#1274.
+# Argv is joined with `|` so we can grep substrings; needles are prefixed with
+# `|` to avoid grep treating `--`-leading strings as flags.
+ARCH_PLAN_TMP=$(mktemp /tmp/arch-plan-XXXXXX.md)
+printf 'plan content for arch ask test\n' > "$ARCH_PLAN_TMP"
+mika() { printf '|%s' "$@"; printf '|'; }  # leading | so first arg also has separator
+ARCH_ARGV=$(_arch_ask "mika-arch-groom-ticket" "$ARCH_PLAN_TMP")
+assert_contains "_arch_ask uses enable-skill flag (not the wrong skill flag)" "|--enable-skill|" "$ARCH_ARGV"
+assert_contains "_arch_ask threads skill name after enable-skill" "|--enable-skill|mika-arch-groom-ticket|" "$ARCH_ARGV"
+assert_contains "_arch_ask sets agent mika-arch" "|--agent|mika-arch|" "$ARCH_ARGV"
+assert_contains "_arch_ask sets format json" "|--format|json|" "$ARCH_ARGV"
+assert_contains "_arch_ask sets verbose flag" "|--verbose|" "$ARCH_ARGV"
+assert_contains "_arch_ask passes @-file body" "|@${ARCH_PLAN_TMP}|" "$ARCH_ARGV"
+assert_not_contains "_arch_ask omits session-id when not given" "|--session-id|" "$ARCH_ARGV"
+
+ARCH_ARGV_WITH_SESSION=$(_arch_ask "mika-arch-second-review" "$ARCH_PLAN_TMP" "session-xyz")
+assert_contains "_arch_ask threads session-id when given" "|--session-id|session-xyz|" "$ARCH_ARGV_WITH_SESSION"
+assert_contains "_arch_ask passes @-file with session-id" "|@${ARCH_PLAN_TMP}|" "$ARCH_ARGV_WITH_SESSION"
+
+unset -f mika
+rm -f "$ARCH_PLAN_TMP"
+
+# _iterate_groom_loop — guard rejects missing worktree/issue
+assert_eq "_iterate_groom_loop fails when WORKTREE_DIR unset" "1" \
+    "$(WORKTREE_DIR="" ISSUE_NUM="1267" REPO="mika" _iterate_groom_loop 2>/dev/null; echo $?)"
+assert_eq "_iterate_groom_loop fails when ISSUE_NUM unset" "1" \
+    "$(WORKTREE_DIR="/tmp" ISSUE_NUM="" REPO="mika" _iterate_groom_loop 2>/dev/null; echo $?)"
+assert_eq "_iterate_groom_loop fails when REPO unset" "1" \
+    "$(WORKTREE_DIR="/tmp" ISSUE_NUM="1267" REPO="" _iterate_groom_loop 2>/dev/null; echo $?)"
+
+# _iterate_groom_loop — guard rejects when no plan file present
+ITERATE_TMP=$(mktemp -d)
+mkdir -p "$ITERATE_TMP/docs/plans"
+assert_eq "_iterate_groom_loop fails when no plan file present" "1" \
+    "$(WORKTREE_DIR="$ITERATE_TMP" ISSUE_NUM="1267" REPO="mika" _iterate_groom_loop 2>/dev/null; echo $?)"
+rm -rf "$ITERATE_TMP"
+
+# Code-shape inspection: the function references the three required disposition
+# values and the second-pass GROOMED verdict (three load-bearing flows wired).
+ITERATE_FUNC=$(declare -f _iterate_groom_loop)
+assert_contains "_iterate_groom_loop dispatches on READY" "READY)" "$ITERATE_FUNC"
+assert_contains "_iterate_groom_loop dispatches on ITERATE" "ITERATE)" "$ITERATE_FUNC"
+assert_contains "_iterate_groom_loop dispatches on ESCALATE" "ESCALATE)" "$ITERATE_FUNC"
+assert_contains "_iterate_groom_loop checks GROOMED on second pass" "GROOMED)" "$ITERATE_FUNC"
+assert_contains "_iterate_groom_loop invokes mika-arch-groom-ticket" "mika-arch-groom-ticket" "$ITERATE_FUNC"
+assert_contains "_iterate_groom_loop invokes mika-arch-second-review" "mika-arch-second-review" "$ITERATE_FUNC"
+assert_contains "_iterate_groom_loop threads session_id to second pass" 'mika-arch-second-review' "$ITERATE_FUNC"
+
+# Wiring point inspection on dispatch_claude_pilot
+DISPATCH_FUNC=$(declare -f dispatch_claude_pilot)
+assert_contains "dispatch_claude_pilot reads MIKA_DISPATCH_USE_ITERATE_LOOP flag" "MIKA_DISPATCH_USE_ITERATE_LOOP" "$DISPATCH_FUNC"
+assert_contains "dispatch_claude_pilot guards iterate-loop on dev-groom skill" "dev-groom" "$DISPATCH_FUNC"
+assert_contains "dispatch_claude_pilot calls _iterate_groom_loop" "_iterate_groom_loop" "$DISPATCH_FUNC"
+
+# Ordering check: iterate-loop runs AFTER _run_claude_pilot and BEFORE _push_branch.
+# Use grep -n on declare-f output; pick first occurrence of each.
+DISPATCH_ORDER=$(printf '%s\n' "$DISPATCH_FUNC" | grep -nE "_run_claude_pilot|_iterate_groom_loop|_push_branch" | head -10)
+RUN_LINE=$(echo "$DISPATCH_ORDER" | grep _run_claude_pilot | head -1 | cut -d: -f1)
+ITERATE_LINE=$(echo "$DISPATCH_ORDER" | grep _iterate_groom_loop | head -1 | cut -d: -f1)
+PUSH_LINE=$(echo "$DISPATCH_ORDER" | grep _push_branch | head -1 | cut -d: -f1)
+if [ -n "$RUN_LINE" ] && [ -n "$ITERATE_LINE" ] && [ -n "$PUSH_LINE" ] && \
+   [ "$RUN_LINE" -lt "$ITERATE_LINE" ] && [ "$ITERATE_LINE" -lt "$PUSH_LINE" ]; then
+    assert_eq "dispatch ordering: _run_claude_pilot → _iterate_groom_loop → _push_branch" "ok" "ok"
+else
+    assert_eq "dispatch ordering: _run_claude_pilot → _iterate_groom_loop → _push_branch" "ok" \
+        "run=${RUN_LINE:-missing} iterate=${ITERATE_LINE:-missing} push=${PUSH_LINE:-missing}"
+fi
+
 # --- Summary ---
 
 echo ""
