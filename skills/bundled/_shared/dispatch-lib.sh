@@ -815,6 +815,83 @@ _trail_read() {
     [ -r "$trail_file" ] && cat "$trail_file"
 }
 
+_launch_revise_pilot() {
+    # Phase D companion (mika#1271) — launch claude-pilot for content-only plan
+    # revision against architect findings. Entry command: /mika-revise-plan
+    # (slash command at mika-platform/.claude/commands/mika-revise-plan.md,
+    # copied into the worktree by _set_up_worktree at task start).
+    #
+    # The pilot reads findings, revises the plan on disk in-place, exits. We
+    # detect revision via sha256 of the plan file before-and-after. Identical
+    # content = "no revision happened" = caller falls through.
+    #
+    # Args: $1 = absolute path to findings file
+    # Returns: 0 if plan content changed, 1 otherwise (missing args, no plan
+    #          found, pilot failed to revise).
+
+    local findings_file="$1"
+    [ -r "$findings_file" ] || {
+        echo "WARN: _launch_revise_pilot: findings file not readable: $findings_file" >&2
+        return 1
+    }
+    [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || {
+        echo "WARN: _launch_revise_pilot: WORKTREE_DIR missing" >&2; return 1; }
+    [ -n "$ISSUE_NUM" ] || {
+        echo "WARN: _launch_revise_pilot: ISSUE_NUM unset" >&2; return 1; }
+
+    # Find the plan file using the same issue-scoped pattern as elsewhere
+    # in dispatch-lib (mika#1033 >500-byte filter, most-recent first).
+    local plan_path
+    plan_path=$(find "$WORKTREE_DIR/docs/plans" -name "*-${ISSUE_NUM}-*-plan.md" -size +500c \
+        2>/dev/null | sort -r | head -1)
+    [ -n "$plan_path" ] && [ -r "$plan_path" ] || {
+        echo "WARN: _launch_revise_pilot: no plan file to revise" >&2; return 1; }
+
+    # sha256 before revise (detection mechanism; mtime is too coarse).
+    local pre_hash; pre_hash=$(sha256sum "$plan_path" | cut -d' ' -f1)
+
+    # Distinct sub-session log id for the revise pilot.
+    local revise_log_id="${LOG_ID}-revise-$(date +%s)"
+    local revise_stdout; revise_stdout=$(mktemp /tmp/revise-stdout-XXXXXX)
+    local revise_stderr; revise_stderr=$(mktemp /tmp/revise-stderr-XXXXXX)
+
+    echo "_launch_revise_pilot: launching (log $revise_log_id) for $REPO#$ISSUE_NUM with $(basename "$findings_file")" >&2
+    set +e
+    # CWD_ARGS is intentionally word-split (multiple flags)
+    # shellcheck disable=SC2086
+    claude-pilot --verbose --log-dir --task-id "$revise_log_id" \
+        --command "/mika-revise-plan" $CWD_ARGS \
+        -- "@${findings_file}" \
+        >"$revise_stdout" 2>"$revise_stderr"
+    local revise_exit=$?
+    set -e
+
+    # sha256 after revise
+    local post_hash; post_hash=$(sha256sum "$plan_path" | cut -d' ' -f1)
+    rm -f "$revise_stdout" "$revise_stderr"
+
+    if [ "$pre_hash" != "$post_hash" ]; then
+        echo "_launch_revise_pilot: plan revised (sha changed from ${pre_hash:0:12} to ${post_hash:0:12})" >&2
+        return 0
+    else
+        echo "WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)" >&2
+        return 1
+    fi
+}
+
+_cleanup_iterate_findings() {
+    # Sweep $WORKTREE_DIR/.iterate/ on GROOMED success. PRESERVE on ESCALATE
+    # for forensic access — the worktree TTL handles eventual cleanup, and the
+    # findings file is the operator's primary forensic artifact when deciding
+    # whether to retry, refactor, or kill the plan. Sweeping it on ESCALATE
+    # deletes the evidence at exactly the moment it's most useful.
+    [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
+    local findings_dir="$WORKTREE_DIR/.iterate"
+    [ -d "$findings_dir" ] || return 0
+    rm -rf "$findings_dir" 2>/dev/null || true
+    echo "_cleanup_iterate_findings: swept $findings_dir on GROOMED" >&2
+}
+
 _iterate_groom_loop() {
     # Phase D — the iterate-loop state machine (mika#1271 v1 cut).
     #
@@ -875,6 +952,7 @@ _iterate_groom_loop() {
             case "$verdict" in
                 GROOMED)
                     echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    _cleanup_iterate_findings
                     return 0
                     ;;
                 *)
@@ -884,8 +962,51 @@ _iterate_groom_loop() {
             esac
             ;;
         ITERATE)
-            echo "WARN: iterate_groom_loop: first-pass ITERATE — revise-payload relaunch is out-of-v1 (mika#1271 follow-up)" >&2
-            return 1
+            echo "iterate_groom_loop: first-pass ITERATE — launching revise pilot with findings" >&2
+            # Write architect findings to a tempfile in $WORKTREE_DIR/.iterate/
+            # (out-of-namespace from .claude/ to avoid collision with the
+            # slash-command snapshot that _set_up_worktree copies in).
+            local findings_dir="$WORKTREE_DIR/.iterate"
+            mkdir -p "$findings_dir" 2>/dev/null || {
+                echo "WARN: iterate_groom_loop: cannot create $findings_dir" >&2; return 1; }
+            local findings_file="$findings_dir/findings-1.md"
+            printf '%s\n' "$content1" > "$findings_file" || {
+                echo "WARN: iterate_groom_loop: cannot write $findings_file" >&2; return 1; }
+
+            # Launch revise pilot with the findings as @-file payload. Pilot
+            # revises plan on disk; we detect via sha256.
+            _launch_revise_pilot "$findings_file" || {
+                echo "WARN: iterate_groom_loop: revise pilot did not converge — preserving $findings_file for forensics" >&2
+                return 1
+            }
+
+            # Plan revised. Invoke mika-arch second-pass on the revised plan,
+            # continuing the architect session so findings stay in conversation
+            # memory (per mika-arch-second-review session-continuity contract).
+            echo "iterate_groom_loop: invoking mika-arch second-pass on revised plan" >&2
+            local resp2_iter; resp2_iter=$(_arch_ask "mika-arch-second-review" "$plan_path" "$session_id" 2>/dev/null) || {
+                echo "WARN: iterate_groom_loop: second-pass _arch_ask failed (after revise)" >&2
+                return 1
+            }
+            local content2_iter; content2_iter=$(printf '%s' "$resp2_iter" | jq -r '.content // empty' 2>/dev/null)
+            [ -n "$content2_iter" ] || {
+                echo "WARN: iterate_groom_loop: second-pass response missing .content (after revise)" >&2
+                return 1
+            }
+            local verdict_iter; verdict_iter=$(printf '%s' "$content2_iter" | _parse_verdict)
+            _trail_append "second-review" "$session_id" "${verdict_iter:-UNPARSED}"
+
+            case "$verdict_iter" in
+                GROOMED)
+                    echo "iterate_groom_loop: revised plan converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    _cleanup_iterate_findings
+                    return 0
+                    ;;
+                *)
+                    echo "WARN: iterate_groom_loop: second-pass after revise returned ${verdict_iter:-UNPARSED} — preserving findings for forensics" >&2
+                    return 1
+                    ;;
+            esac
             ;;
         ESCALATE)
             echo "WARN: iterate_groom_loop: first-pass ESCALATE for $REPO#$ISSUE_NUM" >&2

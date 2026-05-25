@@ -618,6 +618,72 @@ else
         "run=${RUN_LINE:-missing} iterate=${ITERATE_LINE:-missing} push=${PUSH_LINE:-missing}"
 fi
 
+# ============================================================================
+# ITERATE flow primitives (mika#1271 sub-PR 4)
+# ============================================================================
+
+echo ""
+echo "Test: ITERATE-flow primitives (mika#1271 sub-PR 4)"
+echo "--------------------------------------------------"
+
+# _launch_revise_pilot — guard rejections
+assert_eq "_launch_revise_pilot rejects unreadable findings file" "1" \
+    "$(WORKTREE_DIR="/tmp" ISSUE_NUM="1267" _launch_revise_pilot "/nonexistent/findings.md" 2>/dev/null; echo $?)"
+REV_TMP_GUARD=$(mktemp)
+echo "findings" > "$REV_TMP_GUARD"
+assert_eq "_launch_revise_pilot rejects missing WORKTREE_DIR" "1" \
+    "$(WORKTREE_DIR="" ISSUE_NUM="1267" _launch_revise_pilot "$REV_TMP_GUARD" 2>/dev/null; echo $?)"
+assert_eq "_launch_revise_pilot rejects missing ISSUE_NUM" "1" \
+    "$(WORKTREE_DIR="/tmp" ISSUE_NUM="" _launch_revise_pilot "$REV_TMP_GUARD" 2>/dev/null; echo $?)"
+REV_DIR_GUARD=$(mktemp -d)
+mkdir -p "$REV_DIR_GUARD/docs/plans"
+assert_eq "_launch_revise_pilot rejects when no plan file present" "1" \
+    "$(WORKTREE_DIR="$REV_DIR_GUARD" ISSUE_NUM="9999" _launch_revise_pilot "$REV_TMP_GUARD" 2>/dev/null; echo $?)"
+rm -rf "$REV_TMP_GUARD" "$REV_DIR_GUARD"
+
+# Code-shape: _launch_revise_pilot
+REVISE_FUNC=$(declare -f _launch_revise_pilot)
+assert_contains "_launch_revise_pilot invokes /mika-revise-plan slash command" "/mika-revise-plan" "$REVISE_FUNC"
+assert_contains "_launch_revise_pilot uses sha256 detection (not mtime)" "sha256sum" "$REVISE_FUNC"
+assert_contains "_launch_revise_pilot passes findings via @-file" '@${findings_file}' "$REVISE_FUNC"
+
+# _cleanup_iterate_findings — no-op when .iterate/ absent
+CLEAN_TMP=$(mktemp -d)
+assert_eq "_cleanup_iterate_findings no-op when .iterate/ absent" "0" \
+    "$(WORKTREE_DIR="$CLEAN_TMP" _cleanup_iterate_findings 2>/dev/null; echo $?)"
+
+# _cleanup_iterate_findings — sweeps .iterate/ when present
+mkdir -p "$CLEAN_TMP/.iterate"
+echo "findings" > "$CLEAN_TMP/.iterate/findings-1.md"
+WORKTREE_DIR="$CLEAN_TMP" _cleanup_iterate_findings 2>/dev/null
+if [ ! -d "$CLEAN_TMP/.iterate" ]; then
+    assert_eq "_cleanup_iterate_findings sweeps .iterate/ when present" "removed" "removed"
+else
+    assert_eq "_cleanup_iterate_findings sweeps .iterate/ when present" "removed" "still present"
+fi
+rm -rf "$CLEAN_TMP"
+
+# _cleanup_iterate_findings — guard: WORKTREE_DIR unset → no-op
+assert_eq "_cleanup_iterate_findings no-op when WORKTREE_DIR unset" "0" \
+    "$(WORKTREE_DIR="" _cleanup_iterate_findings 2>/dev/null; echo $?)"
+
+# Code-shape inspection: ITERATE branch in _iterate_groom_loop
+ITERATE_FULL=$(declare -f _iterate_groom_loop)
+assert_contains "ITERATE branch calls _launch_revise_pilot" "_launch_revise_pilot" "$ITERATE_FULL"
+assert_contains "ITERATE branch writes findings to .iterate/" ".iterate" "$ITERATE_FULL"
+assert_contains "ITERATE branch invokes second-pass after revise" "mika-arch-second-review" "$ITERATE_FULL"
+
+# Cleanup symmetry: GROOMED paths sweep findings; ESCALATE/failure preserve.
+# Two GROOMED paths (READY+ITERATE) each call _cleanup_iterate_findings; ESCALATE
+# paths must NOT call it. Expect exactly 2 references.
+SWEEP_COUNT=$(printf '%s\n' "$ITERATE_FULL" | grep -c '_cleanup_iterate_findings')
+assert_eq "_iterate_groom_loop calls _cleanup_iterate_findings on both GROOMED paths" "2" "$SWEEP_COUNT"
+
+# Session-id symmetry: second-pass invoked on both READY and ITERATE branches,
+# both threading session_id from first-pass response.
+SECOND_PASS_COUNT=$(printf '%s\n' "$ITERATE_FULL" | grep -c 'mika-arch-second-review')
+assert_eq "_iterate_groom_loop invokes second-pass twice (READY + ITERATE)" "2" "$SECOND_PASS_COUNT"
+
 # --- Summary ---
 
 echo ""
