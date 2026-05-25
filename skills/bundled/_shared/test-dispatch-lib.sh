@@ -259,40 +259,6 @@ assert_eq "Multiple callouts: first one wins" "docs/plans/first.md" "$EXTRACTED4
 DRY_RUN_JQ=$(sed -n '/_handle_dry_run()/,/^}/p' "$DISPATCH_LIB")
 assert_contains "Dry run output includes entry_command" 'entry_command' "$DRY_RUN_JQ"
 
-# --- Test 8: Recovery shim fallback removed (mika#1144) ---
-
-echo ""
-echo "Test 8: _verify_and_write_body_callout has no unscoped fallback"
-echo "-----------------------------------------------------------------"
-
-VERIFY_FUNC=$(sed -n '/_verify_and_write_body_callout()/,/^}/p' "$DISPATCH_LIB")
-
-# Assertion 1 (POSITIVE — F2 paired-test discipline): the issue-scoped find is
-# retained. If a refactor accidentally removes BOTH finds, this assertion fires.
-SCOPED_FIND_COUNT=$(printf '%s\n' "$VERIFY_FUNC" \
-    | grep -cE 'find.*-name *"\*-\$\{issue_num\}-\*-plan\.md"' || true)
-assert_eq "Issue-scoped find call retained" "1" "$SCOPED_FIND_COUNT"
-
-# Assertion 2 (NEGATIVE — the core mika#1144 regression guard): the unscoped
-# fallback find is gone. Detection shape: an assignment to plan_file with a
-# `find ... -name "*-plan.md"` glob that does NOT contain `${issue_num}`.
-# The scoped find above DOES contain `${issue_num}` and is filtered out by the
-# `grep -v issue_num` step.
-UNSCOPED_FALLBACK_COUNT=$(printf '%s\n' "$VERIFY_FUNC" \
-    | grep -E 'plan_file=.*find.*-name *"\*-plan\.md"' \
-    | grep -vc 'issue_num' || true)
-assert_eq "No unscoped fallback find call (mika#1144 strip)" "0" "$UNSCOPED_FALLBACK_COUNT"
-
-# Assertion 3: the new stderr log key is present (signals the skip path is
-# explicit, not silent).
-assert_contains "Skipped-recovery stderr log present" \
-    'body_callout_drift_recovery_skipped' "$VERIFY_FUNC"
-
-# Assertion 4: the function still has the early-return guard after the
-# issue-scoped find — no plan file → return 0, now with a log line on stderr.
-SKIP_BLOCK=$(printf '%s\n' "$VERIFY_FUNC" | sed -n '/if \[ -z "\$plan_file" \]/,/^[[:space:]]*fi$/p' | head -10)
-assert_contains "Skip block returns 0" "return 0" "$SKIP_BLOCK"
-assert_contains "Skip block logs to stderr" '>&2' "$SKIP_BLOCK"
 
 # --- Test 9: claude-pilot venv smoke test structure (mika#1200) ---
 
@@ -407,82 +373,6 @@ else
     echo "  ⊘ cli.py not found at expected path (skipped — set MIKA_PLATFORM_DIR or run from mika-platform root)"
     echo "    tried: ${CLI_PY:-<empty>}"
 fi
-
-# --- Test 11: Class D drift fix — cat-file guard and fallback callouts (mika#1204) ---
-
-echo ""
-echo "Test 11: Class D drift fix — cat-file guard and fallback callouts (mika#1204)"
-echo "-------------------------------------------------------------------------------"
-
-VERIFY_FUNC=$(sed -n '/_verify_and_write_body_callout()/,/^}/p' "$DISPATCH_LIB")
-
-# (a) cat-file -e guard exists — the core fix. HEAD's tree is checked before
-# stamping a SHA, so a plan-on-disk-but-not-in-HEAD state is detected.
-assert_contains "cat-file -e guard present" \
-    'cat-file -e "HEAD:${plan_relpath}"' "$VERIFY_FUNC"
-
-# (b) Recovery commit uses pathspec-limited commit (not git add + git commit).
-# This prevents capturing other staged files from a partial pilot run.
-assert_contains "Recovery commit is pathspec-limited" \
-    'git -C "$worktree_dir" commit -m' "$VERIFY_FUNC"
-# Check for pathspec separator followed by plan_relpath in the commit command.
-# Cannot use assert_contains here because the needle starts with '--' which
-# grep interprets as an option. Use a direct grep -F with -- end-of-options.
-if printf '%s\n' "$VERIFY_FUNC" | grep -qF -- '-- "$plan_relpath"'; then
-    PASS=$((PASS + 1))
-    echo "  ✓ Pathspec targets plan file only"
-else
-    FAIL=$((FAIL + 1))
-    echo "  ✗ Pathspec targets plan file only"
-fi
-
-# (c) Recovery commit message follows wip() convention with issue reference.
-assert_contains "Recovery commit message has wip() prefix" \
-    'wip(${repo}#${issue_num})' "$VERIFY_FUNC"
-
-# (d) Commit failure fallback stamps as uncommitted, not with a fabricated SHA.
-# The (uncommitted ...) format does NOT match "committed on branch @" — safe for
-# downstream parsers (check_grooming_markers, _detect_plan_on_branch).
-assert_contains "Commit-failure fallback uses uncommitted callout" \
-    '(uncommitted on branch' "$VERIFY_FUNC"
-
-# (e) Push failure fallback stamps differently from commit failure — operator
-# can distinguish the two states.
-assert_contains "Push-failure fallback uses committed-locally callout" \
-    '(committed locally, push failed' "$VERIFY_FUNC"
-
-# (f) head_sha capture is AFTER the cat-file guard — not before. This ensures
-# the SHA is only stamped when the plan is verifiably in HEAD.
-# Strategy: extract line numbers and confirm ordering.
-CATFILE_LINE=$(printf '%s\n' "$VERIFY_FUNC" | grep -n 'cat-file -e "HEAD:${plan_relpath}"' | head -1 | cut -d: -f1)
-HEADSHA_LINE=$(printf '%s\n' "$VERIFY_FUNC" | grep -n 'head_sha=$(git -C "$worktree_dir" rev-parse --short HEAD' | head -1 | cut -d: -f1)
-if [ -n "$CATFILE_LINE" ] && [ -n "$HEADSHA_LINE" ] && [ "$CATFILE_LINE" -lt "$HEADSHA_LINE" ]; then
-    PASS=$((PASS + 1))
-    echo "  ✓ cat-file guard (line $CATFILE_LINE) fires before head_sha capture (line $HEADSHA_LINE)"
-else
-    FAIL=$((FAIL + 1))
-    echo "  ✗ cat-file guard must fire before head_sha capture"
-    echo "    catfile_line=$CATFILE_LINE headsha_line=$HEADSHA_LINE"
-fi
-
-# (g) Push of recovery commit is present — SHA must be reachable from origin.
-assert_contains "Recovery commit is pushed to origin" \
-    'git -C "$worktree_dir" push origin "$branch"' "$VERIFY_FUNC"
-
-# (h) Both fallback paths return 0 (recovery is best-effort, not fatal).
-# Use a wider capture (30 lines) since fallback blocks include heredoc + gh issue edit.
-COMMIT_FAIL_BLOCK=$(printf '%s\n' "$VERIFY_FUNC" | sed -n '/post_flight_class_d_commit_failed/,/return 0/p' | head -30)
-assert_contains "Commit-failure fallback returns 0" "return 0" "$COMMIT_FAIL_BLOCK"
-PUSH_FAIL_BLOCK=$(printf '%s\n' "$VERIFY_FUNC" | sed -n '/post_flight_class_d_push_failed/,/return 0/p' | head -30)
-assert_contains "Push-failure fallback returns 0" "return 0" "$PUSH_FAIL_BLOCK"
-
-# (i) Stderr diagnostic keys are present for observability.
-assert_contains "Class D recovery start log key" \
-    'post_flight_class_d_recovery' "$VERIFY_FUNC"
-assert_contains "Commit failure log key" \
-    'post_flight_class_d_commit_failed' "$VERIFY_FUNC"
-assert_contains "Push failure log key" \
-    'post_flight_class_d_push_failed' "$VERIFY_FUNC"
 
 # ============================================================================
 # Iterate-loop primitives (mika#1271 — Phase A/B/C helpers)
@@ -605,10 +495,17 @@ DISPATCH_FUNC=$(declare -f dispatch_claude_pilot)
 assert_not_contains "dispatch_claude_pilot no longer references MIKA_DISPATCH_USE_ITERATE_LOOP flag" "MIKA_DISPATCH_USE_ITERATE_LOOP" "$DISPATCH_FUNC"
 assert_contains "dispatch_claude_pilot still gates iterate-loop on dev-groom skill" "dev-groom" "$DISPATCH_FUNC"
 assert_contains "dispatch_claude_pilot calls _iterate_groom_loop" "_iterate_groom_loop" "$DISPATCH_FUNC"
-# Defense-in-depth: Class D recovery shim (mika#1123) still runs in
-# _run_claude_pilot for drift cases until sub-PR 7b retires it.
+# Sub-PR 7b retirement: Class D recovery shim is gone — _verify_and_write_body_callout
+# function definition deleted; its post-flight call site in _run_claude_pilot removed.
+# Tests below assert both deletions structurally.
 RUN_CLAUDE_PILOT_FUNC=$(declare -f _run_claude_pilot)
-assert_contains "_run_claude_pilot still invokes Class D recovery shim (defense-in-depth)" "_verify_and_write_body_callout" "$RUN_CLAUDE_PILOT_FUNC"
+assert_not_contains "_run_claude_pilot no longer invokes Class D recovery shim" "_verify_and_write_body_callout" "$RUN_CLAUDE_PILOT_FUNC"
+# Class D function definition removed entirely from dispatch-lib.sh.
+if declare -f _verify_and_write_body_callout >/dev/null 2>&1; then
+    assert_eq "_verify_and_write_body_callout function deleted (sub-PR 7b)" "absent" "still-defined"
+else
+    assert_eq "_verify_and_write_body_callout function deleted (sub-PR 7b)" "absent" "absent"
+fi
 
 # Ordering check: iterate-loop runs AFTER _run_claude_pilot and BEFORE _push_branch.
 # Use grep -n on declare-f output; pick first occurrence of each.
@@ -759,12 +656,12 @@ assert_contains "_escalate_groom populates RESULT even when WORKTREE_DIR unset" 
 # Phase D — canonical body-callout writer (mika#1271 sub-PR 6)
 # ----------------------------------------------------------------------------
 # _write_canonical_callout is the forward-path body-callout writer called on
-# GROOMED success. Distinct from _verify_and_write_body_callout (mika#1123)
-# which writes a RECOVERY callout that explicitly does NOT carry a GROOMED
-# marker. Tests below assert: definition exists, two call sites in
-# _iterate_groom_loop (one per GROOMED path), zero call sites on ESCALATE,
-# stage labels produce distinct Grooming-history shapes, unknown stage
-# returns 1, gh failure on idempotency check leaves no write.
+# GROOMED success. As of sub-PR 7b it is the sole structural authority for the
+# body callout — the Class D recovery shim (formerly _verify_and_write_body_callout,
+# mika#1123) was retired. Tests below assert: definition exists, two call sites
+# in _iterate_groom_loop (one per GROOMED path), zero call sites on ESCALATE,
+# stage labels produce distinct Grooming-history shapes, unknown stage returns 1,
+# gh failure on idempotency check leaves no write.
 
 # Definition exists
 if declare -f _write_canonical_callout >/dev/null 2>&1; then
@@ -817,7 +714,7 @@ assert_contains "writer source includes session_id in Grooming history" 'session
 assert_contains "ready-to-groomed stage produces READY → GROOMED history" 'first-pass (READY) → second-pass (GROOMED)' "$WRITER_SRC"
 assert_contains "iterate-to-groomed stage produces ITERATE → revised → GROOMED history" 'first-pass (ITERATE) → revised → second-pass (GROOMED)' "$WRITER_SRC"
 
-# Idempotency check uses same three-signal pattern as _verify_and_write_body_callout (mika#1123)
+# Idempotency check uses the dispatch-gate three-signal pattern from executor.rs::check_grooming_markers
 assert_contains "writer reuses Pin B has_branch signal" 'has_branch=' "$WRITER_SRC"
 assert_contains "writer reuses Pin B has_plan signal" 'has_plan=' "$WRITER_SRC"
 assert_contains "writer reuses Pin B has_verdict signal" 'has_verdict=' "$WRITER_SRC"
