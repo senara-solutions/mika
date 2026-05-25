@@ -10,6 +10,7 @@ applies_when:
   - claude-pilot terminates with error_max_turns (SDK turn limit reached)
   - mika-dev post-callback handling classifies a pipeline result as failure
   - Any verdict path that claims "no commits produced" without verifying local branch state
+resolved_by: "mika#1268 — unconditional post-flight push finalizer in dispatch-lib.sh"
 tags:
   - error-max-turns
   - recover-unpushed-work
@@ -96,3 +97,14 @@ Uniform handling of all guardrails would produce incorrect guidance. Each should
 - **Structural fix:** mika#838 — adds `recover_unpushed_work` verdict class to self-dev pipeline-result classification
 - **Architectural precedent:** mika#825 — `block[ac]` verdict class (operator-routed, no auto-retry)
 - **Related grounding patterns:** `feedback_mika_dev_llm_fabricates_tool_errors.md`, `feedback_verify_before_claiming.md`
+
+## Resolution
+
+This failure class is resolved by the unconditional post-flight push finalizer added in mika#1268. `dispatch-lib.sh` now calls `_post_flight_push()` after `_run_claude_pilot()` returns and before callback delivery, regardless of pilot exit code. The helper:
+
+1. Fetches fresh remote state for the branch (no-ops on first-push where the ref doesn't exist yet).
+2. If `origin/$BRANCH` exists and HEAD is not ahead, skips (already in sync — handles idempotency with the Class D push at line 250).
+3. Otherwise pushes with `-u` for upstream tracking.
+4. Appends a status line to RESULT (`Post-flight push: pushed to origin/$BRANCH` or `Post-flight push: FAILED — commits remain local-only on $BRANCH`).
+
+The manual recovery procedure above remains valid for edge cases where the push itself fails (e.g., diverged remote, network failure), but the common case of "valid commits stranded locally due to non-zero exit code" no longer requires manual intervention.
