@@ -892,6 +892,38 @@ _cleanup_iterate_findings() {
     echo "_cleanup_iterate_findings: swept $findings_dir on GROOMED" >&2
 }
 
+_escalate_groom() {
+    # Phase D escalation helper (mika#1271) — fail loudly per mika#1033 precedent
+    # when the architect returns ESCALATE (first-pass or second-pass). Writes the
+    # architect's escalation rationale to $WORKTREE_DIR/.iterate/escalate-<stage>.md
+    # for operator forensic access, and appends a structured PIPELINE FAILURE
+    # marker to RESULT so the callback delivers an actionable error rather than
+    # a generic "no PR" message.
+    #
+    # Findings are PRESERVED on ESCALATE — never swept. Worktree TTL handles
+    # eventual cleanup. The findings file is the operator's primary forensic
+    # artifact when deciding whether to retry, refactor, or kill the plan.
+    #
+    # Args:
+    #   $1: stage label — "first-pass" | "second-pass-after-ready" | "second-pass-after-iterate"
+    #   $2: architect content (the escalation rationale text)
+    #   $3: architect session_id (for callback observability + log correlation)
+    local stage="$1" content="$2" session_id="$3"
+
+    local findings_dir="$WORKTREE_DIR/.iterate"
+    mkdir -p "$findings_dir" 2>/dev/null || true
+    local findings_file="$findings_dir/escalate-${stage}.md"
+    printf '%s\n' "$content" > "$findings_file" 2>/dev/null || true
+
+    echo "iterate_groom_loop: ESCALATE at ${stage} — failing loudly per mika#1033 (findings at ${findings_file})" >&2
+
+    RESULT="${RESULT}
+PIPELINE FAILURE: groom escalated by mika-arch ${stage}.
+Verdict: ESCALATE — human review required.
+Session: ${session_id}
+Architect findings preserved at: ${findings_file}"
+}
+
 _iterate_groom_loop() {
     # Phase D — the iterate-loop state machine (mika#1271 v1 cut).
     #
@@ -956,7 +988,7 @@ _iterate_groom_loop() {
                     return 0
                     ;;
                 *)
-                    echo "WARN: iterate_groom_loop: second-pass returned ${verdict:-UNPARSED} for $REPO#$ISSUE_NUM" >&2
+                    _escalate_groom "second-pass-after-ready" "$content2" "$session_id"
                     return 1
                     ;;
             esac
@@ -1003,13 +1035,13 @@ _iterate_groom_loop() {
                     return 0
                     ;;
                 *)
-                    echo "WARN: iterate_groom_loop: second-pass after revise returned ${verdict_iter:-UNPARSED} — preserving findings for forensics" >&2
+                    _escalate_groom "second-pass-after-iterate" "$content2_iter" "$session_id"
                     return 1
                     ;;
             esac
             ;;
         ESCALATE)
-            echo "WARN: iterate_groom_loop: first-pass ESCALATE for $REPO#$ISSUE_NUM" >&2
+            _escalate_groom "first-pass" "$content1" "$session_id"
             return 1
             ;;
         *)
