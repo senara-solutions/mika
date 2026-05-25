@@ -354,6 +354,9 @@ _handle_dry_run() {
 _run_claude_pilot() {
     local ENTRY_COMMAND="$1"
 
+    # Unit 3 (mika#1282): flag for dirty-worktree rescue, checked by Unit 2.
+    RESCUED_DIRTY_WORKTREE=0
+
     STDERR_FILE=$(mktemp)
     STDOUT_FILE=$(mktemp)
     # Persistent stderr copy for post-mortem forensics (mika#1097 Step 0-A).
@@ -409,6 +412,35 @@ Note: process exited with code ${PILOT_EXIT} after session completed — result 
                 RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
 
 ${RESULT}"
+            fi
+
+            # Unit 1 (mika#1282): detect dirty worktree on zero-commit dev-pilot.
+            # If the pilot wrote files but never committed, auto-rescue the content
+            # so it isn't lost with the worktree. This is dispatch-lib exercising its
+            # structural git-workflow ownership per the content/workflow split
+            # (mika#1271 architect verdict; pilot-vs-substrate-contract-split-2026-05-25.md).
+            if [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ] && [ -n "$WORKTREE_DIR" ]; then
+                DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
+                if [ -n "$DIRTY_FILES" ]; then
+                    git -C "$WORKTREE_DIR" add -A 2>&9
+                    git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
+
+Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
+Auto-rescued by dispatch-lib dirty-worktree detection." 2>&9
+
+                    # Update POST_RUN_HEAD so _push_branch sees new commits
+                    POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+
+                    # Amend the PIPELINE FAILURE message (already set above) with rescue note
+                    RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
+Files rescued:
+${DIRTY_FILES}
+
+${RESULT}"
+
+                    # Mark for draft PR creation in Unit 2
+                    RESCUED_DIRTY_WORKTREE=1
+                fi
             fi
         fi
 
@@ -1205,5 +1237,47 @@ EOF
     fi
 
     _push_branch
+
+    # Unit 2 (mika#1282): open a draft PR when content was rescued by dispatch-lib's
+    # git-workflow ownership (content/workflow split per mika#1271 architect verdict).
+    # Draft status signals "pilot failed to drive git; substrate owns recovery workflow."
+    # Runs after _push_branch (which handles first-push natively — lines 558-564)
+    # and before _deliver_callback.
+    if [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
+        RESCUED_PR_URL=$(gh pr create \
+            --repo "senara-solutions/$REPO" \
+            --head "$BRANCH" \
+            --base main \
+            --draft \
+            --title "wip(${REPO}#${ISSUE_NUM}): rescued impl (dispatch-lib recovery)" \
+            --body "$(cat <<RESCUEBODY
+## Rescued implementation (dispatch-lib content/workflow split)
+
+This PR was created by dispatch-lib's git-workflow recovery (mika#1282).
+
+The dev-pilot session wrote file changes but never completed the git workflow
+(no \`git commit\` or \`gh pr create\`). Per the mika#1271 content/workflow split
+contract, dispatch-lib took ownership of the git layer: staged, committed with
+\`wip()\` prefix, pushed, and opened this draft PR to preserve the content.
+
+**This is a draft PR requiring human review.** The content has NOT passed
+\`/ce:review\` and may contain partially-coherent multi-file changes.
+
+### Recovery metadata
+- Pilot session: \`${SESSION_ID:-unknown}\`
+- Turns: ${TURNS:-unknown}
+- Cost: \$${COST:-unknown}
+
+Closes #${ISSUE_NUM}
+RESCUEBODY
+)" 2>&9 || true)
+
+        if [ -n "$RESCUED_PR_URL" ]; then
+            PR_URL="$RESCUED_PR_URL"
+            RESULT="${RESULT}
+Draft PR (dispatch-lib recovery): ${PR_URL}"
+        fi
+    fi
+
     _deliver_callback
 }
