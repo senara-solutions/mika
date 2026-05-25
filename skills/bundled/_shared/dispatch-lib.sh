@@ -1155,13 +1155,18 @@ EOF
         export CLAUDE_PILOT_REQUIRE_PR=1
         ;;
       dev-groom)
-        ENTRY_COMMAND="/mika-groom-ticket"
+        # As of mika#1271 sub-PR 8: autonomous-loop pilot uses /mika-groom-plan-only
+        # (content-only — generate plan, commit, push, exit). Architect convergence
+        # + canonical body-callout write are owned by dispatch-lib's _iterate_groom_loop
+        # below. /mika-groom-ticket remains the operator-facing full pipeline
+        # (Phase 1-6 + architect + body callout + comment) and is unchanged.
+        ENTRY_COMMAND="/mika-groom-plan-only"
         # Early-exit guard (mika#1097 Layer B): dev-groom sessions MUST produce
-        # tool calls (at minimum: gh issue view, git worktree, /ce:plan, mika ask).
+        # tool calls (at minimum: gh issue view, git worktree, /ce:plan, git commit/push).
         # If the session exits "success" with fewer than this threshold, claude-pilot
         # re-prompts once; a second early-exit emits early_exit_zero_action.
-        # Calibrated from the 2026-05-13 incident: failures had 0 tool calls;
-        # successful grooming sessions have 15-40+.
+        # Threshold unchanged from /mika-groom-ticket — /mika-groom-plan-only still
+        # produces 5+ tool calls (issue view, /ce:plan, file edits, git add/commit/push).
         export CLAUDE_PILOT_MIN_TOOL_CALLS="${CLAUDE_PILOT_MIN_TOOL_CALLS:-3}"
         ;;
       *) echo "Unknown skill: $SKILL" >&2; exit 1 ;;
