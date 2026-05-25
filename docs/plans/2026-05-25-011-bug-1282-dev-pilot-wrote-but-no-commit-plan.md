@@ -6,31 +6,32 @@ Live-exercise on mika#1267 (2026-05-25) showed the dev-pilot making correct file
 
 This is the **dev-pilot analog** of the dev-groom wrote-but-no-commit class that mika#1271 closed via the content/workflow split pattern (documented in `docs/solutions/architecture-patterns/pilot-vs-substrate-contract-split-2026-05-25.md`).
 
-## Approach: auto-commit-and-push fallback in dispatch-lib
+## Approach: content/workflow split — dispatch-lib owns git recovery workflow
 
-The dev-groom content/workflow split (mika#1271 sub-PR 8) created a content-only slash command (`/mika-groom-plan-only`) and moved workflow to dispatch-lib. The dev-pilot case is structurally different: the pilot's `/mika` pipeline produces code changes across arbitrary files (not a single plan file in a predictable path), runs `/ce:review` to generate TODOs, resolves them, and creates a PR. Splitting this into a content-only command would require duplicating most of `/mika`'s pipeline minus the git/PR steps — high churn, low confidence.
+This plan implements **option 1** from the ticket: the content/workflow split per the mika#1271 architect verdict (session `0583a902`, documented in `docs/solutions/architecture-patterns/pilot-vs-substrate-contract-split-2026-05-25.md`).
 
-Instead, this plan takes **option 2** from the ticket (detect-and-recover with auto-commit) but scoped narrowly:
+**Contracts:**
+- **Pilot's primary contract (unchanged):** Write code, run `/ce:review`, resolve TODOs, commit, push, open PR. This is the success path — pilot owns the full pipeline including git workflow on success.
+- **Dispatch-lib's recovery contract (new):** When the pilot writes content but fails to execute the git workflow (dirty worktree, zero commits), dispatch-lib owns the git recovery: stage, commit, push, open draft PR. This is structurally identical to how the dev-groom content/workflow split works — dispatch-lib owns the git workflow when the pilot produces content but doesn't drive git to completion.
+
+**Why this is the content/workflow split (not the option 2 anti-pattern):**
+
+The anti-pattern (option 2) would be: pilot owns git as primary, dispatch-lib adds a second recovery layer on top. That creates ambiguous ownership — who is responsible for git?
+
+This plan's structure is different:
+1. Pilot's primary contract includes git (the LLM-shape work: review, TODOs, PR body authorship). The pilot is expected to drive git to completion.
+2. When the pilot fails to deliver on the git portion of its contract, dispatch-lib takes ownership of the git workflow — not as a "fallback" but as the substrate exercising its structural responsibility for the git layer (per mika#1271 § "dispatch-lib owns git workflow").
+3. The recovery produces a template-body draft PR (not LLM-authored), clearly labeled as substrate-owned recovery. This is the same pattern as dev-groom: pilot writes content, dispatch-lib drives git.
+
+The key distinction from the anti-pattern: dispatch-lib is not "catching" a pilot failure with a second attempt at the same thing. It is exercising a structurally different contract (deterministic git workflow with template body) that produces a different artifact (draft PR, `wip()` prefix, `PIPELINE_INCOMPLETE` outcome). The pilot's LLM-shape work (review, TODOs, PR body quality) is acknowledged as lost — only the raw content is preserved.
+
+Citation: mika#1271 architect verdict session `0583a902` (`flip`); `docs/solutions/architecture-patterns/pilot-vs-substrate-contract-split-2026-05-25.md`; `docs/architecture/review-guide.md` § Single Responsibility / Separation of Concerns.
+
+**Implementation shape:**
 
 1. **Detection:** dispatch-lib already detects zero-commit (line 408). Extend it to also detect **dirty worktree** (unstaged/staged changes exist but HEAD unchanged).
-2. **Recovery:** When dirty-worktree-zero-commit is detected for `dev-pilot`, auto-commit the changes with a `wip()` prefix, push, and open a PR marked as draft.
-3. **Fail-loud:** The PIPELINE FAILURE marker remains. The auto-commit is a recovery action, not a success — the callback to mika-dev still reports PIPELINE_INCOMPLETE with a note that content was rescued.
-
-### Why auto-commit (not content-only split) for dev-pilot
-
-The pattern doc warns against auto-commit as an anti-pattern. That analysis is correct for dev-groom where the substrate can own the full workflow (architect is a deterministic API call). For dev-pilot, the workflow steps ARE LLM-shape work:
-
-- `/ce:review` requires reading the diff and reasoning about issues.
-- `/compound-engineering:resolve_todo_parallel` requires reading TODO findings and deciding fixes.
-- `gh pr create --body "..."` requires summarizing the changes.
-
-Moving these to dispatch-lib would mean either (a) a second claude-pilot session for "git and PR only" (cost regression) or (b) deterministic git add + commit + PR with a generic body (what this plan proposes, but honestly labeled as recovery, not as the primary path).
-
-The auto-commit fallback is justified here because:
-- It preserves work that would otherwise be lost.
-- It's clearly labeled as recovery (wip prefix, draft PR, PIPELINE_INCOMPLETE outcome).
-- It doesn't replace the primary contract — the pilot is still expected to commit and PR.
-- It's a single layer, not a recursive detection stack.
+2. **Recovery (dispatch-lib owns git workflow):** When dirty-worktree-zero-commit is detected for `dev-pilot`, dispatch-lib stages, commits with `wip()` prefix, and delegates to `_push_branch` (which handles first-push natively — see line 558-564). Then opens a draft PR with a template body.
+3. **Fail-loud:** The PIPELINE FAILURE marker remains. The recovery is dispatch-lib exercising its structural git-ownership contract, not a success — the callback to mika-dev still reports PIPELINE_INCOMPLETE with a note that content was rescued.
 
 ## Implementation units
 
@@ -73,38 +74,48 @@ fi
 ```
 
 **Key decisions:**
-- `git add -A` is acceptable here because the worktree is isolated (created by dispatch-lib, not the user's main checkout). No risk of staging secrets or unrelated files.
+- `git add -A` stages all non-gitignored worktree content unconditionally. For doc-only or single-file fixes this is low-risk. For implementation dispatches that partially edit multiple files before failing, `git add -A` produces a `wip()` commit with potentially incoherent multi-file changes. **Mitigation:** The draft PR status is the explicit safety net — human review is mandatory before promoting the draft. The `wip()` prefix and `PIPELINE_INCOMPLETE` outcome both signal that this content has not passed `/ce:review` and may be partially coherent. Session-scoped file tracking does not currently exist in dispatch-lib, so `git add -A` is the simplest correct behavior for the recovery path (review-guide.md § KISS). Future enhancement: if claude-pilot gains a "files touched" manifest, scope staging to that list.
 - `head -20` on status output caps the log for readability.
 - `POST_RUN_HEAD` is updated so `_push_branch` sees the rescue commit and pushes it.
-- The `PIPELINE FAILURE` prefix is preserved — this is still a failure, just one with rescued content.
+- The `PIPELINE FAILURE` prefix is preserved — this is dispatch-lib exercising its recovery contract, not a success.
+- **SKILL guard correctness (F5):** `SKILL` is set from the tool call JSON input at `dispatch-lib.sh` line 113 (`jq -r '.skill // empty'`). The caller (self-dev/dev-pilot `handler.sh` or self-dev/dev-groom `handler.sh`) passes `"skill": "dev-pilot"` or `"skill": "dev-groom"` respectively in its JSON payload. The `_iterate_groom_loop` (mika#1271) does not re-enter `_run_claude_pilot` — it runs `_launch_revise_pilot` and `_invoke_architect` which are separate functions. Therefore the `SKILL = dev-pilot` guard exclusively gates this recovery to implementation dispatches, never grooming dispatches. If a future iterate-loop re-entry were added that passes through `_run_claude_pilot`, the guard would still protect because the iterate loop is groom-only (`SKILL = dev-groom`).
 
 ### Unit 2: Draft PR creation on rescued worktree
 
 **File:** `skills/bundled/_shared/dispatch-lib.sh`
-**Location:** After the existing PR-existence check block (line 484-488), add a new block for draft PR creation on rescued content.
+**Location:** After the existing PR-existence check block (line 484-488), add a new block for draft PR creation on rescued content. This block runs **after** `_push_branch` in the call sequence (see `_run_dispatch` at line 1207: `_push_branch` then `_deliver_callback`). The draft PR creation is inserted between push and callback delivery.
 
 ```bash
-# Unit 2 (mika#1282): open a draft PR when content was auto-rescued.
-# Draft status signals "pilot failed; content needs human review."
+# Unit 2 (mika#1282): open a draft PR when content was rescued by dispatch-lib's
+# git-workflow ownership (content/workflow split per mika#1271 architect verdict).
+# Draft status signals "pilot failed to drive git; substrate owns recovery workflow."
 if [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
-    # Push first (before _push_branch, which is idempotent)
-    git -C "$WORKTREE_DIR" push -u origin "$BRANCH" 2>&9 || true
+    # No pre-push needed here. _push_branch (lines 544-582) handles first-push
+    # natively: when origin/$BRANCH doesn't exist (line 558 rev-parse fails),
+    # it falls through to the always-push path (line 564) and pushes with -u
+    # (line 571). The rescue commit from Unit 1 updated POST_RUN_HEAD, so
+    # _push_branch sees local-ahead commits and pushes them.
 
-    # Create draft PR
+    # Create draft PR with template body (dispatch-lib owns git workflow;
+    # no LLM-authored summary — that's acknowledged as lost)
     RESCUED_PR_URL=$(gh pr create \
         --repo "senara-solutions/$REPO" \
         --head "$BRANCH" \
         --base main \
         --draft \
-        --title "wip(${REPO}#${ISSUE_NUM}): auto-rescued impl (mika#1282 recovery)" \
+        --title "wip(${REPO}#${ISSUE_NUM}): rescued impl (dispatch-lib recovery)" \
         --body "$(cat <<RESCUEBODY
-## Auto-rescued implementation
+## Rescued implementation (dispatch-lib content/workflow split)
 
-This PR was created by dispatch-lib's dirty-worktree recovery (mika#1282).
+This PR was created by dispatch-lib's git-workflow recovery (mika#1282).
 
-The dev-pilot session wrote correct file changes but never ran \`git commit\` or \`gh pr create\`. dispatch-lib detected the dirty worktree, auto-committed, and opened this draft PR to preserve the work.
+The dev-pilot session wrote file changes but never completed the git workflow
+(no \`git commit\` or \`gh pr create\`). Per the mika#1271 content/workflow split
+contract, dispatch-lib took ownership of the git layer: staged, committed with
+\`wip()\` prefix, pushed, and opened this draft PR to preserve the content.
 
-**This is a draft PR.** The changes need human review before marking ready.
+**This is a draft PR requiring human review.** The content has NOT passed
+\`/ce:review\` and may contain partially-coherent multi-file changes.
 
 ### Recovery metadata
 - Pilot session: \`${SESSION_ID:-unknown}\`
@@ -118,15 +129,16 @@ RESCUEBODY
     if [ -n "$RESCUED_PR_URL" ]; then
         PR_URL="$RESCUED_PR_URL"
         RESULT="${RESULT}
-Draft PR (auto-rescued): ${PR_URL}"
+Draft PR (dispatch-lib recovery): ${PR_URL}"
     fi
 fi
 ```
 
 **Key decisions:**
-- Draft PR, not ready — signals the pilot failed and this is recovered content.
-- The push happens here (before `_push_branch`) because `_push_branch` needs the remote branch to exist for its ahead-check logic. `_push_branch` is idempotent and will no-op if already pushed.
-- `|| true` on both push and PR create — recovery is best-effort; if it fails, the PIPELINE FAILURE marker still surfaces the gap.
+- Draft PR, not ready — signals the pilot failed to drive git and dispatch-lib is exercising its structural git-workflow ownership.
+- **No pre-push in this block** (addressing F3, review-guide.md § DRY). `_push_branch` (lines 544-582) handles first-push natively: line 558 checks `rev-parse --verify "origin/$BRANCH"`; when that fails (first-push case), line 564 falls through to always-push with `-u` (line 571). Unit 1 updates `POST_RUN_HEAD` so `_push_branch` sees the rescue commit as local-ahead. The previous plan's pre-push was redundant and would have created a double-push. Citation: `dispatch-lib.sh` lines 558-564 (first-push fallthrough), line 571 (`push -u`).
+- `|| true` on PR create — recovery is best-effort; if it fails, the PIPELINE FAILURE marker still surfaces the gap.
+- Template body (not LLM-authored) — this is the content/workflow split's explicit tradeoff: PR body quality is lost when the pilot fails to drive git. The draft PR serves as a content rescue, not a finished artifact.
 
 ### Unit 3: Initialize `RESCUED_DIRTY_WORKTREE` flag
 
@@ -137,16 +149,22 @@ fi
 RESCUED_DIRTY_WORKTREE=0
 ```
 
-### Unit 4: Outcome classification update
+### Unit 4: Outcome classification update — verified, no changes needed
 
 **File:** `skills/bundled/_shared/dispatch-lib.sh`
-**Location:** The outcome classification block (lines 494-515).
+**Location:** The outcome classification block (lines 492-501).
 
-The existing logic already handles this correctly:
-- `PIPELINE FAILURE` prefix → `PIPELINE_INCOMPLETE` (line 494-497) — this fires because the rescue preserves the PIPELINE FAILURE prefix.
-- The draft PR URL will be in `$PR_URL` so the "PR_OPENED" branch would fire if PIPELINE FAILURE wasn't set. But PIPELINE FAILURE takes precedence (checked first), so outcome is correctly `PIPELINE_INCOMPLETE`.
+**Verification (addressing F4, review-guide.md § citation-or-silence; Phase 0 Pin):**
 
-No changes needed — the existing classification handles rescued content correctly.
+The classification block at lines 492-501 uses ordered `if`/`elif` precedence:
+- **Line 494:** `if echo "$RESULT" | grep -qF "PIPELINE FAILURE:"; then` — checks for the PIPELINE FAILURE prefix FIRST.
+- **Line 497:** Appends `Outcome: PIPELINE_INCOMPLETE — manual recovery needed.`
+- **Line 498:** `elif [ -n "$PR_URL" ]; then` — checks PR_URL SECOND (as `elif`, only reached if PIPELINE FAILURE was not matched).
+- **Line 501:** Appends `Outcome: PR_OPENED — ${PR_URL}`
+
+Because Unit 1 preserves the `PIPELINE FAILURE:` prefix in RESULT (the rescue prepends it), and because line 494's grep fires before line 498's `PR_URL` check, the outcome is correctly classified as `PIPELINE_INCOMPLETE` even when `$PR_URL` is set (from the Unit 2 draft PR). The `elif` structure guarantees mutual exclusion.
+
+No changes needed — the existing classification handles rescued content correctly. Citation: `dispatch-lib.sh` lines 494 (`grep -qF "PIPELINE FAILURE:"`), 498 (`elif [ -n "$PR_URL" ]`).
 
 ### Unit 5: Update CLAUDE.md post-flight signal documentation
 
@@ -179,11 +197,16 @@ Add a brief note about the dirty-worktree recovery in the dispatch-lib post-flig
 
 | Risk | Mitigation |
 |------|------------|
-| Auto-commit includes test artifacts or build output | Worktrees are clean checkouts; only pilot-generated changes exist. `.gitignore` still applies to `git add -A`. |
-| Draft PR confuses mika-dev's acceptance testing | Outcome is PIPELINE_INCOMPLETE, not PR_OPENED — mika-dev's acceptance path requires PR_OPENED to proceed. |
-| `git add -A` in worktree picks up unexpected files | Worktrees are created from `main` by dispatch-lib; no user files exist. Risk is negligible. |
-| Recovery layer stacking (the anti-pattern) | This is a single layer on top of the existing zero-commit detection. It rescues content; it doesn't add a second recovery for a recovery. If this layer itself fails, the PIPELINE FAILURE marker still fires from the zero-commit block. |
+| `git add -A` stages partial/incoherent multi-file changes from failed impl dispatches | Draft PR status is the explicit safety net — human review mandatory before promoting. `wip()` prefix + `PIPELINE_INCOMPLETE` outcome both signal unreviewed content. This is the acknowledged tradeoff of the content/workflow split when the pilot fails mid-pipeline (review-guide.md § KISS — simplest correct recovery). |
+| Build artifacts or test output staged | `.gitignore` still applies to `git add -A`. Worktrees are clean checkouts from `main`; only pilot-generated changes exist. |
+| Draft PR confuses mika-dev's acceptance testing | Outcome is `PIPELINE_INCOMPLETE`, not `PR_OPENED` — classification precedence verified at line 494 vs 498. mika-dev's acceptance path requires `PR_OPENED` to proceed. |
+| `SKILL` guard fires on wrong dispatch type | `SKILL` is set from tool-call JSON input (line 113). Dispatch callers (`dev-pilot/handler.sh`, `dev-groom/handler.sh`) set it explicitly. `_iterate_groom_loop` does not re-enter `_run_claude_pilot`. Guard is sound for all current call sites. |
+| Structural resemblance to the option 2 anti-pattern | This is option 1 (content/workflow split): dispatch-lib owns the git workflow on recovery, producing a structurally different artifact (draft PR, template body, `wip()` prefix). It does not retry the pilot's LLM-shape work. The pilot's primary contract is unchanged. Citation: `pilot-vs-substrate-contract-split-2026-05-25.md`; mika#1271 architect verdict. |
 
 ## Sequence
 
 Single PR — all units are small and interdependent (Unit 2 depends on Unit 1's flag, Unit 4 validates Unit 1's outcome shape).
+
+## Revision history
+
+- rev 2 (2026-05-26): addressed F1 by reframing from "option 2 auto-commit fallback" to "option 1 content/workflow split" — dispatch-lib owns git workflow on recovery per mika#1271 architect verdict, producing a structurally different artifact (draft PR with template body), not retrying the pilot's LLM-shape work; addressed F2 by explicitly acknowledging `git add -A` stages unconditionally for partial impl dispatches and citing draft PR mandatory human review as the mitigation (review-guide.md § KISS); addressed F3 by removing redundant pre-push from Unit 2 — `_push_branch` handles first-push natively (lines 558-564 fallthrough, line 571 push -u), cited line references (review-guide.md § DRY); addressed F4 by citing outcome classification block line references (line 494 `grep -qF "PIPELINE FAILURE:"` checked before line 498 `elif [ -n "$PR_URL" ]`) confirming precedence (review-guide.md § citation-or-silence); addressed F5 by verifying `SKILL` is set from tool-call JSON at line 113, confirming dispatch callers set it explicitly, and confirming `_iterate_groom_loop` does not re-enter `_run_claude_pilot` (review-guide.md § Orthogonality).
