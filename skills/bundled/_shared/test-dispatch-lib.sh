@@ -443,6 +443,11 @@ assert_eq "_arch_ask rejects unreadable plan_path" "2" \
 # This catches the --skill vs --enable-skill flag-name bug that was in PR#1274.
 # Argv is joined with `|` so we can grep substrings; needles are prefixed with
 # `|` to avoid grep treating `--`-leading strings as flags.
+#
+# mika#1283: _arch_ask passes plan content via stdin (mika ask "-" reads stdin),
+# NOT as @-file argument (mika ask doesn't expand @<path>). The argv should
+# contain a literal "-" marker and the stub should receive the plan content
+# on stdin when invoked.
 ARCH_PLAN_TMP=$(mktemp /tmp/arch-plan-XXXXXX.md)
 printf 'plan content for arch ask test\n' > "$ARCH_PLAN_TMP"
 mika() { printf '|%s' "$@"; printf '|'; }  # leading | so first arg also has separator
@@ -452,14 +457,24 @@ assert_contains "_arch_ask threads skill name after enable-skill" "|--enable-ski
 assert_contains "_arch_ask sets agent mika-arch" "|--agent|mika-arch|" "$ARCH_ARGV"
 assert_contains "_arch_ask sets format json" "|--format|json|" "$ARCH_ARGV"
 assert_contains "_arch_ask sets verbose flag" "|--verbose|" "$ARCH_ARGV"
-assert_contains "_arch_ask passes @-file body" "|@${ARCH_PLAN_TMP}|" "$ARCH_ARGV"
+# mika#1283: stdin-marker, not @-file
+assert_contains "_arch_ask uses stdin marker (mika#1283)" "|-|" "$ARCH_ARGV"
+assert_not_contains "_arch_ask no longer passes @-path (mika#1283)" "|@${ARCH_PLAN_TMP}|" "$ARCH_ARGV"
 assert_not_contains "_arch_ask omits session-id when not given" "|--session-id|" "$ARCH_ARGV"
 
 ARCH_ARGV_WITH_SESSION=$(_arch_ask "mika-arch-second-review" "$ARCH_PLAN_TMP" "session-xyz")
 assert_contains "_arch_ask threads session-id when given" "|--session-id|session-xyz|" "$ARCH_ARGV_WITH_SESSION"
-assert_contains "_arch_ask passes @-file with session-id" "|@${ARCH_PLAN_TMP}|" "$ARCH_ARGV_WITH_SESSION"
+assert_contains "_arch_ask uses stdin marker with session-id (mika#1283)" "|-|" "$ARCH_ARGV_WITH_SESSION"
+assert_not_contains "_arch_ask no longer passes @-path with session-id (mika#1283)" "|@${ARCH_PLAN_TMP}|" "$ARCH_ARGV_WITH_SESSION"
 
-unset -f mika
+# mika#1283: verify plan content arrives on stdin, not as argv. Use a stub that
+# echoes the stdin it receives so we can grep for the plan content.
+mika_stdin_capture() { cat; }  # echo whatever arrives on stdin
+mika() { mika_stdin_capture; }
+ARCH_STDIN_RECEIVED=$(_arch_ask "mika-arch-groom-ticket" "$ARCH_PLAN_TMP")
+assert_contains "_arch_ask delivers plan content via stdin (mika#1283)" "plan content for arch ask test" "$ARCH_STDIN_RECEIVED"
+
+unset -f mika mika_stdin_capture
 rm -f "$ARCH_PLAN_TMP"
 
 # _iterate_groom_loop — guard rejects missing worktree/issue

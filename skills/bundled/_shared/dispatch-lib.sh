@@ -592,12 +592,23 @@ Push: FAILED — commits remain local-only on $BRANCH"
 
 _arch_ask() {
     # Phase A — architect-call helper. Invokes mika-arch via the CLI with the
-    # given skill and plan file. Returns the full JSON envelope on stdout for
-    # the caller to parse `.content` and `.metadata.session_id`.
+    # given skill, delivering plan content via stdin. Returns the full JSON
+    # envelope on stdout for the caller to parse `.content` and
+    # `.metadata.session_id`.
+    #
+    # mika#1283: previously passed "@${plan_path}" as the message argument,
+    # expecting `mika ask` to expand it to file content. `mika ask` does NOT
+    # support `@<path>` expansion (verified 2026-05-25 via direct probe — the
+    # literal path string was sent, and mika-arch's `read_agent_file` is
+    # scoped to /home/samidarko/.mika/agents/mika-arch/ so worktree paths
+    # like /data/workspace/.../docs/plans/...md are unreadable). The
+    # architect was reviewing whatever issue-body context was already in
+    # session memory, not the plan content. Fix: pipe content via stdin
+    # (mika ask "-" reads the message from stdin per `mika ask --help`).
     #
     # Args:
     #   $1: skill name (mika-arch-groom-ticket | mika-arch-second-review)
-    #   $2: absolute path to plan file (passed as @-file body)
+    #   $2: absolute path to plan file (content piped via stdin)
     #   $3: optional session_id to continue an existing architect session
     local skill="$1" plan_path="$2" session_id="${3:-}"
 
@@ -606,9 +617,9 @@ _arch_ask() {
 
     local args=( ask --agent mika-arch --format json --verbose --enable-skill "$skill" )
     [ -n "$session_id" ] && args+=( --session-id "$session_id" )
-    args+=( "@${plan_path}" )
+    args+=( - )
 
-    mika "${args[@]}"
+    mika "${args[@]}" < "$plan_path"
 }
 
 _parse_disposition() {
