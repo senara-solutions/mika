@@ -484,6 +484,71 @@ assert_contains "Commit failure log key" \
 assert_contains "Push failure log key" \
     'post_flight_class_d_push_failed' "$VERIFY_FUNC"
 
+# ============================================================================
+# Iterate-loop primitives (mika#1271 — Phase A/B/C helpers)
+# ============================================================================
+
+echo ""
+echo "Test: iterate-loop primitives (mika#1271)"
+echo "-----------------------------------------"
+
+# Source the lib so the helpers are callable. dispatch-lib.sh runs `set -euo
+# pipefail` at the top; sourcing it sets that for the test script too — which
+# is fine since we use `|| true` everywhere we expect non-zero.
+# shellcheck disable=SC1090
+source "$DISPATCH_LIB" 2>/dev/null || true
+
+# _parse_disposition — recognizes the three literal forms
+assert_eq "_parse_disposition READY" "READY" \
+    "$(printf 'Some prose.\nDisposition: READY\nMore prose.\n' | _parse_disposition)"
+assert_eq "_parse_disposition ITERATE" "ITERATE" \
+    "$(printf 'Findings:\n- F1: ...\nDisposition: ITERATE\n' | _parse_disposition)"
+assert_eq "_parse_disposition ESCALATE" "ESCALATE" \
+    "$(printf 'Disposition: ESCALATE\nReason: out of scope.\n' | _parse_disposition)"
+
+# _parse_disposition — extra whitespace tolerance
+assert_eq "_parse_disposition tolerates extra spaces" "READY" \
+    "$(printf 'Disposition:   READY\n' | _parse_disposition)"
+
+# _parse_disposition — no match returns empty
+assert_eq "_parse_disposition empty on no match" "" \
+    "$(printf 'No verdict here.\n' | _parse_disposition)"
+
+# _parse_disposition — only first match wins (defensive: never mix dispositions in a session)
+assert_eq "_parse_disposition first match wins" "READY" \
+    "$(printf 'Disposition: READY\nDisposition: ITERATE\n' | _parse_disposition)"
+
+# _parse_verdict — recognizes the two literal forms
+assert_eq "_parse_verdict GROOMED" "GROOMED" \
+    "$(printf 'Verdict: GROOMED\n' | _parse_verdict)"
+assert_eq "_parse_verdict ESCALATE" "ESCALATE" \
+    "$(printf 'Verdict: ESCALATE\n' | _parse_verdict)"
+
+# _parse_verdict — no match returns empty
+assert_eq "_parse_verdict empty on no match" "" \
+    "$(printf 'no verdict\n' | _parse_verdict)"
+
+# _trail_append + _trail_read — round-trip
+TRAIL_TMP=$(mktemp -d)
+WORKTREE_DIR="$TRAIL_TMP" _trail_append "groom-ticket" "session-abc" "READY"
+WORKTREE_DIR="$TRAIL_TMP" _trail_append "second-review" "session-abc" "GROOMED"
+TRAIL_OUTPUT=$(WORKTREE_DIR="$TRAIL_TMP" _trail_read)
+assert_contains "_trail round-trip captures groom-ticket entry" "groom-ticket	session-abc	READY" "$TRAIL_OUTPUT"
+assert_contains "_trail round-trip captures second-review entry" "second-review	session-abc	GROOMED" "$TRAIL_OUTPUT"
+rm -rf "$TRAIL_TMP"
+
+# _trail_append — silently no-ops when WORKTREE_DIR unset / missing
+assert_eq "_trail_append no-op when WORKTREE_DIR unset" "0" \
+    "$(WORKTREE_DIR="" _trail_append "x" "y" "z" 2>/dev/null; echo $?)"
+
+# _arch_ask — guard rejects missing args
+assert_eq "_arch_ask rejects missing skill" "2" \
+    "$(_arch_ask "" "/tmp/foo" 2>/dev/null; echo $?)"
+assert_eq "_arch_ask rejects missing plan_path" "2" \
+    "$(_arch_ask "mika-arch-groom-ticket" "" 2>/dev/null; echo $?)"
+assert_eq "_arch_ask rejects unreadable plan_path" "2" \
+    "$(_arch_ask "mika-arch-groom-ticket" "/nonexistent/path" 2>/dev/null; echo $?)"
+
 # --- Summary ---
 
 echo ""

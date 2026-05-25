@@ -739,6 +739,82 @@ Push: FAILED — commits remain local-only on $BRANCH"
     rm -f "$push_err"
 }
 
+# ============================================================================
+# Iterate-loop primitives (mika#1271 contract refactor — Phase A/B/C).
+#
+# These helpers will be wired into a state machine (`_iterate_groom_loop`) in a
+# follow-up PR. v1 ships the primitives only — defined and unit-testable, no
+# call sites in the live dispatch path. See
+# docs/plans/2026-05-25-003-feat-1271-iterate-loop-state-machine-plan.md.
+# ============================================================================
+
+_arch_ask() {
+    # Phase A — architect-call helper. Invokes mika-arch via the CLI with the
+    # given skill and plan file. Returns the full JSON envelope on stdout for
+    # the caller to parse `.content` and `.metadata.session_id`.
+    #
+    # Args:
+    #   $1: skill name (mika-arch-groom-ticket | mika-arch-second-review)
+    #   $2: absolute path to plan file (passed as @-file body)
+    #   $3: optional session_id to continue an existing architect session
+    local skill="$1" plan_path="$2" session_id="${3:-}"
+
+    [ -n "$skill" ] && [ -n "$plan_path" ] || { echo "_arch_ask: missing skill or plan_path" >&2; return 2; }
+    [ -r "$plan_path" ] || { echo "_arch_ask: plan_path not readable: $plan_path" >&2; return 2; }
+
+    local args=( ask --agent mika-arch --format json --verbose --skill "$skill" )
+    [ -n "$session_id" ] && args+=( --session-id "$session_id" )
+    args+=( "@${plan_path}" )
+
+    mika "${args[@]}"
+}
+
+_parse_disposition() {
+    # Phase B — first-pass verdict parser. Reads architect response text from
+    # stdin, emits READY|ITERATE|ESCALATE on stdout (or nothing on no match).
+    #
+    # v1 tolerates literal `Disposition: <X>` lines only. Paraphrased
+    # dispositions handling is out-of-v1 — see mika#1272.
+    grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
+        | grep -oE '(READY|ITERATE|ESCALATE)' \
+        | head -1
+}
+
+_parse_verdict() {
+    # Phase B — second-pass verdict parser. Reads architect response text from
+    # stdin, emits GROOMED|ESCALATE on stdout (or nothing on no match).
+    #
+    # v1 tolerates literal `Verdict: <X>` lines only. mika#1272 covers
+    # paraphrased forms.
+    grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
+        | grep -oE '(GROOMED|ESCALATE)' \
+        | head -1
+}
+
+_trail_append() {
+    # Phase C — verdict-trail capture. Appends a single line to
+    # $WORKTREE_DIR/.claude/groom-verdict-trail.log capturing one architect
+    # call's metadata. Used by the eventual canonical-callout writer to render
+    # the Grooming history field.
+    #
+    # Args: $1 = skill (groom-ticket | second-review), $2 = session_id,
+    #       $3 = disposition (READY|ITERATE|ESCALATE) or verdict (GROOMED|ESCALATE)
+    local skill="$1" session_id="$2" outcome="$3"
+    [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
+    local trail_dir="$WORKTREE_DIR/.claude"
+    mkdir -p "$trail_dir" 2>/dev/null
+    local trail_file="$trail_dir/groom-verdict-trail.log"
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$skill" "$session_id" "$outcome" >> "$trail_file"
+}
+
+_trail_read() {
+    # Phase C — verdict-trail reader. Emits the trail entries as TSV on stdout.
+    # Caller composes the Grooming history line from these entries.
+    [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
+    local trail_file="$WORKTREE_DIR/.claude/groom-verdict-trail.log"
+    [ -r "$trail_file" ] && cat "$trail_file"
+}
+
 _deliver_callback() {
     set +e
     if [ -n "$AGENT" ]; then
