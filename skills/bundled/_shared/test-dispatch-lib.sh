@@ -684,6 +684,71 @@ assert_eq "_iterate_groom_loop calls _cleanup_iterate_findings on both GROOMED p
 SECOND_PASS_COUNT=$(printf '%s\n' "$ITERATE_FULL" | grep -c 'mika-arch-second-review')
 assert_eq "_iterate_groom_loop invokes second-pass twice (READY + ITERATE)" "2" "$SECOND_PASS_COUNT"
 
+# ============================================================================
+# ESCALATE flow (mika#1271 sub-PR 5)
+# ============================================================================
+
+echo ""
+echo "Test: ESCALATE-flow helper (mika#1271 sub-PR 5)"
+echo "-----------------------------------------------"
+
+# _escalate_groom — writes findings file under .iterate/ + appends structured
+# PIPELINE FAILURE marker to RESULT
+ESC_TMP=$(mktemp -d)
+RESULT=""
+WORKTREE_DIR="$ESC_TMP" _escalate_groom "first-pass" "F1: Concern\nDisposition: ESCALATE" "session-esc-1" 2>/dev/null
+if [ -r "$ESC_TMP/.iterate/escalate-first-pass.md" ]; then
+    assert_eq "_escalate_groom writes findings file under .iterate/" "ok" "ok"
+else
+    assert_eq "_escalate_groom writes findings file under .iterate/" "ok" "missing"
+fi
+assert_contains "_escalate_groom appends PIPELINE FAILURE to RESULT" "PIPELINE FAILURE: groom escalated by mika-arch first-pass" "$RESULT"
+assert_contains "_escalate_groom RESULT includes Verdict: ESCALATE" "Verdict: ESCALATE" "$RESULT"
+assert_contains "_escalate_groom RESULT includes session_id" "Session: session-esc-1" "$RESULT"
+assert_contains "_escalate_groom RESULT references findings file path" "Architect findings preserved at:" "$RESULT"
+rm -rf "$ESC_TMP"
+
+# _escalate_groom — distinct stage labels write distinct findings files
+ESC_TMP2=$(mktemp -d)
+RESULT=""
+WORKTREE_DIR="$ESC_TMP2" _escalate_groom "second-pass-after-ready" "second-pass-ready content" "sess-2" 2>/dev/null
+if [ -r "$ESC_TMP2/.iterate/escalate-second-pass-after-ready.md" ]; then
+    assert_eq "_escalate_groom: second-pass-after-ready stage label drives filename" "ok" "ok"
+else
+    assert_eq "_escalate_groom: second-pass-after-ready stage label drives filename" "ok" "missing"
+fi
+RESULT=""
+WORKTREE_DIR="$ESC_TMP2" _escalate_groom "second-pass-after-iterate" "second-pass-iter content" "sess-3" 2>/dev/null
+if [ -r "$ESC_TMP2/.iterate/escalate-second-pass-after-iterate.md" ]; then
+    assert_eq "_escalate_groom: second-pass-after-iterate stage label drives filename" "ok" "ok"
+else
+    assert_eq "_escalate_groom: second-pass-after-iterate stage label drives filename" "ok" "missing"
+fi
+rm -rf "$ESC_TMP2"
+
+# Code-shape: _iterate_groom_loop has exactly 3 _escalate_groom call sites
+# (first-pass ESCALATE + READY-then-second-pass-fail + ITERATE-then-second-pass-fail)
+ITERATE_NOW=$(declare -f _iterate_groom_loop)
+ESCALATE_CALL_COUNT=$(printf '%s\n' "$ITERATE_NOW" | grep -c '_escalate_groom')
+assert_eq "_iterate_groom_loop has 3 _escalate_groom call sites" "3" "$ESCALATE_CALL_COUNT"
+
+# Each stage label appears exactly once
+assert_contains "ESCALATE branch uses first-pass stage" '_escalate_groom "first-pass"' "$ITERATE_NOW"
+assert_contains "READY-second-pass-fail uses second-pass-after-ready stage" '_escalate_groom "second-pass-after-ready"' "$ITERATE_NOW"
+assert_contains "ITERATE-second-pass-fail uses second-pass-after-iterate stage" '_escalate_groom "second-pass-after-iterate"' "$ITERATE_NOW"
+
+# Preservation invariant: ESCALATE never calls _cleanup_iterate_findings.
+# Cleanup count must still be exactly 2 (the two GROOMED success paths only).
+CLEANUP_COUNT=$(printf '%s\n' "$ITERATE_NOW" | grep -c '_cleanup_iterate_findings')
+assert_eq "_iterate_groom_loop still has 2 cleanup calls (GROOMED-only; ESCALATE preserves)" "2" "$CLEANUP_COUNT"
+
+# Robustness: _escalate_groom populates RESULT even when WORKTREE_DIR is unset
+# (defensive — should not crash; findings file write is best-effort, RESULT
+# marker is the mandatory product).
+RESULT=""
+WORKTREE_DIR="" _escalate_groom "first-pass" "content" "sess-x" 2>/dev/null
+assert_contains "_escalate_groom populates RESULT even when WORKTREE_DIR unset" "PIPELINE FAILURE" "$RESULT"
+
 # --- Summary ---
 
 echo ""
