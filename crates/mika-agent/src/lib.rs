@@ -11,6 +11,7 @@ pub(crate) mod github_graphql;
 pub mod kg;
 pub mod mcp;
 pub mod messaging;
+pub mod operational;
 pub mod pricing;
 pub mod prompt;
 pub mod rewind;
