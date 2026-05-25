@@ -1024,17 +1024,22 @@ CALLOUT_EOF
 }
 
 _iterate_groom_loop() {
-    # Phase D — the iterate-loop state machine (mika#1271 v1 cut).
+    # Phase D — the iterate-loop state machine (mika#1271).
     #
-    # Invokes mika-arch first-pass on the plan-on-branch, then on Disposition:
-    # READY proceeds to second-pass. On Verdict: GROOMED returns 0 (success).
-    # All other paths return non-zero (caller falls through to existing flow).
+    # Architect-driven groom convergence with five terminal states:
+    #   READY    → second-pass GROOMED → _write_canonical_callout "ready-to-groomed"
+    #   READY    → second-pass *      → _escalate_groom "second-pass-after-ready"
+    #   ITERATE  → revise → second-pass GROOMED → _write_canonical_callout "iterate-to-groomed"
+    #   ITERATE  → revise → second-pass *      → _escalate_groom "second-pass-after-iterate"
+    #   ESCALATE (first-pass)                   → _escalate_groom "first-pass"
     #
-    # v1 scope: READY → second-pass → GROOMED finalize ONLY. ITERATE rounds
-    # and ESCALATE handling are out-of-v1; both emit WARN and return non-zero
-    # so the existing pilot-owns-architect path can still produce the canonical
-    # body callout via the Class D shim. See
-    # docs/plans/2026-05-25-004-feat-1271-iterate-loop-state-machine-wire-plan.md.
+    # GROOMED paths preserve findings in $WORKTREE_DIR/.iterate/ until cleanup
+    # at the end of the success branch. ESCALATE paths PRESERVE findings for
+    # operator forensic access (worktree TTL handles eventual sweep).
+    #
+    # Always-on for the dev-groom skill as of sub-PR 7a. Non-zero return means
+    # the loop did not converge — caller continues to downstream Class D recovery
+    # (mika#1123) until sub-PR 7b retires the shim.
     #
     # Guards: requires WORKTREE_DIR, ISSUE_NUM, REPO; finds the plan file via
     # the same issue-scoped pattern Class D uses. Returns 1 if any guard fails.
@@ -1319,13 +1324,16 @@ EOF
     _handle_dry_run
     _run_claude_pilot "$ENTRY_COMMAND"
 
-    # mika#1271 — iterate-loop state machine (v1 cut, READY → second-pass → GROOMED only).
-    # Gated by MIKA_DISPATCH_USE_ITERATE_LOOP=1. Default unset (existing pilot-owns-architect
-    # path remains authoritative). On success the existing Class D body-callout shim still
-    # writes the canonical callout downstream — the state machine validates the architect
-    # convergence; the callout write retires in a follow-up sub-PR.
-    if [ "$SKILL" = "dev-groom" ] && [ "${MIKA_DISPATCH_USE_ITERATE_LOOP:-0}" = "1" ]; then
-        _iterate_groom_loop || echo "info: iterate_groom_loop did not converge — falling through to existing path" >&2
+    # mika#1271 — iterate-loop state machine (always-on for dev-groom as of sub-PR 7a).
+    # Invokes mika-arch first-pass on the plan-on-branch, then second-pass on READY
+    # or ITERATE-then-revise; on GROOMED writes the canonical body callout via
+    # _write_canonical_callout (idempotent vs. the pilot's organic write); on ESCALATE
+    # appends a structured PIPELINE FAILURE marker to RESULT. Non-zero return means
+    # the loop did NOT converge — the downstream Class D recovery shim (mika#1123)
+    # inside _run_claude_pilot still catches drift cases as defense-in-depth until
+    # sub-PR 7b retires it. See docs/plans/2026-05-25-008-feat-1271-flag-removal-plan.md.
+    if [ "$SKILL" = "dev-groom" ]; then
+        _iterate_groom_loop || echo "info: iterate_groom_loop did not converge — Class D recovery (mika#1123) downstream catches drift" >&2
     fi
 
     _push_branch
