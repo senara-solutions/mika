@@ -422,24 +422,43 @@ ${RESULT}"
             if [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ] && [ -n "$WORKTREE_DIR" ]; then
                 DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
                 if [ -n "$DIRTY_FILES" ]; then
-                    git -C "$WORKTREE_DIR" add -A 2>&9
-                    git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
+                    # Stage all dirty files EXCEPT worktree-scaffold paths copied by
+                    # _set_up_worktree (mika#1288). .claude/commands/ contains slash-command
+                    # snapshots from mika-platform — not pilot-authored content.
+                    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' 2>&9
+
+                    # Guard: if pathspec exclusion left nothing staged, skip the rescue
+                    # commit. Handles the edge case where the pilot wrote ONLY to scaffold
+                    # paths (mika#1288).
+                    if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
+                        echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/) — no pilot content to rescue" >&2
+                        RESCUED_DIRTY_WORKTREE=0
+                    else
+                        # Compute accurate rescued-files list for the PIPELINE FAILURE
+                        # message. DIRTY_FILES (from git status --porcelain) includes
+                        # excluded scaffold paths; RESCUED_FILES reflects what was actually
+                        # staged and will be committed.
+                        RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
+
+                        git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
 
 Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
-Auto-rescued by dispatch-lib dirty-worktree detection." 2>&9
+Auto-rescued by dispatch-lib dirty-worktree detection.
+Scaffold paths excluded (mika#1288)." 2>&9
 
-                    # Update POST_RUN_HEAD so _push_branch sees new commits
-                    POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+                        # Update POST_RUN_HEAD so _push_branch sees new commits
+                        POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
 
-                    # Amend the PIPELINE FAILURE message (already set above) with rescue note
-                    RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
+                        # Amend the PIPELINE FAILURE message (already set above) with rescue note
+                        RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
 Files rescued:
-${DIRTY_FILES}
+${RESCUED_FILES}
 
 ${RESULT}"
 
-                    # Mark for draft PR creation in Unit 2
-                    RESCUED_DIRTY_WORKTREE=1
+                        # Mark for draft PR creation in Unit 2
+                        RESCUED_DIRTY_WORKTREE=1
+                    fi
                 fi
             fi
         fi
