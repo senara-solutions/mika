@@ -287,6 +287,14 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Enable embedded dashboard SPA at /dashboard/ (default: false)",
     },
+    // -- Operational partner --
+    ConfigKeyInfo {
+        key: "operational_partner",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_OPERATIONAL_PARTNER"),
+        secret: false,
+        description: "Enable operational partner read APIs (writes always-on, default: false)",
+    },
     // -- Task engine --
     ConfigKeyInfo {
         key: "max_agent_tasks_per_session",
@@ -827,6 +835,12 @@ pub struct Settings {
     /// (colon separator conflicts with Windows drive letters).
     #[serde(default, deserialize_with = "deserialize_colon_paths")]
     pub kg_docs_roots: Option<Vec<PathBuf>>,
+
+    /// Enable operational partner mode — gates read APIs for operational items
+    /// (HTTP endpoint, CLI surface). Writes are always-on once the migration
+    /// lands (mika#1262). Default: false.
+    #[serde(default)]
+    pub operational_partner: bool,
 
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
@@ -1390,6 +1404,7 @@ impl Settings {
             callback_watchdog_grace_period_secs: None,
             kg_docs_root: None,
             kg_docs_roots: None,
+            operational_partner: false,
         }
     }
 }
@@ -1516,6 +1531,7 @@ impl std::fmt::Debug for Settings {
             )
             .field("kg_docs_root", &self.kg_docs_root)
             .field("kg_docs_roots", &self.kg_docs_roots)
+            .field("operational_partner", &self.operational_partner)
             .field("home_dir", &self.home_dir)
             .finish()
     }

@@ -1424,3 +1424,85 @@ mod tests {
         assert_eq!(json["type"], "issue");
     }
 }
+
+// ===== Operational Items Endpoint =====
+
+/// Query params for the operational items endpoint.
+#[derive(Debug, Deserialize)]
+pub struct OperationalItemsQuery {
+    /// Filter by agent ID (required).
+    pub agent_id: Option<String>,
+    /// Filter by kind (e.g., "task", "goal", "commitment").
+    pub kind: Option<String>,
+    /// Filter by status (e.g., "now", "waiting", "done").
+    pub status: Option<String>,
+    /// Max results (default 20, max 100).
+    pub limit: Option<u32>,
+    /// Sort: "priority_desc" or "created_at_desc" (default).
+    pub sort: Option<String>,
+}
+
+/// Handler for `GET /api/v1/operational-items`.
+///
+/// Feature-gated behind `MIKA_OPERATIONAL_PARTNER=1` — returns 404 when disabled.
+pub async fn handle_operational_items(
+    State(state): State<AppState>,
+    Query(query): Query<OperationalItemsQuery>,
+) -> impl IntoResponse {
+    use crate::operational::types::{OperationalItemFilter, OperationalKind, OperationalStatus};
+
+    // Feature gate
+    if !state.settings.operational_partner {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "operational partner mode is not enabled"
+            })),
+        )
+            .into_response();
+    }
+
+    let agent_id = query.agent_id.unwrap_or_else(|| "mika".to_string());
+
+    let kind = query
+        .kind
+        .as_deref()
+        .and_then(OperationalKind::from_str_opt);
+    let status = query
+        .status
+        .as_deref()
+        .and_then(OperationalStatus::from_str_opt);
+    let sort_by_priority = query.sort.as_deref() == Some("priority_desc");
+
+    let filter = OperationalItemFilter {
+        agent_id,
+        kind,
+        status,
+        owner_type: None,
+        limit: query.limit,
+        sort_by_priority,
+    };
+
+    let result = state
+        .dashboard_db
+        .with_db(move |db| db.query_operational_items(&filter))
+        .await;
+
+    match result {
+        Ok(items) => Json(serde_json::json!({
+            "items": items,
+            "count": items.len(),
+        }))
+        .into_response(),
+        Err(e) => {
+            error!(error = %e, "failed to query operational items");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "failed to query operational items"
+                })),
+            )
+                .into_response()
+        }
+    }
+}

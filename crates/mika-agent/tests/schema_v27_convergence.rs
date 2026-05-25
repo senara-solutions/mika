@@ -180,7 +180,7 @@ fn fresh_db_has_schema_meta_with_coalesce_marker() {
 // ===== Schema version =====
 
 #[test]
-fn fresh_db_is_at_v38() {
+fn fresh_db_is_at_v39() {
     let (_dir, conn) = build_fresh_db().unwrap();
 
     let version: i64 = conn
@@ -189,7 +189,7 @@ fn fresh_db_is_at_v38() {
         })
         .unwrap();
 
-    assert_eq!(version, 38, "Fresh DB must be at schema version 38");
+    assert_eq!(version, 39, "Fresh DB must be at schema version 39");
 }
 
 // ===== Index verification =====
