@@ -600,9 +600,15 @@ assert_contains "_iterate_groom_loop threads session_id to second pass" 'mika-ar
 
 # Wiring point inspection on dispatch_claude_pilot
 DISPATCH_FUNC=$(declare -f dispatch_claude_pilot)
-assert_contains "dispatch_claude_pilot reads MIKA_DISPATCH_USE_ITERATE_LOOP flag" "MIKA_DISPATCH_USE_ITERATE_LOOP" "$DISPATCH_FUNC"
-assert_contains "dispatch_claude_pilot guards iterate-loop on dev-groom skill" "dev-groom" "$DISPATCH_FUNC"
+# Sub-PR 7a: MIKA_DISPATCH_USE_ITERATE_LOOP feature flag removed — iterate loop
+# is now unconditional for the dev-groom skill (gated by SKILL check only).
+assert_not_contains "dispatch_claude_pilot no longer references MIKA_DISPATCH_USE_ITERATE_LOOP flag" "MIKA_DISPATCH_USE_ITERATE_LOOP" "$DISPATCH_FUNC"
+assert_contains "dispatch_claude_pilot still gates iterate-loop on dev-groom skill" "dev-groom" "$DISPATCH_FUNC"
 assert_contains "dispatch_claude_pilot calls _iterate_groom_loop" "_iterate_groom_loop" "$DISPATCH_FUNC"
+# Defense-in-depth: Class D recovery shim (mika#1123) still runs in
+# _run_claude_pilot for drift cases until sub-PR 7b retires it.
+RUN_CLAUDE_PILOT_FUNC=$(declare -f _run_claude_pilot)
+assert_contains "_run_claude_pilot still invokes Class D recovery shim (defense-in-depth)" "_verify_and_write_body_callout" "$RUN_CLAUDE_PILOT_FUNC"
 
 # Ordering check: iterate-loop runs AFTER _run_claude_pilot and BEFORE _push_branch.
 # Use grep -n on declare-f output; pick first occurrence of each.
