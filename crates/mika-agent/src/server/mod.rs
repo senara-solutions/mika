@@ -224,6 +224,11 @@ fn build_router(state: AppState) -> Router {
             "/skills/{skill}/variants/{provider}/{model}/diff",
             get(variants::handle_variant_diff),
         )
+        // Operational items (feature-gated behind MIKA_OPERATIONAL_PARTNER)
+        .route(
+            "/operational-items",
+            get(dashboard::handle_operational_items),
+        )
         // Variant mutation endpoints (still dashboard-auth for validate, promote needs internal)
         .route(
             "/skills/{skill}/variants/{provider}/{model}/validate",

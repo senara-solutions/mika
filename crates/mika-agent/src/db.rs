@@ -1,4 +1,5 @@
 pub mod kg_schema;
+pub mod operational;
 
 use anyhow::{Context, Result};
 use chrono::{Duration, TimeZone, Utc};
@@ -24,7 +25,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 38;
+pub const CURRENT_SCHEMA_VERSION: i64 = 39;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1157,6 +1158,11 @@ impl Database {
             info!(version = 38, "database migrated to v38");
         }
 
+        if (3..=38).contains(&version) {
+            self.migrate_v38_to_v39()?;
+            info!(version = 39, "database migrated to v39");
+        }
+
         Ok(())
     }
 
@@ -1211,7 +1217,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (38);
+            INSERT INTO schema_version (version) VALUES (39);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1779,6 +1785,35 @@ impl Database {
                 invalidated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 PRIMARY KEY (subject_entity_id, agent_id)
             );
+
+            -- Operational ledger (#1262): canonical operational-item store.
+            CREATE TABLE operational_items (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'commitment', 'decision', 'blocker', 'evidence', 'next_action')),
+                title TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('now', 'waiting', 'delegated', 'scheduled', 'at_risk', 'done')),
+                owner_type TEXT NOT NULL CHECK (owner_type IN ('user', 'mika', 'person', 'agent')),
+                owner_name TEXT,
+                priority REAL NOT NULL DEFAULT 0.0,
+                user_importance REAL NOT NULL DEFAULT 0.0,
+                due_at TEXT,
+                blocked_by TEXT,
+                next_action TEXT,
+                evidence_refs TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                source_table TEXT,
+                source_id TEXT,
+                agent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_operational_items_agent_status ON operational_items(agent_id, status);
+            CREATE INDEX idx_operational_items_agent_kind ON operational_items(agent_id, kind);
+            CREATE INDEX idx_operational_items_agent_priority ON operational_items(agent_id, priority DESC);
+            CREATE INDEX idx_operational_items_source ON operational_items(source_table, source_id);
+            CREATE UNIQUE INDEX idx_operational_items_source_unique
+                ON operational_items(agent_id, source_table, source_id)
+                WHERE source_table IS NOT NULL AND source_id IS NOT NULL;
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -4139,6 +4174,71 @@ impl Database {
         tx.commit()?;
 
         info!("v37→v38: added system_prompt_bytes column to llm_calls (mika#1217)");
+
+        Ok(())
+    }
+
+    /// v38→v39: Add `operational_items` table (mika#1262).
+    ///
+    /// Canonical operational-item ledger for the What's Next engine.
+    /// New table with indexes, no existing table changes.
+    fn migrate_v38_to_v39(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 39 {
+            return Ok(());
+        }
+
+        let has_table: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operational_items'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if !has_table {
+            tx.execute_batch(
+                "CREATE TABLE operational_items (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK (kind IN ('goal', 'task', 'commitment', 'decision', 'blocker', 'evidence', 'next_action')),
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('now', 'waiting', 'delegated', 'scheduled', 'at_risk', 'done')),
+                    owner_type TEXT NOT NULL CHECK (owner_type IN ('user', 'mika', 'person', 'agent')),
+                    owner_name TEXT,
+                    priority REAL NOT NULL DEFAULT 0.0,
+                    user_importance REAL NOT NULL DEFAULT 0.0,
+                    due_at TEXT,
+                    blocked_by TEXT,
+                    next_action TEXT,
+                    evidence_refs TEXT NOT NULL DEFAULT '[]',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    source_table TEXT,
+                    source_id TEXT,
+                    agent_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX idx_operational_items_agent_status ON operational_items(agent_id, status);
+                CREATE INDEX idx_operational_items_agent_kind ON operational_items(agent_id, kind);
+                CREATE INDEX idx_operational_items_agent_priority ON operational_items(agent_id, priority DESC);
+                CREATE INDEX idx_operational_items_source ON operational_items(source_table, source_id);
+                CREATE UNIQUE INDEX idx_operational_items_source_unique
+                    ON operational_items(agent_id, source_table, source_id)
+                    WHERE source_table IS NOT NULL AND source_id IS NOT NULL;",
+            )?;
+        }
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (39)", [])?;
+        tx.commit()?;
+
+        info!("v38→v39: added operational_items table (mika#1262)");
 
         Ok(())
     }
@@ -9816,6 +9916,7 @@ pub struct ResetAgentCounts {
     pub agent_kg_corpora: u64,
     pub kg_invalidated_no_match: u64,
     pub skill_overrides: u64,
+    pub operational_items: u64,
     pub heartbeat_sends: u64,
     pub reflection_runs: u64,
     pub customer_config: u64,
@@ -9850,6 +9951,7 @@ impl ResetAgentCounts {
             + self.agent_kg_corpora
             + self.kg_invalidated_no_match
             + self.skill_overrides
+            + self.operational_items
             + self.heartbeat_sends
             + self.reflection_runs
             + self.customer_config
@@ -9904,6 +10006,7 @@ impl Database {
             agent_kg_corpora: count("agent_kg_corpora", "agent_id", agent_id)?,
             kg_invalidated_no_match: count("kg_invalidated_no_match", "agent_id", agent_id)?,
             skill_overrides: count("skill_overrides", "agent_id", agent_id)?,
+            operational_items: count("operational_items", "agent_id", agent_id)?,
             heartbeat_sends: count("heartbeat_sends", "agent_id", agent_id)?,
             reflection_runs: count("reflection_runs", "agent_id", agent_id)?,
             customer_config: count("customer_config", "agent_id", agent_id)?,
@@ -10080,9 +10183,12 @@ impl Database {
         // -- Category 8: Skills --
         delete_by_agent!("skill_overrides", skill_overrides);
 
+        // -- Category 9: Operational ledger --
+        delete_by_agent!("operational_items", operational_items);
+
         tx.commit()?;
 
-        // -- Category 9: Post-transaction FTS5 rebuild --
+        // -- Category 10: Post-transaction FTS5 rebuild --
         // External-content FTS5 table needs explicit rebuild after base table changes.
         // If the rebuild fails, the data is already deleted (transaction committed).
         // Log a warning but return success — the FTS index will self-heal on next
@@ -15377,6 +15483,7 @@ mod tests {
                 || lower.contains("idx_kg_")
                 || lower.contains("idx_agent_kg_corpora")
                 || lower.contains("schema_meta")
+                || lower.contains("operational_items")
             {
                 continue;
             }
@@ -15455,6 +15562,7 @@ mod tests {
         db2.migrate_v35_to_v36().unwrap();
         db2.migrate_v36_to_v37().unwrap();
         db2.migrate_v37_to_v38().unwrap();
+        db2.migrate_v38_to_v39().unwrap();
 
         let final_version: i64 = db2
             .conn
