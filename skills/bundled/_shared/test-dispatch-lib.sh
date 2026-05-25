@@ -734,6 +734,114 @@ assert_contains "writer reuses Pin B has_branch signal" 'has_branch=' "$WRITER_S
 assert_contains "writer reuses Pin B has_plan signal" 'has_plan=' "$WRITER_SRC"
 assert_contains "writer reuses Pin B has_verdict signal" 'has_verdict=' "$WRITER_SRC"
 
+# --- Test: Auto-rescue scaffold exclusion (mika#1288) ---
+
+echo ""
+echo "Test: Auto-rescue excludes scaffold files (mika#1288)"
+echo "------------------------------------------------------"
+
+# Test A: Mixed content — scaffold excluded, pilot content staged
+test_auto_rescue_excludes_scaffold_files() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    # Setup: create a git repo simulating a dirty worktree
+    git -C "$test_dir" init -q
+    git -C "$test_dir" commit --allow-empty -m "initial" -q
+
+    # 1. Tracked file with a pilot modification
+    echo "original" > "$test_dir/tracked.rs"
+    git -C "$test_dir" add tracked.rs
+    git -C "$test_dir" commit -m "add tracked" -q
+    echo "modified by pilot" > "$test_dir/tracked.rs"
+
+    # 2. Scaffold file (untracked) — must NOT be staged
+    mkdir -p "$test_dir/.claude/commands"
+    echo "# scaffold" > "$test_dir/.claude/commands/mika-groom-ticket.md"
+
+    # 3. Pilot-authored new file (untracked) — must be staged
+    mkdir -p "$test_dir/src"
+    echo "fn main() {}" > "$test_dir/src/new_feature.rs"
+
+    # Exercise: run the pathspec-filtered git add
+    git -C "$test_dir" add -A -- ':!.claude/commands/' 2>/dev/null
+
+    # Assert: check what was staged
+    local staged
+    staged=$(git -C "$test_dir" diff --cached --name-only)
+
+    # Scaffold file must NOT appear in staged files
+    if echo "$staged" | grep -q '.claude/commands/'; then
+        echo "FAIL: scaffold file was staged"
+        return 1
+    fi
+
+    # Pilot-authored new file must be staged
+    if ! echo "$staged" | grep -q 'src/new_feature.rs'; then
+        echo "FAIL: pilot-authored new file was not staged"
+        return 1
+    fi
+
+    # Modified tracked file must be staged
+    if ! echo "$staged" | grep -q 'tracked.rs'; then
+        echo "FAIL: modified tracked file was not staged"
+        return 1
+    fi
+
+    echo "PASS"
+}
+
+RESULT_A=$(test_auto_rescue_excludes_scaffold_files 2>/dev/null)
+if [ "$RESULT_A" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Mixed content: scaffold excluded, pilot content staged"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Mixed content: $RESULT_A"
+fi
+
+# Test B: Scaffold-only worktree — empty index guard
+test_auto_rescue_empty_index_guard() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    # Setup: repo where the ONLY dirty content is scaffold files
+    git -C "$test_dir" init -q
+    git -C "$test_dir" commit --allow-empty -m "initial" -q
+
+    mkdir -p "$test_dir/.claude/commands"
+    echo "# scaffold only" > "$test_dir/.claude/commands/mika-groom-ticket.md"
+    echo "# another scaffold" > "$test_dir/.claude/commands/mika.md"
+
+    # Exercise: pathspec-filtered git add
+    git -C "$test_dir" add -A -- ':!.claude/commands/' 2>/dev/null
+
+    # Assert: index should be empty (diff --cached --quiet exits 0)
+    if ! git -C "$test_dir" diff --cached --quiet 2>/dev/null; then
+        echo "FAIL: index is not empty despite only scaffold files being dirty"
+        return 1
+    fi
+
+    echo "PASS"
+}
+
+RESULT_B=$(test_auto_rescue_empty_index_guard 2>/dev/null)
+if [ "$RESULT_B" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Scaffold-only worktree: empty index correctly detected"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Scaffold-only worktree: $RESULT_B"
+fi
+
+# Test C: Structural — dispatch-lib uses pathspec exclusion (not bare git add -A)
+RESCUE_BLOCK=$(sed -n '/Unit 1 (mika#1282)/,/^[[:space:]]*fi$/p' "$DISPATCH_LIB" | head -50)
+assert_contains "Rescue uses pathspec exclusion :!.claude/commands/" ":!.claude/commands/" "$RESCUE_BLOCK"
+assert_contains "Rescue has empty-index guard (diff --cached --quiet)" "diff --cached --quiet" "$RESCUE_BLOCK"
+assert_contains "Rescue uses RESCUED_FILES for message" 'RESCUED_FILES' "$RESCUE_BLOCK"
+
 # --- Summary ---
 
 echo ""
