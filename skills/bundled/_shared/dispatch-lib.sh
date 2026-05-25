@@ -699,10 +699,12 @@ ${STDERR_TAIL}"
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
 }
 
-_post_flight_push() {
-    # Unconditional push finalizer (mika#1268): after _run_claude_pilot completes,
-    # push any local-ahead commits to origin regardless of pilot exit code.
-    # Handles both first-push (no origin/$BRANCH) and existing-remote cases.
+_push_branch() {
+    # Canonical push step in dispatch-lib's git workflow (mika#1271 contract
+    # refactor; introduced as _post_flight_push in mika#1268). After
+    # _run_claude_pilot completes, push any local-ahead commits to origin
+    # regardless of pilot exit code. Handles both first-push (no origin/$BRANCH)
+    # and existing-remote cases.
 
     # Guard: repo#number mode only — free-text mode has no branch to push.
     [ -n "$REPO" ] && [ -n "$WORKTREE_DIR" ] && [ -n "$BRANCH" ] || return 0
@@ -710,7 +712,7 @@ _post_flight_push() {
     # Fetch fresh remote state. No-ops if origin/$BRANCH doesn't exist (first-push).
     git -C "$WORKTREE_DIR" fetch origin "$BRANCH" 2>/dev/null || true
 
-    # Branch on remote-ref existence (F1 fix from architect review):
+    # Branch on remote-ref existence (F1 fix from architect review on mika#1268):
     if git -C "$WORKTREE_DIR" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
         # Existing-remote case — push only if HEAD is ahead.
         local ahead
@@ -723,16 +725,16 @@ _post_flight_push() {
 
     # Push with upstream tracking (-u sets upstream on first push).
     local push_err
-    push_err=$(mktemp /tmp/post-flight-push-err-XXXXXX)
+    push_err=$(mktemp /tmp/push-branch-err-XXXXXX)
     if git -C "$WORKTREE_DIR" push -u origin "$BRANCH" 2>"$push_err"; then
-        echo "post_flight_push: pushed $BRANCH to origin" >&2
+        echo "push_branch: pushed $BRANCH to origin" >&2
         RESULT="${RESULT}
-Post-flight push: pushed to origin/$BRANCH"
+Push: pushed to origin/$BRANCH"
     else
-        echo "WARN: post_flight_push_failed for $BRANCH — commits remain local-only" >&2
+        echo "WARN: push_branch_failed for $BRANCH — commits remain local-only" >&2
         cat "$push_err" >&2
         RESULT="${RESULT}
-Post-flight push: FAILED — commits remain local-only on $BRANCH"
+Push: FAILED — commits remain local-only on $BRANCH"
     fi
     rm -f "$push_err"
 }
@@ -901,6 +903,6 @@ EOF
     _detect_plan_on_branch
     _handle_dry_run
     _run_claude_pilot "$ENTRY_COMMAND"
-    _post_flight_push
+    _push_branch
     _deliver_callback
 }
