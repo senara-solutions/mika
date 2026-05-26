@@ -789,7 +789,10 @@ fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
 
 /// Extract `<think>…</think>` block from text, returning (thinking, remaining_text).
 /// Returns `None` if no think block is found.
-fn extract_think_block(text: &str) -> Option<(String, String)> {
+///
+/// Used by both `OpenAiCompatibleProvider` and `OllamaProvider` for models that
+/// emit reasoning in `<think>` tags (e.g., DeepSeek-R1, MiniMax thinking models).
+pub(crate) fn extract_think_block(text: &str) -> Option<(String, String)> {
     let start_tag = "<think>";
     let end_tag = "</think>";
     let start = text.find(start_tag)?;
