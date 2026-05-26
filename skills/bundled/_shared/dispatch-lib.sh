@@ -662,6 +662,14 @@ _push_branch() {
     # Guard: repo#number mode only — free-text mode has no branch to push.
     [ -n "$REPO" ] && [ -n "$WORKTREE_DIR" ] && [ -n "$BRANCH" ] || return 0
 
+    # Pre-push duplicate-commit guard (mika#784)
+    if ! _check_duplicate_commits; then
+        echo "WARN: push_branch skipped — duplicate-commit guard failed for $BRANCH" >&2
+        RESULT="${RESULT}
+Push: SKIPPED — duplicate-commit guard detected patch-equivalent commits on branch that could not be auto-rebased. Manual resolution required."
+        return 1
+    fi
+
     # Fetch fresh remote state. No-ops if origin/$BRANCH doesn't exist (first-push).
     git -C "$WORKTREE_DIR" fetch origin "$BRANCH" 2>/dev/null || true
 
@@ -690,6 +698,56 @@ Push: pushed to origin/$BRANCH"
 Push: FAILED — commits remain local-only on $BRANCH"
     fi
     rm -f "$push_err"
+}
+
+_check_duplicate_commits() {
+    # Pre-push guard: detect commits on the branch that are patch-equivalent
+    # to commits already on origin/main. These duplicates cause
+    # mergeable=CONFLICTING on GitHub even though content is identical.
+    # See mika#784 for the observed failure mode.
+    #
+    # Uses git log --cherry-mark --right-only which shows commits on HEAD
+    # that do NOT have a patch-equivalent on origin/main. By inverting
+    # (--left-right --cherry-mark), we can detect commits marked as '='
+    # (equivalent on both sides).
+
+    [ -n "$WORKTREE_DIR" ] || return 0
+
+    # Fetch fresh main to compare against.
+    # Failure-open: if fetch fails (network, auth), skip the guard but warn.
+    # Rationale: don't block push on connectivity; but surface the degraded state
+    # so dispatch logs show the guard was skipped. (review-guide.md § Single Responsibility)
+    if ! git -C "$WORKTREE_DIR" fetch origin main 2>/dev/null; then
+        echo "WARN: duplicate-commit guard skipped — could not fetch origin/main" >&2
+        return 0
+    fi
+
+    # Find commits on HEAD that are patch-equivalent to commits on origin/main.
+    # --cherry-mark marks equivalent commits with '=' prefix.
+    # --right-only shows only commits on the right side (HEAD).
+    # Equivalent commits on HEAD = duplicates that will conflict.
+    local duplicates
+    duplicates=$(git -C "$WORKTREE_DIR" log --cherry-mark --right-only \
+        --format="%m %H %s" origin/main...HEAD 2>/dev/null \
+        | grep "^=" || true)
+
+    [ -z "$duplicates" ] && return 0
+
+    # Duplicates found — attempt automatic rebase to clean them up
+    echo "WARN: duplicate-commit guard found patch-equivalent commits on branch:" >&2
+    echo "$duplicates" >&2
+    echo "Attempting rebase onto origin/main to deduplicate..." >&2
+
+    if git -C "$WORKTREE_DIR" rebase origin/main 2>/dev/null; then
+        echo "Rebase succeeded — duplicate commits resolved." >&2
+        return 0
+    fi
+
+    # Rebase failed — abort and report
+    git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
+    echo "ERROR: duplicate-commit rebase failed. Branch has commits equivalent to main:" >&2
+    echo "$duplicates" >&2
+    return 1
 }
 
 # ============================================================================
