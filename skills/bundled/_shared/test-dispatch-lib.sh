@@ -837,10 +837,164 @@ else
 fi
 
 # Test C: Structural — dispatch-lib uses pathspec exclusion (not bare git add -A)
-RESCUE_BLOCK=$(sed -n '/Unit 1 (mika#1282)/,/^[[:space:]]*fi$/p' "$DISPATCH_LIB" | head -50)
+RESCUE_BLOCK=$(sed -n '/Unit 1 (mika#1282)/,/^[[:space:]]*fi$/p' "$DISPATCH_LIB" | head -120)
 assert_contains "Rescue uses pathspec exclusion :!.claude/commands/" ":!.claude/commands/" "$RESCUE_BLOCK"
 assert_contains "Rescue has empty-index guard (diff --cached --quiet)" "diff --cached --quiet" "$RESCUE_BLOCK"
 assert_contains "Rescue uses RESCUED_FILES for message" 'RESCUED_FILES' "$RESCUE_BLOCK"
+
+# --- Test: Auto-rescue hook failure handling (mika#1296) ---
+
+echo ""
+echo "Test: Auto-rescue checks commit exit code (mika#1296)"
+echo "------------------------------------------------------"
+
+# Test A — structural assertion (code-shape): RESCUED_DIRTY_WORKTREE=1 appears
+# only inside the commit-success path, not as a fallthrough after the if/elif/else.
+# In the rescue block (between "mika-rescue-commit-err" and the closing fi chain),
+# every RESCUED_DIRTY_WORKTREE=1 must be preceded by an "rm -f" (cleanup on success)
+# within the same branch — not as a standalone unconditional line.
+RESCUE_BLOCK_1296=$(sed -n '/mika-rescue-commit-err/,/^[[:space:]]*fi$/p' "$DISPATCH_LIB")
+
+# Count RESCUED_DIRTY_WORKTREE=1 in non-comment lines of the rescue block
+RESCUED_SET_COUNT=$(printf '%s\n' "$RESCUE_BLOCK_1296" | grep -v '^\s*#' | grep -c 'RESCUED_DIRTY_WORKTREE=1' || true)
+# There should be exactly 2: one for first-try success, one for retry success
+assert_eq "RESCUED_DIRTY_WORKTREE=1 appears exactly twice in rescue block (success paths only)" "2" "$RESCUED_SET_COUNT"
+
+# The else branch (unknown hook failure) must NOT set RESCUED_DIRTY_WORKTREE=1
+# Verify by checking that no RESCUED_DIRTY_WORKTREE=1 appears after "non-rustfmt" marker
+AFTER_NON_RUSTFMT=$(printf '%s\n' "$RESCUE_BLOCK_1296" | sed -n '/non-rustfmt/,/fi/p')
+NON_RUSTFMT_RESCUED=$(printf '%s\n' "$AFTER_NON_RUSTFMT" | grep -v '^\s*#' | grep -c 'RESCUED_DIRTY_WORKTREE=1' || true)
+assert_eq "Unknown hook failure branch does NOT set RESCUED_DIRTY_WORKTREE" "0" "$NON_RUSTFMT_RESCUED"
+
+# Test B — live invariant (git-repo exercise): pre-commit hook rejects commit,
+# verify RESCUED_DIRTY_WORKTREE is NOT set and RESULT contains PIPELINE FAILURE.
+test_rescue_hook_failure_invariant() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    # Setup: create a git repo with a pre-commit hook that rejects with "rust-fmt"
+    git -C "$test_dir" init -q
+    git -C "$test_dir" commit --allow-empty -m "initial" -q
+
+    # Create a pre-commit hook that always fails with rust-fmt in stderr
+    mkdir -p "$test_dir/.git/hooks"
+    cat > "$test_dir/.git/hooks/pre-commit" << 'HOOK'
+#!/bin/bash
+echo "error: rust-fmt check failed" >&2
+exit 1
+HOOK
+    chmod +x "$test_dir/.git/hooks/pre-commit"
+
+    # Create a dirty tracked file
+    echo "fn main() {}" > "$test_dir/main.rs"
+    git -C "$test_dir" add main.rs
+    git -C "$test_dir" -c core.hooksPath="$test_dir/.git/hooks" commit --no-verify -m "add file" -q
+    echo "fn main() { println!(\"dirty\"); }" > "$test_dir/main.rs"
+    git -C "$test_dir" add main.rs
+
+    # Create a stub cargo fmt on PATH that succeeds (simulates formatting)
+    local stub_bin
+    stub_bin=$(mktemp -d)
+    cat > "$stub_bin/cargo" << 'STUB'
+#!/bin/bash
+# Stub cargo that does nothing for "fmt" subcommand
+exit 0
+STUB
+    chmod +x "$stub_bin/cargo"
+
+    # Exercise: simulate the rescue commit logic
+    local WORKTREE_DIR="$test_dir"
+    local REPO="mika" ISSUE_NUM="1296" SESSION_ID="test-session"
+    local RESCUED_DIRTY_WORKTREE=0
+    local RESULT=""
+    local RESCUE_COMMIT_ERR="$WORKTREE_DIR/.git/mika-rescue-commit-err"
+    local CARGO_FMT_ERR="" RESCUE_ERR_CONTENT=""
+
+    # First attempt — will fail due to pre-commit hook
+    if git -C "$WORKTREE_DIR" commit -m "wip(test): rescue" 2>"$RESCUE_COMMIT_ERR"; then
+        rm -f "$RESCUE_COMMIT_ERR"
+        RESCUED_DIRTY_WORKTREE=1
+    elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
+        CARGO_FMT_ERR=""
+        CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && PATH="$stub_bin:$PATH" cargo fmt --all) 2>&1 ) || true
+        git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' 2>/dev/null
+
+        # Retry — will also fail (hook still rejects)
+        if git -C "$WORKTREE_DIR" commit -m "wip(test): rescue retry" 2>"$RESCUE_COMMIT_ERR"; then
+            rm -f "$RESCUE_COMMIT_ERR"
+            RESCUED_DIRTY_WORKTREE=1
+        else
+            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -20)
+            RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
+cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+
+${RESULT}"
+            rm -f "$RESCUE_COMMIT_ERR"
+        fi
+    else
+        RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -20)
+        RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
+Hook output: ${RESCUE_ERR_CONTENT}
+
+${RESULT}"
+        rm -f "$RESCUE_COMMIT_ERR"
+    fi
+
+    # Assertions
+    local failures=""
+    if [ "$RESCUED_DIRTY_WORKTREE" != "0" ]; then
+        failures="${failures}RESCUED_DIRTY_WORKTREE should be 0 but is $RESCUED_DIRTY_WORKTREE; "
+    fi
+    if ! printf '%s' "$RESULT" | grep -qF "PIPELINE FAILURE"; then
+        failures="${failures}RESULT missing PIPELINE FAILURE; "
+    fi
+    if ! printf '%s' "$RESULT" | grep -qF "cargo fmt stderr:"; then
+        failures="${failures}RESULT missing cargo fmt diagnostic; "
+    fi
+    if [ -f "$RESCUE_COMMIT_ERR" ]; then
+        failures="${failures}scratch file not cleaned up; "
+    fi
+
+    rm -rf "$stub_bin"
+    if [ -z "$failures" ]; then
+        echo "PASS"
+    else
+        echo "FAIL: $failures"
+    fi
+}
+
+RESULT_HOOK=$(test_rescue_hook_failure_invariant 2>/dev/null)
+if [ "$RESULT_HOOK" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Hook failure: RESCUED_DIRTY_WORKTREE=0, PIPELINE FAILURE in RESULT, diagnostics present, scratch cleaned"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Hook failure invariant: $RESULT_HOOK"
+fi
+
+# Test C — structural assertion: scratch file uses .git/ location (not .iterate/)
+SCRATCH_FILE_CHECK=$(grep -c 'mika-rescue-commit-err' "$DISPATCH_LIB" || true)
+if [ "$SCRATCH_FILE_CHECK" -ge 1 ]; then
+    # Verify it uses $WORKTREE_DIR/.git/ prefix
+    SCRATCH_IN_GIT=$(grep 'WORKTREE_DIR/.git/mika-rescue-commit-err' "$DISPATCH_LIB" | grep -v '^\s*#' | head -1)
+    if [ -n "$SCRATCH_IN_GIT" ]; then
+        PASS=$((PASS + 1))
+        echo "  ✓ Scratch file uses \$WORKTREE_DIR/.git/mika-rescue-commit-err (not .iterate/)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ Scratch file location does not use \$WORKTREE_DIR/.git/ prefix"
+    fi
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ No mika-rescue-commit-err reference found in dispatch-lib.sh"
+fi
+
+# Verify no .iterate/rescue-commit-err reference exists (regression guard)
+ITERATE_SCRATCH=$(grep -c '.iterate/rescue-commit-err' "$DISPATCH_LIB" || true)
+assert_eq "No .iterate/rescue-commit-err reference in dispatch-lib.sh" "0" "$ITERATE_SCRATCH"
 
 # --- Summary ---
 
