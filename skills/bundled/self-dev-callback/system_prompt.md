@@ -6,9 +6,30 @@ When you receive a callback result from a completed background task (`run_claude
 
 > **CALLBACK TYPE DETECTION (MANDATORY — before any other processing):**
 > Call `check_task(task_id)` and read the `label` field:
+> - `long_running:run_claude_pilot_groom...` → dev-groom callback (process per groom path below).
 > - `long_running:run_claude_pilot...` → claude-pilot callback (process per claude-pilot path below).
 > - `long_running:deploy_mika...` → deploy hook callback (skip metadata extraction; advance/pause per milestone context).
 > - Other → treat as claude-pilot callback (fallback).
+
+> **GROOM CALLBACK HANDLER (early-return path — mika#1289):**
+> When the label matches `long_running:run_claude_pilot_groom`, handle the dev-groom callback here. Do NOT fall through to the dev-pilot success/failure paths below.
+>
+> 1. **Extract repo and issue number:** From `check_task(task_id)` read `reference_url`. Parse `senara-solutions/<repo>/issues/<n>` from the URL (strip any `?phase=groom` suffix).
+>
+> 2. **Body-marker GROOMED check (MUST run BEFORE any `PIPELINE FAILURE:` routing):**
+>    Call `run_gh("issue view <n> --repo senara-solutions/<repo> --json body --jq '.body'")`.
+>    Check for the `second-pass (GROOMED)` structural marker in the body text (written by `_write_canonical_callout`, sole writer per mika#1282 — same signal the dispatch gate uses).
+>
+>    - **If `second-pass (GROOMED)` IS present → GROOMED success:**
+>      a. Call `update_task_status(task_id, "completed")` to mark the groom task done (frees groom dispatch slot — independent from implement slot per mika#1001).
+>      b. Call `run_gh("issue edit <n> --add-label ready --repo senara-solutions/<repo>")` to re-add the `ready` label. This re-triggers the ready-label webhook handler, which finds the groomed body callout and dispatches dev-pilot.
+>      c. Call `send_message`: "Auto-groom completed for {repo}#{n}. Re-added `ready` label to trigger dev-pilot dispatch."
+>      d. Stop the turn. The ready-label webhook handler takes over from here.
+>      **Do NOT check the callback result text for `PIPELINE FAILURE:` or `Outcome:` lines — the body marker is authoritative.**
+>
+>    - **If `second-pass (GROOMED)` is ABSENT → failure routing:**
+>      - If the callback result text contains `PIPELINE FAILURE:` prefix → route to the "On pipeline failure" handler below (same retry logic and escalation threshold apply to groom callbacks).
+>      - Otherwise → route to the "On failure" handler below (Step 4.5).
 
 > **CRITICAL: DO NOT end your turn after receiving a callback.** Make at least one tool call before EndTurn. Engine rejects zero-tool-call callbacks (#870).
 

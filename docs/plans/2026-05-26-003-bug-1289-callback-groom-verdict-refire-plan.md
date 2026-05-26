@@ -1,7 +1,7 @@
 ---
 title: "bug: Add groom callback verdict handling to self-dev-callback"
 type: fix
-status: active
+status: completed
 date: 2026-05-26
 ---
 
@@ -21,8 +21,8 @@ Two instances observed on 2026-05-25: mika#897 (23:05Z) and mika#1288 (23:32Z). 
 
 ## Requirements Trace
 
-- R1. When dev-groom callback delivers with `Outcome: PLAN_GROOMED`, mika-dev must auto-fire dev-pilot without operator intervention
-- R2. When dev-groom callback delivers with `PIPELINE FAILURE:` or failure, follow existing failure/retry paths
+- R1. When dev-groom callback arrives and the issue body contains the `second-pass (GROOMED)` structural marker (written by `_write_canonical_callout`, sole writer per mika#1282), mika-dev must auto-fire dev-pilot without operator intervention — regardless of whether `PIPELINE FAILURE:` is also present in the callback result text
+- R2. When dev-groom callback has no body-level GROOMED marker AND contains `PIPELINE FAILURE:` or failure signals, follow existing failure/retry paths
 - R3. Parent task must NOT end in `blocked` after successful groom — it should transition through `in_progress` (during dev-pilot) to a terminal state
 - R4. Must compose with the existing milestone/project context check (self-dev-callback lines 19-27)
 - R5. Must satisfy the `callback_terminal_action` engine guard (requires both `update_task_status` AND `send_message`)
@@ -43,12 +43,16 @@ Two instances observed on 2026-05-25: mika#897 (23:05Z) and mika#1288 (23:32Z). 
 - `skills/bundled/_shared/dispatch-lib.sh` — line 553-561: on dev-groom success with valid plan, callback result contains `Outcome: PLAN_GROOMED — <plan_path>`. Line 545-548: on pipeline failure, result contains `PIPELINE FAILURE:` prefix and `Outcome: PIPELINE_INCOMPLETE`.
 - `skills/bundled/self-dev-webhook-ready-label/system_prompt.md` — line 23: groom tasks use `reference_url` with `?phase=groom` suffix to distinguish from dispatch tasks.
 
-### Callback Result Signals
+### Callback Result Signals and Body Markers
 
 The dispatch-lib appends structured `Outcome:` lines to the callback result:
 - `Outcome: PLAN_GROOMED — <plan_path>` — groom succeeded, plan on branch, body callout written
 - `Outcome: PIPELINE_INCOMPLETE — manual recovery needed.` — groom failed (prefixed by `PIPELINE FAILURE:`)
 - `Outcome: UNKNOWN — inspect worktree manually.` — ambiguous result
+
+**Critical: `Outcome:` lines are unreliable for GROOMED detection when `PIPELINE FAILURE:` co-occurs.** dispatch-lib outcome classification (lines 541-566) checks `PIPELINE FAILURE:` first — when present, `Outcome: PIPELINE_INCOMPLETE` is written regardless of whether a valid plan exists. The documented bug instances (mika#897, mika#1288) had `PIPELINE FAILURE: dev-groom produced a plan file but no /ce:plan invocation detected` co-present with `Verdict: GROOMED`, causing dispatch-lib to emit `Outcome: PIPELINE_INCOMPLETE` instead of `Outcome: PLAN_GROOMED`.
+
+**Authoritative GROOMED signal: issue body `second-pass (GROOMED)` structural marker.** Written by `_write_canonical_callout` (dispatch-lib.sh line 831+, sole writer per mika#1282). The marker lives in the issue body, not the callback result text, making it immune to result-text pollution from pipeline validation checks. Detection regex (matching dispatch-lib line 898): `second-pass \(GROOMED\)`. This is the same three-signal check (`Branch:` + `docs/plans/` + `second-pass (GROOMED)`) that the dispatch gate (`executor.rs::check_grooming_markers`, Pin B) uses.
 
 ### Callback Type Detection
 
@@ -67,9 +71,11 @@ The documented re-entry (step 3e) says to re-enter the Ready-Label Dispatch hand
 - **Groom detection via label prefix:** Use `long_running:run_claude_pilot_groom` label prefix to detect groom callbacks, consistent with the existing `long_running:run_claude_pilot` and `long_running:deploy_mika` detection pattern at lines 7-11.
 - **Re-entry via `ready` label re-add:** Per the documented contract in `self-dev-webhook-ready-label` step 3e, re-entry is achieved by re-adding the `ready` label. This keeps dispatch logic in one place (the ready-label handler) rather than duplicating `create_task` + `run_claude_pilot` inline.
 - **Groom task completion before re-entry:** Mark the groom task `completed` before re-adding the label. This frees the groom dispatch slot and ensures the ready-label handler's subsequent `run_claude_pilot` call doesn't hit `global_dispatch_active` for the groom class.
-- **`Outcome:` line as primary success signal:** Parse `Outcome: PLAN_GROOMED` from the callback result text rather than checking the issue body. The callback result is the authoritative signal from dispatch-lib; the body callout is a downstream artifact.
-- **Failure routing:** Groom callbacks with `PIPELINE FAILURE:` prefix follow the existing pipeline failure path (lines 64-69) — same retry logic, same escalation threshold. Groom callbacks with non-PIPELINE_FAILURE failures follow the existing failure path (lines 78, 85-108).
+- **Issue body `second-pass (GROOMED)` marker as primary success signal:** Parse the issue body (via `run_gh("issue view <n> --json body")`) for the `second-pass (GROOMED)` structural marker, NOT the callback result text's `Outcome:` line. Rationale: the documented failing instances (mika#897, mika#1288) had `PIPELINE FAILURE:` in the result text (from dispatch-lib's /ce:plan invocation check, lines 491-506) co-present with `Verdict: GROOMED` (from the iterate loop). dispatch-lib's outcome classifier (lines 541-566) checks `PIPELINE FAILURE:` first, so it emits `Outcome: PIPELINE_INCOMPLETE` — never `Outcome: PLAN_GROOMED` — when both conditions hold. The body marker `second-pass (GROOMED)` is written by `_write_canonical_callout` (sole writer, mika#1282), is immune to result-text pollution, and is the same signal the dispatch gate (`check_grooming_markers`, Pin B) uses.
+- **GROOMED check takes precedence over `PIPELINE FAILURE:` routing:** The groom handler's body-marker check runs before any `PIPELINE FAILURE:` routing. If `second-pass (GROOMED)` is present in the issue body, the callback is treated as GROOMED success regardless of result text content. Only when the body marker is absent does the handler fall through to `PIPELINE FAILURE:` / failure routing. This directly addresses the documented failure mode where `PIPELINE FAILURE:` from the /ce:plan check (a diagnostic, not a verdict) masked the architect's GROOMED verdict.
+- **Failure routing (body marker absent):** Groom callbacks without the body GROOMED marker and with `PIPELINE FAILURE:` prefix follow the existing pipeline failure path (lines 64-69) — same retry logic, same escalation threshold. Groom callbacks with non-PIPELINE_FAILURE failures follow the existing failure path (lines 78, 85-108).
 - **Extract repo and issue number from task context:** Use `check_task(task_id)` to get `reference_url`, parse `senara-solutions/<repo>/issues/<n>` from it. The `?phase=groom` suffix confirms groom context.
+- **Dispatch slot independence verified:** mika#1001 (per-class dispatch slot split) is merged — confirmed by `tasks.dispatch_class` column present in codebase (v33→v34 migration). Groom and implement dispatch classes are independent; completing the groom task frees the `groom` slot, and the ready-label handler's subsequent dispatch uses the `implement` slot.
 
 ## Open Questions
 
@@ -85,7 +91,7 @@ The documented re-entry (step 3e) says to re-enter the Ready-Label Dispatch hand
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add groom callback detection and handling to self-dev-callback**
+- [x] **Unit 1: Add groom callback detection and handling to self-dev-callback**
 
 **Goal:** Add a groom-specific callback handling path that detects dev-groom callbacks, parses the outcome, and re-fires dev-pilot via ready-label re-add on GROOMED success.
 
@@ -102,21 +108,24 @@ Insert a new groom callback handler block after the callback type detection (lin
 
 1. **Detection:** After `check_task(task_id)`, if the `label` field starts with `long_running:run_claude_pilot_groom`, this is a groom callback. Proceed with groom-specific handling instead of falling through to the dev-pilot paths.
 
-2. **Outcome parsing:** Check the callback result text for `Outcome:` line signals:
-   - `Outcome: PLAN_GROOMED` → success path (step 3 below)
-   - `PIPELINE FAILURE:` prefix → route to existing pipeline failure handler (lines 64-69). The groom task's retry semantics are identical to dev-pilot pipeline failures.
-   - Other failure signals → route to existing failure handler (lines 78+)
+2. **Body-marker GROOMED check (MUST run before any `PIPELINE FAILURE:` routing):**
+   a. Extract repo and issue number from the groom task's `reference_url` (parse `senara-solutions/<repo>/issues/<n>` — strip `?phase=groom` suffix).
+   b. Read the issue body via `run_gh("issue view <n> --repo senara-solutions/<repo> --json body --jq '.body'")`.
+   c. Check for the `second-pass (GROOMED)` structural marker in the body text (regex: `second-pass \(GROOMED\)`). This marker is written by `_write_canonical_callout` (dispatch-lib.sh line 831+, sole writer per mika#1282) and is the same signal the dispatch gate (`check_grooming_markers`, Pin B) uses.
+   d. If `second-pass (GROOMED)` is present → GROOMED success path (step 3 below). **Do not check the callback result text for `PIPELINE FAILURE:` or `Outcome:` lines — the body marker is authoritative.**
+   e. If `second-pass (GROOMED)` is absent → fall through to failure routing:
+      - If callback result text contains `PIPELINE FAILURE:` prefix → route to existing pipeline failure handler (lines 64-69). The groom task's retry semantics are identical to dev-pilot pipeline failures.
+      - Other failure signals → route to existing failure handler (lines 78+).
 
 3. **GROOMED success path (R1, R3):**
-   a. Extract repo and issue number from the groom task's `reference_url` (parse `senara-solutions/<repo>/issues/<n>` — strip `?phase=groom` suffix).
-   b. Call `update_task_status(task_id, "completed")` to mark the groom task done. This frees the groom dispatch slot.
-   c. Call `run_gh("issue edit <n> --add-label ready --repo senara-solutions/<repo>")` to re-add the `ready` label. This triggers the ready-label webhook handler, which will find the groomed body callout and dispatch dev-pilot.
-   d. Call `send_message` to notify: "Auto-groom completed for {repo}#{n}. Re-added `ready` label to trigger dev-pilot dispatch."
-   e. Stop the turn. The ready-label webhook handler takes over from here.
+   a. Call `update_task_status(task_id, "completed")` to mark the groom task done. This frees the groom dispatch slot (independent from implement slot per mika#1001, v33→v34 migration — `tasks.dispatch_class` column verified in codebase).
+   b. Call `run_gh("issue edit <n> --add-label ready --repo senara-solutions/<repo>")` to re-add the `ready` label. This triggers the ready-label webhook handler, which will find the groomed body callout (Branch + Plan + `second-pass (GROOMED)`) and dispatch dev-pilot.
+   c. Call `send_message` to notify: "Auto-groom completed for {repo}#{n}. Re-added `ready` label to trigger dev-pilot dispatch."
+   d. Stop the turn. The ready-label webhook handler takes over from here.
 
 4. **Milestone/project composition (R4):** The existing milestone/project context check (lines 19-27) runs before this groom handler. When milestone context is detected AND the callback is a groom callback, the re-entry via ready-label re-add still works — the webhook handler creates a new dispatch task that inherits the milestone parent context through the existing `reference_url` dedup mechanism.
 
-5. **Engine guard satisfaction (R5):** The GROOMED path calls both `update_task_status` (step 3b) and `send_message` (step 3d), satisfying the `callback_terminal_action` guard.
+5. **Engine guard satisfaction (R5):** The GROOMED path calls both `update_task_status` (step 3b) and `send_message` (step 3c), satisfying the `callback_terminal_action` guard.
 
 **Patterns to follow:**
 - The existing callback type detection block at lines 7-11 for detection style
@@ -124,15 +133,18 @@ Insert a new groom callback handler block after the callback type detection (lin
 - The existing success handler at lines 71-76 for notification + status update pattern
 
 **Test scenarios:**
-- Happy path: Groom callback with `Outcome: PLAN_GROOMED` in result → groom task marked `completed`, `ready` label re-added, notification sent, turn stops
-- Error path: Groom callback with `PIPELINE FAILURE:` prefix → routes to existing pipeline failure handler (retry or escalate)
-- Error path: Groom callback with non-structured failure → routes to existing failure handler
-- Integration: After `ready` label re-add, the ready-label webhook handler fires, finds `Plan: docs/plans/` in body, and dispatches dev-pilot (not testable in prompt-only change — verified by end-to-end observation per acceptance criteria)
+- Happy path: Groom callback with `second-pass (GROOMED)` in issue body → groom task marked `completed`, `ready` label re-added, notification sent, turn stops — regardless of whether callback result text contains `PIPELINE FAILURE:` (this is the exact bug scenario from mika#897 and mika#1288)
+- Happy path: Groom callback with `second-pass (GROOMED)` in body AND `Outcome: PLAN_GROOMED` in result (no `PIPELINE FAILURE:`) → same GROOMED success path
+- Error path: Groom callback with NO `second-pass (GROOMED)` in body AND `PIPELINE FAILURE:` prefix in result → routes to existing pipeline failure handler (retry or escalate)
+- Error path: Groom callback with NO `second-pass (GROOMED)` in body AND non-structured failure → routes to existing failure handler
+- Integration: After `ready` label re-add, the ready-label webhook handler fires, finds `Plan: docs/plans/` + `second-pass (GROOMED)` in body, and dispatches dev-pilot (not testable in prompt-only change — verified by end-to-end observation per acceptance criteria)
 
 **Verification:**
 - The self-dev-callback prompt contains a groom callback detection clause matching `long_running:run_claude_pilot_groom`
+- The GROOMED detection uses the issue body `second-pass (GROOMED)` marker (via `run_gh issue view`), NOT the callback result text's `Outcome:` line
+- The body-marker check runs BEFORE any `PIPELINE FAILURE:` routing — GROOMED takes precedence when the body marker is present
 - The GROOMED success path calls `update_task_status`, `run_gh` (label re-add), and `send_message`
-- The pipeline failure path routes to the existing retry/escalate logic
+- When the body marker is absent, the pipeline failure path routes to the existing retry/escalate logic
 - No existing dev-pilot callback handling is changed
 
 ## System-Wide Impact
@@ -140,7 +152,7 @@ Insert a new groom callback handler block after the callback type detection (lin
 - **Interaction graph:** Groom callback → self-dev-callback (new handler) → `run_gh` label re-add → GitHub webhook → self-dev-webhook-ready-label → dev-pilot dispatch. The chain is two webhook hops total.
 - **Error propagation:** Groom failures route to the existing pipeline failure handler — no new failure paths introduced.
 - **State lifecycle risks:** The groom task is marked `completed` before the label re-add. If the label re-add fails (GitHub API error), the groom task is done but dev-pilot never fires. The operator can manually re-add the `ready` label as the existing workaround. This is acceptable — the failure mode is no worse than today, and the common path succeeds.
-- **Dispatch slot interaction:** Marking the groom task `completed` frees the groom dispatch slot before the ready-label handler fires. The ready-label handler creates a new implement-class dispatch task, using the implement slot. The two dispatch classes are independent (per mika#1001 per-class slot split).
+- **Dispatch slot interaction:** Marking the groom task `completed` frees the groom dispatch slot before the ready-label handler fires. The ready-label handler creates a new implement-class dispatch task, using the implement slot. The two dispatch classes are independent per mika#1001 per-class slot split — verified merged: `tasks.dispatch_class TEXT` column present in codebase via v33→v34 migration, referenced in `crates/mika-agent/src/tools/{create_task,update_task_status,mod,pr_merge_with_gate,create_scheduled_task}.rs`.
 - **Unchanged invariants:** The dev-pilot callback path (lines 31-112) is completely unchanged. The ready-label handler's dispatch logic (steps 1-5) is unchanged. The dispatch-lib callback result format is unchanged.
 
 ## Risks & Dependencies
@@ -155,3 +167,7 @@ Insert a new groom callback handler block after the callback type detection (lin
 - Related issues: mika#1289 (this bug), mika#996 (auto-groom on dispatch), mika#1271 (contract refactor)
 - Evidence: mika#897 dispatch 2026-05-25 23:05Z, mika#1288 dispatch 2026-05-25 23:32Z
 - Related code: `skills/bundled/self-dev-callback/system_prompt.md`, `skills/bundled/self-dev-webhook-ready-label/system_prompt.md`, `skills/bundled/_shared/dispatch-lib.sh`
+
+## Revision history
+
+- rev 2 (2026-05-26): addressed F1 by restructuring GROOMED detection to use the issue body's `second-pass (GROOMED)` structural marker (written by `_write_canonical_callout`, sole writer per mika#1282) checked BEFORE any `PIPELINE FAILURE:` routing — the body marker is immune to result-text pollution from dispatch-lib's /ce:plan invocation check (lines 491-506) that caused the documented misrouting in mika#897 and mika#1288; addressed F2 by replacing `Outcome: PLAN_GROOMED` detection with the body marker `second-pass (GROOMED)` — the `Outcome:` line is unreliable because dispatch-lib's outcome classifier (lines 541-566) emits `PIPELINE_INCOMPLETE` instead of `PLAN_GROOMED` when `PIPELINE FAILURE:` co-occurs, matching the exact failure mode in the bug report; addressed F3 by verifying mika#1001 merge status — `tasks.dispatch_class TEXT` column present in codebase via v33→v34 migration, referenced in 5 tool modules under `crates/mika-agent/src/tools/`.
