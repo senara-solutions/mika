@@ -494,12 +494,13 @@ pub fn new_delivery_cache() -> Arc<std::sync::Mutex<lru::LruCache<String, ()>>> 
 pub(crate) enum ForwardResult {
     /// 200 or 202 — agent accepted the event.
     Success,
-    /// 429 or 5xx, or a request timeout — transient, worth retrying.
+    /// 429 or 5xx, request timeout, or localhost connection error (agent may be
+    /// restarting during deploy, #1293) — transient, worth retrying.
     Retryable {
-        /// Human-readable description for logging (e.g. "HTTP 429" or "request timeout").
+        /// Human-readable description for logging (e.g. "HTTP 429" or "connection error").
         reason: String,
     },
-    /// 4xx (other than 429), connection error (agent offline), or unresolvable route —
+    /// 4xx (other than 429), non-localhost connection error, or unresolvable route —
     /// retrying will not help.
     Permanent {
         /// Human-readable description for logging.
@@ -951,9 +952,20 @@ pub(crate) async fn forward_to_resolved_route(
         }
         Err(e) => {
             if e.is_connect() {
-                // Connection refused / DNS failure — agent is offline, retrying won't help.
-                ForwardResult::Permanent {
-                    reason: format!("connection error: {e}"),
+                // Connection refused to a local agent — may be restarting during deploy.
+                // Retry with backoff; if all retries fail the event falls through to DLQ.
+                // Scoped to localhost per mika#1293 — extend to other routes if the
+                // same pattern is observed (see issue "Out of scope").
+                let is_localhost = route.container_url.starts_with("http://localhost")
+                    || route.container_url.starts_with("http://127.0.0.1");
+                if is_localhost {
+                    ForwardResult::Retryable {
+                        reason: format!("connection error (localhost, retryable): {e}"),
+                    }
+                } else {
+                    ForwardResult::Permanent {
+                        reason: format!("connection error: {e}"),
+                    }
                 }
             } else {
                 // Timeout or other transient network error — worth retrying.
@@ -968,7 +980,8 @@ pub(crate) async fn forward_to_resolved_route(
 /// Retry wrapper for GitHub webhook delivery.
 ///
 /// Calls [`forward_to_resolved_route`] once using the caller's semaphore permit.
-/// On a retryable failure (429, 5xx, or request timeout), releases the permit,
+/// On a retryable failure (429, 5xx, request timeout, or localhost connection
+/// error — see #1293), releases the permit,
 /// sleeps for the next delay in [`RETRY_DELAYS`] (with jitter), re-acquires a
 /// permit, and retries.
 ///
@@ -2248,7 +2261,21 @@ mod tests {
     }
 
     #[test]
-    fn test_forward_result_permanent_connection_error() {
+    fn test_forward_result_localhost_connection_error_is_retryable() {
+        // mika#1293: localhost connection errors are retryable (agent may be restarting).
+        let r = ForwardResult::Retryable {
+            reason: "connection error (localhost, retryable): connection refused".to_string(),
+        };
+        assert!(r.is_retryable());
+        assert_eq!(
+            r.reason(),
+            Some("connection error (localhost, retryable): connection refused")
+        );
+    }
+
+    #[test]
+    fn test_forward_result_non_localhost_connection_error_remains_permanent() {
+        // Non-localhost connection errors remain permanent per mika#1293 scope.
         let r = ForwardResult::Permanent {
             reason: "connection error: connection refused".to_string(),
         };
@@ -2262,6 +2289,67 @@ mod tests {
             reason: "network error: request timeout".to_string(),
         };
         assert!(r.is_retryable());
+    }
+
+    // -- Connection error classification tests (mika#1293) --
+    //
+    // These test the actual `forward_to_resolved_route` function to verify that
+    // localhost connection errors are Retryable and non-localhost are Permanent.
+
+    #[tokio::test]
+    async fn test_localhost_connection_error_is_retryable_integration() {
+        // Connect to a port that refuses connections (no server listening).
+        // Uses 127.0.0.1 to avoid DNS resolution — a refused TCP connection
+        // triggers `e.is_connect()` in reqwest.
+        let state = test_state_with_base_url("http://127.0.0.1:1");
+        let route = ResolvedRoute {
+            container_url: "http://127.0.0.1:1".to_string(),
+            agent_mapping: serde_json::json!({}),
+        };
+
+        let result = forward_to_resolved_route(
+            &state,
+            &route,
+            "mika-dev",
+            "test event",
+            "delivery-conn-localhost",
+            Some("org/repo"),
+        )
+        .await;
+
+        assert!(
+            matches!(result, ForwardResult::Retryable { .. }),
+            "localhost connection error should be Retryable, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_localhost_connection_error_remains_permanent_integration() {
+        // Use 127.0.0.2:1 — still on the loopback interface (triggers TCP RST /
+        // connection refused, so `is_connect()` returns true), but does NOT match
+        // our localhost check (`starts_with("http://localhost")` or
+        // `starts_with("http://127.0.0.1")`). This exercises the non-localhost
+        // branch of the classification logic.
+        let state = test_state_with_base_url("http://127.0.0.2:1");
+        let route = ResolvedRoute {
+            container_url: "http://127.0.0.2:1".to_string(),
+            agent_mapping: serde_json::json!({}),
+        };
+
+        let result = forward_to_resolved_route(
+            &state,
+            &route,
+            "mika-dev",
+            "test event",
+            "delivery-conn-remote",
+            Some("org/repo"),
+        )
+        .await;
+
+        assert!(
+            matches!(result, ForwardResult::Permanent { .. }),
+            "non-localhost connection error should be Permanent, got: {result:?}"
+        );
     }
 
     // -- Retry schedule tests --
