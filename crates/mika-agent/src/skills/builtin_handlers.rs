@@ -1632,6 +1632,29 @@ const QA_REVIEW_GH_ALLOWED: &[(&str, &str)] = &[
     ("issue", "view"),
 ];
 
+/// Allowed read-only `gh api` endpoint patterns (mika#805).
+///
+/// Only GET requests matching one of these patterns are permitted.
+/// Patterns use regex; leading `/` is optional (gh CLI accepts both forms).
+/// Compiled once via `LazyLock` — malformed patterns surface immediately on
+/// first use rather than silently denying all requests.
+const GH_API_READ_ALLOWED_PATTERNS: &[&str] = &[
+    r"^/?repos/[^/]+/[^/]+/branches/[^/]+$",
+    r"^/?repos/[^/]+/[^/]+/branches$",
+    r"^/?repos/[^/]+/[^/]+/commits/[a-fA-F0-9]+$",
+];
+
+static GH_API_READ_COMPILED: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
+    GH_API_READ_ALLOWED_PATTERNS
+        .iter()
+        .map(|p| {
+            regex::Regex::new(p).unwrap_or_else(|e| {
+                panic!("BUG: malformed GH_API_READ_ALLOWED_PATTERNS regex '{p}': {e}")
+            })
+        })
+        .collect()
+});
+
 // ---------------------------------------------------------------------------
 // Logical-key → argv-extractor table (mika#899)
 // ---------------------------------------------------------------------------
@@ -1832,6 +1855,45 @@ fn validate_qa_review_gh_scope(args: &[String], ctx: &ToolContext<'_>) -> Result
     )))
 }
 
+/// Validate `gh api` invocations: GET-only + path allowlist (mika#805).
+///
+/// Extracts the HTTP method (default GET) and the API path from argv.
+/// Rejects non-GET methods and paths that don't match any allowed pattern.
+fn validate_gh_api_scope(args: &[String]) -> Result<(), ToolOutput> {
+    if args.first().map(String::as_str) != Some("api") {
+        return Ok(());
+    }
+
+    let method = extract_api_method(args);
+    if !method.eq_ignore_ascii_case("GET") {
+        return Err(ToolOutput::error(format!(
+            "gh api method '{method}' is not allowed. Only GET requests are permitted \
+             through run_gh. Use the appropriate gh subcommand (e.g., gh issue, gh pr) \
+             for write operations."
+        )));
+    }
+
+    // Extract the API path: first positional arg after "api" that doesn't start with "-"
+    let path = args
+        .iter()
+        .skip(1)
+        .find(|s| !s.starts_with('-'))
+        .map(String::as_str)
+        .unwrap_or("");
+
+    let matched = GH_API_READ_COMPILED.iter().any(|re| re.is_match(path));
+
+    if !matched {
+        return Err(ToolOutput::error(format!(
+            "gh api path '{path}' is not in the read-only allowlist. \
+             Allowed: repos/{{owner}}/{{repo}}/branches[/{{branch}}], \
+             repos/{{owner}}/{{repo}}/commits/{{sha}}."
+        )));
+    }
+
+    Ok(())
+}
+
 /// Extract the HTTP method from a `gh api` argv.
 ///
 /// Scans for `--method X` or `--method=X` (also `-X` shorthand). Defaults to `"GET"`
@@ -1866,6 +1928,12 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // Skill-scoped scope check (mika#1196): when qa-review is in the active
     // skill set, restrict to the narrow allowlist before any side effects.
     if let Err(err) = validate_qa_review_gh_scope(&gh_args.args, ctx) {
+        return err;
+    }
+
+    // gh api read-only scope check (mika#805): restrict api subcommand to
+    // GET-only against allowed endpoint patterns.
+    if let Err(err) = validate_gh_api_scope(&gh_args.args) {
         return err;
     }
 
@@ -2783,10 +2851,13 @@ mod tests {
     #[test]
     fn test_run_gh_allowlist_accepts_api() {
         let input = serde_json::json!({
-            "command": ["api", "/repos/owner/repo/milestones/1", "--method", "PATCH", "-f", "state=closed"]
+            "command": ["api", "repos/owner/repo/branches/main"]
         });
         let result = validate_gh_input(&input);
-        assert!(result.is_ok(), "gh api should be allowed");
+        assert!(
+            result.is_ok(),
+            "gh api should be allowed at input validation level"
+        );
     }
 
     #[test]
@@ -2818,6 +2889,96 @@ mod tests {
             .map(String::from)
             .collect();
         assert_eq!(extract_api_method(&args), "GET");
+    }
+
+    // -- validate_gh_api_scope tests (mika#805) --
+
+    #[test]
+    fn test_gh_api_get_branches_allowed() {
+        let args = str_args(&["api", "repos/senara-solutions/mika/branches/main"]);
+        assert!(validate_gh_api_scope(&args).is_ok());
+    }
+
+    #[test]
+    fn test_gh_api_get_branches_list_allowed() {
+        let args = str_args(&["api", "repos/senara-solutions/mika/branches"]);
+        assert!(validate_gh_api_scope(&args).is_ok());
+    }
+
+    #[test]
+    fn test_gh_api_get_commit_allowed() {
+        let args = str_args(&["api", "repos/senara-solutions/mika/commits/abc123def"]);
+        assert!(validate_gh_api_scope(&args).is_ok());
+    }
+
+    #[test]
+    fn test_gh_api_leading_slash_allowed() {
+        let args = str_args(&["api", "/repos/senara-solutions/mika/branches/main"]);
+        assert!(validate_gh_api_scope(&args).is_ok());
+    }
+
+    #[test]
+    fn test_gh_api_patch_rejected() {
+        let args = str_args(&[
+            "api",
+            "repos/o/r/branches/main",
+            "--method",
+            "PATCH",
+            "-f",
+            "protection=false",
+        ]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("Only GET requests"));
+    }
+
+    #[test]
+    fn test_gh_api_post_rejected() {
+        let args = str_args(&["api", "repos/o/r/issues", "-X", "POST"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("Only GET requests"));
+    }
+
+    #[test]
+    fn test_gh_api_delete_rejected() {
+        let args = str_args(&["api", "repos/o/r/branches/main", "--method", "DELETE"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gh_api_milestones_not_allowed() {
+        // Milestones not in scope per mika#805 (F2 — review-guide.md § YAGNI).
+        let args = str_args(&["api", "repos/o/r/milestones"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the read-only allowlist")
+        );
+    }
+
+    #[test]
+    fn test_gh_api_disallowed_path_rejected() {
+        let args = str_args(&["api", "repos/o/r/pulls"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gh_api_arbitrary_path_rejected() {
+        let args = str_args(&["api", "graphql"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gh_api_non_api_subcommand_skipped() {
+        let args = str_args(&["pr", "list"]);
+        assert!(validate_gh_api_scope(&args).is_ok());
     }
 
     #[test]
