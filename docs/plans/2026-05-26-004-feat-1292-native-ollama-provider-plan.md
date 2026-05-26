@@ -88,13 +88,13 @@ struct OllamaResponseMessage {
 
 - `chat_url()` → `format!("{}/api/chat", self.base_url)`
 - `tags_url()` → `format!("{}/api/tags", self.base_url)` (for health check)
-- `to_ollama_request(&self, request: &LlmRequest) -> OllamaChatRequest` — converts provider-agnostic request to ollama format. System message goes as first message with `role: "system"`. Tool definitions are ignored (no tool calling support). `LlmContent::Blocks` with tool results/images are flattened to text (best-effort; no native support).
-- `from_ollama_response(response: OllamaChatResponse) -> LlmResponse` — maps ollama's flat response to `LlmResponse`. `stop_reason` is always `EndTurn` (no tool use). Token counts from `eval_count`/`prompt_eval_count` map to `LlmUsage`. Extract `<think>...</think>` blocks into `reasoning` field (same pattern as `openai.rs`).
+- `to_ollama_request(&self, request: &LlmRequest) -> OllamaChatRequest` — converts provider-agnostic request to ollama format. System message goes as first message with `role: "system"`. Tool definitions are ignored (no tool calling support). `LlmContent::Blocks` with tool results/images: the agent loop gates on `supports_tool_calling()` at `agent.rs:2614` — when it returns `false`, `tools_for_request` is set to `None`, the LLM never sees tool definitions, and never produces tool calls or tool results. Therefore `LlmContent::Blocks` containing tool results are unreachable in normal operation. As defense-in-depth, if such blocks are encountered (e.g., via a manually-constructed `LlmRequest` in tests), flatten to text with a `warn!` log — this is a contract violation signal, not silent degradation (review-guide.md § Single Responsibility — contract violations surface as warnings, not silent fallbacks).
+- `from_ollama_response(response: OllamaChatResponse) -> LlmResponse` — maps ollama's flat response to `LlmResponse`. `stop_reason` is always `EndTurn` (no tool use). Token counts from `eval_count`/`prompt_eval_count` map to `LlmUsage`. Extract `<think>...</think>` blocks into `reasoning` field — reuse `extract_think_block()` from `openai.rs:790-808` (already handles DeepSeek-R1, MiniMax thinking models via the OpenAI-compat path at `openai.rs:769-773`). Import as `use super::openai::extract_think_block;` (function is currently `fn` — promote to `pub(crate) fn` to enable cross-module reuse without duplication; review-guide.md § DRY).
 - `send_once()` — single HTTP POST to `/api/chat` with JSON body, parse response. No auth header (ollama typically runs unauthenticated; include `Authorization: Bearer` only if `api_key` is `Some`).
 
 **Retry logic:** Mirror the `OpenAiCompatibleProvider` pattern — 3 retries with exponential backoff (500ms, 1s, 2s). Since ollama is local, retries mainly cover transient model-loading delays (ollama loads models on first request; can timeout).
 
-**Deadline-aware retry:** Override `send_message_with_deadline()` with the same budget-check pattern as `OpenAiCompatibleProvider` — abort retry when remaining time < `TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS`.
+**Deadline-aware retry:** Override `send_message_with_deadline()` with the same budget-check pattern as `OpenAiCompatibleProvider` (`openai.rs:268`, `openai.rs:316`) — abort retry when remaining time < `TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS`. These constants are defined as `pub const` in `mod.rs:23-25` (shared module scope, not `openai.rs`-local) and imported via `use super::{TYPICAL_CALL_DURATION_SECS, RETRY_BUFFER_SECS}` (same pattern as `openai.rs:134`). The shared 120s budget (90s + 30s) is acceptable for ollama v1: ollama's cold-start model-loading delay is bounded by the per-request 120s `reqwest` timeout, and the deadline budget check is a retry-abort heuristic, not a per-call timeout. If local-LLM latency proves materially different in practice, a follow-up can define `OllamaProvider`-specific constants — but the shared values are correct for the initial implementation (review-guide.md § DRY — shared constants in shared module, no duplication).
 
 **Trait implementation:**
 - `provider_name()` → `"ollama"`
@@ -113,10 +113,10 @@ struct OllamaResponseMessage {
 
 1. Add `pub mod ollama;` to module declarations (line ~6, after `pub mod openai;`).
 
-2. Update `create_provider()` to route `ProviderKind::Ollama` to the new provider:
+2. Update `create_provider()` (`mod.rs:380`) to route `ProviderKind::Ollama` to the new provider. The current match structure (`mod.rs:385-396`) is `ProviderKind::Anthropic => { ... }` + `_ => { OpenAI-compat }`. The `ProviderKind` enum (`mod.rs:235-251`) has 11 variants: `Anthropic`, `OpenAi`, `OpenRouter`, `Groq`, `Ollama`, `Mistral`, `Google`, `DeepSeek`, `MiniMax`, `Kimi`, `Qwen`. After this change, the match becomes:
 ```rust
 match spec.provider {
-    ProviderKind::Anthropic => { /* existing */ }
+    ProviderKind::Anthropic => { /* existing, mod.rs:386-395 */ }
     ProviderKind::Ollama => {
         let base_url = spec.effective_base_url().ok_or_else(|| {
             anyhow::anyhow!("base URL is required for ollama provider")
@@ -130,9 +130,10 @@ match spec.provider {
         );
         Ok(Arc::new(provider))
     }
-    _ => { /* existing OpenAI-compat fallback */ }
+    _ => { /* existing OpenAI-compat fallback — covers OpenAi, OpenRouter, Groq, Mistral, Google, DeepSeek, MiniMax, Kimi, Qwen (9 variants) */ }
 }
 ```
+The `_ =>` arm remains correct: no `ProviderKind` variant has its own dedicated arm other than `Anthropic` and the new `Ollama`. All 9 remaining variants route to `OpenAiCompatibleProvider` via the catchall — no unreachable patterns, no shadowing (review-guide.md § Orthogonality — factory match verified exhaustive against the 11-variant enum).
 
 3. Update `ProviderKind::Ollama.default_base_url()` from `http://localhost:11434/v1` to `http://localhost:11434`.
 
@@ -169,16 +170,19 @@ The existing ollama-specific `/api/tags` handling strips `/v1` from the base URL
 
 2. **Root `CLAUDE.md`** — Update `MIKA_OLLAMA_API_KEY` comment to note it's usually not needed (ollama runs unauthenticated locally). Already says this, no change needed.
 
-3. **`.env.example`** — If `MIKA_OLLAMA_BASE_URL` is documented, update the example from `http://localhost:11434/v1` to `http://localhost:11434`.
+3. **`.env.example`** — Verified: `.env.example` does NOT contain `MIKA_OLLAMA_BASE_URL` (grep confirms zero matches). No update required. The default base URL is encoded only in `ProviderKind::Ollama.default_base_url()` (`mod.rs:293`) — the single source of truth.
 
 ## Files Changed
 
 | File | Change |
 |------|--------|
 | `crates/mika-common/src/llm/ollama.rs` | **New** — native ollama provider (~300 lines) |
+| `crates/mika-common/src/llm/openai.rs` | Promote `extract_think_block()` from `fn` to `pub(crate) fn` (line 792) |
 | `crates/mika-common/src/llm/mod.rs` | Add module, update factory match arm, change default base URL |
 | `crates/mika-common/src/llm/models.rs` | Comment update only (logic unchanged) |
 | `crates/mika-common/CLAUDE.md` | Note native ollama provider |
+
+**Not changed:** `.env.example` — verified it does not contain `MIKA_OLLAMA_BASE_URL`; no operator-facing config surface needs updating.
 
 ## Risk Assessment
 
@@ -193,3 +197,7 @@ The existing ollama-specific `/api/tags` handling strips `/v1` from the base URL
 - Native vision/multimodal
 - Embedding endpoint (`/api/embeddings`)
 - `keep_alive` parameter tuning
+
+## Revision history
+
+- rev 2 (2026-05-26): addressed F1 by citing `mod.rs:23-25` as the shared constant definition location and documenting why the 120s budget is acceptable for ollama v1; addressed F2 by citing the agent loop gate at `agent.rs:2614` confirming tool-result blocks are unreachable, and changing the flatten behavior from silent to warn-logged (contract violation signal); addressed F3 by citing `openai.rs:790-808` (`extract_think_block()`) with exact line range, and specifying `pub(crate)` promotion for cross-module reuse; addressed F4 by listing all 11 `ProviderKind` variants (`mod.rs:235-251`) and confirming the updated 3-arm match (Anthropic/Ollama/catchall) is exhaustive with no shadowing; addressed F5 by verifying `.env.example` contains no `MIKA_OLLAMA_BASE_URL` entry — no update needed.
