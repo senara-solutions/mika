@@ -101,8 +101,8 @@ async fn fetch_models_from_api(
 
         // Ollama uses a different endpoint shape
         ProviderKind::Ollama => {
-            // Ollama base_url is typically http://localhost:11434/v1 for OpenAI compat,
-            // but the tags endpoint is at the root: http://localhost:11434/api/tags
+            // Ollama default base_url is http://localhost:11434 (native provider).
+            // Strip /v1 suffix for operators who explicitly override with an OpenAI-compat URL.
             let root_url = base_url
                 .trim_end_matches('/')
                 .strip_suffix("/v1")

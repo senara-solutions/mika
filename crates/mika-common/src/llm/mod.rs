@@ -3,6 +3,7 @@ pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
 pub mod models;
+pub mod ollama;
 pub mod openai;
 pub mod types;
 
@@ -290,7 +291,7 @@ impl ProviderKind {
             ProviderKind::OpenAi => Some("https://api.openai.com/v1"),
             ProviderKind::OpenRouter => Some("https://openrouter.ai/api/v1"),
             ProviderKind::Groq => Some("https://api.groq.com/openai/v1"),
-            ProviderKind::Ollama => Some("http://localhost:11434/v1"),
+            ProviderKind::Ollama => Some("http://localhost:11434"),
             ProviderKind::Mistral => Some("https://api.mistral.ai/v1"),
             ProviderKind::Google => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
             ProviderKind::DeepSeek => Some("https://api.deepseek.com"),
@@ -393,7 +394,22 @@ pub fn create_provider(
             .context("failed to create Anthropic provider")?;
             Ok(Arc::new(provider))
         }
+        ProviderKind::Ollama => {
+            let base_url = spec
+                .effective_base_url()
+                .ok_or_else(|| anyhow::anyhow!("base URL is required for ollama provider"))?;
+            let provider = ollama::OllamaProvider::new(
+                base_url,
+                spec.api_key.clone(),
+                spec.model.clone(),
+                max_tokens,
+                log_llm_bodies,
+            );
+            Ok(Arc::new(provider))
+        }
         _ => {
+            // OpenAI-compatible fallback — covers OpenAi, OpenRouter, Groq, Mistral,
+            // Google, DeepSeek, MiniMax, Kimi, Qwen (9 variants)
             let base_url = spec.effective_base_url().ok_or_else(|| {
                 anyhow::anyhow!(
                     "base URL is required for provider '{}'. Set {}_base_url in config.toml.",
@@ -522,7 +538,7 @@ mod tests {
         );
         assert_eq!(
             ProviderKind::Ollama.default_base_url(),
-            Some("http://localhost:11434/v1")
+            Some("http://localhost:11434")
         );
         assert_eq!(
             ProviderKind::DeepSeek.default_base_url(),
@@ -568,7 +584,7 @@ mod tests {
         };
         assert_eq!(
             spec.effective_base_url(),
-            Some("http://localhost:11434/v1".into())
+            Some("http://localhost:11434".into())
         );
     }
 
