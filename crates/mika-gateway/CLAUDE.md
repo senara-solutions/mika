@@ -34,7 +34,7 @@ HMAC-SHA256 signature validation via `X-Hub-Signature-256`. Event routing:
 
 ### Inbound delivery retry (#589)
 
-The spawned forwarding task retries on HTTP 429/5xx or request timeouts using the fixed schedule `[2s, 5s, 15s, 60s, 300s]` with ±25% per-attempt jitter (prevents synchronized retry bursts on the same agent). Permanent failures (HTTP 4xx other than 429, connection errors indicating the agent is offline, or unresolvable route) stop retries immediately. Route resolution (`github_repos` lookup + `agent_mapping`) is cached across retries — a single Postgres query per event regardless of retry count.
+The spawned forwarding task retries on HTTP 429/5xx or request timeouts using the fixed schedule `[2s, 5s, 15s, 60s, 300s]` with ±25% per-attempt jitter (prevents synchronized retry bursts on the same agent). Permanent failures (HTTP 4xx other than 429, non-localhost connection errors, or unresolvable route) stop retries immediately. Localhost connection errors are retryable (#1293) — the agent may be restarting during a deploy. Route resolution (`github_repos` lookup + `agent_mapping`) is cached across retries — a single Postgres query per event regardless of retry count.
 
 Semaphore lifecycle during retry: the 30-permit `webhook_semaphore` (shared with Telegram) is released during each retry sleep and re-acquired via `try_acquire_owned` before the next attempt. If the semaphore is full on re-acquire, the retry is abandoned with a dedicated ERROR log (`semaphore at capacity during retry`), distinct from the `retry budget exhausted` ERROR emitted when all 6 attempts return a retryable failure.
 
