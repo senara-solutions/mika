@@ -39,15 +39,21 @@ _check_duplicate_commits() {
     
     [ -n "$WORKTREE_DIR" ] || return 0
     
-    # Fetch fresh main to compare against
-    git -C "$WORKTREE_DIR" fetch origin main 2>/dev/null || return 0
+    # Fetch fresh main to compare against.
+    # Failure-open: if fetch fails (network, auth), skip the guard but warn.
+    # Rationale: don't block push on connectivity; but surface the degraded state
+    # so dispatch logs show the guard was skipped. (review-guide.md § Single Responsibility)
+    if ! git -C "$WORKTREE_DIR" fetch origin main 2>/dev/null; then
+        echo "WARN: duplicate-commit guard skipped — could not fetch origin/main" >&2
+        return 0
+    fi
     
     # Find commits on HEAD that are patch-equivalent to commits on origin/main.
     # --cherry-mark marks equivalent commits with '=' prefix.
     # --right-only shows only commits on the right side (HEAD).
     # Equivalent commits on HEAD = duplicates that will conflict.
     local duplicates
-    duplicates=$(git -C "$WORKTREE_DIR" log --cherry-mark --right-only --no-walk \
+    duplicates=$(git -C "$WORKTREE_DIR" log --cherry-mark --right-only \
         --format="%m %H %s" origin/main...HEAD 2>/dev/null \
         | grep "^=" || true)
     
@@ -72,7 +78,7 @@ _check_duplicate_commits() {
 ```
 
 **Design notes:**
-- Uses `git log --cherry-mark` which compares patches (not hashes) — detects duplicate content regardless of hash divergence.
+- Uses `git log --cherry-mark --right-only` which compares patches (not hashes) — detects duplicate content regardless of hash divergence. `--right-only` limits output to commits on HEAD's side of the three-dot range. Note: `--no-walk` is intentionally omitted — it suppresses range traversal and would produce empty output on range expressions, defeating the guard entirely (see git-log documentation on `--no-walk` + range interaction).
 - Attempts automatic rebase as self-heal (same pattern as startup guard). Rebase naturally drops patch-equivalent commits when replaying onto a base that already has them.
 - On rebase failure, returns non-zero so `_push_branch` can surface the error.
 - Fetches `origin/main` fresh to compare against current remote state, not stale local refs.
@@ -103,17 +109,17 @@ Push: SKIPPED — duplicate-commit guard detected patch-equivalent commits on br
 
 **Why before push, not after:** The guard must run before `git push` to prevent the CONFLICTING state from reaching GitHub. Post-push detection would require force-push to fix, which is a more dangerous operation.
 
-### Step 3: Retire the tactical Git discipline prompt section
+### Step 3: Evaluate tactical Git discipline prompt section per issue body retirement clause
 
 **File:** `.claude/commands/mika.md`
-**Action:** Remove the "Git discipline (MANDATORY)" section added in commit `58b64a87`.
+**Action:** Evaluate the "Git discipline (MANDATORY)" section (added in commit `58b64a87`) per mika#784 issue body retirement clause: *"If the structural guard makes the prompt rule fully redundant, remove it. If only partial, narrow it."* Final decision in PR description per issue body instruction.
 
-The structural pre-push guard makes the prompt-level rule fully redundant:
-- The prompt rule forbids `git pull` / `git merge main` during the pipeline.
-- The structural guard catches and auto-fixes the consequences (duplicate commits) regardless of what git commands ran.
-- Keeping the prompt rule after the structural fix is dead weight that increases prompt token count without adding safety.
+**Recommendation: remove.** Reasoning:
+- The structural pre-push guard catches and auto-fixes duplicate commits regardless of what git commands ran — covers the full failure class.
+- The permission-policy already escalates `git pull` to TIER 3 — the prompt rule's "forbid git pull" is a third layer on top of two structural layers (permission classifier + pre-push guard).
+- Keeping the prompt rule after two structural guards is dead weight that increases prompt token count without adding safety.
 
-**Important:** The permission-policy already omits `git pull` from TIER 1 auto-approve. Between the structural guard (catches duplicates) and permission-policy (escalates `git pull` to TIER 3), the tactical prompt section is doubly redundant.
+**Decision authority:** The operator ratifies removal (or narrowing) at PR review time, per the issue body's explicit deferral. This plan recommends removal but does not pre-authorize it.
 
 ### Step 4: Update the #747 solution doc
 
@@ -138,7 +144,7 @@ The structural pre-push guard makes the prompt-level rule fully redundant:
 | File | Change |
 |------|--------|
 | `skills/bundled/_shared/dispatch-lib.sh` | Add `_check_duplicate_commits()` + wire into `_push_branch()` |
-| `.claude/commands/mika.md` | Remove "Git discipline (MANDATORY)" tactical section |
+| `.claude/commands/mika.md` | Evaluate + remove/narrow "Git discipline (MANDATORY)" section per issue body retirement clause (operator ratifies at PR review) |
 | `docs/solutions/logic-errors/stale-base-conflicting-prs-no-self-heal-2026-04-23.md` | Add follow-up section |
 | `docs/solutions/logic-errors/mid-session-duplicate-commit-pre-push-guard-2026-05-26.md` | New solution doc |
 
@@ -159,3 +165,7 @@ The structural pre-push guard makes the prompt-level rule fully redundant:
 - **Low risk.** The guard is additive — it runs before push and falls back to skip-push-with-warning on failure. No existing behavior is changed; only a new check is inserted.
 - **Auto-rebase failure mode:** If the auto-rebase fails (due to real conflicts, not just duplicates), the guard returns non-zero and push is skipped. The PR will not be created in CONFLICTING state. The pilot session exits with a push failure, which surfaces via dispatch-lib's existing error propagation.
 - **Performance:** One additional `git fetch origin main` + `git log --cherry-mark` per push. Both are fast operations on typical branch sizes (<100 commits).
+
+## Revision history
+
+- rev 2 (2026-05-26): addressed F1 by removing `--no-walk` from `git log` invocation — `--no-walk` suppresses range traversal on three-dot expressions, producing empty output and silently passing all branches (review-guide.md § KISS); addressed F2 by reframing Step 3 as conditional evaluation per issue body retirement clause, with removal as recommendation rather than pre-authorized action (workflows § plan-reframes-spec); addressed F3 by replacing silent `return 0` on fetch failure with a `WARN` log line before the early exit, preserving failure-open behavior while surfacing degraded state in dispatch logs (review-guide.md § Single Responsibility).

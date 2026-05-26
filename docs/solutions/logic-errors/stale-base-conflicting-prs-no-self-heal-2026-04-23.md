@@ -87,6 +87,16 @@ Added one sentence in the "On success" callback path: check `mergeable` state vi
 - When worktree reuse or branch checkout paths exist in handlers, always consider whether the branch may be behind the base. Fetch + rebase-or-abort is the standard pattern.
 - The EXIT trap in `run.sh` checks `[ -z "$RESULT" ]` — populate `RESULT` before `exit 1` to deliver a structured callback instead of a generic "HANDLER CRASH" message.
 
+## Follow-up: mid-session duplicate-commit guard (#784)
+
+The #747 rebase-or-abort guard runs once at session START, but mid-session `git pull` or `git merge main` can reintroduce duplicate-hash copies of upstream commits onto the branch. This was observed in PR #782: after the startup guard ran cleanly, the claude-pilot session ran `git pull origin main` mid-session, creating commit `8693b3fd` — a duplicate of main's `14279524` (same author date, message, diff, different hash). GitHub's 3-way merge saw both commits touching the same lines → `mergeable=CONFLICTING`.
+
+**Fix:** A pre-push `_check_duplicate_commits()` guard in `dispatch-lib.sh` uses `git log --cherry-mark --right-only origin/main...HEAD` to detect patch-equivalent commits before push. If duplicates are found, it attempts an automatic rebase onto `origin/main` (rebase naturally drops patch-equivalent commits). On rebase failure, push is skipped with a structured error message.
+
+This closes the gap between the startup guard (#747) and the push boundary — duplicates introduced mid-session by any mechanism (pull, merge, cherry-pick) are caught before they reach GitHub.
+
+See: `docs/solutions/logic-errors/mid-session-duplicate-commit-pre-push-guard-2026-05-26.md`
+
 ## Related Issues
 
 - [#747](https://github.com/senara-solutions/mika/issues/747) — this fix
