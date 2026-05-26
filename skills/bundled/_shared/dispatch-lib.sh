@@ -440,24 +440,84 @@ ${RESULT}"
                         # staged and will be committed.
                         RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
 
-                        git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
+                        # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
+                        # Use a worktree-local scratch file under .git/ to avoid coupling with
+                        # .iterate/ (the iterate-loop artifact directory — review-guide.md § Orthogonality).
+                        RESCUE_COMMIT_ERR="$WORKTREE_DIR/.git/mika-rescue-commit-err"
+
+                        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
 
 Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
 Auto-rescued by dispatch-lib dirty-worktree detection.
-Scaffold paths excluded (mika#1288)." 2>&9
+Scaffold paths excluded (mika#1288)." 2>"$RESCUE_COMMIT_ERR"; then
+                            # Commit succeeded on first try — proceed normally
+                            rm -f "$RESCUE_COMMIT_ERR"
 
-                        # Update POST_RUN_HEAD so _push_branch sees new commits
-                        POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+                            # Update POST_RUN_HEAD so _push_branch sees new commits
+                            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
 
-                        # Amend the PIPELINE FAILURE message (already set above) with rescue note
-                        RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
+                            # Amend the PIPELINE FAILURE message (already set above) with rescue note
+                            RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
 Files rescued:
 ${RESCUED_FILES}
 
 ${RESULT}"
 
-                        # Mark for draft PR creation in Unit 2
-                        RESCUED_DIRTY_WORKTREE=1
+                            # Mark for draft PR creation in Unit 2
+                            RESCUED_DIRTY_WORKTREE=1
+                        elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
+                            # Pre-commit rust-fmt hook rejected — auto-fix and retry (mika#1296).
+                            # Capture cargo fmt stderr so it surfaces in the PIPELINE FAILURE message
+                            # if the retry also fails (review-guide.md § Single Responsibility — failure
+                            # paths must surface all available diagnostic information).
+                            CARGO_FMT_ERR=""
+                            echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
+                            CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
+                            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' 2>&9
+
+                            if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
+
+Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
+Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
+Scaffold paths excluded (mika#1288)." 2>"$RESCUE_COMMIT_ERR"; then
+                                # Retry succeeded after cargo fmt
+                                rm -f "$RESCUE_COMMIT_ERR"
+
+                                POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+
+                                RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed after cargo fmt (mika#1282 + mika#1296 recovery).
+Files rescued:
+${RESCUED_FILES}
+
+${RESULT}"
+
+                                RESCUED_DIRTY_WORKTREE=1
+                            else
+                                # Retry also failed — abort rescue, leave dirty.
+                                # Surface the full diagnostic chain: cargo fmt output + retry commit
+                                # hook output, so the operator can diagnose from the message alone
+                                # (mika#1296 acceptance criteria).
+                                RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -20)
+                                RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
+cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+
+${RESULT}"
+                                # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
+                                rm -f "$RESCUE_COMMIT_ERR"
+                            fi
+                        else
+                            # Unknown hook failure — abort rescue, leave dirty
+                            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -20)
+                            RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+
+${RESULT}"
+                            # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
+                            rm -f "$RESCUE_COMMIT_ERR"
+                        fi
                     fi
                 fi
             fi
