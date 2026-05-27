@@ -457,11 +457,18 @@ ${RESULT}"
                         # .iterate/ (the iterate-loop artifact directory — review-guide.md § Orthogonality).
                         RESCUE_COMMIT_ERR="$WORKTREE_DIR/.git/mika-rescue-commit-err"
 
+                        # mika#1310: capture BOTH stdout and stderr. Lefthook
+                        # pre-commit hooks print their summary + failure marks
+                        # to stdout (not stderr); a `2>` redirect alone captured
+                        # an empty file and the operator saw "Hook output:"
+                        # blank on every false-positive rejection. Combined
+                        # `>file 2>&1` captures the full lefthook decoration
+                        # block including ⛔ failure lines.
                         if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
 
 Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
 Auto-rescued by dispatch-lib dirty-worktree detection.
-Scaffold paths excluded (mika#1288)." 2>"$RESCUE_COMMIT_ERR"; then
+Scaffold paths excluded (mika#1288)." > "$RESCUE_COMMIT_ERR" 2>&1; then
                             # Commit succeeded on first try — proceed normally
                             rm -f "$RESCUE_COMMIT_ERR"
 
@@ -487,11 +494,12 @@ ${RESULT}"
                             CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
                             git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' 2>&9
 
+                            # mika#1310: capture both stdout+stderr (see above).
                             if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
 
 Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
 Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
-Scaffold paths excluded (mika#1288)." 2>"$RESCUE_COMMIT_ERR"; then
+Scaffold paths excluded (mika#1288)." > "$RESCUE_COMMIT_ERR" 2>&1; then
                                 # Retry succeeded after cargo fmt
                                 rm -f "$RESCUE_COMMIT_ERR"
 
@@ -509,7 +517,17 @@ ${RESULT}"
                                 # Surface the full diagnostic chain: cargo fmt output + retry commit
                                 # hook output, so the operator can diagnose from the message alone
                                 # (mika#1296 acceptance criteria).
-                                RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -20)
+                                RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
+                            # mika#1310: if captured output is empty, dump git
+                            # diagnostic state as fallback so PIPELINE FAILURE
+                            # carries SOMETHING the operator can act on.
+                            if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
+                                RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
+git status:
+$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
+git diff --cached --name-only:
+$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
+                            fi
                                 RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
 cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
 Hook output: ${RESCUE_ERR_CONTENT}
@@ -521,7 +539,17 @@ ${RESULT}"
                             fi
                         else
                             # Unknown hook failure — abort rescue, leave dirty
-                            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -20)
+                            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
+                            # mika#1310: if captured output is empty, dump git
+                            # diagnostic state as fallback so PIPELINE FAILURE
+                            # carries SOMETHING the operator can act on.
+                            if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
+                                RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
+git status:
+$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
+git diff --cached --name-only:
+$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
+                            fi
                             RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
 Hook output: ${RESCUE_ERR_CONTENT}
 Worktree left dirty for operator inspection: ${WORKTREE_DIR}
