@@ -64,19 +64,21 @@ struct BashToolInput {
 /// If the pattern set grows beyond 10 entries OR Python and Rust drift, escalate
 /// to build-time codegen.
 ///
-/// ## Branch 5 divergence (mika#938, mika#942, mika#946)
+/// ## Branch 5 divergence (mika#938, mika#942, mika#944, mika#946)
 ///
 /// Branch 5 rejection uses quote-aware scanning in this Rust module via
-/// `contains_unquoted_metacharacter()` for four metacharacters (`$(`,
-/// backtick, `>(`, `<(`), while `tier1.py` uses quote-aware scanning for
-/// `$(` and backtick (mika#946) but retains blanket regex rejection for
-/// `>(` and `<(` (`tier1.py:89-90`). This is N=1 divergence (quote-awareness
-/// asymmetry on the process-substitution pair only). Codegen escalation
-/// threshold NOT crossed.
+/// `contains_unquoted_metacharacter()` for five metacharacters (`$(`,
+/// backtick, `$'`, `>(`, `<(`), while `tier1.py` uses quote-aware scanning
+/// for `$(`, backtick, and `$'` (mika#944, mika#946) but retains blanket
+/// regex rejection for `>(` and `<(` (`tier1.py:89-90`). This is N=1
+/// divergence (quote-awareness asymmetry on the process-substitution pair
+/// only). Codegen escalation threshold NOT crossed.
 ///
 /// Prior: mika#946 resolved the `$(` / backtick asymmetry to divergence 0.
 /// mika#942 extends the Rust scanner to `>(` / `<(` — Python already has
 /// blanket coverage for those, so net divergence returns to 1.
+/// mika#944 adds `$'` (ANSI-C quoting) to both scanners simultaneously —
+/// no new divergence introduced.
 const TIER3_PATTERNS: &[&str] = &[
     "rm -rf",
     "rm -fr",
@@ -99,9 +101,10 @@ const TIER3_PATTERNS: &[&str] = &[
 /// 2. Message doesn't start with `[claude-pilot] ` → `None`
 /// 3. JSON parse fails → `None` (malformed; existing error path applies)
 /// 4. `tool_name != "Bash"` → `None` (only Bash dispatch is pre-classified)
-/// 5. Command contains `$(`, backtick, `>(`, or `<(` OUTSIDE quoted regions → `None`
-///    (would trigger shell expansion on execution; literal occurrences inside `"..."` or
-///    `'...'` are allowed — they're passed as message content to `mika ask`)
+/// 5. Command contains `$(`, backtick, `$'`, `>(`, or `<(` OUTSIDE quoted regions → `None`
+///    (would trigger shell expansion or ANSI-C escape injection on execution; literal
+///    occurrences inside `"..."` or `'...'` are allowed — they're passed as message
+///    content to `mika ask`)
 /// 6. Command matches intra-platform dispatch AND peer is known AND no TIER 3 → `Some(Allow)`
 /// 7. Otherwise → `None`
 pub fn pre_classify_pilot_event(user_message: &str, agent_id: &str) -> Option<PermissionAction> {
@@ -158,10 +161,11 @@ fn contains_tier3_pattern(command: &str) -> bool {
 /// Check if a command contains shell-expansion metacharacters outside quoted regions.
 ///
 /// Walks the command bytes left-to-right, tracking quote state (none / single / double).
-/// Returns `true` on first occurrence of `$(`, `` ` ``, `>(`, or `<(` while in no-quote
-/// state. The four characters cover bash command substitution (`$()`, backticks) and
-/// process substitution (`>()`, `<()`) — all four cause shell expansion that would
-/// execute arbitrary embedded commands.
+/// Returns `true` on first occurrence of `$(`, `` ` ``, `$'`, `>(`, or `<(` while in
+/// no-quote state. The five patterns cover bash command substitution (`$()`, backticks),
+/// ANSI-C quoting (`$'...'` — mika#944), and process substitution (`>()`, `<()`) — all
+/// five cause shell expansion that would execute arbitrary embedded commands or allow
+/// escape-sequence injection at execution time.
 /// Per Decision 1 Option C (mika#938): metacharacters inside either single or double
 /// quoted regions are treated as literal (allowed).
 ///
@@ -212,6 +216,13 @@ fn contains_unquoted_metacharacter(command: &str) -> bool {
                 }
                 // Check for `$(`
                 if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'(' {
+                    return true;
+                }
+                // Check for `$'` (ANSI-C quoting — escapes like \xNN expand at execution time)
+                // mika#944: the two-byte sequence $' opens an ANSI-C quoted string where
+                // \xNN, \nNN, and named escapes are expanded by bash at execution time.
+                // Only $' triggers — plain $ (e.g., $HOME, ${VAR}) is NOT rejected.
+                if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'\'' {
                     return true;
                 }
                 // Check for `>(` (process substitution — output)
@@ -1189,6 +1200,108 @@ mod tests {
     fn test_942_process_substitution_inside_single_quotes_allowed() {
         // Single-quoted message content with <(...) — regression guard
         let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch 'use <(cmd) for input'""#);
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    // === mika#944: ANSI-C quoting ($'...' bypass) tests ===
+
+    #[test]
+    fn test_unquoted_meta_ansi_c_quoting_outside_quotes() {
+        // The canonical bypass shape from the issue body
+        assert!(contains_unquoted_metacharacter(
+            r"mika ask --agent mika-arch $'\x60id\x60'"
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_ansi_c_quoting_literal_outside_quotes() {
+        // Even literal content in ANSI-C quoting is rejected (AC2)
+        assert!(contains_unquoted_metacharacter(
+            "mika ask --agent mika-arch $'literal'"
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_plain_dollar_not_rejected() {
+        // AC3 — plain $ (no following apostrophe) must NOT trigger
+        assert!(!contains_unquoted_metacharacter("echo $HOME"));
+        assert!(!contains_unquoted_metacharacter("echo ${HOME}"));
+        assert!(!contains_unquoted_metacharacter("echo $1 $2"));
+        assert!(!contains_unquoted_metacharacter("echo $_"));
+    }
+
+    #[test]
+    fn test_unquoted_meta_ansi_c_quoting_inside_double_quotes_allowed() {
+        // Inside double-quoted region — literal text, not expansion. Allowed.
+        assert!(!contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch "discussion of $'\xNN' syntax""#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_ansi_c_quoting_inside_single_quotes_allowed() {
+        // Inside single-quoted region — $ followed by end-of-single-quote is literal.
+        // This tests that $' inside single-quoted text is handled correctly.
+        // Note: in bash, single quotes cannot contain single quotes (no escaping),
+        // so $' at the end of a single-quoted region means $ is literal and ' closes
+        // the quote. The next character determines the outcome.
+        // "mika ask --agent mika-arch 'text with a trailing $'" — the ' after $ closes
+        // the single quote, but since the scanner sees $' in unquoted context we need
+        // to be careful about test expectations.
+        // Simple case: $ alone at end of single-quoted region
+        assert!(!contains_unquoted_metacharacter("echo 'cost is $'"));
+    }
+
+    #[test]
+    fn test_unquoted_meta_ansi_c_quoting_after_closing_quote_detected() {
+        // $' appears AFTER the quoted region closes → unquoted → detected
+        assert!(contains_unquoted_metacharacter(
+            r#"mika ask --agent mika-arch "msg" $'\x60id\x60'"#
+        ));
+    }
+
+    #[test]
+    fn test_unquoted_meta_dollar_at_end_of_string() {
+        // Lone $ at end of string — no following byte, must NOT trigger
+        assert!(!contains_unquoted_metacharacter("echo $"));
+    }
+
+    // === mika#944 integration tests via pre_classify_pilot_event ===
+
+    #[test]
+    fn test_944_ansi_c_quoting_xnn_rejected() {
+        // AC1 — exact issue-body shape
+        let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch $'\\x60id\\x60'""#);
+        assert_eq!(pre_classify_pilot_event(&msg, "mika-relay"), None);
+    }
+
+    #[test]
+    fn test_944_ansi_c_quoting_literal_rejected() {
+        // AC2 — literal payload in ANSI-C quoting also rejected
+        let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch $'literal'""#);
+        assert_eq!(pre_classify_pilot_event(&msg, "mika-relay"), None);
+    }
+
+    #[test]
+    fn test_944_plain_dollar_var_allowed() {
+        // AC3 — $HOME-style expansion not rejected at the structural layer
+        let msg = pilot_event_bash_raw(r#""mika ask --agent mika-arch \"$HOME mention\"""#);
+        assert_eq!(
+            pre_classify_pilot_event(&msg, "mika-relay"),
+            Some(PermissionAction::Allow)
+        );
+    }
+
+    #[test]
+    fn test_944_ansi_c_quoting_inside_quoted_message_allowed() {
+        // Regression guard for the mika#938 carve-out: $' inside a quoted message
+        // is literal brief content and must NOT be blocked.
+        let msg = pilot_event_bash_raw(
+            r#""mika ask --agent mika-arch \"discussion of $'\\\\xNN' syntax\"""#,
+        );
         assert_eq!(
             pre_classify_pilot_event(&msg, "mika-relay"),
             Some(PermissionAction::Allow)
