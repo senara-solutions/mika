@@ -36,7 +36,7 @@ fn assert_no_fallback_patterns(text: &str) {
             panic!(
                 "assert_no_fallback_patterns failed:\n  forbidden pattern '{}' found\n  response: {:?}",
                 pattern,
-                &text[..text.len().min(300)]
+                mika_common::text::safe_truncate(text, 300)
             );
         }
     }
@@ -85,7 +85,7 @@ async fn test_merge_gate_blocked_no_fallback() -> anyhow::Result<()> {
     assert!(
         lower.contains("merge_conflict") || lower.contains("rebase") || lower.contains("conflict"),
         "Response should reference merge conflict, rebase, or conflict. Got: {:?}",
-        &text[..text.len().min(300)]
+        mika_common::text::safe_truncate(text, 300)
     );
 
     Ok(())
