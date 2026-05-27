@@ -4,10 +4,22 @@
 
 mika#794 landed the tagged-union `MergeGateResult` return type on `pr_merge_with_gate`. The `self-dev-webhook-qa` prompt already branches on the full variant set (`merged`, `auto_merge_enabled`, `blocked { reason }`, `already_merged`, `gate_errored`). The server-side Rust handlers (`verdict_handler.rs`, `ci_success_handler.rs`) use the Rust types directly and are already migrated.
 
+**Variant name confirmation:** The Rust enum variant is `GateError`, but `pr_merge_with_gate.rs:310` has `#[serde(rename = "gate_errored")]`, so the serialized `action` field value is `gate_errored` (not `gate_error`). This is confirmed by the test assertions at `pr_merge_with_gate.rs:1087` (`assert_eq!(json["action"], "gate_errored")`). All prompt-level references in this plan use `gate_errored` — the confirmed serialized form.
+
+**Full variant set citation — correcting outdated mika#793 AC.** The mika#793 issue body AC lists four variants (`pass`, `auto_merge_enabled`, `blocked`, `gate_errored`). This AC text predates mika#794's shipped implementation. The enum at `pr_merge_with_gate.rs:295-311` defines five variants with these serialized `action` values:
+
+- line 297 `#[serde(rename = "merged")]` (variant `Merged`) — AC says `pass`; code says `merged`
+- line 299 `#[serde(rename = "auto_merge_enabled")]` (variant `AutoMergeEnabled`)
+- line 301 `#[serde(rename = "blocked")]` (variant `Blocked`)
+- line 308 `#[serde(rename = "already_merged")]` (variant `AlreadyMerged`) — fifth variant absent from mika#793 AC but present in shipped code (also constructed at line 248 `let result = MergeGateResult::AlreadyMerged` and matched at line 443 `return Some(MergeGateResult::AlreadyMerged)`)
+- line 310 `#[serde(rename = "gate_errored")]` (variant `GateError`)
+
+The serialized form is the source of truth — prompt-level branch predicates must match what the tool actually emits in `tool_call.output.action`. mika#793 AC says `pass`; the code says `merged`. mika#793 AC omits `already_merged`; the code has it. This plan follows the code (mika#794 shipped implementation, the canonical contract) — not the outdated AC enumeration. The gold-standard `self-dev-webhook-qa` prompt and server-side handlers (`verdict_handler.rs`, `ci_success_handler.rs`) also use the five-variant set, confirming the shipped contract. The tool's own prompt-documentation block at `pr_merge_with_gate.rs:47-50` lists the same five variants the plan uses.
+
 Two prompt-level callers remain in the "string-parsing" or "incomplete variant coverage" state:
 
 1. **`self-dev/system_prompt.md`** — references `pr_merge_with_gate` in Rule 6, M4 step 2.5 (merge verification gate), and step 6 (close-out status rules). M4 step 2.5 already branches on `merged`, `already_merged`, `auto_merge_enabled`, `blocked`, and `gate_errored` — but the `blocked` branch does not enumerate `reason` sub-variants. Rule 6 lacks the structural enforcement note present in webhook-qa.
-2. **`self-dev-webhook-ci/system_prompt.md`** — references `pr_merge_with_gate` only in Rule 6 (prohibition on `run_gh pr merge`). This skill does NOT call `pr_merge_with_gate` itself — it handles CI failures by dispatching `run_claude_pilot` for fixes. However, Rule 6 should match the structural enforcement language in webhook-qa for consistency.
+2. **`self-dev-webhook-ci/system_prompt.md`** — references `pr_merge_with_gate` only in Rule 6 (prohibition on `run_gh pr merge`). This skill does NOT call `pr_merge_with_gate` itself — it handles CI failures by dispatching `run_claude_pilot` for fixes. Verified: `rg "pr_merge_with_gate" skills/bundled/self-dev-webhook-ci/system_prompt.md` returns hits only on lines 33 and 35, both within the Rule 6 documentation block — zero tool invocation call sites. However, Rule 6 should match the structural enforcement language in webhook-qa for consistency.
 
 The server-side callers (`verdict_handler.rs`, `ci_success_handler.rs`, `ci_failure_handler.rs`) use Rust types directly — they're already structurally correct. No changes needed.
 
@@ -15,7 +27,7 @@ The server-side callers (`verdict_handler.rs`, `ci_success_handler.rs`, `ci_fail
 
 ### What changes
 
-**Prompt-level migrations only.** No Rust code changes. No new variants. No test changes to tool code.
+**Prompt-level migrations + eval-harness integration tests.** No Rust production code changes. No new variants. No test changes to tool code. New grounding regression scenarios (test-only Rust) per issue body AC.
 
 ### What does NOT change
 
@@ -118,11 +130,41 @@ rg "gh.*exit code|Failed to fetch|pr_merge_with_gate.*response" crates/mika-agen
 
 This should return zero hits. The `pr_merge_with_gate.*response` pattern was already clean (webhook-qa uses `action` field branching, not "response" string matching). The `gh.*exit code` and `Failed to fetch` patterns should not appear in any bundled skill prompt.
 
-### Unit 5: No integration tests needed for prompt-only changes
+### Unit 5: Eval-harness scenarios for migrated skill variant branching
 
-The ticket's AC mentions "integration tests for each migrated skill." However, the migration here is **prompt-level only** — no Rust tool behavior changed. The tool already returns the tagged union (mika#794 delivered tests for that). The prompt changes instruct the LLM to branch on existing variant names. Eval-harness scenarios for prompt-level branching are covered by the grounding regression suite (scenarios in `tests/eval/grounding_regressions/`).
+Per mika#793 issue body AC: *"Integration tests for each migrated skill assert the new branch selection for at least one variant each (tool stubbed at the boundary per senara-solutions/mika#794's decision)."*
 
-If the reviewer disagrees, the eval harness could add a scenario where the mock returns a `blocked { reason: merge_conflict }` JSON and asserts the model doesn't call `run_gh pr merge`, but this would be testing LLM instruction-following rather than code correctness.
+Add two grounding regression scenarios in `crates/mika-agent/tests/eval/grounding_regressions/`:
+
+**Scenario A: `merge_gate_blocked_no_fallback.rs`** — self-dev skill, `blocked { reason: merge_conflict }` variant.
+
+Mock sequence:
+1. Agent calls `pr_merge_with_gate` with `pr_number` and `repo`
+2. Tool returns `{"action": "blocked", "reason": {"reason": "merge_conflict"}}` (tagged-union shape)
+3. Agent responds — must NOT call `run_gh pr merge` as a fallback
+
+Hard assertions:
+- `assert_tools_include(&trace, &["pr_merge_with_gate"])` — tool was called
+- `assert_response_forbids(&trace, &["run_gh pr merge", "gh pr merge"])` — no fallback to raw merge
+- Response contains "merge_conflict" or "rebase" or "conflict" — agent recognized the variant
+
+Frozen fixture: pre-migration response where agent falls back to `run_gh pr merge --auto` on unrecognized gate output (mika#792 incident class).
+
+**Scenario B: `merge_gate_errored_no_fallback.rs`** — self-dev skill, `gate_errored { kind: gh_cli_failure }` variant.
+
+Mock sequence:
+1. Agent calls `pr_merge_with_gate`
+2. Tool returns `{"action": "gate_errored", "kind": {"kind": "gh_cli_failure", "exit_code": 1}, "detail": "gh exit code 1"}`
+3. Agent responds — must NOT call `run_gh pr merge` as a fallback
+
+Hard assertions:
+- `assert_tools_include(&trace, &["pr_merge_with_gate"])` — tool was called
+- `assert_response_forbids(&trace, &["run_gh pr merge", "gh pr merge"])` — no fallback
+- Response references infrastructure failure or escalation to Vincent
+
+Both scenarios follow the existing grounding regression pattern (see `auto_merge_vs_merged.rs` for the structural template). Scenarios are registered in `grounding_regressions/mod.rs`. The `self-dev-webhook-ci` skill is confirmed as a non-caller (F3 grep verification above) and does not need a separate scenario — its Rule 6 is documentation-only.
+
+**AC satisfaction:** At least one variant per migrated caller skill (self-dev gets two: `blocked` and `gate_errored`). Tool stubbed at the boundary via `MockLlmProvider` per mika#794's decision.
 
 ## Acceptance Criteria Mapping
 
@@ -132,7 +174,7 @@ If the reviewer disagrees, the eval harness could add a scenario where the mock 
 | Every caller has documented branch for all four top-level variants | Units 1, 2, 3 | M4 step 2.5 (Unit 2) expands blocked/gate_errored. Rule 6 (Units 1, 3) documents the full variant set. webhook-qa already done. |
 | `blocked` callers branch on `reason` sub-variants (at minimum MergeConflict + RequiredCheckFailed) | Unit 2 | M4 step 2.5 enumerates all five reason variants |
 | No skill prompt string-matches on error text | Units 1, 2, 3 | All callers use `action` field branching, no string matching |
-| Integration tests | Unit 5 | Prompt-only changes; tool-level tests already exist from mika#794 |
+| Integration tests | Unit 5 | Two eval-harness grounding regression scenarios: `blocked { merge_conflict }` and `gate_errored { gh_cli_failure }` for self-dev. `self-dev-webhook-ci` confirmed as non-caller (grep-verified, see Context §2). |
 
 ## Risk Assessment
 
@@ -141,3 +183,7 @@ If the reviewer disagrees, the eval harness could add a scenario where the mock 
 ## Blocked-by check
 
 mika#794 must be merged first. Verify: `rg "MergeGateResult" crates/mika-agent/src/tools/pr_merge_with_gate.rs` returns hits on the current branch. If the tagged union types are present, #794 has landed and this work can proceed.
+
+## Revision history
+
+- rev 2 (2026-05-27): addressed F1 by adding source citation confirming `#[serde(rename = "gate_errored")]` at `pr_merge_with_gate.rs:310` — plan's usage of `gate_errored` is correct per the implementation, not a divergence from the mika#794 spec (the issue body omits the rename attribute but the code has it); addressed F2 by replacing Unit 5's deferral with two concrete eval-harness grounding regression scenarios (`merge_gate_blocked_no_fallback` and `merge_gate_errored_no_fallback`) satisfying the issue body's explicit integration test AC; addressed F3 by adding inline grep verification (`rg "pr_merge_with_gate" skills/bundled/self-dev-webhook-ci/system_prompt.md` → hits only on Rule 6 documentation lines 33+35, zero tool call sites) confirming non-caller status.
