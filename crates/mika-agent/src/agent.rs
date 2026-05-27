@@ -1695,15 +1695,23 @@ async fn run_loop(
                     // satisfied predicate needs the user_message (to extract
                     // the expected location) AND the input_summary of each
                     // dispatch call. Single retry with structured re-prompt.
+                    // Match on `#N` only (not full `repo#N`) — the dispatch
+                    // prompt has multiple valid formats: `mika#500`,
+                    // `mika issue#500`, `senara-solutions/mika#500`. The
+                    // structural invariant is: the trigger's ISSUE NUMBER
+                    // must appear in the dispatch arg. Extract `#N` suffix
+                    // from location.
+                    let expected_hash_n: Option<String> =
+                        parse_ready_label_location(&user_input_text)
+                            .and_then(|loc| loc.rfind('#').map(|idx| loc[idx..].to_string()));
                     if !skip_remaining_guards
                         && matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !intent_guard_retries.contains("dispatch_arg_match")
                         && ready_label_dispatch_trigger(&user_input_text)
-                        && let Some(expected_location) =
-                            parse_ready_label_location(&user_input_text)
+                        && let Some(ref expected_location) = expected_hash_n
                         && let Some(mismatched) = all_tool_summaries.iter().find(|s| {
                             (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
-                                && !s.input_summary.contains(&expected_location)
+                                && !s.input_summary.contains(expected_location.as_str())
                         })
                     {
                         intent_guard_retries.insert("dispatch_arg_match");
