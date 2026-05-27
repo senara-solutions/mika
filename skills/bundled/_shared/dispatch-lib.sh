@@ -1193,13 +1193,22 @@ CALLOUT_EOF
     tmpfile=$(mktemp /tmp/canonical-callout-XXXXXX.md)
     printf '%s' "$new_body" > "$tmpfile"
 
-    if gh issue edit "$ISSUE_NUM" --repo "senara-solutions/$REPO" \
-        --body-file "$tmpfile" 2>/dev/null; then
+    # mika#1309: capture stderr from gh issue edit so failure cause is visible.
+    # The previous `2>/dev/null` silently dropped permission/rate-limit/network
+    # errors, leaving the dispatch-gate signals missing without operator-visible
+    # cause. We also redirect stdout to /dev/null (gh prints URL on success)
+    # and route stderr to a captured variable so it can be surfaced in the WARN
+    # line on failure.
+    local gh_stderr gh_exit
+    gh_stderr=$(gh issue edit "$ISSUE_NUM" --repo "senara-solutions/$REPO" \
+        --body-file "$tmpfile" 2>&1 >/dev/null)
+    gh_exit=$?
+    if [ "$gh_exit" -eq 0 ]; then
         echo "write_canonical_callout: wrote canonical callout to $REPO#$ISSUE_NUM (stage=$stage, session=$session_id)" >&2
         rm -f "$tmpfile"
         return 0
     else
-        echo "WARN: write_canonical_callout: gh issue edit failed for $REPO#$ISSUE_NUM" >&2
+        echo "WARN: write_canonical_callout: gh issue edit failed for $REPO#$ISSUE_NUM (exit=$gh_exit): ${gh_stderr:-<empty>}" >&2
         rm -f "$tmpfile"
         return 1
     fi
@@ -1278,7 +1287,7 @@ _iterate_groom_loop() {
                 GROOMED)
                     echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
                     _write_canonical_callout "ready-to-groomed" "$session_id" || \
-                        echo "info: canonical callout write non-fatal failure — pilot's organic write in dev-groom skill prompt remains as fallback until prompt-update follow-up ships" >&2
+                        echo "WARN: canonical_callout_failed — dispatch gate will reject next ready unless pilot organic write or operator-direct rescue fills the body callout" >&2
                     _cleanup_iterate_findings
                     return 0
                     ;;
@@ -1329,7 +1338,7 @@ _iterate_groom_loop() {
                 GROOMED)
                     echo "iterate_groom_loop: revised plan converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
                     _write_canonical_callout "iterate-to-groomed" "$session_id" || \
-                        echo "info: canonical callout write non-fatal failure — pilot's organic write in dev-groom skill prompt remains as fallback until prompt-update follow-up ships" >&2
+                        echo "WARN: canonical_callout_failed — dispatch gate will reject next ready unless pilot organic write or operator-direct rescue fills the body callout" >&2
                     _cleanup_iterate_findings
                     return 0
                     ;;
