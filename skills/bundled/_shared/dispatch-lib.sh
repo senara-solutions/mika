@@ -270,6 +270,16 @@ _set_up_worktree() {
         # Rebase-or-abort guard
         BEHIND=$(git -C "$WORKTREE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         if [ "$BEHIND" -gt 0 ]; then
+            # Clean dispatch-lib-owned ephemeral files before rebase (mika#1301):
+            # .claude/groom-verdict-trail.log and .iterate/ are written by the
+            # iterate-loop itself; their presence as unstaged changes blocks
+            # rebase with `error: cannot rebase: You have unstaged changes`,
+            # producing a misleading REBASE_CONFLICT with no actual semantic
+            # conflict. dispatch-lib owns these paths, so it can safely reset
+            # them before rebasing.
+            git -C "$WORKTREE_DIR" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
+            rm -rf "$WORKTREE_DIR/.iterate" 2>/dev/null || true
+
             if git -C "$WORKTREE_DIR" rebase origin/main 2>/dev/null; then
                 echo "Rebased ${BRANCH} onto origin/main (${BEHIND} commits caught up)." >&2
             else
@@ -561,11 +571,14 @@ ${RESULT}"
 
 ${RESULT}"
             elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
-                # Valid plan file exists but /ce:plan was never invoked — LLM
-                # wrote a plan-shaped file without running the planning skill
-                RESULT="PIPELINE FAILURE: dev-groom produced a plan file but no /ce:plan invocation detected in session log. Plan may not have been generated through the planning skill.
-
-${RESULT}"
+                # Valid plan file exists but /ce:plan was never invoked.
+                # Demoted from PIPELINE FAILURE to advisory note (mika#1303):
+                # pilot Write-tool plan creation is a valid path. The plan
+                # file's existence + size threshold + downstream architect
+                # verdict are the structural contract — the slash-command
+                # invocation is one of multiple valid paths to producing a
+                # plan, not the gate itself.
+                echo "Note: dev-groom produced a plan file ($VALID_PLAN) without explicit /ce:plan invocation. Plan-file existence is the operative gate." >&2
             fi
         fi
 
