@@ -270,6 +270,16 @@ _set_up_worktree() {
         # Rebase-or-abort guard
         BEHIND=$(git -C "$WORKTREE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         if [ "$BEHIND" -gt 0 ]; then
+            # Clean dispatch-lib-owned ephemeral files before rebase (mika#1301):
+            # .claude/groom-verdict-trail.log and .iterate/ are written by the
+            # iterate-loop itself; their presence as unstaged changes blocks
+            # rebase with `error: cannot rebase: You have unstaged changes`,
+            # producing a misleading REBASE_CONFLICT with no actual semantic
+            # conflict. dispatch-lib owns these paths, so it can safely reset
+            # them before rebasing.
+            git -C "$WORKTREE_DIR" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
+            rm -rf "$WORKTREE_DIR/.iterate" 2>/dev/null || true
+
             if git -C "$WORKTREE_DIR" rebase origin/main 2>/dev/null; then
                 echo "Rebased ${BRANCH} onto origin/main (${BEHIND} commits caught up)." >&2
             else
