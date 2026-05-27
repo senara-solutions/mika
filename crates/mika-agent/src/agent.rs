@@ -1702,8 +1702,7 @@ async fn run_loop(
                         && let Some(expected_location) =
                             parse_ready_label_location(&user_input_text)
                         && let Some(mismatched) = all_tool_summaries.iter().find(|s| {
-                            (s.name == "run_claude_pilot"
-                                || s.name == "run_claude_pilot_groom")
+                            (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
                                 && !s.input_summary.contains(&expected_location)
                         })
                     {
