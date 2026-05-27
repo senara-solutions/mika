@@ -37,7 +37,7 @@ fn assert_no_fallback_patterns(text: &str) {
             panic!(
                 "assert_no_fallback_patterns failed:\n  forbidden pattern '{}' found\n  response: {:?}",
                 pattern,
-                &text[..text.len().min(300)]
+                mika_common::text::safe_truncate(text, 300)
             );
         }
     }
@@ -90,7 +90,7 @@ async fn test_merge_gate_errored_no_fallback() -> anyhow::Result<()> {
             || lower.contains("escalat")
             || lower.contains("gate_errored"),
         "Response should reference infrastructure failure or escalation. Got: {:?}",
-        &text[..text.len().min(300)]
+        mika_common::text::safe_truncate(text, 300)
     );
 
     Ok(())
