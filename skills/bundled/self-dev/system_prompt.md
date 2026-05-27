@@ -272,9 +272,11 @@ If a tool returns `"Missing required parameter(s)"`, check field names character
 
 Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR. Always use `pr_merge_with_gate` with `pr_number` (integer) and `repo` (owner/repo string). The tool checks required CI statuses and returns a structured `action` — act on it.
 
+**Structural enforcement:** `pr_merge_with_gate` returns typed variants (`merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`). The `blocked` variant carries a `reason` field with sub-variants (`merge_conflict`, `required_check_failed`, `missing_approval`, `pr_closed`, `draft`). The `gate_errored` variant carries `kind` and `detail` fields. Branch on these variants exhaustively — do NOT fall back to `run_gh pr merge` on ANY error or blocked state. Runtime enforcement via policy table — see follow-up ticket.
+
 **Exception:** The "merge anyway" block resumption command uses raw `run_gh` as an intentional override of the CI gate when Vincent explicitly requests it.
 
-**Incident:** mika#485 on 2026-04-08 — PR merged with required CI check in FAILURE state because agent used `run_gh pr merge` which has no CI gate.
+**Incident:** mika#485 on 2026-04-08 — PR merged with required CI check in FAILURE state because agent used `run_gh pr merge` which has no CI gate. mika#792 on 2026-04-24 — agent improvised `run_gh pr merge --auto` when gate returned an unstructured error on a CONFLICTING PR.
 
 ### Rule 7 — Verification before diagnostic claims
 
@@ -493,7 +495,14 @@ For each `child_task_id` in `child_wis` (in order):
 
    *(M4 HOLD ≠ QA verdict `hold[*]`. The latter is a verdict class for blocked-but-fixable PRs handled in `self-dev-webhook-qa` § Verdict class `hold[*]`. Same word, different machinery.)*
 
-   - If `pr_merge_with_gate` returned `"blocked"` or `"gate_errored"`: the webhook handler already routed to the appropriate block/error path. M4 step 3 will see the child as `blocked`.
+   - If `pr_merge_with_gate` returned `"blocked"`: branch on the `reason` field:
+     - `reason.reason = "required_check_failed"`: the webhook handler already routed to CI-fix. M4 step 3 will see the child per the handler's outcome.
+     - `reason.reason = "merge_conflict"`: rebase needed. M4 step 3 will see the child as `blocked` or `in_progress` per the handler's outcome.
+     - `reason.reason = "missing_approval"`: review approval needed. Task stays `in_progress`.
+     - `reason.reason = "draft"` or `reason.reason = "pr_closed"`: unexpected in milestone flow. Escalate to Vincent. Task status: `blocked`.
+     - Unrecognized `reason` value: do NOT fall back to `run_gh pr merge`. Notify Vincent. Task stays `in_progress`.
+
+   - If `pr_merge_with_gate` returned `"gate_errored"`: infrastructure failure. Do NOT fall back to `run_gh pr merge`. Notify Vincent with `kind` and `detail`. Task stays `in_progress`.
 
    **Literal verification command** (per committed decision — do NOT re-derive):
    ```
