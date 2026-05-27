@@ -300,6 +300,15 @@ _set_up_worktree() {
             # them before rebasing.
             git -C "$WORKTREE_DIR" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
             rm -rf "$WORKTREE_DIR/.iterate" 2>/dev/null || true
+            # mika#1311 follow-up: reused worktrees can carry uncommitted/
+            # staged docs/plans/ edits from a prior failed dispatch (groom
+            # session crashed before commit, or a commit step was hook-
+            # rejected without retry). The committed plan on origin/$BRANCH
+            # is the canonical source of truth; any leftover unstaged or
+            # staged plan-doc edits are abandoned state. Reset tracked
+            # plan files to HEAD so rebase can proceed. (Untracked plan
+            # files are not affected — only tracked-but-modified ones.)
+            git -C "$WORKTREE_DIR" checkout HEAD -- docs/plans/ 2>/dev/null || true
 
             if git -C "$WORKTREE_DIR" rebase origin/main 2>/dev/null; then
                 echo "Rebased ${BRANCH} onto origin/main (${BEHIND} commits caught up)." >&2
