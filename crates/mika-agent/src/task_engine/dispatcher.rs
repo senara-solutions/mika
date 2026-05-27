@@ -415,6 +415,15 @@ impl TaskDispatcher {
             // depending on the LLM to fire the transition. Coupled pair with
             // `reap_orphaned_parent_tasks` (failure path).
             try_complete_parent_on_callback_success(&self.db, task).await;
+            // mika#1289: structural counterpart to the prompt-level groom-
+            // success handler in self-dev-callback (PR #1291). When a groom
+            // callback delivers with `Outcome: PLAN_GROOMED`, re-add the
+            // `ready` label so the ready-label webhook handler dispatches
+            // dev-pilot — engine-side, not LLM-mediated, so it fires every
+            // time. Prompt-level path remains as defense-in-depth
+            // (idempotent — re-adding an already-present label is a no-op).
+            try_dispatch_pilot_after_groom_success(&self.db, task, self.github_token.as_deref())
+                .await;
         }
 
         // Suppress user-facing notifications for team-child callbacks.
@@ -1496,6 +1505,165 @@ async fn try_complete_parent_on_callback_success(db: &AsyncDatabase, task: &Task
 /// `engine.rs:874-912`.
 fn is_team_child_callback(task: &Task) -> bool {
     task.team_run_id.is_some() && task.parent_task_id.is_some()
+}
+
+/// mika#1289 — When a dev-groom callback delivers with `Outcome: PLAN_GROOMED`
+/// in its result text, re-add the `ready` label on the GitHub issue so the
+/// ready-label webhook handler dispatches dev-pilot. This is the structural
+/// counterpart to the LLM-mediated prompt-level path in `self-dev-callback`
+/// (mika#996 / PR #1291) which has a documented drift rate: the LLM
+/// sometimes sets `update_task_status(completed)` but skips the
+/// `gh issue edit --add-label ready` step, leaving the queue wedged.
+///
+/// Engine-side dispatch is fire-and-forget: failure to re-add the label is
+/// logged at WARN and does not affect the callback delivery. The prompt-
+/// level handler remains as defense-in-depth (idempotent — re-adding an
+/// already-present label is a no-op on GitHub).
+///
+/// Trigger conditions (all must hold):
+///   - `task.dispatch_class == Some("groom")` — groom-class callbacks only
+///   - `task.result` contains the literal `"Outcome: PLAN_GROOMED"` —
+///     the structural success marker emitted by `_write_canonical_callout`'s
+///     parent `_iterate_groom_loop` (does not depend on body-marker write
+///     having succeeded; the callback-result text is canonical for this signal)
+///   - parent task has a parseable `reference_url` of shape
+///     `https://github.com/<owner>/<repo>/issues/<n>`
+///
+/// `gh` subprocess uses the resolved GitHub token from `github_token` (already
+/// scrubbed-and-re-injected pattern from `run_gh`). Audit event written under
+/// `tool_name='task_engine_groom_pilot_dispatcher'` for traceability.
+async fn try_dispatch_pilot_after_groom_success(
+    db: &AsyncDatabase,
+    task: &Task,
+    github_token: Option<&str>,
+) {
+    // 1. Groom-class callbacks only.
+    if task.dispatch_class.as_deref() != Some("groom") {
+        return;
+    }
+
+    // 2. Canonical success marker in callback result text.
+    let result = match &task.result {
+        Some(r) if r.contains("Outcome: PLAN_GROOMED") => r,
+        _ => return,
+    };
+
+    // 3. Parent task with parseable issue URL.
+    let parent_id = match &task.parent_task_id {
+        Some(id) => id.clone(),
+        None => return,
+    };
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    let reference_url = match parent.reference_url.as_deref() {
+        Some(url) => url,
+        None => return,
+    };
+    let (repo, issue_num) = match parse_repo_issue_from_url(reference_url) {
+        Some(parsed) => parsed,
+        None => return,
+    };
+
+    // 4. GitHub token required.
+    let token = match github_token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            warn!(
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                "engine: groom-pilot auto-fire skipped — no GitHub token configured"
+            );
+            return;
+        }
+    };
+
+    // 5. Spawn `gh issue edit <n> --repo senara-solutions/<repo> --add-label ready`.
+    //    Idempotent: re-adding an already-present label is a no-op on GitHub.
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args([
+        "issue",
+        "edit",
+        &issue_num.to_string(),
+        "--repo",
+        &format!("senara-solutions/{repo}"),
+        "--add-label",
+        "ready",
+    ]);
+    cmd.env("GH_TOKEN", token);
+    cmd.env("GH_PROMPT_DISABLED", "1");
+
+    match cmd.output().await {
+        Ok(out) if out.status.success() => {
+            info!(
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                repo = %repo,
+                issue = issue_num,
+                _result_len = result.len(),
+                "engine: auto-fired dev-pilot dispatch after groom success (mika#1289 — re-added ready label)"
+            );
+            let system_session = format!("system-{}", parent.agent_id);
+            let trace_id = mika_common::trace::generate_trace_id();
+            let reason = format!("groom_pilot_dispatch_fired (issue: {repo}#{issue_num})");
+            if let Err(e) = db
+                .log_audit_event(
+                    &system_session,
+                    "task_engine_groom_pilot_dispatcher",
+                    &parent_id,
+                    Some("groom_delivered"),
+                    Some("ready_label_re_added"),
+                    Some(&reason),
+                    Some(&trace_id),
+                )
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "engine: failed to write groom-pilot-dispatcher audit event"
+                );
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            warn!(
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                repo = %repo,
+                issue = issue_num,
+                exit_code = ?out.status.code(),
+                stderr = %stderr,
+                "engine: groom-pilot auto-fire failed — gh issue edit returned non-zero"
+            );
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                error = %e,
+                "engine: groom-pilot auto-fire failed — could not spawn gh subprocess"
+            );
+        }
+    }
+}
+
+/// Parse `senara-solutions/<repo>/issues/<n>` from a reference URL.
+/// Returns `(repo, issue_number)` on match, `None` otherwise.
+fn parse_repo_issue_from_url(url: &str) -> Option<(String, u64)> {
+    let after_org = url.split("senara-solutions/").nth(1)?;
+    let mut parts = after_org.split('/');
+    let repo = parts.next()?.to_string();
+    let kind = parts.next()?;
+    if kind != "issues" {
+        return None;
+    }
+    let n_str = parts.next()?;
+    // Strip any query string from the number.
+    let n_str = n_str.split('?').next().unwrap_or(n_str);
+    let n: u64 = n_str.parse().ok()?;
+    Some((repo, n))
 }
 
 /// Parse structured fields from callback result text.
