@@ -996,6 +996,34 @@ fi
 ITERATE_SCRATCH=$(grep -c '.iterate/rescue-commit-err' "$DISPATCH_LIB" || true)
 assert_eq "No .iterate/rescue-commit-err reference in dispatch-lib.sh" "0" "$ITERATE_SCRATCH"
 
+# --- Test 11: Idempotency-bypass-architect fabrication detection (mika#1319) ---
+
+echo ""
+echo "Test 11: Idempotency-bypass-architect fabrication detection (mika#1319)"
+echo "------------------------------------------------------------------------"
+
+# Extract the dev-groom post-flight section from dispatch-lib
+# The fabrication detection block lives inside the success branch, guarded by SKILL=dev-groom
+DEVGROOM_POSTFLIGHT=$(sed -n '/mika#1319.*idempotency-bypass-architect/,/^        fi$/p' "$DISPATCH_LIB")
+
+assert_contains "Fabrication detection block exists (mika#1319 comment)" "idempotency-bypass-architect" "$DEVGROOM_POSTFLIGHT"
+
+# Verify it is guarded by dev-groom skill check
+assert_contains "Guarded by dev-groom skill" 'dev-groom' "$DEVGROOM_POSTFLIGHT"
+
+# Verify it greps SESSION_LOG for the fabrication string
+assert_contains "Uses SESSION_LOG for fabrication detection" 'SESSION_LOG' "$DEVGROOM_POSTFLIGHT"
+
+# Verify the distinctive fabrication needle is present
+assert_contains "Contains fabrication needle substring" 'Architect convergence pending via dispatch-lib iterate loop' "$DEVGROOM_POSTFLIGHT"
+
+# Verify the PIPELINE FAILURE marker contains the idempotency-bypass-architect sub-type
+assert_contains "PIPELINE FAILURE marker includes idempotency-bypass-architect" 'PIPELINE FAILURE:' "$DEVGROOM_POSTFLIGHT"
+assert_contains "Marker includes sub-type identifier" 'idempotency-bypass-architect' "$DEVGROOM_POSTFLIGHT"
+
+# Verify fail-open: session log unavailability produces a warning, not a failure
+assert_contains "Fail-open warning when session log unavailable" 'Warning:' "$DEVGROOM_POSTFLIGHT"
+
 # --- Summary ---
 
 echo ""
