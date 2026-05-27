@@ -1,7 +1,7 @@
 ---
 title: "fix: Add dispatch-lib brake for dev-groom idempotency-bypass-architect fabrication"
 type: fix
-status: active
+status: completed
 date: 2026-05-27
 ---
 
@@ -11,7 +11,7 @@ date: 2026-05-27
 
 When the dev-groom pilot finds an already-committed plan on HEAD from a prior groom attempt, it treats the work as complete and exits with a fabricated success message without invoking the architect. This bypasses the architect roundtrip entirely, producing `PIPELINE FAILURE: HEAD unchanged` callbacks because no `Outcome: PLAN_GROOMED` marker is emitted. Three dispatches failed this way on 2026-05-27 (mika#806 and mika#736 x2).
 
-This fix adds a structural brake in dispatch-lib's post-flight checks to detect the fabrication string, and fixes the `/mika-groom-plan-only` prompt that instructs the pilot to output it.
+This fix adds a structural brake in dispatch-lib's post-flight checks to detect the fabrication string, plus a structural test to verify the brake exists. The `/mika-groom-plan-only` prompt fix (which removes the instruction that produces the fabrication) is deferred to a follow-on per mika#1319 scope authorization ("Vincent's morning read").
 
 ## Problem Frame
 
@@ -27,9 +27,9 @@ The fabrication string is bit-identical across all three failures, making it a r
 
 ## Requirements Trace
 
-- R1. dispatch-lib detects the 87-character fabrication string in the session log and classifies it as a distinct PIPELINE FAILURE sub-type (`idempotency-bypass-architect`)
-- R2. The `/mika-groom-plan-only` prompt no longer instructs the pilot to output the fabrication string
-- R3. The `/mika-groom-plan-only` prompt's idempotent re-groom path (Phase 2 step 4) gives the pilot actionable instructions for the prior-commit case instead of silently deferring
+- R1. dispatch-lib detects the fabrication string in the session log and classifies it as a distinct PIPELINE FAILURE sub-type (`idempotency-bypass-architect`)
+- ~~R2. (deferred — see Scope Boundaries)~~
+- ~~R3. (deferred — see Scope Boundaries)~~
 - R4. Existing post-flight checks (HEAD unchanged, plan validation, PR existence) remain orthogonal and unchanged
 - R5. Structural test in `test-dispatch-lib.sh` verifies the new detection block exists
 
@@ -42,7 +42,7 @@ The fabrication string is bit-identical across all three failures, making it a r
 
 ### Deferred to Separate Tasks
 
-- Full skill-prompt restructure (Option A from ticket) -- follow-on after this dispatch-lib brake ships
+- Full skill-prompt restructure (Option A from ticket) -- follow-on after this dispatch-lib brake ships. **Includes the `/mika-groom-plan-only` prompt fix (R2, R3)**, which the mika#1319 issue body explicitly scopes as "Vincent's morning read" follow-on, not tonight's dispatch.
 - Engine-side `idempotency-bypass-architect` recognition for structured reaper handling -- future iteration if the brake proves insufficient
 
 ## Context & Research
@@ -65,13 +65,14 @@ The fabrication string is bit-identical across all three failures, making it a r
 
 - **Session log grep (not PILOT_OUTPUT)**: `PILOT_OUTPUT_RAW` is the structured JSON envelope from claude-pilot's stdout, not the session transcript. The session log at `$SESSION_LOG` contains the full pilot transcript and is already used for the `/ce:plan` invocation check. The fabrication string appears in the pilot's final text output, which is captured in the session log.
 - **Substring match, not regex**: the fabrication string is bit-identical across all observed failures. A simple `grep -qF` (fixed-string match) is more robust than regex and matches the existing `/ce:plan` detection pattern.
+- **60-char distinctive substring vs full 87-char fabrication string**: The issue AC specifies "substring-match the bit-identical 87-character fabrication string." This plan uses the distinctive portion `Architect convergence pending via dispatch-lib iterate loop` (60 chars) rather than the full `Plan committed and pushed. Architect convergence pending via dispatch-lib iterate loop.` (87 chars). Rationale: the 60-char substring is the semantically distinctive portion — the `Plan committed and pushed.` prefix is generic phrasing that could appear in legitimate success messages. The 60-char tail is unique to this fabrication class (it references dispatch-lib's internal iterate loop, which no legitimate pilot output would). False-positive risk is negligible for the distinctive portion alone, while matching the full string risks false-negatives if the pilot paraphrases only the generic prefix (e.g., "Plan committed." instead of "Plan committed and pushed."). Either choice satisfies the AC's intent (structural detection of this fabrication); the distinctive substring is the more robust match target. (review-guide.md § KISS — prefer the simpler choice that is also more robust.)
 - **Prepend to RESULT, not replace**: follow the existing pattern where post-flight checks prepend `PIPELINE FAILURE:` to `$RESULT`, preserving the original claude-pilot output for diagnostic context.
 - **Detection fires for dev-groom only**: guarded by `$SKILL = "dev-groom"` to avoid false positives on other dispatch skills.
 - **Prompt fix removes the instruction entirely**: Phase 3 step 8 should not prescribe a specific exit string. The pilot should output whatever confirms the artifacts it produced. The idempotent re-groom path (Phase 2 step 4) should instruct the pilot to re-commit the existing plan (ensuring HEAD advances) rather than silently treating it as done.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add fabrication-string detection to dispatch-lib post-flight**
+- [x] **Unit 1: Add fabrication-string detection to dispatch-lib post-flight**
 
 **Goal:** Detect the bit-identical fabrication string in the dev-groom session log and classify as a distinct PIPELINE FAILURE sub-type.
 
@@ -87,7 +88,7 @@ The fabrication string is bit-identical across all three failures, making it a r
 - Pattern: grep `$SESSION_LOG` for the fixed string `Architect convergence pending via dispatch-lib iterate loop` (the distinctive 60-char substring that is unique to this fabrication class).
 - On match: prepend `PIPELINE FAILURE: dev-groom session exited without architect roundtrip (idempotency-bypass-architect). Pilot claimed architect convergence is pending via dispatch-lib but dispatch-lib's _iterate_groom_loop runs within this same dispatch — not separately.` to `$RESULT`.
 - Fail-open: if `$SESSION_LOG` is unavailable or unreadable, skip with a stderr warning (same pattern as the `/ce:plan` check at lines 611-618).
-- The existing `HEAD unchanged` check at line 453 fires first (it's earlier in the function). The new check adds diagnostic specificity -- both may fire on the same session, and the outcome classification at line 678 correctly uses `grep -qF "PIPELINE FAILURE:"` which matches either.
+- **Double-firing with HEAD-unchanged check is accepted.** The existing `HEAD unchanged` check at line 453 fires first (it's earlier in the function). When both checks fire on the same session, `$RESULT` carries two `PIPELINE FAILURE:` prefixes: `PIPELINE FAILURE: [idempotency-bypass-architect detail] PIPELINE FAILURE: [HEAD unchanged detail]`. This is accepted because: (a) the outcome classifier at line 678 uses `grep -qF "PIPELINE FAILURE:"` which matches on the first occurrence — the doubled prefix does not affect classification; (b) the delivered callback text is diagnostic-only (mika-dev reads the outcome line, not the RESULT body, for dispatch decisions); (c) the more specific idempotency-bypass-architect marker appears first, giving operators the actionable diagnosis at a glance. Adding a dedup guard (e.g., skip HEAD-unchanged when fabrication is detected) would violate the orthogonality of the two checks — the fabrication check detects *why* the pilot misbehaved; the HEAD-unchanged check detects the *structural consequence*. Both diagnostics are independently useful. (review-guide.md § Single Responsibility — each check diagnoses one thing; review-guide.md § Orthogonality — independent checks should not suppress each other.)
 
 **Patterns to follow:**
 - Lines 596-641: dev-groom plan validation block (same guard structure, same `$SESSION_LOG` access pattern, same `RESULT` prepend convention)
@@ -103,38 +104,9 @@ The fabrication string is bit-identical across all three failures, making it a r
 - The grep pattern matches against a file containing the fabrication string
 - The PIPELINE FAILURE marker includes `idempotency-bypass-architect` for structured recognition
 
-- [ ] **Unit 2: Fix /mika-groom-plan-only prompt — remove fabrication instruction and fix idempotent path**
+- ~~**Unit 2: (deferred)** Fix /mika-groom-plan-only prompt — deferred to follow-on ticket per mika#1319 scope authorization ("Vincent's morning read"). R2/R3 are addressed there, not in this dispatch.~~
 
-**Goal:** Remove the instruction that tells the pilot to output the fabrication string, and give the idempotent re-groom path actionable behavior.
-
-**Requirements:** R2, R3
-
-**Dependencies:** None (independent of Unit 1)
-
-**Files:**
-- Modify: `.claude/commands/mika-groom-plan-only.md`
-
-**Approach:**
-Two changes in the prompt:
-
-1. **Phase 2 step 4 (idempotent re-groom, line 45):** Currently says "If a plan is found, reuse it as the starting point -- this is an idempotent re-groom case." This gives no actionable instruction, causing the pilot to treat it as "work done, exit." Change to instruct the pilot to: read the existing plan, still run `/ce:plan` (which will incorporate the prior plan as context), and produce a fresh commit. This ensures HEAD advances and the iterate loop's architect call has a real commit to work with.
-
-2. **Phase 3 step 8 (exit text, line 59):** Currently prescribes the exact fabrication string. Remove the prescribed text. Replace with a generic instruction: "Output a brief confirmation of what was produced (plan file path and commit SHA)." This avoids creating a new bit-identical fabrication target while still giving the pilot a clear exit behavior.
-
-Also update the "What this command does NOT do" section to explicitly state: "Do NOT claim architect convergence is pending elsewhere. The architect is invoked by dispatch-lib within the same dispatch lifecycle, not as a separate process."
-
-**Patterns to follow:**
-- `.claude/commands/mika-revise-plan.md` -- the content-only revise pilot command, which has a similar "do the content work, commit, exit" shape without prescribing specific exit text
-
-**Test scenarios:**
-- Test expectation: none -- prompt-only change, no behavioral test. The structural brake in Unit 1 provides defense-in-depth.
-
-**Verification:**
-- The prompt no longer contains the substring `Architect convergence pending via dispatch-lib iterate loop`
-- Phase 2 step 4 instructs the pilot to run `/ce:plan` even when a prior plan exists
-- Phase 3 step 8 does not prescribe a specific exit string
-
-- [ ] **Unit 3: Add structural test for fabrication detection block**
+- [x] **Unit 2: Add structural test for fabrication detection block**
 
 **Goal:** Verify the new detection block exists in dispatch-lib via the established structural grep pattern.
 
@@ -171,7 +143,7 @@ Also update the "What this command does NOT do" section to explicitly state: "Do
 
 | Risk | Mitigation |
 |------|------------|
-| Prompt fix doesn't prevent future fabrication variants (LLM paraphrases the string) | Unit 1's dispatch-lib brake catches the known variant structurally. Future paraphrase variants would be caught by the existing HEAD-unchanged check. The brake is defense-in-depth, not sole defense. |
+| Prompt fix is deferred — fabrication instruction remains in `/mika-groom-plan-only` | Unit 1's dispatch-lib brake catches the known variant structurally. The prompt fix (R2/R3) ships as a follow-on per mika#1319 scope authorization. Until then, the existing HEAD-unchanged check + the new fabrication brake provide two independent defenses. Future paraphrase variants would be caught by the HEAD-unchanged check. |
 | Session log unavailable in some environments | Fail-open pattern (skip with warning) matches existing `/ce:plan` check. The HEAD-unchanged check is the primary defense and does not depend on the session log. |
 | False positive if a legitimate session mentions the fabrication string in diagnostic context | The string is 60 characters of very specific phrasing. Legitimate sessions would not produce this exact substring in normal operation. Risk accepted as negligible. |
 
@@ -185,3 +157,7 @@ Also update the "What this command does NOT do" section to explicitly state: "Do
 - Memory: `feedback_mika_dev_llm_fabricates_tool_errors`
 - Solution: `docs/solutions/agent-quirks/dev-groom-fabricated-verdict-2026-05-20.md`
 - Solution: `docs/solutions/best-practices/dev-groom-drift-detection-structural-validation-2026-05-11.md`
+
+## Revision history
+
+- rev 2 (2026-05-27): addressed F1 by removing Unit 2 (prompt fix to `/mika-groom-plan-only.md`) — operator scope authorization in mika#1319 explicitly defers it to follow-on ("Vincent's morning read"), R2/R3 struck from active requirements, risk table updated; addressed F2 by adding Key Technical Decisions entry justifying 60-char distinctive substring over full 87-char string (semantic distinctiveness, false-negative robustness, review-guide.md § KISS); addressed F3 by expanding Unit 1's Approach with explicit acceptance of double-firing — both diagnostics are independently useful and the outcome classifier is unaffected, citing review-guide.md § Single Responsibility and § Orthogonality.
