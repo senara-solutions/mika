@@ -640,6 +640,26 @@ ${RESULT}"
             fi
         fi
 
+        # mika#1319: Detect idempotency-bypass-architect fabrication in dev-groom
+        # sessions. When the pilot finds a prior plan commit on HEAD, it sometimes
+        # fabricates a success message claiming architect convergence is pending
+        # "via dispatch-lib iterate loop" — but _iterate_groom_loop runs within
+        # this same dispatch, not separately. The bit-identical fabrication string
+        # appeared in 3/3 observed failures (mika#806, mika#736 x2). Detect it
+        # structurally and classify as a distinct PIPELINE FAILURE sub-type.
+        if [ "$SKILL" = "dev-groom" ]; then
+            FABRICATION_NEEDLE="Architect convergence pending via dispatch-lib iterate loop"
+            if [ -f "$SESSION_LOG" ] && [ -r "$SESSION_LOG" ]; then
+                if grep -qF "$FABRICATION_NEEDLE" "$SESSION_LOG" 2>/dev/null; then
+                    RESULT="PIPELINE FAILURE: dev-groom session exited without architect roundtrip (idempotency-bypass-architect). Pilot claimed architect convergence is pending via dispatch-lib but dispatch-lib's _iterate_groom_loop runs within this same dispatch — not separately.
+
+${RESULT}"
+                fi
+            else
+                echo "Warning: session log not available at $SESSION_LOG — skipping idempotency-bypass-architect check" >&2
+            fi
+        fi
+
         # Issue #138: Discover actual PR URL from the branch
         PR_URL=""
         if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
