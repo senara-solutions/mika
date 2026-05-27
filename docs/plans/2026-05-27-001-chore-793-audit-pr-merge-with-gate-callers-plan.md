@@ -6,6 +6,17 @@ mika#794 landed the tagged-union `MergeGateResult` return type on `pr_merge_with
 
 **Variant name confirmation:** The Rust enum variant is `GateError`, but `pr_merge_with_gate.rs:310` has `#[serde(rename = "gate_errored")]`, so the serialized `action` field value is `gate_errored` (not `gate_error`). This is confirmed by the test assertions at `pr_merge_with_gate.rs:1087` (`assert_eq!(json["action"], "gate_errored")`). All prompt-level references in this plan use `gate_errored` — the confirmed serialized form.
 
+**Sub-variant serialization shape confirmation — `BlockReason` and `GateErrorKind`:**
+
+`BlockReason` at `pr_merge_with_gate.rs:316` uses `#[serde(tag = "reason")]` — internally tagged. `GateErrorKind` at `pr_merge_with_gate.rs:337` uses `#[serde(tag = "kind")]` — internally tagged. Because each sub-enum is itself internally tagged, and the parent `MergeGateResult` nests them as struct fields (`reason: BlockReason` at `:303`, `kind: GateErrorKind` at `:311`), the serialized JSON has a doubly-nested shape:
+
+- `Blocked { reason: BlockReason::MergeConflict }` → `{"action": "blocked", "reason": {"reason": "merge_conflict"}, ...}` — confirmed by test assertion at `:1039` (`json["reason"]["reason"]`, "merge_conflict"`)
+- `GateError { kind: GateErrorKind::GhCliFailure { exit_code: 1 } }` → `{"action": "gate_errored", "kind": {"kind": "gh_cli_failure", "exit_code": 1}, ...}` — confirmed by test assertions at `:1088` (`json["kind"]["kind"]`, "gh_cli_failure"`) and `:1089` (`json["kind"]["exit_code"]`, 1)
+
+All five `BlockReason` variants are confirmed doubly-nested via test assertions: `required_check_failed` (`:1025`), `merge_conflict` (`:1039`), `missing_approval` (`:1053`), `draft` (`:1065`), `pr_closed` (`:1077`). All four `GateErrorKind` variants are confirmed: `gh_cli_failure` (`:1088`), `network_error` (`:1101`), `parse_error` (`:1112`), `unknown` (`:1123`).
+
+This plan's Unit 2 branch predicates (`reason.reason = "merge_conflict"` etc.) and Unit 5 mock payloads (`{"reason": {"reason": "merge_conflict"}}`, `{"kind": {"kind": "gh_cli_failure", "exit_code": 1}}`) match the confirmed serialized shapes.
+
 **Full variant set citation — correcting outdated mika#793 AC.** The mika#793 issue body AC lists four variants (`pass`, `auto_merge_enabled`, `blocked`, `gate_errored`). This AC text predates mika#794's shipped implementation. The enum at `pr_merge_with_gate.rs:295-311` defines five variants with these serialized `action` values:
 
 - line 297 `#[serde(rename = "merged")]` (variant `Merged`) — AC says `pass`; code says `merged`
@@ -187,3 +198,4 @@ mika#794 must be merged first. Verify: `rg "MergeGateResult" crates/mika-agent/s
 ## Revision history
 
 - rev 2 (2026-05-27): addressed F1 by adding source citation confirming `#[serde(rename = "gate_errored")]` at `pr_merge_with_gate.rs:310` — plan's usage of `gate_errored` is correct per the implementation, not a divergence from the mika#794 spec (the issue body omits the rename attribute but the code has it); addressed F2 by replacing Unit 5's deferral with two concrete eval-harness grounding regression scenarios (`merge_gate_blocked_no_fallback` and `merge_gate_errored_no_fallback`) satisfying the issue body's explicit integration test AC; addressed F3 by adding inline grep verification (`rg "pr_merge_with_gate" skills/bundled/self-dev-webhook-ci/system_prompt.md` → hits only on Rule 6 documentation lines 33+35, zero tool call sites) confirming non-caller status.
+- rev 3 (2026-05-27): addressed F1 by citing `BlockReason` serde attribute `#[serde(tag = "reason")]` at `:316` and `GateErrorKind` serde attribute `#[serde(tag = "kind")]` at `:337`, both internally tagged. Confirmed doubly-nested serialization shape via test assertions (`:1025`–`:1123`): `reason.reason = "merge_conflict"` and `kind.kind = "gh_cli_failure"` match the actual JSON output. Unit 2 branch predicates and Unit 5 mock payloads are correct as written. Added per-line citation table for all 9 sub-variant test assertions to the Context section. Citation: review-guide.md § Single Responsibility — prompt-tool contract boundary requires branch predicates to match the tool's actual serialized output.
