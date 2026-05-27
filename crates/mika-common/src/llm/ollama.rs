@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::error::LlmError;
@@ -18,17 +19,50 @@ struct OllamaChatRequest {
     messages: Vec<OllamaMessage>,
     stream: bool,
     options: OllamaOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OllamaTool>>,
 }
 
 #[derive(Serialize)]
 struct OllamaMessage {
     role: String,
     content: String,
+    /// Tool calls from assistant messages (echoed back in conversation history).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
 #[derive(Serialize)]
 struct OllamaOptions {
     num_predict: u32,
+}
+
+/// Tool definition sent in the request (same shape as OpenAI).
+#[derive(Serialize)]
+struct OllamaTool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: OllamaFunctionDef,
+}
+
+#[derive(Serialize)]
+struct OllamaFunctionDef {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+/// Tool call returned in the response message.
+#[derive(Debug, Serialize, Deserialize)]
+struct OllamaToolCall {
+    function: OllamaFunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OllamaFunctionCall {
+    name: String,
+    /// Ollama returns arguments as a JSON object, not a string (unlike OpenAI).
+    arguments: Value,
 }
 
 // -- Response types --
@@ -51,6 +85,8 @@ struct OllamaResponseMessage {
     #[allow(dead_code)]
     role: String,
     content: String,
+    #[serde(default)]
+    tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
 // -- Error response --
@@ -70,7 +106,7 @@ const MAX_RETRIES: u32 = 3;
 /// - Uses Ollama's native request/response format
 /// - Does not require `/v1` suffix in the base URL
 /// - Uses `/api/tags` for health checks
-/// - Does not support tool calling or vision (deferred)
+/// - Does not support vision (deferred)
 pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
@@ -123,63 +159,115 @@ impl OllamaProvider {
             messages.push(OllamaMessage {
                 role: "system".into(),
                 content: system.clone(),
+                tool_calls: None,
             });
         }
 
         // Convert conversation messages
         for msg in &request.messages {
             match msg.role {
-                LlmRole::User | LlmRole::Assistant => {
-                    let role = match msg.role {
-                        LlmRole::User => "user",
-                        LlmRole::Assistant => "assistant",
-                        _ => unreachable!(),
-                    };
+                LlmRole::User => {
                     let content = match &msg.content {
                         LlmContent::Text(t) => t.clone(),
-                        LlmContent::Blocks(blocks) => {
-                            // Flatten blocks to text. Tool call/result blocks are
-                            // unreachable in normal operation (the agent loop gates on
-                            // supports_tool_calling() at agent.rs:2614). Log a warning
-                            // as a contract-violation signal if encountered.
-                            let mut has_non_text = false;
-                            let text: String = blocks
-                                .iter()
-                                .filter_map(|b| match b {
-                                    LlmContentBlock::Text(t) => Some(t.as_str()),
-                                    _ => {
-                                        has_non_text = true;
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("");
-                            if has_non_text {
-                                warn!(
-                                    role = role,
-                                    "ollama provider received non-text content blocks \
-                                     (tool call/result/image) — these are unreachable in \
-                                     normal operation; flattening to text only"
-                                );
-                            }
-                            text
-                        }
+                        LlmContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                LlmContentBlock::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(""),
                     };
                     messages.push(OllamaMessage {
-                        role: role.into(),
+                        role: "user".into(),
                         content,
+                        tool_calls: None,
                     });
                 }
-                LlmRole::Tool => {
-                    // Tool result messages are unreachable when supports_tool_calling()
-                    // returns false. Log warning and skip.
-                    warn!(
-                        "ollama provider received tool result message — \
-                         this is unreachable in normal operation; skipping"
-                    );
+                LlmRole::Assistant => {
+                    let mut text_parts = Vec::new();
+                    let mut tool_calls = Vec::new();
+
+                    match &msg.content {
+                        LlmContent::Text(t) => text_parts.push(t.as_str()),
+                        LlmContent::Blocks(blocks) => {
+                            for block in blocks {
+                                match block {
+                                    LlmContentBlock::Text(t) => text_parts.push(t.as_str()),
+                                    LlmContentBlock::ToolCall {
+                                        name, arguments, ..
+                                    } => {
+                                        tool_calls.push(OllamaToolCall {
+                                            function: OllamaFunctionCall {
+                                                name: name.clone(),
+                                                arguments: arguments.clone(),
+                                            },
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    };
+
+                    messages.push(OllamaMessage {
+                        role: "assistant".into(),
+                        content: text_parts.join(""),
+                        tool_calls: if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls)
+                        },
+                    });
                 }
+                LlmRole::Tool => match &msg.content {
+                    LlmContent::Blocks(blocks) => {
+                        for block in blocks {
+                            if let LlmContentBlock::ToolResult { content, .. } = block {
+                                let text = match content {
+                                    LlmToolResultContent::Text(t) => t.clone(),
+                                    LlmToolResultContent::Blocks(parts) => parts
+                                        .iter()
+                                        .filter_map(|p| match p {
+                                            LlmToolResultBlock::Text(t) => Some(t.as_str()),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(""),
+                                };
+                                messages.push(OllamaMessage {
+                                    role: "tool".into(),
+                                    content: text,
+                                    tool_calls: None,
+                                });
+                            }
+                        }
+                    }
+                    LlmContent::Text(t) => {
+                        messages.push(OllamaMessage {
+                            role: "tool".into(),
+                            content: t.clone(),
+                            tool_calls: None,
+                        });
+                    }
+                },
             }
         }
+
+        // Convert tools
+        let tools = request.tools.as_ref().map(|tools| {
+            tools
+                .iter()
+                .map(|t| OllamaTool {
+                    tool_type: "function".into(),
+                    function: OllamaFunctionDef {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.parameters.clone(),
+                    },
+                })
+                .collect()
+        });
 
         OllamaChatRequest {
             model: request.model.clone(),
@@ -188,6 +276,7 @@ impl OllamaProvider {
             options: OllamaOptions {
                 num_predict: self.max_tokens,
             },
+            tools,
         }
     }
 
@@ -202,11 +291,29 @@ impl OllamaProvider {
             None
         };
 
-        let content = if text.is_empty() {
-            vec![]
-        } else {
-            vec![LlmResponseContent::Text(text)]
-        };
+        let mut content = Vec::new();
+
+        if !text.is_empty() {
+            content.push(LlmResponseContent::Text(text));
+        }
+
+        // Parse tool calls from response. Ollama doesn't provide tool call IDs,
+        // so we generate positional IDs (unique within a single response turn).
+        let has_tool_calls = response
+            .message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tc| !tc.is_empty());
+
+        if let Some(tool_calls) = response.message.tool_calls {
+            for (index, tc) in tool_calls.into_iter().enumerate() {
+                content.push(LlmResponseContent::ToolCall {
+                    id: format!("ollama_tc_{index}"),
+                    name: tc.function.name,
+                    arguments: tc.function.arguments,
+                });
+            }
+        }
 
         let usage = LlmUsage {
             input_tokens: response.prompt_eval_count.unwrap_or(0),
@@ -218,7 +325,11 @@ impl OllamaProvider {
         LlmResponse {
             content,
             reasoning,
-            stop_reason: LlmStopReason::EndTurn,
+            stop_reason: if has_tool_calls {
+                LlmStopReason::ToolUse
+            } else {
+                LlmStopReason::EndTurn
+            },
             usage,
         }
     }
@@ -452,7 +563,7 @@ impl LlmProvider for OllamaProvider {
     }
 
     fn supports_tool_calling(&self) -> bool {
-        false
+        true
     }
 
     fn supports_vision(&self) -> bool {
@@ -612,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_ollama_request_tools_ignored() {
+    fn test_to_ollama_request_with_tools() {
         let provider = make_provider();
         let req = LlmRequest {
             model: "llama3".into(),
@@ -623,17 +734,149 @@ mod tests {
             }],
             tools: Some(vec![LlmToolDefinition {
                 name: "search".into(),
-                description: "Search".into(),
-                parameters: json!({"type": "object"}),
+                description: "Search the web".into(),
+                parameters: json!({"type": "object", "properties": {"query": {"type": "string"}}}),
             }]),
             max_tokens: 4096,
             thinking: None,
         };
 
         let ollama_req = provider.to_ollama_request(&req);
-        // Tools are not included in the ollama request format
         let json = serde_json::to_value(&ollama_req).unwrap();
-        assert!(json.get("tools").is_none());
+        let tools = json.get("tools").expect("tools should be present");
+        assert_eq!(tools.as_array().unwrap().len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "search");
+        assert_eq!(tools[0]["function"]["description"], "Search the web");
+        assert!(tools[0]["function"]["parameters"]["properties"]["query"].is_object());
+    }
+
+    #[test]
+    fn test_to_ollama_request_no_tools_omitted() {
+        let provider = make_provider();
+        let req = LlmRequest {
+            model: "llama3".into(),
+            system: None,
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Text("Hello".into()),
+            }],
+            tools: None,
+            max_tokens: 4096,
+            thinking: None,
+        };
+
+        let ollama_req = provider.to_ollama_request(&req);
+        let json = serde_json::to_value(&ollama_req).unwrap();
+        assert!(
+            json.get("tools").is_none(),
+            "tools field should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn test_to_ollama_request_assistant_with_tool_calls() {
+        let provider = make_provider();
+        let req = LlmRequest {
+            model: "llama3".into(),
+            system: None,
+            messages: vec![LlmMessage {
+                role: LlmRole::Assistant,
+                content: LlmContent::Blocks(vec![
+                    LlmContentBlock::Text("Let me search for that.".into()),
+                    LlmContentBlock::ToolCall {
+                        id: "call_1".into(),
+                        name: "search".into(),
+                        arguments: json!({"query": "weather"}),
+                    },
+                ]),
+            }],
+            tools: None,
+            max_tokens: 4096,
+            thinking: None,
+        };
+
+        let ollama_req = provider.to_ollama_request(&req);
+        assert_eq!(ollama_req.messages.len(), 1);
+
+        let json = serde_json::to_value(&ollama_req).unwrap();
+        let msg = &json["messages"][0];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["content"], "Let me search for that.");
+        let tc = &msg["tool_calls"][0];
+        assert_eq!(tc["function"]["name"], "search");
+        assert_eq!(tc["function"]["arguments"]["query"], "weather");
+    }
+
+    #[test]
+    fn test_to_ollama_request_tool_result_messages() {
+        let provider = make_provider();
+        let req = LlmRequest {
+            model: "llama3".into(),
+            system: None,
+            messages: vec![LlmMessage {
+                role: LlmRole::Tool,
+                content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
+                    tool_call_id: "call_1".into(),
+                    content: LlmToolResultContent::Text("Sunny, 22°C".into()),
+                    is_error: false,
+                }]),
+            }],
+            tools: None,
+            max_tokens: 4096,
+            thinking: None,
+        };
+
+        let ollama_req = provider.to_ollama_request(&req);
+        assert_eq!(ollama_req.messages.len(), 1);
+        assert_eq!(ollama_req.messages[0].role, "tool");
+        assert_eq!(ollama_req.messages[0].content, "Sunny, 22°C");
+    }
+
+    #[test]
+    fn test_to_ollama_request_tool_result_blocks() {
+        let provider = make_provider();
+        let req = LlmRequest {
+            model: "llama3".into(),
+            system: None,
+            messages: vec![LlmMessage {
+                role: LlmRole::Tool,
+                content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
+                    tool_call_id: "call_1".into(),
+                    content: LlmToolResultContent::Blocks(vec![
+                        LlmToolResultBlock::Text("Part 1. ".into()),
+                        LlmToolResultBlock::Text("Part 2.".into()),
+                    ]),
+                    is_error: false,
+                }]),
+            }],
+            tools: None,
+            max_tokens: 4096,
+            thinking: None,
+        };
+
+        let ollama_req = provider.to_ollama_request(&req);
+        assert_eq!(ollama_req.messages[0].content, "Part 1. Part 2.");
+    }
+
+    #[test]
+    fn test_to_ollama_request_tool_result_text_content() {
+        let provider = make_provider();
+        let req = LlmRequest {
+            model: "llama3".into(),
+            system: None,
+            messages: vec![LlmMessage {
+                role: LlmRole::Tool,
+                content: LlmContent::Text("raw tool output".into()),
+            }],
+            tools: None,
+            max_tokens: 4096,
+            thinking: None,
+        };
+
+        let ollama_req = provider.to_ollama_request(&req);
+        assert_eq!(ollama_req.messages[0].role, "tool");
+        assert_eq!(ollama_req.messages[0].content, "raw tool output");
     }
 
     #[test]
@@ -667,6 +910,7 @@ mod tests {
             message: OllamaResponseMessage {
                 role: "assistant".into(),
                 content: "Hello! How can I help you?".into(),
+                tool_calls: None,
             },
             done: true,
             total_duration: Some(1_500_000_000),
@@ -689,6 +933,7 @@ mod tests {
             message: OllamaResponseMessage {
                 role: "assistant".into(),
                 content: "Response".into(),
+                tool_calls: None,
             },
             done: true,
             total_duration: None,
@@ -708,6 +953,7 @@ mod tests {
             message: OllamaResponseMessage {
                 role: "assistant".into(),
                 content: "<think>\nLet me reason about this.\n</think>\n\nThe answer is 42.".into(),
+                tool_calls: None,
             },
             done: true,
             total_duration: Some(2_000_000_000),
@@ -727,6 +973,7 @@ mod tests {
             message: OllamaResponseMessage {
                 role: "assistant".into(),
                 content: String::new(),
+                tool_calls: None,
             },
             done: true,
             total_duration: None,
@@ -737,6 +984,162 @@ mod tests {
         let llm = OllamaProvider::from_ollama_response(resp);
         assert!(llm.content.is_empty());
         assert_eq!(llm.text(), "");
+    }
+
+    #[test]
+    fn test_from_ollama_response_tool_calls() {
+        let resp = OllamaChatResponse {
+            model: "llama3".into(),
+            message: OllamaResponseMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(vec![OllamaToolCall {
+                    function: OllamaFunctionCall {
+                        name: "get_weather".into(),
+                        arguments: json!({"city": "Tokyo"}),
+                    },
+                }]),
+            },
+            done: true,
+            total_duration: Some(1_000_000_000),
+            eval_count: Some(10),
+            prompt_eval_count: Some(20),
+        };
+
+        let llm = OllamaProvider::from_ollama_response(resp);
+        assert_eq!(llm.content.len(), 1);
+        match &llm.content[0] {
+            LlmResponseContent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "ollama_tc_0");
+                assert_eq!(name, "get_weather");
+                assert_eq!(arguments, &json!({"city": "Tokyo"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_ollama_response_tool_calls_stop_reason() {
+        let resp = OllamaChatResponse {
+            model: "llama3".into(),
+            message: OllamaResponseMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(vec![OllamaToolCall {
+                    function: OllamaFunctionCall {
+                        name: "search".into(),
+                        arguments: json!({"q": "test"}),
+                    },
+                }]),
+            },
+            done: true,
+            total_duration: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        };
+
+        let llm = OllamaProvider::from_ollama_response(resp);
+        assert_eq!(llm.stop_reason, LlmStopReason::ToolUse);
+    }
+
+    #[test]
+    fn test_from_ollama_response_tool_calls_with_text() {
+        let resp = OllamaChatResponse {
+            model: "llama3".into(),
+            message: OllamaResponseMessage {
+                role: "assistant".into(),
+                content: "I'll look that up for you.".into(),
+                tool_calls: Some(vec![OllamaToolCall {
+                    function: OllamaFunctionCall {
+                        name: "search".into(),
+                        arguments: json!({"query": "rust"}),
+                    },
+                }]),
+            },
+            done: true,
+            total_duration: None,
+            eval_count: Some(25),
+            prompt_eval_count: Some(30),
+        };
+
+        let llm = OllamaProvider::from_ollama_response(resp);
+        assert_eq!(llm.content.len(), 2);
+        assert!(
+            matches!(&llm.content[0], LlmResponseContent::Text(t) if t == "I'll look that up for you.")
+        );
+        assert!(
+            matches!(&llm.content[1], LlmResponseContent::ToolCall { name, .. } if name == "search")
+        );
+        assert_eq!(llm.stop_reason, LlmStopReason::ToolUse);
+    }
+
+    #[test]
+    fn test_from_ollama_response_multiple_tool_calls() {
+        let resp = OllamaChatResponse {
+            model: "llama3".into(),
+            message: OllamaResponseMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(vec![
+                    OllamaToolCall {
+                        function: OllamaFunctionCall {
+                            name: "search".into(),
+                            arguments: json!({"q": "a"}),
+                        },
+                    },
+                    OllamaToolCall {
+                        function: OllamaFunctionCall {
+                            name: "calculate".into(),
+                            arguments: json!({"expr": "1+1"}),
+                        },
+                    },
+                ]),
+            },
+            done: true,
+            total_duration: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        };
+
+        let llm = OllamaProvider::from_ollama_response(resp);
+        assert_eq!(llm.content.len(), 2);
+        match &llm.content[0] {
+            LlmResponseContent::ToolCall { id, name, .. } => {
+                assert_eq!(id, "ollama_tc_0");
+                assert_eq!(name, "search");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &llm.content[1] {
+            LlmResponseContent::ToolCall { id, name, .. } => {
+                assert_eq!(id, "ollama_tc_1");
+                assert_eq!(name, "calculate");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_ollama_response_empty_tool_calls_is_end_turn() {
+        let resp = OllamaChatResponse {
+            model: "llama3".into(),
+            message: OllamaResponseMessage {
+                role: "assistant".into(),
+                content: "Just text.".into(),
+                tool_calls: Some(vec![]),
+            },
+            done: true,
+            total_duration: None,
+            eval_count: None,
+            prompt_eval_count: None,
+        };
+
+        let llm = OllamaProvider::from_ollama_response(resp);
+        assert_eq!(llm.stop_reason, LlmStopReason::EndTurn);
     }
 
     // -- Error parsing --
@@ -756,7 +1159,7 @@ mod tests {
         assert_eq!(provider.provider_name(), "ollama");
         assert_eq!(provider.model_name(), "llama3");
         assert_eq!(provider.max_tokens(), 4096);
-        assert!(!provider.supports_tool_calling());
+        assert!(provider.supports_tool_calling());
         assert!(!provider.supports_vision());
         assert!(!provider.supports_extended_thinking());
     }
@@ -770,9 +1173,11 @@ mod tests {
             messages: vec![OllamaMessage {
                 role: "user".into(),
                 content: "Hello".into(),
+                tool_calls: None,
             }],
             stream: false,
             options: OllamaOptions { num_predict: 4096 },
+            tools: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();
@@ -781,5 +1186,8 @@ mod tests {
         assert_eq!(json["options"]["num_predict"], 4096);
         assert_eq!(json["messages"][0]["role"], "user");
         assert_eq!(json["messages"][0]["content"], "Hello");
+        // Optional fields should be omitted when None
+        assert!(json.get("tools").is_none());
+        assert!(json["messages"][0].get("tool_calls").is_none());
     }
 }
