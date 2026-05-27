@@ -1,8 +1,9 @@
 //! # Grounding + Fabrication Regression Scenarios (#741)
 //!
-//! Five scenarios, each testing a concrete fabrication class from the KG milestone
-//! retrospective. Each scenario has hard assertions on tool calls and response text.
-//! All gated behind `#[ignore]` + `MIKA_EVAL_GROUNDING=1` for integration tier.
+//! Thirty scenarios, each testing a concrete fabrication class from the KG milestone
+//! retrospective and subsequent guards. Each scenario has hard assertions on tool calls
+//! and response text. All gated behind `#[ignore]` + `MIKA_EVAL_GROUNDING=1` for
+//! integration tier.
 //!
 //! ## Tag Vocabulary (`grounding:*`)
 //!
@@ -40,6 +41,8 @@ pub mod engine_correction_rejection;
 pub mod fabricated_shell_errors;
 pub mod graphql_field_fabrication;
 pub mod kg_result_ignored;
+pub mod merge_gate_blocked_no_fallback;
+pub mod merge_gate_errored_no_fallback;
 pub mod milestone_close;
 pub mod qa_review_absence_claim_grounded;
 pub mod qa_review_per_element_enumeration;
