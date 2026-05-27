@@ -561,11 +561,14 @@ ${RESULT}"
 
 ${RESULT}"
             elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
-                # Valid plan file exists but /ce:plan was never invoked — LLM
-                # wrote a plan-shaped file without running the planning skill
-                RESULT="PIPELINE FAILURE: dev-groom produced a plan file but no /ce:plan invocation detected in session log. Plan may not have been generated through the planning skill.
-
-${RESULT}"
+                # Valid plan file exists but /ce:plan was never invoked.
+                # Demoted from PIPELINE FAILURE to advisory note (mika#1303):
+                # pilot Write-tool plan creation is a valid path. The plan
+                # file's existence + size threshold + downstream architect
+                # verdict are the structural contract — the slash-command
+                # invocation is one of multiple valid paths to producing a
+                # plan, not the gate itself.
+                echo "Note: dev-groom produced a plan file ($VALID_PLAN) without explicit /ce:plan invocation. Plan-file existence is the operative gate." >&2
             fi
         fi
 
