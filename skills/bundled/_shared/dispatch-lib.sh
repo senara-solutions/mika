@@ -22,6 +22,8 @@
 
 _dispatch_lib_exit_trap() {
     _EXIT_CODE=$?
+    # Cleanup fuzzy-match side-channel tmpfile (mika#1272)
+    rm -f "${_DISPOSITION_FUZZY_FILE:-}" 2>/dev/null
     # Guard: skip if already delivered or no task ID
     [ "$CALLBACK_SENT" -eq 1 ] && { [ -n "$STDOUT_FILE" ] && rm -f "$STDOUT_FILE"; [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; rm -f "$TRACE_FILE"; return; }
     [ -z "$TASK_ID" ] && { [ -n "$STDOUT_FILE" ] && rm -f "$STDOUT_FILE"; [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; rm -f "$TRACE_FILE"; return; }
@@ -791,26 +793,167 @@ _arch_ask() {
     mika "${args[@]}" < "$plan_path"
 }
 
+# Module-global flag: set to 1 when tier-2 fuzzy matching fires, 0 otherwise.
+# Read by _iterate_groom_loop to annotate trail entries with "(fuzzy)".
+# Side-channel design per mika#1272 rev 2 — parser stdout stays clean.
+#
+# Implementation note: bash subshells ($(...)) cannot set parent variables, so
+# we use a tmpfile to communicate the flag across the subshell boundary. The
+# tmpfile path is set once at module load and cleaned up by callers' EXIT traps
+# (dispatch-lib already installs one). Functions write "1" or "0" to the file;
+# callers read it after the $(...) returns.
+_DISPOSITION_FUZZY=0
+_DISPOSITION_FUZZY_FILE="${TMPDIR:-/tmp}/.dispatch-lib-fuzzy-$$"
+
+_disposition_was_fuzzy() {
+    # Returns 0 (true) if the last _parse_disposition/_parse_verdict call used
+    # tier-2 fuzzy matching; 1 (false) otherwise. Reads the tmpfile side-channel.
+    [ -f "$_DISPOSITION_FUZZY_FILE" ] && [ "$(cat "$_DISPOSITION_FUZZY_FILE" 2>/dev/null)" = "1" ]
+}
+
+_parse_disposition_fuzzy() {
+    # Tier 2 — fuzzy disposition parser (mika#1272). Reads architect response
+    # text from stdin, applies case-insensitive pattern matching against known
+    # paraphrase indicators, and emits the canonical disposition on stdout.
+    #
+    # Priority: ESCALATE > ITERATE > READY (most conservative wins).
+    # Emits nothing if no pattern matches. Logs matched snippet to stderr.
+    local text
+    text=$(cat)
+
+    local matched_escalate="" matched_iterate="" matched_ready=""
+    local snippet=""
+
+    # ESCALATE patterns
+    for pat in "escalate" "human review" "cannot proceed" "fundamental" "out of scope for"; do
+        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
+            matched_escalate="$snippet"
+            break
+        fi
+    done
+
+    # ITERATE patterns
+    for pat in "needs revision" "another pass" "revise" "address the following" "concerns that require"; do
+        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
+            matched_iterate="$snippet"
+            break
+        fi
+    done
+
+    # READY patterns (affirmative forward-motion signals only — no negated-absence)
+    for pat in "proceed" "ship it" "dispatch" "good to go" "plan is clean"; do
+        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
+            matched_ready="$snippet"
+            break
+        fi
+    done
+
+    # Disambiguation: ESCALATE > ITERATE > READY
+    if [ -n "$matched_escalate" ]; then
+        echo "_parse_disposition_fuzzy: mapped paraphrased disposition → ESCALATE (matched: '$matched_escalate')" >&2
+        echo "ESCALATE"
+    elif [ -n "$matched_iterate" ]; then
+        echo "_parse_disposition_fuzzy: mapped paraphrased disposition → ITERATE (matched: '$matched_iterate')" >&2
+        echo "ITERATE"
+    elif [ -n "$matched_ready" ]; then
+        echo "_parse_disposition_fuzzy: mapped paraphrased disposition → READY (matched: '$matched_ready')" >&2
+        echo "READY"
+    fi
+    # No match → emit nothing (caller's * case fires)
+}
+
+_parse_verdict_fuzzy() {
+    # Tier 2 — fuzzy verdict parser (mika#1272). Same pattern as
+    # _parse_disposition_fuzzy but for second-pass verdicts (GROOMED vs ESCALATE).
+    #
+    # Priority: ESCALATE > GROOMED (conservative).
+    local text
+    text=$(cat)
+
+    local matched_escalate="" matched_groomed=""
+    local snippet=""
+
+    # ESCALATE patterns
+    for pat in "escalate" "cannot approve" "human review needed" "fundamental issues remain"; do
+        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
+            matched_escalate="$snippet"
+            break
+        fi
+    done
+
+    # GROOMED patterns (use "ship it" not bare "ship" — avoids substring
+    # false positives in "relationship", "ownership", "leadership", etc.)
+    for pat in "groomed" "approved" "plan is ready" "ship it" "no remaining concerns"; do
+        if snippet=$(printf '%s' "$text" | grep -oi "$pat" | head -1) && [ -n "$snippet" ]; then
+            matched_groomed="$snippet"
+            break
+        fi
+    done
+
+    # Disambiguation: ESCALATE > GROOMED
+    if [ -n "$matched_escalate" ]; then
+        echo "_parse_verdict_fuzzy: mapped paraphrased verdict → ESCALATE (matched: '$matched_escalate')" >&2
+        echo "ESCALATE"
+    elif [ -n "$matched_groomed" ]; then
+        echo "_parse_verdict_fuzzy: mapped paraphrased verdict → GROOMED (matched: '$matched_groomed')" >&2
+        echo "GROOMED"
+    fi
+}
+
 _parse_disposition() {
     # Phase B — first-pass verdict parser. Reads architect response text from
     # stdin, emits READY|ITERATE|ESCALATE on stdout (or nothing on no match).
     #
-    # v1 tolerates literal `Disposition: <X>` lines only. Paraphrased
-    # dispositions handling is out-of-v1 — see mika#1272.
-    grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
+    # Two-tier matching (mika#1272):
+    #   Tier 1: strict literal `Disposition: <X>` (zero-cost fast path)
+    #   Tier 2: fuzzy paraphrase matching (conservative, ESCALATE wins ties)
+    # Writes "1" to $_DISPOSITION_FUZZY_FILE when tier 2 fires, "0" when tier 1
+    # fires. Callers read _disposition_was_fuzzy() after the $(...) returns.
+    printf '0' > "$_DISPOSITION_FUZZY_FILE"
+    local text
+    text=$(cat)
+    local result
+    result=$(printf '%s' "$text" | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
         | grep -oE '(READY|ITERATE|ESCALATE)' \
-        | head -1
+        | head -1)
+    if [ -n "$result" ]; then
+        echo "$result"
+        return
+    fi
+    # Tier 2 fallback
+    result=$(printf '%s' "$text" | _parse_disposition_fuzzy)
+    if [ -n "$result" ]; then
+        printf '1' > "$_DISPOSITION_FUZZY_FILE"
+        echo "$result"
+    fi
 }
 
 _parse_verdict() {
     # Phase B — second-pass verdict parser. Reads architect response text from
     # stdin, emits GROOMED|ESCALATE on stdout (or nothing on no match).
     #
-    # v1 tolerates literal `Verdict: <X>` lines only. mika#1272 covers
-    # paraphrased forms.
-    grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
+    # Two-tier matching (mika#1272):
+    #   Tier 1: strict literal `Verdict: <X>` (zero-cost fast path)
+    #   Tier 2: fuzzy paraphrase matching (conservative, ESCALATE wins ties)
+    # Writes "1" to $_DISPOSITION_FUZZY_FILE when tier 2 fires, "0" when tier 1
+    # fires. Callers read _disposition_was_fuzzy() after the $(...) returns.
+    printf '0' > "$_DISPOSITION_FUZZY_FILE"
+    local text
+    text=$(cat)
+    local result
+    result=$(printf '%s' "$text" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
         | grep -oE '(GROOMED|ESCALATE)' \
-        | head -1
+        | head -1)
+    if [ -n "$result" ]; then
+        echo "$result"
+        return
+    fi
+    # Tier 2 fallback
+    result=$(printf '%s' "$text" | _parse_verdict_fuzzy)
+    if [ -n "$result" ]; then
+        printf '1' > "$_DISPOSITION_FUZZY_FILE"
+        echo "$result"
+    fi
 }
 
 _trail_append() {
@@ -1100,7 +1243,9 @@ _iterate_groom_loop() {
         return 1
     }
     local disposition; disposition=$(printf '%s' "$content1" | _parse_disposition)
-    _trail_append "groom-ticket" "$session_id" "${disposition:-UNPARSED}"
+    local _trail_suffix=""
+    _disposition_was_fuzzy && _trail_suffix=" (fuzzy)"
+    _trail_append "groom-ticket" "$session_id" "${disposition:-UNPARSED}${_trail_suffix}"
 
     case "$disposition" in
         READY)
@@ -1112,7 +1257,9 @@ _iterate_groom_loop() {
             [ -n "$content2" ] || {
                 echo "WARN: iterate_groom_loop: second-pass response missing .content" >&2; return 1; }
             local verdict; verdict=$(printf '%s' "$content2" | _parse_verdict)
-            _trail_append "second-review" "$session_id" "${verdict:-UNPARSED}"
+            local _trail_suffix_v=""
+            _disposition_was_fuzzy && _trail_suffix_v=" (fuzzy)"
+            _trail_append "second-review" "$session_id" "${verdict:-UNPARSED}${_trail_suffix_v}"
 
             case "$verdict" in
                 GROOMED)
@@ -1161,7 +1308,9 @@ _iterate_groom_loop() {
                 return 1
             }
             local verdict_iter; verdict_iter=$(printf '%s' "$content2_iter" | _parse_verdict)
-            _trail_append "second-review" "$session_id" "${verdict_iter:-UNPARSED}"
+            local _trail_suffix_vi=""
+            _disposition_was_fuzzy && _trail_suffix_vi=" (fuzzy)"
+            _trail_append "second-review" "$session_id" "${verdict_iter:-UNPARSED}${_trail_suffix_vi}"
 
             case "$verdict_iter" in
                 GROOMED)
