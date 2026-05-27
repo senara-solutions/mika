@@ -262,8 +262,29 @@ _set_up_worktree() {
             git -C "$WORKTREE_DIR" checkout "$BRANCH" 2>/dev/null || true
         else
             git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
-            if ! git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" origin/main 2>/dev/null; then
-                git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH"
+            # mika#1311: when origin/$BRANCH already exists from a prior
+            # successful dispatch, base the worktree on it (preserves prior
+            # history) rather than creating a fresh local branch from
+            # origin/main. Without this, re-dispatches after origin/main
+            # advances past the prior groom diverge silently — the new
+            # local branch has one commit on new main, the remote has the
+            # prior groom on older main, and the post-flight push fails
+            # with `branch is behind its remote counterpart`. The LLM
+            # then correctly escalates to operator (status=blocked) but
+            # the queue stays wedged. The downstream BEHIND-block rebases
+            # onto origin/main and mika#784's _check_duplicate_commits
+            # handles cherry-mark dedup of any merged-but-still-present
+            # commits — so basing on origin/$BRANCH first and rebasing
+            # afterward composes cleanly with the existing flow.
+            if git -C "$SUB_REPO_DIR" ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+                git -C "$SUB_REPO_DIR" fetch origin "$BRANCH" 2>/dev/null || true
+                if ! git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$BRANCH" 2>/dev/null; then
+                    git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH"
+                fi
+            else
+                if ! git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" origin/main 2>/dev/null; then
+                    git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH"
+                fi
             fi
         fi
 
