@@ -1682,6 +1682,73 @@ async fn run_loop(
                         continue;
                     }
 
+                    // #1313 — Dispatch-arg-fabrication guard. When a ready-label
+                    // webhook fires for repo#N, the LLM must dispatch
+                    // run_claude_pilot / run_claude_pilot_groom with
+                    // prompt="<repo>#<N>" matching the trigger. If the LLM
+                    // emits a dispatch arg that references a DIFFERENT issue
+                    // (drawn from stale conversation context), the dispatch
+                    // succeeds for the wrong issue — burning a full pilot
+                    // session and writing plans into the wrong worktree.
+                    //
+                    // Inline rather than in INTENT_GUARDS because the
+                    // satisfied predicate needs the user_message (to extract
+                    // the expected location) AND the input_summary of each
+                    // dispatch call. Single retry with structured re-prompt.
+                    // Match on `#N` only (not full `repo#N`) — the dispatch
+                    // prompt has multiple valid formats: `mika#500`,
+                    // `mika issue#500`, `senara-solutions/mika#500`. The
+                    // structural invariant is: the trigger's ISSUE NUMBER
+                    // must appear in the dispatch arg. Extract `#N` suffix
+                    // from location.
+                    let expected_hash_n: Option<String> =
+                        parse_ready_label_location(&user_input_text)
+                            .and_then(|loc| loc.rfind('#').map(|idx| loc[idx..].to_string()));
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains("dispatch_arg_match")
+                        && ready_label_dispatch_trigger(&user_input_text)
+                        && let Some(ref expected_location) = expected_hash_n
+                        && let Some(mismatched) = all_tool_summaries.iter().find(|s| {
+                            (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
+                                && !s.input_summary.contains(expected_location.as_str())
+                        })
+                    {
+                        intent_guard_retries.insert("dispatch_arg_match");
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            tool = %mismatched.name,
+                            expected = %expected_location,
+                            input_preview = %mismatched.input_summary,
+                            intent_guard = "dispatch_arg_match",
+                            "Dispatch-arg-fabrication guard fired — re-prompting (#1313)"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[mika-engine] The ready-label webhook trigger \
+                                 for this turn was `{expected_location}`, but \
+                                 your `{}` call used a `prompt` argument that \
+                                 does not contain `{expected_location}` \
+                                 (input preview: `{}`). The dispatch arg must \
+                                 match the triggering webhook's `repo#issue` \
+                                 exactly — do NOT compose it from prior \
+                                 conversation context. Re-emit the dispatch \
+                                 call with `prompt=\"{expected_location}\"` \
+                                 (and the same task_id + skill). See mika#1313.",
+                                mismatched.name, mismatched.input_summary,
+                            )),
+                        });
+                        continue;
+                    }
+
                     // Persistence evaluation guard: if the agent is ending a turn
                     // that appears to contain institutional knowledge but no
                     // persistence tool was called, nudge the model to consider
