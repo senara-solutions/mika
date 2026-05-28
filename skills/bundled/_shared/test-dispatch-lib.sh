@@ -996,33 +996,27 @@ fi
 ITERATE_SCRATCH=$(grep -c '.iterate/rescue-commit-err' "$DISPATCH_LIB" || true)
 assert_eq "No .iterate/rescue-commit-err reference in dispatch-lib.sh" "0" "$ITERATE_SCRATCH"
 
-# --- Test 11: Idempotency-bypass-architect fabrication detection (mika#1319) ---
+# --- Test 11: Idempotency-bypass-architect fabrication brake retired (mika#1327) ---
 
 echo ""
-echo "Test 11: Idempotency-bypass-architect fabrication detection (mika#1319)"
-echo "------------------------------------------------------------------------"
+echo "Test 11: Idempotency-bypass-architect fabrication brake retired (mika#1327)"
+echo "---------------------------------------------------------------------------"
 
-# Extract the dev-groom post-flight section from dispatch-lib
-# The fabrication detection block lives inside the success branch, guarded by SKILL=dev-groom
-DEVGROOM_POSTFLIGHT=$(sed -n '/mika#1319.*idempotency-bypass-architect/,/^        fi$/p' "$DISPATCH_LIB")
+# The mika#1322 brake (fabrication-string grep on session log) was retired in
+# mika#1327. Per Vincent's ticket comment IC_kwDORWsgGM8AAAABEDBqdw, the brake
+# was a duplicate fabrication-detection mechanism alongside state-grounded
+# checks (HEAD-unchanged at line 451, plan-missing at line 621, iterate-loop
+# ESCALATE inside _escalate_groom) and post-cpp#20 had become dead code.
+#
+# These assertions are regression guards against re-introducing the brake.
 
-assert_contains "Fabrication detection block exists (mika#1319 comment)" "idempotency-bypass-architect" "$DEVGROOM_POSTFLIGHT"
+DISPATCH_LIB_CONTENT=$(cat "$DISPATCH_LIB")
 
-# Verify it is guarded by dev-groom skill check
-assert_contains "Guarded by dev-groom skill" 'dev-groom' "$DEVGROOM_POSTFLIGHT"
-
-# Verify it greps SESSION_LOG for the fabrication string
-assert_contains "Uses SESSION_LOG for fabrication detection" 'SESSION_LOG' "$DEVGROOM_POSTFLIGHT"
-
-# Verify the distinctive fabrication needle is present
-assert_contains "Contains fabrication needle substring" 'Architect convergence pending via dispatch-lib iterate loop' "$DEVGROOM_POSTFLIGHT"
-
-# Verify the PIPELINE FAILURE marker contains the idempotency-bypass-architect sub-type
-assert_contains "PIPELINE FAILURE marker includes idempotency-bypass-architect" 'PIPELINE FAILURE:' "$DEVGROOM_POSTFLIGHT"
-assert_contains "Marker includes sub-type identifier" 'idempotency-bypass-architect' "$DEVGROOM_POSTFLIGHT"
-
-# Verify fail-open: session log unavailability produces a warning, not a failure
-assert_contains "Fail-open warning when session log unavailable" 'Warning:' "$DEVGROOM_POSTFLIGHT"
+assert_not_contains "Brake comment header (mika#1319 + idempotency-bypass-architect) is absent" 'mika#1319.*idempotency-bypass-architect' "$DISPATCH_LIB_CONTENT"
+assert_not_contains "Brake comment header (idempotency-bypass-architect fabrication in dev-groom) is absent" 'idempotency-bypass-architect fabrication in dev-groom' "$DISPATCH_LIB_CONTENT"
+assert_not_contains "Fabrication needle (Architect convergence pending via dispatch-lib iterate loop) is absent" 'Architect convergence pending via dispatch-lib iterate loop' "$DISPATCH_LIB_CONTENT"
+assert_not_contains "FABRICATION_NEEDLE variable assignment is absent" 'FABRICATION_NEEDLE=' "$DISPATCH_LIB_CONTENT"
+assert_not_contains "PIPELINE FAILURE marker with idempotency-bypass-architect sub-type is absent" 'PIPELINE FAILURE:.*idempotency-bypass-architect' "$DISPATCH_LIB_CONTENT"
 
 # --- Summary ---
 
