@@ -45,9 +45,11 @@ Before drafting Units, the following load-bearing source-state was verified agai
 
 **Conclusion:** the brake at 643-661 is the ONLY dispatch-lib site whose behavior depends on a specific pilot exit string. Removing the brake removes the entire dispatch-lib coupling to pilot exit text. (Addresses architect F2.)
 
-### Pin C — Downstream-consumer scope check (qa-review, webhooks, self-dev)
+### Pin C — Downstream-consumer + upstream-orchestrator scope check (qa-review, webhooks, self-dev, dev-groom)
 
 `grep -rnE "Plan committed|Architect convergence|fabrication" mika/skills/bundled/{qa-review,self-dev-webhook-ci,self-dev-webhook-qa,self-dev}` returns no consumer that parses pilot exit text. Two hits in `self-dev/system_prompt.md` (lines 244, 317) are mika-dev's outbound message templates ("Grooming completed for {repo}#{issue_number}. Plan committed on branch. PR: {url}.") that compose against the structured callback envelope (Outcome line + Plan path + PR URL), not against pilot session text. No re-write required.
+
+**Upstream-orchestrator augment (added pass-2 per architect F1 sharpening):** `grep -nE "Architect convergence|Plan committed and pushed|fabrication|exit.*string|confirmation.*string" mika/skills/bundled/dev-groom/system_prompt.md` returns one hit at line 19, which references mika#1133's dev-groom dispatch-fabrication guard (the engine rejects fabricated `Verdict: GROOMED`/`Verdict: ESCALATE` emissions from the dispatcher's response turn). That is an unrelated fabrication-guard surface that targets dev-groom's outbound dispatch response, not the pilot's session exit text. Zero hits on the four other distinctive patterns (`Architect convergence`, `Plan committed and pushed`, `exit.*string`, `confirmation.*string`). Conclusion: `dev-groom/system_prompt.md` does not depend on the mika#1322 brake or the templated exit string; Unit 2's scope is correct as drafted.
 
 ### Pin D — `mika-platform/.claude/commands/mika-groom-plan-only.md` current Phase 3 step 8 (F3 scope check)
 
@@ -347,7 +349,7 @@ assert_not_contains "PIPELINE FAILURE marker with idempotency-bypass-architect s
 
 **Requirements:** R4 (forensic continuity preserved by the solutions doc, not by surviving code).
 
-**Dependencies:** Units 1–3 must land first; this doc edit reflects the shipped state.
+**Dependencies:** Units 1–3 are co-located in the same PR pair; Unit 4 lands as a same-branch commit before `git push`, NOT deferred to a post-merge compound step. (Architect F2 sharpening pass-2: same-branch commit avoids the deployment window where retired code is live but the institutional record is not. Same shape as mika#855's second-pass-GROOMED precedent.)
 
 **Files:**
 - Modify: `mika/docs/solutions/best-practices/idempotency-bypass-architect-fabrication-detection-2026-05-28.md`.
@@ -449,10 +451,11 @@ This PR touches both `mika/` and `mika-platform/` (the slash command lives in th
 
 ## Compound Step (post-merge)
 
-After merge, the `/mika` pipeline's compound step will:
-1. Update `mika/docs/solutions/best-practices/idempotency-bypass-architect-fabrication-detection-2026-05-28.md` with the retirement section (Unit 4).
-2. Add the cross-link to `project_cpp15_substrate_wedge_2026-05-28` memory and to cpp#20's PR/issue numbers.
-3. Document the principle: "Substrate gates on state, not on text. When retiring a string-gate, retire it fully — the historical fingerprint goes in the solutions doc and in git, not in surviving dead code."
+Unit 4's solutions-doc edit is in-PR (co-located with Units 1-3 per pass-2 architect F2 sharpening), so the post-merge compound step is lighter:
+
+1. Add the cross-link to `project_cpp15_substrate_wedge_2026-05-28` memory and to cpp#20's PR/issue numbers (memory edit, can't be in-PR).
+2. Compound the principle into long-term recall: "Substrate gates on state, not on text. When retiring a string-gate, retire it fully — the historical fingerprint goes in the solutions doc and in git, not in surviving dead code."
+3. If the canary re-dispatch on a staled-groom ticket reveals additional substrate hazards (e.g., the loader-walks-worktree class from mika#1326), file separate solutions docs for each — do not bundle into this PR's retirement record.
 
 ## References
 
