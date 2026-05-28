@@ -1,7 +1,7 @@
 ---
 title: "test(skills): static parity assertion — engine-referenced tool names must be loader-reachable"
 type: feat
-status: active
+status: completed
 date: 2026-05-28
 issue: mika#1253
 ---
@@ -35,8 +35,8 @@ mika#1173 created `dev-groom` as a tool-owning skill but omitted the loader-side
 
 - `crates/mika-agent/src/bundled_skills.rs` — `all_bundled_skills()` merges legacy + build-time ENTRIES; existing test `test_self_dev_declares_both_dispatch_siblings_as_dependencies` (line 1365) uses the same data access pattern
 - `crates/mika-agent/src/skills/matcher.rs` — `match_skills()` BFS algorithm for transitive dependency resolution (lines 56-73); the test replicates this walk starting from `always_on=true` seeds only
-- `crates/mika-agent/src/skills/manifest.rs` — `SkillManifest` with `skill.always_on`, `skill.dependencies` fields
-- Skill tool definitions live in `tools.json` files embedded as `SkillFile` entries in each `BundledSkill`
+- `crates/mika-agent/src/skills/manifest.rs` — `SkillManifest` with `skill.always_on`, `skill.dependencies` fields. **No `enabled` field exists in `SkillManifest` or `skill.toml`** — enabled/disabled is a runtime DB-backed state via `skill_overrides.enabled` (tri-state nullable: NULL=default enabled, 0=disabled, 1=explicitly enabled; schema v24, mika#629). `BUNDLED_SKILL_MANIFESTS` has zero knowledge of enabled/disabled status.
+- Skill tool definitions live in `tools.json` files embedded as `SkillFile` entries in each `BundledSkill`. The `BundledSkill` struct (bundled_skills.rs:44–52) carries `files: &'static [SkillFile]` where each `SkillFile` has `path: &'static str`, `content: &'static str`, `executable: bool`. To extract tool names, filter `files` for `path == "tools.json"`, parse `content` as JSON. **JSON shape:** top-level array of tool objects `[{"name": "...", "description": "...", "input_schema": {...}, "handler": {...}}]`. Tool name is `obj["name"]`. **Not all skills have tools.json** — 10 of 22 bundled skills lack it (e.g., `self-dev`, `permission-policy`, `dev-handsoff`); these must be skipped gracefully during tool-name collection.
 
 ### Engine-Referenced Skill Tool Names (Current HEAD)
 
@@ -72,11 +72,11 @@ Only Category A tools belong in `ENGINE_REFERENCED_SKILL_TOOLS`. Category B tool
 
 - **Test location in `bundled_skills.rs`**: The existing sibling test (`test_self_dev_declares_both_dispatch_siblings_as_dependencies`) lives here and uses the same data access pattern (`all_bundled_skills()`). The ticket says `crates/mika-agent/src/skills/<file>.rs` — `bundled_skills.rs` satisfies this constraint. No new file needed.
 
-- **BFS walk replication**: The test replicates the `match_skills()` BFS from `matcher.rs` but simplified — no keyword matching, no disabled-skill filtering, just pure always-on transitive closure. This mirrors the worst-case reachability (a webhook turn with no keyword hits).
+- **BFS walk replication**: The test replicates the `match_skills()` BFS from `matcher.rs` but simplified — no keyword matching, just pure always-on transitive closure. This mirrors the worst-case reachability (a webhook turn with no keyword hits). **Disabled-skill filtering is intentionally omitted** because `enabled` is a runtime DB flag (`skill_overrides.enabled`, schema v24), not a TOML field — `BUNDLED_SKILL_MANIFESTS` contains no enabled/disabled state, and `build.rs` has zero knowledge of it. The production `match_skills()` BFS disabled-skill gate at matcher.rs:67 is a defensive secondary guard for the runtime registry; the test operates over compile-time data where the concept does not apply. (Citation: matcher.rs:197–199 confirms "disabled skills are evicted from the registry by `apply_overrides()` before `match_skills()` is ever called"; review-guide.md § Orthogonality.)
 
 ## Implementation Units
 
-- [ ] **Unit 1: Add `ENGINE_REFERENCED_SKILL_TOOLS` const and parity test**
+- [x] **Unit 1: Add `ENGINE_REFERENCED_SKILL_TOOLS` const and parity test**
 
 **Goal:** Create the central registry const and the static parity assertion test that validates every entry is reachable through the always-on dependency closure.
 
@@ -89,12 +89,12 @@ Only Category A tools belong in `ENGINE_REFERENCED_SKILL_TOOLS`. Category B tool
 
 **Approach:**
 
-1. Add `ENGINE_REFERENCED_SKILL_TOOLS: &[&str]` as a module-level const (inside `#[cfg(test)]` or at module level — prefer module level so it can serve as documentation and future enforcement point). Contains the 3 Category A tool names: `run_claude_pilot`, `run_claude_pilot_groom`, `deploy_mika`. Doc comment explains the Category A/B distinction and the maintenance contract.
+1. Add `ENGINE_REFERENCED_SKILL_TOOLS: &[&str]` inside the `#[cfg(test)] mod tests` block. The sole consumer is the parity test — no production code path reads this const, so `#[cfg(test)]` is the correct placement per review-guide.md § YAGNI. A well-named test-only const with a doc comment explaining the Category A/B distinction and maintenance contract serves the documentation purpose equally well without adding ~200 bytes to the production binary. Contains the 3 Category A tool names: `run_claude_pilot`, `run_claude_pilot_groom`, `deploy_mika`.
 
 2. Add `test_engine_referenced_tool_names_are_loader_reachable` test that:
    - Calls `all_bundled_skills()` to get all embedded skill manifests
    - Parses each skill's `skill.toml` to extract `always_on` and `dependencies`
-   - Parses each skill's `tools.json` to extract tool names
+   - For each skill, finds the `SkillFile` with `path == "tools.json"` in `files`; skips skills without one (10 of 22 bundled skills lack `tools.json`). Parses the `content` as a JSON array `[{"name": "...", ...}]` and collects each `obj["name"]` as a tool name
    - Computes the always-on closure via BFS: seed with all `always_on=true` skills, walk transitive `dependencies`
    - Collects all tool names from closure-member skills' `tools.json`
    - Asserts every entry in `ENGINE_REFERENCED_SKILL_TOOLS` is in the closure-reachable set
@@ -102,7 +102,7 @@ Only Category A tools belong in `ENGINE_REFERENCED_SKILL_TOOLS`. Category B tool
 
 **Patterns to follow:**
 - `test_self_dev_declares_both_dispatch_siblings_as_dependencies` (bundled_skills.rs:1365) — same `all_bundled_skills()` + TOML parse pattern
-- `match_skills()` BFS in `matcher.rs:56-73` — same transitive dependency walk algorithm (simplified: no keyword, no disabled check)
+- `match_skills()` BFS in `matcher.rs:56-73` — same transitive dependency walk algorithm (simplified: no keyword matching; disabled-skill filtering omitted because `enabled` is a runtime DB flag not present in compile-time `BUNDLED_SKILL_MANIFESTS` — see matcher.rs:197–199)
 
 **Test scenarios:**
 - Happy path: test passes at current HEAD — all 3 Category A engine-referenced tools (`run_claude_pilot`, `run_claude_pilot_groom`, `deploy_mika`) are reachable through the always-on closure via self-dev (always_on=true, depends on dev-pilot, dev-groom, deploy-mika)
@@ -124,3 +124,7 @@ Only Category A tools belong in `ENGINE_REFERENCED_SKILL_TOOLS`. Category B tool
 
 - Related issues: mika#1251 (regression), mika#1173 (origin), mika#1244, mika#1248 (siblings)
 - Related code: `crates/mika-agent/src/skills/matcher.rs` (BFS algorithm), `crates/mika-agent/src/bundled_skills.rs` (data access pattern)
+
+## Revision history
+
+- rev 2 (2026-05-28): addressed F1 by adding Phase 0 pin confirming `enabled` is a runtime DB flag (`skill_overrides.enabled`, schema v24) not present in `skill.toml` or `BUNDLED_SKILL_MANIFESTS` — disabled-skill filtering omission is safe and now documented with justification citing matcher.rs:197–199 and review-guide.md § Orthogonality; addressed F2 by adding Phase 0 pins for `BundledSkill` struct definition (`files: &[SkillFile]` where `path == "tools.json"`), `tools.json` JSON shape (top-level array of `{"name": ..., ...}` objects), and tool-less skill handling (10 of 22 bundled skills lack `tools.json`, must be skipped); addressed F3 by changing `ENGINE_REFERENCED_SKILL_TOOLS` placement from "prefer module level" to `#[cfg(test)]` — sole consumer is the parity test, no production use exists or is planned, per review-guide.md § YAGNI and § KISS.
