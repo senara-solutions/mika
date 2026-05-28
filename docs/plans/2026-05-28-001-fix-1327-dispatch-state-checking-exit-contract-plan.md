@@ -1,7 +1,7 @@
 ---
 title: "fix(dispatch): retire mika#1322 fabrication-string brake; remove templated exit-string from /mika-groom-plan-only"
 type: fix
-status: planned
+status: active
 date: 2026-05-28
 issue: mika#1327
 ---
@@ -211,7 +211,7 @@ The section MUST cover:
 
 ## Implementation Units
 
-### Unit 1: Remove the fabrication brake block from dispatch-lib
+### ~~Unit 1: Remove the fabrication brake block from dispatch-lib~~ ✅
 
 **Goal:** Delete lines 643-661 from `dispatch-lib.sh`. No replacement code, no stderr diagnostic.
 
@@ -259,7 +259,7 @@ The section MUST cover:
 - Pilot-lied (no commit, no plan file) + fabrication-string-in-log: HEAD-unchanged + plan-missing both fire; outcome is `PIPELINE_INCOMPLETE`.
 - Legit-plan + fabrication-string-in-log + iterate-loop ESCALATE: `_escalate_groom` appends its own PIPELINE FAILURE; outcome is `PIPELINE_INCOMPLETE`.
 
-### Unit 2: Drop the templated exit-string instruction from `/mika-groom-plan-only`
+### ~~Unit 2: Drop the templated exit-string instruction from `/mika-groom-plan-only`~~ ✅
 
 **Goal:** Rewrite Phase 3 step 8 so the pilot exits without narrating, removing the producer of the fabrication string.
 
@@ -296,7 +296,7 @@ With:
 **Test scenarios:**
 - N/A for slash-command edits (no automated test surface). Validation is end-to-end per the Acceptance Validation section.
 
-### Unit 3: Rewrite Test 11 as block-absent regression guard
+### ~~Unit 3: Rewrite Test 11 as block-absent regression guard~~ ✅
 
 **Goal:** Encode the retirement in the structural test so re-introduction is caught as a regression.
 
@@ -343,7 +343,7 @@ assert_not_contains "PIPELINE FAILURE marker with idempotency-bypass-architect s
 - Run `bash skills/bundled/_shared/test-dispatch-lib.sh` from the repo root. All assertions in Test 11 must pass after Unit 1's deletion.
 - Negative test (mental): if the brake is re-introduced (any of the 5 forbidden strings appears anywhere in `dispatch-lib.sh`), Test 11 fails. Verified by inspecting the assertions before merge.
 
-### Unit 4: Extend the solutions doc with the retirement section
+### ~~Unit 4: Extend the solutions doc with the retirement section~~ ✅
 
 **Goal:** Future operators reading the brake doc see the original incident (mika#1322) AND the retirement context (mika#1327) in one place.
 
