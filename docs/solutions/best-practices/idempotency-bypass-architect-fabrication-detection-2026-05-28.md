@@ -184,3 +184,80 @@ exists. Compound the result.
   PLAN_GROOMED marker emitted, but the human-facing failure message was
   generic. The brake gives the human (and any future automation) the right
   word for what broke.
+
+## Contract update 2026-05-28 — brake retired (mika#1327)
+
+### What the brake was for
+
+The mika#1322 brake detected a specific failure class: pilots that emitted the
+templated exit string `Plan committed and pushed. Architect convergence pending
+via dispatch-lib iterate loop.` without having done the work. This happened in
+3/3 observed failures (mika#806, mika#736 x2) where the pilot found a prior
+plan commit on HEAD, skipped `/ce:plan`, and exited with the confirmation
+string. The brake correctly caught those incidents.
+
+### Why it was retired
+
+Two structural arguments, both authored by Vincent on the mika#1327 ticket:
+
+**Readability/canonicality (IC_kwDORWsgGM8AAAABEDBqdw, 2026-05-28T17:22Z):**
+
+> "This ticket's scope should explicitly retire the #1322 grep as part of
+> acceptance, not just add the state-check alongside it. Otherwise a reader
+> six weeks out sees two fabrication-detection mechanisms in dispatch-lib.sh
+> and can't tell which is canonical (a duplication that hides which version
+> is load-bearing). The state-check is the replacement, not an addition."
+
+**Dead code (2026-05-28T18:57Z):**
+
+> "cpp#20 (joints 1+2 + synthetic emit + cpp#21 source rename) deployed at
+> `c3492b32` via cpp PR#22, merged + installed 2026-05-28T18:54Z. ... The
+> mika#1322 brake retirement remains in this ticket's acceptance criteria
+> (per the earlier comment) — post-implementation here, the fabrication-string
+> grep becomes dead code."
+
+Post-cpp#20, the LLM-emits-exit-string-after-denied-Bash failure class can no
+longer happen structurally (denied Bash halts the pilot loop before the exit
+string can be emitted). Post-mika#1327 Unit 2, the `/mika-groom-plan-only`
+slash command no longer instructs the pilot to emit the string at all. The
+brake catches a class that the substrate no longer produces.
+
+### What replaced it
+
+The state-grounded checks that already existed in dispatch-lib cover all
+structural consequences of "pilot lied entirely":
+
+- **HEAD-unchanged check (line 451-462):** fires when `PRE_RUN_HEAD ==
+  POST_RUN_HEAD` — catches "pilot exited 0 but did no work."
+- **Plan-file-missing check (line 621-630):** fires when `SKILL=dev-groom`
+  and no plan file >500c exists on the worktree — catches "pilot wrote no
+  plan file."
+- **Iterate-loop ESCALATE (`_escalate_groom`):** fires when the architect
+  verdict is not GROOMED — catches "pilot wrote a plan the architect
+  rejects."
+
+These checks gate on observable state, not on text the pilot emitted.
+
+### The principle for the future
+
+**Substrate gates on state, not on text.** When a dispatch-lib post-flight
+check depends on a string the pilot is *instructed* to emit, it cannot
+distinguish "pilot did the work and spoke the instructed text" from "pilot
+lied and spoke the same text." The structural alternative is to check the
+artifacts the pilot was supposed to produce (commits, files, branch state)
+and let the iterate-loop verdict handle convergence.
+
+When retiring a string-gate, retire it fully — the historical fingerprint
+goes in the solutions doc (this file) and in git history (mika#1322 commit),
+not in surviving dead code or stderr diagnostics that create canonicality
+ambiguity.
+
+### Related
+
+- mika#1327 — the retirement ticket.
+- mika#1322 — the brake PR being retired.
+- cpp#20 — joints 1+2 of the substrate-coherence cluster (visible
+  `interrupt=True` denials + complete `permissions.yaml`), shipped
+  2026-05-28T18:54:51Z at `c3492b32`.
+- Test 11 in `test-dispatch-lib.sh` — rewritten from block-present to
+  block-absent regression guard (prevents re-introduction).
