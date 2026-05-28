@@ -1401,6 +1401,148 @@ mod tests {
         }
     }
 
+    /// Engine post-condition guards (agent.rs, engine.rs, executor.rs) reference
+    /// these skill tool names by string literal. The guards fire regardless of
+    /// which skills are loaded — a missing tool means the guard silently no-ops
+    /// or misfires.
+    ///
+    /// **Category A only.** These are tools that appear in `EndTurn` guard
+    /// predicates, intent-precondition checks, and dispatch-class derivation.
+    /// Category B tools (builtin handler dispatch tables, test fixtures) are
+    /// intentionally agent-scoped and NOT listed here — their loader
+    /// unreachability on non-matching agents is by design.
+    ///
+    /// **Maintenance contract:** When adding a new engine post-condition guard
+    /// that references a skill tool name, add the tool name here. If the test
+    /// below fails, add the owning skill to the always-on dependency closure
+    /// (typically via `self-dev.dependencies`).
+    const ENGINE_REFERENCED_SKILL_TOOLS: &[&str] = &[
+        "run_claude_pilot",       // dev-pilot
+        "run_claude_pilot_groom", // dev-groom
+        "deploy_mika",            // deploy-mika
+    ];
+
+    #[test]
+    fn test_engine_referenced_tool_names_are_loader_reachable() {
+        // Static parity assertion (mika#1253, generalizing mika#1251).
+        //
+        // Every skill tool name referenced by engine post-condition guards
+        // must be reachable through the always-on dependency closure of
+        // BUNDLED_SKILL_MANIFESTS. This catches the class of bug where a
+        // tool is known to the engine but unreachable by the skill loader
+        // on keyword-less turns (e.g., GitHub webhook auto-groom).
+        //
+        // The test replicates the match_skills() BFS from matcher.rs but
+        // simplified: no keyword matching, no disabled-skill filtering
+        // (enabled is a runtime DB flag not present in compile-time data).
+        // This mirrors the worst-case reachability on a webhook turn with
+        // no keyword hits — only always_on=true seeds.
+
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let all_skills = all_bundled_skills();
+
+        // Parse each skill's manifest and collect tool names
+        let mut skill_manifests: HashMap<String, crate::skills::manifest::SkillManifest> =
+            HashMap::new();
+        let mut skill_tools: HashMap<String, Vec<String>> = HashMap::new();
+
+        for skill in &all_skills {
+            let manifest_file = skill
+                .files
+                .iter()
+                .find(|f| f.path == "skill.toml")
+                .unwrap_or_else(|| panic!("skill '{}' must have skill.toml", skill.name));
+
+            let manifest: crate::skills::manifest::SkillManifest =
+                toml::from_str(manifest_file.content).unwrap_or_else(|e| {
+                    panic!("skill '{}' skill.toml parse error: {e}", skill.name)
+                });
+
+            // Collect tool names from tools.json if present
+            let mut tools = Vec::new();
+            if let Some(tools_file) = skill.files.iter().find(|f| f.path == "tools.json") {
+                let tool_defs: Vec<serde_json::Value> = serde_json::from_str(tools_file.content)
+                    .unwrap_or_else(|e| {
+                        panic!("skill '{}' tools.json parse error: {e}", skill.name)
+                    });
+                for tool_def in &tool_defs {
+                    if let Some(name) = tool_def.get("name").and_then(|n| n.as_str()) {
+                        tools.push(name.to_string());
+                    }
+                }
+            }
+
+            let name_lower = skill.name.to_lowercase();
+            skill_manifests.insert(name_lower.clone(), manifest);
+            skill_tools.insert(name_lower, tools);
+        }
+
+        // BFS: seed with always_on=true skills, walk transitive dependencies
+        let mut closure: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+
+        for (name, manifest) in &skill_manifests {
+            if manifest.skill.always_on {
+                closure.insert(name.clone());
+                queue.push_back(name.clone());
+            }
+        }
+
+        while let Some(current) = queue.pop_front() {
+            if let Some(manifest) = skill_manifests.get(&current) {
+                for dep in &manifest.skill.dependencies {
+                    let dep_lower = dep.to_lowercase();
+                    if skill_manifests.contains_key(&dep_lower) && !closure.contains(&dep_lower) {
+                        closure.insert(dep_lower.clone());
+                        queue.push_back(dep_lower);
+                    }
+                }
+            }
+        }
+
+        // Collect all tool names reachable through the closure
+        let mut reachable_tools: HashSet<String> = HashSet::new();
+        for skill_name in &closure {
+            if let Some(tools) = skill_tools.get(skill_name) {
+                for tool in tools {
+                    reachable_tools.insert(tool.clone());
+                }
+            }
+        }
+
+        // Assert every engine-referenced tool is reachable
+        let mut missing: Vec<(&str, Option<&str>)> = Vec::new();
+        for &tool_name in ENGINE_REFERENCED_SKILL_TOOLS {
+            if !reachable_tools.contains(tool_name) {
+                // Find owning skill for diagnostic message
+                let owner = skill_tools
+                    .iter()
+                    .find(|(_, tools)| tools.iter().any(|t| t == tool_name))
+                    .map(|(name, _)| name.as_str());
+                missing.push((tool_name, owner));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Engine-referenced skill tool(s) not reachable through the always-on \
+             dependency closure (mika#1253). Missing tools:\n{}\n\
+             Fix: add the owning skill to an always_on=true skill's dependencies \
+             (typically self-dev/skill.toml).",
+            missing
+                .iter()
+                .map(|(tool, owner)| {
+                    match owner {
+                        Some(skill) => format!("  - {tool} (owned by skill '{skill}')"),
+                        None => format!("  - {tool} (owning skill not found in bundle)"),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     // Shared fixtures for merge-semantics tests — call `merge_skill_lists`
     // directly so the production merge function is the unit under test.
     // Previously the test re-implemented the merge algorithm locally, which
