@@ -31,12 +31,62 @@ static CONTEXT_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .expect("failed to build context HTTP client")
 });
 
+/// Status of a resolved context block, derived from resolution outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextStatus {
+    /// Full content was available and injected.
+    Full,
+    /// Content was truncated due to budget constraints.
+    Truncated,
+    /// Context resolution failed; sentinel text was injected.
+    Unavailable,
+}
+
+impl ContextStatus {
+    /// Label used in the `<!-- context_meta: ... -->` annotation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContextStatus::Full => "full",
+            ContextStatus::Truncated => "truncated",
+            ContextStatus::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Sentinel prefix for unavailable context blocks.
+const UNAVAILABLE_SENTINEL_PREFIX: &str = "(Context unavailable:";
+
 /// Resolved context block ready for template injection.
 #[derive(Debug, Clone)]
 pub struct ContextBlock {
     pub name: String,
     pub content: String,
     pub truncated: bool,
+    /// The context type from the skill manifest (e.g., "gh_pr_diff").
+    pub context_type: String,
+}
+
+impl ContextBlock {
+    /// Derive the context status from the block's state.
+    pub fn status(&self) -> ContextStatus {
+        if self.content.starts_with(UNAVAILABLE_SENTINEL_PREFIX) {
+            ContextStatus::Unavailable
+        } else if self.truncated {
+            ContextStatus::Truncated
+        } else {
+            ContextStatus::Full
+        }
+    }
+
+    /// Build the metadata annotation comment line for this context block.
+    pub fn metadata_annotation(&self) -> String {
+        format!(
+            "<!-- context_meta: type={}, status={}, chars={} -->",
+            self.context_type,
+            self.status().as_str(),
+            self.content.len(),
+        )
+    }
 }
 
 /// Resolve context requirements for matched skills.
@@ -147,6 +197,7 @@ pub async fn resolve_contexts(
                                 context_type
                             ),
                             truncated: false,
+                            context_type: context_type.clone(),
                         },
                     );
                 }
@@ -180,7 +231,7 @@ pub fn apply_context_replacements(prompt: &str, context: &HashMap<String, Contex
             let key = &caps[1];
             context
                 .get(key)
-                .map(|b| b.content.clone())
+                .map(|b| format!("{}\n{}", b.metadata_annotation(), b.content))
                 .unwrap_or_else(|| caps[0].to_string())
         })
         .into_owned()
@@ -214,6 +265,7 @@ async fn resolve_gh_pr_diff(message: &str, github_token: Option<&str>) -> Result
             name: "pr_diff".to_string(),
             content: "(No file changes in this pull request.)".to_string(),
             truncated: false,
+            context_type: "gh_pr_diff".to_string(),
         });
     }
 
@@ -226,6 +278,7 @@ async fn resolve_gh_pr_diff(message: &str, github_token: Option<&str>) -> Result
             name: "pr_diff".to_string(),
             content: diff,
             truncated: false,
+            context_type: "gh_pr_diff".to_string(),
         })
     }
 }
@@ -363,6 +416,7 @@ pub fn truncate_diff(raw_diff: &str, char_budget: usize) -> ContextBlock {
             name: "pr_diff".to_string(),
             content: raw_diff[..raw_diff.floor_char_boundary(char_budget)].to_string(),
             truncated: true,
+            context_type: "gh_pr_diff".to_string(),
         };
     }
 
@@ -424,6 +478,7 @@ pub fn truncate_diff(raw_diff: &str, char_budget: usize) -> ContextBlock {
         name: "pr_diff".to_string(),
         content: result,
         truncated: true,
+        context_type: "gh_pr_diff".to_string(),
     }
 }
 
@@ -464,19 +519,27 @@ mod tests {
         assert_eq!(number, 1);
     }
 
+    /// Helper to build a test ContextBlock with default context_type.
+    fn test_block(name: &str, content: &str, truncated: bool) -> ContextBlock {
+        ContextBlock {
+            name: name.to_string(),
+            content: content.to_string(),
+            truncated,
+            context_type: "test_type".to_string(),
+        }
+    }
+
     #[test]
     fn test_apply_context_replacements_basic() {
         let mut ctx = HashMap::new();
         ctx.insert(
             "pr_diff".to_string(),
-            ContextBlock {
-                name: "pr_diff".to_string(),
-                content: "the diff content".to_string(),
-                truncated: false,
-            },
+            test_block("pr_diff", "the diff content", false),
         );
         let result = apply_context_replacements("Review this: {{pr_diff}} end", &ctx);
-        assert_eq!(result, "Review this: the diff content end");
+        assert!(result.contains("<!-- context_meta: type=test_type, status=full, chars=16 -->"));
+        assert!(result.contains("the diff content"));
+        assert!(result.ends_with(" end"));
     }
 
     #[test]
@@ -489,14 +552,7 @@ mod tests {
     #[test]
     fn test_apply_context_replacements_no_placeholders() {
         let mut ctx = HashMap::new();
-        ctx.insert(
-            "key".to_string(),
-            ContextBlock {
-                name: "key".to_string(),
-                content: "value".to_string(),
-                truncated: false,
-            },
-        );
+        ctx.insert("key".to_string(), test_block("key", "value", false));
         let result = apply_context_replacements("no placeholders", &ctx);
         assert_eq!(result, "no placeholders");
     }
@@ -507,23 +563,15 @@ mod tests {
         let mut ctx = HashMap::new();
         ctx.insert(
             "pr_diff".to_string(),
-            ContextBlock {
-                name: "pr_diff".to_string(),
-                content: "contains {{other_key}} text".to_string(),
-                truncated: false,
-            },
+            test_block("pr_diff", "contains {{other_key}} text", false),
         );
         ctx.insert(
             "other_key".to_string(),
-            ContextBlock {
-                name: "other_key".to_string(),
-                content: "SHOULD NOT APPEAR".to_string(),
-                truncated: false,
-            },
+            test_block("other_key", "SHOULD NOT APPEAR", false),
         );
         let result = apply_context_replacements("{{pr_diff}}", &ctx);
         // The {{other_key}} inside pr_diff's content should NOT be replaced
-        assert_eq!(result, "contains {{other_key}} text");
+        assert!(result.contains("contains {{other_key}} text"));
     }
 
     #[test]
@@ -592,23 +640,104 @@ mod tests {
     #[test]
     fn test_apply_context_replacements_multiple_keys() {
         let mut ctx = HashMap::new();
-        ctx.insert(
-            "key_a".to_string(),
-            ContextBlock {
-                name: "key_a".to_string(),
-                content: "AAA".to_string(),
-                truncated: false,
-            },
-        );
-        ctx.insert(
-            "key_b".to_string(),
-            ContextBlock {
-                name: "key_b".to_string(),
-                content: "BBB".to_string(),
-                truncated: false,
-            },
-        );
+        ctx.insert("key_a".to_string(), test_block("key_a", "AAA", false));
+        ctx.insert("key_b".to_string(), test_block("key_b", "BBB", false));
         let result = apply_context_replacements("start {{key_a}} middle {{key_b}} end", &ctx);
-        assert_eq!(result, "start AAA middle BBB end");
+        assert!(result.contains("AAA"));
+        assert!(result.contains("BBB"));
+    }
+
+    // --- Step 1 tests: context metadata annotation ---
+
+    #[test]
+    fn test_context_status_full() {
+        let block = test_block("pr_diff", "diff content", false);
+        assert_eq!(block.status(), ContextStatus::Full);
+    }
+
+    #[test]
+    fn test_context_status_truncated() {
+        let block = test_block("pr_diff", "partial diff...", true);
+        assert_eq!(block.status(), ContextStatus::Truncated);
+    }
+
+    #[test]
+    fn test_context_status_unavailable() {
+        let block = test_block(
+            "pr_diff",
+            "(Context unavailable: gh_pr_diff resolution failed)",
+            false,
+        );
+        assert_eq!(block.status(), ContextStatus::Unavailable);
+    }
+
+    #[test]
+    fn test_metadata_annotation_full() {
+        let block = ContextBlock {
+            name: "pr_diff".to_string(),
+            content: "some diff".to_string(),
+            truncated: false,
+            context_type: "gh_pr_diff".to_string(),
+        };
+        assert_eq!(
+            block.metadata_annotation(),
+            "<!-- context_meta: type=gh_pr_diff, status=full, chars=9 -->"
+        );
+    }
+
+    #[test]
+    fn test_metadata_annotation_truncated() {
+        let block = ContextBlock {
+            name: "pr_diff".to_string(),
+            content: "partial...".to_string(),
+            truncated: true,
+            context_type: "gh_pr_diff".to_string(),
+        };
+        assert_eq!(
+            block.metadata_annotation(),
+            "<!-- context_meta: type=gh_pr_diff, status=truncated, chars=10 -->"
+        );
+    }
+
+    #[test]
+    fn test_metadata_annotation_unavailable() {
+        let block = ContextBlock {
+            name: "pr_diff".to_string(),
+            content: "(Context unavailable: gh_pr_diff resolution failed)".to_string(),
+            truncated: false,
+            context_type: "gh_pr_diff".to_string(),
+        };
+        assert_eq!(
+            block.metadata_annotation(),
+            "<!-- context_meta: type=gh_pr_diff, status=unavailable, chars=51 -->"
+        );
+    }
+
+    #[test]
+    fn test_apply_context_replacements_prepends_metadata() {
+        let mut ctx = HashMap::new();
+        ctx.insert(
+            "pr_diff".to_string(),
+            ContextBlock {
+                name: "pr_diff".to_string(),
+                content: "the diff".to_string(),
+                truncated: false,
+                context_type: "gh_pr_diff".to_string(),
+            },
+        );
+        let result = apply_context_replacements("BEGIN {{pr_diff}} END", &ctx);
+        assert!(result.contains("<!-- context_meta: type=gh_pr_diff, status=full, chars=8 -->"));
+        assert!(result.contains("the diff"));
+        // Metadata annotation should come before the content
+        let meta_pos = result.find("<!-- context_meta:").unwrap();
+        let content_pos = result.find("the diff").unwrap();
+        assert!(meta_pos < content_pos);
+    }
+
+    #[test]
+    fn test_truncate_diff_includes_context_type() {
+        let diff = "diff --git a/file.rs b/file.rs\n+line\n";
+        let result = truncate_diff(diff, 100);
+        assert_eq!(result.context_type, "gh_pr_diff");
     }
 }

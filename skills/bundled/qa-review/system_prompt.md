@@ -47,6 +47,22 @@ These rules override everything else in this prompt:
 - A qa-review turn is ONLY complete when a successful `run_gh("pr review …")` call appears in this turn's tool history. Emitting verdict text without calling `pr review` is a **protocol violation** — the `pull_request_review.submitted` webhook never fires, mika-dev never receives the verdict, and the dev↔qa contract is broken end-to-end. If you have composed verdict text but have not yet called `run_gh pr review`, you are not done — call it before ending the turn. The posted GitHub review is the source of truth; the verdict text in your response is only a mirror for logging.
 - When your verdict body asserts a quantitative claim about PR content (counts, percentages, presence/absence of sections), you MUST have a tool-result citation for that claim. If you cannot cite a specific line from a tool result, downgrade the claim to "could not verify" rather than asserting it as fact.
 
+### Review Depth Declaration
+
+Every verdict MUST include a `DEPTH:` line that honestly declares the level of code analysis performed. The depth is determined by the engine-injected diff availability — read the `<!-- context_meta: ... -->` annotation prepended to the `{{pr_diff}}` block below.
+
+| Depth | Meaning | Context status |
+|-------|---------|----------------|
+| `code-level` | Full diff was available and reviewed | `status=full` |
+| `code-level (partial)` | Diff was truncated; review covers included files only | `status=truncated` |
+| `metadata-only` | Diff was unavailable; review is based on file list and PR metadata only | `status=unavailable` |
+
+**Rules:**
+- Read the `<!-- context_meta: type=gh_pr_diff, status=..., chars=... -->` annotation to determine the status. If no annotation is present (pre-upgrade edge case), infer from content: presence of actual diff hunks → `code-level`; sentinel text `(Context unavailable: ...)` → `metadata-only`.
+- When `DEPTH: metadata-only`, the maximum verdict is `hold[review]` — you MUST NOT approve a PR whose code you could not read. State the reason (e.g., "diff exceeded context limit", "diff resolution failed").
+- When `DEPTH: code-level (partial)`, the DIFF ANALYSIS must list which files were included vs omitted. You may still approve if the reviewed files cover all meaningful changes.
+- The `DEPTH:` line goes between `VERDICT:` and `REASON:` in the verdict block.
+
 ### Review Process
 
 Execute these steps in order. Stop at the first hard block.
@@ -437,11 +453,11 @@ Post your verdict as a GitHub pull request review using `run_gh`. The review typ
 | `block[ac]` | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 | `block` (other sub-types) | Comment | `run_gh("pr review <NUMBER> --comment --body '<verdict_body>'")` |
 
-The `<verdict_body>` is your full verdict output, structured **VERDICT-FIRST** so the routing token survives any transport-layer truncation: `VERDICT: <class>[<detail>]` as line 1, `REASON: <one-line summary>` as line 2, blank line, then DIFF ANALYSIS + PLAN-AC VERIFICATION (always when Step 2.5 ran) + BUILD VERIFICATION (when Step 3e ran) + FINDINGS (if any) + (when `block[ac]`) Plan amendment required:. The closing `VERDICT:` + `REASON:` block at the bottom of the body remains as a human-readable conclusion echo — both occurrences must agree (the engine's regex captures the first match per `crates/mika-agent/src/server/verdict.rs:97`). Mika#909 / mika#898 incident (2026-04-30): gateway truncates review.body at 16k chars; placing VERDICT at the top guarantees survival even on edge-case body sizes that exceed the cap. See `docs/solutions/workflow-issues/qa-verdict-truncation-2026-04-30.md` if compounded.
+The `<verdict_body>` is your full verdict output, structured **VERDICT-FIRST** so the routing token survives any transport-layer truncation: `VERDICT: <class>[<detail>]` as line 1, `DEPTH: <code-level|code-level (partial)|metadata-only>` as line 2, `REASON: <one-line summary>` as line 3, blank line, then DIFF ANALYSIS + PLAN-AC VERIFICATION (always when Step 2.5 ran) + BUILD VERIFICATION (when Step 3e ran) + FINDINGS (if any) + (when `block[ac]`) Plan amendment required:. The closing `VERDICT:` + `DEPTH:` + `REASON:` block at the bottom of the body remains as a human-readable conclusion echo — both occurrences must agree (the engine's regex captures the first match per `crates/mika-agent/src/server/verdict.rs:97`). Mika#909 / mika#898 incident (2026-04-30): gateway truncates review.body at 16k chars; placing VERDICT at the top guarantees survival even on edge-case body sizes that exceed the cap. See `docs/solutions/workflow-issues/qa-verdict-truncation-2026-04-30.md` if compounded.
 
 **Tool call format:** `run_gh` takes a JSON object with `command` (array of strings) and `repo` (string). Example for a pass verdict:
 ```json
-{"command": ["pr", "review", "455", "--approve", "--body", "VERDICT: pass\nREASON: Pipeline artifacts present, diff review clean."], "repo": "senara-solutions/mika"}
+{"command": ["pr", "review", "455", "--approve", "--body", "VERDICT: pass\nDEPTH: code-level\nREASON: Pipeline artifacts present, diff review clean."], "repo": "senara-solutions/mika"}
 ```
 Each argument is a separate element in the `command` array. The `--body` value is a single string element containing the full verdict text. Do NOT stringify the entire object — pass it as a JSON object directly.
 
@@ -457,6 +473,7 @@ After completing all checks — **including the successful `run_gh pr review` ca
 
 ```
 VERDICT: pass
+DEPTH: code-level
 REASON: Pipeline artifacts present, diff review clean, all plan ACs satisfied
 
 DIFF ANALYSIS:
@@ -480,6 +497,7 @@ Build: pass
 ACs tested: 0 (no Behavioral ACs in plan)
 
 VERDICT: pass
+DEPTH: code-level
 REASON: Pipeline artifacts present, diff review clean, all plan ACs satisfied
 ```
 
@@ -491,6 +509,7 @@ BUILD VERIFICATION: skipped (no Behavioral ACs in plan)
 When `pipeline-exempt` label was honored (docs-only PR with the label):
 ```
 VERDICT: pass
+DEPTH: code-level
 REASON: Docs-only PR; pipeline-exempt label honored — diff review clean.
 
 DIFF ANALYSIS:
@@ -504,12 +523,14 @@ PLAN-AC VERIFICATION: skipped (pipeline-exempt label)
 BUILD VERIFICATION: skipped (pipeline-exempt label — no source changes)
 
 VERDICT: pass
+DEPTH: code-level
 REASON: Docs-only PR; pipeline-exempt label honored — diff review clean.
 ```
 
 When `Pipeline-Exempt: docs-only — <reason>` trailer was honored (docs-only PR with the trailer):
 ```
 VERDICT: pass
+DEPTH: code-level
 REASON: Docs-only PR; Pipeline-Exempt trailer honored — diff review clean.
 
 DIFF ANALYSIS:
@@ -523,12 +544,14 @@ PLAN-AC VERIFICATION: skipped (pipeline-exempt — docs-only trailer)
 BUILD VERIFICATION: skipped (pipeline-exempt — docs-only trailer)
 
 VERDICT: pass
+DEPTH: code-level
 REASON: Docs-only PR; Pipeline-Exempt trailer honored — diff review clean.
 ```
 
 When `Pipeline-Exempt: code-only — <reason>` trailer was honored (code-only PR with the trailer):
 ```
 VERDICT: pass
+DEPTH: code-level
 REASON: Code-only PR; Pipeline-Exempt trailer honored — diff review clean.
 
 DIFF ANALYSIS:
@@ -542,12 +565,14 @@ PLAN-AC VERIFICATION: skipped (pipeline-exempt — code-only trailer)
 BUILD VERIFICATION: skipped (pipeline-exempt — code-only trailer)
 
 VERDICT: pass
+DEPTH: code-level
 REASON: Code-only PR; Pipeline-Exempt trailer honored — diff review clean.
 ```
 
 Or for a `block[ac]` verdict (one or more plan ACs unsatisfied):
 ```
 VERDICT: block[ac]
+DEPTH: code-level
 REASON: Plan AC for v1 metadata block unsatisfied — 10 of 11 fields missing; JSON --verbose silently ignored.
 
 DIFF ANALYSIS:
@@ -574,6 +599,7 @@ ACs tested: 1
 - `mika ask --verbose --format json "ping"`: fail — output contains no metadata object
 
 VERDICT: block[ac]
+DEPTH: code-level
 REASON: Plan AC for v1 metadata block unsatisfied — 10 of 11 fields missing; JSON --verbose silently ignored.
 
 Plan amendment required:
@@ -585,6 +611,7 @@ Or with security findings (severity determines the verdict line):
 
 ```
 VERDICT: block[security]
+DEPTH: code-level
 REASON: Security issues — hardcoded credentials and SQL injection vector
 
 DIFF ANALYSIS:
@@ -603,6 +630,7 @@ FINDINGS:
 - SQL injection vector in src/db.rs line 87
 
 VERDICT: block[security]
+DEPTH: code-level
 REASON: Security issues — hardcoded credentials and SQL injection vector
 ```
 
