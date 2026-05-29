@@ -55,7 +55,7 @@ RUN ARCH_MAP="amd64:x86_64-unknown-linux-gnu arm64:aarch64-unknown-linux-gnu" &&
     GWS_VERSION="0.13.3" && \
     wget -qO /tmp/gws.tar.gz "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/gws-${GWS_ARCH}.tar.gz" && \
     wget -qO /tmp/gws.tar.gz.sha256 "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/gws-${GWS_ARCH}.tar.gz.sha256" && \
-    cd /tmp && echo "$(cat gws.tar.gz.sha256)  gws.tar.gz" | sha256sum -c - && \
+    cd /tmp && echo "$(cut -d' ' -f1 gws.tar.gz.sha256)  gws.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/gws.tar.gz -C /tmp && \
     find /tmp -name gws -type f -executable -exec mv {} /usr/local/bin/gws \; && \
     rm -rf /tmp/gws*
