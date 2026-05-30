@@ -753,7 +753,10 @@ fn truncate_output(s: &str) -> String {
     }
 }
 
-use crate::github_graphql::fetch_open_blockers;
+use crate::github_graphql::{
+    fetch_issue_labels, fetch_issue_milestone_number, fetch_milestone_issues_by_state,
+    fetch_open_blockers, parse_phase_label,
+};
 
 /// Derive the dispatch class from a skill name (#1001).
 ///
@@ -1105,6 +1108,130 @@ async fn validate_dispatch_readiness(
                             "Skipping grooming-marker check: no GitHub token configured"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    // Phase guard (mika#1153 E4): reject dispatch when the target issue has a
+    // `phase:N` label (N > 1) and any phase-(N-1) sub-issues in the same
+    // milestone are still OPEN. Defense-in-depth over the `blockedBy` GraphQL guard.
+    // Position: between grooming-marker (check 5) and blocked-by (check 6).
+    // Cost: 1-2 REST API calls (medium), cheaper than GraphQL blocked-by.
+    if let Some(GitHubRef::Issue {
+        ref owner,
+        ref repo,
+        number,
+    }) = github_ref
+    {
+        // Only gate issue-type tasks (matching check #5 pattern).
+        if task.r#type == db::TASK_TYPE_ISSUE {
+            match github_token {
+                Some(token) => {
+                    match fetch_issue_labels(token, owner, repo, number).await {
+                        Ok(labels) => {
+                            if let Some(phase) = parse_phase_label(&labels)
+                                && phase > 1
+                            {
+                                // Fetch the issue's milestone number from the GitHub API.
+                                let milestone_number =
+                                    fetch_issue_milestone_number(token, owner, repo, number)
+                                        .await
+                                        .ok();
+
+                                if let Some(ms_num) = milestone_number {
+                                    // Fetch open issues in the milestone and check for open phase-(N-1) issues.
+                                    match fetch_milestone_issues_by_state(
+                                        token, owner, repo, ms_num, "open",
+                                    )
+                                    .await
+                                    {
+                                        Ok(open_issues) => {
+                                            let prior_phase = phase - 1;
+                                            let open_in_prior_phase: Vec<u64> = open_issues
+                                                .iter()
+                                                .filter(|issue| {
+                                                    parse_phase_label(&issue.labels)
+                                                        == Some(prior_phase)
+                                                })
+                                                .map(|issue| issue.number)
+                                                .collect();
+
+                                            if !open_in_prior_phase.is_empty() {
+                                                let rejection = serde_json::json!({
+                                                    "error": "dispatch_phase_blocked",
+                                                    "task_id": task_id,
+                                                    "phase": phase,
+                                                    "blocking_phase": prior_phase,
+                                                    "open_issues_in_prior_phase": open_in_prior_phase,
+                                                    "reason": format!(
+                                                        "Cannot dispatch phase-{phase} issue #{number}: \
+                                                         {count} phase-{prior_phase} issue(s) are still open \
+                                                         ({issues}). Phase-{prior_phase} must complete before \
+                                                         phase-{phase} can be dispatched.",
+                                                        count = open_in_prior_phase.len(),
+                                                        issues = open_in_prior_phase
+                                                            .iter()
+                                                            .map(|n| format!("#{n}"))
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ")
+                                                    )
+                                                });
+                                                record_dispatch_rejection(
+                                                    db,
+                                                    task_id,
+                                                    &rejection.to_string(),
+                                                )
+                                                .await;
+                                                return Err(rejection.to_string());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Fail-closed: reject dispatch on API error
+                                            warn!(
+                                                task_id = task_id,
+                                                error = %e,
+                                                "phase guard: failed to fetch milestone issues, rejecting dispatch"
+                                            );
+                                            return Err(serde_json::json!({
+                                                "error": "dispatch_check_failed",
+                                                "task_id": task_id,
+                                                "reason": format!(
+                                                    "Failed to fetch milestone issues for phase guard: {e}"
+                                                )
+                                            })
+                                            .to_string());
+                                        }
+                                    }
+                                }
+                                // If we can't determine the milestone number, skip (can't check).
+                            }
+                            // No phase label or phase == 1: bypass guard.
+                        }
+                        Err(e) => {
+                            // Fail-closed: reject dispatch on API error (matching check #6 pattern)
+                            warn!(
+                                task_id = task_id,
+                                error = %e,
+                                "phase guard: failed to fetch issue labels, rejecting dispatch"
+                            );
+                            return Err(serde_json::json!({
+                                "error": "dispatch_check_failed",
+                                "task_id": task_id,
+                                "reason": format!(
+                                    "Failed to fetch issue labels for phase guard: {e}"
+                                )
+                            })
+                            .to_string());
+                        }
+                    }
+                }
+                None => {
+                    // Fail-open: no token configured (matching check #6 pattern)
+                    warn!(
+                        task_id = task_id,
+                        "Skipping phase guard: no GitHub token configured"
+                    );
                 }
             }
         }
