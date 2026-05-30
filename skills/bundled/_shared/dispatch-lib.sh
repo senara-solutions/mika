@@ -451,9 +451,20 @@ Note: process exited with code ${PILOT_EXIT} after session completed — result 
         if [ -n "$PRE_RUN_HEAD" ] && [ -n "$REPO" ]; then
             POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
             if [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ]; then
-                RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
+                # mika#1333 Unit 2: For dev-groom re-dispatch, HEAD-unchanged is
+                # expected when the plan was already committed in a prior run.
+                # The architect pass (_iterate_groom_loop) is what matters — don't
+                # poison RESULT with PIPELINE FAILURE for the expected re-dispatch state.
+                if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && \
+                   find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | grep -q .; then
+                    RESULT="Note: HEAD unchanged on dev-groom re-dispatch — plan already committed from prior run. Architect pass will determine outcome.
 
 ${RESULT}"
+                else
+                    RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
+
+${RESULT}"
+                fi
             fi
 
             # Unit 1 (mika#1282): detect dirty worktree on zero-commit dev-pilot.
@@ -700,11 +711,12 @@ Outcome: PR_OPENED — ${PR_URL}"
             # $VALID_PLAN is set by the dev-groom plan-validation block earlier
             # in this success branch (~line 476) when a docs/plans/*-plan.md
             # file >500 bytes is found. Non-local — in scope here.
-            # QA-review-#1140 finding 2: surface the resolved plan path instead
-            # of a generic message.
+            # mika#1333: emit PLAN_COMMITTED (not PLAN_GROOMED) at this stage.
+            # The architect pass hasn't run yet — PLAN_GROOMED is only emitted
+            # after _iterate_groom_loop succeeds (see dispatch_claude_pilot).
             RESULT="${RESULT}
 
-Outcome: PLAN_GROOMED — ${VALID_PLAN}"
+Outcome: PLAN_COMMITTED — ${VALID_PLAN}"
         else
             RESULT="${RESULT}
 
@@ -1612,7 +1624,19 @@ EOF
     # remains as a fallback until the dev-groom-prompt-update follow-up
     # ships. See docs/plans/2026-05-25-009-feat-1271-class-d-shim-retire-plan.md.
     if [ "$SKILL" = "dev-groom" ]; then
-        _iterate_groom_loop || echo "info: iterate_groom_loop did not converge — pilot's organic write remains as fallback (dev-groom skill prompt)" >&2
+        if _iterate_groom_loop; then
+            # Architect converged on GROOMED — upgrade outcome from PLAN_COMMITTED
+            # to PLAN_GROOMED (the only path that earns this outcome name).
+            RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: PLAN_COMMITTED/Outcome: PLAN_GROOMED/')
+        else
+            # mika#1333: propagate architect-convergence failure into RESULT.
+            # Replaces the silent-tolerance pattern that caused mid-flow
+            # short-circuit (plan committed but architect never ran/failed).
+            RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: PLAN_COMMITTED.*$/Outcome: PIPELINE_INCOMPLETE — architect convergence did not complete./')
+            RESULT="PIPELINE FAILURE: architect convergence did not complete (_iterate_groom_loop returned non-zero). Plan exists on branch but architect verdict is missing.
+
+${RESULT}"
+        fi
     fi
 
     _push_branch
