@@ -105,6 +105,14 @@ Permitted post-callback actions are described prosaically in the success/failure
 
 **Step 4.5 — Diagnose and recover from failure**
 
+> **MANDATORY STATE VERIFICATION (before ANY failure diagnosis or reporting):**
+> Before reading logs, classifying errors, or describing what happened:
+> 1. Extract `reference_url` from `check_task(task_id)` — parse `senara-solutions/<repo>/issues/<n>`.
+> 2. Call `run_gh("issue view <n> --repo senara-solutions/<repo> --json state,stateReason,closedAt")`.
+> 3. Call `run_gh("pr list --head <branch> --repo senara-solutions/<repo> --json url,number,state,mergedAt,reviewDecision")`.
+> 4. If the issue is closed AND a merged PR exists → the work **succeeded**. Do NOT enter failure diagnosis. Route to success path.
+> 5. Include the verified state in your notification to Vincent. Never claim "no PR" or "manually closed" — state what the tools returned.
+
 1. **Read the log.** Extract log path from callback. `run_shell`:
    ```
    tail -200 /var/log/claude-pilot/<task-id>.log
