@@ -105,10 +105,11 @@ After extracting, **persist immediately:** call `update_task_status` with the cu
 When you receive a `[heartbeat trigger]` message, before performing any other heartbeat actions (sprint checks, commitment reviews, etc.), check for stalled milestone queues:
 
 1. Call `list_tasks(status="in_progress", type="milestone")` to find in-flight milestones.
-2. For each milestone found, call `check_task(milestone_task_id)` to get its children.
-3. Check if the milestone has a completed/failed child that was NOT followed by a new dispatch:
+2. For each milestone found, call `check_task(milestone_task_id)` to get its children and metadata.
+3. **Phase progress (mika#1153):** If the milestone task's metadata contains `phase_progress`, include it in the health report: "Phase {current_phase}/{phase_count}: {phase_completed}/{phase_total} completed." If `phase_cascade_pending` is true, note: "Phase cascade pending — operator must apply `ready` labels to phase-{N+1} issues manually."
+4. Check if the milestone has a completed/failed child that was NOT followed by a new dispatch:
    - If the most recent callback child is `completed` or `failed` AND no sibling child is `pending` or `in_progress` with `trigger_type="callback"`, the milestone queue is stalled.
-4. For stalled milestones: call `run_claude_pilot` for the next pending child issue, OR call `update_task_status(milestone_task_id, status='blocked', note='heartbeat detected stalled queue — no pending children to advance to')` if no pending children remain.
+5. For stalled milestones: call `run_claude_pilot` for the next pending child issue, OR call `update_task_status(milestone_task_id, status='blocked', note='heartbeat detected stalled queue — no pending children to advance to')` if no pending children remain.
 
 This is the heartbeat-level backstop for the chronic stall pattern documented in `project_heartbeat_milestone_phantom.md`. The engine's `PostCallbackAdvance` trigger (mika#991) catches per-callback stalls; heartbeat catches older stalls that slipped through (>24h idle).
 
@@ -433,6 +434,8 @@ For **each** issue number in `milestone_issues` (ALL of them, in the topo-sorted
 
 **GATE:** Verify `len(child_wis) == len(milestone_issues)`. If not equal, you missed issues — go back and create the missing children. Do NOT proceed to M4 until every issue has a child task.
 
+**Phase label verification (mika#1153):** If the milestone has `phase:N` labels on its sub-issues (visible in `issue_labels` from M2), verify that every child issue has exactly one `phase:N` label. If any child is unlabeled, warn Vincent: "Milestone <repo> milestone#<n>: issue(s) #X, #Y are missing phase labels. Phase dispatch gating and cascade may not work for these issues." This is a warning — do not block on it.
+
 **Record to memory:** `store_fact(category="event", description="Milestone <repo> milestone#<n> initialized with {N} child issues: #X, #Y, #Z (topo-sorted). Parent task: <milestone_wi>.")`
 
 **Memory (current_priorities):** After creating the milestone parent task:
@@ -445,6 +448,12 @@ update_core_memory(section="current_priorities", action="replace",
 Notify Vincent: "Milestone <repo> milestone#<n> initialized with {N} issues (dependency-sorted). Starting sequential execution."
 
 ### Step M4 — Serial execution loop
+
+**Phase-aware execution (mika#1153):** For phased milestones (issues carry `phase:N` labels), the engine automatically handles phase sequencing:
+- The dispatch-readiness guard (E4) rejects dispatch of phase-K issues while phase-(K-1) issues are still open.
+- When all issues in a phase complete, the ready-label cascade (E5) automatically labels next-phase issues `ready` (unless `MIKA_PHASE_CASCADE_AUTO=false`, in which case operator must label manually).
+- Phase progress is tracked in the milestone task's metadata under `phase_progress`.
+- If the cascade is auto (default), the autonomous `self-dev-webhook-ready-label` handler picks up newly-labeled issues without M4 needing to explicitly manage phase boundaries.
 
 For each `child_task_id` in `child_wis` (in order):
 

@@ -854,9 +854,14 @@ async fn run_agent_for_message(
         // a `[milestone-parent: <id>]` marker so the inline webhook_milestone_advance
         // guard in agent.rs can fire. Never returns Handled (LLM still owns the
         // advance/halt decision).
-        let milestone_action =
-            milestone_context_handler::try_handle_pr_closed_milestone_context(&req.text, &a.db)
-                .await;
+        // Phase tracking + cascade (mika#1153): also computes phase progress and
+        // triggers ready-label cascade on phase rollover.
+        let milestone_action = milestone_context_handler::try_handle_pr_closed_milestone_context(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+        )
+        .await;
         match milestone_action {
             VerdictAction::Passthrough {
                 enrichment: Some(e),

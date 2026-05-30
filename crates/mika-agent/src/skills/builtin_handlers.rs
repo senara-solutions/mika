@@ -1642,6 +1642,8 @@ const GH_API_READ_ALLOWED_PATTERNS: &[&str] = &[
     r"^/?repos/[^/]+/[^/]+/branches/[^/]+$",
     r"^/?repos/[^/]+/[^/]+/branches$",
     r"^/?repos/[^/]+/[^/]+/commits/[a-fA-F0-9]+$",
+    // Milestone read: GET /repos/{owner}/{repo}/milestones/{number} (mika#1153 R4)
+    r"^/?repos/[^/]+/[^/]+/milestones/\d+$",
 ];
 
 static GH_API_READ_COMPILED: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
@@ -1650,6 +1652,27 @@ static GH_API_READ_COMPILED: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         .map(|p| {
             regex::Regex::new(p).unwrap_or_else(|e| {
                 panic!("BUG: malformed GH_API_READ_ALLOWED_PATTERNS regex '{p}': {e}")
+            })
+        })
+        .collect()
+});
+
+/// Allowed write `gh api` endpoint patterns (mika#1153 R4).
+///
+/// Only PATCH method on matching paths is permitted. This is scoped narrowly
+/// to milestone lifecycle operations (close + readback). POST/PUT/DELETE are
+/// never allowed through this path.
+const GH_API_WRITE_ALLOWED_PATTERNS: &[&str] = &[
+    // Milestone close: PATCH /repos/{owner}/{repo}/milestones/{number}
+    r"^/?repos/[^/]+/[^/]+/milestones/\d+$",
+];
+
+static GH_API_WRITE_COMPILED: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
+    GH_API_WRITE_ALLOWED_PATTERNS
+        .iter()
+        .map(|p| {
+            regex::Regex::new(p).unwrap_or_else(|e| {
+                panic!("BUG: malformed GH_API_WRITE_ALLOWED_PATTERNS regex '{p}': {e}")
             })
         })
         .collect()
@@ -1855,43 +1878,53 @@ fn validate_qa_review_gh_scope(args: &[String], ctx: &ToolContext<'_>) -> Result
     )))
 }
 
-/// Validate `gh api` invocations: GET-only + path allowlist (mika#805).
+/// Validate `gh api` invocations: method + path allowlist (mika#805, mika#1153).
 ///
 /// Extracts the HTTP method (default GET) and the API path from argv.
-/// Rejects non-GET methods and paths that don't match any allowed pattern.
+/// GET requests are checked against `GH_API_READ_COMPILED`. PATCH requests
+/// are checked against `GH_API_WRITE_COMPILED` (milestone lifecycle only).
+/// All other methods (POST, PUT, DELETE) are unconditionally rejected.
 fn validate_gh_api_scope(args: &[String]) -> Result<(), ToolOutput> {
     if args.first().map(String::as_str) != Some("api") {
         return Ok(());
     }
 
     let method = extract_api_method(args);
-    if !method.eq_ignore_ascii_case("GET") {
-        return Err(ToolOutput::error(format!(
-            "gh api method '{method}' is not allowed. Only GET requests are permitted \
-             through run_gh. Use the appropriate gh subcommand (e.g., gh issue, gh pr) \
-             for write operations."
-        )));
-    }
 
     // Extract the API path: first positional arg after "api" that doesn't start with "-"
-    let path = args
-        .iter()
-        .skip(1)
-        .find(|s| !s.starts_with('-'))
-        .map(String::as_str)
-        .unwrap_or("");
+    // and is not the value of a flag (e.g., `-X PATCH` or `--method PATCH`).
+    let path = extract_api_path(args);
 
-    let matched = GH_API_READ_COMPILED.iter().any(|re| re.is_match(path));
-
-    if !matched {
-        return Err(ToolOutput::error(format!(
-            "gh api path '{path}' is not in the read-only allowlist. \
-             Allowed: repos/{{owner}}/{{repo}}/branches[/{{branch}}], \
-             repos/{{owner}}/{{repo}}/commits/{{sha}}."
-        )));
+    if method.eq_ignore_ascii_case("GET") {
+        let matched = GH_API_READ_COMPILED.iter().any(|re| re.is_match(path));
+        if !matched {
+            return Err(ToolOutput::error(format!(
+                "gh api path '{path}' is not in the read-only allowlist. \
+                 Allowed: repos/{{owner}}/{{repo}}/branches[/{{branch}}], \
+                 repos/{{owner}}/{{repo}}/commits/{{sha}}, \
+                 repos/{{owner}}/{{repo}}/milestones/{{number}}."
+            )));
+        }
+        return Ok(());
     }
 
-    Ok(())
+    if method.eq_ignore_ascii_case("PATCH") {
+        let matched = GH_API_WRITE_COMPILED.iter().any(|re| re.is_match(path));
+        if !matched {
+            return Err(ToolOutput::error(format!(
+                "gh api PATCH path '{path}' is not in the write allowlist. \
+                 Only PATCH on repos/{{owner}}/{{repo}}/milestones/{{number}} is permitted."
+            )));
+        }
+        return Ok(());
+    }
+
+    // All other methods (POST, PUT, DELETE) are unconditionally rejected.
+    Err(ToolOutput::error(format!(
+        "gh api method '{method}' is not allowed. Only GET and PATCH (on milestone \
+         endpoints) are permitted through run_gh. Use the appropriate gh subcommand \
+         (e.g., gh issue, gh pr) for other write operations."
+    )))
 }
 
 /// Extract the HTTP method from a `gh api` argv.
@@ -1911,6 +1944,47 @@ fn extract_api_method(args: &[String]) -> &str {
         }
     }
     "GET"
+}
+
+/// Extract the API path from a `gh api` argv.
+///
+/// Finds the first positional argument after "api" that is not a flag (`-...`)
+/// and not a value consumed by a preceding flag (`-X`, `--method`, `-f`, `--jq`,
+/// `-H`, `--header`, `-t`, `--template`, `-q`, `--jq`, `--hostname`).
+fn extract_api_path(args: &[String]) -> &str {
+    /// Flags that consume the next positional argument as their value.
+    const VALUE_FLAGS: &[&str] = &[
+        "-X",
+        "--method",
+        "-f",
+        "-F",
+        "--raw-field",
+        "-H",
+        "--header",
+        "-t",
+        "--template",
+        "-q",
+        "--jq",
+        "--hostname",
+        "--input",
+        "-p",
+        "--preview",
+    ];
+
+    let mut iter = args.iter().skip(1); // skip "api"
+    while let Some(arg) = iter.next() {
+        if arg.starts_with('-') {
+            // If this flag consumes the next arg, skip it
+            if VALUE_FLAGS.contains(&arg.as_str()) {
+                let _ = iter.next(); // consume the value
+            }
+            // Flags with `=` (e.g., --method=PATCH) don't consume the next arg
+            continue;
+        }
+        // First non-flag, non-consumed arg is the API path
+        return arg.as_str();
+    }
+    ""
 }
 
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
@@ -2918,7 +2992,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gh_api_patch_rejected() {
+    fn test_gh_api_patch_non_allowed_path_rejected() {
         let args = str_args(&[
             "api",
             "repos/o/r/branches/main",
@@ -2929,7 +3003,12 @@ mod tests {
         ]);
         let result = validate_gh_api_scope(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().content.contains("Only GET requests"));
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the write allowlist")
+        );
     }
 
     #[test]
@@ -2937,7 +3016,7 @@ mod tests {
         let args = str_args(&["api", "repos/o/r/issues", "-X", "POST"]);
         let result = validate_gh_api_scope(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().content.contains("Only GET requests"));
+        assert!(result.unwrap_err().content.contains("is not allowed"));
     }
 
     #[test]
@@ -2945,11 +3024,12 @@ mod tests {
         let args = str_args(&["api", "repos/o/r/branches/main", "--method", "DELETE"]);
         let result = validate_gh_api_scope(&args);
         assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("is not allowed"));
     }
 
     #[test]
-    fn test_gh_api_milestones_not_allowed() {
-        // Milestones not in scope per mika#805 (F2 — review-guide.md § YAGNI).
+    fn test_gh_api_milestone_list_not_allowed() {
+        // Listing milestones (no number) is not in scope — only specific milestone GET/PATCH.
         let args = str_args(&["api", "repos/o/r/milestones"]);
         let result = validate_gh_api_scope(&args);
         assert!(result.is_err());
@@ -2958,6 +3038,85 @@ mod tests {
                 .unwrap_err()
                 .content
                 .contains("not in the read-only allowlist")
+        );
+    }
+
+    #[test]
+    fn test_gh_api_milestone_get_allowed() {
+        // GET readback for milestone close verification (mika#1153 R4)
+        let args = str_args(&["api", "repos/o/r/milestones/14"]);
+        assert!(validate_gh_api_scope(&args).is_ok());
+    }
+
+    #[test]
+    fn test_gh_api_milestone_get_leading_slash_allowed() {
+        let args = str_args(&["api", "/repos/o/r/milestones/14"]);
+        assert!(validate_gh_api_scope(&args).is_ok());
+    }
+
+    #[test]
+    fn test_gh_api_milestone_patch_allowed() {
+        // PATCH for milestone close (mika#1153 R4)
+        let args = str_args(&[
+            "api",
+            "-X",
+            "PATCH",
+            "/repos/o/r/milestones/14",
+            "-f",
+            "state=closed",
+        ]);
+        assert!(validate_gh_api_scope(&args).is_ok());
+    }
+
+    #[test]
+    fn test_gh_api_milestone_post_rejected() {
+        // POST (create milestone) is not allowed — only PATCH
+        let args = str_args(&[
+            "api",
+            "-X",
+            "POST",
+            "/repos/o/r/milestones",
+            "-f",
+            "title=new",
+        ]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("is not allowed"));
+    }
+
+    #[test]
+    fn test_gh_api_milestone_delete_rejected() {
+        let args = str_args(&["api", "-X", "DELETE", "/repos/o/r/milestones/14"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().content.contains("is not allowed"));
+    }
+
+    #[test]
+    fn test_gh_api_patch_non_milestone_rejected() {
+        // PATCH on non-milestone paths is rejected
+        let args = str_args(&["api", "-X", "PATCH", "/repos/o/r/issues/14"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the write allowlist")
+        );
+    }
+
+    #[test]
+    fn test_gh_api_patch_milestone_no_number_rejected() {
+        // PATCH on /milestones (no number) doesn't match the pattern
+        let args = str_args(&["api", "-X", "PATCH", "/repos/o/r/milestones"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the write allowlist")
         );
     }
 
