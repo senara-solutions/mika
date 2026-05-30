@@ -1498,8 +1498,13 @@ _detect_plan_on_branch() {
 
     # Validate the plan file exists in the worktree
     if [ -f "$WORKTREE_DIR/$PLAN_PATH" ]; then
-        ENTRY_COMMAND="/ce:work $PLAN_PATH"
-        echo "Plan-on-branch detected: overriding entry command to '/ce:work $PLAN_PATH'" >&2
+        # compound-engineering 3.x renamed `name: ce:work` → `name: ce-work`
+        # (CHANGELOG #503). The plugin's `/ce:work` slash command was removed; the
+        # canonical invocation is now `/ce-work`. Dispatch-lib must use the new
+        # form or claude-pilot exits 7ms with `[error] pipeline_incomplete:` (no
+        # API call). See mika#1345.
+        ENTRY_COMMAND="/ce-work $PLAN_PATH"
+        echo "Plan-on-branch detected: overriding entry command to '/ce-work $PLAN_PATH'" >&2
     else
         echo "Plan-on-branch callout found but file not in worktree: $WORKTREE_DIR/$PLAN_PATH — falling back to /mika" >&2
     fi
