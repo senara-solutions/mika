@@ -303,20 +303,20 @@ pub struct DisabledSkill {
 /// A loaded skill that has validation warnings (non-fatal issues).
 ///
 /// These skills are still in the registry and functional, but operators
-/// should be aware of the issues. Produced by `SkillRegistry::validate_loaded()`.
+/// should be aware of the issues. Produced by `SkillRegistry::apply_load_safety_check()`.
 #[derive(Debug, Clone)]
 pub struct SkillValidationWarning {
     pub skill_name: String,
     pub diagnostics: Vec<SkillDiagnostic>,
 }
 
-/// Classify whether a `Fail`-level diagnostic from `validate_skill()` should
-/// cause the skill to be skipped at startup (vs. loaded with a warning).
+/// Classify whether a Fail diagnostic warrants skipping the skill at load time.
 ///
-/// Skip-worthy failures indicate the skill **cannot function** at runtime
-/// (missing handler, broken tools.json, unreadable manifest). All other
-/// Fail-level diagnostics are downgraded to warnings at startup since the
-/// skill can still load and operate.
+/// This is part of the runtime crash-protection layer — not the change-time
+/// validation gate. Skip-worthy failures indicate structural corruption that
+/// would cause runtime errors (missing handler, broken tools.json, unreadable
+/// manifest). All other Fail-level diagnostics are downgraded to warnings at
+/// load time since the skill can still operate.
 ///
 /// # Maintenance note
 /// This function depends on message strings produced by `validate_skill()`.

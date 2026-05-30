@@ -125,7 +125,7 @@ async fn spawn_agent_worker(
     {
         skill_registry.apply_overrides(&overrides);
     }
-    skill_registry.validate_loaded();
+    skill_registry.apply_load_safety_check();
     skill_registry.log_summary();
     let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));

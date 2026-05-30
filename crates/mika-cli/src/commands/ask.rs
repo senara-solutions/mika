@@ -303,7 +303,7 @@ pub async fn run(
             eprintln!("[mika] warning: --enable-skill '{name}' did not match any loaded skill");
         }
     }
-    skill_registry.validate_loaded();
+    skill_registry.apply_load_safety_check();
     skill_registry.log_summary();
 
     // Surface validation warnings on stderr (Unit 4: #530)

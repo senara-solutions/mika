@@ -21,6 +21,65 @@ These are orthogonal concerns. The code is already correct — only the document
 
 **Why not framing #3 (gate on skill origin):** The complexity of per-origin gating is not justified. The `validate_loaded()` pass is cheap (filesystem-only, no LLM calls, no network) and runs once at startup. The marginal cost of re-validating CI-covered skills is negligible.
 
+## Phase 0 Pins
+
+### Pin 1: Callsite inventory (`grep -rn "validate_loaded" crates/`)
+
+Non-test method calls (4 callsites):
+- `crates/mika-cli/src/commands/ask.rs:335` — `skill_registry.validate_loaded()`
+- `crates/mika-cli/src/commands/chat.rs:128` — `skill_registry.validate_loaded()`
+- `crates/mika-agent/src/server/mod.rs:415` — `skill_registry.validate_loaded()`
+- `crates/mika-agent/src/tools/list_skills.rs:59` — `registry.validate_loaded()`
+
+Internal references (definition + doc comments, in `crates/mika-agent/src/skills/mod.rs`):
+- Line 272: `pub fn validate_loaded(&mut self)` — method definition
+- Line 165, 218, 258: doc comments referencing `validate_loaded()`
+
+Other crate references:
+- `crates/mika-agent/src/skills/index.rs:306` — doc comment on `SkillValidationWarning`
+- `crates/mika-agent/build.rs:118` — doc comment referencing `validate_loaded()`
+
+Test functions (13 in `crates/mika-agent/src/skills/mod.rs`):
+- `test_validate_loaded_no_issues` (line 1889)
+- `test_validate_loaded_empty_registry` (line 1905)
+- `test_validate_loaded_llm_section_warns_not_skipped` (line 1915)
+- `test_validate_loaded_name_in_keywords_warns_not_skipped` (line 1946)
+- `test_validate_loaded_missing_handler_script_skips` (line 1971)
+- `test_validate_loaded_handler_not_executable_skips` (line 2001)
+- `test_validate_loaded_invalid_tools_json_skips` (line 2033)
+- `test_validate_loaded_skip_worthy_and_warn_both_present_skips` (line 2046)
+- `test_validate_loaded_warn_only_diagnostics_kept` (line 2091)
+- `test_validate_loaded_multiple_skills_mixed` (line 2111)
+- `test_validate_loaded_symlink_race_all_fail_no_ok` (line 2157)
+- `test_validate_loaded_always_on_oversized_prompt_skips` (line 2175)
+- `test_validate_loaded_skip_reason_contains_diagnostic` (line 2212)
+
+**No hot-reload sites found.** `server/handlers.rs` and `server/a2a.rs` do not call `validate_loaded()`.
+
+### Pin 2: Doc cross-reference inventory (`grep -rn "agent-tool-must-call-validate-loaded\|validate_loaded" docs/ crates/mika-agent/CLAUDE.md`)
+
+Files requiring update (current references, excluding historical plan files and the plan itself):
+- `docs/solutions/best-practices/agent-tool-must-call-validate-loaded-on-skill-registry.md` — file rename + 13 internal references
+- `docs/solutions/architecture-patterns/startup-skill-validation-structural-enforcement.md` — 2 references (line 33, line 69)
+- `docs/solutions/integration-issues/always-on-skill-oversized-prompt-loud-failure.md` — 2 references (line 76, line 89)
+- `docs/solutions/architecture-patterns/skill-enabled-state-db-eviction.md` — 1 cross-link to best-practices doc filename (line 201)
+- `docs/solutions/architecture-patterns/cli-skill-always-on-transient-override.md` — 1 reference (line 42)
+- `crates/mika-agent/CLAUDE.md` — 2 references (line 191, line 193)
+- `crates/mika-agent/docs/skills.md` — 1 reference (line 1143, crates.io fallback copy)
+- `docs/skills.md` — 1 reference (line 1143, source of truth)
+- `crates/mika-agent/build.rs` — 1 reference in doc comment (line 118)
+
+Files NOT updated (historical records — plan files are immutable post-merge):
+- `docs/plans/2026-04-13-004-feat-startup-skill-validation-plan.md` (20+ references)
+- `docs/plans/2026-04-15-003-feat-list-skills-report-skipped-count-plan.md` (1 reference)
+- `docs/plans/2026-04-16-005-refactor-bundled-skills-directory-source-plan.md` (1 reference)
+- `docs/plans/2026-04-18-001-feat-skill-enabled-state-db-eviction-plan.md` (4 references)
+- `docs/plans/2026-04-20-002-feat-skill-always-on-cli-flag-plan.md` (1 reference)
+- `docs/plans/2026-04-20-005-feat-enable-disable-skill-flags-plan.md` (1 reference)
+- `docs/plans/2026-04-21-004-feat-domain-graph-builder-plan.md` (1 reference)
+- `docs/plans/2026-04-21-005-feat-lexical-ingestion-plan.md` (1 reference)
+- `docs/plans/2026-04-13-005-fix-skills-validator-handler-path-canonicalization-plan.md` (1 reference)
+
 ## Implementation units
 
 ### Unit 1: Rename and document the role boundary
@@ -78,23 +137,31 @@ These are orthogonal concerns. The code is already correct — only the document
 
 **Goal:** Rename the method call at every site that invokes `validate_loaded()`.
 
-**Files (6 callsites):**
+**Files (4 callsites — exhaustive per Phase 0 Pin 1):**
 - `crates/mika-cli/src/commands/ask.rs:335` — `skill_registry.validate_loaded()` → `skill_registry.apply_load_safety_check()`
 - `crates/mika-cli/src/commands/chat.rs:128` — same rename
 - `crates/mika-agent/src/server/mod.rs:415` — same rename
 - `crates/mika-agent/src/tools/list_skills.rs:59` — same rename
-- Any hot-reload sites in `server/handlers.rs` and `server/a2a.rs` that rebuild the registry
 
-**Mechanical:** Find-and-replace `validate_loaded()` → `apply_load_safety_check()` at each callsite. No logic changes.
+**Also update internal references (3 files):**
+- `crates/mika-agent/src/skills/index.rs:306` — doc comment on `SkillValidationWarning`
+- `crates/mika-agent/build.rs:118` — doc comment referencing `validate_loaded()`
+- `crates/mika-agent/src/skills/mod.rs` — doc comments at lines 165, 218, 258
+
+**Mechanical:** Find-and-replace `validate_loaded()` → `apply_load_safety_check()` at each callsite and doc comment. No logic changes. No hot-reload sites exist (confirmed by Phase 0 Pin 1).
 
 ### Unit 3: Update solution docs and cross-references
 
-**Goal:** Update all documented references to `validate_loaded()` to use the new name and framing.
+**Goal:** Update all documented references to `validate_loaded()` to use the new name and framing. Full file list per Phase 0 Pin 2.
 
-**Files:**
-- `docs/solutions/best-practices/agent-tool-must-call-validate-loaded-on-skill-registry.md` — rename file to `agent-tool-must-call-apply-load-safety-check-on-skill-registry.md`, update all internal references
-- `docs/solutions/architecture-patterns/startup-skill-validation-structural-enforcement.md` — update references
-- `docs/solutions/integration-issues/always-on-skill-oversized-prompt-loud-failure.md` — update references
+**Files (7 — exhaustive per Phase 0 Pin 2, excluding historical plan files which are immutable post-merge):**
+- `docs/solutions/best-practices/agent-tool-must-call-validate-loaded-on-skill-registry.md` — rename file to `agent-tool-must-call-apply-load-safety-check-on-skill-registry.md`, update all 13 internal references
+- `docs/solutions/architecture-patterns/startup-skill-validation-structural-enforcement.md` — update 2 references (lines 33, 69)
+- `docs/solutions/integration-issues/always-on-skill-oversized-prompt-loud-failure.md` — update 2 references (lines 76, 89)
+- `docs/solutions/architecture-patterns/skill-enabled-state-db-eviction.md` — update cross-link to renamed best-practices doc (line 201)
+- `docs/solutions/architecture-patterns/cli-skill-always-on-transient-override.md` — update 1 reference (line 42)
+- `docs/skills.md` — update 1 reference (line 1143, source of truth)
+- `crates/mika-agent/docs/skills.md` — update 1 reference (line 1143, crates.io fallback copy; sync via `scripts/sync-agent-docs.sh`)
 
 ### Unit 4: Update test names
 
@@ -114,7 +181,7 @@ is_skip_worthy_failure() ← doc-only change (crash-protection framing)
     ↓
 apply_load_safety_check() ← renamed from validate_loaded()
     ↓
-6 callsites ← mechanical rename
+4 callsites + 3 doc-comment refs ← mechanical rename (Phase 0 Pin 1)
 ```
 
 No behavioral changes. The decision matrix, the skip-worthy classification, and the two-phase collect-then-apply pattern are all unchanged.
@@ -123,8 +190,8 @@ No behavioral changes. The decision matrix, the skip-worthy classification, and 
 
 | Risk | Mitigation |
 |------|------------|
-| Rename breaks external consumers | `validate_loaded()` is `pub` on `SkillRegistry` but the crate is not published to crates.io as a library. All consumers are in-tree. `cargo build` catches any missed callsites. |
-| Doc references go stale | Unit 3 covers all known doc references. `grep -r validate_loaded` after implementation confirms none are missed. |
+| Rename breaks external consumers | `validate_loaded()` is `pub` on `SkillRegistry` but the crate is not published to crates.io as a library. All consumers are in-tree. `cargo build` catches any missed callsites. Phase 0 Pin 1 enumerates all 4 callsites + 3 doc-comment refs. |
+| Doc references go stale | Phase 0 Pin 2 enumerates the exhaustive cross-reference set (7 files). Historical plan files are immutable post-merge and excluded. `grep -r validate_loaded` after implementation confirms none are missed. |
 | Rename is bikeshedding | The rename is the minimal change that satisfies the ticket's AC3 (document the orthogonality boundary). The alternative — keeping the name and only updating docs — leaves the naming inconsistent with the documented role. |
 
 ## Acceptance criteria mapping
@@ -141,3 +208,7 @@ No behavioral changes. The decision matrix, the skip-worthy classification, and 
 - Adding origin-based gating (framing #3) — complexity not justified
 - Removing any validation checks (framing #2) — safety regression
 - Changes to CI or CLI validation — already satisfied per mika-skills#162
+
+## Revision history
+
+- rev 2 (2026-05-30): addressed F1 by adding Phase 0 Pin 1 with exhaustive `grep -rn "validate_loaded" crates/` results — confirmed 4 non-test callsites (not 6), no hot-reload sites, 13 test functions, 3 doc-comment refs; updated Unit 2 and interaction graph to reflect pinned counts. Addressed F2 by adding Phase 0 Pin 2 with exhaustive doc cross-reference inventory (7 active files, 9 historical plan files excluded as immutable); expanded Unit 3 from 3 files to 7 with line-level citations. Per Phase 0 Pin pattern (core memory current_priorities) and review-guide.md § Orthogonality.
