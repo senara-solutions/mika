@@ -38,6 +38,7 @@ pub mod asserted_unavailability_caught;
 pub mod asserted_unavailability_elided_copula;
 pub mod asserted_unavailability_genuine;
 pub mod auto_merge_vs_merged;
+pub mod callback_state_claim_unverified;
 pub mod current_priorities_drift;
 pub mod dev_groom_dispatched_no_verdict;
 pub mod dev_groom_fabricated_verdict_caught;
