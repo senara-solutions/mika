@@ -296,6 +296,273 @@ pub(crate) fn extract_open_blocker_numbers(body: &serde_json::Value) -> Vec<u64>
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Phase label helpers (mika#1153)
+// ---------------------------------------------------------------------------
+
+/// Extract the phase number from a list of label names.
+///
+/// Looks for labels matching `phase:N` (1-indexed). Returns `None` if no
+/// phase label is found. Logs a warning and returns the first match if
+/// multiple phase labels are present.
+pub(crate) fn parse_phase_label(labels: &[String]) -> Option<u32> {
+    let mut found: Option<u32> = None;
+    for label in labels {
+        if let Some(n_str) = label.strip_prefix("phase:")
+            && let Ok(n) = n_str.parse::<u32>()
+        {
+            if n == 0 {
+                continue; // phases are 1-indexed
+            }
+            if let Some(first) = found {
+                tracing::warn!(
+                    first = first,
+                    duplicate = n,
+                    "issue has multiple phase labels, using first"
+                );
+                return found;
+            }
+            found = Some(n);
+        }
+    }
+    found
+}
+
+/// Lightweight representation of a milestone sub-issue from the GitHub REST API.
+#[derive(Debug, Clone)]
+pub(crate) struct MilestoneIssue {
+    pub number: u64,
+    pub state: String,
+    pub labels: Vec<String>,
+}
+
+/// Fetch all labels for a specific issue via GitHub REST API.
+///
+/// Returns a vector of label name strings. 10s timeout, Bearer auth.
+pub(crate) async fn fetch_issue_labels(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Vec<String>, String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/labels");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "mika-agent")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "token invalid or expired".to_string(),
+            403 => "token lacks required permissions".to_string(),
+            404 => "not found or not accessible".to_string(),
+            429 => "rate limit exceeded".to_string(),
+            _ => format!("HTTP {status}"),
+        };
+        return Err(format!("GitHub API error: {msg}"));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse labels response: {e}"))?;
+
+    let labels = body
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(labels)
+}
+
+/// Fetch issues in a milestone by state via GitHub REST API.
+///
+/// Returns all issues with their labels. Paginates up to 100 (single page).
+/// `state` should be "open", "closed", or "all".
+pub(crate) async fn fetch_milestone_issues_by_state(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    milestone_number: u64,
+    state: &str,
+) -> Result<Vec<MilestoneIssue>, String> {
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/issues?milestone={milestone_number}&state={state}&per_page=100"
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "mika-agent")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "token invalid or expired".to_string(),
+            403 => "token lacks required permissions".to_string(),
+            404 => "not found or not accessible".to_string(),
+            429 => "rate limit exceeded".to_string(),
+            _ => format!("HTTP {status}"),
+        };
+        return Err(format!("GitHub API error: {msg}"));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse milestone issues response: {e}"))?;
+
+    let issues = body
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|issue| {
+                    let number = issue.get("number")?.as_u64()?;
+                    let state = issue.get("state")?.as_str()?.to_string();
+                    let labels = issue
+                        .get("labels")
+                        .and_then(|l| l.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|l| {
+                                    l.get("name").and_then(|n| n.as_str()).map(String::from)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(MilestoneIssue {
+                        number,
+                        state,
+                        labels,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(issues)
+}
+
+/// Fetch the milestone number associated with a GitHub issue.
+///
+/// Makes a GET request to `/repos/{owner}/{repo}/issues/{number}` and extracts
+/// the `milestone.number` field. Returns `None` if the issue has no milestone.
+pub(crate) async fn fetch_issue_milestone_number(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    issue_number: u64,
+) -> Result<u64, String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "mika-agent")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "token invalid or expired".to_string(),
+            403 => "token lacks required permissions".to_string(),
+            404 => "not found or not accessible".to_string(),
+            429 => "rate limit exceeded".to_string(),
+            _ => format!("HTTP {status}"),
+        };
+        return Err(format!("GitHub API error: {msg}"));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse issue response: {e}"))?;
+
+    body.get("milestone")
+        .and_then(|m| m.get("number"))
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| "issue has no milestone".to_string())
+}
+
+/// Add a label to a GitHub issue via REST API.
+///
+/// POST /repos/{owner}/{repo}/issues/{number}/labels — idempotent (adding an
+/// existing label is a no-op). Returns `Ok(())` on success.
+pub(crate) async fn add_label_to_issue(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    label: &str,
+) -> Result<(), String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/labels");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let body = serde_json::json!({ "labels": [label] });
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "mika-agent")
+        .header("Accept", "application/vnd.github+json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("GitHub API request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "token invalid or expired".to_string(),
+            403 => "token lacks required permissions".to_string(),
+            404 => "not found or not accessible".to_string(),
+            410 => "issue is gone (transferred or deleted)".to_string(),
+            422 => "validation failed (label may not exist)".to_string(),
+            429 => "rate limit exceeded".to_string(),
+            _ => format!("HTTP {status}"),
+        };
+        return Err(format!("GitHub label API error for issue #{number}: {msg}"));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +710,53 @@ mod tests {
     fn test_extract_latest_verdict_empty_array() {
         let body = serde_json::json!([]);
         assert_eq!(extract_latest_verdict(&body), None);
+    }
+
+    // -- Phase label parsing (mika#1153) --
+
+    #[test]
+    fn test_parse_phase_label_found() {
+        let labels = vec![
+            "bug".to_string(),
+            "phase:2".to_string(),
+            "p1-important".to_string(),
+        ];
+        assert_eq!(parse_phase_label(&labels), Some(2));
+    }
+
+    #[test]
+    fn test_parse_phase_label_phase_one() {
+        let labels = vec!["phase:1".to_string()];
+        assert_eq!(parse_phase_label(&labels), Some(1));
+    }
+
+    #[test]
+    fn test_parse_phase_label_empty() {
+        let labels: Vec<String> = vec![];
+        assert_eq!(parse_phase_label(&labels), None);
+    }
+
+    #[test]
+    fn test_parse_phase_label_no_phase() {
+        let labels = vec!["enhancement".to_string(), "agent-core".to_string()];
+        assert_eq!(parse_phase_label(&labels), None);
+    }
+
+    #[test]
+    fn test_parse_phase_label_zero_rejected() {
+        let labels = vec!["phase:0".to_string()];
+        assert_eq!(parse_phase_label(&labels), None);
+    }
+
+    #[test]
+    fn test_parse_phase_label_non_numeric() {
+        let labels = vec!["phase:abc".to_string()];
+        assert_eq!(parse_phase_label(&labels), None);
+    }
+
+    #[test]
+    fn test_parse_phase_label_multiple_first_wins() {
+        let labels = vec!["phase:1".to_string(), "phase:2".to_string()];
+        assert_eq!(parse_phase_label(&labels), Some(1));
     }
 }
