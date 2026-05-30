@@ -1682,6 +1682,50 @@ async fn run_loop(
                         continue;
                     }
 
+                    // #1331 — Assert-grounded guard. Catches affirmative state
+                    // claims about referenced resources (issue/PR/task) without
+                    // a grounding tool call (run_gh, check_task, gh_read) in the
+                    // turn's tool-call trace. Single retry via
+                    // intent_guard_retries. Mirror of asserted_unavailability's
+                    // negative-claim detector.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(ASSERT_GROUNDED_LABEL)
+                        && let Some(claim) = detect_affirmative_state_claim(&text)
+                        && !assert_grounded_satisfied(&claim, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(ASSERT_GROUNDED_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            resource_type = claim.resource_type,
+                            resource_ref = %claim.resource_ref,
+                            claim = %claim.claim_text,
+                            intent_guard = ASSERT_GROUNDED_LABEL,
+                            "Assert-grounded guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[mika-engine] The previous response claimed state \
+                                 about {} {} without a grounding tool call this turn. \
+                                 Verifiable state claims require evidence: call \
+                                 `run_gh` (for issues/PRs) or `check_task` (for \
+                                 tasks) to verify the state, then report what the \
+                                 tool returned — or remove the unverified claim from \
+                                 your response.",
+                                claim.resource_type, claim.resource_ref,
+                            )),
+                        });
+                        continue;
+                    }
+
                     // #1313 — Dispatch-arg-fabrication guard. When a ready-label
                     // webhook fires for repo#N, the LLM must dispatch
                     // run_claude_pilot / run_claude_pilot_groom with
@@ -5877,6 +5921,154 @@ fn asserted_unavailability_satisfied(
     summaries: &[ToolCallSummary],
 ) -> bool {
     !enabled_tools.contains(tool_name) || summaries.iter().any(|s| s.name == tool_name)
+}
+
+// ---------------------------------------------------------------------------
+// #1331 — Assert-grounded guard (affirmative state-claim detection)
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the assert-grounded
+/// guard (#1331). Inline guard (not in `INTENT_GUARDS` const array) because it
+/// checks *assistant* text and needs `all_tool_summaries` + dynamic correction.
+const ASSERT_GROUNDED_LABEL: &str = "assert_grounded";
+
+/// Tools that ground a verifiable state claim about a resource.
+const GROUNDING_TOOLS: &[&str] = &["run_gh", "check_task", "gh_read"];
+
+/// Structured result from affirmative state-claim detection.
+struct AffirmativeStateClaim {
+    resource_type: &'static str,
+    resource_ref: String,
+    claim_text: String,
+}
+
+/// Four regex patterns detecting affirmative state claims about resources.
+/// Mirror of `ASSERTED_UNAVAILABILITY_PATTERNS` for affirmative (not negative) claims.
+static AFFIRMATIVE_STATE_CLAIM_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        vec![
+            // Pattern 1: "I checked/confirmed/verified/reviewed/inspected/looked at the issue/PR #N"
+            regex::Regex::new(
+                r"(?i)\bI (?:checked|confirmed|verified|reviewed|inspected|looked at) (?:the )?(?P<rtype>issue|PR|pull request|task|ticket) #(?P<ref>\d+)",
+            )
+            .expect("assert_grounded pattern 1"),
+            // Pattern 2: "I checked/confirmed/verified/reviewed the issue/PR and it's <state>"
+            // Requires resource-type noun but may lack #N — caller extracts ref from vicinity.
+            regex::Regex::new(
+                r"(?i)\bI (?:checked|confirmed|verified|reviewed|inspected|looked at) (?:the )?(?P<rtype>issue|PR|pull request|task|ticket) and (?:it's|it is|they're|they are) (?P<state>\w+)",
+            )
+            .expect("assert_grounded pattern 2"),
+            // Pattern 3: "issue/PR #N is/was/has been <state>"
+            regex::Regex::new(
+                r"(?i)\b(?P<rtype>issue|PR|pull request|task|ticket) #(?P<ref>\d+) (?:is|was|has been) (?:groomed|merged|closed|completed|ready|approved|reviewed|open|blocked)",
+            )
+            .expect("assert_grounded pattern 3"),
+            // Pattern 4: "the handler/callback/subprocess/dispatch (already) closed/completed/... the issue/PR/task"
+            regex::Regex::new(
+                r"(?i)\b(?:the handler|the callback|the subprocess|the dispatch) (?:already )?(?:closed|completed|merged|finished|resolved) (?:the )?(?P<rtype>issue|PR|pull request|task|ticket)",
+            )
+            .expect("assert_grounded pattern 4"),
+        ]
+    });
+
+/// Regex for extracting a GitHub issue/PR number from nearby text.
+static RESOURCE_REF_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"#(\d+)").expect("resource_ref pattern"));
+
+/// UUID pattern for task references.
+static TASK_UUID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+        .expect("task_uuid pattern")
+});
+
+/// Detects affirmative state claims about referenced resources in assistant text.
+///
+/// Scans for one of four high-precision claim patterns. If a pattern matches,
+/// attempts to extract the resource reference (`#N` for issues/PRs, UUID for tasks).
+/// Returns `None` when no pattern matches OR when a pattern matches but no resource
+/// reference can be extracted (lean-narrow fail-open per D2/OQ1).
+fn detect_affirmative_state_claim(text: &str) -> Option<AffirmativeStateClaim> {
+    for (idx, re) in AFFIRMATIVE_STATE_CLAIM_PATTERNS.iter().enumerate() {
+        if let Some(caps) = re.captures(text) {
+            let matched_text = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            let resource_type = match caps.name("rtype") {
+                Some(m) => {
+                    let rt = m.as_str().to_ascii_lowercase();
+                    match rt.as_str() {
+                        "pr" | "pull request" => "PR",
+                        "issue" => "issue",
+                        "task" => "task",
+                        "ticket" => "ticket",
+                        _ => "issue",
+                    }
+                }
+                None => continue,
+            };
+
+            // Try to extract resource ref from named capture group first
+            if let Some(ref_match) = caps.name("ref") {
+                return Some(AffirmativeStateClaim {
+                    resource_type,
+                    resource_ref: format!("#{}", ref_match.as_str()),
+                    claim_text: matched_text.to_string(),
+                });
+            }
+
+            // For patterns without inline #N (Pattern 2, Pattern 4):
+            // search the surrounding text for a resource reference.
+            let match_start = caps.get(0).map(|m| m.start()).unwrap_or(0);
+            let search_start = match_start.saturating_sub(100);
+            let search_end = (match_start + 200).min(text.len());
+            let vicinity = &text[search_start..search_end];
+
+            // For task-type claims, try UUID first
+            if resource_type == "task"
+                && let Some(uuid_match) = TASK_UUID_RE.find(vicinity)
+            {
+                return Some(AffirmativeStateClaim {
+                    resource_type,
+                    resource_ref: uuid_match.as_str().to_string(),
+                    claim_text: matched_text.to_string(),
+                });
+            }
+
+            // Try #N extraction from vicinity
+            if let Some(ref_caps) = RESOURCE_REF_RE.captures(vicinity)
+                && let Some(num) = ref_caps.get(1)
+            {
+                return Some(AffirmativeStateClaim {
+                    resource_type,
+                    resource_ref: format!("#{}", num.as_str()),
+                    claim_text: matched_text.to_string(),
+                });
+            }
+
+            // Pattern matched but no resource ref extractable → fail-open (D2 lean-narrow)
+            // Log for observability but don't fire the guard.
+            debug!(
+                pattern = idx + 1,
+                matched = matched_text,
+                "assert_grounded: pattern matched but no resource ref extractable — skipping"
+            );
+        }
+    }
+    None
+}
+
+/// Returns `true` when the assert-grounded guard should NOT fire
+/// (i.e., a grounding tool call for the claimed resource exists in the turn).
+///
+/// Accepts any call attempt (success or failure) matching the resource ref,
+/// same as `asserted_unavailability_satisfied`. The purpose is to force an
+/// attempt — a failed `run_gh` means the agent tried to verify (real failure
+/// is a signal, not fabrication).
+fn assert_grounded_satisfied(claim: &AffirmativeStateClaim, summaries: &[ToolCallSummary]) -> bool {
+    // Extract the bare number from "#500" → "500" for matching against input_summary
+    let bare_ref = claim.resource_ref.trim_start_matches('#');
+
+    summaries
+        .iter()
+        .any(|s| GROUNDING_TOOLS.contains(&s.name.as_str()) && s.input_summary.contains(bare_ref))
 }
 
 #[cfg(test)]
@@ -10171,6 +10363,299 @@ mod tests {
             None,
             "Natural language 'service not available' (elided copula) must still be \
              filtered by the enabled-set lookup — 'service' is not a tool"
+        );
+    }
+
+    // -- #1331 assert-grounded detection tests --
+
+    #[test]
+    fn test_detect_affirmative_state_claim_pattern_1_issue() {
+        let result = detect_affirmative_state_claim("I checked the issue #500 and it's groomed");
+        let claim = result.expect("Pattern 1 should match");
+        assert_eq!(claim.resource_type, "issue");
+        assert_eq!(claim.resource_ref, "#500");
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_pattern_1_pr() {
+        let result = detect_affirmative_state_claim("I reviewed PR #123 — no issues found");
+        let claim = result.expect("Pattern 1 should match PR");
+        assert_eq!(claim.resource_type, "PR");
+        assert_eq!(claim.resource_ref, "#123");
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_pattern_2_with_nearby_ref() {
+        // Pattern 2 matches the claim shape; the #456 is nearby in text
+        let result =
+            detect_affirmative_state_claim("Looking at #456, I confirmed the PR and it's merged");
+        let claim = result.expect("Pattern 2 should match with nearby ref");
+        assert_eq!(claim.resource_type, "PR");
+        assert_eq!(claim.resource_ref, "#456");
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_pattern_3_issue() {
+        let result = detect_affirmative_state_claim("Issue #500 is groomed and ready for dispatch");
+        let claim = result.expect("Pattern 3 should match");
+        assert_eq!(claim.resource_type, "issue");
+        assert_eq!(claim.resource_ref, "#500");
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_pattern_3_passive_pr() {
+        let result = detect_affirmative_state_claim("PR #123 has been merged");
+        let claim = result.expect("Pattern 3 should match passive PR");
+        assert_eq!(claim.resource_type, "PR");
+        assert_eq!(claim.resource_ref, "#123");
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_pattern_4_with_task_uuid() {
+        let result = detect_affirmative_state_claim(
+            "For task a1b2c3d4-e5f6-7890-abcd-ef1234567890, \
+             the handler already closed the task",
+        );
+        let claim = result.expect("Pattern 4 should match with task UUID");
+        assert_eq!(claim.resource_type, "task");
+        assert_eq!(claim.resource_ref, "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_no_match_casual_reference() {
+        assert!(
+            detect_affirmative_state_claim("This relates to the #500 groom we did").is_none(),
+            "Casual reference should not match"
+        );
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_no_match_discussion() {
+        assert!(
+            detect_affirmative_state_claim("See #500 for details on the approach").is_none(),
+            "Discussion reference should not match"
+        );
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_no_match_question() {
+        assert!(
+            detect_affirmative_state_claim("Is issue #500 groomed yet?").is_none(),
+            "Question should not match"
+        );
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_no_match_negation() {
+        assert!(
+            detect_affirmative_state_claim("I haven't checked issue #500 yet").is_none(),
+            "Negation should not match"
+        );
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_pattern_2_no_resource_ref() {
+        // Pattern 2 matches text shape but no #N or UUID in vicinity → None
+        assert!(
+            detect_affirmative_state_claim("I confirmed the PR and it's merged").is_none(),
+            "Pattern 2 without resource ref should return None (lean-narrow fail-open)"
+        );
+    }
+
+    #[test]
+    fn test_detect_affirmative_state_claim_pattern_4_no_resource_ref() {
+        // Pattern 4 matches text shape but no task UUID or #N nearby → None
+        assert!(
+            detect_affirmative_state_claim("The handler already closed the task").is_none(),
+            "Pattern 4 without resource ref should return None (lean-narrow fail-open)"
+        );
+    }
+
+    // -- #1331 assert-grounded satisfaction predicate tests --
+
+    #[test]
+    fn test_assert_grounded_satisfied_run_gh_matching_ref() {
+        let claim = AffirmativeStateClaim {
+            resource_type: "issue",
+            resource_ref: "#500".to_string(),
+            claim_text: "I checked issue #500".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: "gh issue view 500 --json state".to_string(),
+            output_summary: "open".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(
+            assert_grounded_satisfied(&claim, &summaries),
+            "run_gh with matching ref and success=true should satisfy"
+        );
+    }
+
+    #[test]
+    fn test_assert_grounded_not_satisfied_different_ref() {
+        let claim = AffirmativeStateClaim {
+            resource_type: "issue",
+            resource_ref: "#500".to_string(),
+            claim_text: "I checked issue #500".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: "gh issue view 123 --json state".to_string(),
+            output_summary: "open".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(
+            !assert_grounded_satisfied(&claim, &summaries),
+            "run_gh with different ref should NOT satisfy"
+        );
+    }
+
+    #[test]
+    fn test_assert_grounded_satisfied_failed_run_gh() {
+        // A failed run_gh still shows the agent attempted verification —
+        // real failure is a signal, not fabrication (matches
+        // asserted_unavailability's accept-any-attempt pattern).
+        let claim = AffirmativeStateClaim {
+            resource_type: "PR",
+            resource_ref: "#500".to_string(),
+            claim_text: "PR #500 is merged".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: "gh pr view 500".to_string(),
+            output_summary: "Error: auth failed".to_string(),
+            success: false,
+            non_zero_exit: false,
+        }];
+        assert!(
+            assert_grounded_satisfied(&claim, &summaries),
+            "run_gh attempt with matching ref should satisfy (even on failure)"
+        );
+    }
+
+    #[test]
+    fn test_assert_grounded_satisfied_check_task() {
+        let claim = AffirmativeStateClaim {
+            resource_type: "task",
+            resource_ref: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
+            claim_text: "the handler already closed the task".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "check_task".to_string(),
+            input_summary: "task_id: a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
+            output_summary: "completed".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(
+            assert_grounded_satisfied(&claim, &summaries),
+            "check_task with matching task ref should satisfy"
+        );
+    }
+
+    #[test]
+    fn test_assert_grounded_satisfied_gh_read() {
+        let claim = AffirmativeStateClaim {
+            resource_type: "issue",
+            resource_ref: "#500".to_string(),
+            claim_text: "Issue #500 is groomed".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "gh_read".to_string(),
+            input_summary: "op: issue_view, target: 500".to_string(),
+            output_summary: "Issue #500: groomed".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(
+            assert_grounded_satisfied(&claim, &summaries),
+            "gh_read with matching ref should satisfy"
+        );
+    }
+
+    #[test]
+    fn test_assert_grounded_not_satisfied_empty_summaries() {
+        let claim = AffirmativeStateClaim {
+            resource_type: "issue",
+            resource_ref: "#500".to_string(),
+            claim_text: "Issue #500 is groomed".to_string(),
+        };
+        assert!(
+            !assert_grounded_satisfied(&claim, &[]),
+            "Empty summaries should NOT satisfy"
+        );
+    }
+
+    #[test]
+    fn test_assert_grounded_not_satisfied_unrelated_tools() {
+        let claim = AffirmativeStateClaim {
+            resource_type: "issue",
+            resource_ref: "#500".to_string(),
+            claim_text: "I checked issue #500".to_string(),
+        };
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "search_memory".to_string(),
+                input_summary: "query: issue 500".to_string(),
+                output_summary: "found 2 results".to_string(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 1,
+                name: "store_fact".to_string(),
+                input_summary: "category: issues".to_string(),
+                output_summary: "stored".to_string(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(
+            !assert_grounded_satisfied(&claim, &summaries),
+            "Non-grounding tools should NOT satisfy"
+        );
+    }
+
+    #[test]
+    fn test_assert_grounded_satisfied_grounding_call_after_claim_text() {
+        // Confirms same-turn ordering irrelevance (D3/Step 2)
+        let claim = AffirmativeStateClaim {
+            resource_type: "PR",
+            resource_ref: "#500".to_string(),
+            claim_text: "PR #500 looks good".to_string(),
+        };
+        // Summaries are accumulated over the full turn; a grounding call
+        // appended after the claim text still satisfies the predicate.
+        let summaries = vec![
+            ToolCallSummary {
+                step: 0,
+                name: "search_memory".to_string(),
+                input_summary: "query: something".to_string(),
+                output_summary: "results".to_string(),
+                success: true,
+                non_zero_exit: false,
+            },
+            ToolCallSummary {
+                step: 2,
+                name: "run_gh".to_string(),
+                input_summary: "gh pr view 500 --json state".to_string(),
+                output_summary: "merged".to_string(),
+                success: true,
+                non_zero_exit: false,
+            },
+        ];
+        assert!(
+            assert_grounded_satisfied(&claim, &summaries),
+            "Grounding call at any step in the turn should satisfy"
         );
     }
 
