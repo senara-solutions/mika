@@ -139,16 +139,6 @@ pub async fn handle_message(
         }
     };
 
-    // Structural pre-classifier (#935): if this is a PilotEvent carrying an
-    // intra-platform agent dispatch (mika ask --agent <known-peer>), return
-    // the allow action immediately without invoking the LLM. Defense-in-depth
-    // for the claude-pilot tier1 fast-path.
-    if let Some(action) =
-        super::permission_pre_classifier::pre_classify_pilot_event(&req.text, &req.agent)
-    {
-        return (StatusCode::OK, Json(action.to_json_value())).into_response();
-    }
-
     // Webhook deferral check (#528): if this is a GitHub webhook targeting a task
     // with an in-flight callback, queue it instead of processing immediately.
     if req.channel == "github"

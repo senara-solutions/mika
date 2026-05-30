@@ -200,7 +200,7 @@ pub async fn run(
         }
 
         // Correlation-only path: validate task exists, emit deprecation warning if needed.
-        // Uses unscoped lookup because the caller (e.g., mika-relay) may not own the task.
+        // Uses unscoped lookup because the caller may not own the task.
         // See Database::get_task_unscoped for the ownership-vs-correlation distinction.
         match ctx.async_db.get_task_unscoped(tid).await {
             Ok(Some(task)) => {
@@ -227,35 +227,6 @@ pub async fn run(
             }
         }
         // Fall through to normal agent loop with task_id in session metadata + trace
-    }
-
-    // Structural pre-classifier (#935): if this is mika-relay processing a PilotEvent
-    // with an intra-platform agent dispatch, short-circuit with the allow action.
-    // This bypasses the full agent loop (skill loading, LLM call, etc.) for known
-    // platform peer dispatch.
-    if let Some(action) = mika_agent::server::permission_pre_classifier::pre_classify_pilot_event(
-        &user_message,
-        agent_name,
-    ) {
-        let response_text = action.to_json_string();
-        match format {
-            OutputFormat::Text => println!("{response_text}"),
-            OutputFormat::Json => {
-                let response = AskJsonResponse {
-                    role: "assistant",
-                    content: Some(response_text),
-                    task_id: task_id.map(|s| s.to_string()),
-                    pending_tasks: vec![],
-                    metadata: None,
-                };
-                println!("{}", serde_json::to_string(&response)?);
-            }
-        }
-        // End the session
-        if let Err(e) = ctx.async_db.end_session(&session_id).await {
-            tracing::warn!(error = %e, "failed to end session");
-        }
-        return Ok(());
     }
 
     // Prepend task context if --parent-task-id is provided

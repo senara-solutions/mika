@@ -236,8 +236,8 @@ pub fn is_bundled_skill(name: &str) -> bool {
 /// Returns the names of all bundled skills (both legacy hardcoded and
 /// directory-sourced), deduplicated with ENTRIES-wins semantics.
 ///
-/// Used by well-known agent tests to verify that mika-relay's `disabled_skills`
-/// list stays in sync with the full bundled skill set.
+/// Used by well-known agent tests to verify that agent skill allowlists
+/// reference only bundled skills that actually exist.
 pub fn all_bundled_skill_names() -> Vec<&'static str> {
     all_bundled_skills().iter().map(|s| s.name).collect()
 }
