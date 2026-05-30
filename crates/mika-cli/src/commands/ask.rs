@@ -200,7 +200,7 @@ pub async fn run(
         }
 
         // Correlation-only path: validate task exists, emit deprecation warning if needed.
-        // Uses unscoped lookup because the caller (e.g., mika-relay) may not own the task.
+        // Uses unscoped lookup because the caller may not own the task.
         // See Database::get_task_unscoped for the ownership-vs-correlation distinction.
         match ctx.async_db.get_task_unscoped(tid).await {
             Ok(Some(task)) => {

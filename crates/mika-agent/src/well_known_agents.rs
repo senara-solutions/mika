@@ -720,7 +720,7 @@ pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disable
 /// well-known agents that moved to identity-driven `[skills].allowlist`
 /// (mika#815, D2 cross-cutting).
 ///
-/// Scope: `agent_id IN ('mika-dev', 'mika-qa', 'mika-relay')` with
+/// Scope: `agent_id IN ('mika-dev', 'mika-qa')` with
 /// `enabled = 0` (denylist-seeded rows only). Operator-set LLM overrides
 /// (`enabled IS NULL`, `llm_provider`/`llm_model` non-NULL) are preserved.
 /// User-defined agents are untouched.
@@ -755,7 +755,7 @@ pub fn migrate_well_known_to_identity_allowlist(db: &mut Database) {
         }
     };
 
-    let agents = ["mika-dev", "mika-qa", "mika-relay"];
+    let agents = ["mika-dev", "mika-qa"];
     let mut total_deleted = 0u32;
     for agent_id in &agents {
         let deleted: usize = match tx.execute(
@@ -819,7 +819,7 @@ pub fn migrate_well_known_to_identity_allowlist(db: &mut Database) {
 ///
 /// **Fast-path exit:** agents with empty `disabled_skills` AND empty
 /// `llm_overrides` return immediately — nothing to seed or reconcile.
-/// Post-#815, this applies to mika-dev, mika-qa, and mika-relay (all
+/// Post-#815, this applies to mika-dev and mika-qa (both
 /// use identity allowlist). mika-arch still enters for LLM override
 /// reconciliation.
 ///
