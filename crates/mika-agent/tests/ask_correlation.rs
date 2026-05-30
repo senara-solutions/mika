@@ -1,6 +1,6 @@
 //! Regression tests for the `mika ask --task-id` correlation path (#752).
 //!
-//! The relay agent (`mika-relay`) issues `mika ask --task-id <uuid>` for tasks
+//! A caller issues `mika ask --task-id <uuid>` for tasks
 //! owned by a different agent (e.g. `mika-dev`). The correlation branch must
 //! use `get_task_unscoped` so the lookup succeeds across agent boundaries.
 //! The contrast test proves an agent-scoped lookup on the same task returns

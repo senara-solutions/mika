@@ -25,7 +25,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 39;
+pub const CURRENT_SCHEMA_VERSION: i64 = 40;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1163,6 +1163,11 @@ impl Database {
             info!(version = 39, "database migrated to v39");
         }
 
+        if (3..=39).contains(&version) {
+            self.migrate_v39_to_v40()?;
+            info!(version = 40, "database migrated to v40");
+        }
+
         Ok(())
     }
 
@@ -1217,7 +1222,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (39);
+            INSERT INTO schema_version (version) VALUES (40);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -4239,6 +4244,60 @@ impl Database {
         tx.commit()?;
 
         info!("v38→v39: added operational_items table (mika#1262)");
+
+        Ok(())
+    }
+
+    /// v39→v40: Delete all mika-relay agent data (mika#1193).
+    ///
+    /// Self-contained: explicit deletes in reverse-dependency order. Correctness
+    /// does NOT depend on PRAGMA foreign_keys being ON.
+    fn migrate_v39_to_v40(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 40 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Delete in reverse-dependency order: descendants before ancestors.
+        // Each statement is idempotent (no-op if rows are already gone).
+        tx.execute_batch(
+            "-- v40: mika#1193 retire mika-relay agent.
+            DELETE FROM tool_calls
+              WHERE session_id IN (SELECT id FROM sessions WHERE agent_id = 'mika-relay');
+
+            DELETE FROM llm_calls
+              WHERE session_id IN (SELECT id FROM sessions WHERE agent_id = 'mika-relay');
+
+            DELETE FROM messages
+              WHERE session_id IN (SELECT id FROM sessions WHERE agent_id = 'mika-relay');
+
+            DELETE FROM skill_overrides
+              WHERE agent_id = 'mika-relay';
+
+            DELETE FROM audit_events
+              WHERE session_id IN (SELECT id FROM sessions WHERE agent_id = 'mika-relay');
+
+            DELETE FROM operational_items
+              WHERE agent_id = 'mika-relay';
+
+            DELETE FROM tasks
+              WHERE agent_id = 'mika-relay';
+
+            DELETE FROM sessions
+              WHERE agent_id = 'mika-relay';
+
+            DELETE FROM agents
+              WHERE id = 'mika-relay';",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (40)", [])?;
+        tx.commit()?;
+
+        info!("v39→v40: deleted mika-relay agent data (mika#1193)");
 
         Ok(())
     }
@@ -15563,6 +15622,7 @@ mod tests {
         db2.migrate_v36_to_v37().unwrap();
         db2.migrate_v37_to_v38().unwrap();
         db2.migrate_v38_to_v39().unwrap();
+        db2.migrate_v39_to_v40().unwrap();
 
         let final_version: i64 = db2
             .conn

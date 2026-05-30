@@ -1,5 +1,0 @@
-{
-  "command": "mika",
-  "args": ["--agent", "mika-relay", "ask"],
-  "timeout": 120000
-}
