@@ -104,11 +104,27 @@ pub fn build_callback_trigger_context(
     failed: bool,
 ) -> String {
     let base = format_callback_framing(label, task_id, parent_task_id, result, failed);
+
+    // #716: When the callback reports failure, add a mandatory verification
+    // instruction. The LLM rationalizes error signals into fabricated state
+    // claims ("no PR", "manually closed") — this prompt reinforcement is
+    // defense-in-depth alongside guard 4c.
+    let failure_verification = if failed {
+        "\n\nIMPORTANT: This callback reported a FAILURE. Before describing what \
+         happened, you MUST call run_gh to verify the actual state of the referenced \
+         issue and any associated PRs. Do not claim 'no PR', 'manually closed', \
+         'handler crashed', or any other downstream state without tool verification. \
+         The callback error may not reflect the actual outcome — work may have \
+         succeeded despite the handler error.\n"
+    } else {
+        ""
+    };
+
     format!(
         "{base}\n\
          IMPORTANT: A successful result confirms only the specific action performed. \
          NEVER extrapolate to downstream states (PR status, CI health, deploy readiness) \
-         that the result does not explicitly mention.\n\n\
+         that the result does not explicitly mention.{failure_verification}\n\n\
          Follow the workflow defined by your active skills for this callback type. \
          If no skill-specific workflow applies, use send_message to notify the user \
          with a clear, concise summary of the key findings and any recommended actions.\n\n\
@@ -847,6 +863,10 @@ async fn run_loop(
     // Whether we already injected a fabricated-action correction. Only allow one retry.
     // Guards against fabricated action claims with URLs but zero tool calls (#308).
     let mut fabricated_action_retry_done = false;
+    // Whether we already injected a callback state-claim correction. Only allow one retry.
+    // Guards against fabricated downstream state claims (PR status, issue close reason)
+    // on callback turns without verification via run_gh or check_task. See #716.
+    let mut callback_state_claim_retry_done = false;
     // Whether we already injected a dev-groom fabrication correction. Only allow one retry.
     // Guards against "Verdict: GROOMED/ESCALATE" in conversation-mode text without a
     // successful run_claude_pilot_groom call in the turn. dev-groom is a dispatcher —
@@ -1402,6 +1422,52 @@ async fn run_loop(
                             label = mode.label(),
                             "Milestone close claim guard already fired this turn — accepting EndTurn with second violation (budget exhausted)"
                         );
+                    }
+
+                    // #716 — Callback error state-claim guard (position 4c).
+                    // Detects when a callback-turn response claims downstream GitHub
+                    // state (PR status, issue close reason) without calling run_gh or
+                    // check_task to verify. The LLM rationalizes error signals into
+                    // fabricated narratives; this guard forces verification.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !callback_state_claim_retry_done
+                        && tool_ctx.is_callback_turn
+                        && let Some(claim) = detect_unverified_callback_state_claim(&text)
+                    {
+                        let has_verification = tools_called.contains("run_gh")
+                            || tools_called.contains("check_task")
+                            || tools_called.contains("gh_read");
+
+                        if !has_verification {
+                            callback_state_claim_retry_done = true;
+                            warn!(
+                                step,
+                                claim,
+                                label = mode.label(),
+                                "Callback state claim detected without verification tool — re-prompting"
+                            );
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::Assistant,
+                                content: LlmContent::Blocks(
+                                    mika_common::llm::response_content_to_blocks(&response.content),
+                                ),
+                            });
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::User,
+                                content: LlmContent::Text(format!(
+                                    "[mika-engine] The previous response claimed \"{claim}\" \
+                                     on a callback turn without calling run_gh or check_task \
+                                     to verify. Callback errors do not reliably reflect \
+                                     actual outcomes — the work may have succeeded despite \
+                                     the handler error. Before describing what happened, \
+                                     call run_gh to verify the actual state of the issue \
+                                     and any associated PRs. Then describe the VERIFIED \
+                                     state.",
+                                )),
+                            });
+                            continue;
+                        }
                     }
 
                     // Fabricated action-claim guard: if the agent claims to have
@@ -5229,6 +5295,43 @@ fn detect_fabricated_action_claim(text: &str) -> Option<(&str, &str)> {
     let url_match = GITHUB_RESOURCE_URL_RE.find(text)?;
     let verb_match = ACTION_CLAIM_RE.find(text)?;
     Some((verb_match.as_str(), url_match.as_str()))
+}
+
+/// Regex matching callback-turn state claims about downstream GitHub state
+/// (PR status, issue close reason, branch existence) that are commonly
+/// fabricated when the LLM rationalizes callback error signals. See #716.
+static CALLBACK_STATE_CLAIM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+        r"(?i)\b(no\s+PR|without\s+PR|manually\s+closed|closed\s+without|no\s+commits?|handler\s+crashed|no\s+branch)\b",
+    )
+    .expect("callback state claim regex must compile")
+    },
+);
+
+/// Detects when callback-turn assistant text claims downstream GitHub state
+/// (PR status, issue close reason) without verification. Returns the matched
+/// claim fragment if found.
+///
+/// Only meaningful when checked against `tools_called` — the guard fires
+/// when this returns `Some` AND neither `run_gh` nor `check_task` was called.
+/// See #716.
+fn detect_unverified_callback_state_claim(text: &str) -> Option<&str> {
+    // Fast path: skip regex if no likely substrings present.
+    let lower = text.to_lowercase();
+    let has_candidate = lower.contains("no pr")
+        || lower.contains("without pr")
+        || lower.contains("manually closed")
+        || lower.contains("closed without")
+        || lower.contains("no commit")
+        || lower.contains("handler crashed")
+        || lower.contains("no branch");
+
+    if !has_candidate {
+        return None;
+    }
+
+    CALLBACK_STATE_CLAIM_RE.find(text).map(|m| m.as_str())
 }
 
 /// Tools that persist institutional knowledge. Used by the persistence
@@ -9126,6 +9229,71 @@ mod tests {
         let (verb, url) = result.unwrap();
         assert_eq!(verb, "posted");
         assert!(url.contains("#issuecomment-4146200192"));
+    }
+
+    // -- Callback state claim detection tests (#716) --
+
+    #[test]
+    fn test_detect_callback_claim_no_pr() {
+        let result = detect_unverified_callback_state_claim("There was no PR created");
+        assert!(result.is_some());
+        assert!(result.unwrap().to_lowercase().contains("no pr"));
+    }
+
+    #[test]
+    fn test_detect_callback_claim_without_pr() {
+        // "without PR" is standalone — fast path matches "without pr"
+        let result =
+            detect_unverified_callback_state_claim("The run ended without PR being created");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_callback_claim_manually_closed() {
+        let result = detect_unverified_callback_state_claim("Issue was manually closed by someone");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_callback_claim_handler_crashed() {
+        let result = detect_unverified_callback_state_claim("The handler crashed");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_callback_claim_no_commits() {
+        let result = detect_unverified_callback_state_claim("The branch had no commits on it.");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_callback_claim_no_branch() {
+        let result = detect_unverified_callback_state_claim("There is no branch for this work");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_callback_claim_closed_without() {
+        let result = detect_unverified_callback_state_claim("It was closed without any resolution");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_detect_callback_claim_no_match_normal_text() {
+        assert!(detect_unverified_callback_state_claim("Task completed successfully").is_none());
+    }
+
+    #[test]
+    fn test_detect_callback_claim_no_match_empty() {
+        assert!(detect_unverified_callback_state_claim("").is_none());
+    }
+
+    #[test]
+    fn test_detect_callback_claim_case_insensitive() {
+        assert!(detect_unverified_callback_state_claim("NO PR was found").is_some());
+        assert!(
+            detect_unverified_callback_state_claim("Handler Crashed during execution").is_some()
+        );
     }
 
     // -- Persistence evaluation guard detection tests (#648) --
