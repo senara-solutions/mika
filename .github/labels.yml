@@ -108,6 +108,39 @@
   color: "d97706"
   description: "Run make deploy after merge, before next ticket in milestone/sprint"
 
+# ── Phased Milestones (mika#1153) ───────────────────────────────────────────
+- name: "phase:1"
+  color: "c5def5"
+  description: "Phase 1 of phased milestone"
+
+- name: "phase:2"
+  color: "c5def5"
+  description: "Phase 2 of phased milestone"
+
+- name: "phase:3"
+  color: "c5def5"
+  description: "Phase 3 of phased milestone"
+
+- name: "phase:4"
+  color: "c5def5"
+  description: "Phase 4 of phased milestone"
+
+- name: "phase:5"
+  color: "c5def5"
+  description: "Phase 5 of phased milestone"
+
+- name: "phase:6"
+  color: "c5def5"
+  description: "Phase 6 of phased milestone"
+
+- name: "phase:7"
+  color: "c5def5"
+  description: "Phase 7 of phased milestone"
+
+- name: "phase:8"
+  color: "c5def5"
+  description: "Phase 8 of phased milestone"
+
 # ── Automation ───────────────────────────────────────────────────────────────
 - name: release
   color: "6e40c9"
