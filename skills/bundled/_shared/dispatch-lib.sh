@@ -482,6 +482,19 @@ ${RESULT}"
                         # staged and will be committed.
                         RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
 
+                        # Proactive formatting (mika#1336): the dominant rescue-failure class is
+                        # pilot-authored Rust that was never `cargo fmt`-ed, so the first commit
+                        # trips the lefthook rust-fmt gate. Formatting up front makes the first
+                        # commit succeed, halves wall-clock (one clippy compile, not two), and
+                        # removes reliance on parsing lefthook stdout to detect a fmt rejection.
+                        # The reactive rust-fmt retry below remains as belt-and-suspenders.
+                        # Gated on staged *.rs so docs-only / non-Rust pilots don't pay cargo startup.
+                        if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
+                            PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
+                            [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
+                            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' 2>&9
+                        fi
+
                         # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
                         # Use a worktree-local scratch file under .git/ to avoid coupling with
                         # .iterate/ (the iterate-loop artifact directory — review-guide.md § Orthogonality).
