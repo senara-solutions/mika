@@ -507,9 +507,18 @@ ${RESULT}"
                         fi
 
                         # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
-                        # Use a worktree-local scratch file under .git/ to avoid coupling with
-                        # .iterate/ (the iterate-loop artifact directory — review-guide.md § Orthogonality).
-                        RESCUE_COMMIT_ERR="$WORKTREE_DIR/.git/mika-rescue-commit-err"
+                        # mika#1341: scratch file MUST live outside the worktree tree, NOT under
+                        # "$WORKTREE_DIR/.git/". In a linked worktree (every autonomous dev-pilot run)
+                        # ".git" is a FILE (a `gitdir:` pointer), not a directory — so a redirect into
+                        # "$WORKTREE_DIR/.git/<name>" fails to OPEN (ENOTDIR). A failed output redirect
+                        # means `git commit` never runs and exits non-zero with no captured output,
+                        # producing the "non-rustfmt empty-capture" PIPELINE FAILURE with HEAD unchanged.
+                        # `mktemp` keeps the original intent (off the working tree, away from .iterate/)
+                        # while guaranteeing a real, writable path in both linked and non-linked checkouts.
+                        # Named template preserves the descriptive "mika-rescue-commit-err" scratch name.
+                        # NOTE: the literal token "mika-rescue-commit-err" is also a sed anchor in
+                        # test-dispatch-lib.sh (rescue-block extraction); renaming it breaks those tests.
+                        RESCUE_COMMIT_ERR="$(mktemp "${TMPDIR:-/tmp}/mika-rescue-commit-err.XXXXXX")"
 
                         # mika#1310: capture BOTH stdout and stderr. Lefthook
                         # pre-commit hooks print their summary + failure marks
