@@ -48,7 +48,9 @@ Note: unlike `asserted_unavailability` which accepts *any* call attempt (success
 
 ### D4: Guard chain position
 
-Position: immediately after `asserted_unavailability` (~line 1683), before `dispatch_arg_match` (#1313). Same `skip_remaining_guards` gate — skipped when `has_successful_pr_review()` is true (a turn that posted `gh pr review` completed its primary action; the review body itself is grounded evidence).
+Position: immediately after `asserted_unavailability`, before `dispatch_arg_match` (#1313). Same `skip_remaining_guards` gate — skipped when `has_successful_pr_review()` is true (a turn that posted `gh pr review` completed its primary action; the review body itself is grounded evidence).
+
+**Phase 0 Pin (required before implementation):** Run `grep -n "dispatch_arg_match\|asserted_unavailability\|ASSERT_GROUNDED" crates/mika-agent/src/agent.rs` to confirm the exact line range between the `asserted_unavailability` block end and the `dispatch_arg_match` block start. Verify no intervening guard logic exists that would affect guard-chain semantics. The insertion point is the blank line immediately after the `asserted_unavailability` block's closing `}` and before the next guard's `if !skip_remaining_guards` line. If intervening logic is found, adjust the insertion point to preserve existing guard ordering semantics (review-guide.md § Orthogonality — guard ordering is load-bearing).
 
 ### D5: Single-retry budget
 
@@ -87,12 +89,12 @@ Add:
 - `const ASSERT_GROUNDED_LABEL: &str = "assert_grounded";`
 - `static AFFIRMATIVE_STATE_CLAIM_PATTERNS: LazyLock<Vec<Regex>>` — four regex patterns from D2 above, each with named capture groups `(?P<resource_type>...)` and `(?P<resource_ref>...)` where applicable
 - `static RESOURCE_REF_RE: LazyLock<Regex>` — `#(\d+)` extractor for GitHub issue/PR numbers in the claim vicinity
-- `fn detect_affirmative_state_claim(text: &str) -> Option<AffirmativeStateClaim>` — scans text for patterns, extracts resource reference. Returns `None` on no match.
+- `fn detect_affirmative_state_claim(text: &str) -> Option<AffirmativeStateClaim>` — scans text for patterns, extracts resource reference. Returns `None` on no match. **Crucially, also returns `None` when a pattern matches but no `resource_ref` can be extracted** (e.g., Pattern 2 "I confirmed the PR and it's merged" without a `#N`). This is the lean-narrow design: no resource ref → no grounding check possible → no guard fire. Fail-open on absent resource ref is consistent with OQ1's "lean narrow — a small set of high-precision affirmative-claim patterns" resolution (review-guide.md § KISS).
 
 ```rust
 struct AffirmativeStateClaim {
     resource_type: &'static str,  // "issue", "PR", "task"
-    resource_ref: String,          // "#500", task UUID, or descriptive
+    resource_ref: String,          // "#500", task UUID — never empty (None returned instead)
     claim_text: String,            // the matched claim for logging
 }
 ```
@@ -117,6 +119,8 @@ Logic:
    - `check_task` where `input_summary` contains a task reference
    - `gh_read` where `input_summary` contains the resource reference number (mika-arch's read-only GitHub tool)
 3. Return `true` if found, `false` if not
+
+**Same-turn ordering is irrelevant.** `all_tool_summaries` is accumulated over the full turn before the EndTurn guard chain runs. A grounding call appearing after the claim text but before EndTurn in the same turn satisfies the predicate identically to a call before the claim text. This is by design — the guard checks presence, not sequence — and is consistent with `asserted_unavailability`'s accumulation model (review-guide.md § Single Responsibility).
 
 **Grounding tool set:** `const GROUNDING_TOOLS: &[&str] = &["run_gh", "check_task", "gh_read"];`
 
@@ -166,7 +170,7 @@ if !skip_remaining_guards
 }
 ```
 
-### Step 4: Unit tests for detection function (~120 lines)
+### Step 4: Unit tests for detection function (~140 lines)
 
 **File:** `crates/mika-agent/src/agent.rs` (in `mod tests`, near `test_detect_asserted_unavailability_*` at ~line 9927)
 
@@ -177,13 +181,15 @@ Tests:
 3. **Pattern 2 fires:** "I confirmed the PR and it's merged" → detects PR claim
 4. **Pattern 3 fires:** "Issue #500 is groomed and ready for dispatch" → detects issue #500
 5. **Pattern 3 fires (passive):** "PR #123 has been merged" → detects PR #123
-6. **Pattern 4 fires:** "The handler already closed the task" → detects task claim
+6. **Pattern 4 fires (with task UUID in context):** "The handler already closed the task abc-123-..." where a task UUID is extractable from the surrounding text → detects task claim with `resource_ref`
 7. **No match — casual reference:** "This relates to the #500 groom we did" → `None`
 8. **No match — discussion:** "See #500 for details on the approach" → `None`
 9. **No match — question:** "Is issue #500 groomed yet?" → `None`
 10. **No match — negation:** "I haven't checked issue #500 yet" → `None`
+11. **No match — Pattern 2 without resource ref:** "I confirmed the PR and it's merged" (no `#N` extractable) → `None` (F1: lean-narrow fail-open on absent resource ref)
+12. **No match — Pattern 4 without resource ref:** "The handler already closed the task" with no task UUID in context → `None` (F1: same fail-open behavior for Pattern 4)
 
-### Step 5: Unit tests for satisfaction predicate (~60 lines)
+### Step 5: Unit tests for satisfaction predicate (~70 lines)
 
 Tests:
 
@@ -194,6 +200,7 @@ Tests:
 5. **Satisfied — gh_read:** claim `#500`, summaries contain `gh_read` with `"500"` success → `true`
 6. **Not satisfied — empty summaries:** → `false`
 7. **Not satisfied — unrelated tools only:** summaries contain `search_memory`, `store_fact` → `false`
+8. **Satisfied — grounding call after claim text in same turn:** claim `#500`, summaries contain `run_gh` with `"500"` success=true appended AFTER the claim-text response in the same turn → `true` (F3: confirms same-turn ordering irrelevance)
 
 ### Step 6: Eval grounding regression scenarios (~150 lines)
 
@@ -240,7 +247,7 @@ Update the EndTurn guard chain documentation:
 | File | Change type | ~Lines |
 |------|------------|--------|
 | `crates/mika-agent/src/agent.rs` | Add detection fn, satisfaction fn, label const, regex patterns, inline guard wiring | ~150 |
-| `crates/mika-agent/src/agent.rs` (tests) | Unit tests for detection + satisfaction | ~180 |
+| `crates/mika-agent/src/agent.rs` (tests) | Unit tests for detection + satisfaction (12 detection + 8 satisfaction) | ~210 |
 | `crates/mika-agent/tests/eval/grounding_regressions/assert_grounded_pr_state_caught.rs` | New eval scenario | ~50 |
 | `crates/mika-agent/tests/eval/grounding_regressions/assert_grounded_pr_state_satisfied.rs` | New eval scenario | ~40 |
 | `crates/mika-agent/tests/eval/grounding_regressions/assert_grounded_false_positive_guard.rs` | New eval scenario | ~35 |
@@ -248,7 +255,7 @@ Update the EndTurn guard chain documentation:
 | `crates/mika-agent/tests/eval/grounding_regressions/mod.rs` | Register new scenarios | ~4 |
 | `crates/mika-agent/CLAUDE.md` | Document guard 6d, update counts | ~10 |
 | `CLAUDE.md` | Update guard count | ~2 |
-| **Total** | | **~521** |
+| **Total** | | **~551** |
 
 ## Risks and mitigations
 
@@ -258,6 +265,7 @@ Update the EndTurn guard chain documentation:
 | **Truncated input_summary misses resource ref** | `input_summary` is capped at 200 chars. For `run_gh` calls, the issue/PR number appears early in the args and will survive truncation. For `check_task`, the task UUID is the primary argument. Low risk. |
 | **Guard fires on honest pilot with grounded claim in a different turn** | By design — per-turn grounding is the contract. Cross-turn claims should reference the prior turn's result or re-verify. Single-retry budget means the pilot gets one correction opportunity. |
 | **Interaction with `skip_remaining_guards`** | Guard sits behind `!skip_remaining_guards` — skipped when PR review posted. Correct: a PR review submission IS grounding evidence. |
+| **Stale `callback_state_claim_unverified.rs`** | `callback_state_claim_unverified.rs` (from the retired #1322 regex brake approach) is removed by #716's implementation. If #1331 ships before #716, confirm the file is deleted or ignored — it is **not** a prior implementation of this guard. It uses a different detection strategy (retired regex brake) that was explicitly superseded by this state-based approach (review-guide.md § Single Responsibility; #1327/#1328 fabrication brake retirement). |
 
 ## Testing strategy
 
@@ -265,3 +273,7 @@ Update the EndTurn guard chain documentation:
 2. **Eval scenarios** (Step 6): Four grounding regression scenarios with frozen pre-fix fixtures. Run via `cargo test -p mika-agent --test eval -- grounding_regressions::assert_grounded`.
 3. **Full test suite**: `cargo test -p mika-agent` — verify no regressions in existing 35 grounding scenarios.
 4. **Clippy**: `cargo clippy -p mika-agent` — no new warnings.
+
+## Revision history
+
+- rev 2 (2026-05-29): addressed F1 by specifying explicit fail-open (return `None`) when Pattern 2/4 matches but no `resource_ref` is extractable — added unit tests 11-12 pinning this behavior; addressed F2 by adding Phase 0 Pin grep requirement to D4 with exact instructions for confirming the insertion point and verifying no intervening guard logic (review-guide.md § Orthogonality); addressed F3 by documenting same-turn ordering irrelevance in Step 2 and adding satisfaction predicate unit test 8 for grounding-call-after-claim ordering; addressed F4 by adding `callback_state_claim_unverified.rs` cross-reference to the Risks table noting it is a stale artifact from the retired #1322 regex brake, not a prior implementation of this guard.
