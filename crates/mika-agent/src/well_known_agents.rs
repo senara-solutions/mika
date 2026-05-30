@@ -142,7 +142,6 @@ allowlist = [\n\
   \"dev-groom\",\n\
   \"build-mika\",\n\
   \"deploy-mika\",\n\
-  \"permission-policy\",\n\
   \"agents-teams\",\n\
   \"address-pr-comments\",\n\
   \"resolve-pr-conflicts\",\n\
@@ -209,39 +208,6 @@ allowlist = [\n\
   \"github\",\n\
   \"mcp\",\n\
   \"browser-control\",\n\
-]\n";
-
-/// mika-relay agent specification.
-///
-/// Lightweight agent for handling claude-pilot (the binary) `can_use_tool`
-/// permission relay events. Only the `permission-policy` skill is enabled
-/// via identity-driven allowlist; all others are denied by default.
-/// Uses haiku for cheap, fast JSON classification.
-///
-/// Uses identity-driven `[skills].allowlist` (D2 cross-cutting, #815).
-/// mika-relay's 1-skill allowlist is the exemplar for restrictive agent
-/// scoping — new bundled skills are denied unless explicitly added.
-pub static MIKA_RELAY: WellKnownAgent = WellKnownAgent {
-    name: "mika-relay",
-    display_name: "Relay",
-    emoji: "🔑",
-    soul: MIKA_RELAY_SOUL,
-    // Empty: mika-relay uses identity allowlist, not denylist (#815).
-    disabled_skills: &[],
-    config_toml: Some(MIKA_RELAY_CONFIG),
-    identity_source: Some(IdentitySource::Static(MIKA_RELAY_IDENTITY)),
-    llm_overrides: &[],
-};
-
-/// mika-relay identity.toml — identity-driven allowlist per mika#815
-/// (D2 cross-cutting). Only `permission-policy` is enabled.
-const MIKA_RELAY_IDENTITY: &str = "\
-name = \"Relay\"\n\
-emoji = \"🔑\"\n\
-\n\
-[skills]\n\
-allowlist = [\n\
-  \"permission-policy\",\n\
 ]\n";
 
 /// mika-arch agent specification.
@@ -401,8 +367,7 @@ allowlist = ["mika-arch-groom-ticket", "mika-arch-groom-milestone", "mika-arch-s
 }
 
 /// All well-known agents.
-pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] =
-    &[&MIKA_DEV, &MIKA_TEST, &MIKA_QA, &MIKA_RELAY, &MIKA_ARCH];
+pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] = &[&MIKA_DEV, &MIKA_TEST, &MIKA_QA, &MIKA_ARCH];
 
 /// Identity-toml section paths that the reconciler owns from the static spec.
 ///
@@ -617,7 +582,7 @@ pub fn reconcile_well_known_identity(home_dir: &Path, spec: &WellKnownAgent, set
 
 /// Platform agents that can be dispatched via `mika ask --agent <peer>` without
 /// requiring LLM permission classification. These are intra-platform peers that
-/// claude-pilot and mika-relay should structurally allow.
+/// claude-pilot should structurally allow.
 ///
 /// # Sentinel — cross-language duplication (mika#935, architect F2)
 ///
@@ -1055,34 +1020,6 @@ verify implementations against requirements, and ensure code quality standards.
 - Flag security, performance, and maintainability concerns
 "#;
 
-const MIKA_RELAY_SOUL: &str = r#"# Mika Relay — Permission Relay Agent
-
-## Role
-You are Mika Relay, a permission relay agent. Your sole job is handling
-claude-pilot `can_use_tool` permission events — classifying tool calls
-into allow/deny/answer/escalate tiers and returning structured JSON.
-
-## Communication style
-- Respond only with structured JSON as specified by the permission-policy skill
-- Never engage in conversation or prose when handling `[claude-pilot]` events
-- Be fast and decisive — permission decisions should not require deliberation
-
-## Behaviors
-- Apply the permission-policy skill's tier classification strictly
-- When in doubt, escalate (Tier 3) rather than allow
-- Never initiate workflows, create tasks, or manage development lifecycle
-- You exist only to make permission decisions efficiently
-"#;
-
-const MIKA_RELAY_CONFIG: &str = r#"# Mika Relay — lightweight permission relay agent.
-# Uses haiku for cheap, fast JSON classification of permission events.
-
-llm_provider = "anthropic"
-anthropic_model = "claude-haiku-4-5-20251001"
-llm_max_tokens = 1024
-log_level = "info"
-"#;
-
 const MIKA_TEST_SOUL: &str = r#"# Mika Test — Minimal Test Agent
 
 ## Role
@@ -1195,11 +1132,6 @@ mod tests {
         );
         assert!(find_well_known_agent("mika-qa").is_some());
         assert_eq!(find_well_known_agent("mika-qa").unwrap().name, "mika-qa");
-        assert!(find_well_known_agent("mika-relay").is_some());
-        assert_eq!(
-            find_well_known_agent("mika-relay").unwrap().name,
-            "mika-relay"
-        );
     }
 
     #[test]
@@ -1242,7 +1174,6 @@ mod tests {
 
         assert!(mika_common::agent::agent_exists(home, "mika-dev"));
         assert!(mika_common::agent::agent_exists(home, "mika-qa"));
-        assert!(mika_common::agent::agent_exists(home, "mika-relay"));
         assert!(
             !mika_common::agent::agent_exists(home, "mika-arch"),
             "mika-arch must NOT be provisioned without absolute docs_roots"
@@ -1348,18 +1279,16 @@ mod tests {
         "qa-review-build-callback",
         // Skill management
         "skill-review",
-        // Permission policy executes side-effects
-        "permission-policy",
     ];
 
     /// Invariant: well-known agents that are **read-only** (declare both
     /// `[skills].allowlist` AND `[tools].disabled`) must not have any
     /// write-capable bundled skill in their active set.
     ///
-    /// Post-#815, all four well-known agents have `[skills].allowlist`, but
-    /// only mika-arch is read-only (has `[tools].disabled`). mika-dev,
-    /// mika-qa, and mika-relay are write-capable agents whose allowlists
-    /// legitimately include write-capable skills.
+    /// Post-#815, all well-known agents have `[skills].allowlist`, but
+    /// only mika-arch is read-only (has `[tools].disabled`). mika-dev
+    /// and mika-qa are write-capable agents whose allowlists legitimately
+    /// include write-capable skills.
     ///
     /// This protects against the silent-reorder regression flagged by the
     /// testing reviewer: if a future refactor reorders `apply_identity_allowlist`
@@ -1464,22 +1393,6 @@ mod tests {
             qa_identity.contains("\"qa-review\""),
             "mika-qa allowlist must include qa-review"
         );
-
-        let relay_identity = fs::read_to_string(
-            mika_common::agent::agent_dir(home, "mika-relay").join("identity.toml"),
-        )
-        .unwrap();
-        assert!(relay_identity.contains("name = \"Relay\""));
-        assert!(relay_identity.contains("emoji = \"🔑\""));
-        // #815: mika-relay must have identity-driven allowlist
-        assert!(
-            relay_identity.contains("[skills]"),
-            "mika-relay identity must contain [skills] section (#815)"
-        );
-        assert!(
-            relay_identity.contains("\"permission-policy\""),
-            "mika-relay allowlist must include permission-policy"
-        );
     }
 
     #[test]
@@ -1502,12 +1415,6 @@ mod tests {
         assert!(qa_soul.contains("Mika QA"));
         assert!(qa_soul.contains("Quality Assurance"));
 
-        let relay_soul =
-            fs::read_to_string(mika_common::agent::agent_dir(home, "mika-relay").join("soul.md"))
-                .unwrap();
-        assert!(relay_soul.contains("Mika Relay"));
-        assert!(relay_soul.contains("Permission Relay Agent"));
-
         let arch_soul =
             fs::read_to_string(mika_common::agent::agent_dir(home, "mika-arch").join("soul.md"))
                 .unwrap();
@@ -1518,28 +1425,6 @@ mod tests {
         assert!(arch_soul.contains("## Foundational references"));
         assert!(arch_soul.contains("docs/design/north-star.md"));
         assert!(arch_soul.contains("required-tools-gate-evasion-patterns-2026-04-28.md"));
-    }
-
-    #[test]
-    fn test_provision_relay_config_toml() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        fs::create_dir_all(home.join("agents")).unwrap();
-
-        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
-
-        let relay_config = fs::read_to_string(
-            mika_common::agent::agent_dir(home, "mika-relay").join("config.toml"),
-        )
-        .unwrap();
-        assert!(relay_config.contains("anthropic_model = \"claude-haiku-4-5-20251001\""));
-        assert!(relay_config.contains("llm_max_tokens = 1024"));
-
-        // mika-dev should have the default config.toml (not overwritten)
-        let dev_config =
-            fs::read_to_string(mika_common::agent::agent_dir(home, "mika-dev").join("config.toml"))
-                .unwrap();
-        assert!(!dev_config.contains("claude-haiku"));
     }
 
     #[test]
@@ -1629,24 +1514,6 @@ mod tests {
     }
 
     #[test]
-    fn test_seed_skill_overrides_fast_path_mika_relay() {
-        // Post-#815: mika-relay has empty disabled_skills and empty llm_overrides.
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let mut db = Database::open(&db_path).unwrap();
-        db.register_agent("mika-relay", "Relay", "/tmp/mika-relay")
-            .unwrap();
-
-        seed_well_known_skill_overrides(&mut db, "mika-relay");
-
-        let overrides = db.get_skill_overrides("mika-relay").unwrap();
-        assert!(
-            overrides.is_empty(),
-            "mika-relay should have zero skill_overrides rows (uses identity allowlist)"
-        );
-    }
-
-    #[test]
     fn test_all_well_known_agents_use_empty_disabled_skills() {
         // Post-#815: ALL four well-known agents use identity allowlist, not denylist.
         for spec in WELL_KNOWN_AGENTS {
@@ -1675,41 +1542,6 @@ mod tests {
         assert!(
             allowlist.contains(&"dev-groom".to_string()),
             "MIKA_DEV_IDENTITY allowlist must contain 'dev-groom' (mika#1173); got {allowlist:?}"
-        );
-    }
-
-    #[test]
-    fn test_relay_allowlist_contains_only_permission_policy() {
-        // Verify mika-relay's identity has exactly permission-policy in its allowlist.
-        let identity: crate::prompt::Identity =
-            toml::from_str(MIKA_RELAY_IDENTITY).expect("MIKA_RELAY_IDENTITY must be valid TOML");
-        let allowlist = identity
-            .skills
-            .allowlist
-            .expect("relay must have allowlist");
-        assert_eq!(
-            allowlist,
-            vec!["permission-policy"],
-            "mika-relay should only allow permission-policy"
-        );
-    }
-
-    #[test]
-    fn test_relay_config_toml_is_valid_toml() {
-        // Verify the config string is valid TOML and contains expected fields
-        let config: toml::Table =
-            toml::from_str(MIKA_RELAY_CONFIG).expect("MIKA_RELAY_CONFIG must be valid TOML");
-        assert_eq!(
-            config.get("llm_provider").and_then(|v| v.as_str()),
-            Some("anthropic")
-        );
-        assert_eq!(
-            config.get("anthropic_model").and_then(|v| v.as_str()),
-            Some("claude-haiku-4-5-20251001")
-        );
-        assert_eq!(
-            config.get("llm_max_tokens").and_then(|v| v.as_integer()),
-            Some(1024)
         );
     }
 
@@ -1748,7 +1580,6 @@ mod tests {
             "self-dev-webhook-ready-label",
             "dev-pilot",
             "dev-groom",
-            "permission-policy",
             "agents-teams",
             "address-pr-comments",
             "resolve-pr-conflicts",
@@ -1777,22 +1608,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_relay_allowlist_is_strict_subset_of_dev_and_qa() {
-        // mika-relay's 1-skill allowlist must be a subset of mika-dev's allowlist
-        // (permission-policy is in mika-dev but not mika-qa).
-        let dev_identity: crate::prompt::Identity = toml::from_str(MIKA_DEV_IDENTITY).unwrap();
-        let relay_identity: crate::prompt::Identity = toml::from_str(MIKA_RELAY_IDENTITY).unwrap();
-        let dev_allowlist = dev_identity.skills.allowlist.unwrap();
-        let relay_allowlist = relay_identity.skills.allowlist.unwrap();
-        for skill in &relay_allowlist {
-            assert!(
-                dev_allowlist.contains(skill),
-                "mika-relay allowlist skill '{skill}' must also be in mika-dev's allowlist"
-            );
-        }
-    }
-
     // -- D2 migration tests (#815) --
 
     #[test]
@@ -1803,20 +1618,14 @@ mod tests {
         db.register_agent("mika-dev", "Dev", "/tmp/mika-dev")
             .unwrap();
         db.register_agent("mika-qa", "QA", "/tmp/mika-qa").unwrap();
-        db.register_agent("mika-relay", "Relay", "/tmp/mika-relay")
-            .unwrap();
 
-        // Simulate pre-#815 state: denylist rows for all three agents
+        // Simulate pre-#815 state: denylist rows for both agents
         db.set_skill_enabled("mika-dev", "qa-review", false)
             .unwrap();
         db.set_skill_enabled("mika-dev", "skill-review", false)
             .unwrap();
         db.set_skill_enabled("mika-qa", "self-dev", false).unwrap();
         db.set_skill_enabled("mika-qa", "dev-pilot", false).unwrap();
-        db.set_skill_enabled("mika-relay", "self-dev", false)
-            .unwrap();
-        db.set_skill_enabled("mika-relay", "qa-review", false)
-            .unwrap();
 
         // Run migration
         migrate_well_known_to_identity_allowlist(&mut db);
@@ -1831,11 +1640,6 @@ mod tests {
         assert!(
             qa_overrides.is_empty(),
             "mika-qa should have no overrides after migration"
-        );
-        let relay_overrides = db.get_skill_overrides("mika-relay").unwrap();
-        assert!(
-            relay_overrides.is_empty(),
-            "mika-relay should have no overrides after migration"
         );
     }
 
@@ -1976,8 +1780,8 @@ mod tests {
             .expect("mika-dev must have allowlist");
         assert_eq!(
             allowlist.len(),
-            26,
-            "mika-dev allowlist should have 26 skills (dev-groom added mika#1173)"
+            25,
+            "mika-dev allowlist should have 25 skills (permission-policy retired mika#1193)"
         );
     }
 
@@ -1993,21 +1797,6 @@ mod tests {
             allowlist.len(),
             17,
             "mika-qa allowlist should have 17 skills"
-        );
-    }
-
-    #[test]
-    fn test_relay_identity_allowlist_count() {
-        let identity: crate::prompt::Identity = toml::from_str(MIKA_RELAY_IDENTITY)
-            .expect("MIKA_RELAY_IDENTITY must parse as Identity");
-        let allowlist = identity
-            .skills
-            .allowlist
-            .expect("mika-relay must have allowlist");
-        assert_eq!(
-            allowlist.len(),
-            1,
-            "mika-relay allowlist should have 1 skill"
         );
     }
 
