@@ -75,7 +75,7 @@ Three root causes converge:
 
 ## Implementation Units
 
-- [ ] **Unit 1: Propagate `_iterate_groom_loop` failure into RESULT**
+- [x] **Unit 1: Propagate `_iterate_groom_loop` failure into RESULT**
 
 **Goal:** When `_iterate_groom_loop` returns non-zero, append a PIPELINE FAILURE marker to RESULT so the outcome classification produces `PIPELINE_INCOMPLETE` instead of `PLAN_GROOMED`.
 
@@ -111,7 +111,7 @@ Option (b) is simpler and follows the existing pattern where PIPELINE FAILURE ma
 **Verification:**
 - After this unit, a groom dispatch where `_iterate_groom_loop` fails produces `Outcome: PIPELINE_INCOMPLETE` in the callback result, not `Outcome: PLAN_GROOMED`
 
-- [ ] **Unit 2: Downgrade HEAD-unchanged to informational for dev-groom with plan-on-branch**
+- [x] **Unit 2: Downgrade HEAD-unchanged to informational for dev-groom with plan-on-branch**
 
 **Goal:** When dev-groom re-dispatch finds HEAD unchanged but a valid plan already exists on branch, treat this as expected re-dispatch state (informational note) rather than PIPELINE FAILURE. The architect pass is what matters — Unit 1's `_iterate_groom_loop` propagation handles that.
 
@@ -144,7 +144,7 @@ Option (b) is preferred: the pattern is a one-liner, already used in three other
 **Verification:**
 - Re-dispatching a groom on a ticket with plan-on-branch but no architect verdict does not produce `PIPELINE FAILURE: HEAD unchanged` — it produces an informational note and proceeds to the architect pass
 
-- [ ] **Unit 3: Rename `PLAN_GROOMED` outcome to `PLAN_COMMITTED` for pre-architect state**
+- [x] **Unit 3: Rename `PLAN_GROOMED` outcome to `PLAN_COMMITTED` for pre-architect state**
 
 **Goal:** Make the outcome naming precise: `PLAN_COMMITTED` when plan exists but architect verdict is unknown; `PLAN_GROOMED` only after architect convergence. This satisfies R3 (precise audit reasoning) and eliminates the semantic confusion that caused mika-dev to interpret plan-committed as plan-groomed.
 
