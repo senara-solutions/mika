@@ -79,6 +79,10 @@ mod eval {
     // qa-review skill-scoped run_gh validator wiring test (mika#1196)
     mod test_qa_review_run_gh_scope_validator;
 
+    // Self-dev-callback engine consistency: documented callback-handler branches
+    // produce tool calls the engine accepts or defers (mika#806).
+    mod test_self_dev_callback_engine_consistency;
+
     // Multi-agent corpus parity: regression guard for #1155 search_content gap
     mod kg_multi_agent_corpus_parity;
 }
