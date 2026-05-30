@@ -204,8 +204,9 @@ assert_contains "Uses docs/plans/ prefix in pattern" 'docs/plans/' "$PLAN_FUNC"
 # Verify it validates file existence ([ -f or test -f)
 assert_contains "Validates plan file exists before overriding" '[ -f' "$PLAN_FUNC"
 
-# Verify it overrides ENTRY_COMMAND to /ce:work
-assert_contains "Overrides ENTRY_COMMAND to /ce:work" '/ce:work' "$PLAN_FUNC"
+# Verify it overrides ENTRY_COMMAND to /ce-work
+# (compound-engineering 3.x renamed `ce:work` → `ce-work` per plugin CHANGELOG #503; mika#1345)
+assert_contains "Overrides ENTRY_COMMAND to /ce-work" '/ce-work' "$PLAN_FUNC"
 
 # Verify the function is called in dispatch_claude_pilot after _set_up_worktree
 # and before _handle_dry_run
