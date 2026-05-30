@@ -908,7 +908,10 @@ STUB
     local REPO="mika" ISSUE_NUM="1296" SESSION_ID="test-session"
     local RESCUED_DIRTY_WORKTREE=0
     local RESULT=""
-    local RESCUE_COMMIT_ERR="$WORKTREE_DIR/.git/mika-rescue-commit-err"
+    # mika#1341: mirror the production scratch path (mktemp), not the old "$WORKTREE_DIR/.git/"
+    # location. This harness uses a non-linked `git init` repo (where .git is a directory), so
+    # either path would open here — but the mirror should track production shape for fidelity.
+    local RESCUE_COMMIT_ERR="$(mktemp)"
     local CARGO_FMT_ERR="" RESCUE_ERR_CONTENT=""
 
     # First attempt — will fail due to pre-commit hook
@@ -975,26 +978,93 @@ else
     echo "  ✗ Hook failure invariant: $RESULT_HOOK"
 fi
 
-# Test C — structural assertion: scratch file uses .git/ location (not .iterate/)
-SCRATCH_FILE_CHECK=$(grep -c 'mika-rescue-commit-err' "$DISPATCH_LIB" || true)
-if [ "$SCRATCH_FILE_CHECK" -ge 1 ]; then
-    # Verify it uses $WORKTREE_DIR/.git/ prefix
-    SCRATCH_IN_GIT=$(grep 'WORKTREE_DIR/.git/mika-rescue-commit-err' "$DISPATCH_LIB" | grep -v '^\s*#' | head -1)
-    if [ -n "$SCRATCH_IN_GIT" ]; then
-        PASS=$((PASS + 1))
-        echo "  ✓ Scratch file uses \$WORKTREE_DIR/.git/mika-rescue-commit-err (not .iterate/)"
-    else
-        FAIL=$((FAIL + 1))
-        echo "  ✗ Scratch file location does not use \$WORKTREE_DIR/.git/ prefix"
-    fi
+# Test C — structural assertion (mika#1341): the rescue scratch path MUST NOT live
+# under "$WORKTREE_DIR/.git/". In a linked worktree (every autonomous dev-pilot run)
+# ".git" is a FILE, so a redirect into "$WORKTREE_DIR/.git/<name>" fails (ENOTDIR),
+# the rescue `git commit` never runs, and the loop wedges. The active assignment must
+# use mktemp (off the working tree, valid in linked + non-linked checkouts).
+# This assertion FAILS against the pre-mika#1341 ".git/"-scratch code.
+RESCUE_ASSIGN=$(grep 'RESCUE_COMMIT_ERR=' "$DISPATCH_LIB" | grep -v '^\s*#')
+ACTIVE_ASSIGN=$(printf '%s\n' "$RESCUE_ASSIGN" | grep 'mktemp' || true)
+GIT_FILE_ASSIGN=$(printf '%s\n' "$RESCUE_ASSIGN" | grep 'WORKTREE_DIR/.git/mika-rescue-commit-err' || true)
+if [ -n "$ACTIVE_ASSIGN" ] && [ -z "$GIT_FILE_ASSIGN" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Rescue scratch path uses mktemp, not \$WORKTREE_DIR/.git/ (mika#1341)"
 else
     FAIL=$((FAIL + 1))
-    echo "  ✗ No mika-rescue-commit-err reference found in dispatch-lib.sh"
+    echo "  ✗ Rescue scratch path must use mktemp and must NOT use \$WORKTREE_DIR/.git/ (mika#1341)"
+    echo "    active(mktemp): ${ACTIVE_ASSIGN:-<none>}"
+    echo "    git-file path:  ${GIT_FILE_ASSIGN:-<none>}"
 fi
 
 # Verify no .iterate/rescue-commit-err reference exists (regression guard)
 ITERATE_SCRATCH=$(grep -c '.iterate/rescue-commit-err' "$DISPATCH_LIB" || true)
 assert_eq "No .iterate/rescue-commit-err reference in dispatch-lib.sh" "0" "$ITERATE_SCRATCH"
+
+# Test D — live invariant (mika#1341): the rescue commit must succeed inside a real
+# LINKED worktree. Reproduces the root cause as an executable artifact: in a linked
+# worktree ".git" is a file, a redirect into "<wt>/.git/<name>" fails (ENOTDIR), but
+# a commit capturing into an mktemp path lands and advances HEAD.
+#
+# This is a standalone root-cause PROOF — it reimplements the rescue commit with its own
+# mktemp scratch and does NOT source dispatch-lib.sh, so it passes regardless of the
+# production code. The source-coupled regression guard is Test C above (which asserts the
+# production RESCUE_COMMIT_ERR assignment uses mktemp, not "$WORKTREE_DIR/.git/"). Do not
+# delete Test C assuming Test D covers the regression — Test D would still pass on buggy code.
+test_rescue_linked_worktree_invariant() {
+    local base_dir wt_dir
+    base_dir=$(mktemp -d)
+    wt_dir="${base_dir}-wt"
+    trap "git -C '$base_dir' worktree remove --force '$wt_dir' 2>/dev/null; rm -rf '$base_dir' '$wt_dir'" RETURN
+
+    # Base repo with an initial commit + an identity so commits work in CI.
+    git -C "$base_dir" init -q
+    git -C "$base_dir" config user.email "test@mika.local"
+    git -C "$base_dir" config user.name "mika test"
+    git -C "$base_dir" commit --allow-empty -m "initial" -q
+
+    # Create a LINKED worktree on a new branch.
+    git -C "$base_dir" worktree add -q -b rescue-test "$wt_dir" 2>/dev/null
+
+    local failures=""
+
+    # (1) In a linked worktree, .git is a FILE, not a directory.
+    if [ ! -f "$wt_dir/.git" ]; then
+        failures="${failures}linked worktree .git is not a file; "
+    fi
+
+    # (2) The OLD path construction fails to open (documents the ENOTDIR root cause).
+    if ( echo probe > "$wt_dir/.git/mika-rescue-commit-err" ) 2>/dev/null; then
+        failures="${failures}redirect into <wt>/.git/<name> unexpectedly succeeded; "
+    fi
+
+    # (3) The FIXED approach: capture into an mktemp path; the rescue commit lands.
+    local pre_head post_head scratch
+    pre_head=$(git -C "$wt_dir" rev-parse HEAD)
+    echo "pilot wrote this but never committed" > "$wt_dir/impl.txt"
+    git -C "$wt_dir" add -A -- ':!.claude/commands/' 2>/dev/null
+    scratch="$(mktemp)"
+    if git -C "$wt_dir" commit -m "wip(mika#1341): rescue in linked worktree" > "$scratch" 2>&1; then
+        post_head=$(git -C "$wt_dir" rev-parse HEAD)
+        [ "$pre_head" != "$post_head" ] || failures="${failures}HEAD did not advance after rescue commit; "
+        git -C "$wt_dir" diff --quiet HEAD -- impl.txt || failures="${failures}impl.txt not committed; "
+    else
+        failures="${failures}rescue commit failed with mktemp scratch path; "
+    fi
+    rm -f "$scratch"
+    [ ! -f "$scratch" ] || failures="${failures}scratch not cleaned; "
+
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_LWT=$(test_rescue_linked_worktree_invariant 2>/dev/null)
+if [ "$RESULT_LWT" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Linked-worktree rescue: .git is a file, mktemp scratch lands the commit (mika#1341)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Linked-worktree rescue invariant: $RESULT_LWT"
+fi
 
 # --- Test 11: Idempotency-bypass-architect fabrication brake retired (mika#1327) ---
 
