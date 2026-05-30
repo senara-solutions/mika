@@ -40,11 +40,11 @@ The mika#1282 dirty-worktree rescue currently uses a **reactive** pattern: attem
 if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
     PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
     [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
-    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' 2>&9
+    git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' 2>&9
 fi
 ```
 
-**Why this location:** After `RESCUED_FILES` is computed (line 483) and before the first `git commit` (line 497). The `RESCUED_FILES` variable is already captured, so re-staging after fmt doesn't lose the file list. The re-stage (`git add -A`) picks up any formatting changes that `cargo fmt` made to already-staged files.
+**Why this location:** After `RESCUED_FILES` is computed (line 483) and before the first `git commit` (line 497). The `RESCUED_FILES` variable is already captured, so re-staging after fmt doesn't lose the file list. The re-stage uses `git add -u` (update-only) rather than `git add -A` to narrow the contract to "re-stage fmt-modified tracked files only" — `cargo fmt` only modifies already-tracked files in place, never creates new files, so `-u` has identical effect in the intended case while avoiding inadvertently staging untracked files the pilot left deliberately outside the staged set (review-guide.md § Single Responsibility).
 
 **What stays unchanged:** The entire reactive branch at lines 517–569 (the `grep -q "rust-fmt"` → `cargo fmt` → retry path) remains as a fallback. If proactive formatting succeeds, the reactive branch never fires (the first commit succeeds). If proactive formatting somehow misses a case or a new lint is added to lefthook, the reactive branch catches it.
 
@@ -77,14 +77,15 @@ tags: [dispatch-lib, cargo-fmt, deploy-lag, dirty-worktree, rescue, lefthook, mi
 
 4. **Resolution** — Proactive `cargo fmt --all` (mika#1336) eliminates the dominant fmt-class rescue failure. Reactive retry (mika#1296 + mika#1310) retained as fallback. Cross-references:
    - `docs/solutions/best-practices/recover-unpushed-claude-pilot-work-2026-04-27.md`
-   - `docs/solutions/architecture-patterns/pilot-vs-substrate-contract-split-2026-05-25.md`
+   - `docs/solutions/architecture-patterns/pilot-vs-substrate-contract-split-2026-05-25.md` (verified path — issue body references `cross-repo-patterns/` which is stale; the file lives under `architecture-patterns/`)
 
 ## Implementation order
 
 1. Write the compound doc (Deliverable 2) — no code dependencies, documents the investigation.
 2. Insert the proactive fmt block in dispatch-lib.sh (Deliverable 1).
 3. Run `cargo fmt` and `cargo clippy` (the dispatch-lib change is shell, but verify no Rust side-effects).
-4. Manual verification: in a test worktree, stage unformatted `.rs` files and confirm the proactive path fires before commit.
+4. Run `cargo test -p mika-agent` — verify no regressions (dispatch-lib change is shell-only, but AC3 requires test confirmation).
+5. Manual verification: in a test worktree, stage unformatted `.rs` files and confirm the proactive path fires before commit.
 
 ## Risk assessment
 
@@ -100,3 +101,7 @@ tags: [dispatch-lib, cargo-fmt, deploy-lag, dirty-worktree, rescue, lefthook, mi
 |------|--------|
 | `skills/bundled/_shared/dispatch-lib.sh` | Insert proactive `cargo fmt --all` block (~8 lines) after RESCUED_FILES, before first rescue commit |
 | `docs/solutions/best-practices/dispatch-rescue-fmt-and-deploy-lag-2026-05-30.md` | New compound doc (~80 lines) |
+
+## Revision history
+
+- rev 2 (2026-05-30): addressed F1 by changing proactive re-stage from `git add -A` to `git add -u` — narrows contract to re-staging fmt-modified tracked files only, preventing inadvertent staging of untracked files (review-guide.md § Single Responsibility); addressed F2 by adding step 4 (`cargo test -p mika-agent`) to implementation order per issue AC3; addressed F3 by verifying the pilot-vs-substrate doc path — confirmed `docs/solutions/architecture-patterns/` is correct, annotated the cross-reference with resolution note (review-guide.md § DRY).
