@@ -2055,7 +2055,7 @@ mod tests {
 
     #[test]
     fn test_well_known_agents_includes_mika_arch() {
-        assert_eq!(WELL_KNOWN_AGENTS.len(), 5);
+        assert_eq!(WELL_KNOWN_AGENTS.len(), 4);
         assert!(
             WELL_KNOWN_AGENTS.iter().any(|a| a.name == "mika-arch"),
             "WELL_KNOWN_AGENTS should include mika-arch"
@@ -2114,8 +2114,8 @@ mod tests {
             .expect("reconciler must add [skills].allowlist");
         assert_eq!(
             allowlist.len(),
-            26,
-            "mika-dev reconciled allowlist must contain all 26 spec skills"
+            25,
+            "mika-dev reconciled allowlist must contain all 25 spec skills"
         );
         assert!(allowlist.contains(&"self-dev".to_string()));
         assert!(allowlist.contains(&"dev-pilot".to_string()));
@@ -2207,7 +2207,7 @@ mod tests {
             !allowlist.contains(&"only-self-dev".to_string()),
             "operator-weakened allowlist must be overwritten"
         );
-        assert_eq!(allowlist.len(), 26);
+        assert_eq!(allowlist.len(), 25);
     }
 
     #[test]

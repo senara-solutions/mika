@@ -1222,7 +1222,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (39);
+            INSERT INTO schema_version (version) VALUES (40);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -15622,6 +15622,7 @@ mod tests {
         db2.migrate_v36_to_v37().unwrap();
         db2.migrate_v37_to_v38().unwrap();
         db2.migrate_v38_to_v39().unwrap();
+        db2.migrate_v39_to_v40().unwrap();
 
         let final_version: i64 = db2
             .conn
