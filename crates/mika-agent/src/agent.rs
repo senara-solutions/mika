@@ -5179,6 +5179,56 @@ fn extract_claimed_milestone_number(claim_text: &str) -> Option<u64> {
         .and_then(|m| m.as_str().parse::<u64>().ok())
 }
 
+/// Attempts to parse a `run_gh` input_summary as JSON and extract a milestone
+/// number from a close-PATCH argv. Returns `Some(milestone_number)` if the
+/// argv positionally matches the milestone close shape, `None` otherwise.
+///
+/// Expected shapes:
+///   ["api", "-X", "PATCH", "/repos/<owner>/<repo>/milestones/<N>", "-f", "state=closed"]
+///   ["api", "--method", "PATCH", "/repos/<owner>/<repo>/milestones/<N>", "-f", "state=closed"]
+///
+/// The path element and state=closed field can appear at any position after
+/// the PATCH method, because `gh api` accepts flags in any order. The key
+/// invariant is: subcommand is "api", method is PATCH, path matches the
+/// milestones pattern, and "state=closed" appears as a `-f` field value.
+fn parse_run_gh_milestone_close_argv(input_summary: &str) -> Option<u64> {
+    let parsed: serde_json::Value = serde_json::from_str(input_summary).ok()?;
+    let command = parsed.get("command")?.as_array()?;
+
+    // argv[0] must be "api"
+    if command.first()?.as_str()? != "api" {
+        return None;
+    }
+
+    // Find PATCH method: either "-X" "PATCH" or "--method" "PATCH"
+    let has_patch_method = command.windows(2).any(|pair| {
+        let flag = pair[0].as_str().unwrap_or("");
+        let val = pair[1].as_str().unwrap_or("");
+        (flag == "-X" || flag == "--method") && val == "PATCH"
+    });
+    if !has_patch_method {
+        return None;
+    }
+
+    // Find state=closed: must appear as a "-f" field pair
+    let has_state_closed = command.windows(2).any(|pair| {
+        let flag = pair[0].as_str().unwrap_or("");
+        let val = pair[1].as_str().unwrap_or("");
+        flag == "-f" && val == "state=closed"
+    });
+    if !has_state_closed {
+        return None;
+    }
+
+    // Extract milestone number from the milestones API path element
+    command.iter().filter_map(|v| v.as_str()).find_map(|s| {
+        MILESTONE_API_PATH_RE
+            .captures(s)
+            .and_then(|c| c.name("num"))
+            .and_then(|n| n.as_str().parse::<u64>().ok())
+    })
+}
+
 /// Detects whether assistant text claims a GitHub milestone was closed without
 /// invoking the required `run_gh` PATCH call.
 ///
@@ -5193,14 +5243,19 @@ fn extract_claimed_milestone_number(claim_text: &str) -> Option<u64> {
 /// mika-arch's multi-milestone review surface — a single turn may legitimately
 /// PATCH one milestone while writing prose about another.
 ///
-/// A qualifying call has `input_summary` containing all four substrings:
-/// `"api"`, `"PATCH"`, `state=closed`, AND a milestones API path. The
+/// A qualifying call is detected via two-tier parsing (#1182):
+/// Tier 1 — `parse_run_gh_milestone_close_argv()` parses `input_summary` as
+/// JSON and walks the argv array positionally, checking subcommand, method
+/// flag, milestones API path, and `-f state=closed` field. Immune to
+/// substring spoofing (e.g., PATCH path inside a `pr comment --body`).
+/// Tier 2 — substring fallback: `input_summary` must contain `"api"`,
+/// `"PATCH"`, `state=closed`, AND a milestones API path regex match. Used
+/// when JSON parsing fails (truncated or non-JSON summaries). The
 /// `state=closed` requirement narrows the surface against milestones PATCH
-/// calls that mutate non-state fields (e.g., `-f title=...`). This is a
-/// substring-shape check; the coupling to `ToolCallSummary.input_summary`
-/// JSON serialization is documented and cross-locked with
-/// `skills/bundled/self-dev/system_prompt.md` § M5 step 3a. A structural
-/// argv-parse rewrite is tracked as follow-up.
+/// calls that mutate non-state fields (e.g., `-f title=...`). The substring
+/// fallback coupling to `ToolCallSummary.input_summary` JSON serialization is
+/// documented and cross-locked with `skills/bundled/self-dev/system_prompt.md`
+/// § M5 step 3a.
 fn detect_milestone_close_claim_without_patch<'a>(
     text: &'a str,
     all_tool_summaries: &[ToolCallSummary],
@@ -5227,19 +5282,28 @@ fn detect_milestone_close_claim_without_patch<'a>(
     let claimed_num = extract_claimed_milestone_number(&text[match_start..]);
 
     // AC2+AC4: collect PATCH milestone numbers from tool summaries.
+    // Tier 1: Structured JSON argv parse (preferred — immune to substring spoofing).
+    // Tier 2: Substring fallback for parse failures (truncated or non-JSON summaries).
     let patched_set: HashSet<u64> = all_tool_summaries
         .iter()
-        .filter(|s| {
-            s.name == "run_gh"
-                && s.input_summary.contains("\"api\"")
+        .filter(|s| s.name == "run_gh")
+        .filter_map(|s| {
+            // Tier 1: structured parse
+            if let Some(num) = parse_run_gh_milestone_close_argv(&s.input_summary) {
+                return Some(num);
+            }
+            // Tier 2: substring fallback (preserves coverage for truncated/legacy summaries)
+            if s.input_summary.contains("\"api\"")
                 && s.input_summary.contains("\"PATCH\"")
                 && s.input_summary.contains("state=closed")
-        })
-        .filter_map(|s| {
-            MILESTONE_API_PATH_RE
-                .captures(&s.input_summary)
-                .and_then(|c| c.name("num"))
-                .and_then(|n| n.as_str().parse::<u64>().ok())
+            {
+                MILESTONE_API_PATH_RE
+                    .captures(&s.input_summary)
+                    .and_then(|c| c.name("num"))
+                    .and_then(|n| n.as_str().parse::<u64>().ok())
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -9117,6 +9181,147 @@ mod tests {
                 &summaries,
             )
             .is_some()
+        );
+    }
+
+    // -- parse_run_gh_milestone_close_argv unit tests (#1182) --
+
+    #[test]
+    fn test_parse_run_gh_milestone_close_argv_valid() {
+        let input =
+            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/42","-f","state=closed"]}"#;
+        assert_eq!(parse_run_gh_milestone_close_argv(input), Some(42));
+    }
+
+    #[test]
+    fn test_parse_run_gh_milestone_close_argv_not_api() {
+        let input = r#"{"command":["pr","comment","--body","text"]}"#;
+        assert_eq!(parse_run_gh_milestone_close_argv(input), None);
+    }
+
+    #[test]
+    fn test_parse_run_gh_milestone_close_argv_no_state_closed() {
+        // PATCH without state=closed should not match.
+        let input =
+            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/17","-f","title=new name"]}"#;
+        assert_eq!(parse_run_gh_milestone_close_argv(input), None);
+    }
+
+    #[test]
+    fn test_parse_run_gh_milestone_close_argv_truncated_json() {
+        // Truncated JSON should return None (graceful fallback).
+        let input = r#"{"command":["api","-X","PATCH","/repos/o/r/milest"#;
+        assert_eq!(parse_run_gh_milestone_close_argv(input), None);
+    }
+
+    #[test]
+    fn test_parse_run_gh_milestone_close_argv_long_method_flag() {
+        // "--method" is the long form of "-X" in gh api.
+        let input = r#"{"command":["api","--method","PATCH","/repos/o/r/milestones/17","-f","state=closed"]}"#;
+        assert_eq!(parse_run_gh_milestone_close_argv(input), Some(17));
+    }
+
+    // -- milestone-close guard hardening integration tests (#1182) --
+
+    #[test]
+    fn test_milestone_close_guard_substring_spoof_rejected() {
+        // A pr comment whose body contains all four substrings should NOT
+        // satisfy the guard — the PATCH is in the body text, not an actual
+        // api PATCH call.
+        let spoofed = run_gh_summary(
+            r#"{"command":["pr","comment","--body","closed via PATCH /repos/senara-solutions/mika/milestones/17 state=closed"]}"#,
+        );
+        let summaries = vec![spoofed];
+        let result = detect_milestone_close_claim_without_patch(
+            "I closed milestone#17 on GitHub",
+            &summaries,
+        );
+        // Guard should fire — the spoof should not satisfy it.
+        assert!(
+            result.is_some(),
+            "substring spoof should not satisfy the guard"
+        );
+    }
+
+    #[test]
+    fn test_milestone_close_guard_cross_milestone_leakage() {
+        // PATCH for milestone#17 should NOT satisfy a claim about milestone#18.
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","-X","PATCH","/repos/senara-solutions/mika/milestones/17","-f","state=closed"]}"#,
+        )];
+        let result = detect_milestone_close_claim_without_patch(
+            "I closed milestone#18 on GitHub",
+            &summaries,
+        );
+        assert!(
+            result.is_some(),
+            "PATCH for #17 should not satisfy claim about #18"
+        );
+    }
+
+    #[test]
+    fn test_milestone_close_guard_truncated_input_still_resolves() {
+        // Build an argv where state=closed is beyond byte 200 (truncation boundary).
+        // The structured parse fails on truncated JSON, but the path and "PATCH"
+        // appear before byte 200, so the substring fallback extracts the number.
+        let long_org = "a".repeat(150); // Push state=closed past byte 200
+        let input = format!(
+            r#"{{"command":["api","-X","PATCH","/repos/{}/mika/milestones/17","-f","state=closed"]}}"#,
+            long_org
+        );
+        // Truncate to INPUT_SUMMARY_MAX to simulate what ToolCallSummary does.
+        let truncated = truncate_summary(&input, INPUT_SUMMARY_MAX);
+        let summaries = vec![run_gh_summary(&truncated)];
+
+        let result = detect_milestone_close_claim_without_patch(
+            "I closed milestone#17 on GitHub",
+            &summaries,
+        );
+        // If state=closed was truncated, substring fallback also fails →
+        // guard correctly fires (over-fire is the safe direction per the ticket).
+        // The key invariant: the guard does NOT stall — it either suppresses
+        // (if substring fallback finds a match) or fires (if not).
+        // With 150-char org name, state=closed is truncated away, so the guard fires.
+        assert!(
+            result.is_some(),
+            "truncated state=closed should cause guard to fire (safe direction)"
+        );
+    }
+
+    #[test]
+    fn test_milestone_close_guard_long_method_flag() {
+        // "--method" is the long form of "-X" in gh api.
+        let summaries = vec![run_gh_summary(
+            r#"{"command":["api","--method","PATCH","/repos/senara-solutions/mika/milestones/17","-f","state=closed"]}"#,
+        )];
+        assert!(
+            detect_milestone_close_claim_without_patch(
+                "I closed milestone#17 on GitHub",
+                &summaries,
+            )
+            .is_none(),
+            "--method PATCH should satisfy the guard"
+        );
+    }
+
+    #[test]
+    fn test_milestone_close_guard_non_json_fallback() {
+        // If input_summary is not valid JSON (e.g., pre-existing format or
+        // corruption), the substring fallback should still work.
+        let summaries = vec![run_gh_summary(
+            r#"api -X PATCH /repos/senara-solutions/mika/milestones/17 -f state=closed "api" "PATCH""#,
+        )];
+        // This is a non-JSON string that happens to contain the substring markers.
+        // The structured parse fails; the substring fallback should try to extract.
+        let result = detect_milestone_close_claim_without_patch(
+            "I closed milestone#17 on GitHub",
+            &summaries,
+        );
+        // Substring fallback finds "api", "PATCH", and "state=closed" as substrings,
+        // plus the milestone path regex matches. Should suppress the guard.
+        assert!(
+            result.is_none(),
+            "substring fallback should work for non-JSON input"
         );
     }
 
