@@ -119,7 +119,7 @@ RUN ARCH=$(uname -m) && \
     find /tmp -name gws -type f -executable -exec install -m 755 {} /usr/local/bin/gws \; && \
     rm -rf /tmp/gws*
 
-# Ollama (sha256 verified — AC7)
+# Ollama (sha256 verified)
 ARG OLLAMA_VERSION=0.6.0
 RUN ARCH=$(uname -m) && \
     case "$ARCH" in \
@@ -127,15 +127,14 @@ RUN ARCH=$(uname -m) && \
         aarch64) OLLAMA_ARCH="arm64" ;; \
         *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac && \
-    wget -qO "/tmp/ollama-linux-${OLLAMA_ARCH}" \
-        "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${OLLAMA_ARCH}" && \
-    wget -qO "/tmp/ollama-linux-${OLLAMA_ARCH}.sha256" \
-        "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${OLLAMA_ARCH}.sha256" && \
-    cd /tmp && \
-    EXPECTED=$(cat "ollama-linux-${OLLAMA_ARCH}.sha256" | awk '{print $1}') && \
-    echo "${EXPECTED}  ollama-linux-${OLLAMA_ARCH}" | sha256sum -c - && \
-    install -m 755 "ollama-linux-${OLLAMA_ARCH}" /usr/local/bin/ollama && \
-    rm -f /tmp/ollama-linux-*
+    wget -qO "/tmp/ollama-linux-${OLLAMA_ARCH}.tgz" \
+        "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${OLLAMA_ARCH}.tgz" && \
+    wget -qO /tmp/ollama-checksums.txt \
+        "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/sha256sum.txt" && \
+    cd /tmp && grep "ollama-linux-${OLLAMA_ARCH}.tgz" ollama-checksums.txt | sha256sum -c - && \
+    tar -xzf "/tmp/ollama-linux-${OLLAMA_ARCH}.tgz" -C /tmp && \
+    install -m 755 /tmp/bin/ollama /usr/local/bin/ollama && \
+    rm -rf /tmp/ollama-* /tmp/bin /tmp/lib
 
 # ── Create non-root user ──
 RUN useradd -m -u 1000 -s /bin/bash mika
