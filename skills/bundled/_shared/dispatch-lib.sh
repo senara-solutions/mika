@@ -310,14 +310,29 @@ _set_up_worktree() {
             # files are not affected — only tracked-but-modified ones.)
             git -C "$WORKTREE_DIR" checkout HEAD -- docs/plans/ 2>/dev/null || true
 
-            if git -C "$WORKTREE_DIR" rebase origin/main 2>/dev/null; then
+            # Capture rebase stderr instead of discarding to /dev/null (mika#1364 AC#4).
+            local rebase_err
+            rebase_err=$(mktemp "${TMPDIR:-/tmp}/dispatch-lib-rebase-err.XXXXXX")
+            if git -C "$WORKTREE_DIR" rebase origin/main 2>"$rebase_err"; then
                 echo "Rebased ${BRANCH} onto origin/main (${BEHIND} commits caught up)." >&2
+                rm -f "$rebase_err"
             else
+                # Capture conflict list and rebase reason BEFORE --abort resets the index.
                 CONFLICTS=$(git -C "$WORKTREE_DIR" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')
+                local rebase_reason rebase_mode
+                rebase_reason=$(cat "$rebase_err" 2>/dev/null | head -20)
+                if [ -n "$CONFLICTS" ]; then
+                    rebase_mode="conflict"
+                else
+                    rebase_mode="other"
+                fi
                 git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
+                rm -f "$rebase_err"
                 RESULT="STATUS=REBASE_CONFLICT
 Branch ${BRANCH} is ${BEHIND} commits behind origin/main.
-Conflicted files: ${CONFLICTS:-<unable to capture>}
+Rebase failure mode: ${rebase_mode}
+Conflicted files: ${CONFLICTS:-<none>}
+Rebase stderr: ${rebase_reason:-<empty>}
 Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
                 exit 1
             fi
@@ -781,28 +796,65 @@ Push: SKIPPED — duplicate-commit guard detected patch-equivalent commits on br
     git -C "$WORKTREE_DIR" fetch origin "$BRANCH" 2>/dev/null || true
 
     # Branch on remote-ref existence (F1 fix from architect review on mika#1268):
+    # Determine push mode: first-push, fast-forward, or diverged (mika#1364).
+    local push_mode="first-push"
     if git -C "$WORKTREE_DIR" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
         # Existing-remote case — push only if HEAD is ahead.
         local ahead
         ahead=$(git -C "$WORKTREE_DIR" rev-list "origin/$BRANCH..HEAD" --count 2>/dev/null || echo 0)
         [ "${ahead:-0}" -eq 0 ] && return 0
+
+        # Ancestry check (mika#1364 KTD-1): determine if origin/$BRANCH is an
+        # ancestor of HEAD (fast-forward) or not (diverged — rebase rewrote
+        # history). Only the diverged case needs --force-with-lease.
+        # Exit codes: 0 = is ancestor, 1 = not ancestor, 128+ = error.
+        local ancestry_rc=0
+        git -C "$WORKTREE_DIR" merge-base --is-ancestor "origin/$BRANCH" HEAD 2>/dev/null || ancestry_rc=$?
+        if [ "$ancestry_rc" -eq 0 ]; then
+            push_mode="fast-forward"
+        elif [ "$ancestry_rc" -eq 1 ]; then
+            push_mode="diverged"
+        else
+            # Ancestry probe itself errored (shallow clone, missing objects).
+            # Fall back to plain push — this is current behavior, not a
+            # regression. If the remote diverged, the push will reject as
+            # non-fast-forward and land in the FAILED arm below. We do NOT
+            # silently force on uncertain state (mika#1364 F2).
+            push_mode="fast-forward"
+            echo "WARN: push_branch ancestry probe failed (rc=$ancestry_rc) — falling back to plain push" >&2
+        fi
     fi
     # First-push case (no origin/$BRANCH ref) — always push.
     # (Sub-PR 7b retired the Class D recovery shim's first-push path;
     # this helper is now the sole git-push site for dev-groom dispatches.)
 
     # Push with upstream tracking (-u sets upstream on first push).
-    local push_err
+    # Diverged branches use --force-with-lease to land rebased history
+    # without clobbering concurrent remote advances (mika#1364 KTD-1).
+    local push_err push_cmd
     push_err=$(mktemp /tmp/push-branch-err-XXXXXX)
-    if git -C "$WORKTREE_DIR" push -u origin "$BRANCH" 2>"$push_err"; then
-        echo "push_branch: pushed $BRANCH to origin" >&2
-        RESULT="${RESULT}
-Push: pushed to origin/$BRANCH"
+    if [ "$push_mode" = "diverged" ]; then
+        push_cmd=(git -C "$WORKTREE_DIR" push --force-with-lease="$BRANCH:origin/$BRANCH" -u origin "$BRANCH")
     else
+        push_cmd=(git -C "$WORKTREE_DIR" push -u origin "$BRANCH")
+    fi
+    if "${push_cmd[@]}" >/dev/null 2>"$push_err"; then
+        echo "push_branch: pushed $BRANCH to origin (mode=$push_mode)" >&2
+        RESULT="${RESULT}
+Push: pushed to origin/$BRANCH (mode=$push_mode)"
+    else
+        local push_err_content
+        push_err_content=$(cat "$push_err" 2>/dev/null)
         echo "WARN: push_branch_failed for $BRANCH — commits remain local-only" >&2
         cat "$push_err" >&2
-        RESULT="${RESULT}
+        # Distinguish lease-stale abort from other push failures (mika#1364).
+        if printf '%s' "$push_err_content" | grep -q "stale info\|expected old/new\|failed to push"; then
+            RESULT="${RESULT}
+Push: FAILED — remote advanced since fetch (lease aborted); commits remain local-only on $BRANCH"
+        else
+            RESULT="${RESULT}
 Push: FAILED — commits remain local-only on $BRANCH"
+        fi
     fi
     rm -f "$push_err"
 }
@@ -845,15 +897,26 @@ _check_duplicate_commits() {
     echo "$duplicates" >&2
     echo "Attempting rebase onto origin/main to deduplicate..." >&2
 
-    if git -C "$WORKTREE_DIR" rebase origin/main 2>/dev/null; then
+    # Capture rebase stderr instead of discarding to /dev/null (mika#1364 AC#4).
+    local dedup_rebase_err
+    dedup_rebase_err=$(mktemp "${TMPDIR:-/tmp}/dispatch-lib-dedup-rebase-err.XXXXXX")
+    if git -C "$WORKTREE_DIR" rebase origin/main 2>"$dedup_rebase_err"; then
         echo "Rebase succeeded — duplicate commits resolved." >&2
+        rm -f "$dedup_rebase_err"
         return 0
     fi
 
-    # Rebase failed — abort and report
+    # Rebase failed — capture reason BEFORE --abort resets the index.
+    local dedup_conflicts dedup_reason
+    dedup_conflicts=$(git -C "$WORKTREE_DIR" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')
+    dedup_reason=$(cat "$dedup_rebase_err" 2>/dev/null | head -20)
     git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
+    rm -f "$dedup_rebase_err"
     echo "ERROR: duplicate-commit rebase failed. Branch has commits equivalent to main:" >&2
     echo "$duplicates" >&2
+    echo "Rebase stderr: ${dedup_reason:-<empty>}" >&2
+    RESULT="${RESULT}
+Dedup-rebase failed (${dedup_conflicts:+conflict: $dedup_conflicts}${dedup_conflicts:-other}): ${dedup_reason:-<no stderr>}"
     return 1
 }
 
