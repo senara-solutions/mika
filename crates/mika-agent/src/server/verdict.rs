@@ -14,6 +14,16 @@ pub(crate) struct PrReviewEvent {
     pub body: String,
 }
 
+/// Review depth parsed from a verdict body (mika#275).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReviewDepth {
+    CodeLevel,
+    CodeLevelPartial,
+    MetadataOnly,
+    /// DEPTH line was present but had an unrecognized value.
+    Unknown(String),
+}
+
 impl PrReviewEvent {
     /// Construct the PR HTML URL from repo and number.
     pub fn pr_url(&self) -> String {
@@ -37,6 +47,9 @@ static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static VERDICT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?mi)^VERDICT:\s*(.+)$").expect("verdict regex"));
+
+static DEPTH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?mi)^DEPTH:\s*(.+)$").expect("depth regex"));
 
 static BLOCK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^block\[([^\]]+)\]$").expect("block regex"));
@@ -118,6 +131,20 @@ pub(crate) fn parse_verdict(body: &str) -> Verdict {
     Verdict::Missing {
         truncated: body.contains("[truncated]"),
     }
+}
+
+/// Parse review depth from a verdict body (mika#275).
+///
+/// Returns `None` if no `DEPTH:` line is present (backward compat).
+pub(crate) fn parse_review_depth(body: &str) -> Option<ReviewDepth> {
+    let caps = DEPTH_RE.captures(body)?;
+    let value = caps[1].trim();
+    Some(match value.to_lowercase().as_str() {
+        "code-level" => ReviewDepth::CodeLevel,
+        "code-level (partial)" => ReviewDepth::CodeLevelPartial,
+        "metadata-only" => ReviewDepth::MetadataOnly,
+        _ => ReviewDepth::Unknown(value.to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -244,5 +271,58 @@ Please fix the pipeline issues.";
 
         let text2 = "[GitHub] PR review (approved) on repo#notanumber (title) by @user";
         assert!(parse_pr_review_event(text2).is_none());
+    }
+
+    // --- Review depth parsing tests (mika#275) ---
+
+    #[test]
+    fn parse_depth_code_level() {
+        let body = "VERDICT: pass\nDEPTH: code-level\nREASON: all good";
+        assert_eq!(parse_review_depth(body), Some(ReviewDepth::CodeLevel));
+    }
+
+    #[test]
+    fn parse_depth_code_level_partial() {
+        let body = "VERDICT: pass\nDEPTH: code-level (partial)\nREASON: truncated diff";
+        assert_eq!(
+            parse_review_depth(body),
+            Some(ReviewDepth::CodeLevelPartial)
+        );
+    }
+
+    #[test]
+    fn parse_depth_metadata_only() {
+        let body = "VERDICT: hold[review]\nDEPTH: metadata-only\nREASON: diff unavailable";
+        assert_eq!(parse_review_depth(body), Some(ReviewDepth::MetadataOnly));
+    }
+
+    #[test]
+    fn parse_depth_missing_returns_none() {
+        let body = "VERDICT: pass\nREASON: all good";
+        assert_eq!(parse_review_depth(body), None);
+    }
+
+    #[test]
+    fn parse_depth_case_insensitive() {
+        let body = "DEPTH: Code-Level";
+        assert_eq!(parse_review_depth(body), Some(ReviewDepth::CodeLevel));
+
+        let body2 = "DEPTH: METADATA-ONLY";
+        assert_eq!(parse_review_depth(body2), Some(ReviewDepth::MetadataOnly));
+    }
+
+    #[test]
+    fn parse_depth_unknown_value() {
+        let body = "DEPTH: something-else";
+        assert_eq!(
+            parse_review_depth(body),
+            Some(ReviewDepth::Unknown("something-else".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_depth_first_match_wins() {
+        let body = "DEPTH: code-level\nDEPTH: metadata-only";
+        assert_eq!(parse_review_depth(body), Some(ReviewDepth::CodeLevel));
     }
 }
