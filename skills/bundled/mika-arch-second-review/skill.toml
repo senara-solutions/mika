@@ -2,7 +2,7 @@
 name = "mika-arch-second-review"
 description = "Iteration-pass plan review after a first-pass ITERATE verdict — produces GROOMED or ESCALATE. Never ITERATE again."
 version = "0.1.0"
-always_on = false
+always_on = true
 timeout_secs = 120
 
 [triggers]

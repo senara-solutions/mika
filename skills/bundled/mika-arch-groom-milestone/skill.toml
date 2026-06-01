@@ -2,7 +2,7 @@
 name = "mika-arch-groom-milestone"
 description = "Milestone-level plan review — reviews all sub-issue plans for cross-cutting concerns, sequencing, and produces an aggregate READY / ITERATE / ESCALATE disposition."
 version = "0.1.0"
-always_on = false
+always_on = true
 timeout_secs = 180
 
 [triggers]
