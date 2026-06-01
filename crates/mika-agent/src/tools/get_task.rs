@@ -54,13 +54,16 @@ impl Tool for GetTaskTool {
         let ref_url = task.reference_url.as_deref().unwrap_or("none");
         let source = task.source.as_deref().unwrap_or("none");
 
+        let dispatch_cls = task.dispatch_class.as_deref().unwrap_or("implement");
+
         let output = format!(
-            "Task: {}\nLabel: {}\nStatus: {}\nTrigger: {}\nAction: {}\nCreated: {}\nNext fire: {}\nTimeout: {}\nReference: {}\nSource: {}\nResult: {}",
+            "Task: {}\nLabel: {}\nStatus: {}\nTrigger: {}\nAction: {}\nDispatch class: {}\nCreated: {}\nNext fire: {}\nTimeout: {}\nReference: {}\nSource: {}\nResult: {}",
             task.id,
             task.label,
             task.status,
             task.trigger_type,
             task.action_type,
+            dispatch_cls,
             created,
             next_fire,
             timeout,
@@ -127,6 +130,71 @@ mod tests {
         assert!(result.content.contains("callback"));
         assert!(result.content.contains("resume_agent"));
         assert!(result.content.contains("pending"));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_shows_dispatch_class_default() {
+        let harness = TestHarness::new();
+        let id = add_callback_task(&harness, "Impl task").await;
+        let ctx = harness.ctx();
+        let tool = GetTaskTool;
+
+        let result = tool
+            .execute(serde_json::json!({"id": id}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("Dispatch class: implement"),
+            "default dispatch_class should show 'implement': {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_shows_dispatch_class_groom() {
+        let harness = TestHarness::new();
+        let id = harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "Groom task".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("groom".to_string()),
+            })
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
+        let tool = GetTaskTool;
+
+        let result = tool
+            .execute(serde_json::json!({"id": id}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("Dispatch class: groom"),
+            "groom dispatch_class should be shown: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

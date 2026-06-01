@@ -301,7 +301,7 @@ pub async fn try_handle_ci_failure(
         .has_active_callback_tasks_excluding(&task.id, "implement")
         .await
     {
-        Ok(Some((parent_id, callback_id))) => {
+        Ok(Some((parent_id, callback_id, _label))) => {
             info!(
                 task_id = %task.id,
                 blocking_parent = %parent_id,
