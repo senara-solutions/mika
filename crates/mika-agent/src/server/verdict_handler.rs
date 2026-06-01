@@ -31,7 +31,9 @@ use crate::tools::pr_merge_with_gate::{
     CheckClassification, classify_checks, run_gh_checks, run_gh_merge,
 };
 
-use super::verdict::{PrReviewEvent, Verdict, parse_pr_review_event, parse_verdict};
+use super::verdict::{
+    PrReviewEvent, Verdict, parse_pr_review_event, parse_review_depth, parse_verdict,
+};
 use super::webhook_queue::has_active_callback_child;
 
 /// Maximum block[ac] retries before escalation.
@@ -76,6 +78,16 @@ pub async fn try_handle_pr_review_verdict(
 
     // 2. Parse the verdict — authoritative regardless of GH review.state (#889)
     let verdict = parse_verdict(&event.body);
+
+    // 2b. Parse and log review depth (mika#275) — informational metadata
+    let review_depth = parse_review_depth(&event.body);
+    info!(
+        event = "verdict_review_depth",
+        pr_number = event.pr_number,
+        repo = %event.repo,
+        review_depth = ?review_depth,
+        "parsed review depth from verdict body"
+    );
 
     match verdict {
         Verdict::Pass => {

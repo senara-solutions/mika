@@ -1806,6 +1806,33 @@ pub fn validate_tool_arg_suffixes(
     Ok(())
 }
 
+/// Known valid DEPTH values for review depth declaration (mika#275).
+const VALID_DEPTH_VALUES: &[&str] = &["code-level", "code-level (partial)", "metadata-only"];
+
+/// Validate that a `pr review --body` contains a `DEPTH:` line (mika#275).
+///
+/// Called in `run_gh` BEFORE subprocess spawn, only when `required_tool_arg_suffixes`
+/// is active (qa-review skill loaded). Returns a corrective error if missing.
+pub fn validate_review_depth_present(body: &str) -> Result<(), ToolOutput> {
+    let has_depth = body.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("DEPTH:")
+    });
+
+    if !has_depth {
+        return Err(ToolOutput::error(format!(
+            "{{\"error\": \"review_depth_missing\", \"message\": \
+             \"The --body argument of this `pr review` call is missing a DEPTH: line. \
+             Every review verdict must declare review depth between VERDICT: and REASON:. \
+             Valid values: {}. \
+             Re-emit the tool call with DEPTH: <value> after the VERDICT: line.\"}}",
+            VALID_DEPTH_VALUES.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
 /// Validated `run_gh` input — command args and optional repo.
 #[derive(Debug)]
 struct GhArgs {
@@ -2071,6 +2098,16 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
                 .store(true, std::sync::atomic::Ordering::Release);
             return err;
         }
+    }
+
+    // Review depth declaration validation (mika#275): check that --body of
+    // `pr review` contains a DEPTH: line. Runs only when required_tool_arg_suffixes
+    // is non-empty (i.e., qa-review skill is active — same gating).
+    if !ctx.required_tool_arg_suffixes.is_empty()
+        && let Some(body) = extract_pr_review_body(&gh_args.args)
+        && let Err(err) = validate_review_depth_present(&body)
+    {
+        return err;
     }
 
     // Audit event for `gh api` invocations — structural observability for the
@@ -6428,6 +6465,40 @@ mod tests {
     #[test]
     fn test_extractor_for_unknown_key() {
         assert!(extractor_for_key("nonexistent_key").is_none());
+    }
+
+    // -- validate_review_depth_present tests (mika#275) --
+
+    #[test]
+    fn test_depth_present_passes() {
+        let body = "VERDICT: pass\nDEPTH: code-level\nREASON: all good";
+        assert!(validate_review_depth_present(body).is_ok());
+    }
+
+    #[test]
+    fn test_depth_present_partial_passes() {
+        let body = "VERDICT: pass\nDEPTH: code-level (partial)\nREASON: truncated";
+        assert!(validate_review_depth_present(body).is_ok());
+    }
+
+    #[test]
+    fn test_depth_present_metadata_only_passes() {
+        let body = "VERDICT: hold[review]\nDEPTH: metadata-only\nREASON: diff unavailable";
+        assert!(validate_review_depth_present(body).is_ok());
+    }
+
+    #[test]
+    fn test_depth_missing_fails() {
+        let body = "VERDICT: pass\nREASON: all good\n\nDIFF ANALYSIS:\nFiles: 3";
+        let result = validate_review_depth_present(body);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("review_depth_missing"));
+    }
+
+    #[test]
+    fn test_depth_empty_body_fails() {
+        assert!(validate_review_depth_present("").is_err());
     }
 
     // -- validate_qa_review_gh_scope tests (mika#1196) --
