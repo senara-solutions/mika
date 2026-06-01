@@ -515,6 +515,58 @@ impl TaskDispatcher {
                     task_id = %task.id,
                     "deferred wrapper completed — skipping inline chain-promotion (mika#1124); periodic backstop will handle re-promotion if slot is idle"
                 );
+
+                // R9 (#1172): detect no-op wrapper completion. If the parent has
+                // no active non-deferred callback child after this wrapper completes,
+                // the wrapper's silent turn did NOT spawn a real dispatch.
+                if let Some(ref parent_id) = task.parent_task_id {
+                    match self
+                        .db
+                        .has_non_deferred_active_callback_child(parent_id)
+                        .await
+                    {
+                        Ok(false) => {
+                            warn!(
+                                event = "deferred_dispatch_noop_completion",
+                                task_id = %task.id,
+                                parent_task_id = %parent_id,
+                                "deferred wrapper completed without spawning a real callback — no-op cascade risk (mika#1124)"
+                            );
+                            // W4: audit event for no-op completion
+                            if let Err(e) = self
+                                .db
+                                .log_audit_event(
+                                    &session_id,
+                                    "deferred_dispatch_noop_completion",
+                                    &format!("task:{}", task.id),
+                                    None,
+                                    Some("noop_completion"),
+                                    Some(&format!(
+                                        "parent:{parent_id} — wrapper completed without real dispatch"
+                                    )),
+                                    Some(&trace_id),
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "failed to write deferred_dispatch_noop_completion audit event");
+                            }
+                        }
+                        Ok(true) => {
+                            debug!(
+                                task_id = %task.id,
+                                parent_task_id = %parent_id,
+                                "deferred wrapper completed — parent has active non-deferred child (healthy path)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                task_id = %task.id,
+                                error = %e,
+                                "failed to check for non-deferred callback children — R9 detection skipped"
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -998,13 +1050,30 @@ impl TaskDispatcher {
     /// `SilentTrigger::DeferredDispatch` turn for tasks with the deferred label.
     pub(crate) async fn dispatch_next_deferred_callback(&self) {
         match self.db.promote_next_deferred_callback().await {
-            Ok(true) => {
+            Ok(Some(promoted_task_id)) => {
                 info!(
                     event = "deferred_dispatch_promoted",
+                    promoted_task_id = %promoted_task_id,
                     "promoted oldest pending deferred wrapper for engine dispatch"
                 );
+                // W4: audit event for promotion (#1172)
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        "system",
+                        "deferred_dispatch_promoted",
+                        &format!("task:{promoted_task_id}"),
+                        Some("pending"),
+                        Some("completed"),
+                        Some("inline promotion after dispatch completion"),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to write deferred_dispatch_promoted audit event");
+                }
             }
-            Ok(false) => {} // No pending deferred callbacks
+            Ok(None) => {} // No pending deferred callbacks
             Err(e) => {
                 warn!(error = %e, "failed to promote deferred callback — will retry on next tick");
             }
@@ -1020,13 +1089,32 @@ impl TaskDispatcher {
             .promote_next_deferred_callback_for_class(dispatch_class)
             .await
         {
-            Ok(true) => {
+            Ok(Some(promoted_task_id)) => {
                 info!(
                     event = "deferred_dispatch_promoted",
+                    promoted_task_id = %promoted_task_id,
                     dispatch_class, "promoted oldest pending deferred wrapper for engine dispatch"
                 );
+                // W4: audit event for class-scoped promotion (#1172)
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        "system",
+                        "deferred_dispatch_promoted",
+                        &format!("task:{promoted_task_id}"),
+                        Some("pending"),
+                        Some("completed"),
+                        Some(&format!(
+                            "periodic backstop promotion (class: {dispatch_class})"
+                        )),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to write deferred_dispatch_promoted audit event");
+                }
             }
-            Ok(false) => {} // No pending deferred callbacks in this class
+            Ok(None) => {} // No pending deferred callbacks in this class
             Err(e) => {
                 warn!(
                     error = %e,

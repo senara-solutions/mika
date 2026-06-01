@@ -25,6 +25,10 @@ impl Tool for ListScheduledTasksTool {
                         "type": "string",
                         "description": "Optional status filter. One of: 'pending', 'recurring_active', 'in_progress'. Omit to show all active tasks (pending and recurring_active).",
                         "enum": ["pending", "recurring_active", "in_progress"]
+                    },
+                    "label_contains": {
+                        "type": "string",
+                        "description": "Optional substring filter on task label. Use ':deferred' to find pending deferred dispatch wrappers."
                     }
                 },
                 "required": []
@@ -38,8 +42,15 @@ impl Tool for ListScheduledTasksTool {
         } else {
             vec!["pending".to_string(), "recurring_active".to_string()]
         };
+        let label_contains = input["label_contains"]
+            .as_str()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
 
-        let tasks = ctx.db.get_tasks_by_status(statuses).await?;
+        let tasks = ctx
+            .db
+            .get_tasks_by_status_and_label(statuses, label_contains.map(|s| s.to_string()))
+            .await?;
 
         if tasks.is_empty() {
             return Ok(ToolOutput::success("No active tasks."));
@@ -155,6 +166,61 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("No active tasks"));
+    }
+
+    #[tokio::test]
+    async fn test_list_scheduled_tasks_label_contains_filter() {
+        let harness = TestHarness::new();
+        // Create a regular task and a deferred wrapper
+        add_task(&harness, "Morning reminder", "send_message").await;
+        harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "long_running:run_claude_pilot:deferred".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap();
+
+        let ctx = harness.ctx();
+        let tool = ListScheduledTasksTool;
+
+        // Filter for ":deferred" — should only return the deferred wrapper
+        let result = tool
+            .execute(serde_json::json!({"label_contains": ":deferred"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("run_claude_pilot:deferred"),
+            "should contain deferred wrapper: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("Morning reminder"),
+            "should NOT contain regular task: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

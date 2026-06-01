@@ -151,13 +151,19 @@ impl Tool for ListTasksTool {
             let children = child_count
                 .map(|c| format!(" children:{c}"))
                 .unwrap_or_default();
+            // Hide the default ("implement") to keep the common case compact;
+            // surface "groom" so dispatch-class-aware tasks stand out.
+            let dispatch_cls = match task.dispatch_class.as_deref() {
+                Some("groom") => " class:groom",
+                _ => "", // "implement" is the default — omit for compact output
+            };
             let pid = task
                 .process_id
                 .map(|p| format!(" pid:{p}"))
                 .unwrap_or_default();
 
             lines.push(format!(
-                "- [{status}] {id} {label} (created:{created}{ref_url}{src}{task_type}{children}{pid})",
+                "- [{status}] {id} {label} (created:{created}{ref_url}{src}{task_type}{dispatch_cls}{children}{pid})",
                 status = task.status,
                 id = task.id,
                 label = task.label,
@@ -589,6 +595,66 @@ mod tests {
         assert!(result.content.contains("type:milestone"));
         assert!(result.content.contains("type:project"));
         assert!(!result.content.contains("type:issue"));
+    }
+
+    #[tokio::test]
+    async fn test_list_hides_default_dispatch_class() {
+        let harness = TestHarness::new();
+        create_test_task(&harness, "Impl item", Some("user_request"), None).await;
+
+        let ctx = harness.ctx();
+        let tool = ListTasksTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("Impl item"));
+        assert!(
+            !result.content.contains("class:"),
+            "default dispatch_class (implement) should be hidden: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_shows_groom_dispatch_class() {
+        let harness = TestHarness::new();
+        harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "Groom item".to_string(),
+                trigger_type: trigger_type::MANUAL.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: action_type::NONE.to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("test-session".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("user_request".to_string()),
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("groom".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let ctx = harness.ctx();
+        let tool = ListTasksTool;
+        let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("class:groom"),
+            "groom dispatch_class should be visible: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

@@ -953,7 +953,7 @@ async fn validate_dispatch_readiness(
     let dispatch_class = tool_input.and_then(extract_skill_from_input);
     let class = derive_dispatch_class(dispatch_class);
     match db.has_active_callback_tasks_excluding(task_id, class).await {
-        Ok(Some((blocking_parent_id, blocking_callback_id))) => {
+        Ok(Some((blocking_parent_id, blocking_callback_id, blocking_label))) => {
             // mika#1011 — Register a deferred-dispatch callback so the engine
             // auto-retries when the blocking dispatch completes. The LLM still
             // sees the rejection (γ composition) and may call send_message;
@@ -965,12 +965,21 @@ async fn validate_dispatch_readiness(
                 false
             };
 
+            // Derive blocker_kind from the blocking callback's label (#1172 W3).
+            let blocker_kind = if blocking_label.ends_with(":deferred") {
+                "deferred_wrapper"
+            } else {
+                "real_callback"
+            };
+
             let mut rejection = serde_json::json!({
                 "error": "global_dispatch_active",
                 "task_id": task_id,
                 "dispatch_class": class,
                 "blocking_task_id": blocking_parent_id,
                 "blocking_callback_id": blocking_callback_id,
+                "blocking_label": blocking_label,
+                "blocker_kind": blocker_kind,
                 "reason": format!(
                     "Another task ('{}') already has an active {} dispatch \
                      (callback task '{}'). Only one long-running dispatch per class may be \
@@ -981,6 +990,23 @@ async fn validate_dispatch_readiness(
             });
             if deferred_registered {
                 rejection["deferred_dispatch_registered"] = serde_json::json!(true);
+                // W4: audit event for deferred registration (#1172)
+                if let Err(e) = db
+                    .log_audit_event(
+                        "system",
+                        "deferred_dispatch_registered",
+                        &format!("task:{task_id}"),
+                        None,
+                        Some("deferred"),
+                        Some(&format!(
+                            "dispatch_class:{class}, blocking:{blocking_parent_id}"
+                        )),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to write deferred_dispatch_registered audit event");
+                }
             }
             record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
             return Err(rejection.to_string());
@@ -4187,7 +4213,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_some());
-        let (parent_id, found_callback_id) = result.unwrap();
+        let (parent_id, found_callback_id, _label) = result.unwrap();
         assert_eq!(parent_id, wi);
         assert_eq!(found_callback_id, callback_id);
     }
@@ -4270,7 +4296,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_some(), "same-class dispatch should be blocked");
-        let (parent_id, found_id) = result.unwrap();
+        let (parent_id, found_id, _label) = result.unwrap();
         assert_eq!(parent_id, wi1);
         assert_eq!(found_id, callback_id);
     }
@@ -4414,7 +4440,7 @@ mod tests {
             .has_active_callback_tasks_excluding(&parent_a, "implement")
             .await
             .unwrap();
-        let (blocking_parent, blocking_callback) = result.expect(
+        let (blocking_parent, blocking_callback, _label) = result.expect(
             "real pending callback MUST still block — only :deferred wrappers are excluded",
         );
         assert_eq!(blocking_parent, parent_c, "real dispatch is the blocker");

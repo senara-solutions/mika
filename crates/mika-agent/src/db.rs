@@ -6041,14 +6041,17 @@ impl Database {
     /// wrapper sees the OTHER as slot-occupied and registers yet another
     /// wrapper. Mirrors the equivalent clause in `has_any_active_callback`
     /// (mika#1070), which the engine-level promotion backstop uses.
+    /// Returns `(parent_task_id, callback_id, callback_label)` of the blocking
+    /// callback, or `None` if no conflicting dispatch exists. The label enables
+    /// callers to derive `blocker_kind` for rejection JSON (#1172 W3).
     pub fn has_active_callback_tasks_excluding(
         &self,
         excluded_parent_id: &str,
         agent_id: &str,
         dispatch_class: &str,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<Option<(String, String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT parent_task_id, id FROM tasks
+            "SELECT parent_task_id, id, label FROM tasks
              WHERE trigger_type = 'callback'
                AND status IN ('pending', 'in_progress')
                AND parent_task_id IS NOT NULL
@@ -6060,10 +6063,26 @@ impl Database {
         )?;
         let mut rows = stmt.query(params![excluded_parent_id, agent_id, dispatch_class])?;
         if let Some(row) = rows.next()? {
-            Ok(Some((row.get(0)?, row.get(1)?)))
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
         } else {
             Ok(None)
         }
+    }
+
+    /// Check whether the given parent task has any active (pending/in_progress)
+    /// non-deferred callback child. Used by the R9 no-op wrapper detection (#1172)
+    /// to determine if a deferred wrapper completed without spawning a real dispatch.
+    pub fn has_non_deferred_active_callback_child(&self, parent_task_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE parent_task_id = ?1
+               AND trigger_type = 'callback'
+               AND status IN ('pending', 'in_progress')
+               AND label NOT LIKE '%:deferred'",
+            params![parent_task_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Count pending callback tasks for a given team run with depth > 1.
@@ -6100,64 +6119,90 @@ impl Database {
     ///
     /// Sets `next_fire_at` to now and marks with a synthetic result so the task
     /// engine's periodic scan picks it up and routes through `dispatch_resume_agent`
-    /// within one tick (~1 second). Returns `true` if a task was promoted.
-    /// Called by the dispatcher after a blocking callback completes (mika#1011).
-    pub fn promote_next_deferred_callback(&self, agent_id: &str) -> Result<bool> {
-        let now = crate::timestamp::now();
-        let n = self.conn.execute(
-            "UPDATE tasks
-             SET status = 'completed',
-                 result = 'deferred dispatch slot freed',
-                 completed_at = ?3,
-                 next_fire_at = ?3,
-                 updated_at = ?3
-             WHERE id = (
-                 SELECT id FROM tasks
+    /// within one tick (~1 second). Returns `Some(task_id)` if a task was promoted,
+    /// `None` if no pending deferred callback existed. Called by the dispatcher
+    /// after a blocking callback completes (mika#1011).
+    pub fn promote_next_deferred_callback(&self, agent_id: &str) -> Result<Option<String>> {
+        // First, find the candidate task ID
+        let candidate_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tasks
                  WHERE agent_id = ?1
                    AND trigger_type = 'callback'
                    AND status = 'pending'
                    AND label = 'long_running:run_claude_pilot:deferred'
                  ORDER BY created_at ASC
-                 LIMIT 1
-             )
-             AND agent_id = ?2",
-            params![agent_id, agent_id, now],
+                 LIMIT 1",
+                params![agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(task_id) = candidate_id else {
+            return Ok(None);
+        };
+
+        let now = crate::timestamp::now();
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET status = 'completed',
+                 result = 'deferred dispatch slot freed',
+                 completed_at = ?2,
+                 next_fire_at = ?2,
+                 updated_at = ?2
+             WHERE id = ?1
+               AND status = 'pending'",
+            params![task_id, now],
         )?;
-        Ok(n > 0)
+        Ok(if n > 0 { Some(task_id) } else { None })
     }
 
     /// Class-scoped sibling of `promote_next_deferred_callback`. Promotes the
     /// oldest pending deferred wrapper matching the given `dispatch_class`.
-    /// Returns `true` if a task was promoted. Used by the periodic backstop's
-    /// per-class iteration (mika#1175). Pre-v34 NULL rows treated as 'implement'
-    /// via COALESCE (matches `has_active_callback_tasks_excluding` semantics).
+    /// Returns `Some(task_id)` if a task was promoted, `None` otherwise. Used by
+    /// the periodic backstop's per-class iteration (mika#1175). Pre-v34 NULL
+    /// rows treated as 'implement' via COALESCE (matches
+    /// `has_active_callback_tasks_excluding` semantics).
     pub fn promote_next_deferred_callback_for_class(
         &self,
         agent_id: &str,
         dispatch_class: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
+        // First, find the candidate task ID
+        let candidate_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE agent_id = ?1
+                   AND trigger_type = 'callback'
+                   AND status = 'pending'
+                   AND label = 'long_running:run_claude_pilot:deferred'
+                   AND COALESCE(dispatch_class, 'implement') = ?2
+                 ORDER BY created_at ASC
+                 LIMIT 1",
+                params![agent_id, dispatch_class],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(task_id) = candidate_id else {
+            return Ok(None);
+        };
+
         let now = crate::timestamp::now();
         let n = self.conn.execute(
             "UPDATE tasks
              SET status = 'completed',
                  result = 'deferred dispatch slot freed',
-                 completed_at = ?3,
-                 next_fire_at = ?3,
-                 updated_at = ?3
-             WHERE id = (
-                 SELECT id FROM tasks
-                 WHERE agent_id = ?1
-                   AND trigger_type = 'callback'
-                   AND status = 'pending'
-                   AND label = 'long_running:run_claude_pilot:deferred'
-                   AND COALESCE(dispatch_class, 'implement') = ?4
-                 ORDER BY created_at ASC
-                 LIMIT 1
-             )
-             AND agent_id = ?2",
-            params![agent_id, agent_id, now, dispatch_class],
+                 completed_at = ?2,
+                 next_fire_at = ?2,
+                 updated_at = ?2
+             WHERE id = ?1
+               AND status = 'pending'",
+            params![task_id, now],
         )?;
-        Ok(n > 0)
+        Ok(if n > 0 { Some(task_id) } else { None })
     }
 
     /// Returns true if any non-deferred callback task is in pending or in_progress
@@ -6217,6 +6262,18 @@ impl Database {
     }
 
     pub fn get_tasks_by_status(&self, agent_id: &str, statuses: &[&str]) -> Result<Vec<Task>> {
+        self.get_tasks_by_status_and_label(agent_id, statuses, None)
+    }
+
+    /// Like `get_tasks_by_status`, but with an optional `label_contains` substring filter.
+    /// When `label_contains` is `Some`, only tasks whose label contains the substring
+    /// (case-sensitive) are returned. The substring is parameterized (no SQL injection).
+    pub fn get_tasks_by_status_and_label(
+        &self,
+        agent_id: &str,
+        statuses: &[&str],
+        label_contains: Option<&str>,
+    ) -> Result<Vec<Task>> {
         if statuses.is_empty() {
             return Ok(vec![]);
         }
@@ -6224,15 +6281,25 @@ impl Database {
             .map(|i| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
+        let label_param_idx = statuses.len() + 2; // next param index after agent_id + statuses
+        let label_clause = if label_contains.is_some() {
+            format!(" AND label LIKE '%' || ?{label_param_idx} || '%'")
+        } else {
+            String::new()
+        };
         let sql = format!(
-            "SELECT {} FROM tasks WHERE agent_id = ?1 AND status IN ({}) ORDER BY created_at DESC",
+            "SELECT {} FROM tasks WHERE agent_id = ?1 AND status IN ({}){} ORDER BY created_at DESC",
             Self::TASK_COLUMNS,
-            placeholders
+            placeholders,
+            label_clause,
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(agent_id.to_string())];
         for s in statuses {
             bind.push(Box::new(s.to_string()));
+        }
+        if let Some(lc) = label_contains {
+            bind.push(Box::new(lc.to_string()));
         }
         let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
         let rows = stmt
@@ -16612,8 +16679,8 @@ mod tests {
     fn test_promote_next_deferred_callback_fifo() {
         let db = db();
 
-        // No deferred callbacks → returns false
-        assert!(!db.promote_next_deferred_callback("mika").unwrap());
+        // No deferred callbacks → returns None
+        assert!(db.promote_next_deferred_callback("mika").unwrap().is_none());
 
         // Create parent tasks (FK requirement)
         let p1_id = db
@@ -16643,7 +16710,7 @@ mod tests {
         let id2 = db.create_task(&task2).unwrap();
 
         // Promote first (FIFO)
-        assert!(db.promote_next_deferred_callback("mika").unwrap());
+        assert!(db.promote_next_deferred_callback("mika").unwrap().is_some());
 
         // First should be completed, second still pending
         let t1 = db.get_task_unscoped(&id1).unwrap().unwrap();
@@ -16660,12 +16727,12 @@ mod tests {
         );
 
         // Promote second
-        assert!(db.promote_next_deferred_callback("mika").unwrap());
+        assert!(db.promote_next_deferred_callback("mika").unwrap().is_some());
         let t2 = db.get_task_unscoped(&id2).unwrap().unwrap();
         assert_eq!(t2.status, "completed");
 
-        // No more → returns false
-        assert!(!db.promote_next_deferred_callback("mika").unwrap());
+        // No more → returns None
+        assert!(db.promote_next_deferred_callback("mika").unwrap().is_none());
     }
 
     /// mika#1175 — Class-scoped sibling of `test_promote_next_deferred_callback_fifo`.
@@ -16676,14 +16743,16 @@ mod tests {
     fn test_promote_next_deferred_callback_for_class_filters_by_class() {
         let db = db();
 
-        // No deferred callbacks → both class predicates return false.
+        // No deferred callbacks → both class predicates return None.
         assert!(
-            !db.promote_next_deferred_callback_for_class("mika", "implement")
+            db.promote_next_deferred_callback_for_class("mika", "implement")
                 .unwrap()
+                .is_none()
         );
         assert!(
-            !db.promote_next_deferred_callback_for_class("mika", "groom")
+            db.promote_next_deferred_callback_for_class("mika", "groom")
                 .unwrap()
+                .is_none()
         );
 
         // Parent tasks (FK requirement).
@@ -16732,6 +16801,7 @@ mod tests {
         assert!(
             db.promote_next_deferred_callback_for_class("mika", "groom")
                 .unwrap()
+                .is_some()
         );
         assert_eq!(
             db.get_task_unscoped(&id_groom).unwrap().unwrap().status,
@@ -16750,8 +16820,9 @@ mod tests {
 
         // No more groom wrappers pending.
         assert!(
-            !db.promote_next_deferred_callback_for_class("mika", "groom")
+            db.promote_next_deferred_callback_for_class("mika", "groom")
                 .unwrap()
+                .is_none()
         );
 
         // First implement promotion: one of (implement, NULL) transitions
@@ -16759,6 +16830,7 @@ mod tests {
         assert!(
             db.promote_next_deferred_callback_for_class("mika", "implement")
                 .unwrap()
+                .is_some()
         );
         let after_first_impl = (
             db.get_task_unscoped(&id_impl).unwrap().unwrap().status,
@@ -16777,6 +16849,7 @@ mod tests {
         assert!(
             db.promote_next_deferred_callback_for_class("mika", "implement")
                 .unwrap()
+                .is_some()
         );
         assert_eq!(
             db.get_task_unscoped(&id_impl).unwrap().unwrap().status,
@@ -16792,12 +16865,14 @@ mod tests {
 
         // Drained.
         assert!(
-            !db.promote_next_deferred_callback_for_class("mika", "implement")
+            db.promote_next_deferred_callback_for_class("mika", "implement")
                 .unwrap()
+                .is_none()
         );
         assert!(
-            !db.promote_next_deferred_callback_for_class("mika", "groom")
+            db.promote_next_deferred_callback_for_class("mika", "groom")
                 .unwrap()
+                .is_none()
         );
     }
 
@@ -16837,7 +16912,7 @@ mod tests {
         let w2_id = db.create_task(&w2).unwrap();
 
         // Step 1: Promote W1 (simulates blocking callback completion)
-        assert!(db.promote_next_deferred_callback("mika").unwrap());
+        assert!(db.promote_next_deferred_callback("mika").unwrap().is_some());
         let t1 = db.get_task_unscoped(&w1_id).unwrap().unwrap();
         assert_eq!(t1.status, "completed");
         assert!(t1.completed_at.is_some());
@@ -16855,7 +16930,7 @@ mod tests {
 
         // Step 3: Chain promotion — promote W2 (this was blocked by the
         // anti-cascade guard before mika#1070)
-        assert!(db.promote_next_deferred_callback("mika").unwrap());
+        assert!(db.promote_next_deferred_callback("mika").unwrap().is_some());
         let t2 = db.get_task_unscoped(&w2_id).unwrap().unwrap();
         assert_eq!(
             t2.status, "completed",
@@ -17094,12 +17169,13 @@ mod tests {
         let result = db
             .has_active_callback_tasks_excluding("other-task", "mika", "implement")
             .unwrap();
-        let (parent_id, callback_id) = result.expect(
+        let (parent_id, callback_id, callback_label) = result.expect(
             "real (non-deferred) pending callback MUST still be detected as an \
              active dispatch — exclusion is narrowly scoped to :deferred wrappers",
         );
         assert_eq!(parent_id, p_b, "should match Parent B (the real dispatch)");
         assert_eq!(callback_id, real_b_id);
+        assert_eq!(callback_label, "long_running:run_claude_pilot");
 
         // Mixed-state: querying from Parent B itself excludes B's own callback
         // via the parent_task_id != ?1 clause, and the only remaining row is
@@ -17136,7 +17212,7 @@ mod tests {
         let result = db
             .has_active_callback_tasks_excluding("other-task", "mika", "implement")
             .unwrap();
-        let (parent_id, callback_id) = result.expect(
+        let (parent_id, callback_id, _callback_label) = result.expect(
             "label `:deferred:retry` is NOT a suffix match for `%:deferred` — \
              must still be counted as an active dispatch",
         );

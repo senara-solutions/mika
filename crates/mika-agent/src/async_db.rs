@@ -574,11 +574,13 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_task_descendants(&r)).await
     }
 
+    /// Returns `(parent_task_id, callback_id, callback_label)` of the blocking
+    /// callback, or `None` if no conflicting dispatch exists (#1172 W3).
     pub async fn has_active_callback_tasks_excluding(
         &self,
         excluded_parent_id: &str,
         dispatch_class: &str,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<Option<(String, String, String)>> {
         let p = excluded_parent_id.to_owned();
         let a = self.agent_id.clone();
         let c = dispatch_class.to_owned();
@@ -612,6 +614,16 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Check if a parent task has any active non-deferred callback child (#1172 R9).
+    pub async fn has_non_deferred_active_callback_child(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<bool> {
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.has_non_deferred_active_callback_child(&p))
+            .await
+    }
+
     /// Count pending deferred-dispatch callbacks for this agent (mika#1011).
     pub async fn count_pending_deferred_callbacks(&self) -> Result<i64> {
         let a = self.agent_id.clone();
@@ -620,17 +632,19 @@ impl AsyncDatabase {
     }
 
     /// Promote the next pending deferred-dispatch callback for dispatch (mika#1011).
-    pub async fn promote_next_deferred_callback(&self) -> Result<bool> {
+    /// Returns `Some(task_id)` of the promoted task, or `None` if no wrapper pending.
+    pub async fn promote_next_deferred_callback(&self) -> Result<Option<String>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.promote_next_deferred_callback(&a))
             .await
     }
 
     /// Class-scoped sibling of `promote_next_deferred_callback` (mika#1175).
+    /// Returns `Some(task_id)` of the promoted task, or `None` if no wrapper pending.
     pub async fn promote_next_deferred_callback_for_class(
         &self,
         dispatch_class: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let a = self.agent_id.clone();
         let c = dispatch_class.to_string();
         self.with_db(move |db| db.promote_next_deferred_callback_for_class(&a, &c))
@@ -661,6 +675,20 @@ impl AsyncDatabase {
         self.with_db(move |db| {
             let refs: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
             db.get_tasks_by_status(&id, &refs)
+        })
+        .await
+    }
+
+    /// Like `get_tasks_by_status`, but with an optional label substring filter (#1172 W1).
+    pub async fn get_tasks_by_status_and_label(
+        &self,
+        statuses: Vec<String>,
+        label_contains: Option<String>,
+    ) -> Result<Vec<Task>> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| {
+            let refs: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+            db.get_tasks_by_status_and_label(&id, &refs, label_contains.as_deref())
         })
         .await
     }
