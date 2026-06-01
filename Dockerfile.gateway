@@ -16,6 +16,9 @@ RUN mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agen
     && echo "" > crates/mika-agent/src/lib.rs \
     && mkdir -p crates/mika-agent/src && echo "fn main() {}" > crates/mika-agent/src/cli.rs
 
+COPY crates/mika-a2a/Cargo.toml crates/mika-a2a/Cargo.toml
+RUN mkdir -p crates/mika-a2a/src && echo "" > crates/mika-a2a/src/lib.rs
+
 # Build with BuildKit cache mounts for incremental compilation
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
