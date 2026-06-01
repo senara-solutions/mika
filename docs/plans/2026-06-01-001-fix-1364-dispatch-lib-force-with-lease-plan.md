@@ -1,7 +1,7 @@
 ---
 title: "fix: dispatch-lib strands rebased impl behind stale remote tip (force-with-lease + rebase diagnostics)"
 type: fix
-status: active
+status: completed
 date: 2026-06-01
 issue: senara-solutions/mika#1364
 target_repo: mika

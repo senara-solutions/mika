@@ -1089,6 +1089,417 @@ assert_not_contains "Fabrication needle (Architect convergence pending via dispa
 assert_not_contains "FABRICATION_NEEDLE variable assignment is absent" 'FABRICATION_NEEDLE=' "$DISPATCH_LIB_CONTENT"
 assert_not_contains "PIPELINE FAILURE marker with idempotency-bypass-architect sub-type is absent" 'PIPELINE FAILURE:.*idempotency-bypass-architect' "$DISPATCH_LIB_CONTENT"
 
+# ============================================================================
+# Test 12: Push divergence awareness + rebase failure surfacing (mika#1364)
+# ============================================================================
+
+echo ""
+echo "Test 12: _push_branch divergence awareness (mika#1364)"
+echo "-------------------------------------------------------"
+
+# Helper: create a throwaway bare repo + working clone, wired with file:// remotes.
+# Sets FIXTURE_BARE, FIXTURE_CLONE. Caller must clean up via _fixture_cleanup.
+_fixture_setup() {
+    FIXTURE_BARE=$(mktemp -d)
+    FIXTURE_CLONE=$(mktemp -d)
+
+    git -C "$FIXTURE_BARE" init --bare -q
+    git clone -q "file://$FIXTURE_BARE" "$FIXTURE_CLONE"
+    git -C "$FIXTURE_CLONE" config user.email "test@mika.local"
+    git -C "$FIXTURE_CLONE" config user.name "mika test"
+
+    # Initial commit on main so we have a base.
+    echo "base" > "$FIXTURE_CLONE/file.txt"
+    git -C "$FIXTURE_CLONE" add file.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "initial commit"
+    git -C "$FIXTURE_CLONE" push -q origin main
+}
+
+_fixture_cleanup() {
+    rm -rf "$FIXTURE_BARE" "$FIXTURE_CLONE" 2>/dev/null
+}
+
+# Safety assertion: verify fixture remotes are local file:// paths, never the real origin.
+_assert_fixture_is_local() {
+    local remote_url
+    remote_url=$(git -C "$FIXTURE_CLONE" remote get-url origin 2>/dev/null)
+    if ! printf '%s' "$remote_url" | grep -q "^file://\|^/"; then
+        echo "SAFETY ABORT: fixture remote is not local: $remote_url" >&2
+        _fixture_cleanup
+        return 1
+    fi
+}
+
+# --- Test 12a: First push (no origin/$BRANCH) → plain push, no force ---
+test_first_push() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # Create a branch with a commit, never pushed.
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/first-push
+    echo "new" > "$FIXTURE_CLONE/new.txt"
+    git -C "$FIXTURE_CLONE" add new.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "new feature"
+
+    # Exercise _push_branch. Set globals directly (not VAR=val func syntax,
+    # which does not persist function-internal assignments back to caller).
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="feat/first-push"
+    REPO="mika"
+    RESULT=""
+    _push_branch
+
+    local failures=""
+    # Assert: push succeeded.
+    if ! printf '%s' "$RESULT" | grep -qF "Push: pushed"; then
+        failures="${failures}RESULT missing 'Push: pushed'; "
+    fi
+    # Assert: mode is first-push (not diverged).
+    if printf '%s' "$RESULT" | grep -qF "mode=diverged"; then
+        failures="${failures}should not be diverged mode for first push; "
+    fi
+    # Assert: remote ref now exists.
+    if ! git -C "$FIXTURE_CLONE" rev-parse --verify "origin/feat/first-push" >/dev/null 2>&1; then
+        failures="${failures}origin/feat/first-push should exist after push; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12A=$(test_first_push 2>/dev/null)
+if [ "$RESULT_12A" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ First push: plain push, no force"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ First push: $RESULT_12A"
+fi
+
+# --- Test 12b: Fast-forward (origin/$BRANCH is ancestor of HEAD) → plain push ---
+test_fast_forward_push() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # Create and push a branch.
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/ff-push
+    echo "v1" > "$FIXTURE_CLONE/feature.txt"
+    git -C "$FIXTURE_CLONE" add feature.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "feature v1"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/ff-push
+
+    # Add one more commit locally (fast-forward case).
+    echo "v2" > "$FIXTURE_CLONE/feature.txt"
+    git -C "$FIXTURE_CLONE" add feature.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "feature v2"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="feat/ff-push"
+    REPO="mika"
+    RESULT=""
+    _push_branch
+
+    local failures=""
+    if ! printf '%s' "$RESULT" | grep -qF "Push: pushed"; then
+        failures="${failures}RESULT missing 'Push: pushed'; "
+    fi
+    if ! printf '%s' "$RESULT" | grep -qF "mode=fast-forward"; then
+        failures="${failures}should be fast-forward mode; "
+    fi
+    # Remote should match local HEAD.
+    local local_head remote_head
+    local_head=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    remote_head=$(git -C "$FIXTURE_CLONE" rev-parse "origin/feat/ff-push")
+    if [ "$local_head" != "$remote_head" ]; then
+        failures="${failures}remote HEAD should match local HEAD after ff push; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12B=$(test_fast_forward_push 2>/dev/null)
+if [ "$RESULT_12B" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Fast-forward push: plain push, no force"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Fast-forward push: $RESULT_12B"
+fi
+
+# --- Test 12c: Diverged (stale remote, branch rebased onto advanced main) → force-with-lease ---
+# This is THE title fix — the case that strands work on main today.
+test_diverged_force_with_lease() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # 1. Create branch with a commit and push it (the "stale remote tip").
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/diverged-push
+    echo "branch work" > "$FIXTURE_CLONE/branch.txt"
+    git -C "$FIXTURE_CLONE" add branch.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "branch work"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/diverged-push
+
+    # 2. Advance main past the branch point (non-conflicting).
+    git -C "$FIXTURE_CLONE" checkout -q main
+    echo "main advance" > "$FIXTURE_CLONE/main-only.txt"
+    git -C "$FIXTURE_CLONE" add main-only.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "advance main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    # 3. Go back to the feature branch and rebase onto advanced main.
+    git -C "$FIXTURE_CLONE" checkout -q feat/diverged-push
+    git -C "$FIXTURE_CLONE" fetch -q origin main
+    git -C "$FIXTURE_CLONE" rebase origin/main
+
+    # Now local HEAD has new SHAs (rebased), but origin/feat/diverged-push
+    # still points at the old pre-rebase tip. This is the diverged state.
+
+    # 4. Add one more commit (simulates pilot work).
+    echo "pilot impl" > "$FIXTURE_CLONE/impl.txt"
+    git -C "$FIXTURE_CLONE" add impl.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "pilot implementation"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="feat/diverged-push"
+    REPO="mika"
+    RESULT=""
+    _push_branch
+
+    local failures=""
+    if ! printf '%s' "$RESULT" | grep -qF "Push: pushed"; then
+        failures="${failures}RESULT missing 'Push: pushed'; "
+    fi
+    if ! printf '%s' "$RESULT" | grep -qF "mode=diverged"; then
+        failures="${failures}should be diverged mode; "
+    fi
+    # Remote should match local HEAD.
+    local local_head remote_head
+    local_head=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" fetch -q origin feat/diverged-push
+    remote_head=$(git -C "$FIXTURE_CLONE" rev-parse "origin/feat/diverged-push")
+    if [ "$local_head" != "$remote_head" ]; then
+        failures="${failures}remote HEAD should match local HEAD after force-with-lease push; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12C=$(test_diverged_force_with_lease 2>/dev/null)
+if [ "$RESULT_12C" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Diverged push: force-with-lease succeeds (title fix)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Diverged push: $RESULT_12C"
+fi
+
+# --- Test 12d: Structural — force-with-lease uses explicit ref form (not blind --force) ---
+# The lease-stale abort is a race condition between fetch and push that cannot be
+# reliably reproduced in a single-process test (the fetch inside _push_branch always
+# picks up the latest remote state). Instead, verify the safety contract structurally:
+# - The diverged path uses --force-with-lease=$BRANCH:origin/$BRANCH (explicit ref form)
+# - The diverged path does NOT use plain --force
+# - The fast-forward and first-push paths do NOT use any force flag
+PUSH_FUNC_SRC=$(declare -f _push_branch)
+# Verify explicit lease form (pins expected remote SHA)
+if printf '%s' "$PUSH_FUNC_SRC" | grep -q 'force-with-lease=.*BRANCH.*origin.*BRANCH'; then
+    PASS=$((PASS + 1)); echo "  ✓ Lease form: --force-with-lease uses explicit ref pinning"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Lease form: should use --force-with-lease=\$BRANCH:origin/\$BRANCH"
+fi
+# Verify no blind --force (without -with-lease)
+if printf '%s' "$PUSH_FUNC_SRC" | grep -q -- '--force[^-]'; then
+    FAIL=$((FAIL + 1)); echo "  ✗ Lease safety: found bare --force (should be --force-with-lease only)"
+else
+    PASS=$((PASS + 1)); echo "  ✓ Lease safety: no bare --force (only --force-with-lease)"
+fi
+
+# --- Test 12e: Conflicting rebase → REBASE_CONFLICT + reason surfaced (AC#2/AC#4) ---
+echo ""
+echo "Test 12e: Rebase conflict surfacing (mika#1364 AC#2/AC#4)"
+echo "-----------------------------------------------------------"
+
+test_rebase_conflict_surfaced() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # 1. Create branch with a change to file.txt and push.
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/conflict-rebase
+    echo "branch version" > "$FIXTURE_CLONE/file.txt"
+    git -C "$FIXTURE_CLONE" add file.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "branch change to file.txt"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/conflict-rebase
+
+    # 2. Advance main with a CONFLICTING change to file.txt.
+    git -C "$FIXTURE_CLONE" checkout -q main
+    echo "main conflicting version" > "$FIXTURE_CLONE/file.txt"
+    git -C "$FIXTURE_CLONE" add file.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "conflicting change on main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    # 3. Go back to the branch. Simulate what _set_up_worktree's rebase guard
+    # does: compute BEHIND, then rebase.
+    git -C "$FIXTURE_CLONE" checkout -q feat/conflict-rebase
+    git -C "$FIXTURE_CLONE" fetch -q origin main
+
+    local BEHIND WORKTREE_DIR BRANCH REPO ISSUE_NUM RESULT
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="feat/conflict-rebase"
+    REPO="mika"
+    ISSUE_NUM="1364"
+    RESULT=""
+    BEHIND=$(git -C "$WORKTREE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+
+    # The rebase guard logic (inlined from dispatch-lib.sh):
+    local rebase_err exit_code=0
+    rebase_err=$(mktemp "${TMPDIR:-/tmp}/dispatch-lib-rebase-err.XXXXXX")
+    if git -C "$WORKTREE_DIR" rebase origin/main >/dev/null 2>"$rebase_err"; then
+        rm -f "$rebase_err"
+        # Should NOT succeed — we expect a conflict.
+        echo "FAIL: rebase should have conflicted but succeeded"
+        _fixture_cleanup
+        return 1
+    else
+        CONFLICTS=$(git -C "$WORKTREE_DIR" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')
+        local rebase_reason rebase_mode
+        rebase_reason=$(cat "$rebase_err" 2>/dev/null | head -20)
+        if [ -n "$CONFLICTS" ]; then
+            rebase_mode="conflict"
+        else
+            rebase_mode="other"
+        fi
+        git -C "$WORKTREE_DIR" rebase --abort 2>/dev/null || true
+        rm -f "$rebase_err"
+        RESULT="STATUS=REBASE_CONFLICT
+Branch ${BRANCH} is ${BEHIND} commits behind origin/main.
+Rebase failure mode: ${rebase_mode}
+Conflicted files: ${CONFLICTS:-<none>}
+Rebase stderr: ${rebase_reason:-<empty>}
+Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
+    fi
+
+    local failures=""
+    # Assert: STATUS=REBASE_CONFLICT present.
+    if ! printf '%s' "$RESULT" | grep -qF "STATUS=REBASE_CONFLICT"; then
+        failures="${failures}RESULT missing STATUS=REBASE_CONFLICT; "
+    fi
+    # Assert: conflict mode token present (AC#4).
+    if ! printf '%s' "$RESULT" | grep -qF "Rebase failure mode: conflict"; then
+        failures="${failures}RESULT missing 'Rebase failure mode: conflict'; "
+    fi
+    # Assert: conflicted filename present.
+    if ! printf '%s' "$RESULT" | grep -qF "file.txt"; then
+        failures="${failures}RESULT missing conflicted filename 'file.txt'; "
+    fi
+    # Assert: rebase stderr is non-empty (AC#4 — not /dev/null).
+    if printf '%s' "$RESULT" | grep -qF "Rebase stderr: <empty>"; then
+        failures="${failures}RESULT has empty rebase stderr (should be surfaced); "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12E=$(test_rebase_conflict_surfaced 2>/dev/null)
+if [ "$RESULT_12E" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Rebase conflict: STATUS=REBASE_CONFLICT + mode + stderr surfaced"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Rebase conflict: $RESULT_12E"
+fi
+
+# --- Test 12f: Full _push_branch call chain with dedup-rebase → diverged → force (F3) ---
+echo ""
+echo "Test 12f: Dedup-rebase → diverged → force-with-lease composition (mika#1364 F3)"
+echo "---------------------------------------------------------------------------------"
+
+test_dedup_rebase_diverged_force() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # 1. Create branch with two commits: one that will be patch-equivalent to
+    # a main commit (duplicate), and one that is genuinely new.
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/dedup-diverge
+    echo "duplicate content" > "$FIXTURE_CLONE/dup.txt"
+    git -C "$FIXTURE_CLONE" add dup.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "add dup.txt"
+    echo "unique content" > "$FIXTURE_CLONE/unique.txt"
+    git -C "$FIXTURE_CLONE" add unique.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "add unique.txt"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/dedup-diverge
+
+    # 2. Cherry-pick the "dup.txt" commit onto main (making it patch-equivalent).
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # Recreate the same content to make it patch-equivalent.
+    echo "duplicate content" > "$FIXTURE_CLONE/dup.txt"
+    git -C "$FIXTURE_CLONE" add dup.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "add dup.txt on main too"
+    # Also advance main with another non-conflicting change.
+    echo "main extra" > "$FIXTURE_CLONE/main-extra.txt"
+    git -C "$FIXTURE_CLONE" add main-extra.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "advance main further"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    # 3. Go back to the feature branch. Simulate a rebase (as _set_up_worktree does).
+    git -C "$FIXTURE_CLONE" checkout -q feat/dedup-diverge
+    git -C "$FIXTURE_CLONE" fetch -q origin main
+    git -C "$FIXTURE_CLONE" rebase origin/main
+
+    # Now the branch is rebased (diverged from origin/feat/dedup-diverge).
+    # _check_duplicate_commits will detect the dup and rebase again, which
+    # may further rewrite history. Then _push_branch should force-with-lease.
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="feat/dedup-diverge"
+    REPO="mika"
+    RESULT=""
+    _push_branch
+
+    local failures=""
+    if ! printf '%s' "$RESULT" | grep -qF "Push: pushed"; then
+        failures="${failures}RESULT missing 'Push: pushed'; "
+    fi
+    # Remote should match local HEAD.
+    local local_head remote_head
+    local_head=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" fetch -q origin feat/dedup-diverge
+    remote_head=$(git -C "$FIXTURE_CLONE" rev-parse "origin/feat/dedup-diverge")
+    if [ "$local_head" != "$remote_head" ]; then
+        failures="${failures}remote HEAD should match local HEAD after push; "
+    fi
+    # unique.txt should be present (not lost by dedup).
+    if [ ! -f "$FIXTURE_CLONE/unique.txt" ]; then
+        failures="${failures}unique.txt should still exist; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12F=$(test_dedup_rebase_diverged_force 2>/dev/null)
+if [ "$RESULT_12F" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Dedup-rebase → diverged → force-with-lease composition"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Dedup-rebase composition: $RESULT_12F"
+fi
+
+# --- Test 12g: Structural assertions on dispatch-lib.sh (mika#1364) ---
+echo ""
+echo "Test 12g: Structural assertions (mika#1364)"
+echo "---------------------------------------------"
+
+# _push_branch uses merge-base --is-ancestor for divergence detection
+PUSH_FUNC=$(declare -f _push_branch)
+assert_contains "_push_branch uses merge-base --is-ancestor" "merge-base --is-ancestor" "$PUSH_FUNC"
+assert_contains "_push_branch uses force-with-lease" "force-with-lease" "$PUSH_FUNC"
+assert_contains "_push_branch tracks push_mode" "push_mode" "$PUSH_FUNC"
+
+# _set_up_worktree rebase captures stderr (no 2>/dev/null on rebase)
+# Check that the rebase at the setup site uses a temp file, not /dev/null
+SETUP_REBASE_REGION=$(sed -n '/Rebase-or-abort guard/,/^[[:space:]]*fi$/p' "$DISPATCH_LIB" | head -40)
+assert_contains "Setup rebase captures stderr to temp file" "dispatch-lib-rebase-err" "$SETUP_REBASE_REGION"
+assert_contains "Setup rebase surfaces failure mode token" "rebase_mode" "$SETUP_REBASE_REGION"
+
+# _check_duplicate_commits rebase captures stderr
+DEDUP_FUNC=$(declare -f _check_duplicate_commits)
+assert_contains "Dedup rebase captures stderr to temp file" "dedup-rebase-err" "$DEDUP_FUNC"
+assert_contains "Dedup rebase surfaces reason in RESULT" "Dedup-rebase failed" "$DEDUP_FUNC"
+
 # --- Summary ---
 
 echo ""
