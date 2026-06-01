@@ -173,14 +173,6 @@ Update `docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-
 
    A new contributor adding a recurrence to the N catalogue should add the verbatim phrasing to whichever file's shape it matches, and add a frozen `*_pre_fix.json` fixture to `tests/eval/grounding_regressions/fixtures/` alongside.
 
-   **Canonical fixture locations** (cite these in Rule 4 so the rule is actionable, not advisory — per first-pass NF1):
-   - `crates/mika-agent/tests/eval/grounding_regressions/asserted_unavailability_caught.rs` (Patterns 1, 2, 4 — canonical phrasings)
-   - `crates/mika-agent/tests/eval/grounding_regressions/asserted_unavailability_genuine.rs` (false-positive defense — genuinely disabled tool)
-   - `crates/mika-agent/tests/eval/grounding_regressions/asserted_unavailability_elided_copula.rs` (Patterns 2, 3, 4 elided/adverb-interposed shapes — new in this PR)
-   - `crates/mika-agent/src/agent.rs` `#[cfg(test)] mod tests` block — unit tests for `detect_asserted_unavailability()` directly (registry-filter and case-insensitive coverage)
-
-   A new contributor adding a recurrence to the N catalogue should add the verbatim phrasing to whichever file's shape it matches, and add a frozen `*_pre_fix.json` fixture to `tests/eval/grounding_regressions/fixtures/` alongside.
-
 3. **Update the "Forward Work" section** — note that the structural counterpart is *operational and regex-extended*, with the verbatim-fixture rule now governing pattern maintenance.
 
 4. **Update "Citations"** — add mika#894 alongside mika#862 as the regex-extension follow-up.
