@@ -30,7 +30,7 @@ This is the same anti-pattern documented in `harden-write-skill-variant-no-path-
 
 Wire validation into the startup path, not just into an explicit CLI command. The implementation pattern:
 
-1. **Add a `validate_loaded()` method** on the registry that calls the existing `validate_skill()` on every loaded entry
+1. **Add a `apply_load_safety_check()` method** on the registry that calls the existing `validate_skill()` on every loaded entry
 2. **Run it after all mutations** (DB overrides, dependency resolution) since mutations can change validation context
 3. **Apply a decision matrix** — classify each failure as skip-worthy (skill cannot function) or warn-only (cosmetic/degraded but still operational)
 4. **Use a two-phase collect-then-apply pattern** when the registry struct has multiple mutable fields (borrow checker prevents mutating `skipped` inside a `retain()` closure that reads `skills`)
@@ -66,7 +66,7 @@ After: validation at every startup site
 ```rust
 let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
 skill_registry.apply_overrides(&overrides);
-skill_registry.validate_loaded();  // semantic validation with decision matrix
+skill_registry.apply_load_safety_check();  // semantic validation with decision matrix
 let skill_registry = Arc::new(skill_registry);
 ```
 

@@ -73,7 +73,7 @@ Plus per-skip `WARN` lines with name and reason:
 WARN skill skipped name=big-skill reason="oversized prompt (29000B, limit 16384B)"
 ```
 
-Call `log_summary()` after both `apply_overrides()` and `validate_loaded()` for accurate counts that include validation-demoted skills.
+Call `log_summary()` after both `apply_overrides()` and `apply_load_safety_check()` for accurate counts that include validation-demoted skills.
 
 ### Key files
 
@@ -86,7 +86,7 @@ Call `log_summary()` after both `apply_overrides()` and `validate_loaded()` for 
 - **All oversized skills are hard-skipped.** A skill with tools but no prompt produces garbage — the LLM has tool definitions but no system prompt context to guide their use. Hard-skipping is always safer than loading with an empty prompt.
 - **Use typed return values instead of sentinel strings.** The previous `load_snippet_with_limit() -> String` collapsed four distinct outcomes into one type. The `SnippetLoadResult` enum makes the failure mode explicit and matchable.
 - **Evict disabled skills at the registry level, not at match time.** `apply_overrides()` removes disabled skills from `entries` before any matching or tool registration runs. No belt-and-suspenders checks needed downstream (#629, #630).
-- **Log after all mutation phases.** Call `log_summary()` after both `apply_overrides()` (evicts disabled) and `validate_loaded()` (demotes broken skills to skipped) for accurate three-state counts.
+- **Log after all mutation phases.** Call `log_summary()` after both `apply_overrides()` (evicts disabled) and `apply_load_safety_check()` (demotes broken skills to skipped) for accurate three-state counts.
 - **Use `mika skills validate`** to diagnose oversized prompts. The differentiated messaging now tells operators exactly what will happen for their skill type.
 
 ## Related
