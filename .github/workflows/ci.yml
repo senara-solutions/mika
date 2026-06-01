@@ -132,10 +132,31 @@ jobs:
           GITHUB_PR_BODY: ${{ github.event.pull_request.body }}
         run: bash scripts/verify-pipeline.sh origin/main
 
+  docker-build-filter:
+    name: Docker Build Filter
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'pull_request'
+    outputs:
+      docker-relevant: ${{ steps.filter.outputs.docker-relevant }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docker-relevant:
+              - 'Dockerfile.agent'
+              - 'Dockerfile.gateway'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - '.github/workflows/ci.yml'
+
   docker-build:
     name: Docker Build
     runs-on: ubuntu-22.04
-    if: github.event_name == 'pull_request'
+    needs: docker-build-filter
+    if: github.event_name == 'pull_request' && needs.docker-build-filter.outputs.docker-relevant == 'true'
     strategy:
       matrix:
         dockerfile: [Dockerfile.agent, Dockerfile.gateway]
