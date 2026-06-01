@@ -37,6 +37,7 @@ use mika_agent::db::NewTask;
 use mika_agent::tools::{Tool, ToolContext, ToolOutput, default_tools};
 use mika_common::claude::ToolDefinition;
 use mika_common::llm::{LlmContent, LlmContentBlock, LlmRequest, LlmRole};
+use mika_common::text::safe_truncate;
 
 use super::*;
 
@@ -282,7 +283,7 @@ async fn test_milestone_close_regression_no_patch() -> anyhow::Result<()> {
         correction_text.contains("close PATCH"),
         "Expected milestone-close guard correction (contains 'close PATCH'), \
          got completion-claim or other guard. Correction text: {}",
-        &correction_text[..correction_text.len().min(500)]
+        safe_truncate(&correction_text, 500)
     );
 
     Ok(())
