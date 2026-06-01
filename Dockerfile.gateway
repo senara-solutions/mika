@@ -16,8 +16,9 @@ RUN mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agen
     && echo "" > crates/mika-agent/src/lib.rs \
     && mkdir -p crates/mika-agent/src && echo "fn main() {}" > crates/mika-agent/src/cli.rs
 
-COPY crates/mika-a2a/Cargo.toml crates/mika-a2a/Cargo.toml
-RUN mkdir -p crates/mika-a2a/src && echo "" > crates/mika-a2a/src/lib.rs
+# mika-gateway depends on mika-a2a's real code (mika_a2a::jsonrpc, A2A proxy),
+# so copy the crate in full — an empty-lib stub breaks the build with E0432 (mika#1370).
+COPY crates/mika-a2a/ crates/mika-a2a/
 
 COPY crates/mika-cli/Cargo.toml crates/mika-cli/Cargo.toml
 RUN mkdir -p crates/mika-cli/src && echo "fn main() {}" > crates/mika-cli/src/main.rs
