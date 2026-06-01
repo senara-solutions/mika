@@ -1,7 +1,7 @@
 ---
 title: "feat: auto-detect tactical-surface PRs as Pipeline-Exempt by changed-path-set"
 type: feat
-status: active
+status: completed
 date: 2026-06-01
 ---
 
