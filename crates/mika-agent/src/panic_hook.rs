@@ -1,0 +1,263 @@
+/// Install a tracing-aware panic hook that emits structured log events
+/// before chaining to the previous (default) hook.
+///
+/// Must be called after tracing is initialized and before any
+/// tokio tasks are spawned. This is the defense-in-depth layer for
+/// spawned tasks whose `JoinHandle` is dropped — tokio's default
+/// panic handler writes to stderr as raw text, bypassing the structured
+/// JSON tracing layer. See mika#765.
+pub fn install_tracing_panic_hook() {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string payload>".to_string());
+
+        tracing::error!(
+            target: "panic",
+            location = %location,
+            message = %msg,
+            thread = %std::thread::current().name().unwrap_or("<unnamed>"),
+            event = "process_panic",
+            "Rust panic caught by tracing hook"
+        );
+
+        // Chain to previous hook — preserves backtrace formatting,
+        // test panic reporting, and any other registered handlers.
+        prev_hook(info);
+    }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Helper: build a tracing subscriber that writes to an in-memory buffer.
+    /// Returns (subscriber, buffer) where buffer can be read after the test.
+    fn capturing_subscriber() -> (impl tracing::Subscriber + Send + Sync, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = buf.clone();
+
+        let layer = fmt::layer()
+            .with_writer(move || {
+                // tracing_subscriber calls this per-event to get a writer
+                let w = writer.clone();
+                WriterHandle(w)
+            })
+            .with_ansi(false)
+            .with_target(true);
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        (subscriber, buf)
+    }
+
+    /// A `Write` impl that appends to a shared `Vec<u8>`.
+    struct WriterHandle(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WriterHandle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_hook_chains_to_previous() {
+        let chained = Arc::new(AtomicBool::new(false));
+        let chained_clone = chained.clone();
+
+        // Install a custom hook that sets the flag
+        std::panic::set_hook(Box::new(move |_| {
+            chained_clone.store(true, Ordering::SeqCst);
+        }));
+
+        // Install our tracing hook on top (chains to the flag-setting hook)
+        install_tracing_panic_hook();
+
+        // Trigger a panic and catch it
+        let _ = std::panic::catch_unwind(|| {
+            panic!("test chain");
+        });
+
+        assert!(
+            chained.load(Ordering::SeqCst),
+            "previous hook should have been called via chaining"
+        );
+
+        // Restore default hook so other tests aren't affected
+        let _ = std::panic::take_hook();
+    }
+
+    #[test]
+    fn test_str_payload_captured() {
+        let (subscriber, buf) = capturing_subscriber();
+
+        // Scope the subscriber so it's active during the panic
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Install a no-op previous hook so the default handler doesn't interfere
+        std::panic::set_hook(Box::new(|_| {}));
+        install_tracing_panic_hook();
+
+        let _ = std::panic::catch_unwind(|| {
+            panic!("str payload test");
+        });
+
+        let binding = buf.lock().unwrap();
+        let output = String::from_utf8_lossy(&binding);
+        assert!(
+            output.contains("process_panic"),
+            "output should contain event name 'process_panic', got: {output}"
+        );
+        assert!(
+            output.contains("str payload test"),
+            "output should contain the panic message, got: {output}"
+        );
+
+        let _ = std::panic::take_hook();
+    }
+
+    #[test]
+    fn test_string_payload_captured() {
+        let (subscriber, buf) = capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        std::panic::set_hook(Box::new(|_| {}));
+        install_tracing_panic_hook();
+
+        let _ = std::panic::catch_unwind(|| {
+            panic!("{}", String::from("owned message test"));
+        });
+
+        let binding = buf.lock().unwrap();
+        let output = String::from_utf8_lossy(&binding);
+        assert!(
+            output.contains("process_panic"),
+            "output should contain event name 'process_panic', got: {output}"
+        );
+        assert!(
+            output.contains("owned message test"),
+            "output should contain the owned string message, got: {output}"
+        );
+
+        let _ = std::panic::take_hook();
+    }
+
+    #[test]
+    fn test_non_string_payload() {
+        let (subscriber, buf) = capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        std::panic::set_hook(Box::new(|_| {}));
+        install_tracing_panic_hook();
+
+        let _ = std::panic::catch_unwind(|| {
+            std::panic::panic_any(42i32);
+        });
+
+        let binding = buf.lock().unwrap();
+        let output = String::from_utf8_lossy(&binding);
+        assert!(
+            output.contains("process_panic"),
+            "output should contain event name 'process_panic', got: {output}"
+        );
+        assert!(
+            output.contains("<non-string payload>"),
+            "output should contain non-string payload fallback, got: {output}"
+        );
+
+        let _ = std::panic::take_hook();
+    }
+
+    #[tokio::test]
+    async fn test_spawned_task_panic_reaches_tracing() {
+        // `set_default` is thread-local, but tokio spawns tasks on worker
+        // threads that don't inherit it. Use an AtomicBool-based layer that
+        // detects the `process_panic` event across any thread.
+        let saw_event = Arc::new(AtomicBool::new(false));
+        let saw_event_clone = saw_event.clone();
+
+        let detect_layer = PanicDetectLayer(saw_event_clone);
+        let subscriber = tracing_subscriber::registry().with(detect_layer);
+
+        // Use set_global_default — this test validates the cross-thread
+        // dispatch path which requires a global subscriber. Safe because
+        // if another test already set a global, this returns Err and we
+        // skip gracefully.
+        let global_set = tracing::subscriber::set_global_default(subscriber).is_ok();
+        if !global_set {
+            // Another test already claimed the global subscriber slot.
+            // The hook still fires tracing::error!, it just goes to
+            // whatever subscriber is installed. Skip the assertion.
+            return;
+        }
+
+        std::panic::set_hook(Box::new(|_| {}));
+        install_tracing_panic_hook();
+
+        // Spawn a task that panics — drop the handle (the motivating use case)
+        #[allow(clippy::let_underscore_future)]
+        let _ = tokio::spawn(async {
+            panic!("spawned task panic");
+        });
+
+        // Give the panic time to fire on the worker thread
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            saw_event.load(Ordering::SeqCst),
+            "spawned task panic should produce a structured tracing event with 'process_panic'"
+        );
+
+        let _ = std::panic::take_hook();
+    }
+
+    /// A minimal tracing layer that sets an `AtomicBool` when it sees
+    /// an event with `event = "process_panic"`. Works across threads
+    /// (unlike the `fmt`-based capturing subscriber used in sync tests).
+    struct PanicDetectLayer(Arc<AtomicBool>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PanicDetectLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            // Visit the event fields looking for event = "process_panic"
+            let mut visitor = PanicFieldVisitor(false);
+            event.record(&mut visitor);
+            if visitor.0 {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    struct PanicFieldVisitor(bool);
+
+    impl tracing::field::Visit for PanicFieldVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "event" && value == "process_panic" {
+                self.0 = true;
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+}

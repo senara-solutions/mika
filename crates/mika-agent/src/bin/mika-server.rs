@@ -29,5 +29,9 @@ async fn main() -> Result<()> {
         settings.log_llm_bodies,
     );
 
+    // Install tracing-aware panic hook (defense-in-depth for spawned tasks
+    // that panic without their JoinHandle being awaited — see mika#765)
+    mika_agent::panic_hook::install_tracing_panic_hook();
+
     mika_agent::server::run_server(&settings).await
 }
