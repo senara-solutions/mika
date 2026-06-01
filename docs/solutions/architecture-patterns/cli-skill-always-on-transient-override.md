@@ -39,7 +39,7 @@ Call order matters (disable first, enable second — matches `apply_overrides()`
 2. `apply_overrides()` — apply DB overrides (evicts disabled skills)
 3. `apply_transient_disable()` — apply CLI disable overrides (evicts skills)
 4. `apply_transient_always_on()` — apply CLI enable overrides (cannot resurrect evicted skills)
-5. `validate_loaded()` — validate the final registry state
+5. `apply_load_safety_check()` — validate the final registry state
 6. `Arc::new()` — wrap for agent loop
 
 ### Conflict detection

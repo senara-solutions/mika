@@ -54,9 +54,9 @@ impl Tool for ListSkillsTool {
             registry.apply_overrides(&overrides);
         }
 
-        // Run semantic validation to promote broken-handler/tools.json skills to skipped,
+        // Run load-time crash-protection to promote broken-handler/tools.json skills to skipped,
         // matching the startup paths (chat.rs, ask.rs, server/mod.rs).
-        registry.validate_loaded();
+        registry.apply_load_safety_check();
         registry.log_summary();
 
         let entries = registry.skills();

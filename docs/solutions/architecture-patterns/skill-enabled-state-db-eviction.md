@@ -198,4 +198,4 @@ which is exactly what `skill_overrides` already stored.
 - Plan: `docs/plans/2026-04-18-001-feat-skill-enabled-state-db-eviction-plan.md`
 - Related: `docs/solutions/architecture-patterns/skill-llm-override-db-layer-and-linked-unblock.md`
 - Related: `docs/solutions/database-issues/skill-override-persistence-via-db-layer.md`
-- Related: `docs/solutions/best-practices/agent-tool-must-call-validate-loaded-on-skill-registry.md`
+- Related: `docs/solutions/best-practices/agent-tool-must-call-apply-load-safety-check-on-skill-registry.md`

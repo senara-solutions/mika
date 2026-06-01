@@ -115,7 +115,7 @@ fn copy_dashboard_assets(manifest_dir: &str, out_dir: &str) {
 ///   resolution surprises when the generated file is `include!()`d.
 ///
 /// The generator does NOT parse `skill.toml` — validation is runtime's job
-/// (`SkillRegistry::validate_loaded()`).
+/// (`SkillRegistry::apply_load_safety_check()`).
 fn generate_bundled_skills_table(manifest_dir: &str, out_dir: &str) {
     let bundled_root = Path::new(manifest_dir).join("../../skills/bundled");
     let output_path = Path::new(out_dir).join("bundled_skills_generated.rs");
