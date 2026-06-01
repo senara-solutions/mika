@@ -132,6 +132,20 @@ jobs:
           GITHUB_PR_BODY: ${{ github.event.pull_request.body }}
         run: bash scripts/verify-pipeline.sh origin/main
 
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        dockerfile: [Dockerfile.agent, Dockerfile.gateway]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+      - name: Build ${{ matrix.dockerfile }}
+        run: docker buildx build -f ${{ matrix.dockerfile }} --platform linux/amd64 --load -t test-${{ matrix.dockerfile }} .
+
   security:
     name: Security
     runs-on: ubuntu-22.04
