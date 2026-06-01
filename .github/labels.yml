@@ -90,6 +90,14 @@
   color: "5C6BC0"
   description: Knowledge Graph subsystem (extraction, resolution, corpora, schema)
 
+- name: evaluation
+  color: "84cc16"
+  description: Evaluation harness, eval scenarios, provider quality comparisons
+
+- name: observability
+  color: "f59e0b"
+  description: "Logging, tracing, metrics, dashboards \u2014 anything operator-visible"
+
 # ── State ─────────────────────────────────────────────────────────────────────
 - name: ready
   color: "2ea44f"
