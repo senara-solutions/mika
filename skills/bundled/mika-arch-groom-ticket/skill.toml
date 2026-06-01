@@ -2,7 +2,7 @@
 name = "mika-arch-groom-ticket"
 description = "First-pass principle-grounded plan review — produces READY / ITERATE / ESCALATE disposition with annotated plan content."
 version = "0.1.0"
-always_on = false
+always_on = true
 timeout_secs = 120
 
 [triggers]

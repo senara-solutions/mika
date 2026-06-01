@@ -214,9 +214,8 @@ allowlist = [\n\
 ///
 /// Read-only architect agent for plan-stage review. Uses identity-driven
 /// skill allowlist (`mika-arch-groom-ticket`, `mika-arch-groom-milestone`,
-/// and `mika-arch-second-review` are enabled). Base model is Kimi; per-skill
-/// LLM overrides route to Opus 4.7 (groom-ticket, groom-milestone) and
-/// Sonnet 4.6 (second-review).
+/// and `mika-arch-second-review` are enabled). Skills inherit the agent
+/// default model — no per-skill LLM overrides (mika#949).
 ///
 /// Identity is computed at provision time from `Settings.kg_docs_roots` so
 /// `[kg].docs_roots` contains absolute paths. Without `MIKA_KG_DOCS_ROOTS`
@@ -230,23 +229,7 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
     disabled_skills: &[],
     config_toml: Some(MIKA_ARCH_CONFIG),
     identity_source: Some(IdentitySource::Computed(build_mika_arch_identity)),
-    llm_overrides: &[
-        LlmOverrideSpec {
-            skill_name: "mika-arch-groom-ticket",
-            provider: "anthropic",
-            model: "claude-sonnet-4-6",
-        },
-        LlmOverrideSpec {
-            skill_name: "mika-arch-groom-milestone",
-            provider: "anthropic",
-            model: "claude-sonnet-4-6",
-        },
-        LlmOverrideSpec {
-            skill_name: "mika-arch-second-review",
-            provider: "anthropic",
-            model: "claude-sonnet-4-6",
-        },
-    ],
+    llm_overrides: &[],
 };
 
 /// Tools mika-arch must NOT receive in its LLM tool array.
@@ -810,6 +793,50 @@ pub fn migrate_well_known_to_identity_allowlist(db: &mut Database) {
     );
 }
 
+/// Clean up stale LLM override rows left by a previous spec that had
+/// per-skill LLM overrides, when the current spec has none (mika#949).
+///
+/// Only deletes rows whose sole purpose was the LLM override (i.e.,
+/// `enabled` is `None` — the default). If a row has `enabled = Some(false)`,
+/// that was an operator-set disable and must not be deleted — the LLM
+/// fields are cleared but the row is preserved for the `enabled` state.
+fn cleanup_stale_llm_overrides(db: &mut Database, agent_name: &str) {
+    let overrides = match db.get_skill_overrides(agent_name) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(
+                agent = agent_name,
+                error = %e,
+                "failed to read skill overrides for stale LLM cleanup"
+            );
+            return;
+        }
+    };
+
+    for ov in &overrides {
+        let has_llm = ov.llm_provider.is_some() || ov.llm_model.is_some();
+        if !has_llm {
+            continue;
+        }
+
+        // Row has an LLM override that needs clearing.
+        if let Err(e) = db.delete_skill_llm_override(agent_name, &ov.skill_name) {
+            warn!(
+                agent = agent_name,
+                skill = %ov.skill_name,
+                error = %e,
+                "failed to clean up stale LLM override"
+            );
+        } else {
+            info!(
+                agent = agent_name,
+                skill = %ov.skill_name,
+                "cleaned up stale LLM override row (spec now has no per-skill overrides)"
+            );
+        }
+    }
+}
+
 /// Seed skill overrides for a well-known agent, with drift reconciliation.
 ///
 /// Seeds skill overrides for a well-known agent. On first creation (no
@@ -817,11 +844,16 @@ pub fn migrate_well_known_to_identity_allowlist(db: &mut Database) {
 /// and seeds LLM overrides. On subsequent runs, reconciles both disabled
 /// skills and LLM overrides that have drifted from the source spec.
 ///
+/// **Stale LLM cleanup (mika#949):** when the spec's `llm_overrides` is
+/// empty, any existing DB rows with LLM override columns are cleaned up
+/// before the fast-path exit. This handles the transition from a spec
+/// that had per-skill overrides to one that doesn't.
+///
 /// **Fast-path exit:** agents with empty `disabled_skills` AND empty
 /// `llm_overrides` return immediately — nothing to seed or reconcile.
 /// Post-#815, this applies to mika-dev and mika-qa (both
-/// use identity allowlist). mika-arch still enters for LLM override
-/// reconciliation.
+/// use identity allowlist). Post-#949, mika-arch also hits this path
+/// after stale cleanup runs.
 ///
 /// Disabled-skills reconciliation (mika#1041): when a new skill is added
 /// to the well-known denylist after the agent was first provisioned, the
@@ -833,6 +865,13 @@ pub fn seed_well_known_skill_overrides(db: &mut Database, agent_name: &str) {
         Some(s) => s,
         None => return,
     };
+
+    // Clean up stale LLM override rows when the spec no longer has any
+    // per-skill overrides (mika#949). Must run BEFORE the fast-path exit
+    // so leftover rows from a previous spec are removed.
+    if spec.llm_overrides.is_empty() {
+        cleanup_stale_llm_overrides(db, agent_name);
+    }
 
     // Fast-path exit: agents with identity-driven allowlist and no LLM
     // overrides have nothing to seed or reconcile (#815).
@@ -1090,8 +1129,7 @@ Cite these when relevant in reviews. They are the durable artifacts behind the p
 "#;
 
 const MIKA_ARCH_CONFIG: &str = r#"# Mika Architect — advisory plan review agent.
-# Base model is Kimi for orchestration shell.
-# Per-skill LLM overrides route to Opus 4.7 (groom-ticket) and Sonnet 4.6 (second-review).
+# Base model is Kimi; skills inherit the agent default model (mika#949).
 
 llm_provider = "openrouter"
 openrouter_model = "moonshotai/kimi-k2.5"
@@ -1857,26 +1895,12 @@ mod tests {
     }
 
     #[test]
-    fn test_mika_arch_has_llm_overrides() {
-        assert_eq!(MIKA_ARCH.llm_overrides.len(), 3);
-        assert_eq!(
-            MIKA_ARCH.llm_overrides[0].skill_name,
-            "mika-arch-groom-ticket"
+    fn test_mika_arch_has_no_llm_overrides() {
+        // mika#949: skills inherit the agent default model.
+        assert!(
+            MIKA_ARCH.llm_overrides.is_empty(),
+            "mika-arch should have no per-skill LLM overrides"
         );
-        assert_eq!(MIKA_ARCH.llm_overrides[0].provider, "anthropic");
-        assert_eq!(MIKA_ARCH.llm_overrides[0].model, "claude-sonnet-4-6");
-        assert_eq!(
-            MIKA_ARCH.llm_overrides[1].skill_name,
-            "mika-arch-groom-milestone"
-        );
-        assert_eq!(MIKA_ARCH.llm_overrides[1].provider, "anthropic");
-        assert_eq!(MIKA_ARCH.llm_overrides[1].model, "claude-sonnet-4-6");
-        assert_eq!(
-            MIKA_ARCH.llm_overrides[2].skill_name,
-            "mika-arch-second-review"
-        );
-        assert_eq!(MIKA_ARCH.llm_overrides[2].provider, "anthropic");
-        assert_eq!(MIKA_ARCH.llm_overrides[2].model, "claude-sonnet-4-6");
     }
 
     #[test]
@@ -1953,83 +1977,48 @@ mod tests {
         seed_well_known_skill_overrides(&mut db, "mika-arch");
 
         let overrides = db.get_skill_overrides("mika-arch").unwrap();
-        // Should have 3 LLM overrides (no disabled_skills for mika-arch)
-        assert_eq!(overrides.len(), 3);
-
-        let groom = overrides
-            .iter()
-            .find(|o| o.skill_name == "mika-arch-groom-ticket")
-            .expect("groom-ticket override should exist");
-        assert_eq!(groom.llm_provider.as_deref(), Some("anthropic"));
-        assert_eq!(groom.llm_model.as_deref(), Some("claude-sonnet-4-6"));
-
-        let milestone = overrides
-            .iter()
-            .find(|o| o.skill_name == "mika-arch-groom-milestone")
-            .expect("groom-milestone override should exist");
-        assert_eq!(milestone.llm_provider.as_deref(), Some("anthropic"));
-        assert_eq!(milestone.llm_model.as_deref(), Some("claude-sonnet-4-6"));
-
-        let review = overrides
-            .iter()
-            .find(|o| o.skill_name == "mika-arch-second-review")
-            .expect("second-review override should exist");
-        assert_eq!(review.llm_provider.as_deref(), Some("anthropic"));
-        assert_eq!(review.llm_model.as_deref(), Some("claude-sonnet-4-6"));
+        // mika#949: no disabled_skills and no llm_overrides — fast-path exit,
+        // 0 rows seeded.
+        assert_eq!(overrides.len(), 0);
     }
 
     #[test]
-    fn test_seed_skill_overrides_reconciles_drifted_llm_override() {
+    fn test_seed_skill_overrides_cleans_stale_llm_overrides() {
         let mut db = Database::open_in_memory().unwrap();
         db.register_agent("mika-arch", "Architect", "🏛").unwrap();
 
-        // Simulate a stale DB state: all three skills on opus (the pre-fix drift)
+        // Simulate stale DB state: 3 LLM override rows from previous spec
         db.set_skill_llm_override(
             "mika-arch",
             "mika-arch-groom-ticket",
             "anthropic",
-            "claude-opus-4-7",
+            "claude-sonnet-4-6",
         )
         .unwrap();
         db.set_skill_llm_override(
             "mika-arch",
             "mika-arch-groom-milestone",
             "anthropic",
-            "claude-opus-4-7",
+            "claude-sonnet-4-6",
         )
         .unwrap();
         db.set_skill_llm_override(
             "mika-arch",
             "mika-arch-second-review",
             "anthropic",
-            "claude-opus-4-7",
+            "claude-sonnet-4-6",
         )
         .unwrap();
 
-        // Overrides exist, so this hits the reconciliation path
+        // Verify pre-condition: 3 rows exist
+        assert_eq!(db.get_skill_overrides("mika-arch").unwrap().len(), 3);
+
+        // Seed with the new spec (empty llm_overrides) — should clean up
         seed_well_known_skill_overrides(&mut db, "mika-arch");
 
+        // All 3 stale rows should be removed (LLM-only rows with no enabled flag)
         let overrides = db.get_skill_overrides("mika-arch").unwrap();
-        assert_eq!(overrides.len(), 3);
-
-        // All three should now match the source spec (sonnet for all)
-        let groom = overrides
-            .iter()
-            .find(|o| o.skill_name == "mika-arch-groom-ticket")
-            .unwrap();
-        assert_eq!(groom.llm_model.as_deref(), Some("claude-sonnet-4-6"));
-
-        let milestone = overrides
-            .iter()
-            .find(|o| o.skill_name == "mika-arch-groom-milestone")
-            .unwrap();
-        assert_eq!(milestone.llm_model.as_deref(), Some("claude-sonnet-4-6"));
-
-        let review = overrides
-            .iter()
-            .find(|o| o.skill_name == "mika-arch-second-review")
-            .unwrap();
-        assert_eq!(review.llm_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(overrides.len(), 0);
     }
 
     #[test]
@@ -2037,20 +2026,60 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         db.register_agent("mika-arch", "Architect", "🏛").unwrap();
 
-        // First seed — fresh
+        // First seed — fresh, 0 rows (empty spec)
         seed_well_known_skill_overrides(&mut db, "mika-arch");
+        assert_eq!(db.get_skill_overrides("mika-arch").unwrap().len(), 0);
 
-        // Second seed — should be a no-op (overrides match source)
+        // Second seed — still 0 rows, no-op
+        seed_well_known_skill_overrides(&mut db, "mika-arch");
+        assert_eq!(db.get_skill_overrides("mika-arch").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_preserves_operator_disabled_rows() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.register_agent("mika-arch", "Architect", "🏛").unwrap();
+
+        // Simulate a row that has both an LLM override AND an operator-set
+        // enabled=false. The LLM override came from the old spec; the disable
+        // was set by the operator via `mika skills disable`.
+        db.set_skill_llm_override(
+            "mika-arch",
+            "mika-arch-groom-ticket",
+            "anthropic",
+            "claude-sonnet-4-6",
+        )
+        .unwrap();
+        db.set_skill_enabled("mika-arch", "mika-arch-groom-ticket", false)
+            .unwrap();
+
+        // Also add a pure LLM-only row (no enabled flag) for a sibling skill
+        db.set_skill_llm_override(
+            "mika-arch",
+            "mika-arch-second-review",
+            "anthropic",
+            "claude-sonnet-4-6",
+        )
+        .unwrap();
+
+        // Pre-condition: 2 rows
+        assert_eq!(db.get_skill_overrides("mika-arch").unwrap().len(), 2);
+
         seed_well_known_skill_overrides(&mut db, "mika-arch");
 
         let overrides = db.get_skill_overrides("mika-arch").unwrap();
-        assert_eq!(overrides.len(), 3);
 
-        let groom = overrides
-            .iter()
-            .find(|o| o.skill_name == "mika-arch-groom-ticket")
-            .unwrap();
-        assert_eq!(groom.llm_model.as_deref(), Some("claude-sonnet-4-6"));
+        // The pure LLM-only row (second-review) should be deleted entirely.
+        // The operator-disabled row (groom-ticket) should survive with LLM
+        // fields cleared but enabled=false preserved.
+        assert_eq!(overrides.len(), 1);
+
+        let preserved = &overrides[0];
+        assert_eq!(preserved.skill_name, "mika-arch-groom-ticket");
+        assert_eq!(preserved.enabled, Some(false));
+        // LLM fields should be cleared
+        assert_eq!(preserved.llm_provider, None);
+        assert_eq!(preserved.llm_model, None);
     }
 
     #[test]
