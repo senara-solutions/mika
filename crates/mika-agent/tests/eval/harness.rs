@@ -1,11 +1,13 @@
 //! EvalHarness — builder for running `run_agent()` with a `MockLlmProvider`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use tempfile::TempDir;
 
+use dashmap::DashMap;
 use mika_agent::agent::{AgentParams, run_agent, run_agent_with_deadline};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
@@ -48,6 +50,9 @@ pub struct EvalHarness {
     brave_api_key: Option<String>,
     github_token: Option<String>,
     mcp_manager: Option<McpManager>,
+    /// Session-scoped PR review dedup map (#821, #736).
+    /// When `Some`, enables the session-scope dedup guard in the agent loop.
+    pub pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
 }
 
 impl EvalHarness {
@@ -93,7 +98,7 @@ impl EvalHarness {
             trace_id: Some(self.trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
-            pr_reviews_posted: None,
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         let output = run_agent(&params).await?;
@@ -139,7 +144,7 @@ impl EvalHarness {
             trace_id: Some(self.trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
-            pr_reviews_posted: None,
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         let output = run_agent_with_deadline(&params, deadline).await?;
@@ -196,7 +201,7 @@ impl EvalHarness {
             trace_id: Some(turn_trace_id.clone()),
             correlated_task_id: None,
             internal: self.internal,
-            pr_reviews_posted: None,
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
         };
 
         let output = run_agent(&params).await?;
@@ -223,6 +228,7 @@ pub struct EvalHarnessBuilder {
     brave_api_key: Option<String>,
     github_token: Option<String>,
     mcp_manager: Option<McpManager>,
+    pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
 }
 
 impl Default for EvalHarnessBuilder {
@@ -244,6 +250,7 @@ impl Default for EvalHarnessBuilder {
             brave_api_key: None,
             github_token: None,
             mcp_manager: None,
+            pr_reviews_posted: None,
         }
     }
 }
@@ -347,6 +354,15 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Set a session-scoped PR review dedup map (#821, #736). Default: `None`.
+    ///
+    /// When set, enables the session-scope dedup guard in the agent loop,
+    /// which prevents duplicate PR reviews across turns within the same session.
+    pub fn pr_reviews_posted(mut self, map: Arc<DashMap<String, HashSet<String>>>) -> Self {
+        self.pr_reviews_posted = Some(map);
+        self
+    }
+
     /// Build the harness, creating the in-memory DB and temp directories.
     pub async fn build(self) -> Result<EvalHarness> {
         // Create temp directory with minimal agent structure
@@ -407,6 +423,7 @@ impl EvalHarnessBuilder {
             brave_api_key: self.brave_api_key,
             github_token: self.github_token,
             mcp_manager: self.mcp_manager,
+            pr_reviews_posted: self.pr_reviews_posted,
         })
     }
 }
