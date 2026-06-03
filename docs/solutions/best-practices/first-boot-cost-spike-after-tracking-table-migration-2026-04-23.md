@@ -145,6 +145,18 @@ One-shot, not per-call — a log flood is worse than a silent cost. The advisory
 
 Keep the check narrow and specific (`provider_name == "anthropic"`). A generic `kg_expensive_provider` event that tries to classify every provider's pricing becomes a maintenance tax — when OpenAI pricing changes, when a new provider is added, when OpenRouter's routing changes. Name the specific provider the specific incident involved, and add new providers case-by-case as new incidents surface.
 
+### Design note: default=None is deliberate
+
+`MIKA_KG_EXTRACTION_MODEL` and `MIKA_KG_RESOLUTION_MODEL` default to `None` — when unset, KG features requiring LLM calls are disabled entirely. This is a deliberate policy choice, not a gap waiting to be filled.
+
+**Rationale:** A silent fallback to any provider — even a cheap one — hides misconfiguration and shifts cost discovery from deploy-time (where the operator makes an explicit decision) to bill-time (where the cost is a surprise). The entire point of the #757 rescue was to make cost-bearing behavior require explicit opt-in. Defaulting to a provider, however cheap, would reintroduce exactly the class of cost surprise this document exists to prevent.
+
+The `kg_anthropic_provider` WARN (see the "Provider choice is a structural cost lever" subsection above) is the compensating signal for the narrower case where an operator *has* configured a model but chose an expensive provider. That advisory is appropriate because the operator already opted in to KG — they just picked a suboptimal route. A startup-disabled default is the right posture for the broader case where the operator has not opted in at all.
+
+Cross-reference: `CLAUDE.md` § Environment Variables documents the "If unset, KG features requiring LLM calls are disabled" behavior for both `MIKA_KG_EXTRACTION_MODEL` and `MIKA_KG_RESOLUTION_MODEL`, with `MIKA_KG_INGESTION_MODEL` as the shared fallback.
+
+**Do not add a code-level fallback for these env vars.** If a future change needs KG to work out of the box, the correct path is a first-run setup wizard or an explicit `mika setup --kg` step that forces the operator to choose a provider — not a silent default that makes the choice for them.
+
 ### Fan-out on shared source data: document it or share the extraction
 
 Per-tenant isolation is a deliberate schema decision — Mika's subject/chunk tables are agent-scoped so each agent has its own view of the subject graph. The cost consequence: when N agents point at the same `docs_root`, every doc is processed N times.
