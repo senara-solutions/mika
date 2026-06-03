@@ -2178,22 +2178,45 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     output
 }
 
+/// Extract the PR number from a positional argument.
+///
+/// Handles:
+/// - Bare numbers: `"735"` → `"735"`
+/// - GitHub URLs: `"https://github.com/org/repo/pull/735"` → `"735"`
+/// - Full URLs with query/fragment: `".../pull/735?diff=unified"` → `"735"`
+///
+/// Falls back to the original string if no number can be extracted
+/// (preserves current behavior for unknown formats).
+fn normalize_pr_identifier(s: &str) -> &str {
+    // Try to extract number from GitHub PR URL pattern
+    if let Some(idx) = s.rfind("/pull/") {
+        let after = &s[idx + 6..];
+        // Take only digits (strip query params, fragments, trailing slashes)
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        if end > 0 {
+            return &after[..end];
+        }
+    }
+    s
+}
+
 /// Derive a dedup key for a `gh pr review` invocation.
 ///
-/// Format: `{repo}|{positional}` where `positional` is the first argument
-/// after `pr review` (typically a PR URL or number), and `repo` is from the
-/// `--repo` flag. Falls back to `__default__` and `__current_branch__`
-/// when those values are absent.
+/// Format: `{repo}|{normalized_positional}` where `normalized_positional` is
+/// the PR number extracted from the first argument after `pr review` (handles
+/// both bare numbers like `"735"` and full GitHub URLs like
+/// `"https://github.com/org/repo/pull/735"`), and `repo` is from the `--repo`
+/// flag. Falls back to `__default__` and `__current_branch__` when those
+/// values are absent.
 ///
-/// `__current_branch__` fallback fires only for `gh pr review --approve` with no
-/// positional, which mika-qa never emits (it always passes the PR URL). If this
-/// fallback ever produces same-key collisions for legitimately different PRs in
-/// one session, the fix is to normalize via `gh pr view --json number` — file as
-/// follow-up if it surfaces.
+/// Normalization (mika#736) ensures the dedup key is format-stable regardless
+/// of whether the LLM passes a bare number or a full URL across turns.
 fn make_pr_dedup_key(args: &[String], repo: Option<&str>) -> String {
     let positional = args
         .get(2)
-        .map(String::as_str)
+        .map(|s| normalize_pr_identifier(s))
         .unwrap_or("__current_branch__");
     format!("{}|{}", repo.unwrap_or("__default__"), positional)
 }
@@ -5799,10 +5822,45 @@ mod tests {
         );
     }
 
-    // -- make_pr_dedup_key unit tests (#821) --
+    // -- normalize_pr_identifier unit tests (#736) --
+
+    #[test]
+    fn test_normalize_pr_identifier_bare_number() {
+        assert_eq!(normalize_pr_identifier("735"), "735");
+    }
+
+    #[test]
+    fn test_normalize_pr_identifier_github_url() {
+        assert_eq!(
+            normalize_pr_identifier("https://github.com/org/repo/pull/735"),
+            "735"
+        );
+    }
+
+    #[test]
+    fn test_normalize_pr_identifier_url_with_query() {
+        assert_eq!(
+            normalize_pr_identifier("https://github.com/org/repo/pull/735?diff=unified"),
+            "735"
+        );
+    }
+
+    #[test]
+    fn test_normalize_pr_identifier_non_pr_url() {
+        let input = "https://example.com/other";
+        assert_eq!(normalize_pr_identifier(input), input);
+    }
+
+    #[test]
+    fn test_normalize_pr_identifier_branch_ref() {
+        assert_eq!(normalize_pr_identifier("--approve"), "--approve");
+    }
+
+    // -- make_pr_dedup_key unit tests (#821, updated #736) --
 
     #[test]
     fn test_make_pr_dedup_key_with_url_and_repo() {
+        // After #736 normalization, URL is reduced to the PR number
         let args = vec![
             "pr".to_string(),
             "review".to_string(),
@@ -5810,7 +5868,7 @@ mod tests {
             "--approve".to_string(),
         ];
         let key = make_pr_dedup_key(&args, Some("org/repo"));
-        assert_eq!(key, "org/repo|https://github.com/org/repo/pull/42");
+        assert_eq!(key, "org/repo|42");
     }
 
     #[test]
@@ -5830,6 +5888,29 @@ mod tests {
         ];
         let key = make_pr_dedup_key(&args, Some("org/repo"));
         assert_eq!(key, "org/repo|42");
+    }
+
+    #[test]
+    fn test_make_pr_dedup_key_url_vs_number_same_key() {
+        // Core #736 fix: URL and bare number for the same PR produce identical keys
+        let url_args = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "https://github.com/senara-solutions/mika/pull/735".to_string(),
+            "--approve".to_string(),
+        ];
+        let num_args = vec![
+            "pr".to_string(),
+            "review".to_string(),
+            "735".to_string(),
+            "--approve".to_string(),
+        ];
+        let key_from_url = make_pr_dedup_key(&url_args, Some("senara-solutions/mika"));
+        let key_from_num = make_pr_dedup_key(&num_args, Some("senara-solutions/mika"));
+        assert_eq!(
+            key_from_url, key_from_num,
+            "URL and bare number must produce the same dedup key"
+        );
     }
 
     // -- Session-scoped PR review dedup tests (#821) --
