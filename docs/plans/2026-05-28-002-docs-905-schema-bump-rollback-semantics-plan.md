@@ -6,6 +6,18 @@ mika#874 second-pass surfaced finding F8: every SQLite CHECK-constraint expansio
 
 The pattern should be extracted as a best-practices doc so future schema bumps catch this without re-discovering it. The worked example is v29→v30's `matched_llm_db_fallback` and v34→v35's `no_candidate_of_type` additions to `kg_resolutions_log.outcome`.
 
+## Phase 0 — Pin (verbatim source citations)
+
+The #905 / #874 issue bodies and the v1 grooming-audit trail use the framing "v28→v29 + matched_llm_db_fallback". This was the original target; the migration ultimately shipped at **v29→v30** (and `no_candidate_of_type` at **v34→v35**). Plan version numbers come from the **migration source code**, not the older issue-body framing:
+
+- `crates/mika-agent/src/db.rs:3782-3785` — `/// v29→v30: Expand kg_resolutions_log.outcome CHECK constraint to include 'matched_llm_db_fallback' (#874)`. DDL at `db.rs:3809`. Audit message `db.rs:3845` reads `"v29→v30: expanded kg_resolutions_log outcome CHECK constraint (#874)"`.
+- `crates/mika-agent/src/db.rs:3980, 4044` — `/// v34→v35: ... 'no_candidate_of_type' (#1154)`. DDL at `db.rs:4007`. Audit message `db.rs:4044` reads `"v34→v35: expanded kg_resolutions_log outcome CHECK to include 'no_candidate_of_type' (#1154)"`.
+- `CLAUDE.md` Database section reproduces both bumps with the same version numbers (v29→v30 #874; v34→v35 #1154).
+
+If a future architect/reviewer cites "v28→v29" from issue body, **the source code is authoritative** — the issue body framing is stale relative to the migration that actually shipped.
+
+**Stub-file note (architect F2):** A prior groom pass cited `docs/solutions/best-practices/schema-bump-rollback-class-stub-2026-04-30.md` as a stub that needed folding/deletion. Verification on `origin/main` at plan-write time: `git show origin/main:docs/solutions/best-practices/schema-bump-rollback-class-stub-2026-04-30.md` returns `fatal: path does not exist in 'origin/main'`. The stub was added once (commit `6ec2d3ee`) and removed before this work started; it no longer exists on the trunk. No fold/delete change is required by this plan.
+
 ## Changes
 
 ### Change 1: Create the best-practices doc
@@ -60,7 +72,11 @@ Content structure (per ticket acceptance criteria):
 
 **File:** `docs/architecture/review-guide.md`
 
-Add a new bullet under **§ 4: KISS → What to flag** (after the existing schema-migration bullet at ~line 94):
+Add a new bullet under **§ 4: KISS → What to flag**, immediately after the existing schema-migration bullet whose verbatim text begins:
+
+> *"A new schema migration when an existing field would do. D2 in the mika-arch v1 plan proposed migration with a per-agent skill-allowlist table; it was rejected in favor of `Identity.skills.allowlist` with in-memory synthesis..."*
+
+(Currently at `docs/architecture/review-guide.md:94`. The verbatim opening clause is the unambiguous anchor — line number may drift but the leading sentence won't.)
 
 ```markdown
 - **A CHECK-constraint enum expansion without rollback-semantics audit.** Any PR that adds a value to a SQLite CHECK enumeration must include a `## Rollback Semantics` section auditing all Rust consumers of the enum string. See `docs/solutions/best-practices/schema-bump-rollback-semantics-2026-05-28.md` for the checklist and worked example. Mirroring a prior migration's DDL shape is necessary but not sufficient — migration correctness and rollback semantics are distinct concerns (ref: mika#874 F8, mika#905).
