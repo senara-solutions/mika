@@ -1,193 +1,183 @@
 # Plan: feat(ci): add docker build smoke test to ci.yml
 
 **Ticket:** mika issue#1248
-**Date:** 2026-05-31
+**Date:** 2026-05-31 (revised 2026-06-03)
 
 ## Problem
 
-Four Dockerfile bugs shipped to main between 2026-05-19 and 2026-05-22 (mika#1237, #1240, #1242, #1243) — all discoverable by a `docker build` in CI. Currently `ci.yml` runs Rust and Node builds but never exercises Dockerfiles.
+Four Dockerfile bugs shipped to main between 2026-05-19 and 2026-05-22 (mika#1237, #1240, #1242, #1243) — all discoverable by a `docker build` in CI.
 
-## Phase 0 — Pin (verbatim source citations)
+## Current State (post-#1330)
 
-The mika repo lives at `mika-platform/mika/` from the workspace root. Within the worktree (which IS the mika repo), paths are root-relative:
+PR #1330 and follow-ups (#1353, #1360, #1366) already added a `docker-build` job to `ci.yml`. The current job:
 
-- **`Dockerfile.agent`** — at mika repo root. Verified: `/home/samidarko/workspace/mika-platform/mika/Dockerfile.agent` exists.
-- **`Dockerfile.gateway`** — at mika repo root. Verified.
-- **`os/Dockerfile`** — at `os/Dockerfile` from worktree, **NOT** `mika/os/Dockerfile`. The issue body's `mika/os/Dockerfile` is workspace-relative; from the worktree (mika repo root) it is `os/Dockerfile`. Verified: `/home/samidarko/workspace/mika-platform/mika/os/Dockerfile` exists with `mika-os` and `mika-runtime` targets (shipped by mika#1243, closed).
-- **`CLAUDE.md`** (worktree root) is the **same file** as `mika/CLAUDE.md` (workspace-relative). Issue AC6 cites `mika/CLAUDE.md`; from the worktree it's the root `CLAUDE.md`. Single source — no path conflict.
+- ✅ Builds `Dockerfile.agent` and `Dockerfile.gateway` via matrix strategy
+- ✅ Uses BuildKit via `docker/setup-buildx-action`
+- ✅ Uses path filtering via `dorny/paths-filter` (`docker-build-filter` job)
+- ❌ Does NOT build `os/Dockerfile` targets (`mika-os`, `mika-runtime`)
+- ❌ No BuildKit layer caching (raw `docker buildx build` without `--cache-from`/`--cache-to`)
+- ❌ Path filter does not include `os/` paths
+- ❌ `CLAUDE.md` CI/CD section not updated (AC6)
+- ❌ Branch protection rule not updated (AC5 — operator action)
 
-These pins resolve the F1/F3 ambiguity from the first-pass architect review.
+## Remaining Work
 
-## Approach
+This plan covers only the delta between what exists and the full AC set.
 
-Add a `docker-build-smoke` job to `.github/workflows/ci.yml` that runs `docker build` for each Dockerfile on every PR and push to main. Use BuildKit with GitHub Actions cache for layer caching.
-
-## Scope
-
-### In scope
-- New CI job building Dockerfile.agent, Dockerfile.gateway, and both `os/Dockerfile` targets (`mika-os` and `mika-runtime`) — all 4 AC2 builds
-- BuildKit layer caching via `docker/build-push-action` + GHA cache backend
-- CLAUDE.md CI section update (worktree root `CLAUDE.md` = workspace `mika/CLAUDE.md`)
-- Post-merge operator instruction for AC5 (branch protection rule update — repo admin action, documented in PR body)
-
-### Out of scope
-- Registry publishing (build-only, no push)
-- Multi-arch builds
-- Runtime/functional verification (`docker run`)
-- Per-role split of `mika-runtime` (deferred to mika#1247; AC7 covers the target-list update when that lands)
-
-## Implementation Steps
-
-### Step 1: Add `docker-build-smoke` job to `ci.yml`
+### Step 1: Add `os/Dockerfile` targets to the matrix
 
 **File:** `.github/workflows/ci.yml`
 
-Add a new job `docker-build-smoke` after the existing jobs. Structure:
+Extend the `docker-build` job's matrix to include the two `os/Dockerfile` targets. The matrix currently has:
 
 ```yaml
-docker-build-smoke:
-  name: Docker Build Smoke
-  runs-on: ubuntu-22.04
-  if: >-
-    github.event_name == 'push' ||
-    (github.event_name == 'pull_request' &&
-     !startsWith(github.head_ref, 'release/') &&
-     !startsWith(github.head_ref, 'release-please--'))
-  steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@<pinned-sha>
-
-    - name: Build agent image
-      uses: docker/build-push-action@<pinned-sha>
-      with:
-        context: .
-        file: Dockerfile.agent
-        tags: mika-agent:ci
-        push: false
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-
-    - name: Build gateway image
-      uses: docker/build-push-action@<pinned-sha>
-      with:
-        context: .
-        file: Dockerfile.gateway
-        tags: mika-gateway:ci
-        push: false
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-
-    - name: Build mika-os target
-      uses: docker/build-push-action@<pinned-sha>
-      with:
-        context: .
-        file: os/Dockerfile
-        target: mika-os
-        tags: mika-os:ci
-        push: false
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-
-    - name: Build mika-runtime target
-      uses: docker/build-push-action@<pinned-sha>
-      with:
-        context: .
-        file: os/Dockerfile
-        target: mika-runtime
-        tags: mika-runtime:ci
-        push: false
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+matrix:
+  dockerfile: [Dockerfile.agent, Dockerfile.gateway]
 ```
 
-**Path note (per Phase 0 Pin):** The mika-os/mika-runtime targets are in `os/Dockerfile` from the worktree (mika repo root), NOT `mika/os/Dockerfile`. The latter is workspace-relative; the worktree IS the mika repo.
+Replace with an include-style matrix that supports the `target` parameter needed for `os/Dockerfile`:
+
+```yaml
+strategy:
+  matrix:
+    include:
+      - dockerfile: Dockerfile.agent
+        tag: mika-agent
+      - dockerfile: Dockerfile.gateway
+        tag: mika-gateway
+      - dockerfile: os/Dockerfile
+        target: mika-os
+        tag: mika-os
+      - dockerfile: os/Dockerfile
+        target: mika-runtime
+        tag: mika-runtime
+```
+
+Update the build step to use the matrix target (when set):
+
+```yaml
+- name: Build ${{ matrix.tag }}
+  run: |
+    docker buildx build \
+      -f ${{ matrix.dockerfile }} \
+      ${{ matrix.target && format('--target {0}', matrix.target) || '' }} \
+      --platform linux/amd64 \
+      --load \
+      -t ${{ matrix.tag }}:ci .
+```
+
+**Tag fix note:** The existing job had a bug (#1366) with uppercase tags from `matrix.dockerfile`. The explicit `tag` field in the include matrix avoids this — each tag is a clean lowercase string.
+
+### Step 2: Add `os/` to the path filter
+
+**File:** `.github/workflows/ci.yml` — `docker-build-filter` job
+
+Add `os/` paths to the `docker-relevant` filter:
+
+```yaml
+filters: |
+  docker-relevant:
+    - 'Dockerfile.agent'
+    - 'Dockerfile.gateway'
+    - 'os/Dockerfile'
+    - 'os/Dockerfile.dockerignore'
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - 'crates/**'
+    - '.github/workflows/ci.yml'
+```
+
+### Step 3: Add BuildKit layer caching (AC4)
+
+**File:** `.github/workflows/ci.yml` — `docker-build` job
+
+Replace raw `docker buildx build` with `docker/build-push-action` for integrated GHA cache support:
+
+```yaml
+- name: Build ${{ matrix.tag }}
+  uses: docker/build-push-action@<pinned-sha>  # v6
+  with:
+    context: .
+    file: ${{ matrix.dockerfile }}
+    target: ${{ matrix.target || '' }}
+    tags: ${{ matrix.tag }}:ci
+    push: false
+    load: true
+    cache-from: type=gha,scope=${{ matrix.tag }}
+    cache-to: type=gha,scope=${{ matrix.tag }},mode=max
+    platforms: linux/amd64
+```
 
 **Key decisions:**
 
-1. **`docker/build-push-action`** instead of raw `docker build` — this is the standard GHA action for BuildKit builds, handles `DOCKER_BUILDKIT=1` implicitly, and integrates with GHA cache backend (`type=gha`). All actions must be pinned to commit SHAs per repo convention.
+1. **Per-matrix-leg cache scope** (`scope=${{ matrix.tag }}`): Each Dockerfile gets its own GHA cache namespace. Without `scope`, all 4 legs would collide on the default cache key, causing eviction thrash.
 
-2. **GHA cache backend (`type=gha`)** instead of registry-backed cache — GHA cache is simpler (no GHCR auth needed), free within the repo's cache budget (10 GB), and sufficient for PR-to-PR caching. Registry-backed cache is overkill for smoke tests that don't publish images. The `mode=max` exports all layers, not just the final image — important because the Rust build stage is the expensive layer.
+2. **`mode=max`**: Exports all intermediate layers, not just the final image. Important because the Rust `cargo build --release` layer is the expensive one (~15-20min cold) and sits mid-Dockerfile.
 
-3. **`if` condition** matches `docs-sync` — skip on release-please branches since those don't touch Dockerfiles and the Rust build is expensive (~5min cached, ~20min cold).
+3. **GHA cache backend** over registry-backed: Simpler (no GHCR auth), free within 10GB repo cache budget, sufficient for smoke tests. Switch to `type=registry` if cache pressure becomes an issue.
 
-4. **`push: false`** — build-only, no registry push. The `tags` field is required by the action but only labels the local image.
+4. **`push: false` + `load: true`**: Build-only, no registry push. The image is loaded into the runner's Docker daemon for the build to complete the `--load` path (validates the full image is well-formed).
 
-5. **Two separate `build-push-action` steps** (not a matrix) — agent and gateway share the same GHA cache namespace, and running sequentially means the gateway build benefits from any shared base layers cached by the agent build. A matrix would create parallel jobs with separate cache scopes, losing this benefit.
+Pin `docker/build-push-action` to a commit SHA (v6.x latest stable), matching the existing convention for `actions/checkout` and `docker/setup-buildx-action`.
 
-### Step 2: Pin action SHAs
+### Step 4: Update CLAUDE.md CI documentation (AC6)
 
-Look up the latest stable release SHAs for:
-- `docker/setup-buildx-action` (v3.x)
-- `docker/build-push-action` (v6.x)
+**File:** `CLAUDE.md` (repo root)
 
-Pin to commit SHAs, matching the convention used for `actions/checkout` and `actions/setup-node` in the existing workflow.
+In the "Architecture Summary" section under "CI/CD:", the sentence currently lists `byte-slice-lint`, `loop-select-lint`, `docs-sync`. Add `docker-build` to this list:
 
-### Step 3: Update CLAUDE.md CI documentation
-
-**File:** `CLAUDE.md` at the worktree root. This is the **same file** as `mika/CLAUDE.md` from the workspace; AC6's `mika/CLAUDE.md` and this plan's `CLAUDE.md` (root) refer to the same on-disk file (verified per Phase 0 Pin).
-
-In the "Architecture Summary" section under "CI/CD:", update the sentence listing CI jobs to include `docker-build-smoke`:
-
-> Four GitHub Actions workflows → still four workflows, but add `docker-build-smoke` to the listed jobs alongside `byte-slice-lint`, `loop-select-lint`, `docs-sync`.
-
-### Step 4: Verify locally (manual)
-
-Run the Docker builds locally to confirm they pass on the current HEAD:
-
-```bash
-docker build -f Dockerfile.agent -t mika-agent:ci .
-docker build -f Dockerfile.gateway -t mika-gateway:ci .
-docker build --target mika-os -f os/Dockerfile -t mika-os:ci .
-docker build --target mika-runtime -f os/Dockerfile -t mika-runtime:ci .
-```
+> CI includes [...] a `docker-build` job that builds all Dockerfiles (agent, gateway, mika-os, mika-runtime) on every PR to catch structural bugs before merge.
 
 ### Step 5: Post-merge operator action (AC5)
 
-This step is a **post-merge operator action** — it cannot be code-changed by a PR. After the PR lands and CI is green on `main`, the repo admin must add `docker-build-smoke` (the job name from Step 1) to the **required status checks** in the `senara-solutions/mika` branch protection rule for `main`.
-
-Without this step, the CI gate is advisory — it surfaces Dockerfile bugs but doesn't block merges. The operator (samidarko) promoted this to p0-critical specifically because the gate must block (issue comment `IC_kwDORWsgGM8AAAABDbaxRw`).
+This is a **post-merge operator action** — not a code change. After the PR lands, the repo admin adds `Docker Build` (the job name) to the required status checks in the `senara-solutions/mika` branch protection rule for `main`.
 
 The PR body MUST include:
 
 ```
 ## Post-merge operator action (AC5)
 
-Add `docker-build-smoke` to required status checks on the `main` branch protection rule.
-Path: Settings → Branches → main → Required status checks → Add `docker-build-smoke`.
-This is required to satisfy AC5; without it the gate is advisory-only.
+Add `Docker Build` to required status checks on the `main` branch protection rule.
+Path: Settings → Branches → main → Required status checks → Add `Docker Build`.
+Required to satisfy AC5; without it the gate is advisory-only.
 ```
 
-## Caching Analysis
+**Note on path-filtered required checks:** The `docker-build` job is gated behind `docker-build-filter` (path filter). GitHub branch protection treats a skipped required check as "not satisfied" unless the ruleset is configured with "Do not require status checks on creation" or the job is listed as a non-required check that is simply expected when present. Two options:
 
-The Dockerfile.agent is the expensive one:
-- **Dashboard builder stage** (Node): `npm ci` + `npm run build` — cached by npm lockfile layer
-- **Rust builder stage**: `cargo build --release` — the heavy lift (~15-20min cold). BuildKit `--mount=type=cache` in the Dockerfile caches `/app/target` and `/usr/local/cargo/registry` within a single build, but GHA cache (`type=gha`) caches the *layers* across builds. The layer containing `cargo build` is invalidated whenever any `COPY crates/...` layer changes (any Rust source change). This means most PRs that touch Rust code will re-build from scratch within the Docker context.
+- **Option A (recommended):** Make `docker-build-filter` always run and `docker-build` always run (remove path filtering). The build is ~5min cached, acceptable for all PRs. Simplest to reason about.
+- **Option B:** Keep path filtering but use the `paths-filter` action's `skip-duplicate-actions` approach with a "success if skipped" wrapper job. More complex but saves CI minutes on docs-only PRs.
 
-**Mitigation:** This is acceptable because:
-- The job runs in parallel with `check` — it doesn't add to total CI wall-clock time
-- Cold builds are ~15-20min on GitHub-hosted runners, within the 30min budget from AC4
-- The primary value is catching Dockerfile structural bugs (COPY paths, stage ordering, install scripts), not providing fast feedback on Rust compilation
+The implementor should choose based on CI budget constraints. Option A is the default recommendation.
+
+## Scope
+
+### In scope
+- Extend existing `docker-build` matrix with `os/Dockerfile` targets (mika-os, mika-runtime)
+- Add `os/` paths to the `docker-build-filter`
+- Add GHA layer caching via `docker/build-push-action`
+- CLAUDE.md CI section update
+- Post-merge operator instruction for branch protection
+
+### Out of scope
+- Registry publishing (build-only)
+- Multi-arch builds (arm64 + amd64)
+- Runtime/functional verification (`docker run`)
+- Per-role split of `mika-runtime` (deferred to mika#1247; AC7 covers the target-list update when that lands)
 
 ## Risk Assessment
 
-- **Low risk.** Additive-only change — new job, no modification to existing jobs.
-- **CI budget:** ~15-20min cold, ~5min warm. Runs in parallel with existing jobs, so doesn't extend total PR CI time unless it's the longest job.
-- **Cache eviction:** GHA cache is limited to 10GB per repo. Rust Docker layers are large. If cache pressure becomes an issue, can switch to registry-backed cache or reduce `mode=max` to `mode=min`.
-
-## Future Work (mika#1247)
-
-mika#1247 will split `mika-runtime` into per-role targets (e.g., `mika-runtime-server`, `mika-runtime-gateway`). When that lands, the docker-build-smoke job's `--target` list is updated in the same PR per AC7. The Gentoo-based stage3 layers may need a separate caching strategy if total CI time grows beyond the 30min budget.
+- **Low risk.** Extends an existing job — no new job, no modification to unrelated jobs.
+- **CI budget:** 4 matrix legs × ~5min cached = ~20min total, but they run in parallel so wall-clock is ~5min warm. Cold builds (Gentoo stage3 for os/Dockerfile) may hit ~30min.
+- **Cache eviction:** GHA cache is 10GB per repo. Four separate scopes may pressure the budget. Monitor after merge; switch to `mode=min` or registry cache if needed.
 
 ## AC Traceability
 
-| AC | Covered by |
-|----|------------|
-| AC1 | Step 1 — `docker-build-smoke` job |
-| AC2 | Step 1 — all 4 builds (agent + gateway + os/Dockerfile mika-os + os/Dockerfile mika-runtime) |
-| AC3 | Step 1 — BuildKit via `docker/setup-buildx-action` |
-| AC4 | Step 1 — GHA cache backend (`type=gha,mode=max`) |
-| AC5 | Step 5 — post-merge operator instruction documented in PR body |
-| AC6 | Step 3 — CLAUDE.md update (worktree root `CLAUDE.md` ≡ workspace `mika/CLAUDE.md`) |
-| AC7 | Future work — updates target list when mika#1247 splits per-role |
+| AC | Status | Covered by |
+|----|--------|------------|
+| AC1 | ✅ Done (#1330) | `docker-build` job exists |
+| AC2 | ⚠️ Partial | Step 1 — add os/Dockerfile targets to complete all 4 builds |
+| AC3 | ✅ Done (#1330) | BuildKit via `docker/setup-buildx-action` |
+| AC4 | ❌ Open | Step 3 — GHA cache backend via `docker/build-push-action` |
+| AC5 | ❌ Open | Step 5 — post-merge operator instruction |
+| AC6 | ❌ Open | Step 4 — CLAUDE.md update |
+| AC7 | N/A | Future work — updates target list when mika#1247 splits per-role |
