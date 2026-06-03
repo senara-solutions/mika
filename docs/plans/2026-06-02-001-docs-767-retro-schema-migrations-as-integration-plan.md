@@ -9,7 +9,7 @@ Write a compound doc at `docs/solutions/best-practices/schema-migrations-as-inte
 Two existing docs already cover the individual incidents in detail:
 
 - `docs/solutions/best-practices/first-boot-cost-spike-after-tracking-table-migration-2026-04-23.md` — deep dive on #757 (cost spike, budget guards, idempotency, fan-out)
-- `docs/solutions/runtime-errors/utf8-byte-slicing-panic-kg-resolver-extractor-2026-04-23.md` — deep dive on the UTF-8 panic (14 sites, `safe_truncate`, CI lint gate)
+- `docs/solutions/runtime-errors/utf8-byte-slicing-panic-kg-resolver-extractor-2026-04-23.md` — deep dive on the UTF-8 panic (14 resolver/extractor sites per that doc; #767 body scope is 10 — see §2 Incident 2)
 
 This new doc is the **synthesis layer** — it abstracts the shared pattern from both incidents rather than repeating their details. The two incident docs are evidence; this doc is the lesson. Sections should reference (not duplicate) incident-specific metrics and fixes.
 
@@ -53,7 +53,7 @@ related_issues: [757, 767]
 
 2. **Two concrete incidents** — Brief summaries with metrics, linking to the detailed incident docs:
    - **Incident 1: #757 cost spike** — 11 agents × 283 docs → 30,400 LLM calls → ~$40–60, Anthropic credit exhausted. Fix: budget guard + hash idempotency. Detail: see `first-boot-cost-spike-after-tracking-table-migration-2026-04-23.md`.
-   - **Incident 2: KG UTF-8 panic** — v26 migration invalidated markers → full re-extraction → resolver scheduled ~5K subjects/agent → first multi-byte char panicked 14 `&s[..N]` sites → 27 panics across 11 agents, KG resolution fully broken. Fix: `safe_truncate` + CI byte-slice lint. Detail: see `utf8-byte-slicing-panic-kg-resolver-extractor-2026-04-23.md`.
+   - **Incident 2: KG UTF-8 panic** — v26 migration invalidated markers → full re-extraction → resolver scheduled ~5K subjects/agent → first multi-byte char (em-dash, byte 2000) panicked tokio-spawn'd resolver tasks → KG resolution fully broken. Site count: #767 body cites "5 resolver/extractor + 5 workspace-wide" (10 total scope); the resolver/extractor-internal site replacement was **14** per `utf8-byte-slicing-panic-kg-resolver-extractor-2026-04-23.md`, which also reports **27 panic events across 11 agents** in server.log. Fix: `safe_truncate` (`floor_char_boundary`) + CI byte-slice lint + spawn-site panic logging. Detail: see `utf8-byte-slicing-panic-kg-resolver-extractor-2026-04-23.md`.
 
 3. **Why migration tests don't catch this** — The schema migration is correct in isolation. The failure is a second-order effect: changing what the pending-work query returns changes the *volume* and *distribution* of inputs to downstream consumers. Migration tests validate DDL + data transformation; they don't exercise the consumer pipeline at the new scale or against the new input distribution.
 
@@ -75,6 +75,7 @@ related_issues: [757, 767]
    - `utf8-byte-slicing-panic-kg-resolver-extractor-2026-04-23.md`
    - `kg-schema.rs` idempotency contract documentation
    - `check-byte-slices.sh` CI lint
+   - **Implementer note for rescue PR + KG bug ticket:** #767 issue body's Related-section AC asks for "links to #757, the rescue PR, the KG bug ticket." The rescue/KG-bug PRs live in the `#752–#759` series. During implementation, run `gh issue view <N>` for each of `#752 #756 #758 #759` and identify which is the rescue PR (the one that introduced `safe_truncate`) and which is the KG bug ticket (the one that filed the panic). Cite both by number in the compound doc's Related section.
 
 ### Step 2 — Add cross-reference in migration code
 
