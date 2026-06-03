@@ -31,12 +31,14 @@ pub use super::kg_fixtures;
 
 // --- Scenario modules (one per fabrication class, D2) ---
 pub mod assert_grounded_false_positive_guard;
+pub mod assert_grounded_pr_review_composition;
 pub mod assert_grounded_pr_state_caught;
 pub mod assert_grounded_pr_state_satisfied;
 pub mod assert_grounded_task_state_caught;
 pub mod asserted_unavailability_caught;
 pub mod asserted_unavailability_elided_copula;
 pub mod asserted_unavailability_genuine;
+pub mod asserted_unavailability_pr_review_composition;
 pub mod auto_merge_vs_merged;
 pub mod callback_state_claim_unverified;
 pub mod current_priorities_drift;
