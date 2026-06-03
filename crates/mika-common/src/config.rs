@@ -237,6 +237,28 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "DeepSeek base URL override",
     },
+    // -- Per-provider: MikaModel (internal endpoint) --
+    ConfigKeyInfo {
+        key: "mikamodel_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_MIKAMODEL_MODEL"),
+        secret: false,
+        description: "MikaModel model ID",
+    },
+    ConfigKeyInfo {
+        key: "mikamodel_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_MIKAMODEL_API_KEY"),
+        secret: true,
+        description: "MikaModel API key (optional; reserved for hosted-endpoint swap)",
+    },
+    ConfigKeyInfo {
+        key: "mikamodel_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_MIKAMODEL_BASE_URL"),
+        secret: false,
+        description: "MikaModel base URL (defaults to local Ollama transport)",
+    },
     // -- Non-provider settings (File backend) --
     ConfigKeyInfo {
         key: "llm_max_tokens",
@@ -521,6 +543,13 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "kimi_api_key" => settings.kimi_api_key.as_ref().map(|_| "[SET]".to_string()),
         "qwen_api_key" => settings.qwen_api_key.as_ref().map(|_| "[SET]".to_string()),
         "deepseek_base_url" => settings.deepseek_base_url.clone(),
+        // Per-provider: MikaModel
+        "mikamodel_model" => settings.mikamodel_model.clone(),
+        "mikamodel_api_key" => settings
+            .mikamodel_api_key
+            .as_ref()
+            .map(|_| "[SET]".to_string()),
+        "mikamodel_base_url" => settings.mikamodel_base_url.clone(),
 
         // Non-provider secrets/settings
         "brave_api_key" => settings.brave_api_key.as_ref().map(|_| "[SET]".to_string()),
@@ -642,6 +671,10 @@ pub struct Settings {
     pub qwen_api_key: Option<SecretString>,
     pub qwen_model: Option<String>,
     pub qwen_base_url: Option<String>,
+    // -- Per-provider fields: MikaModel (internal endpoint, served via Ollama transport) --
+    pub mikamodel_model: Option<String>,
+    pub mikamodel_api_key: Option<SecretString>,
+    pub mikamodel_base_url: Option<String>,
     #[serde(default)]
     pub deepseek_api_key: Option<SecretString>,
     pub minimax_api_key: Option<SecretString>,
@@ -1067,6 +1100,11 @@ impl Settings {
                 self.qwen_api_key.as_ref().map(|s| s.expose_secret()),
                 self.qwen_base_url.as_deref(),
             ),
+            ProviderKind::MikaModel => (
+                self.mikamodel_model.as_deref(),
+                self.mikamodel_api_key.as_ref().map(|s| s.expose_secret()),
+                self.mikamodel_base_url.as_deref(),
+            ),
         }
     }
 
@@ -1098,6 +1136,7 @@ impl Settings {
             ProviderKind::MiniMax => self.minimax_model = model,
             ProviderKind::Kimi => self.kimi_model = model,
             ProviderKind::Qwen => self.qwen_model = model,
+            ProviderKind::MikaModel => self.mikamodel_model = model,
         }
     }
 
@@ -1364,6 +1403,9 @@ impl Settings {
             qwen_model: None,
             qwen_api_key: None,
             qwen_base_url: None,
+            mikamodel_model: None,
+            mikamodel_api_key: None,
+            mikamodel_base_url: None,
             // Non-provider settings
             db_path: PathBuf::from("test.db"),
             log_level: "info".to_string(),

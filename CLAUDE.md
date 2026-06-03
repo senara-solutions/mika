@@ -12,7 +12,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - **Language:** Rust (edition 2024)
 - **Agent engine:** Explicit Rust loop (no framework) — retrieve context -> build prompt -> LLM API -> match stop_reason -> execute tools or respond
-- **LLM:** Multi-provider via `LlmProvider` trait (11 providers). See `crates/mika-common/CLAUDE.md` for provider details.
+- **LLM:** Multi-provider via `LlmProvider` trait (12 providers). See `crates/mika-common/CLAUDE.md` for provider details.
 - **Database:** SQLite via rusqlite (single DB per container at `~/.mika/data/mika.db`)
 - **HTTP server:** Axum 0.8 (mika-server binary). See `crates/mika-agent/CLAUDE.md` for endpoint details.
 - **HTTP client:** reqwest 0.12 with rustls-tls

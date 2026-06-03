@@ -76,7 +76,8 @@ pub fn validate_file_key(key: &str, value: &str) -> Result<(), String> {
         }
         // Per-provider model fields + embedding_model: non-empty string
         "anthropic_model" | "openai_model" | "openrouter_model" | "groq_model" | "ollama_model"
-        | "mistral_model" | "google_model" | "deepseek_model" | "embedding_model" => {
+        | "mistral_model" | "google_model" | "deepseek_model" | "mikamodel_model"
+        | "embedding_model" => {
             if value.trim().is_empty() {
                 return Err(format!("{key} cannot be empty"));
             }
@@ -89,7 +90,8 @@ pub fn validate_file_key(key: &str, value: &str) -> Result<(), String> {
         | "ollama_base_url"
         | "mistral_base_url"
         | "google_base_url"
-        | "deepseek_base_url" => {
+        | "deepseek_base_url"
+        | "mikamodel_base_url" => {
             let value = value.trim();
             if value.is_empty() {
                 return Err(format!("{key} cannot be empty"));
