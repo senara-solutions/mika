@@ -7,6 +7,17 @@
 
 Four Dockerfile bugs shipped to main between 2026-05-19 and 2026-05-22 (mika#1237, #1240, #1242, #1243) — all discoverable by a `docker build` in CI. Currently `ci.yml` runs Rust and Node builds but never exercises Dockerfiles.
 
+## Phase 0 — Pin (verbatim source citations)
+
+The mika repo lives at `mika-platform/mika/` from the workspace root. Within the worktree (which IS the mika repo), paths are root-relative:
+
+- **`Dockerfile.agent`** — at mika repo root. Verified: `/home/samidarko/workspace/mika-platform/mika/Dockerfile.agent` exists.
+- **`Dockerfile.gateway`** — at mika repo root. Verified.
+- **`os/Dockerfile`** — at `os/Dockerfile` from worktree, **NOT** `mika/os/Dockerfile`. The issue body's `mika/os/Dockerfile` is workspace-relative; from the worktree (mika repo root) it is `os/Dockerfile`. Verified: `/home/samidarko/workspace/mika-platform/mika/os/Dockerfile` exists with `mika-os` and `mika-runtime` targets (shipped by mika#1243, closed).
+- **`CLAUDE.md`** (worktree root) is the **same file** as `mika/CLAUDE.md` (workspace-relative). Issue AC6 cites `mika/CLAUDE.md`; from the worktree it's the root `CLAUDE.md`. Single source — no path conflict.
+
+These pins resolve the F1/F3 ambiguity from the first-pass architect review.
+
 ## Approach
 
 Add a `docker-build-smoke` job to `.github/workflows/ci.yml` that runs `docker build` for each Dockerfile on every PR and push to main. Use BuildKit with GitHub Actions cache for layer caching.
@@ -14,16 +25,16 @@ Add a `docker-build-smoke` job to `.github/workflows/ci.yml` that runs `docker b
 ## Scope
 
 ### In scope
-- New CI job building Dockerfile.agent and Dockerfile.gateway
-- BuildKit layer caching via `docker/build-push-action` + `actions/cache` (or inline cache)
-- CLAUDE.md CI section update
+- New CI job building Dockerfile.agent, Dockerfile.gateway, and both `os/Dockerfile` targets (`mika-os` and `mika-runtime`) — all 4 AC2 builds
+- BuildKit layer caching via `docker/build-push-action` + GHA cache backend
+- CLAUDE.md CI section update (worktree root `CLAUDE.md` = workspace `mika/CLAUDE.md`)
+- Post-merge operator instruction for AC5 (branch protection rule update — repo admin action, documented in PR body)
 
 ### Out of scope
-- Mika OS targets (mika#1247 — not yet landed; `mika/os/Dockerfile` doesn't exist)
 - Registry publishing (build-only, no push)
 - Multi-arch builds
 - Runtime/functional verification (`docker run`)
-- Branch protection rule changes (AC5 — requires repo admin action, not a code change)
+- Per-role split of `mika-runtime` (deferred to mika#1247; AC7 covers the target-list update when that lands)
 
 ## Implementation Steps
 
@@ -67,7 +78,31 @@ docker-build-smoke:
         push: false
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    - name: Build mika-os target
+      uses: docker/build-push-action@<pinned-sha>
+      with:
+        context: .
+        file: os/Dockerfile
+        target: mika-os
+        tags: mika-os:ci
+        push: false
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build mika-runtime target
+      uses: docker/build-push-action@<pinned-sha>
+      with:
+        context: .
+        file: os/Dockerfile
+        target: mika-runtime
+        tags: mika-runtime:ci
+        push: false
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
 ```
+
+**Path note (per Phase 0 Pin):** The mika-os/mika-runtime targets are in `os/Dockerfile` from the worktree (mika repo root), NOT `mika/os/Dockerfile`. The latter is workspace-relative; the worktree IS the mika repo.
 
 **Key decisions:**
 
@@ -91,7 +126,7 @@ Pin to commit SHAs, matching the convention used for `actions/checkout` and `act
 
 ### Step 3: Update CLAUDE.md CI documentation
 
-**File:** `CLAUDE.md` (root)
+**File:** `CLAUDE.md` at the worktree root. This is the **same file** as `mika/CLAUDE.md` from the workspace; AC6's `mika/CLAUDE.md` and this plan's `CLAUDE.md` (root) refer to the same on-disk file (verified per Phase 0 Pin).
 
 In the "Architecture Summary" section under "CI/CD:", update the sentence listing CI jobs to include `docker-build-smoke`:
 
@@ -104,6 +139,24 @@ Run the Docker builds locally to confirm they pass on the current HEAD:
 ```bash
 docker build -f Dockerfile.agent -t mika-agent:ci .
 docker build -f Dockerfile.gateway -t mika-gateway:ci .
+docker build --target mika-os -f os/Dockerfile -t mika-os:ci .
+docker build --target mika-runtime -f os/Dockerfile -t mika-runtime:ci .
+```
+
+### Step 5: Post-merge operator action (AC5)
+
+This step is a **post-merge operator action** — it cannot be code-changed by a PR. After the PR lands and CI is green on `main`, the repo admin must add `docker-build-smoke` (the job name from Step 1) to the **required status checks** in the `senara-solutions/mika` branch protection rule for `main`.
+
+Without this step, the CI gate is advisory — it surfaces Dockerfile bugs but doesn't block merges. The operator (samidarko) promoted this to p0-critical specifically because the gate must block (issue comment `IC_kwDORWsgGM8AAAABDbaxRw`).
+
+The PR body MUST include:
+
+```
+## Post-merge operator action (AC5)
+
+Add `docker-build-smoke` to required status checks on the `main` branch protection rule.
+Path: Settings → Branches → main → Required status checks → Add `docker-build-smoke`.
+This is required to satisfy AC5; without it the gate is advisory-only.
 ```
 
 ## Caching Analysis
@@ -125,18 +178,16 @@ The Dockerfile.agent is the expensive one:
 
 ## Future Work (mika#1247)
 
-When mika#1247 lands and `mika/os/Dockerfile` exists with per-role targets:
-- Add build steps for `--target mika-os` and `--target mika-runtime` (or per-role targets like `mika-runtime-server`, `mika-runtime-gateway`)
-- These are Gentoo-based (stage3) and will be significantly larger/slower — may need separate caching strategy
+mika#1247 will split `mika-runtime` into per-role targets (e.g., `mika-runtime-server`, `mika-runtime-gateway`). When that lands, the docker-build-smoke job's `--target` list is updated in the same PR per AC7. The Gentoo-based stage3 layers may need a separate caching strategy if total CI time grows beyond the 30min budget.
 
 ## AC Traceability
 
 | AC | Covered by |
 |----|------------|
 | AC1 | Step 1 — `docker-build-smoke` job |
-| AC2 | Step 1 — agent + gateway builds (mika-os deferred to mika#1247) |
+| AC2 | Step 1 — all 4 builds (agent + gateway + os/Dockerfile mika-os + os/Dockerfile mika-runtime) |
 | AC3 | Step 1 — BuildKit via `docker/setup-buildx-action` |
 | AC4 | Step 1 — GHA cache backend (`type=gha,mode=max`) |
-| AC5 | Out of scope — requires repo admin action, not code |
-| AC6 | Step 3 — CLAUDE.md update |
-| AC7 | Future work section — depends on mika#1247 |
+| AC5 | Step 5 — post-merge operator instruction documented in PR body |
+| AC6 | Step 3 — CLAUDE.md update (worktree root `CLAUDE.md` ≡ workspace `mika/CLAUDE.md`) |
+| AC7 | Future work — updates target list when mika#1247 splits per-role |
