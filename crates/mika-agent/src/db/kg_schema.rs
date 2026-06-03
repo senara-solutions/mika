@@ -4,6 +4,12 @@
 //! convention constants. All migration code and row mappers import from here
 //! instead of using inline strings or `SELECT *`.
 //!
+//! ## Schema migration pre-ship checklist
+//!
+//! Before shipping any migration that changes what "pending work" queries return,
+//! consult `docs/solutions/best-practices/schema-migrations-as-integration-events-2026-04-23.md`
+//! for the operational checklist (mika#767).
+//!
 //! ## Write Contract (for `kg_chunks` consumers)
 //!
 //! The `kg_chunks` table stores chunk structural metadata (entity link, seq_id,
