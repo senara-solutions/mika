@@ -1274,9 +1274,12 @@ async fn run_loop(
                     }
 
                     // PR review early-accept: if the turn already contains a
-                    // successful `gh pr review` call, skip guards #4–#6. The primary
+                    // successful `gh pr review` call, skip guards #4–#6b, #7–#9.
+                    // Guards 6c (asserted_unavailability) and 6d (assert-grounded)
+                    // are NOT skipped — they detect a different failure family
+                    // (claim-without-evidence vs action-without-completion). The primary
                     // action completed — forced continuation would risk duplicate
-                    // review submissions. See #695.
+                    // review submissions. See #695, #1178.
                     let skip_remaining_guards =
                         matches!(response.stop_reason, LlmStopReason::EndTurn)
                             && has_successful_pr_review(&all_tool_summaries);
@@ -1285,7 +1288,7 @@ async fn run_loop(
                         info!(
                             step,
                             label = mode.label(),
-                            "PR review already posted — accepting EndTurn (skipping guards #4-#6)"
+                            "PR review already posted — accepting EndTurn (skipping guards #4-#6b, #7-#9; NOT 6c/6d)"
                         );
                     }
 
@@ -1704,8 +1707,7 @@ async fn run_loop(
                     // assistant text (not user input) and needs enabled_tool_names
                     // + dynamic correction message. See gate-evasion compound doc
                     // Rule 2.
-                    if !skip_remaining_guards
-                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !intent_guard_retries.contains(ASSERTED_UNAVAILABILITY_LABEL)
                         && let Some(tool_name) =
                             detect_asserted_unavailability(&text, enabled_tool_names)
@@ -1754,8 +1756,7 @@ async fn run_loop(
                     // turn's tool-call trace. Single retry via
                     // intent_guard_retries. Mirror of asserted_unavailability's
                     // negative-claim detector.
-                    if !skip_remaining_guards
-                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !intent_guard_retries.contains(ASSERT_GROUNDED_LABEL)
                         && let Some(claim) = detect_affirmative_state_claim(&text)
                         && !assert_grounded_satisfied(&claim, &all_tool_summaries)
