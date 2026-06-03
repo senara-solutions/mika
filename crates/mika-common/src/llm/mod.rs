@@ -249,6 +249,8 @@ pub enum ProviderKind {
     MiniMax,
     Kimi,
     Qwen,
+    #[serde(rename = "mikamodel")]
+    MikaModel,
 }
 
 impl ProviderKind {
@@ -265,6 +267,7 @@ impl ProviderKind {
         ProviderKind::MiniMax,
         ProviderKind::Kimi,
         ProviderKind::Qwen,
+        ProviderKind::MikaModel,
     ];
 
     /// Config key prefix for per-provider settings (e.g., `"anthropic"` → `anthropic_model`).
@@ -281,6 +284,7 @@ impl ProviderKind {
             ProviderKind::MiniMax => "minimax",
             ProviderKind::Kimi => "kimi",
             ProviderKind::Qwen => "qwen",
+            ProviderKind::MikaModel => "mikamodel",
         }
     }
 
@@ -298,6 +302,11 @@ impl ProviderKind {
             ProviderKind::MiniMax => Some("https://api.minimax.io/v1"),
             ProviderKind::Kimi => Some("https://api.moonshot.cn/v1"),
             ProviderKind::Qwen => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            // MikaModel ships in two phases. Phase 1 (current): served via a local
+            // Ollama runtime, so the default base URL matches the Ollama default and
+            // requests flow through the same /api/chat transport. Phase 2: swap to a
+            // hosted endpoint by overriding `mikamodel_base_url` — no code change.
+            ProviderKind::MikaModel => Some("http://localhost:11434"),
         }
     }
 
@@ -318,6 +327,8 @@ impl ProviderKind {
             ProviderKind::MiniMax => 16_384,
             ProviderKind::Kimi => 8_192,
             ProviderKind::Qwen => 8_192,
+            // MikaModel uses the Ollama transport, which imposes no hard cap.
+            ProviderKind::MikaModel => 131_072,
         }
     }
 
@@ -341,6 +352,7 @@ impl ProviderKind {
             ProviderKind::MiniMax => "MiniMax-M2.7",
             ProviderKind::Kimi => "moonshot-v1-128k",
             ProviderKind::Qwen => "qwen-plus",
+            ProviderKind::MikaModel => "mika",
         }
     }
 }
@@ -367,8 +379,9 @@ impl FromStr for ProviderKind {
             "minimax" => Ok(ProviderKind::MiniMax),
             "kimi" => Ok(ProviderKind::Kimi),
             "qwen" => Ok(ProviderKind::Qwen),
+            "mikamodel" => Ok(ProviderKind::MikaModel),
             _ => Err(format!(
-                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax, kimi, qwen"
+                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax, kimi, qwen, mikamodel"
             )),
         }
     }
@@ -398,6 +411,23 @@ pub fn create_provider(
             let base_url = spec
                 .effective_base_url()
                 .ok_or_else(|| anyhow::anyhow!("base URL is required for ollama provider"))?;
+            let provider = ollama::OllamaProvider::new(
+                base_url,
+                spec.api_key.clone(),
+                spec.model.clone(),
+                max_tokens,
+                log_llm_bodies,
+            );
+            Ok(Arc::new(provider))
+        }
+        ProviderKind::MikaModel => {
+            // Phase 1: served by the Ollama transport (`/api/chat`, tool calling
+            // supported natively). Phase 2 swap (hosted endpoint) just changes the
+            // base URL; the wire protocol stays the same as long as the upstream
+            // server is Ollama-compatible.
+            let base_url = spec
+                .effective_base_url()
+                .ok_or_else(|| anyhow::anyhow!("base URL is required for mikamodel provider"))?;
             let provider = ollama::OllamaProvider::new(
                 base_url,
                 spec.api_key.clone(),
@@ -451,6 +481,7 @@ mod tests {
         assert_eq!(ProviderKind::Mistral.to_string(), "mistral");
         assert_eq!(ProviderKind::Google.to_string(), "google");
         assert_eq!(ProviderKind::DeepSeek.to_string(), "deepseek");
+        assert_eq!(ProviderKind::MikaModel.to_string(), "mikamodel");
     }
 
     #[test]
@@ -471,6 +502,10 @@ mod tests {
         assert_eq!(
             "deepseek".parse::<ProviderKind>(),
             Ok(ProviderKind::DeepSeek)
+        );
+        assert_eq!(
+            "mikamodel".parse::<ProviderKind>(),
+            Ok(ProviderKind::MikaModel)
         );
     }
 
@@ -513,9 +548,35 @@ mod tests {
 
     #[test]
     fn test_provider_kind_all() {
-        assert_eq!(ProviderKind::ALL.len(), 11);
+        assert_eq!(ProviderKind::ALL.len(), 12);
         assert_eq!(ProviderKind::ALL[0], ProviderKind::Anthropic);
         assert_eq!(ProviderKind::ALL[10], ProviderKind::Qwen);
+        assert_eq!(ProviderKind::ALL[11], ProviderKind::MikaModel);
+    }
+
+    #[test]
+    fn test_mikamodel_defaults() {
+        // MikaModel must share the Ollama transport defaults so phase-1
+        // (local Ollama) works out of the box and phase-2 (hosted endpoint)
+        // only needs a base URL override.
+        assert_eq!(ProviderKind::MikaModel.config_prefix(), "mikamodel");
+        assert_eq!(
+            ProviderKind::MikaModel.default_base_url(),
+            Some("http://localhost:11434")
+        );
+        assert_eq!(ProviderKind::MikaModel.default_model(), "mika");
+        assert_eq!(ProviderKind::MikaModel.max_output_tokens(), 131_072);
+        assert!(!ProviderKind::MikaModel.model_names_contain_slash());
+    }
+
+    #[test]
+    fn test_provider_kind_deserialize_mikamodel() {
+        #[derive(Deserialize)]
+        struct TestConfig {
+            provider: ProviderKind,
+        }
+        let config: TestConfig = toml::from_str(r#"provider = "mikamodel""#).unwrap();
+        assert_eq!(config.provider, ProviderKind::MikaModel);
     }
 
     #[test]

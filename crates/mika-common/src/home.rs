@@ -254,7 +254,7 @@ pub const DEFAULT_CONFIG: &str = r#"# Mika configuration (per-agent overrides).
 # Secrets go in ~/.mika/.env (auto-loaded, 0600 permissions).
 # Run `mika setup` to configure your API key.
 
-# Active LLM provider — one of: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek
+# Active LLM provider — one of: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, mikamodel
 llm_provider = "anthropic"
 llm_max_tokens = 4096
 log_level = "info"
@@ -268,6 +268,7 @@ log_level = "info"
 # mistral_model = "mistral-large-latest"
 # google_model = "gemini-2.5-flash"
 # deepseek_model = "deepseek-chat"
+# mikamodel_model = "mika"
 "#;
 
 pub const DEFAULT_IDENTITY: &str = r#"name = "Mika"
