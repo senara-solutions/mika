@@ -71,10 +71,10 @@ Change:
 to:
 
 ```rust
-"PR review already posted — accepting EndTurn (skipping guards #4-#6b)"
+"PR review already posted — accepting EndTurn (skipping guards #4-#6b, #7-#9; NOT 6c/6d)"
 ```
 
-This accurately reflects that guards 6c and 6d are no longer skipped.
+This accurately reflects that guards 6c and 6d are no longer skipped, while guards #7 (persistence-eval), #8 (required-suffix-line), and #9 (required-finding-list) remain skipped.
 
 **Change 4 — Update the comment at line ~1276-1279**
 
@@ -91,9 +91,9 @@ to:
 
 ```rust
 // PR review early-accept: if the turn already contains a
-// successful `gh pr review` call, skip guards #4–#6b. Guards 6c
-// (asserted_unavailability) and 6d (assert-grounded) are NOT
-// skipped — they detect a different failure family
+// successful `gh pr review` call, skip guards #4–#6b, #7–#9.
+// Guards 6c (asserted_unavailability) and 6d (assert-grounded)
+// are NOT skipped — they detect a different failure family
 // (claim-without-evidence vs action-without-completion). The primary
 // action completed — forced continuation would risk duplicate
 // review submissions. See #695, #1178.
@@ -103,13 +103,17 @@ to:
 
 **Change 5 — Update the CLAUDE.md guard documentation**
 
+**Phase 0 Pin (F1):** The full guard chain is: 1, 2, 3, 3b, 4, 4b, 5, 5b, 6, 6b, 6c, 6d, (dispatch-arg-match #1313), 7 (persistence-eval), 8 (required-suffix-line), 9 (required-finding-list). All guards from #4 through #9 currently use `!skip_remaining_guards`. This fix removes the skip gate from ONLY 6c and 6d. Guards #4–#6b, dispatch-arg-match, #7, #8, #9 remain behind `skip_remaining_guards`. The current CLAUDE.md text `#4–#8 are all skipped` was already slightly inaccurate (guard #9, required-finding-list, is also skipped but not listed). This plan corrects the full range.
+
 In the guard 3b documentation, update the description of which guards are skipped. The current text says:
 
 > When true, guards #3 (required-tools, #821), #4–#8 are all skipped
 
 Change to:
 
-> When true, guards #3 (required-tools, #821), #4–#6b are skipped. Guards 6c (asserted_unavailability) and 6d (assert-grounded) are NOT skipped (#1178) — these detect claim-without-evidence, orthogonal to the PR-review completion semantics.
+> When true, guards #3 (required-tools, #821), #4–#6b, #7–#9 are all skipped — but NOT guards 6c (asserted_unavailability) or 6d (assert-grounded) (#1178). Those two detect claim-without-evidence, orthogonal to the PR-review completion semantics.
+
+Note: the range correction from `#4–#8` to `#4–#6b, #7–#9` also fixes the prior documentation omission of guard #9 (required-finding-list, #901) which was already behind `skip_remaining_guards` but not listed. This is a documentation correction, not a behavioral change.
 
 Also update guard 6c documentation. The current text says:
 
@@ -145,6 +149,21 @@ Register the test module in `grounding_regressions/mod.rs`.
 
 Update `tests/eval/grounding_regressions/README.md` scenario table with the new entry.
 
+**Change 6b — Add eval test: assert-grounded fires despite PR review early-accept (F2)**
+
+Create `assert_grounded_pr_review_composition.rs` in the same directory with a scenario where:
+- The LLM emits a successful `run_gh` call with `gh pr review --approve` (triggering `has_successful_pr_review() == true`)
+- The same EndTurn response text contains an affirmative state claim about an unrelated resource (e.g., "PR #42 has been merged and all CI checks are passing") without any grounding tool call for that resource
+- Assert: the assert-grounded guard fires (response contains the correction prompt or the agent retries)
+
+This tests the 6d composition gap, mirroring Change 6's coverage of 6c. The fixture should use the same `MockLlmProvider` pattern:
+1. First response: tool_use `run_gh` with PR review args + EndTurn text containing an ungrounded state claim about a different PR/issue
+2. Second response (after guard fires): clean EndTurn without the ungrounded claim
+
+Register the test module in `grounding_regressions/mod.rs` alongside the 6c test.
+
+Update `tests/eval/grounding_regressions/README.md` scenario table with both new entries (6c and 6d composition scenarios).
+
 ### File: `docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-04-28.md`
 
 **Change 7 — Update the evasion patterns doc**
@@ -154,13 +173,18 @@ The existing entry at line ~118 references mika#1178 as a tracked follow-up. Upd
 ## Test plan
 
 1. `cargo test -p mika-agent` — all existing tests pass (no behavioral regression for the guards that remain behind `skip_remaining_guards`)
-2. New eval test `asserted_unavailability_pr_review_composition` passes — proves the guard fires when PR review early-accept is active
-3. Existing `has_successful_pr_review` tests at agent.rs:~9830 still pass (the helper function is unchanged)
-4. Existing asserted_unavailability detection tests still pass (detection logic unchanged)
-5. Existing grounding regression eval tests still pass
-6. `cargo clippy` clean
+2. New eval test `asserted_unavailability_pr_review_composition` passes — proves guard 6c fires when PR review early-accept is active
+3. New eval test `assert_grounded_pr_review_composition` passes — proves guard 6d fires when PR review early-accept is active (F2: test coverage matches scope)
+4. Existing `has_successful_pr_review` tests at agent.rs:~9830 still pass (the helper function is unchanged)
+5. Existing asserted_unavailability detection tests still pass (detection logic unchanged)
+6. Existing grounding regression eval tests still pass
+7. `cargo clippy` clean
 
 ## Risks
 
 - **False positives on legitimate PR review turns:** Extremely unlikely. The asserted_unavailability guard requires: (a) the text to contain a snake_case tool name matching a specific unavailability claim pattern, AND (b) the named tool to be in the enabled set, AND (c) no call to that tool was attempted. A legitimate PR review turn would not normally contain such claims.
 - **Guard ordering change:** No. The guards stay in the same position in the chain. Only the `skip_remaining_guards` gate is removed from two of them.
+
+## Revision history
+
+- rev 2 (2026-06-03): addressed F1 by verifying the full guard chain (#1–#9) and correcting the CLAUDE.md guard range from `#4–#8` to `#4–#6b, #7–#9` — guards #7 (persistence-eval), #8 (required-suffix-line), and #9 (required-finding-list) remain behind `skip_remaining_guards` and were already skipped but undocumented at #8. The prior `#4–#8` text was already slightly wrong (omitted #9). Phase 0 Pin added to Change 5 with full guard enumeration. Addressed F2 by adding Change 6b — a second eval test (`assert_grounded_pr_review_composition.rs`) covering the 6d composition scenario (PR review + ungrounded state claim about an unrelated resource). Test plan updated to include item 3 for the new test. Citation: review-guide.md § Single Responsibility (change scope must match documented scope; test coverage must match change scope).
