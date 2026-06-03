@@ -200,46 +200,47 @@ mod tests {
         let _ = std::panic::take_hook();
     }
 
-    #[tokio::test]
-    async fn test_spawned_task_panic_reaches_hook() {
+    #[test]
+    fn test_spawned_task_panic_reaches_hook() {
         // Verify the panic hook fires when a spawned task with a dropped
         // JoinHandle panics — the motivating use case for mika#765.
         //
-        // We verify the hook chain fires (via AtomicBool) rather than
-        // capturing tracing output, because set_global_default + tracing
-        // dispatch during panic unwinding in test harness is unreliable.
-        // The sync tests above already verify tracing output capture.
+        // Implementation note: we use std::thread::spawn rather than tokio::spawn
+        // even though the production use case is tokio's worker pool. The
+        // std::panic hook is process-wide (set_hook + take_hook operate on the
+        // global hook), so the firing path is identical regardless of which
+        // runtime spawned the panicking task. Using std::thread lets the test
+        // be a plain #[test] (no async/.await), which means HOOK_MUTEX can be
+        // held across the entire panic+join cycle — no race with parallel
+        // tokio::tests that mutate the global hook during a tokio::sleep.
+        //
+        // We verify the hook chain fires (via AtomicBool) rather than capturing
+        // tracing output, because set_global_default + tracing dispatch during
+        // panic unwinding in the test harness is unreliable. The sync tests
+        // above already verify tracing output capture.
         let hook_fired = Arc::new(AtomicBool::new(false));
         let hook_fired_clone = hook_fired.clone();
 
-        // Install hooks under the mutex, then drop the lock before awaiting.
-        // clippy::await_holding_lock forbids holding a MutexGuard across .await.
-        {
-            let _lock = HOOK_MUTEX.lock().unwrap();
+        let _lock = HOOK_MUTEX.lock().unwrap();
 
-            // Install a flag-setting hook as the base, then layer our tracing hook
-            std::panic::set_hook(Box::new(move |_| {
-                hook_fired_clone.store(true, Ordering::SeqCst);
-            }));
-            install_tracing_panic_hook();
+        // Install a flag-setting hook as the base, then layer our tracing hook
+        std::panic::set_hook(Box::new(move |_| {
+            hook_fired_clone.store(true, Ordering::SeqCst);
+        }));
+        install_tracing_panic_hook();
 
-            // Spawn a task that panics — drop the handle (the motivating use case)
-            #[allow(clippy::let_underscore_future)]
-            let _ = tokio::spawn(async {
-                panic!("spawned task panic");
-            });
-        }
-
-        // Give the panic time to fire on the worker thread
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Spawn a thread that panics. join() waits for the panic to fully
+        // unwind through the hook chain — deterministic, no sleep+race.
+        let handle = std::thread::spawn(|| {
+            panic!("spawned task panic");
+        });
+        let _ = handle.join();
 
         assert!(
             hook_fired.load(Ordering::SeqCst),
             "panic hook chain should fire when a spawned task with dropped handle panics"
         );
 
-        // Clean up under the lock
-        let _lock = HOOK_MUTEX.lock().unwrap();
         let _ = std::panic::take_hook();
     }
 }
