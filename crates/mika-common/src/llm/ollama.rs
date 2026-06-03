@@ -1,15 +1,79 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use super::error::LlmError;
 use super::openai::extract_think_block;
 use super::types::*;
 use super::{LlmProvider, RETRY_BUFFER_SECS, TYPICAL_CALL_DURATION_SECS};
+
+/// One-shot debug-flag-gated payload dump (mika#1387).
+///
+/// When `MIKA_OLLAMA_DUMP_PAYLOAD=<path>` is set, the NEXT `/api/chat`
+/// request body through `OllamaProvider` is written to that path, then the
+/// flag flips and subsequent requests are no-ops. Process-scoped — resets
+/// only on process restart.
+///
+/// Bounded at 256 KiB. Overflow appends a truncation marker so the file
+/// stays grep-able and the operator notices.
+const PAYLOAD_DUMP_CAP_BYTES: usize = 256 * 1024;
+static PAYLOAD_DUMP_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// Test-only handle that resets the one-shot flag so each test starts fresh.
+#[cfg(test)]
+pub(crate) fn reset_payload_dump_flag() {
+    PAYLOAD_DUMP_FIRED.store(false, Ordering::Relaxed);
+}
+
+/// If `MIKA_OLLAMA_DUMP_PAYLOAD` is set and the one-shot flag hasn't fired
+/// this process, write `body_json` (capped at `PAYLOAD_DUMP_CAP_BYTES`) to
+/// the configured path. Failure resets the flag so the operator can retry
+/// after fixing the path; success flips it permanently.
+fn try_dump_payload(body_json: &str) {
+    let path = match std::env::var("MIKA_OLLAMA_DUMP_PAYLOAD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+
+    // Atomically reserve the one-shot slot.
+    if PAYLOAD_DUMP_FIRED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let total_len = body_json.len();
+    let (slice, truncated) = if total_len > PAYLOAD_DUMP_CAP_BYTES {
+        (&body_json[..PAYLOAD_DUMP_CAP_BYTES], true)
+    } else {
+        (body_json, false)
+    };
+
+    let mut content = String::with_capacity(slice.len() + 128);
+    content.push_str(slice);
+    if truncated {
+        content.push_str(&format!(
+            "\n<!-- TRUNCATED at {PAYLOAD_DUMP_CAP_BYTES} bytes; total payload was {total_len} bytes -->\n"
+        ));
+    }
+
+    match std::fs::write(&path, &content) {
+        Ok(()) => warn!(
+            path = %path,
+            bytes_written = content.len(),
+            truncated,
+            "Ollama payload dumped (one-shot)"
+        ),
+        Err(e) => {
+            // Reset so the operator can retry after fixing the path.
+            PAYLOAD_DUMP_FIRED.store(false, Ordering::Relaxed);
+            error!(path = %path, error = %e, "Ollama payload dump failed");
+        }
+    }
+}
 
 // -- Ollama wire types --
 
@@ -345,11 +409,26 @@ impl OllamaProvider {
             headers.insert(AUTHORIZATION, auth);
         }
 
-        // Dev-mode body logging
-        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG)
-            && let Ok(body_json) = serde_json::to_string(request)
-        {
-            debug!(target: "mika::llm_debug", body = %body_json, provider = "ollama", "llm request body");
+        // Serialize once for both the dev-mode debug log and the one-shot
+        // payload dump (#1387). Either gate may be enabled independently;
+        // if both are off, the serialize cost is skipped.
+        let dump_enabled =
+            std::env::var_os("MIKA_OLLAMA_DUMP_PAYLOAD").is_some_and(|v| !v.is_empty());
+        let debug_log_enabled = tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG);
+        if dump_enabled || debug_log_enabled {
+            match serde_json::to_string(request) {
+                Ok(body_json) => {
+                    if debug_log_enabled {
+                        debug!(target: "mika::llm_debug", body = %body_json, provider = "ollama", "llm request body");
+                    }
+                    if dump_enabled {
+                        try_dump_payload(&body_json);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "ollama: failed to serialize request for debug log/dump");
+                }
+            }
         }
 
         let response = self
@@ -1189,5 +1268,131 @@ mod tests {
         // Optional fields should be omitted when None
         assert!(json.get("tools").is_none());
         assert!(json["messages"][0].get("tool_calls").is_none());
+    }
+
+    // -- Payload dump tests (mika#1387) -------------------------------------
+
+    /// Tests for `try_dump_payload` use the process-wide env var
+    /// `MIKA_OLLAMA_DUMP_PAYLOAD` and the process-wide one-shot
+    /// `PAYLOAD_DUMP_FIRED` flag — must run serially and reset the flag
+    /// before each case.
+    mod payload_dump {
+        use super::super::*;
+        use serial_test::serial;
+        use tempfile::TempDir;
+
+        const ENV: &str = "MIKA_OLLAMA_DUMP_PAYLOAD";
+
+        struct EnvGuard {
+            key: &'static str,
+        }
+        impl EnvGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                unsafe { std::env::set_var(key, value) };
+                Self { key }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn r7_basic_dump_writes_body_and_flips_flag() {
+            reset_payload_dump_flag();
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("payload.json");
+            let _guard = EnvGuard::set(ENV, path.to_str().unwrap());
+
+            let body = r#"{"model":"mika","messages":[{"role":"user","content":"hello"}]}"#;
+            try_dump_payload(body);
+
+            let written = std::fs::read_to_string(&path).expect("file should be written");
+            assert_eq!(written, body);
+            assert!(
+                PAYLOAD_DUMP_FIRED.load(Ordering::Relaxed),
+                "one-shot flag should be set after successful dump"
+            );
+            // Cleanup for the next serial test.
+            reset_payload_dump_flag();
+        }
+
+        #[test]
+        #[serial]
+        fn r8_one_shot_second_call_is_noop() {
+            reset_payload_dump_flag();
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("payload.json");
+            let _guard = EnvGuard::set(ENV, path.to_str().unwrap());
+
+            try_dump_payload(r#"{"first":"call"}"#);
+            // Second invocation must not overwrite — content remains the first call's body.
+            try_dump_payload(r#"{"second":"call"}"#);
+
+            let written = std::fs::read_to_string(&path).expect("file should be written");
+            assert_eq!(written, r#"{"first":"call"}"#);
+            reset_payload_dump_flag();
+        }
+
+        #[test]
+        #[serial]
+        fn r9_truncation_marker_when_body_exceeds_cap() {
+            reset_payload_dump_flag();
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("payload.json");
+            let _guard = EnvGuard::set(ENV, path.to_str().unwrap());
+
+            // Body larger than the 256 KiB cap.
+            let body = "x".repeat(PAYLOAD_DUMP_CAP_BYTES + 1024);
+            try_dump_payload(&body);
+
+            let written = std::fs::read_to_string(&path).expect("file should be written");
+            // First PAYLOAD_DUMP_CAP_BYTES bytes preserved verbatim.
+            assert_eq!(
+                &written[..PAYLOAD_DUMP_CAP_BYTES],
+                &body[..PAYLOAD_DUMP_CAP_BYTES]
+            );
+            // Truncation marker appended with both byte counts.
+            assert!(
+                written.contains("<!-- TRUNCATED at "),
+                "expected truncation marker, got tail: {}",
+                &written[written.len().saturating_sub(200)..]
+            );
+            assert!(
+                written.contains(&format!(
+                    "total payload was {} bytes",
+                    PAYLOAD_DUMP_CAP_BYTES + 1024
+                )),
+                "marker should report the total payload length"
+            );
+            reset_payload_dump_flag();
+        }
+
+        #[test]
+        #[serial]
+        fn env_unset_is_noop() {
+            reset_payload_dump_flag();
+            // No env var set — `try_dump_payload` returns without touching anything.
+            unsafe { std::env::remove_var(ENV) };
+            try_dump_payload(r#"{"unused":true}"#);
+            assert!(
+                !PAYLOAD_DUMP_FIRED.load(Ordering::Relaxed),
+                "flag must not flip when env is unset"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn env_empty_is_noop() {
+            reset_payload_dump_flag();
+            let _guard = EnvGuard::set(ENV, "");
+            try_dump_payload(r#"{"unused":true}"#);
+            assert!(
+                !PAYLOAD_DUMP_FIRED.load(Ordering::Relaxed),
+                "flag must not flip when env value is empty"
+            );
+        }
     }
 }
