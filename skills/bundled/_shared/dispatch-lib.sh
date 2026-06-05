@@ -795,11 +795,28 @@ Push: SKIPPED — duplicate-commit guard detected patch-equivalent commits on br
     # Fetch fresh remote state. No-ops if origin/$BRANCH doesn't exist (first-push).
     git -C "$WORKTREE_DIR" fetch origin "$BRANCH" 2>/dev/null || true
 
+    # Three git states, distinguished against the REMOTE-TRACKING branch
+    # (origin/$BRANCH) — never against local `main` (mika#1407):
+    #   (a) HEAD == origin/$BRANCH         → nothing to push. NO-OP, NOT a
+    #                                        divergence (early `return 0` below).
+    #   (b) HEAD ahead of origin/$BRANCH   → push (fast-forward, or
+    #                                        --force-with-lease when ancestry
+    #                                        proves the branch was rebased).
+    #   (c) branch base behind origin/main → a REBASE concern owned by
+    #                                        _set_up_worktree; ORTHOGONAL to the
+    #                                        push decision and not consulted here.
+    # mika#1407: the dev-groom pilot used to make this call in prose and
+    # conflated (c) — a stale local `main` ref — with (b), emitting a spurious
+    # "remote divergence detected; abort" on a branch that had nothing to push.
+    # The push decision lives here in code, keyed solely on origin/$BRANCH..HEAD,
+    # so the stale-main symptom can never drive it.
+    #
     # Branch on remote-ref existence (F1 fix from architect review on mika#1268):
     # Determine push mode: first-push, fast-forward, or diverged (mika#1364).
     local push_mode="first-push"
     if git -C "$WORKTREE_DIR" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
-        # Existing-remote case — push only if HEAD is ahead.
+        # Existing-remote case — state (a)/(b). Push only if HEAD is ahead of
+        # the remote-tracking branch; ahead==0 is state (a), a clean no-op.
         local ahead
         ahead=$(git -C "$WORKTREE_DIR" rev-list "origin/$BRANCH..HEAD" --count 2>/dev/null || echo 0)
         [ "${ahead:-0}" -eq 0 ] && return 0
