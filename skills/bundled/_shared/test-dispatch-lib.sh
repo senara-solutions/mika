@@ -1500,6 +1500,81 @@ DEDUP_FUNC=$(declare -f _check_duplicate_commits)
 assert_contains "Dedup rebase captures stderr to temp file" "dedup-rebase-err" "$DEDUP_FUNC"
 assert_contains "Dedup rebase surfaces reason in RESULT" "Dedup-rebase failed" "$DEDUP_FUNC"
 
+# --- Test 12h: mika#1407 — push decision keyed on the remote-tracking branch ---
+echo ""
+echo "Test 12h: Stale-main conflation no-op (mika#1407)"
+echo "-------------------------------------------------"
+
+# Structural: the three-state rationale is documented in source, and the push
+# decision is keyed on origin/$BRANCH..HEAD (the remote-tracking branch), never
+# on local main. Comments are stripped by `declare -f`, so read the source file.
+PUSH_SRC=$(sed -n '/^_push_branch() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "_push_branch documents mika#1407 three-state rationale" "mika#1407" "$PUSH_SRC"
+assert_contains "_push_branch keys push decision on origin/\$BRANCH..HEAD" 'origin/$BRANCH..HEAD' "$PUSH_SRC"
+
+# Behavioral: HEAD == origin/<branch> (nothing to push) WHILE local `main` is
+# stale (behind origin/main). _push_branch must no-op — return 0, push nothing,
+# emit no divergence/abort text. base-behind-main is orthogonal to the push
+# decision; the pilot's old prose diagnostic conflated the two (mika#1407).
+test_noop_when_head_equals_remote_stale_main() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # Feature branch at HEAD == origin/<branch> (ahead==0).
+    git -C "$FIXTURE_CLONE" checkout -q -b fix/1407-noop
+    echo "plan" > "$FIXTURE_CLONE/plan.txt"
+    git -C "$FIXTURE_CLONE" add plan.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "groom plan (content-only)"
+    git -C "$FIXTURE_CLONE" push -q -u origin fix/1407-noop
+
+    # Advance origin/main via a throwaway clone so the working clone's local
+    # `main` ref falls behind origin/main — the exact conflation trigger.
+    local advance_clone
+    advance_clone=$(mktemp -d)
+    git clone -q "file://$FIXTURE_BARE" "$advance_clone"
+    git -C "$advance_clone" config user.email "test@mika.local"
+    git -C "$advance_clone" config user.name "mika test"
+    echo "advance" > "$advance_clone/main-advance.txt"
+    git -C "$advance_clone" add main-advance.txt
+    git -C "$advance_clone" commit -q -m "advance main"
+    git -C "$advance_clone" push -q origin main
+    rm -rf "$advance_clone"
+    # Update remote-tracking refs but leave local `main` behind origin/main.
+    git -C "$FIXTURE_CLONE" fetch -q origin
+
+    local behind remote_before
+    behind=$(git -C "$FIXTURE_CLONE" rev-list --count main..origin/main 2>/dev/null || echo 0)
+    remote_before=$(git -C "$FIXTURE_CLONE" rev-parse "origin/fix/1407-noop")
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="fix/1407-noop"
+    REPO="mika"
+    RESULT=""
+    local rc=0
+    _push_branch || rc=$?
+
+    local remote_after
+    remote_after=$(git -C "$FIXTURE_CLONE" rev-parse "origin/fix/1407-noop")
+
+    local failures=""
+    [ "$rc" -eq 0 ] || failures="${failures}expected return 0 (no-op), got $rc; "
+    [ "${behind:-0}" -ge 1 ] || failures="${failures}fixture should leave local main behind origin/main; "
+    [ "$remote_before" = "$remote_after" ] || failures="${failures}remote HEAD must be unchanged (nothing pushed); "
+    if printf '%s' "$RESULT" | grep -qiE "divergence|abort|reconciliation|Push: pushed|Push: FAILED"; then
+        failures="${failures}RESULT must contain no push/abort/divergence text; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12H=$(test_noop_when_head_equals_remote_stale_main 2>/dev/null)
+if [ "$RESULT_12H" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ No-op when HEAD==origin/branch + stale local main (mika#1407)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ No-op on stale-main conflation (mika#1407): $RESULT_12H"
+fi
+
 # --- Summary ---
 
 echo ""
