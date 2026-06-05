@@ -73,9 +73,8 @@ fn make_required_tools_skill(name: &str, keywords: &[&str], required_tools: &[&s
         enabled: true,
         has_override: false,
         provider_overrides: HashMap::new(),
-        model_prompts: HashMap::new(),
+        prompt_sources: SkillEntry::empty_prompt_sources(),
         model_overrides: HashMap::new(),
-        generated_model_prompts: HashMap::new(),
     }
 }
 

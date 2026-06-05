@@ -347,7 +347,7 @@ fn list_skills(
                         "always_on": entry.manifest.skill.always_on,
                         "tools": entry.skill_tools.len(),
                         "variants": entry.variant_count(),
-                        "generated_variants": entry.generated_model_prompts.len(),
+                        "generated_variants": entry.generated_model_prompts().len(),
                         "llm_override": llm_override,
                     })
                 })
@@ -405,7 +405,7 @@ fn list_skills(
                 };
                 let variants = {
                     let hand = entry.variant_count();
-                    let gen_count = entry.generated_model_prompts.len();
+                    let gen_count = entry.generated_model_prompts().len();
                     match (hand, gen_count) {
                         (0, 0) => String::new(),
                         (h, 0) => format!(" [variants: {h} hand]"),
@@ -517,7 +517,7 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
 
             // Show provider and model variants
             let providers = entry.variant_providers();
-            let generated_count = entry.generated_model_prompts.len();
+            let generated_count = entry.generated_model_prompts().len();
             if !providers.is_empty() || entry.variant_count() > 0 || generated_count > 0 {
                 println!(
                     "    Variants:    {} hand, {} generated",
@@ -536,7 +536,7 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
                     let models = entry.variant_models(provider);
                     for model in &models {
                         let model_key = format!("{provider}/{model}");
-                        let has_model_prompt = entry.model_prompts.contains_key(&model_key);
+                        let has_model_prompt = entry.model_prompts().contains_key(&model_key);
                         let has_model_override = entry.model_overrides.contains_key(&model_key);
                         let model_parts: Vec<&str> = [
                             if has_model_prompt {
@@ -557,7 +557,7 @@ fn show_skill_detail(registry: &SkillRegistry, name: &str, agent_home: &Path) {
                     }
                 }
                 if generated_count > 0 {
-                    let mut keys: Vec<&String> = entry.generated_model_prompts.keys().collect();
+                    let mut keys: Vec<&String> = entry.generated_model_prompts().keys().collect();
                     keys.sort();
                     println!("      generated:");
                     for key in keys {

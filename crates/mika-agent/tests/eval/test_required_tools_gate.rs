@@ -148,9 +148,8 @@ fn make_skill_with_required_tools(
         enabled: true,
         has_override: false,
         provider_overrides: HashMap::new(),
-        model_prompts: HashMap::new(),
+        prompt_sources: SkillEntry::empty_prompt_sources(),
         model_overrides: HashMap::new(),
-        generated_model_prompts: HashMap::new(),
     }
 }
 

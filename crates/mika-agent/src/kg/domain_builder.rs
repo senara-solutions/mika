@@ -830,9 +830,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: Default::default(),
-            model_prompts: Default::default(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: Default::default(),
-            generated_model_prompts: Default::default(),
         }
     }
 
