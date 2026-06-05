@@ -6467,9 +6467,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: std::collections::HashMap::new(),
-            model_prompts: std::collections::HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: std::collections::HashMap::new(),
-            generated_model_prompts: std::collections::HashMap::new(),
         }
     }
 
@@ -6759,7 +6758,7 @@ mod tests {
         let tools = ToolRegistry::new();
         let mut entry = make_skill_entry("search", 30, &[]);
         entry.prompt_snippet = "Root prompt.".to_string();
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "anthropic/claude-sonnet-4-6".to_string(),
             "Sonnet-specific prompt.".to_string(),
         );
@@ -6793,7 +6792,7 @@ mod tests {
         let tools = ToolRegistry::new();
         let mut entry = make_skill_entry("search", 30, &[]);
         entry.prompt_snippet = "Root prompt.".to_string();
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "anthropic/claude-sonnet-4-6".to_string(),
             "Sonnet prompt.".to_string(),
         );
@@ -6847,7 +6846,7 @@ mod tests {
         let tools = ToolRegistry::new();
         let mut entry = make_skill_entry("search", 30, &[]);
         entry.prompt_snippet = "Root prompt.".to_string();
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "openrouter/anthropic--claude-sonnet-4".to_string(),
             "OpenRouter model prompt.".to_string(),
         );

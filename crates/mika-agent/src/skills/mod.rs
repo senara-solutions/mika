@@ -788,9 +788,8 @@ mod tests {
             enabled,
             has_override: false,
             provider_overrides: std::collections::HashMap::new(),
-            model_prompts: std::collections::HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: std::collections::HashMap::new(),
-            generated_model_prompts: std::collections::HashMap::new(),
         }
     }
 
