@@ -72,9 +72,11 @@ The existing quote-state FSM handles the carve-out correctly:
 
 ## Prevention
 
-- **Cross-language sentinel comments**: Both files enumerate the full metacharacter set (`$(`, backtick, `$'`, `>(`, `<(`) in their coupling contract comments. When adding new metacharacter patterns, update both sides.
-- **Test parity**: The Rust and Python test suites mirror each other's test cases for each metacharacter. New bypasses should get tests on both sides.
-- **Defense-in-depth ordering**: `contains_unquoted_metacharacter()` runs before `split_compound_command()` in both code paths. This means downstream parsers that don't understand `$'...'` never see it — the metacharacter check rejects the command first.
+> **Note (2026-06-03):** the original cross-language framing here described a Rust+Python coupling that no longer exists. The Rust side was retired in mika#1193 (see Update below). The bullets are rewritten as within-`claude-pilot-py` invariants — the only side left.
+
+- **Within-cpp metacharacter sentinel**: `tier1.py`'s `contains_unquoted_metacharacter()` scanner and `policy.py`'s compound-chain allow guard (`_bash_allow_is_chain_safe`, mika cpp#25) share one metacharacter set (`$(`, backtick, `$'`, `>(`, `<(`). The two consumers must agree on what they guard. When adding a new metacharacter pattern, update both files in the same change and add a test on each side.
+- **Test parity within cpp**: `tier1.py`'s test suite and `policy.py`'s test suite mirror each other for the metacharacter scanner cases. New bypasses get tests at both layers, locking the coupling.
+- **Defense-in-depth ordering**: `contains_unquoted_metacharacter()` runs before `split_compound_command()` in the cpp policy stack. Downstream parsers that don't understand `$'...'` never see it — the scanner rejects the command first.
 
 ## References
 
@@ -84,3 +86,12 @@ The existing quote-state FSM handles the carve-out correctly:
 - mika#946 / claude-pilot-py#16 — Python scanner port
 - senara-solutions/mika#1320 — Rust PR
 - senara-solutions/claude-pilot-py#17 — Python companion PR
+
+## Update (2026-06-03): Rust pre-classifier retired — `claude-pilot-py/tier1.py` is now the sole owner
+
+The Rust `permission_pre_classifier.rs` and its `contains_unquoted_metacharacter()` scanner described above **no longer exist** — they were deleted in **mika#1193** (2026-05-30) when mika-relay was retired. Bash-command permission classification now lives **exclusively in `claude-pilot-py`** (`src/claude_pilot/tier1.py` allow-list + `src/claude_pilot/policy.py` compound-chain guard + `src/claude_pilot/policies/permissions.yaml` rules). The original "cross-language sentinel" framing in the Prevention section above has been rewritten as a within-cpp invariant (tier1 ↔ policy coupling), which is the only coupling that still exists.
+
+Anyone auditing or extending command-string permission safety should look there, not here. Two known follow-ups tracked on that repo:
+
+- **claude-pilot-py#25** (shipped) — hardened the policy `allow` path against compound-chained tails (allow-list over segments) and heredoc desyncs. Durable writeup: `claude-pilot-py/docs/solutions/security-issues/command-string-policy-allow-rules-are-compound-unsafe.md`.
+- **claude-pilot-py#27** (open) — `tier1.py`'s first-word allow-list trusts `awk`/`sed` without guarding their code-exec sub-features (`awk 'BEGIN{system(...)}'`, GNU `sed` `e`-flag auto-approve). The TIER3 denylist is incomplete by nature and is not the safety boundary (the allow-list is).
