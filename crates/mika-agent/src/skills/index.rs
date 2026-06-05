@@ -61,6 +61,27 @@ impl fmt::Display for PromptVariantSource {
     }
 }
 
+/// Identifies the origin tier of a prompt map.
+/// Variants are ordered by priority — earlier variants win in `resolve_prompt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSource {
+    /// Hand-authored model variant under `<provider>/<model>/`.
+    HandAuthored,
+    /// Auto-generated variant under `generated/<provider>/<model>/`.
+    Generated,
+    // Future: Marketplace, RemoteFetched, etc.
+}
+
+impl PromptSource {
+    fn to_variant_source(self) -> PromptVariantSource {
+        match self {
+            PromptSource::HandAuthored => PromptVariantSource::HandAuthoredModel,
+            PromptSource::Generated => PromptVariantSource::GeneratedModel,
+        }
+    }
+}
+
 /// Result of resolving a prompt variant via `SkillEntry::resolve_prompt()`.
 #[derive(Debug, Clone)]
 pub struct ResolvedPrompt<'a> {
@@ -107,20 +128,19 @@ pub struct SkillEntry {
     /// Key = provider name, value = sparse override fields.
     /// Empty map if no variants exist.
     pub provider_overrides: HashMap<String, ProviderSkillFields>,
-    /// Model-specific prompt snippet overrides.
-    /// Key = "{provider}/{sanitized_model}" (e.g., "anthropic/claude-sonnet-4-6").
-    /// Empty map if no model variants exist. Populated eagerly at scan time.
-    pub model_prompts: HashMap<String, String>,
+    /// Ordered prompt sources. Each entry is a (source tier, key→prompt map).
+    /// Resolution walks sources in order; first match wins.
+    /// Constructed at scan time with HandAuthored first, Generated second.
+    pub prompt_sources: Vec<(PromptSource, HashMap<String, String>)>,
     /// Model-specific manifest field overrides.
     /// Key = "{provider}/{sanitized_model}", value = sparse override fields.
     /// Empty map if no model variants exist.
     pub model_overrides: HashMap<String, ProviderSkillFields>,
-    /// Auto-generated model prompts under `generated/{provider}/{sanitized_model}/`.
-    /// Key = "{provider}/{sanitized_model}". Populated by `review_skill` (when
-    /// called with `content`) at runtime; loaded eagerly at scan time. Hand-authored variants in
-    /// `model_prompts` always win over generated entries here (see `resolve_prompt`).
-    pub generated_model_prompts: HashMap<String, String>,
 }
+
+/// Empty map returned by accessor methods when a prompt source tier is absent.
+static EMPTY_MAP: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(HashMap::new);
 
 impl SkillEntry {
     /// Effective timeout: model override > provider override > root.
@@ -135,6 +155,24 @@ impl SkillEntry {
                     .and_then(|o| o.timeout_secs)
             })
             .unwrap_or(self.manifest.skill.timeout_secs)
+    }
+
+    /// Access hand-authored model prompts (first source tier).
+    pub fn model_prompts(&self) -> &HashMap<String, String> {
+        self.prompt_sources
+            .iter()
+            .find(|(s, _)| *s == PromptSource::HandAuthored)
+            .map(|(_, m)| m)
+            .unwrap_or(&EMPTY_MAP)
+    }
+
+    /// Access generated model prompts (second source tier).
+    pub fn generated_model_prompts(&self) -> &HashMap<String, String> {
+        self.prompt_sources
+            .iter()
+            .find(|(s, _)| *s == PromptSource::Generated)
+            .map(|(_, m)| m)
+            .unwrap_or(&EMPTY_MAP)
     }
 
     /// Resolve the best prompt for a given provider + model combination.
@@ -152,41 +190,40 @@ impl SkillEntry {
     /// Provider-level prompts are intentionally not supported.
     pub fn resolve_prompt(&self, provider: &str, model: &str) -> ResolvedPrompt<'_> {
         let requesting_key = format!("{}/{}", provider, sanitize_model_dir_name(model));
-        if let Some(prompt) = self.model_prompts.get(&requesting_key) {
-            return ResolvedPrompt {
-                text: prompt,
-                source: PromptVariantSource::HandAuthoredModel,
-                key: Some(requesting_key),
-            };
-        }
-        if let Some(prompt) = self.generated_model_prompts.get(&requesting_key) {
-            return ResolvedPrompt {
-                text: prompt,
-                source: PromptVariantSource::GeneratedModel,
-                key: Some(requesting_key),
-            };
-        }
-        // Generated variants are written under the *canonical* provider/model
-        // tuple (aggregator namespace stripped), so an openrouter caller must
-        // also probe the canonical key. Hand-authored variants intentionally
-        // do not get this fallback — users author against their requesting
-        // provider explicitly.
-        let (canonical_provider, canonical_model) =
-            resolve_canonical_provider_model(provider, model);
-        if canonical_provider != provider || canonical_model != model {
-            let canonical_key = format!(
-                "{}/{}",
-                canonical_provider,
-                sanitize_model_dir_name(canonical_model)
-            );
-            if let Some(prompt) = self.generated_model_prompts.get(&canonical_key) {
+
+        // Walk sources in priority order — first match wins
+        for (source, map) in &self.prompt_sources {
+            if let Some(prompt) = map.get(&requesting_key) {
                 return ResolvedPrompt {
                     text: prompt,
-                    source: PromptVariantSource::GeneratedCanonical,
-                    key: Some(canonical_key),
+                    source: source.to_variant_source(),
+                    key: Some(requesting_key),
                 };
             }
+
+            // Canonical-key fallback only for Generated sources
+            // (hand-authored variants are authored against their requesting provider explicitly)
+            if *source == PromptSource::Generated {
+                let (canonical_provider, canonical_model) =
+                    resolve_canonical_provider_model(provider, model);
+                if canonical_provider != provider || canonical_model != model {
+                    let canonical_key = format!(
+                        "{}/{}",
+                        canonical_provider,
+                        sanitize_model_dir_name(canonical_model)
+                    );
+                    if let Some(prompt) = map.get(&canonical_key) {
+                        return ResolvedPrompt {
+                            text: prompt,
+                            source: PromptVariantSource::GeneratedCanonical,
+                            key: Some(canonical_key),
+                        };
+                    }
+                }
+            }
         }
+
+        // No variant matched — fall back to root prompt
         ResolvedPrompt {
             text: &self.prompt_snippet,
             source: PromptVariantSource::Base,
@@ -200,10 +237,12 @@ impl SkillEntry {
         for key in self.provider_overrides.keys() {
             providers.insert(key.as_str());
         }
-        // Also include providers from model variants
-        for key in self.model_prompts.keys() {
-            if let Some(provider) = key.split('/').next() {
-                providers.insert(provider);
+        // Also include providers from model variants (all prompt sources)
+        for (_, map) in &self.prompt_sources {
+            for key in map.keys() {
+                if let Some(provider) = key.split('/').next() {
+                    providers.insert(provider);
+                }
             }
         }
         for key in self.model_overrides.keys() {
@@ -218,9 +257,11 @@ impl SkillEntry {
     pub fn variant_models(&self, provider: &str) -> BTreeSet<&str> {
         let prefix = format!("{provider}/");
         let mut models = BTreeSet::new();
-        for key in self.model_prompts.keys() {
-            if let Some(model) = key.strip_prefix(&prefix) {
-                models.insert(model);
+        for (_, map) in &self.prompt_sources {
+            for key in map.keys() {
+                if let Some(model) = key.strip_prefix(&prefix) {
+                    models.insert(model);
+                }
             }
         }
         for key in self.model_overrides.keys() {
@@ -238,14 +279,48 @@ impl SkillEntry {
         for key in self.provider_overrides.keys() {
             all_keys.insert(key.as_str());
         }
-        // Model-level composite keys
-        for key in self.model_prompts.keys() {
-            all_keys.insert(key.as_str());
+        // Model-level composite keys (all prompt sources)
+        for (_, map) in &self.prompt_sources {
+            for key in map.keys() {
+                all_keys.insert(key.as_str());
+            }
         }
         for key in self.model_overrides.keys() {
             all_keys.insert(key.as_str());
         }
         all_keys.len()
+    }
+
+    /// Mutable access to hand-authored model prompts (first source tier).
+    /// Panics if no `HandAuthored` source exists.
+    pub fn model_prompts_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self
+            .prompt_sources
+            .iter_mut()
+            .find(|(s, _)| *s == PromptSource::HandAuthored)
+            .expect("HandAuthored source missing")
+            .1
+    }
+
+    /// Mutable access to generated model prompts (second source tier).
+    /// Panics if no `Generated` source exists.
+    pub fn generated_model_prompts_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self
+            .prompt_sources
+            .iter_mut()
+            .find(|(s, _)| *s == PromptSource::Generated)
+            .expect("Generated source missing")
+            .1
+    }
+
+    /// Default prompt sources: `[HandAuthored, Generated]` with empty maps.
+    /// Used to construct `SkillEntry` in tests and in code paths that
+    /// build entries without filesystem scanning.
+    pub fn empty_prompt_sources() -> Vec<(PromptSource, HashMap<String, String>)> {
+        vec![
+            (PromptSource::HandAuthored, HashMap::new()),
+            (PromptSource::Generated, HashMap::new()),
+        ]
     }
 }
 
@@ -571,8 +646,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             enabled,
             has_override: false,
             provider_overrides: variants.provider_overrides,
-            model_prompts: variants.model_prompts,
-            generated_model_prompts: variants.generated_model_prompts,
+            prompt_sources: variants.prompt_sources,
             model_overrides: variants.model_overrides,
         });
     }
@@ -1487,9 +1561,8 @@ fn inject_task_id_field(schema: &mut serde_json::Value) {
 /// Result of scanning provider and model variant directories.
 struct VariantScanResult {
     provider_overrides: HashMap<String, ProviderSkillFields>,
-    model_prompts: HashMap<String, String>,
+    prompt_sources: Vec<(PromptSource, HashMap<String, String>)>,
     model_overrides: HashMap<String, ProviderSkillFields>,
-    generated_model_prompts: HashMap<String, String>,
 }
 
 /// Scan a skill directory for provider and model variant subdirectories.
@@ -1510,9 +1583,11 @@ fn scan_provider_variants(skill_dir: &Path, manifest: &SkillManifest) -> Variant
         Err(_) => {
             return VariantScanResult {
                 provider_overrides: overrides,
-                model_prompts,
+                prompt_sources: vec![
+                    (PromptSource::HandAuthored, model_prompts),
+                    (PromptSource::Generated, generated_model_prompts),
+                ],
                 model_overrides,
-                generated_model_prompts,
             };
         }
     };
@@ -1680,9 +1755,11 @@ fn scan_provider_variants(skill_dir: &Path, manifest: &SkillManifest) -> Variant
 
     VariantScanResult {
         provider_overrides: overrides,
-        model_prompts,
+        prompt_sources: vec![
+            (PromptSource::HandAuthored, model_prompts),
+            (PromptSource::Generated, generated_model_prompts),
+        ],
         model_overrides,
-        generated_model_prompts,
     }
 }
 
@@ -3065,9 +3142,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
         entry.provider_overrides.insert(
             "openai".to_string(),
@@ -3106,9 +3182,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
         assert_eq!(
             entry.effective_timeout("anthropic", "claude-sonnet-4-6"),
@@ -3143,9 +3218,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
         assert_eq!(
             entry.effective_timeout("unknown_provider", "some-model"),
@@ -3180,9 +3254,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
 
         assert_eq!(entry.variant_count(), 0);
@@ -3430,7 +3503,7 @@ mod tests {
         let scan = scan_skills_dir(&skills_root);
         assert_eq!(scan.entries.len(), 1);
         let entry = &scan.entries[0];
-        assert_eq!(entry.generated_model_prompts.len(), 1);
+        assert_eq!(entry.generated_model_prompts().len(), 1);
         // Generated variant wins over root when no hand-authored exists.
         let resolved = entry.resolve_prompt("anthropic", "claude-sonnet-4-6");
         assert_eq!(resolved.text, "GENERATED");
@@ -3618,7 +3691,7 @@ mod tests {
         assert_eq!(scan.entries[0].prompt_snippet, "Root prompt.");
         assert_eq!(
             scan.entries[0]
-                .model_prompts
+                .model_prompts()
                 .get("anthropic/claude-sonnet-4-6")
                 .unwrap(),
             "Sonnet 4.6 prompt."
@@ -3709,7 +3782,7 @@ mod tests {
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(
             scan.entries[0]
-                .model_prompts
+                .model_prompts()
                 .get("openrouter/anthropic--claude-sonnet-4")
                 .unwrap(),
             "OpenRouter Claude Sonnet prompt."
@@ -3718,7 +3791,7 @@ mod tests {
         let sanitized = sanitize_model_dir_name("anthropic/claude-sonnet-4");
         assert_eq!(sanitized, "anthropic--claude-sonnet-4");
         let lookup_key = format!("openrouter/{sanitized}");
-        assert!(scan.entries[0].model_prompts.contains_key(&lookup_key));
+        assert!(scan.entries[0].model_prompts().contains_key(&lookup_key));
     }
 
     #[test]
@@ -3747,7 +3820,7 @@ mod tests {
 
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
-        assert!(scan.entries[0].model_prompts.is_empty());
+        assert!(scan.entries[0].model_prompts().is_empty());
     }
 
     #[test]
@@ -3779,7 +3852,7 @@ mod tests {
         // Model dir is empty so should not be in model_prompts or model_overrides
         assert!(
             !scan.entries[0]
-                .model_prompts
+                .model_prompts()
                 .contains_key("anthropic/claude-opus-4")
         );
         assert!(
@@ -3828,27 +3901,27 @@ mod tests {
         let scan = scan_skills_dir(tmp.path());
         assert_eq!(scan.entries.len(), 1);
         // 3 model variants only (no provider-level prompts)
-        assert_eq!(scan.entries[0].model_prompts.len(), 3);
+        assert_eq!(scan.entries[0].model_prompts().len(), 3);
         assert_eq!(scan.entries[0].variant_count(), 3);
 
         // Verify specific entries
         assert_eq!(
             scan.entries[0]
-                .model_prompts
+                .model_prompts()
                 .get("anthropic/claude-sonnet-4-6")
                 .unwrap(),
             "Sonnet prompt."
         );
         assert_eq!(
             scan.entries[0]
-                .model_prompts
+                .model_prompts()
                 .get("anthropic/claude-opus-4")
                 .unwrap(),
             "Opus prompt."
         );
         assert_eq!(
             scan.entries[0]
-                .model_prompts
+                .model_prompts()
                 .get("minimax/MiniMax-M2.7")
                 .unwrap(),
             "M2.7 prompt."
@@ -3882,11 +3955,10 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "anthropic/claude-sonnet-4-6".to_string(),
             "Sonnet prompt.".to_string(),
         );
@@ -3935,11 +4007,10 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "openrouter/anthropic--claude-sonnet-4".to_string(),
             "OpenRouter model prompt.".to_string(),
         );
@@ -3980,9 +4051,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
         entry.provider_overrides.insert(
             "anthropic".to_string(),
@@ -4037,9 +4107,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
 
         // 2 provider overrides
@@ -4060,15 +4129,15 @@ mod tests {
         assert_eq!(entry.variant_count(), 2);
 
         // + 3 model variants = 5 total
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "anthropic/claude-sonnet-4-6".to_string(),
             "prompt".to_string(),
         );
         entry
-            .model_prompts
+            .model_prompts_mut()
             .insert("anthropic/claude-opus-4".to_string(), "prompt".to_string());
         entry
-            .model_prompts
+            .model_prompts_mut()
             .insert("openai/gpt-4o".to_string(), "prompt".to_string());
         assert_eq!(entry.variant_count(), 5);
     }
@@ -4100,12 +4169,11 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
 
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "anthropic/claude-sonnet-4-6".to_string(),
             "prompt".to_string(),
         );
@@ -4117,7 +4185,7 @@ mod tests {
             },
         );
         entry
-            .model_prompts
+            .model_prompts_mut()
             .insert("openai/gpt-4o".to_string(), "prompt".to_string());
 
         let anthropic_models = entry.variant_models("anthropic");
@@ -4160,13 +4228,12 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
 
         // Only model variants, no provider-level
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "anthropic/claude-sonnet-4-6".to_string(),
             "prompt".to_string(),
         );
@@ -4812,9 +4879,8 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
 
         let resolved = entry.resolve_prompt("anthropic", "claude-sonnet-4-6");
@@ -4851,11 +4917,10 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
-        entry.model_prompts.insert(
+        entry.model_prompts_mut().insert(
             "anthropic/claude-sonnet-4-6".to_string(),
             "Hand-authored prompt.".to_string(),
         );
@@ -4897,11 +4962,10 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
-        entry.generated_model_prompts.insert(
+        entry.generated_model_prompts_mut().insert(
             "deepseek/deepseek-v3.2".to_string(),
             "Generated prompt.".to_string(),
         );
@@ -4939,12 +5003,11 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
         // Generated variant under canonical provider (minimax), not openrouter.
-        entry.generated_model_prompts.insert(
+        entry.generated_model_prompts_mut().insert(
             "minimax/minimax-m2.7".to_string(),
             "Canonical generated.".to_string(),
         );
@@ -4987,14 +5050,15 @@ mod tests {
             enabled: true,
             has_override: false,
             provider_overrides: HashMap::new(),
-            model_prompts: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
             model_overrides: HashMap::new(),
-            generated_model_prompts: HashMap::new(),
         };
         let key = "anthropic/claude-sonnet-4-6".to_string();
-        entry.model_prompts.insert(key.clone(), "Hand.".to_string());
         entry
-            .generated_model_prompts
+            .model_prompts_mut()
+            .insert(key.clone(), "Hand.".to_string());
+        entry
+            .generated_model_prompts_mut()
             .insert(key, "Generated.".to_string());
 
         let resolved = entry.resolve_prompt("anthropic", "claude-sonnet-4-6");
