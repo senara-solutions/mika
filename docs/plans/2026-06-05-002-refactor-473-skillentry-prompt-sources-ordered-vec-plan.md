@@ -225,13 +225,13 @@ Run `cargo test -p mika-agent` and `cargo clippy`. The `resolve_prompt` tests ar
 - **No changes to `PromptVariantSource`** — the existing 4-variant enum stays unchanged for API/logging compatibility.
 - **No serialization changes** — the accessor methods maintain the same shape for JSON output in the CLI.
 
-## Testing
+## Acceptance criteria
 
-- All existing `resolve_prompt` tests must pass unchanged (same inputs → same outputs).
-- All existing test fixtures compile with the new shape.
-- `cargo test -p mika-agent` passes.
-- `cargo clippy` clean.
-- No behavioral changes — this is a pure refactor.
+- [ ] All existing `resolve_prompt` tests must pass unchanged (same inputs → same outputs).
+- [ ] All existing test fixtures compile with the new shape.
+- [ ] `cargo test -p mika-agent` passes.
+- [ ] `cargo clippy` clean.
+- [ ] No behavioral changes — this is a pure refactor.
 
 ## Rollback
 
