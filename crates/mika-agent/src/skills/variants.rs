@@ -17,8 +17,7 @@ use serde::Serialize;
 use tracing::warn;
 
 use super::index::{
-    DiagnosticLevel, MAX_PROMPT_SIZE_CEILING, MAX_PROMPT_SNIPPET_SIZE, SkillDiagnostic,
-    sanitize_model_dir_name,
+    DiagnosticLevel, SkillDiagnostic, effective_prompt_limit, sanitize_model_dir_name,
 };
 use super::manifest::SkillManifest;
 
@@ -355,11 +354,7 @@ pub fn validate_variant(
     let mut results = Vec::with_capacity(4);
 
     // Rule 1: Size limit
-    let max_size = manifest
-        .skill
-        .max_prompt_size
-        .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
-        .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+    let max_size = effective_prompt_limit(manifest.skill.max_prompt_size);
     let content_bytes = content.len() as u64;
 
     if content_bytes > max_size {
