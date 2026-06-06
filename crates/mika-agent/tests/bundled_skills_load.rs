@@ -27,9 +27,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use mika_agent::skills::index::{
-    MAX_PROMPT_SIZE_CEILING, MAX_PROMPT_SNIPPET_SIZE, scan_skills_dir,
-};
+use mika_agent::skills::index::{effective_prompt_limit, scan_skills_dir};
 use mika_agent::skills::manifest::SkillManifest;
 
 fn bundled_skills_dir() -> PathBuf {
@@ -134,9 +132,7 @@ fn bundled_skills_approaching_max_prompt_size_warns() {
             None
         };
 
-        let effective_cap = manifest_max
-            .unwrap_or(MAX_PROMPT_SNIPPET_SIZE)
-            .min(MAX_PROMPT_SIZE_CEILING);
+        let effective_cap = effective_prompt_limit(manifest_max);
 
         let actual = fs::metadata(&prompt_path)
             .unwrap_or_else(|e| panic!("failed to stat {}: {}", prompt_path.display(), e))

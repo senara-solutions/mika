@@ -25,6 +25,25 @@ pub const MAX_PROMPT_SNIPPET_SIZE: u64 = 16 * 1024;
 /// `tests/bundled_skills_load.rs` (mika#852).
 pub const MAX_PROMPT_SIZE_CEILING: u64 = 80 * 1024;
 
+// Compile-time guard: the canonical calculation in `effective_prompt_limit`
+// assumes the default fits within the ceiling. If this relationship changes,
+// the helper's semantics diverge from the test's prior inline form.
+const _: () = assert!(
+    MAX_PROMPT_SNIPPET_SIZE <= MAX_PROMPT_SIZE_CEILING,
+    "effective_prompt_limit assumes the default fits within the ceiling"
+);
+
+/// Effective prompt-size limit for a skill.
+///
+/// Returns the minimum of the manifest's `max_prompt_size` and the hard
+/// ceiling ([`MAX_PROMPT_SIZE_CEILING`]), falling back to the default
+/// snippet size ([`MAX_PROMPT_SNIPPET_SIZE`]) when no override is declared.
+pub fn effective_prompt_limit(max_prompt_size: Option<u64>) -> u64 {
+    max_prompt_size
+        .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
+        .unwrap_or(MAX_PROMPT_SNIPPET_SIZE)
+}
+
 /// Maximum size for tools.json files (256 KB).
 const MAX_TOOLS_JSON_SIZE: u64 = 256 * 1024;
 
@@ -570,11 +589,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
 
         // Load prompt snippet eagerly at startup (cached in SkillEntry)
         let snippet_path = path.join("system_prompt.md");
-        let max_size = manifest
-            .skill
-            .max_prompt_size
-            .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
-            .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+        let max_size = effective_prompt_limit(manifest.skill.max_prompt_size);
         if let Some(requested) = manifest.skill.max_prompt_size
             && requested > MAX_PROMPT_SIZE_CEILING
         {
@@ -1126,11 +1141,7 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
     // 6. Check prompt snippet size against effective limit
     let snippet_path = skill_dir.join("system_prompt.md");
     if snippet_path.exists() {
-        let effective_limit = manifest
-            .skill
-            .max_prompt_size
-            .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
-            .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+        let effective_limit = effective_prompt_limit(manifest.skill.max_prompt_size);
 
         if let Ok(meta) = std::fs::metadata(&snippet_path) {
             let size = meta.len();
@@ -1247,11 +1258,7 @@ pub fn validate_skill(skill_dir: &Path) -> Vec<SkillDiagnostic> {
                     continue;
                 }
 
-                let effective_limit = manifest
-                    .skill
-                    .max_prompt_size
-                    .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
-                    .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+                let effective_limit = effective_prompt_limit(manifest.skill.max_prompt_size);
 
                 // Validate override parseability and check for identity fields
                 if has_override {
@@ -1592,11 +1599,7 @@ fn scan_provider_variants(skill_dir: &Path, manifest: &SkillManifest) -> Variant
         }
     };
 
-    let max_size = manifest
-        .skill
-        .max_prompt_size
-        .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
-        .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+    let max_size = effective_prompt_limit(manifest.skill.max_prompt_size);
 
     for dir_entry in read_dir.flatten() {
         let path = dir_entry.path();
@@ -1774,11 +1777,7 @@ fn scan_generated_variants(skill_dir: &Path, manifest: &SkillManifest) -> HashMa
     let mut out = HashMap::new();
 
     let generated_root = skill_dir.join("generated");
-    let max_size = manifest
-        .skill
-        .max_prompt_size
-        .map(|v| v.min(MAX_PROMPT_SIZE_CEILING))
-        .unwrap_or(MAX_PROMPT_SNIPPET_SIZE);
+    let max_size = effective_prompt_limit(manifest.skill.max_prompt_size);
 
     let provider_dirs = match std::fs::read_dir(&generated_root) {
         Ok(rd) => rd,
