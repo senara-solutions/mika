@@ -126,6 +126,24 @@ Two independent `/mika-groom-ticket mika#1415` spawn attempts (`ab91bf0d-...` an
 - Any unrelated skill-install refactor.
 - Reviewing or modifying the skills marketplace install flow (`mika skills install <user-skill>`); this plan's fix targets ONLY the deploy-time bundled-skill propagation that walks the workspace.
 
+## Phase 0 Pin — RESULT (implementer, 2026-06-06)
+
+> **Premise correction (operator-confirmed re-scope).** The groomed ticket framed this as a *deploy-time skill-install* bug. The pin disproves that premise. Issue re-titled to `fix(dispatch-lib): worktree-setup clobbers sub-repo .claude/commands (#1255 regression on every dispatch)`.
+
+**Phase 0.A — propagation path (pinned with evidence):**
+
+`mika/skills/bundled/_shared/dispatch-lib.sh:359` (pre-fix), inside `_set_up_worktree()`:
+```bash
+cp -r "$PLATFORM_DIR/.claude/commands" "$WORKTREE_DIR/.claude/"
+```
+Exhaustive grep across `mika`, `mika-platform`, `mika-skills` + mika-core Rust confirms this is the **only** writer of `.claude/commands/` into a worktree. Mechanism reproduces the survey symptom exactly: meta-repo `.claude/commands/` (21 files) minus the worktree's 4 tracked files = **18 untracked siblings**; the 3 overlapping names (`mika.md` 72→260 lines, `mika-issue.md`, `mika-issues.md`) are **clobbered**.
+
+**Phase 0.B — the deploy-time premise is unsupported:** every `make deploy` sub-step traced (`build`/`install-mika`/`install-claude-pilot`/`install-skills`/`restart`/`check-ngrok`); none write `.claude/commands`. `mika skills update` has zero `.claude`/`commands`/`worktree` references. There is no deploy-time/skill-install surface. The cp fires at **worktree-creation during a dispatch**, not on deploy. The "two distinct surfaces" model collapses to one — and it is `dispatch-lib.sh`, the file mika#1414 also touches.
+
+**Phase 0.C — fix shape: Shape 1 (path-redirect), operator-confirmed.** Replace the blanket `cp -r` with `_seed_worktree_slash_commands()` enforcing two invariants: (1) never overwrite a command the worktree already tracks (preserves #1255 polymorphic `/mika`); (2) shield meta-only copies via the common-dir `.git/info/exclude` so the worktree stays git-clean (the per-worktree `$GIT_DIR/info/exclude` is *not* honored for status — verified empirically). Meta orchestration commands stay available for the inner session (#1173).
+
+**mika#1414 boundary (non-overlap):** #1414 owns the **pre-rebase** dirty-state cleanup + rebase guard (the mika#1301 block, ~L294–311, plus its `_clean_worktree_for_rebase` helper). #1415 owns the **post-rebase** command-seed (the cp block + `_seed_worktree_slash_commands`). Same function (`_set_up_worktree`), disjoint line ranges and disjoint helpers. #1415 removes the *cause* of dirty worktrees; #1414 stays the *defensive* net.
+
 ## Related
 
 - mika#1255 — the polymorphic /mika fix this propagation undoes every deploy.
