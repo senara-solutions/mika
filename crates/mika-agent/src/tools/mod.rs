@@ -3,6 +3,7 @@ mod add_team_member;
 mod cancel_reminder;
 mod cancel_task;
 mod check_task;
+pub mod classification;
 pub(crate) use check_task::{GitHubRef, parse_github_ref};
 mod complete_task;
 mod create_agent;

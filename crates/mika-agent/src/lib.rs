@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod messaging;
 pub mod operational;
 pub mod panic_hook;
+pub mod post_condition;
 pub mod pricing;
 pub mod prompt;
 pub mod rewind;

@@ -66,11 +66,15 @@ async fn test_duplicate_tool_use_block_deduplicated() {
     // row. The duplicate block still receives a tool_result (so the API
     // contract holds), but it reuses the cached output rather than
     // re-running the tool.
+    //
+    // Note: uses search_memory instead of send_message because the send_message
+    // turn boundary guard (#771) suppresses the second send_message call and
+    // forces EndTurn, interfering with dedup testing.
     let harness = EvalHarness::builder()
         .responses(vec![
             multi_tool_response(vec![
-                ("send_message", json!({"text": "sprint started"})),
-                ("send_message", json!({"text": "sprint started"})),
+                ("search_memory", json!({"query": "sprint status"})),
+                ("search_memory", json!({"query": "sprint status"})),
             ]),
             text_response("Sprint kicked off."),
         ])
@@ -82,13 +86,13 @@ async fn test_duplicate_tool_use_block_deduplicated() {
 
     assert_has_output(&trace);
     // Two identical blocks should collapse to a single tool_calls row.
-    let send_calls = trace.calls_for_tool("send_message");
+    let search_calls = trace.calls_for_tool("search_memory");
     assert_eq!(
-        send_calls.len(),
+        search_calls.len(),
         1,
-        "Expected exactly 1 send_message call, got {}: {:?}",
-        send_calls.len(),
-        send_calls.iter().map(|c| &c.input).collect::<Vec<_>>()
+        "Expected exactly 1 search_memory call, got {}: {:?}",
+        search_calls.len(),
+        search_calls.iter().map(|c| &c.input).collect::<Vec<_>>()
     );
 
     // API contract: every tool_use id the LLM emitted must have a matching
@@ -120,31 +124,35 @@ async fn test_duplicate_tool_use_block_deduplicated() {
 #[tokio::test]
 async fn test_same_tool_different_args_not_deduplicated() {
     // Guard against a regression where the dedup key drops the `arguments`
-    // component and keys only on tool name. Two `send_message` calls with
-    // different text must produce two tool_calls rows — they are legitimately
+    // component and keys only on tool name. Two `search_memory` calls with
+    // different queries must produce two tool_calls rows — they are legitimately
     // distinct invocations, not a provider artifact.
+    //
+    // Note: uses search_memory instead of send_message because the send_message
+    // turn boundary guard (#771) suppresses the second send_message in the same
+    // step. That suppression is intentional — a separate test validates it.
     let harness = EvalHarness::builder()
         .responses(vec![
             multi_tool_response(vec![
-                ("send_message", json!({"text": "sprint started"})),
-                ("send_message", json!({"text": "sprint ended"})),
+                ("search_memory", json!({"query": "sprint alpha"})),
+                ("search_memory", json!({"query": "sprint beta"})),
             ]),
-            text_response("Sent both updates."),
+            text_response("Found both."),
         ])
         .build()
         .await
         .unwrap();
 
-    let trace = harness.run("send both updates").await.unwrap();
+    let trace = harness.run("search for both sprints").await.unwrap();
 
     assert_has_output(&trace);
-    let send_calls = trace.calls_for_tool("send_message");
+    let search_calls = trace.calls_for_tool("search_memory");
     assert_eq!(
-        send_calls.len(),
+        search_calls.len(),
         2,
         "Same tool with different args must not be deduplicated, got {} calls: {:?}",
-        send_calls.len(),
-        send_calls.iter().map(|c| &c.input).collect::<Vec<_>>()
+        search_calls.len(),
+        search_calls.iter().map(|c| &c.input).collect::<Vec<_>>()
     );
 }
 
@@ -152,14 +160,18 @@ async fn test_same_tool_different_args_not_deduplicated() {
 async fn test_three_identical_tool_use_blocks_deduplicated() {
     // The dedup cache must collapse any N >= 2 identical blocks in a single
     // turn to exactly one execution. Exercises the cache-hit path twice.
+    //
+    // Note: uses search_memory instead of send_message because the send_message
+    // turn boundary guard (#771) suppresses the second+ send_message calls and
+    // forces EndTurn, which interferes with dedup testing.
     let harness = EvalHarness::builder()
         .responses(vec![
             multi_tool_response(vec![
-                ("send_message", json!({"text": "ping"})),
-                ("send_message", json!({"text": "ping"})),
-                ("send_message", json!({"text": "ping"})),
+                ("search_memory", json!({"query": "ping"})),
+                ("search_memory", json!({"query": "ping"})),
+                ("search_memory", json!({"query": "ping"})),
             ]),
-            text_response("Pinged."),
+            text_response("Searched."),
         ])
         .build()
         .await
@@ -168,12 +180,12 @@ async fn test_three_identical_tool_use_blocks_deduplicated() {
     let trace = harness.run("ping").await.unwrap();
 
     assert_has_output(&trace);
-    let send_calls = trace.calls_for_tool("send_message");
+    let search_calls = trace.calls_for_tool("search_memory");
     assert_eq!(
-        send_calls.len(),
+        search_calls.len(),
         1,
         "Three identical blocks must still collapse to one tool_calls row, got {}",
-        send_calls.len()
+        search_calls.len()
     );
 }
 
