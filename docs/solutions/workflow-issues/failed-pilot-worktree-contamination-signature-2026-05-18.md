@@ -1,6 +1,7 @@
 ---
 title: "Failed mika-dev pilot leaves meta-repo dispatcher content in sub-repo worktree — recovery signature"
 date: 2026-05-18
+last_updated: 2026-06-06
 category: workflow-issues
 module: dev-pilot
 problem_type: workflow_issue
@@ -24,7 +25,17 @@ tags:
 
 ## Context
 
-mika-dev's autonomous loop occasionally produces a `pipeline-incomplete-empty-handed` failure (mika#1168 family) — many turns burned, zero commits, no PR. A subset of these failures leaves the target-repo worktree in a recognizable contaminated state because the pilot confuses *which repo it is operating in* and starts editing meta-repo dispatcher files instead of repo-local files. The third incident on this branch family (mika#1189 recovery, 2026-05-18) made the signature explicit enough to document.
+> **Root-cause correction (mika#1415, 2026-06-06).** The original attribution below —
+> "the pilot confuses which repo it is operating in" — was disproven by a Phase 0 pin.
+> The signature (`.claude/commands/mika.md` modified + untracked meta siblings) is **not**
+> pilot confusion; it is **mechanical and pilot-independent**: `dispatch-lib`'s worktree
+> setup ran a blanket `cp -r "$PLATFORM_DIR/.claude/commands" "$WORKTREE_DIR/.claude/"` at
+> every dispatch, clobbering the sub-repo's own tracked `/mika` and dropping the meta
+> siblings. mika#1415 removes the cause; after it ships the contamination is no longer
+> regenerated. The recovery procedure below stays valid for worktrees created before that
+> fix. See `docs/solutions/architecture-patterns/seed-scaffold-into-tracked-worktree-dir-via-git-exclude.md`.
+
+mika-dev's autonomous loop occasionally produces a `pipeline-incomplete-empty-handed` failure (mika#1168 family) — many turns burned, zero commits, no PR. A subset of these failures leaves the target-repo worktree in a recognizable contaminated state. The original 2026-05-18 write-up attributed this to the pilot confusing *which repo it is operating in* and editing meta-repo dispatcher files; the mika#1415 pin (above) showed the real cause is dispatch-lib's command-seed `cp -r`, which contaminates the worktree regardless of what the pilot does. The third incident on this branch family (mika#1189 recovery, 2026-05-18) made the signature explicit enough to document.
 
 The contamination is hard to spot at first glance because the bad files look plausible: they're real, well-formed meta-repo command files, just dropped in the wrong place. A surface-level review of `git status` shows "modifications to slash commands" and the operator may not immediately recognize that the pilot was supposed to be editing `crates/...`, not `.claude/commands/`.
 

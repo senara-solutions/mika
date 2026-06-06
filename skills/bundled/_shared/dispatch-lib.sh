@@ -270,6 +270,80 @@ _clean_worktree_for_rebase() {
     fi
 }
 
+# Seed the worktree's .claude/commands/ with the meta-repo orchestration slash
+# commands the inner Claude Code session may invoke (/mika-groom-ticket,
+# /mika-revise-plan, etc.). The pilot runs with `--cwd "$WORKTREE_DIR"`, and
+# Claude Code discovers project commands from <cwd>/.claude/commands/, so those
+# commands must physically exist there or they arrive as raw text and the LLM
+# improvises (mika#1173).
+#
+# The naive `cp -r "$PLATFORM_DIR/.claude/commands" "$WORKTREE_DIR/.claude/"`
+# this replaces caused two regressions (mika#1415), both enforced against here:
+#
+#   1. NEVER overwrite a command the worktree's branch already tracks. The mika
+#      sub-repo ships its OWN polymorphic /mika (mika#1255) and sub-repo-scoped
+#      /mika-issue; the blanket copy clobbered them back to the 260-line
+#      meta-repo dispatcher — re-creating the exact pre-#1255 recursion bug on
+#      every dispatch. The worktree's tracked version always wins.
+#
+#   2. Copied meta-only commands MUST NOT dirty `git status`. They are ephemeral
+#      dispatch scaffold (dispatch-lib already excludes .claude/commands/ from
+#      its rescue `git add` — mika#1288); left visible they appear as ~18
+#      untracked files that break the resume rebase ("cannot rebase: You have
+#      unstaged changes") — the dirty-worktree class mika#1414 defends against.
+#      We shield them via the worktree's shared info/exclude so the tree stays
+#      clean at the source. (Verified: the per-worktree $GIT_DIR/info/exclude is
+#      NOT honored for status; the common-dir info/exclude is.)
+#
+# Boundary (mika#1414 coordination): this helper owns ONLY the post-rebase
+# command-seed. The pre-rebase dirty-state cleanup + rebase guard (the mika#1301
+# block inside _set_up_worktree) is mika#1414's surface; the two do not overlap.
+_seed_worktree_slash_commands() {
+    local platform_dir=$1 worktree_dir=$2
+    [ -d "$platform_dir/.claude/commands" ] || return 0
+    mkdir -p "$worktree_dir/.claude/commands"
+
+    # Shared exclude lives in the common git dir (a linked worktree's own
+    # $GIT_DIR/info/exclude is not consulted for status). --path-format=absolute
+    # needs git >= 2.31; fall back to the bare form otherwise.
+    local common_dir exclude_file=""
+    common_dir=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+        || common_dir=$(git -C "$worktree_dir" rev-parse --git-common-dir 2>/dev/null)
+    if [ -n "$common_dir" ]; then
+        exclude_file="$common_dir/info/exclude"
+        mkdir -p "$(dirname "$exclude_file")"
+    fi
+
+    local src base
+    for src in "$platform_dir/.claude/commands"/*.md; do
+        [ -e "$src" ] || continue
+        base=$(basename "$src")
+        # Invariant 1: the worktree's own tracked command wins — skip the copy.
+        # Name-based: today only /mika, /mika-issue, /mika-issues collide, and
+        # the sub-repo version is correct for all three. If a sub-repo ever
+        # tracks a meta-ONLY orchestration command name (e.g. mika-groom-ticket.md)
+        # this would silently shadow it (a mika#1173 risk) — revisit with an
+        # explicit must-seed set if that case ever arises.
+        if git -C "$worktree_dir" ls-files --error-unmatch ".claude/commands/$base" >/dev/null 2>&1; then
+            continue
+        fi
+        cp "$src" "$worktree_dir/.claude/commands/$base" 2>/dev/null || true
+        # Invariant 2: shield the scaffold copy from git status (idempotent).
+        # Concurrent dispatches off the same sub-repo share this exclude file;
+        # the grep/append is non-atomic, so an overlap may append a duplicate
+        # (inert — git collapses repeated patterns) but never corrupts shielding.
+        # flock was judged not worth the complexity (P3).
+        if [ -n "$exclude_file" ] && ! grep -qxF ".claude/commands/$base" "$exclude_file" 2>/dev/null; then
+            # Guard a pre-existing exclude file with no trailing newline, which
+            # would otherwise concatenate our entry onto its last line.
+            if [ -s "$exclude_file" ] && [ -n "$(tail -c1 "$exclude_file" 2>/dev/null)" ]; then
+                printf '\n' >> "$exclude_file"
+            fi
+            printf '%s\n' ".claude/commands/$base" >> "$exclude_file"
+        fi
+    done
+}
+
 _set_up_worktree() {
     # --- Parse repo#number format ---
     # Matches: mika#214, mika-skills#8, mika-cloud#50
@@ -414,22 +488,15 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         mkdir -p "$WORKTREE_DIR/.claude"
         cp "$PLATFORM_DIR/.claude/claude-pilot.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
         cp "$PLATFORM_DIR/.claude/settings.local.json" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
-        # Copy slash commands so the inner Claude Code session can resolve
-        # /mika, /mika-groom-ticket, /ce:plan-adjacent commands, etc. Without
-        # this, --command "/mika-groom-ticket" arrives as raw text in the
-        # inner session and the LLM has to improvise (mika#1173).
+        # Seed meta-repo orchestration slash commands for the inner session.
+        # Invariants (no-clobber of the worktree's tracked commands; clean git
+        # status) live in _seed_worktree_slash_commands (mika#1173, #1255, #1415).
         #
-        # Snapshot semantics: the cp is taken at worktree-creation time. If a
-        # command file at the platform root is edited after worktree creation
-        # but before the inner session completes, the inner session sees the
-        # pre-edit version. Acceptable because worktrees are short-lived
-        # (per-task, <2h typical) and mid-session edits to /mika or
-        # /mika-groom-ticket violate the slug-immutability principle (mika#844).
-        # Matches dispatch-lib's other worktree-prep behavior (claude-pilot.json
-        # and settings.local.json are also snapshotted).
-        if [ -d "$PLATFORM_DIR/.claude/commands" ]; then
-            cp -r "$PLATFORM_DIR/.claude/commands" "$WORKTREE_DIR/.claude/" 2>/dev/null || true
-        fi
+        # Snapshot semantics: the copy is taken at worktree-creation time; a
+        # platform-root command edited mid-session is not picked up. Acceptable
+        # because worktrees are short-lived and mid-session command edits
+        # violate slug-immutability (mika#844).
+        _seed_worktree_slash_commands "$PLATFORM_DIR" "$WORKTREE_DIR"
 
         CWD_ARGS="--cwd $WORKTREE_DIR"
         if [ -f "$WORKTREE_DIR/.claude/claude-pilot.json" ]; then
