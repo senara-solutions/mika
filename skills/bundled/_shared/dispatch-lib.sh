@@ -1125,11 +1125,19 @@ _find_issue_plan() {
     #   **Ticket:** mika issue#N    (current `/mika-groom-plan-only` shape)
     #   **Ticket:** mika#N          (older convention)
     #   ticket: mika#N              (YAML frontmatter)
-    # The grep is line-anchored to avoid false positives on prose
-    # paragraphs that happen to mention an unrelated #N.
+    #
+    # Header-zone scope: the grep is restricted to the first 20 lines of
+    # each plan file. The canonical ticket reference always sits in YAML
+    # frontmatter or the markdown header above the Problem section.
+    # Without this scope, a plan that QUOTES another ticket's `**Ticket:**`
+    # line in body prose (e.g. to illustrate a founding incident) would
+    # false-positive — observed during the mika#1421 v1 self-test where
+    # the #1421 plan quoted mika#771's header on line 49 and matched
+    # `ISSUE_NUM=771`. Headers stay in the first 20 lines; bodies don't.
     while IFS= read -r candidate; do
         [ -r "$candidate" ] || continue
-        if grep -qE "^(\*\*Ticket:\*\*|ticket:)\s+mika[[:space:]]?(issue)?#${ISSUE_NUM}\b" "$candidate" 2>/dev/null; then
+        if head -n 20 "$candidate" 2>/dev/null \
+            | grep -qE "^(\*\*Ticket:\*\*|ticket:)\s+mika[[:space:]]?(issue)?#${ISSUE_NUM}\b"; then
             printf '%s' "$candidate"
             return 0
         fi

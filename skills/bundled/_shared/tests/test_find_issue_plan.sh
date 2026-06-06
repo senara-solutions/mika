@@ -135,6 +135,44 @@ ISSUE_NUM=1234
 RESULT=$(_find_issue_plan || true)
 assert_empty "prose '#1234' in line 3 (not anchored as **Ticket:**) → no match" "$RESULT"
 
+echo
+echo "Negative (quoted **Ticket:** line in BODY prose must NOT match):"
+# Regression test for self-test failure: mika#1421's plan QUOTED mika#771's
+# `**Ticket:** mika issue#771` header on line 49 (a body quote) to illustrate
+# the founding incident. The v1 helper false-positive'd on ISSUE_NUM=771 and
+# returned the #1421 plan instead of the actual #771 plan. The header-zone
+# scope (first 20 lines) closes this class.
+{
+    echo "---"
+    echo "ticket: mika#5050"  # CANONICAL ticket in YAML frontmatter
+    echo "type: fix"
+    echo "---"
+    echo ""
+    echo "# Plan: Some other thing"
+    echo ""
+    echo "Some preamble text in the header zone."
+    echo ""
+    # Pad to push the quoted Ticket reference past line 20
+    for i in $(seq 1 25); do echo "Body padding line $i — discussion of approach."; done
+    # NOW the quoted reference appears in BODY (past line 20)
+    echo "Line 35 quotes another plan's header to illustrate a point:"
+    echo ""
+    echo "**Ticket:** mika issue#6060"  # This is a QUOTE, not the real ticket
+    echo ""
+    for i in $(seq 1 10); do echo "More body discussion line $i."; done
+} > "$TMPROOT/docs/plans/2026-06-04-004-fix-something-with-quoted-example-plan.md"
+
+ISSUE_NUM=6060
+RESULT=$(_find_issue_plan || true)
+assert_empty "quoted **Ticket:** mika issue#6060 in body (line ~35) → no false-positive match" "$RESULT"
+
+# And verify the canonical issue (5050) still matches via its frontmatter header
+ISSUE_NUM=5050
+RESULT=$(_find_issue_plan)
+assert_eq "canonical YAML 'ticket: mika#5050' in frontmatter (line 2) → matches" \
+    "$TMPROOT/docs/plans/2026-06-04-004-fix-something-with-quoted-example-plan.md" \
+    "$RESULT"
+
 # ============================================================================
 # Most-recent-wins when both shapes exist for the same issue
 # ============================================================================
