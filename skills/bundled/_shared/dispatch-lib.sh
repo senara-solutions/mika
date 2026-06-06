@@ -1289,15 +1289,26 @@ _parse_disposition() {
     # Phase B — first-pass verdict parser. Reads architect response text from
     # stdin, emits READY|ITERATE|ESCALATE on stdout (or nothing on no match).
     #
-    # Two-tier matching (mika#1272):
-    #   Tier 1: strict literal `Disposition: <X>` (zero-cost fast path)
-    #   Tier 2: fuzzy paraphrase matching (conservative, ESCALATE wins ties)
-    # Writes "1" to $_DISPOSITION_FUZZY_FILE when tier 2 fires, "0" when tier 1
-    # fires. Callers read _disposition_was_fuzzy() after the $(...) returns.
+    # Tiered matching:
+    #   Tier 1a: strict literal `Disposition: <X>` (zero-cost fast path).
+    #   Tier 1b: literal `Verdict: GROOMED`/`Verdict: ESCALATE` (mika#1421 v3).
+    #            When mika-arch's session memory has prior ITERATE findings on
+    #            the same plan, a first-pass invocation can return second-pass
+    #            keyword shapes — the architect has effectively "carried over"
+    #            into a second-review stance. Without this tolerance, the
+    #            iterate-loop logs UNPARSED, _iterate_groom_loop returns 1, and
+    #            the groom lands in the half-state #1421 v1+v2 closed for a
+    #            different sub-class. Mapping: GROOMED → READY (loop runs a
+    #            confirmatory second-pass), ESCALATE → ESCALATE.
+    #   Tier 2:  fuzzy paraphrase matching (conservative, ESCALATE wins ties).
+    # Writes "1" to $_DISPOSITION_FUZZY_FILE when tier 2 fires, "0" when tier
+    # 1a/1b fires. Callers read _disposition_was_fuzzy() after the $(...)
+    # returns.
     printf '0' > "$_DISPOSITION_FUZZY_FILE"
     local text
     text=$(cat)
     local result
+    # Tier 1a — canonical first-pass shape
     result=$(printf '%s' "$text" | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
         | grep -oE '(READY|ITERATE|ESCALATE)' \
         | head -1)
@@ -1305,6 +1316,23 @@ _parse_disposition() {
         echo "$result"
         return
     fi
+    # Tier 1b — Verdict-shape carry-over from architect session memory
+    local verdict_keyword
+    verdict_keyword=$(printf '%s' "$text" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \
+        | grep -oE '(GROOMED|ESCALATE)' \
+        | head -1)
+    case "$verdict_keyword" in
+        GROOMED)
+            echo "_parse_disposition: tier 1b accepted Verdict: GROOMED → READY (mika#1421 v3 session-carry-over tolerance)" >&2
+            echo "READY"
+            return
+            ;;
+        ESCALATE)
+            echo "_parse_disposition: tier 1b accepted Verdict: ESCALATE → ESCALATE (mika#1421 v3 session-carry-over tolerance)" >&2
+            echo "ESCALATE"
+            return
+            ;;
+    esac
     # Tier 2 fallback
     result=$(printf '%s' "$text" | _parse_disposition_fuzzy)
     if [ -n "$result" ]; then

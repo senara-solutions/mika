@@ -69,6 +69,43 @@ result=$(printf 'Some preamble.\n\nDisposition: READY\n\nSome trailing text.' | 
 assert_eq "literal READY with surrounding text" "READY" "$result"
 
 # ============================================================================
+# _parse_disposition — tier 1b (Verdict carry-over from architect session memory)
+# mika#1421 v3: when mika-arch's session memory has prior ITERATE findings on
+# the same plan, a first-pass invocation can return second-pass keyword shapes.
+# Without this tolerance, the iterate-loop logged UNPARSED and returned 1 on a
+# valid GROOMED architect response. Mapping: Verdict:GROOMED → READY (loop
+# continues to confirmatory second-pass); Verdict:ESCALATE → ESCALATE.
+# ============================================================================
+echo ""
+echo "Test: _parse_disposition — Verdict carry-over (tier 1b)"
+echo "------------------------------------------------------"
+
+# Founding-incident response — actual mika#771 architect output on 2026-06-06
+# 20:10:53Z (session 9ef3d670-048c-4212-b157-cd8aa5f4c6f9). 85-byte response
+# emitted via the mika-arch-groom-ticket skill but in Verdict-shape because
+# the architect's session had carried the prior plan-state into a second-pass
+# stance.
+result=$(printf 'All prior findings resolved. The plan is ready for implementation.\n\nVerdict: GROOMED' | _parse_disposition 2>/dev/null)
+assert_eq "mika#771 founding-incident: Verdict: GROOMED → READY (session carry-over)" "READY" "$result"
+
+# Verdict: ESCALATE on first-pass → ESCALATE
+result=$(printf 'Architectural concerns remain.\n\nVerdict: ESCALATE' | _parse_disposition 2>/dev/null)
+assert_eq "Verdict: ESCALATE on first-pass → ESCALATE" "ESCALATE" "$result"
+
+# Tier 1b must not fire on partial/empty Verdict lines
+result=$(printf 'Verdict: undefined\n\nDisposition: ITERATE' | _parse_disposition 2>/dev/null)
+assert_eq "tier 1a wins when both Disposition: <X> and unrecognized Verdict: shape present" "ITERATE" "$result"
+
+# Tier 1a still wins when both keywords are present
+result=$(printf 'Disposition: READY\n\nVerdict: GROOMED' | _parse_disposition 2>/dev/null)
+assert_eq "tier 1a wins over tier 1b when both Disposition: <X> and Verdict: <X> present" "READY" "$result"
+
+# Tier 1b fuzzy-flag NOT set (it's a tier-1 path, just with a different keyword)
+printf 'Verdict: GROOMED' | _parse_disposition >/dev/null 2>&1
+fuzzy=$(check_fuzzy)
+assert_eq "tier 1b does not set the fuzzy flag" "0" "$fuzzy"
+
+# ============================================================================
 # _parse_disposition — tier 2 (fuzzy)
 # ============================================================================
 echo ""
