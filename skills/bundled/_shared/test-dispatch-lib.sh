@@ -828,6 +828,105 @@ test_auto_rescue_empty_index_guard() {
     echo "PASS"
 }
 
+# Test C (mika#1419): claude-pilot.json scaffold exclusion — relay-config
+# file is cp'd from $PLATFORM_DIR by _set_up_worktree at line 489 and is NOT
+# pilot-authored content. The rescue commit must exclude it via the same
+# pathspec mechanism mika#1288 uses for .claude/commands/. Without this
+# exclusion, PR #1348's intentional deletion (mika#1193 Phase C) is silently
+# re-introduced on every WIP-rescue flow — the ping-pong on the file's git
+# log is the founding incident for mika#1419.
+test_auto_rescue_excludes_claude_pilot_json() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    git -C "$test_dir" init -q
+    git -C "$test_dir" commit --allow-empty -m "initial" -q
+
+    # 1. claude-pilot.json scaffold file (untracked, cp'd from meta-repo) —
+    #    must NOT be staged by the rescue commit.
+    mkdir -p "$test_dir/.claude"
+    echo '{"command":"mika","args":["--agent","mika-relay","ask"]}' > "$test_dir/.claude/claude-pilot.json"
+
+    # 2. .claude/commands/ scaffold file — must NOT be staged (mika#1288).
+    mkdir -p "$test_dir/.claude/commands"
+    echo "# scaffold" > "$test_dir/.claude/commands/mika-groom-ticket.md"
+
+    # 3. Pilot-authored new file — must be staged.
+    mkdir -p "$test_dir/src"
+    echo "fn main() {}" > "$test_dir/src/new_feature.rs"
+
+    # Exercise: the mika#1419 pathspec exclusion.
+    git -C "$test_dir" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>/dev/null
+
+    local staged
+    staged=$(git -C "$test_dir" diff --cached --name-only)
+
+    # claude-pilot.json must NOT appear in staged files (mika#1419 regression).
+    if echo "$staged" | grep -q '.claude/claude-pilot.json'; then
+        echo "FAIL: .claude/claude-pilot.json was staged (mika#1419 ping-pong reintroduced)"
+        return 1
+    fi
+
+    # .claude/commands/ scaffold must NOT appear (mika#1288 regression).
+    if echo "$staged" | grep -q '.claude/commands/'; then
+        echo "FAIL: .claude/commands/ scaffold was staged (mika#1288 regression)"
+        return 1
+    fi
+
+    # Pilot-authored file MUST be staged.
+    if ! echo "$staged" | grep -q 'src/new_feature.rs'; then
+        echo "FAIL: pilot-authored file was not staged"
+        return 1
+    fi
+
+    echo "PASS"
+}
+
+RESULT_C=$(test_auto_rescue_excludes_claude_pilot_json 2>/dev/null)
+if [ "$RESULT_C" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ claude-pilot.json scaffold excluded (mika#1419 ping-pong regression)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ claude-pilot.json scaffold exclusion: $RESULT_C"
+fi
+
+# Test D (mika#1419): scaffold-only worktree empty-index guard includes
+# claude-pilot.json. Verifies the empty-index path correctly skips the rescue
+# commit when both scaffold types are the only dirty content.
+test_auto_rescue_empty_index_guard_with_claude_pilot_json() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    git -C "$test_dir" init -q
+    git -C "$test_dir" commit --allow-empty -m "initial" -q
+
+    # Only scaffold dirt: both commands/ AND claude-pilot.json — no pilot content.
+    mkdir -p "$test_dir/.claude/commands"
+    echo "# scaffold" > "$test_dir/.claude/commands/mika.md"
+    echo '{"command":"mika","args":["--agent","mika-relay","ask"]}' > "$test_dir/.claude/claude-pilot.json"
+
+    git -C "$test_dir" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>/dev/null
+
+    if ! git -C "$test_dir" diff --cached --quiet 2>/dev/null; then
+        echo "FAIL: index is not empty despite only scaffold-class files being dirty"
+        return 1
+    fi
+
+    echo "PASS"
+}
+
+RESULT_D=$(test_auto_rescue_empty_index_guard_with_claude_pilot_json 2>/dev/null)
+if [ "$RESULT_D" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Empty-index guard covers both scaffold classes (mika#1288 + mika#1419)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Empty-index guard with both scaffolds: $RESULT_D"
+fi
+
 RESULT_B=$(test_auto_rescue_empty_index_guard 2>/dev/null)
 if [ "$RESULT_B" = "PASS" ]; then
     PASS=$((PASS + 1))
