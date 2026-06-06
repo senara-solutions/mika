@@ -316,7 +316,14 @@ impl TaskEngine {
             Ok(tasks) => {
                 for (task_id, pid) in tasks {
                     info!(task_id = %task_id, pid = pid, "killing orphan process for expired task");
-                    super::process_kill::kill_process_immediate(pid);
+                    // Orphan cleanup: pass `None` for expected_start_time. The
+                    // expired-task query returns (task_id, pid) only; we don't
+                    // wire the metadata extraction here because orphan cleanup
+                    // is best-effort and the existing /proc/<pid>/stat existence
+                    // check is good enough for this path. The PID reuse guard
+                    // (#855) is targeted at the cancel-by-operator path where
+                    // wrong-process-kill consequences are higher.
+                    super::process_kill::kill_process_immediate(pid, None);
                     // Clear process_id so we don't attempt to kill again on next tick
                     if let Err(e) = self.db.clear_task_process_id(&task_id).await {
                         warn!(task_id = %task_id, error = %e, "failed to clear process_id after kill");
