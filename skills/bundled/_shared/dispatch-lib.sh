@@ -186,6 +186,90 @@ _scrub_env() {
     unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
 }
 
+# mika#1414: Pre-rebase worktree cleanup for the resume path.
+#
+# On a resume dispatch _set_up_worktree() reuses an existing worktree, then
+# rebases it onto origin/main. `git rebase` refuses to run on a dirty tree
+# (`error: cannot rebase: You have unstaged changes` → STATUS=REBASE_CONFLICT
+# with `Rebase failure mode: other`, no real conflict), re-blocking the task
+# with no recovery path (confirmed n=2 on 2026-06-05: mika#1255, mika#1381).
+# This helper guarantees a clean tree before the rebase, in three tiers:
+#
+#   1. Abort any half-finished rebase left by a killed prior dispatch — a
+#      rebase-in-progress state would make the stash below fail and re-trigger
+#      the exact crash this fixes.
+#   2. Surgically reset dispatch-lib-owned scaffold/ephemeral paths to HEAD.
+#      These are re-copied / re-derived post-rebase anyway, so resetting them
+#      costs nothing and keeps them out of the operator-recovery stash. The
+#      `.claude/commands/` reset covers the dominant case: `make deploy` writing
+#      a stale mika.md into worktree working trees (modified TRACKED file).
+#      Subsumes the mika#1301 (.iterate/, groom-verdict-trail.log) and mika#1311
+#      (docs/plans/) surgical resets that previously lived inline.
+#   3. Blanket fallback: if any residue survives the surgical resets it is
+#      genuinely unexpected (crash leftovers, new untracked files deploy added).
+#      Stash it as a safety net — capturing the IMMUTABLE stash commit SHA and
+#      logging a self-contained recovery command — then hard-reset + clean so
+#      the rebase precondition holds. The stash is operator-recoverable via
+#      `git -C <worktree> stash list` (its message embeds the task id +
+#      timestamp) — this is the durable recovery path; the stderr echo is a
+#      convenience and does NOT land in /var/log/claude-pilot/<id>.stderr (that
+#      file captures only the later claude-pilot subprocess stderr). `clean -fd`
+#      omits -x so it never deletes gitignored worktree state (.claude/*.local.json,
+#      .claude/worktrees, scheduled_tasks.lock); the .claude config files are
+#      re-copied from $PLATFORM_DIR post-rebase regardless.
+#
+# Args: $1 = worktree dir (defaults to $WORKTREE_DIR). Reads $LOG_ID for the
+# stash label. Sets RESUME_CLEANUP_STASH to the stash SHA when one is created
+# (empty otherwise). Returns 1 without touching anything if $wt is not a worktree.
+_clean_worktree_for_rebase() {
+    local wt="${1:-$WORKTREE_DIR}"
+    RESUME_CLEANUP_STASH=""
+
+    # Guard: refuse destructive cleanup on an invalid target. `git -C ""` silently
+    # operates on the dispatch process CWD (a live checkout), so an empty/unset $wt
+    # would point `reset --hard` / `clean -fd` at the wrong tree. Not reachable on
+    # the live path (WORKTREE_DIR is always derived first) but the helper is a
+    # sourceable, destructive primitive — fail closed.
+    if [ -z "$wt" ] || ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "dispatch-lib: _clean_worktree_for_rebase got an invalid worktree ('${wt}'); refusing destructive cleanup" >&2
+        return 1
+    fi
+
+    # Tier 1: abort any half-finished rebase (hardening). stdout is suppressed
+    # along with stderr throughout — dispatch-lib reserves stdout for the RESULT
+    # payload, and `reset --hard` / `clean -fd` below print to stdout.
+    git -C "$wt" rebase --abort >/dev/null 2>&1 || true
+
+    # Tier 2: surgical resets of dispatch-lib-owned scaffold/ephemeral paths.
+    git -C "$wt" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
+    rm -rf "$wt/.iterate" 2>/dev/null || true
+    git -C "$wt" checkout HEAD -- docs/plans/ 2>/dev/null || true
+    git -C "$wt" checkout HEAD -- .claude/commands/ 2>/dev/null || true
+
+    # Tier 3: blanket fallback for genuinely-unexpected residue.
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+        local stash_msg
+        stash_msg="dispatch-lib-resume-cleanup-${LOG_ID:-unknown}-$(date -u +%Y%m%dT%H%M%SZ)"
+        if git -C "$wt" stash push --include-untracked -m "$stash_msg" >/dev/null 2>&1; then
+            # Capture the IMMUTABLE stash commit SHA — stash@{0} shifts as other
+            # worktrees push/pop on the shared stash stack. Use `--verify --quiet`:
+            # plain `rev-parse 'stash@{0}'` on a missing ref exits non-zero but
+            # echoes the literal string "stash@{0}" to stdout, which `|| true`
+            # would capture as a bogus handle when `stash push` reported success
+            # yet created no entry (e.g. nothing actually stashable). --verify
+            # --quiet prints nothing and exits non-zero in that case → empty.
+            RESUME_CLEANUP_STASH=$(git -C "$wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
+            echo "dispatch-lib: resume-cleanup stashed dirty worktree before rebase → stash ${RESUME_CLEANUP_STASH:-<unknown>} (msg: ${stash_msg}); recover with: git -C ${wt} stash apply ${RESUME_CLEANUP_STASH:-<sha>}" >&2
+        else
+            echo "dispatch-lib: resume-cleanup found nothing to stash or stash errored; proceeding with hard reset" >&2
+        fi
+        # Belt-and-suspenders: ensure a clean tree even if the stash captured
+        # nothing (e.g. unmerged paths). No -x, so gitignored config survives.
+        git -C "$wt" reset --hard HEAD >/dev/null 2>&1 || true
+        git -C "$wt" clean -fd >/dev/null 2>&1 || true
+    fi
+}
+
 _set_up_worktree() {
     # --- Parse repo#number format ---
     # Matches: mika#214, mika-skills#8, mika-cloud#50
@@ -291,24 +375,12 @@ _set_up_worktree() {
         # Rebase-or-abort guard
         BEHIND=$(git -C "$WORKTREE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         if [ "$BEHIND" -gt 0 ]; then
-            # Clean dispatch-lib-owned ephemeral files before rebase (mika#1301):
-            # .claude/groom-verdict-trail.log and .iterate/ are written by the
-            # iterate-loop itself; their presence as unstaged changes blocks
-            # rebase with `error: cannot rebase: You have unstaged changes`,
-            # producing a misleading REBASE_CONFLICT with no actual semantic
-            # conflict. dispatch-lib owns these paths, so it can safely reset
-            # them before rebasing.
-            git -C "$WORKTREE_DIR" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
-            rm -rf "$WORKTREE_DIR/.iterate" 2>/dev/null || true
-            # mika#1311 follow-up: reused worktrees can carry uncommitted/
-            # staged docs/plans/ edits from a prior failed dispatch (groom
-            # session crashed before commit, or a commit step was hook-
-            # rejected without retry). The committed plan on origin/$BRANCH
-            # is the canonical source of truth; any leftover unstaged or
-            # staged plan-doc edits are abandoned state. Reset tracked
-            # plan files to HEAD so rebase can proceed. (Untracked plan
-            # files are not affected — only tracked-but-modified ones.)
-            git -C "$WORKTREE_DIR" checkout HEAD -- docs/plans/ 2>/dev/null || true
+            # mika#1414: guarantee a clean tree before rebase on the resume path —
+            # a reused worktree can carry dirty state (dominant case: a stale
+            # .claude/commands/mika.md from `make deploy`) that would otherwise
+            # abort the rebase with a misleading REBASE_CONFLICT and re-block the
+            # task. Rationale + tier design live in _clean_worktree_for_rebase.
+            _clean_worktree_for_rebase "$WORKTREE_DIR"
 
             # Capture rebase stderr instead of discarding to /dev/null (mika#1364 AC#4).
             local rebase_err

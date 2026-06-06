@@ -153,16 +153,27 @@ edited ACs are recorded below):
   `dispatch-lib-resume-cleanup-<task_id>-<timestamp>` and log the stash ref for
   operator recovery."*
 
-- **AC4 — "Stash ref logged in task payload" → "logged to durable per-task stderr
-  log."** Decision: on the success path the RESULT "task payload" is owned by the
-  pilot outcome (lines 454-462), assembled long after worktree setup; threading the
-  setup-phase stash into a success RESULT would mean restructuring result assembly,
-  out of proportion to the fix. The stash SHA + `git stash apply` recovery command
-  are emitted to **stderr**, which dispatch-lib already persists durably per task to
-  `/var/log/claude-pilot/${LOG_ID}.stderr` (mika#1097, secret-scrubbed); the stash
-  is additionally recoverable via `git -C <worktree> stash list`. Reconciled AC4
-  wording: *"Stash ref logged to the durable per-task stderr log for operator
-  recovery."*
+- **AC4 — "Stash ref logged in task payload" → "operator-recoverable via the
+  stash itself."** Decision: on the success path the RESULT "task payload" is owned
+  by the pilot outcome (lines 454-462), assembled long after worktree setup;
+  threading the setup-phase stash into a success RESULT would mean restructuring
+  result assembly, out of proportion to the fix.
+
+  **Implementation correction (post-review, mika#1414):** the original draft of this
+  bullet claimed the stash SHA emitted to stderr lands in
+  `/var/log/claude-pilot/${LOG_ID}.stderr`. That is **false** and was corrected
+  during code review. That file is written *only* from the `claude-pilot`
+  subprocess's captured stderr (`_scrub_secrets_from_output < "$STDERR_FILE" >
+  "$PERSISTENT_STDERR"`), and the redirect truncates (`>`); `_clean_worktree_for_rebase`
+  runs during `_set_up_worktree()`, **before** claude-pilot launches, so its `>&2`
+  echo goes to dispatch-lib's own fd 2 (the tool subprocess stderr captured by the
+  engine), not to that per-task file. The **durable, authoritative** operator-recovery
+  path is therefore the stash itself: `git -C <worktree> stash list` shows the entry,
+  whose message embeds `${LOG_ID}` (task id) + UTC timestamp, and the immutable SHA is
+  captured in `RESUME_CLEANUP_STASH`. The stderr echo is a best-effort convenience that
+  lands wherever the engine routes dispatch-lib stderr. Reconciled AC4 wording:
+  *"Stash ref recoverable via `git stash list` (message embeds task id + timestamp);
+  recovery command additionally echoed to dispatch-lib stderr."*
 
 ## Testing
 
