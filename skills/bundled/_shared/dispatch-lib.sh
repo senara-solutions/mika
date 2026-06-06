@@ -630,15 +630,20 @@ ${RESULT}"
                 DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
                 if [ -n "$DIRTY_FILES" ]; then
                     # Stage all dirty files EXCEPT worktree-scaffold paths copied by
-                    # _set_up_worktree (mika#1288). .claude/commands/ contains slash-command
-                    # snapshots from mika-platform — not pilot-authored content.
-                    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' 2>&9
+                    # _set_up_worktree (mika#1288, mika#1419):
+                    #   - .claude/commands/         slash-command snapshots from mika-platform
+                    #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
+                    # Neither is pilot-authored content. Without the second exclusion, the
+                    # rescue commit re-introduces .claude/claude-pilot.json whose intentional
+                    # deletion shipped in PR #1348 (mika#1193 Phase C) — the founding incident
+                    # for mika#1419 (ping-pong on the file's git log).
+                    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>&9
 
                     # Guard: if pathspec exclusion left nothing staged, skip the rescue
                     # commit. Handles the edge case where the pilot wrote ONLY to scaffold
-                    # paths (mika#1288).
+                    # paths (mika#1288, mika#1419).
                     if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
-                        echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/) — no pilot content to rescue" >&2
+                        echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
                         RESCUED_DIRTY_WORKTREE=0
                     else
                         # Compute accurate rescued-files list for the PIPELINE FAILURE
@@ -657,7 +662,10 @@ ${RESULT}"
                         if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
                             PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
                             [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
-                            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' 2>&9
+                            # Same exclusion pathspec as the initial `git add -A` above
+                            # (mika#1288, mika#1419) — keeps scaffold paths out of the
+                            # post-fmt re-add.
+                            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>&9
                         fi
 
                         # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
@@ -685,7 +693,7 @@ ${RESULT}"
 
 Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
 Auto-rescued by dispatch-lib dirty-worktree detection.
-Scaffold paths excluded (mika#1288)." > "$RESCUE_COMMIT_ERR" 2>&1; then
+Scaffold paths excluded (mika#1288, mika#1419)." > "$RESCUE_COMMIT_ERR" 2>&1; then
                             # Commit succeeded on first try — proceed normally
                             rm -f "$RESCUE_COMMIT_ERR"
 
@@ -709,14 +717,17 @@ ${RESULT}"
                             CARGO_FMT_ERR=""
                             echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
                             CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-                            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' 2>&9
+                            # Same exclusion pathspec as the initial `git add -A` above
+                            # (mika#1288, mika#1419) — scaffold paths stay excluded on the
+                            # post-fmt retry path too.
+                            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>&9
 
                             # mika#1310: capture both stdout+stderr (see above).
                             if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
 
 Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
 Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
-Scaffold paths excluded (mika#1288)." > "$RESCUE_COMMIT_ERR" 2>&1; then
+Scaffold paths excluded (mika#1288, mika#1419)." > "$RESCUE_COMMIT_ERR" 2>&1; then
                                 # Retry succeeded after cargo fmt
                                 rm -f "$RESCUE_COMMIT_ERR"
 
