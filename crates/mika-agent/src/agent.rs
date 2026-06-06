@@ -16,6 +16,7 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::mcp::McpManager;
 use crate::messaging::MessageSender;
+use crate::post_condition::{GuardDecision, POST_CONDITION_GUARDS};
 use crate::prompt;
 use crate::secret_scrubber::scrub_secrets;
 use crate::skills::SkillRegistry;
@@ -854,9 +855,18 @@ async fn run_loop(
     let mut required_tools_retry_done = false;
     // Whether we already injected a text-based tool call correction. Only allow one retry.
     let mut text_tool_call_retry_done = false;
-    // Whether we already injected a completion-claim correction. Only allow one retry.
-    // Guards against fabricated completion claims without update_task_status calls (#483).
-    let mut completion_claim_retry_done = false;
+    // Post-condition guard retry tracking (#771). Each entry label gets inserted
+    // on first fire; presence prevents re-fire. Replaces the former
+    // `completion_claim_retry_done` boolean for the completion-claim guard.
+    let mut post_condition_retries: HashSet<&'static str> = HashSet::new();
+    // Send-message turn boundary tracking (#771). When the agent emits a
+    // `send_message` to the user, this flag is set and any subsequent write
+    // tool calls in the same turn are suppressed. After the step completes,
+    // the agent loop forces EndTurn without making another LLM call.
+    let mut send_message_boundary_active = false;
+    let mut suppressed_write_tools: Vec<String> = Vec::new();
+    // Capture the send_message text for structured logging on violation.
+    let mut send_message_text_capture: String = String::new();
     // Whether we already injected a milestone-close-claim correction. Only allow one retry.
     // Guards against claiming milestone closed without the PATCH call (#797).
     let mut milestone_close_claim_retry_done = false;
@@ -1292,72 +1302,56 @@ async fn run_loop(
                         );
                     }
 
-                    // Completion-claim guard: if the agent claims work is done (e.g.,
-                    // "merged", "deployed", "completed") but didn't call
-                    // update_task_status, reject and re-prompt once. This catches
-                    // fabricated completion claims that leave tasks stuck in
-                    // in_progress. Only fires on EndTurn. See #483.
+                    // Post-condition guard registry dispatch (#771, #483).
+                    // Evaluates each registered guard in sequence. Guards that
+                    // have already fired (tracked in post_condition_retries) are
+                    // skipped. Currently: completion_claim only.
                     if !skip_remaining_guards
                         && matches!(response.stop_reason, LlmStopReason::EndTurn)
-                        && !completion_claim_retry_done
-                        && let Some(keyword) = detect_completion_claim(&text)
                     {
-                        // Only enforce if the agent has the tool available
-                        // (delegates and team agents don't — they get default_tools() only)
-                        if tools.get("update_task_status").is_some()
-                            && !tools_called.contains("update_task_status")
-                        {
-                            // Lazy-resolve active tasks (only completable statuses)
-                            let active_items: Vec<_> = db
-                                .list_active_tasks()
-                                .await
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|t| t.status == "pending" || t.status == "in_progress")
-                                .collect();
-
-                            if !active_items.is_empty() {
-                                completion_claim_retry_done = true;
-                                warn!(
-                                    step,
-                                    keyword,
-                                    active_items = active_items.len(),
-                                    label = mode.label(),
-                                    "Completion claim detected without update_task_status call — re-prompting"
-                                );
-
-                                let item_list = active_items
-                                    .iter()
-                                    .take(5)
-                                    .map(|t| format!("- {} ({}): {}", t.id, t.status, t.label))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-
-                                // Push the assistant's response so the model sees what it tried
-                                request.messages.push(LlmMessage {
-                                    role: LlmRole::Assistant,
-                                    content: LlmContent::Blocks(
-                                        mika_common::llm::response_content_to_blocks(
-                                            &response.content,
-                                        ),
-                                    ),
-                                });
-                                // Inject a correction telling the model to update tasks
-                                request.messages.push(LlmMessage {
-                                    role: LlmRole::User,
-                                    content: LlmContent::Text(format!(
-                                        "[mika-engine] The previous response claimed completion \
-                                         (matched: \"{keyword}\") without calling update_task_status. \
-                                         There are {} active task(s):\n{item_list}\n\n\
-                                         The engine expects update_task_status for each relevant \
-                                         task, or a retraction of the completion claim if the work \
-                                         is not actually done. Tool results are how the engine \
-                                         confirms work; results come from actual calls, not synthesis.",
-                                        active_items.len(),
-                                    )),
-                                });
+                        let mut guard_rejected = false;
+                        for guard in POST_CONDITION_GUARDS {
+                            if post_condition_retries.contains(guard.label) {
                                 continue;
                             }
+                            let decision = match guard.label {
+                                "completion_claim" => {
+                                    evaluate_completion_claim(
+                                        &text,
+                                        &tools_called,
+                                        tools,
+                                        db,
+                                        step,
+                                        mode,
+                                    )
+                                    .await
+                                }
+                                _ => GuardDecision::Pass,
+                            };
+                            match decision {
+                                GuardDecision::Pass => {}
+                                GuardDecision::RejectEndTurn { correction } => {
+                                    post_condition_retries.insert(guard.label);
+                                    // Push the assistant's response so the model sees what it tried
+                                    request.messages.push(LlmMessage {
+                                        role: LlmRole::Assistant,
+                                        content: LlmContent::Blocks(
+                                            mika_common::llm::response_content_to_blocks(
+                                                &response.content,
+                                            ),
+                                        ),
+                                    });
+                                    request.messages.push(LlmMessage {
+                                        role: LlmRole::User,
+                                        content: LlmContent::Text(correction),
+                                    });
+                                    guard_rejected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if guard_rejected {
+                            continue;
                         }
                     }
 
@@ -2280,9 +2274,70 @@ async fn run_loop(
                     session_id,
                     store_tool_calls,
                     llm_call_id.as_deref(),
+                    &mut send_message_boundary_active,
+                    &mut suppressed_write_tools,
+                    &mut send_message_text_capture,
+                    mode.is_conversation(),
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
+
+                // Send-message turn boundary: force EndTurn after a step that
+                // included send_message (#771). Only fires when ALL of:
+                // - Conversation mode (silent/callback modes exempt)
+                // - User message is from a human (not an automated trigger)
+                // Automated triggers (`[callback:`, `[GitHub]`, heartbeats)
+                // legitimately combine send_message with write tools. The
+                // incident case was a conversation-mode user-dialog interaction.
+                let is_automated_trigger = user_input_text.starts_with("[callback:")
+                    || user_input_text.starts_with("[GitHub]")
+                    || user_input_text.starts_with("[heartbeat")
+                    || user_input_text.starts_with("[milestone-parent:")
+                    || user_input_text.starts_with("[advance:")
+                    || tool_ctx.is_callback_turn;
+                if send_message_boundary_active && mode.is_conversation() && !is_automated_trigger {
+                    if !suppressed_write_tools.is_empty() {
+                        warn!(
+                            step,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            suppressed_tool_calls = ?suppressed_write_tools,
+                            send_message_text = %send_message_text_capture,
+                            "send_message_turn_boundary_violation: suppressed write tools after send_message"
+                        );
+                    } else {
+                        info!(
+                            step,
+                            "send_message_turn_boundary_enforced: forcing EndTurn after send_message"
+                        );
+                    }
+                    // Force EndTurn — return Done directly instead of breaking
+                    // to the MaxStepsExceeded path (which would trigger a
+                    // continuation turn). The send_message was delivered; the
+                    // turn is complete.
+                    if mode.saves_to_db() {
+                        let metadata = tool_calls_metadata_json(&all_tool_summaries);
+                        // No assistant text to save — the turn ended with tools only.
+                        // The send_message content was already delivered via the tool.
+                        let _ = db
+                            .save_message_with_metadata(
+                                session_id,
+                                "assistant",
+                                "",
+                                metadata.as_deref(),
+                                Some(tool_ctx.trace_id),
+                                internal,
+                            )
+                            .await;
+                    }
+                    return Ok(LoopResult::Done {
+                        text: None,
+                        thinking: thinking_text,
+                        usage: last_usage,
+                        tool_call_summaries: all_tool_summaries,
+                        system_prompt_original_len: system_prompt_len,
+                    });
+                }
             }
         }
     }
@@ -3044,6 +3099,16 @@ async fn process_tool_calls(
     session_id: &str,
     store_tool_calls: bool,
     llm_call_id: Option<&str>,
+    // Send-message turn boundary state (#771). Passed from the agent loop to
+    // enable intra-step write gating: after a send_message call within this
+    // step, subsequent send_message calls are suppressed (conversation mode only).
+    send_message_boundary_active: &mut bool,
+    suppressed_write_tools: &mut Vec<String>,
+    send_message_text_capture: &mut String,
+    // Whether this is a conversation-mode run. The send_message boundary
+    // guard only applies in conversation mode — silent/callback modes use
+    // send_message as a notification mechanism, not a user-dialog interaction.
+    conversation_mode: bool,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
@@ -3061,6 +3126,46 @@ async fn process_tool_calls(
             arguments,
         } = block
         {
+            // Send-message turn boundary gate (#771): intra-step suppression
+            // for duplicate send_message calls in conversation mode. Within
+            // the same LLM response, a second send_message after the first is
+            // suppressed (the agent should combine messages or wait for user
+            // input). Silent/callback modes are exempt — send_message is the
+            // notification mechanism there, not a user-dialog interaction.
+            // The inter-step gate (after process_tool_calls returns) prevents
+            // cross-step writes by forcing EndTurn.
+            if *send_message_boundary_active && name == "send_message" && conversation_mode {
+                let input_summary_for_suppressed =
+                    truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX);
+                let suppressed_msg =
+                    "[mika-engine] Tool call suppressed: send_message turn boundary (#771). \
+                     A second send_message is not permitted after the first in the same turn. \
+                     Combine your messages into a single send_message call."
+                        .to_string();
+                warn!(
+                    trace_id = %tool_ctx.trace_id,
+                    tool = %name,
+                    step,
+                    "send_message_turn_boundary: suppressed duplicate send_message"
+                );
+                summaries.push(ToolCallSummary {
+                    step,
+                    name: name.clone(),
+                    input_summary: scrub_secrets(&input_summary_for_suppressed).into_owned(),
+                    output_summary: truncate_summary(&suppressed_msg, OUTPUT_SUMMARY_MAX),
+                    success: false,
+                    non_zero_exit: false,
+                });
+                suppressed_write_tools.push(name.clone());
+                // Return a tool_result so the conversation history stays paired
+                tool_results.push(LlmContentBlock::ToolResult {
+                    tool_call_id: id.clone(),
+                    content: LlmToolResultContent::Text(suppressed_msg),
+                    is_error: true,
+                });
+                continue;
+            }
+
             let dedup_key = (
                 name.clone(),
                 serde_json::to_string(arguments).unwrap_or_default(),
@@ -3159,14 +3264,29 @@ async fn process_tool_calls(
                     scrub_secrets(&raw).into_owned()
                 };
                 let non_zero_exit = !output.is_error && has_non_zero_exit_prefix(&output.content);
+                let tool_succeeded = !output.is_error && !non_zero_exit;
                 summaries.push(ToolCallSummary {
                     step,
                     name: name.clone(),
                     input_summary,
                     output_summary,
-                    success: !output.is_error && !non_zero_exit,
+                    success: tool_succeeded,
                     non_zero_exit,
                 });
+
+                // Send-message turn boundary activation (#771): after a
+                // successful send_message in conversation mode, mark the
+                // boundary as active. Silent/callback modes are exempt.
+                if name == "send_message" && tool_succeeded && conversation_mode {
+                    *send_message_boundary_active = true;
+                    // Capture the send_message text for structured logging.
+                    // Use the arguments (which contain the text parameter).
+                    if send_message_text_capture.is_empty()
+                        && let Some(text_val) = arguments.get("text").and_then(|v| v.as_str())
+                    {
+                        *send_message_text_capture = truncate_summary(text_val, 200);
+                    }
+                }
 
                 dedup_cache.insert(dedup_key, output.clone());
                 output
@@ -5133,6 +5253,71 @@ fn detect_completion_claim(text: &str) -> Option<&str> {
         return None;
     }
     COMPLETION_CLAIM_RE.find(text).map(|m| m.as_str())
+}
+
+/// Evaluate the completion-claim post-condition guard (#483, #771).
+///
+/// Extracted from the inline agent loop code into a standalone async function
+/// for dispatch by the `PostConditionGuard` registry. Returns `GuardDecision`.
+async fn evaluate_completion_claim(
+    text: &str,
+    tools_called: &HashSet<String>,
+    tools: &ToolRegistry,
+    db: &AsyncDatabase,
+    step: usize,
+    mode: &LoopMode,
+) -> GuardDecision {
+    let keyword = match detect_completion_claim(text) {
+        Some(kw) => kw.to_string(),
+        None => return GuardDecision::Pass,
+    };
+
+    // Only enforce if the agent has the tool available
+    // (delegates and team agents don't — they get default_tools() only)
+    if tools.get("update_task_status").is_none() || tools_called.contains("update_task_status") {
+        return GuardDecision::Pass;
+    }
+
+    // Lazy-resolve active tasks (only completable statuses)
+    let active_items: Vec<_> = db
+        .list_active_tasks()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.status == "pending" || t.status == "in_progress")
+        .collect();
+
+    if active_items.is_empty() {
+        return GuardDecision::Pass;
+    }
+
+    warn!(
+        step,
+        keyword = keyword.as_str(),
+        active_items = active_items.len(),
+        label = mode.label(),
+        "Completion claim detected without update_task_status call — re-prompting"
+    );
+
+    let item_list = active_items
+        .iter()
+        .take(5)
+        .map(|t| format!("- {} ({}): {}", t.id, t.status, t.label))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    GuardDecision::RejectEndTurn {
+        correction: format!(
+            "[mika-engine] The previous response claimed completion \
+             (matched: \"{keyword}\") without calling update_task_status. \
+             There are {} active task(s):\n{item_list}\n\n\
+             The engine expects update_task_status for each relevant \
+             task, or a retraction of the completion claim if the work \
+             is not actually done. Tool results are how the engine \
+             confirms work; results come from actual calls, not synthesis.",
+            active_items.len(),
+        ),
+    }
 }
 
 /// Regex matching first-person claims that a milestone was closed (#797, #1207).
