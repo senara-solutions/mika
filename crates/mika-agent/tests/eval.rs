@@ -83,6 +83,10 @@ mod eval {
     // produce tool calls the engine accepts or defers (mika#806).
     mod test_self_dev_callback_engine_consistency;
 
+    // Send-message turn boundary guard: prevents write tools after
+    // send_message in conversation mode (#771).
+    mod test_send_message_boundary;
+
     // Multi-agent corpus parity: regression guard for #1155 search_content gap
     mod kg_multi_agent_corpus_parity;
 }
