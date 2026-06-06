@@ -1575,6 +1575,236 @@ else
     FAIL=$((FAIL + 1)); echo "  ✗ No-op on stale-main conflation (mika#1407): $RESULT_12H"
 fi
 
+# --- Test 12i: Resume with dirty worktree → cleaned + stashed, rebase succeeds (mika#1414) ---
+# A reused worktree carrying UNEXPECTED dirty residue (modified non-scaffold tracked
+# file + untracked file) must not crash `git rebase` on the resume path. The real
+# _clean_worktree_for_rebase helper must stash the residue (operator-recoverable) and
+# leave a clean tree so the rebase proceeds. Calling the real function (not an inline
+# copy of the guard) eliminates the Test-12e drift risk called out in the plan.
+test_resume_dirty_worktree_cleaned() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # Feature branch with its own commit, so the rebase actually replays work.
+    # Commit a .gitignore so we can prove `clean -fd` (no -x) preserves ignored files.
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/resume-dirty
+    echo "feat" > "$FIXTURE_CLONE/feature.txt"
+    printf '*.keep\n' > "$FIXTURE_CLONE/.gitignore"
+    git -C "$FIXTURE_CLONE" add feature.txt .gitignore
+    git -C "$FIXTURE_CLONE" commit -q -m "feature work"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/resume-dirty
+
+    # Advance origin/main by one NON-conflicting commit (touches a different file)
+    # via a throwaway clone, so BEHIND>0 and a clean rebase is possible.
+    local advance_clone
+    advance_clone=$(mktemp -d)
+    git clone -q "file://$FIXTURE_BARE" "$advance_clone"
+    git -C "$advance_clone" config user.email "test@mika.local"
+    git -C "$advance_clone" config user.name "mika test"
+    echo "advance" > "$advance_clone/main-advance.txt"
+    git -C "$advance_clone" add main-advance.txt
+    git -C "$advance_clone" commit -q -m "advance main"
+    git -C "$advance_clone" push -q origin main
+    rm -rf "$advance_clone"
+    git -C "$FIXTURE_CLONE" fetch -q origin
+
+    # Dirty the worktree with UNEXPECTED residue: a modified non-scaffold tracked
+    # file + an untracked file. Neither is a dispatch-lib-owned scaffold path, so
+    # both survive the surgical resets and must be stashed by the blanket fallback.
+    echo "dirty" >> "$FIXTURE_CLONE/file.txt"
+    echo "junk" > "$FIXTURE_CLONE/junk.tmp"
+    # A gitignored, uncommitted file (stands in for .claude/*.local.json) — must
+    # survive `clean -fd` (no -x), which is the load-bearing reason -x is omitted.
+    echo "keepme" > "$FIXTURE_CLONE/config.keep"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    LOG_ID="test-1414"
+    RESUME_CLEANUP_STASH=""
+
+    # Call the REAL helper.
+    _clean_worktree_for_rebase "$FIXTURE_CLONE"
+
+    local status_after
+    status_after=$(git -C "$FIXTURE_CLONE" status --porcelain 2>/dev/null)
+
+    # The rebase the helper guards must now succeed on the clean tree.
+    local rebase_rc=0
+    git -C "$FIXTURE_CLONE" rebase origin/main >/dev/null 2>&1 || rebase_rc=$?
+
+    local failures=""
+    # AC1 + AC3: tree clean after cleanup, rebase succeeds (no REBASE_CONFLICT).
+    [ -z "$status_after" ] || failures="${failures}worktree not clean after cleanup: [$status_after]; "
+    [ "$rebase_rc" -eq 0 ] || failures="${failures}rebase should succeed on clean tree, got rc=$rebase_rc; "
+    # AC2: a stash with the descriptive name was created.
+    if ! git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -qF "dispatch-lib-resume-cleanup-test-1414-"; then
+        failures="${failures}expected stash named dispatch-lib-resume-cleanup-test-1414-*; "
+    fi
+    # AC4: the immutable stash SHA was captured for operator recovery.
+    if [ -z "$RESUME_CLEANUP_STASH" ]; then
+        failures="${failures}RESUME_CLEANUP_STASH should hold the stash SHA; "
+    elif ! git -C "$FIXTURE_CLONE" cat-file -e "$RESUME_CLEANUP_STASH" 2>/dev/null; then
+        failures="${failures}RESUME_CLEANUP_STASH ($RESUME_CLEANUP_STASH) is not a valid git object; "
+    fi
+    # AC5: stashed content is recoverable — both the modified tracked file and the
+    # untracked file. The untracked file lives in the stash's third parent (^3),
+    # created by `stash push --include-untracked`.
+    if [ -n "$RESUME_CLEANUP_STASH" ]; then
+        if ! git -C "$FIXTURE_CLONE" stash show "$RESUME_CLEANUP_STASH" 2>/dev/null | grep -qF 'file.txt'; then
+            failures="${failures}stash diff should contain the dirtied tracked file (file.txt); "
+        fi
+        if ! git -C "$FIXTURE_CLONE" ls-tree -r "${RESUME_CLEANUP_STASH}^3" 2>/dev/null | grep -qF 'junk.tmp'; then
+            failures="${failures}stash should preserve the untracked file (junk.tmp); "
+        fi
+    fi
+    # clean -fd omits -x: the gitignored file must survive the blanket fallback.
+    if [ ! -f "$FIXTURE_CLONE/config.keep" ]; then
+        failures="${failures}gitignored file (config.keep) must survive clean -fd (no -x); "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12I=$(test_resume_dirty_worktree_cleaned 2>/dev/null)
+if [ "$RESULT_12I" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Resume dirty worktree: cleaned + stashed, rebase succeeds (mika#1414)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Resume dirty worktree cleanup (mika#1414): $RESULT_12I"
+fi
+
+# --- Test 12j: Resume with ONLY scaffold dirt → surgical reset, NO stash (mika#1414) ---
+# The dominant production case: a stale committed-plan / .claude/commands edit (e.g. a
+# `make deploy` stale mika.md). Tier-2 surgical resets must clean it to HEAD WITHOUT
+# creating an operator-recovery stash — the plan's accepted-consequence contract (AC2
+# reconciliation). A regression that stashes scaffold residue would fill recovery
+# stashes with noise; this test locks the no-stash boundary.
+test_resume_surgical_only_no_stash() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/surgical-only
+    mkdir -p "$FIXTURE_CLONE/docs/plans"
+    echo "plan v1" > "$FIXTURE_CLONE/docs/plans/p.md"
+    echo "feat" > "$FIXTURE_CLONE/feature.txt"
+    git -C "$FIXTURE_CLONE" add docs/plans/p.md feature.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "feature + committed plan"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/surgical-only
+
+    # Advance origin/main (non-conflicting) so BEHIND>0.
+    local advance_clone
+    advance_clone=$(mktemp -d)
+    git clone -q "file://$FIXTURE_BARE" "$advance_clone"
+    git -C "$advance_clone" config user.email "test@mika.local"
+    git -C "$advance_clone" config user.name "mika test"
+    echo "advance" > "$advance_clone/main-advance.txt"
+    git -C "$advance_clone" add main-advance.txt
+    git -C "$advance_clone" commit -q -m "advance main"
+    git -C "$advance_clone" push -q origin main
+    rm -rf "$advance_clone"
+    git -C "$FIXTURE_CLONE" fetch -q origin
+
+    # Dirty ONLY a dispatch-lib-owned scaffold path (a stale committed-plan edit).
+    echo "stale edit" >> "$FIXTURE_CLONE/docs/plans/p.md"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    LOG_ID="test-1414-surgical"
+    RESUME_CLEANUP_STASH=""
+
+    _clean_worktree_for_rebase "$FIXTURE_CLONE"
+
+    local status_after
+    status_after=$(git -C "$FIXTURE_CLONE" status --porcelain 2>/dev/null)
+    local rebase_rc=0
+    git -C "$FIXTURE_CLONE" rebase origin/main >/dev/null 2>&1 || rebase_rc=$?
+
+    local failures=""
+    [ -z "$status_after" ] || failures="${failures}worktree not clean after surgical reset: [$status_after]; "
+    [ "$rebase_rc" -eq 0 ] || failures="${failures}rebase should succeed, got rc=$rebase_rc; "
+    # The accepted-consequence contract: scaffold-only dirt is reset, NOT stashed.
+    [ -z "$RESUME_CLEANUP_STASH" ] || failures="${failures}scaffold-only dirt must NOT create a stash (got $RESUME_CLEANUP_STASH); "
+    if git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -qF "dispatch-lib-resume-cleanup-"; then
+        failures="${failures}no resume-cleanup stash should exist for scaffold-only dirt; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12J=$(test_resume_surgical_only_no_stash 2>/dev/null)
+if [ "$RESULT_12J" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Resume scaffold-only dirt: surgical reset, no stash (mika#1414)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Resume scaffold-only no-stash (mika#1414): $RESULT_12J"
+fi
+
+# --- Test 12k: Resume aborts a half-finished rebase before cleanup (mika#1414 tier 1) ---
+# A prior dispatch killed mid-rebase leaves a rebase-in-progress state. Tier 1 must
+# `rebase --abort` it; otherwise the stash below fails and the exact crash this fix
+# targets recurs. Locks the hardening tier.
+test_resume_aborts_half_finished_rebase() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    # Commit a shared file on main both sides will edit (forces a rebase conflict).
+    echo "base-shared" > "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" add shared.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "add shared"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/half-rebase
+    echo "branch-change" > "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" add shared.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "branch edits shared"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/half-rebase
+
+    # Advance origin/main with a CONFLICTING edit to the same file.
+    local advance_clone
+    advance_clone=$(mktemp -d)
+    git clone -q "file://$FIXTURE_BARE" "$advance_clone"
+    git -C "$advance_clone" config user.email "test@mika.local"
+    git -C "$advance_clone" config user.name "mika test"
+    git -C "$advance_clone" checkout -q main
+    echo "main-change" > "$advance_clone/shared.txt"
+    git -C "$advance_clone" add shared.txt
+    git -C "$advance_clone" commit -q -m "main edits shared (conflict)"
+    git -C "$advance_clone" push -q origin main
+    rm -rf "$advance_clone"
+    git -C "$FIXTURE_CLONE" fetch -q origin
+
+    # Start a conflicting rebase and LEAVE it mid-flight (do not abort/resolve).
+    git -C "$FIXTURE_CLONE" rebase origin/main >/dev/null 2>&1 || true
+
+    local mid_rebase=0
+    if [ -d "$FIXTURE_CLONE/.git/rebase-merge" ] || [ -d "$FIXTURE_CLONE/.git/rebase-apply" ]; then
+        mid_rebase=1
+    fi
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    LOG_ID="test-1414-abort"
+    RESUME_CLEANUP_STASH=""
+
+    _clean_worktree_for_rebase "$FIXTURE_CLONE"
+
+    local failures=""
+    [ "$mid_rebase" -eq 1 ] || failures="${failures}precondition: expected a mid-rebase state in the fixture; "
+    if [ -d "$FIXTURE_CLONE/.git/rebase-merge" ] || [ -d "$FIXTURE_CLONE/.git/rebase-apply" ]; then
+        failures="${failures}tier 1 did not abort the in-progress rebase; "
+    fi
+    local status_after
+    status_after=$(git -C "$FIXTURE_CLONE" status --porcelain 2>/dev/null)
+    [ -z "$status_after" ] || failures="${failures}tree not clean after abort+cleanup: [$status_after]; "
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12K=$(test_resume_aborts_half_finished_rebase 2>/dev/null)
+if [ "$RESULT_12K" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Resume aborts half-finished rebase (mika#1414 tier 1)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Resume half-finished-rebase abort (mika#1414): $RESULT_12K"
+fi
+
 # --- Summary ---
 
 echo ""
