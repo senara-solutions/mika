@@ -146,33 +146,51 @@ DELIVER_COUNT=$(printf '%s\n' "$ISSUE_STATE_REGION" | grep -v '^\s*#' | grep -c 
 assert_eq "Only one _deliver_callback call in the issue-state region (non-comment)" "1" "$DELIVER_COUNT"
 
 # --- Test 5: Prompt recognition guidance ---
+#
+# Historical note (mika#1412): the previous form of this test asserted four
+# specific strings (`auto_skipped`, `Do not ask the operator`, `Do not post
+# a status message`, `mika#988`) about the `self-dev/system_prompt.md`
+# auto-skip section. That section has been refactored out of the prompt
+# entirely as the auto-skip handling moved to engine-level guards
+# (validate_dispatch_readiness in `mika-agent`) — the prompt now describes
+# the rejection-handling shape via typed `pr_merge_with_gate` variants
+# (mika#1326-era refactor) and the `dispatch_task_has_open_pr` rejection
+# (verified at prompt line 87). The four old assertions are removed per
+# mika#1412 AC1 ("removed if it asserts retired behavior").
+#
+# Current invariant worth asserting: the prompt still requires the agent
+# to consult the operator before retrying after a dispatch rejection — the
+# engine guard is authoritative, but the prompt-level discipline backs it.
 
 echo ""
-echo "Test 5: self-dev prompt includes auto-skip recognition"
-echo "-------------------------------------------------------"
+echo "Test 5: self-dev prompt — dispatch-rejection handling discipline (mika#1412 refresh)"
+echo "-----------------------------------------------------------------------------------"
 
 PROMPT_FILE="$SCRIPT_DIR/../self-dev/system_prompt.md"
 if [ -f "$PROMPT_FILE" ]; then
-    # Use grep directly on the file to avoid shell argument size limits
-    if grep -qF "auto_skipped" "$PROMPT_FILE"; then
-        PASS=$((PASS + 1)); echo "  ✓ Prompt mentions auto_skipped"
+    # Invariant: prompt instructs the agent to wait for explicit operator
+    # direction after a dispatch rejection — defense-in-depth against
+    # auto-retry loops on rejected dispatches.
+    if grep -qF "Wait for explicit instructions" "$PROMPT_FILE"; then
+        PASS=$((PASS + 1)); echo "  ✓ Prompt requires explicit operator direction after dispatch rejection"
     else
-        FAIL=$((FAIL + 1)); echo "  ✗ Prompt mentions auto_skipped"
+        FAIL=$((FAIL + 1)); echo "  ✗ Prompt requires explicit operator direction after dispatch rejection"
     fi
-    if grep -qF "Do not ask the operator" "$PROMPT_FILE"; then
-        PASS=$((PASS + 1)); echo "  ✓ Prompt says not to ask operator"
+
+    # Invariant: prompt cites the structural enforcement point so the
+    # prompt-level discipline names where the authoritative gate lives.
+    if grep -qF "validate_dispatch_readiness" "$PROMPT_FILE"; then
+        PASS=$((PASS + 1)); echo "  ✓ Prompt names the authoritative engine guard (validate_dispatch_readiness)"
     else
-        FAIL=$((FAIL + 1)); echo "  ✗ Prompt says not to ask operator"
+        FAIL=$((FAIL + 1)); echo "  ✗ Prompt names the authoritative engine guard"
     fi
-    if grep -qF "Do not post a status message" "$PROMPT_FILE"; then
-        PASS=$((PASS + 1)); echo "  ✓ Prompt says no status message"
+
+    # Invariant: prompt enumerates the typed rejection sub-variants the
+    # agent must branch on exhaustively (mika#1326-era structural fix).
+    if grep -qF "dispatch_task_has_open_pr" "$PROMPT_FILE"; then
+        PASS=$((PASS + 1)); echo "  ✓ Prompt enumerates dispatch_task_has_open_pr rejection variant"
     else
-        FAIL=$((FAIL + 1)); echo "  ✗ Prompt says no status message"
-    fi
-    if grep -qF "mika#988" "$PROMPT_FILE"; then
-        PASS=$((PASS + 1)); echo "  ✓ Prompt references mika#988"
-    else
-        FAIL=$((FAIL + 1)); echo "  ✗ Prompt references mika#988"
+        FAIL=$((FAIL + 1)); echo "  ✗ Prompt enumerates dispatch_task_has_open_pr rejection variant"
     fi
 else
     FAIL=$((FAIL + 1))
@@ -216,10 +234,21 @@ CALL_SEQUENCE=$(printf '%s\n' "$DISPATCH_BODY" | grep -E '^\s+_(set_up_worktree|
 EXPECTED_SEQUENCE=$(printf '%s\n' "_set_up_worktree" "_detect_plan_on_branch" "_handle_dry_run")
 assert_eq "Call ordering: _set_up_worktree -> _detect_plan_on_branch -> _handle_dry_run" "$EXPECTED_SEQUENCE" "$CALL_SEQUENCE"
 
-# Verify the case switch is unchanged (dev-pilot still maps to /mika as default)
+# Verify the case switch maps both skills correctly. As of mika#1271 sub-PR 8
+# (referenced in dispatch-lib.sh around line 1685) the case block is now
+# multi-line per skill and dev-groom maps to `/mika-groom-plan-only`
+# (content-only) — the iterate-groom-loop + canonical body-callout writer
+# took over the architect-convergence work that `/mika-groom-ticket` used to
+# handle in the autonomous flow. Operator-facing `/mika-groom-ticket` is
+# unchanged but is invoked by hand, not by dev-groom. (mika#1412)
 CASE_BLOCK=$(sed -n '/case "\$SKILL" in/,/esac/p' "$DISPATCH_LIB")
-assert_contains "Case switch still maps dev-pilot to /mika" 'dev-pilot)  ENTRY_COMMAND="/mika"' "$CASE_BLOCK"
-assert_contains "Case switch still maps dev-groom to /mika-groom-ticket" 'dev-groom)  ENTRY_COMMAND="/mika-groom-ticket"' "$CASE_BLOCK"
+assert_contains "Case switch still maps dev-pilot to /mika" 'ENTRY_COMMAND="/mika"' "$CASE_BLOCK"
+assert_contains "Case switch maps dev-groom to /mika-groom-plan-only (mika#1271 sub-PR 8)" 'ENTRY_COMMAND="/mika-groom-plan-only"' "$CASE_BLOCK"
+# Defensive: the old single-line shape `dev-pilot)  ENTRY_COMMAND="/mika"`
+# should be absent — if a refactor re-collapses the case block to one-liners
+# this regression test should fire on the structural shape, not just the
+# string match above.
+assert_not_contains "Case block is multi-line (no inlined dev-groom mapping to /mika-groom-ticket)" 'dev-groom)  ENTRY_COMMAND="/mika-groom-ticket"' "$CASE_BLOCK"
 
 # Verify fallback behavior: function returns 0 (no-op) on guard failures
 # 4 guards: skill, issue_body, worktree_dir, plan_path empty
@@ -697,8 +726,12 @@ assert_contains "READY-to-GROOMED branch uses ready-to-groomed stage" '_write_ca
 assert_contains "ITERATE-to-GROOMED branch uses iterate-to-groomed stage" '_write_canonical_callout "iterate-to-groomed"' "$ITERATE_NOW"
 
 # Preservation invariant: writer is called BEFORE cleanup (so callout writes
-# even if cleanup fails) AND callout is non-fatal (|| true on failure).
-assert_contains "ready-to-groomed callout non-fatal on write failure" 'canonical callout write non-fatal failure' "$ITERATE_NOW"
+# even if cleanup fails) AND callout is non-fatal (|| <fallback>). The
+# non-fatal shape evolved (mika#1412): older code used a `|| true`
+# fall-through; current code uses `|| echo "WARN: canonical_callout_failed ..."`
+# so the operator sees a diagnostic if the writer fails. Assertion updated
+# to match the current canonical_callout_failed warning string.
+assert_contains "ready-to-groomed callout non-fatal on write failure (canonical_callout_failed warn)" 'canonical_callout_failed' "$ITERATE_NOW"
 
 # Unknown stage label → returns 1 (defensive contract).
 RESULT=""
