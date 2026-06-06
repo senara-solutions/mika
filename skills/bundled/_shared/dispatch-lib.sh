@@ -1085,6 +1085,59 @@ Dedup-rebase failed (${dedup_conflicts:+conflict: $dedup_conflicts}${dedup_confl
 # docs/plans/2026-05-25-003-feat-1271-iterate-loop-state-machine-plan.md.
 # ============================================================================
 
+_find_issue_plan() {
+    # Locate the plan file for $REPO#$ISSUE_NUM in $WORKTREE_DIR/docs/plans.
+    #
+    # Primary: filename embeds the issue number — `*-${ISSUE_NUM}-*-plan.md`
+    #          (the convention most existing plans follow:
+    #          e.g. `2026-06-05-001-fix-1407-pilot-push-diagnosis-plan.md`).
+    #
+    # Fallback: scan recently-written plan files for an explicit ticket
+    #          reference in their content. The pilot is instructed to set
+    #          `**Ticket:** mika issue#N` in the plan header but may also
+    #          name the plan with a date-prefix slug-tail that does NOT
+    #          embed the issue number (e.g. mika#771 wrote
+    #          `2026-06-06-003-feat-post-condition-guard-send-message-plan.md`).
+    #          Without this fallback, `_iterate_groom_loop` returns 1, the
+    #          architect is never called, and the ticket lands in a half-state
+    #          (plan committed, verdict missing). This is the founding
+    #          incident for mika#1421 — bound at n=2 on 2026-06-06 across
+    #          mika#1381 (n=1, 11:37Z) and mika#771 (n=2, 17:29Z).
+    #
+    # Both passes apply the >500-byte filter (mika#1033) and return the
+    # most-recent match. Prints the absolute plan path on success; returns
+    # non-zero with no stdout on failure. Callers must check `[ -n ... ]`
+    # AND `[ -r ... ]` exactly as before.
+    [ -n "$WORKTREE_DIR" ] && [ -n "$ISSUE_NUM" ] || return 1
+
+    # Primary: filename-embedded issue number
+    local plan_path
+    plan_path=$(find "$WORKTREE_DIR/docs/plans" \
+        -name "*-${ISSUE_NUM}-*-plan.md" -size +500c 2>/dev/null \
+        | sort -r | head -1)
+    if [ -n "$plan_path" ] && [ -r "$plan_path" ]; then
+        printf '%s' "$plan_path"
+        return 0
+    fi
+
+    # Fallback: content references the issue. Pattern handles three
+    # shapes the pilot has been observed to produce in plan headers:
+    #   **Ticket:** mika issue#N    (current `/mika-groom-plan-only` shape)
+    #   **Ticket:** mika#N          (older convention)
+    #   ticket: mika#N              (YAML frontmatter)
+    # The grep is line-anchored to avoid false positives on prose
+    # paragraphs that happen to mention an unrelated #N.
+    while IFS= read -r candidate; do
+        [ -r "$candidate" ] || continue
+        if grep -qE "^(\*\*Ticket:\*\*|ticket:)\s+mika[[:space:]]?(issue)?#${ISSUE_NUM}\b" "$candidate" 2>/dev/null; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done < <(find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | sort -r)
+
+    return 1
+}
+
 _arch_ask() {
     # Phase A — architect-call helper. Invokes mika-arch via the CLI with the
     # given skill, delivering plan content via stdin. Returns the full JSON
@@ -1328,12 +1381,10 @@ _launch_revise_pilot() {
     [ -n "$ISSUE_NUM" ] || {
         echo "WARN: _launch_revise_pilot: ISSUE_NUM unset" >&2; return 1; }
 
-    # Find the plan file using the same issue-scoped pattern as elsewhere
-    # in dispatch-lib (mika#1033 >500-byte filter, most-recent first).
+    # Locate the plan file via _find_issue_plan (mika#1421 — filename pattern
+    # with content-fallback for date-prefix slug-tail filenames).
     local plan_path
-    plan_path=$(find "$WORKTREE_DIR/docs/plans" -name "*-${ISSUE_NUM}-*-plan.md" -size +500c \
-        2>/dev/null | sort -r | head -1)
-    [ -n "$plan_path" ] && [ -r "$plan_path" ] || {
+    plan_path=$(_find_issue_plan) || {
         echo "WARN: _launch_revise_pilot: no plan file to revise" >&2; return 1; }
 
     # sha256 before revise (detection mechanism; mtime is too coarse).
@@ -1457,11 +1508,10 @@ _write_canonical_callout() {
             ;;
     esac
 
-    # Find the issue-scoped plan file (same pattern as _iterate_groom_loop).
+    # Locate the plan file via _find_issue_plan (mika#1421 — filename pattern
+    # with content-fallback for date-prefix slug-tail filenames).
     local plan_path
-    plan_path=$(find "$WORKTREE_DIR/docs/plans" -name "*-${ISSUE_NUM}-*-plan.md" -size +500c \
-        2>/dev/null | sort -r | head -1)
-    [ -n "$plan_path" ] || {
+    plan_path=$(_find_issue_plan) || {
         echo "WARN: write_canonical_callout: no issue-scoped plan file for $REPO#$ISSUE_NUM" >&2
         return 1
     }
@@ -1546,7 +1596,8 @@ _iterate_groom_loop() {
     # until the dev-groom-prompt-update follow-up ships.
     #
     # Guards: requires WORKTREE_DIR, ISSUE_NUM, REPO; finds the plan file via
-    # issue-scoped pattern (`docs/plans/*-${ISSUE_NUM}-*-plan.md`, >500c).
+    # `_find_issue_plan` (issue-scoped filename pattern first, content-grep
+    # fallback for date-prefix slug-tail filenames per mika#1421).
     # Returns 1 if any guard fails.
 
     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || {
@@ -1554,12 +1605,10 @@ _iterate_groom_loop() {
     [ -n "$ISSUE_NUM" ] && [ -n "$REPO" ] || {
         echo "WARN: iterate_groom_loop: ISSUE_NUM or REPO unset" >&2; return 1; }
 
-    # Find the plan file: issue-scoped (mika#1144), >500 byte (mika#1033),
-    # most-recent first.
+    # Locate the plan file via _find_issue_plan (mika#1421 — filename pattern
+    # with content-fallback for date-prefix slug-tail filenames).
     local plan_path
-    plan_path=$(find "$WORKTREE_DIR/docs/plans" -name "*-${ISSUE_NUM}-*-plan.md" -size +500c \
-        2>/dev/null | sort -r | head -1)
-    [ -n "$plan_path" ] && [ -r "$plan_path" ] || {
+    plan_path=$(_find_issue_plan) || {
         echo "WARN: iterate_groom_loop: no issue-scoped plan file for $REPO#$ISSUE_NUM" >&2
         return 1
     }
