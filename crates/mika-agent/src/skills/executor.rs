@@ -2055,7 +2055,8 @@ fn spawn_long_running_exec(
             .stderr(std::process::Stdio::piped())
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
-            .kill_on_drop(false);
+            .kill_on_drop(false)
+            .process_group(0); // Make child a process group leader (#855)
         scrub_mika_env_vars(&mut cmd);
         if let Some(ref token) = github_token {
             cmd.env("GH_TOKEN", token);
