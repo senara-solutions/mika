@@ -71,6 +71,16 @@ Provide `is_write_tool_call(summary: &ToolCallSummary) -> bool` that uses the na
 
 **MCP tools** (`mcp__*` prefix): Default to **write** (conservative — MCP tools can do anything). This is safe because MCP tools are excluded from silent/heartbeat mode already and are uncommon in the send_message violation scenario.
 
+**Note on AC10 (internal channels — issue body):** The issue body lists "internal channels (non-user-dialog) don't trigger the guard (if applicable — some send_message variants may be internal)" as a possible AC. Source check at `crates/mika-agent/src/tools/send_message.rs:28-37` confirms the tool's `input_schema` exposes only a `text` property — there is no `channel` parameter. All `send_message` invocations target the configured `ctx.message_sender` (Telegram or HTTP gateway) by design. **AC10 is N/A** at the tool layer: no internal-channel variant exists to scope around, no test is required. If a channel-parameter variant lands in a future change, the classification module is the single place to update.
+
+**Weighing alternatives for `run_gh`:** The simpler alternative is **classify `run_gh` as write unconditionally**, eliminating the input-summary parsing entirely. The chosen approach (input-summary subcommand discrimination) trades ~30 lines of regex + classification logic for accurate read-vs-write distinction on the most-used skill exec tool. Reasons to keep input-summary parsing:
+
+- Read-only `gh` subcommands (`view`, `list`, `diff`, `checks list`) are common in normal grooming/dispatch flows where the agent fetches context. Conservative-write here over-restricts useful context-fetch turns.
+- The classification only matters POST-`send_message` in the same step. Pre-`send_message` reads are unaffected.
+- Truncation fail-safe: when `input_summary` is truncated before the subcommand is parsable, the classification defaults to write (the safe direction). The "summary lies" failure mode degrades closed, not open.
+
+Trade accepted explicitly — input-summary parsing is the chosen approach despite the complexity, because it preserves benign read-only `run_gh` calls. If empirical post-deploy data shows the read-only-after-send_message case never occurs in practice, simplify to write-unconditional in a follow-up.
+
 **Tests:**
 - Unit tests for every builtin tool name classification
 - Unit test for `run_gh` read/write subcommand discrimination
@@ -146,7 +156,15 @@ This sits in the `ToolUse` arm of the stop_reason match, after `process_tool_cal
 **File:** `crates/mika-agent/src/post_condition.rs` (new module)
 **Wire:** `mod post_condition;` in `crates/mika-agent/src/lib.rs` or `agent.rs`
 
-Extract the completion-claim guard into a registry. The registry is a stepping stone — it holds guards that fire at EndTurn time with the reject-and-reprompt pattern. The send_message boundary guard is NOT in this registry (different enforcement point), but its logging/observability fires here.
+**Spec-reconciliation note (vs issue body).** The issue body proposed a `PostConditionGuard` struct with a `trigger: fn(&TurnContext) -> GuardDecision` function-pointer field, plus a `TruncateAndEndTurn` GuardDecision variant intended to cover the send_message boundary. This plan diverges intentionally on both points:
+
+1. **Function-pointer → label-dispatch.** The completion-claim evaluator requires `async` + DB access (lazy-resolve of active tasks via `&db`). Stable Rust has no `async fn` pointers without trait objects or `Pin<Box<dyn Future>>`; the registry would have to either drop the async/DB capability or introduce trait objects with associated-type juggling. Label-dispatched `match guard.label` against a static const-fn registry keeps the registry minimal while preserving the async capability inline. The label remains the source of truth for retry-tracking and structured logging.
+
+2. **`TruncateAndEndTurn` variant → upstream enforcement (Steps 3+4).** The send_message boundary is *structurally* different from completion-claim. By EndTurn, post-send_message tool calls have already executed — the guard cannot "truncate" them retroactively. Enforcement must be proactive: intra-step gating during tool processing (Step 3) and inter-step EndTurn forcing in the agent loop (Step 4), both *upstream* of the post-condition guard sequence. The registry holds only the observability/logging surface for this case, not the enforcement logic.
+
+Both divergences are architecturally justified by Rust language constraints (1) and the run-loop's execution order (2); this note makes the divergence visible for future readers and for the issue-body / plan reconciliation audit.
+
+Extract the completion-claim guard into a registry. The registry is a stepping stone — it holds guards that fire at EndTurn time with the reject-and-reprompt pattern. The send_message boundary guard is NOT in this registry (different enforcement point per the spec-reconciliation note above), but its logging/observability fires here.
 
 ```rust
 /// Post-condition guard evaluated at EndTurn.
