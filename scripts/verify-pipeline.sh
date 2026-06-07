@@ -127,8 +127,19 @@ fi
 # Sources (priority order): GITHUB_PR_BODY env var (CI), gh pr view (fallback).
 # Branch-name fallback intentionally omitted — silent misfire on branches like
 # `feature/v2/...` is worse than no fallback (see plan F2).
+# mika#1334: Prefer GitHub-parsed closing issue reference over regex-on-body.
+# GitHub's parser ignores quoted/code-block refs and is bound to the PR via
+# its own auto-close engine — not author-controlled scraping. Falls through
+# to body-regex when gh unavailable (no-network / local-dev).
 LINKED_ISSUE=""
-if [ -n "${GITHUB_PR_BODY:-}" ]; then
+if command -v gh >/dev/null 2>&1; then
+  _closing_refs=$(gh pr view --json closingIssuesReferences --jq '.closingIssuesReferences[].number' 2>/dev/null || echo "")
+  if [ -n "$_closing_refs" ]; then
+    LINKED_ISSUE=$(echo "$_closing_refs" | head -1)
+  fi
+fi
+# Fallback: body-regex preserved for the no-network / local-dev case.
+if [ -z "$LINKED_ISSUE" ] && [ -n "${GITHUB_PR_BODY:-}" ]; then
   LINKED_ISSUE=$(echo "$GITHUB_PR_BODY" | grep -oE '(Closes|Fixes|Resolves) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
 fi
 if [ -z "$LINKED_ISSUE" ] && command -v gh >/dev/null 2>&1; then
