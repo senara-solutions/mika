@@ -1,4 +1,4 @@
-# Plan — fix(engine): structural gate for dispatch-eligible input (mika#1324)
+# Plan — fix(engine): structural tool-filter for CI webhook events (mika#1324)
 
 ## Phase 0 — Pin
 
@@ -13,92 +13,143 @@ if !skip_remaining_guards
         (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
             && !s.input_summary.contains(expected_location.as_str())
     })
-{
-    intent_guard_retries.insert("dispatch_arg_match");
-    warn!(... "Dispatch-arg-fabrication guard fired — re-prompting (#1313)");
 ```
+This guard fires AFTER an LLM tool call. It's post-hoc detection, not prevention.
 
-**B. ready_label_dispatch_trigger predicate** (`crates/mika-agent/src/agent.rs:5932`):
+**B. ready_label_dispatch_trigger** (`agent.rs:5932`):
 ```rust
 fn ready_label_dispatch_trigger(msg: &str) -> bool {
     crate::webhook_dispatch::is_ready_label_dispatch_marker(msg)
 }
 ```
+Only true when message starts with `READY_LABEL_DISPATCH_MARKER`. CI webhook text does NOT start with that marker.
 
-**C. is_ready_label_dispatch_marker** (`crates/mika-agent/src/webhook_dispatch.rs:50`):
+**C. CI handler Passthrough → raw text reaches LLM** (`server/handlers.rs:794-816`):
 ```rust
-pub(crate) fn is_ready_label_dispatch_marker(msg: &str) -> bool {
-    msg.starts_with(READY_LABEL_DISPATCH_MARKER)
+let ci_action = ci_success_handler::try_handle_ci_success(&req.text, ...).await;
+match ci_action {
+    VerdictAction::Handled { pre_digest } => { req.text = pre_digest; }
+    VerdictAction::Passthrough { enrichment: Some(e) } => { req.text = format!("{e}{}", req.text); }
+    VerdictAction::Passthrough { enrichment: None } => {}  // ← raw text → LLM
+}
+```
+When the CI handler self-selects but conditions aren't met (no GH token, no open PR, no QA verdict, stale SHA), it returns `Passthrough { enrichment: None }` and the raw `check_suite.completed(...)` text reaches the LLM unmodified.
+
+**D. parse_check_suite_success identifies CI events** (`server/ci_success_handler.rs`):
+```rust
+let event = match parse_check_suite_success(text) {
+    Some(e) => e,
+    None => return VerdictAction::Passthrough { enrichment: None },
+};
+```
+The parser is deterministic — given any `text`, it returns `Some(event)` iff `text` matches the check_suite format. This is the discrimination point for "is this a CI event."
+
+**E. Tool-filter infrastructure** (`agent.rs:4977`):
+```rust
+fn filter_available_required_tools(required_tools, tools, skill_tool_map, mcp_manager)
+```
+Existing mechanism for filtering tools per-turn. The fix extends this layer.
+
+## Hypothesis (committed)
+
+**The LLM (mika-dev) receives raw `check_suite.completed(...)` webhook text via the Passthrough { enrichment: None } path. It infers from the branch name substring "dev-groom" that it should call `run_claude_pilot_groom` on the underlying issue. The `dispatch_arg_match` intent guard's audit-event-log entry refers to the LLM's tool-call attempt being caught at the EndTurn boundary — but as Pin A shows, the guard's `ready_label_dispatch_trigger` precondition would NOT fire on CI text (it requires marker-prefix). So the audit_events note `dispatch_arg_match guard matching branch name substring` is the ticket-author's mis-description of the actual mechanism — the LLM did the substring inference, not the guard's deterministic code.**
+
+This hypothesis fits the observed behavior:
+- 4 dispatches attempted (LLM tool calls)
+- All rejected (orchestrator-Claude judgment, not deterministic guard)
+- Audit-event entry stored as a `store_fact` note FROM mika-dev — i.e., mika-dev's own LLM-generated retrospective, which may have mis-attributed root cause
+
+## Fix shape (committed)
+
+**Filter the LLM's available tools when the input is a CI webhook event.** Structurally remove `run_claude_pilot` and `run_claude_pilot_groom` from the per-request tool set when `req.text` matches `parse_check_suite_success(text).is_some() || parse_check_suite_failure(text).is_some()`.
+
+This is structural because:
+1. The LLM cannot call a tool that's not in its tool list — no prompt enforcement involved
+2. The discrimination is deterministic (parser, not LLM)
+3. The filter applies at the request-assembly layer, before LLM invocation
+
+### Implementation site
+
+Two viable locations; choose the narrower:
+
+**Option 1 (narrower):** At the request-assembly layer in `agent.rs` around where `tools` is wired into `request`. Add a CI-detection branch that filters dispatch tools out.
+
+**Option 2 (broader):** At the webhook-handler layer in `handlers.rs` after CI handlers run. Set a per-request flag (`req.is_ci_webhook = true`) that the agent loop reads when assembling tools.
+
+Going with **Option 1**. Rationale: narrower scope; no new request-level fields; tool-filter is already an existing pattern in `agent.rs`.
+
+### Specific code
+
+In `crates/mika-agent/src/agent.rs`, near where `tools` is assigned into `request.tools` (probably around line 850-1000):
+
+```rust
+// mika#1324: CI webhook events MUST NOT trigger dispatch.
+// Filter out dispatch tools when input is a check_suite.completed event.
+// Structural prevention — the LLM cannot call a tool that isn't in its list.
+const CI_EXCLUDED_TOOLS: &[&str] = &["run_claude_pilot", "run_claude_pilot_groom"];
+let is_ci_webhook =
+    crate::server::ci_success_handler::parse_check_suite_success(user_input_text).is_some()
+    || crate::server::ci_failure_handler::parse_check_suite_failure(user_input_text).is_some();
+if is_ci_webhook {
+    tools.retain(|t| !CI_EXCLUDED_TOOLS.contains(&t.name.as_str()));
 }
 ```
 
-**D. Structural CI handlers** (`crates/mika-agent/src/server/handlers.rs:794, 818`):
-- `ci_success_handler::try_handle_ci_success` — intercepts check_suite.completed(success)
-- `ci_failure_handler::try_handle_ci_failure` — intercepts check_suite.completed(failure|timed_out)
-- Both return `VerdictAction::Handled | Passthrough` — passthrough cases STILL reach the LLM via `req.text`.
+### Why not gate at `try_handle_ci_*`
 
-## Investigation gap (named honestly)
+Both handlers consume `text` (read-only) and can't mutate the eventual tool set. Cleaner to make the agent-layer (which already owns tool-filtering) read the CI-detection from the parsers.
 
-The ticket body attributes the bug to `dispatch_arg_match guard matching branch name substring "dev-groom"`. **Code reading shows the guard does not do branch-name substring matching.** The guard compares `mismatched.input_summary.contains(expected_location)` where `expected_location` is the issue `#N` extracted from the user input — and that guard is gated on `ready_label_dispatch_trigger(msg)` which requires the message to start with `READY_LABEL_DISPATCH_MARKER`.
+### Why not remove the intent guard
 
-CI webhook events would NOT start with that marker, so the guard as documented should NOT fire. Yet the audit-event log shows it firing 4× on CI webhook events.
+The `dispatch_arg_match` intent guard (Pin A) stays as defense-in-depth. The structural filter prevents the LLM from making the wrong tool call; the guard catches any case where structural filtering doesn't apply (e.g., new dispatch-trigger paths added later that don't yet have the CI exclusion).
 
-**Hypotheses to verify with architect:**
+## Acceptance Criteria (concrete)
 
-1. **LLM-internal inference (most likely):** The LLM receives CI webhook text containing `branch: fix/1318/dev-groom-no-force-push`, infers from "dev-groom" substring that it should call `run_claude_pilot_groom`, makes the fabricated tool call. The guard then catches the fabrication post-hoc. *In this case, the bug is "LLM treats CI webhook as dispatch trigger" — the guard works correctly, but the LLM shouldn't have attempted dispatch at all.*
+1. **AC1:** When `req.text` matches the check_suite.completed pattern (success OR failure variant), the per-request tool set excludes `run_claude_pilot` and `run_claude_pilot_groom`. Verified via unit test on the agent-loop's tool-assembly path.
 
-2. **Webhook handler enriches CI text with ready-label-marker prefix:** Some code path prepends a marker that makes `ready_label_dispatch_trigger` return true on CI events. Unlikely given the prefix-match shape, but possible if a handler is over-eager.
+2. **AC2:** Integration regression test in `crates/mika-agent/tests/`:
+   - Simulate a `check_suite.completed(success)` webhook on branch `fix/1318/dev-groom-no-force-push` (matches the original incident)
+   - Inject the resulting `req.text` into the agent loop
+   - Assert the resulting `request.tools` (sent to LLM) does NOT contain `run_claude_pilot` or `run_claude_pilot_groom`
 
-3. **Different guard / code path entirely:** Maybe a separate intent guard or webhook dispatcher in another file is matching branch-name substrings. Needs broader investigation.
+3. **AC3:** Existing ready-label dispatch flow continues to work:
+   - Simulate `issues.labeled (ready)` event
+   - Assert `request.tools` DOES contain `run_claude_pilot` and `run_claude_pilot_groom` (when otherwise available to the agent)
 
-## Approach (assumes Hypothesis 1, subject to architect verification)
+4. **AC4:** Existing `dispatch_arg_match` intent guard stays in place as defense-in-depth (no removal). Verified by reading agent.rs:1838-1860 unchanged.
 
-If LLM-internal inference: the structural fix is at the **input-classification** layer, NOT in `dispatch_arg_match` itself.
+5. **AC5:** `cargo test -p mika-agent --lib` + `cargo clippy -p mika-agent --tests --no-deps -- -D warnings` clean.
 
-Add structural filter:
-- CI webhook events (check_suite.*, pull_request_review.*) MUST never carry user_input shape that the LLM would interpret as a dispatch trigger.
-- The LLM should receive CI webhook text with an explicit "do not dispatch" marker AND/OR with the branch name stripped/sanitized.
+## Files to change
 
-Simpler structural alternative:
-- After `ci_success_handler` / `ci_failure_handler` Passthrough, prepend an instruction to `req.text` that says "[CI webhook — not a dispatch trigger. Do not call run_claude_pilot* tools.]"
-- The LLM then has explicit instruction NOT to dispatch.
-
-## Acceptance criteria (subject to architect calibration)
-
-1. **AC1:** CI webhook events on a PR whose branch name contains `dev-groom` / `dev-pilot` / `groom` MUST NOT trigger LLM dispatches of `run_claude_pilot*` tools.
-2. **AC2:** Audit log shows zero `dispatch_arg_match` guard fires for CI webhook events (because LLM doesn't attempt the dispatch in the first place).
-3. **AC3:** Regression test: simulate a `check_suite.completed` webhook on a branch named `fix/<N>/dev-groom-anything-here` with no `ready` label — verify zero `run_claude_pilot*` tool calls made by the LLM.
-4. **AC4:** Existing ready-label dispatch flow continues to work — `issues.labeled` with `ready` still triggers dispatch.
-
-## Files
-
-- `crates/mika-agent/src/server/handlers.rs` — likely site for structural CI-webhook instruction-prepend
-- `crates/mika-agent/src/server/ci_success_handler.rs` / `ci_failure_handler.rs` — possibly the right home for the instruction
-- `crates/mika-agent/src/agent.rs:1838-1860` — `dispatch_arg_match` guard stays as defense-in-depth
+- `crates/mika-agent/src/agent.rs` — add CI-detection branch in tool-assembly path (~line 850-1000)
+- `crates/mika-agent/src/server/ci_success_handler.rs` — ensure `parse_check_suite_success` is `pub` so agent.rs can call it
+- `crates/mika-agent/src/server/ci_failure_handler.rs` — ensure `parse_check_suite_failure` is `pub`
+- `crates/mika-agent/tests/` — new integration test for AC2 + AC3
 
 ## Out of scope
 
-- Restructuring webhook event routing entirely (separate concern)
-- Removing `dispatch_arg_match` guard (it's defense-in-depth)
-- Other intent guards (different surfaces)
+- Restructuring webhook event routing entirely
+- Removing the `dispatch_arg_match` intent guard (it's defense-in-depth)
+- Adding event-type filtering for pull_request_review or other non-CI event types (separate concern; this ticket scopes to check_suite per the incident)
 
 ## Risk
 
-Medium. The fix touches webhook input flow that affects the autonomous loop's dispatch behavior. A too-aggressive structural filter could prevent legitimate dispatches. Architect canvass needed to:
-- Verify Hypothesis 1 (the actual root cause)
-- Calibrate the instruction-prepend approach vs alternatives (event-type sentinel, request-class enum)
-- Identify additional code paths that might be involved
+Medium. The filter touches the agent loop's tool-assembly. Risks:
+- Over-filtering: if the discrimination misfires, legitimate ready-label dispatches could lose tools. Mitigated by AC3 (positive regression test) and by using the SAME deterministic parsers the CI handlers use (single source of truth for "is this a CI event").
+- Under-filtering: if a CI event reaches the LLM through a path that doesn't go through the standard `req.text` (e.g., a future handler that injects raw webhook text differently), the filter wouldn't apply. Mitigated by the defense-in-depth `dispatch_arg_match` guard.
 
-## Investigation tasks (architect deliverable)
+## Test plan
 
-1. Confirm Hypothesis 1 or rule it out via additional code reading.
-2. Identify all webhook handlers that emit `req.text` reaching the agent loop.
-3. Verify whether `ci_success_handler` / `ci_failure_handler` Passthrough cases are the relevant exposure surface.
-4. Specify the exact AC2 audit-event shape.
-5. Specify whether the instruction-prepend approach is sufficient or if a structural request-class enum is preferred.
+1. Unit: `is_ci_webhook(text)` returns true on real check_suite.completed text samples (success + failure conclusions).
+2. Unit: tool-assembly filters dispatch tools when `is_ci_webhook` is true.
+3. Integration: full agent-loop turn on CI webhook input — verify zero dispatch tool calls.
+4. Regression: same agent-loop on ready-label dispatch input — verify dispatch tools available.
 
-## Test plan (subject to architect)
+## Implementation order
 
-1. Unit test: simulate CI webhook text → verify LLM tool-call set excludes `run_claude_pilot*`.
-2. Integration test: spawn agent with simulated webhook event, observe tool-calls.
-3. Regression: existing ready-label dispatch still works.
+1. Promote `parse_check_suite_success` and `parse_check_suite_failure` to `pub`.
+2. Add CI-detection branch in agent.rs tool-assembly path with the `CI_EXCLUDED_TOOLS` const.
+3. Unit tests for the filter.
+4. Integration test for AC2.
+5. Regression test for AC3.
