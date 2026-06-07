@@ -92,16 +92,37 @@ sender
     .map_err(|_| anyhow!("DB worker channel closed"))?;
 ```
 
-### D. Update DB worker loop
+### D. Update DB worker loop — KEEP dedicated thread + block_on bridge
 
-The DB worker thread (consumer side) currently uses `rx.recv()` (blocking std::sync::mpsc::Receiver). Tokio's `mpsc::Receiver::recv` is async. The DB worker is a dedicated thread (per Phase 0 D — the file's structure), so two options:
+The DB worker thread (consumer side) currently uses blocking `rx.recv()` on `std::sync::mpsc::Receiver`. Tokio's `mpsc::Receiver::recv` is async.
 
-- **D1:** keep the worker as a thread, use `tokio::runtime::Handle::block_on(rx.recv())` to bridge. Cleanest if the worker MUST be a separate thread for SQLite reasons.
-- **D2:** spawn the worker as a tokio task (`tokio::spawn`). Simpler async-native pattern.
+**Committed:** keep the worker as a dedicated `std::thread::spawn` thread; bridge the async receiver via `tokio::runtime::Handle::block_on(rx.recv())`.
 
-**Pre-flight verification needed**: SQLite + tokio thread-shape constraints. SQLite's `rusqlite::Connection` is `!Send`-by-default; pinning to a dedicated thread is the standard pattern. If `block_on` bridge is the right shape, D1; otherwise D2 with `Connection::open` per-task or a connection pool.
+**Reasoning (structural forcing):**
+- `rusqlite::Connection` is `!Send` (verified — the existing dedicated-thread architecture is precisely because of this constraint).
+- Alternative D2 (tokio task) would require either:
+  - `Connection::open` per-operation — significant performance regression (SQLite reopen overhead per DB call), OR
+  - `unsafe impl Send for Connection` — unsound.
+- D1 (keep dedicated thread, async send + block_on recv bridge) preserves the existing thread-safety model AND gets async backpressure on the SEND side, which is the exact site of the Codex finding.
 
-(The plan flags this verification rather than committing — the wrong choice here would regress SQLite thread-safety, which is harder to detect than the original pinning bug.)
+The fix scope is intentionally bounded to the SEND side. The blocking `recv()` on the worker thread is fine: it's a single dedicated thread that's supposed to be blocked when there's no work — that's not the Tokio worker pinning the audit identified.
+
+**Implementation shape:**
+```rust
+// Worker thread setup (preserved structure):
+let worker_handle = std::thread::spawn(move || {
+    let runtime = tokio::runtime::Handle::current();
+    loop {
+        // Bridge async recv to sync worker context
+        let msg = match runtime.block_on(rx.recv()) {
+            Some(closure) => closure,
+            None => break,  // channel closed (shutdown)
+        };
+        // Execute closure with !Send rusqlite::Connection (unchanged)
+        msg(&mut connection);
+    }
+});
+```
 
 ### E. Shutdown path send (line 2314)
 
@@ -128,13 +149,14 @@ This is generally safe with the existing call patterns. Plan calls for a grep au
 
 4. **AC4:** New regression test that saturates the channel and asserts the agent loop continues making progress:
    - Test name: `test_async_db_saturated_channel_does_not_pin_workers`
-   - Mechanism: spawn N closures faster than the worker can drain (artificial slow closure); concurrently spawn a "control" task that increments a counter every 10ms
-   - Assert: the control task's counter increments throughout (worker pool not pinned)
-   - Marked `#[ignore]` if timing-sensitive; PR description names the manual command to run pre-merge
+   - Mechanism: spawn N closures faster than the worker can drain (artificial slow closure that does `std::thread::sleep(100ms)`); concurrently spawn a "control" task that increments a counter every 10ms
+   - Assert: the control task's counter increments throughout the saturation window (worker pool not pinned). Timing-bounded test (~5s total wall-clock) — fits in CI's default test budget.
+   - Runs in default `cargo test -p mika-agent` (NOT `#[ignore]`-gated). CI is the structural binding.
+   - Makefile companion target: `make test-async-db-saturation` invokes `cargo test -p mika-agent --test async_db_saturation -- --nocapture` for manual reproduction/diagnosis.
 
 5. **AC5:** All `with_db` call sites grep-audited for cancellation-aware behavior; PR description names the audit result (counts of sites + any flagged for follow-up).
 
-6. **AC6:** DB worker loop pattern (D1 vs D2) chosen with explicit justification in the PR description.
+6. **AC6:** D1 (dedicated thread + `Handle::block_on(rx.recv())` bridge) chosen because `rusqlite::Connection` is `!Send`. PR description names the `!Send` constraint and contrasts with rejected D2 (per-op Connection::open or unsafe Send).
 
 7. **AC7:** `cargo build -p mika-agent` + `cargo clippy -p mika-agent --tests --no-deps -- -D warnings` + `cargo test -p mika-agent --lib` all pass.
 
@@ -160,7 +182,7 @@ Medium.
 
 ## Implementation order
 
-1. Pre-flight: verify SQLite + tokio thread-shape constraints (D1 vs D2 decision). Read `rusqlite::Connection` Send semantics + check whether existing worker is `Send` or `!Send`.
+1. Pre-flight (informational, NOT a decision-deferral): confirm `rusqlite::Connection` is `!Send` in the version Cargo.lock pins (sanity-check the forcing constraint). Decision is D1 per plan.
 2. Replace channel type at line 49 + sender type at line 36.
 3. Convert with_db's send to `send().await`.
 4. Update DB worker loop per chosen D1/D2.
