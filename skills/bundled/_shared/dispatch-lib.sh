@@ -2006,8 +2006,16 @@ RESCUEBODY
 
         if [ -n "$RESCUED_PR_URL" ]; then
             PR_URL="$RESCUED_PR_URL"
+            # mika#1352: emit canonical `PR:` line alongside the descriptive
+            # `Draft PR (dispatch-lib recovery):` line. mika-dev's callback
+            # parser (dispatcher.rs:1780) matches line-anchored `^PR: ` —
+            # without this, claude_pilot.pr_url is never written and the
+            # parent task false-fails as `callback_delivered_without_pr_url`
+            # despite the rescued PR being open and reviewable. See mika#871
+            # R4 for the canonical contract.
             RESULT="${RESULT}
-Draft PR (dispatch-lib recovery): ${PR_URL}"
+Draft PR (dispatch-lib recovery): ${PR_URL}
+PR: ${PR_URL}"
         fi
     fi
 
