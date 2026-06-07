@@ -3336,9 +3336,14 @@ impl Database {
             tx.commit()?;
         } else {
             // Column already exists (manual re-run in a test / recovery scenario).
-            // Just record the version bump.
-            self.conn
-                .execute("INSERT INTO schema_version (version) VALUES (26)", [])?;
+            // Wrap in TransactionBehavior::Immediate to match the true-branch envelope
+            // (mika#1391): bare INSERT could leave column-exists + schema_version-not-bumped
+            // inconsistent state on failure mid-recovery.
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (26)", [])?;
+            tx.commit()?;
         }
 
         Ok(())
