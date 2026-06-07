@@ -401,10 +401,17 @@ async fn test_required_finding_list_caught_on_verdict_escalate() -> anyhow::Resu
 }
 
 /// Test 7b: Guard does NOT fire on GROOMED verdict (non-terminal for second-review).
+///
+/// Skill name uses the production identifier `mika-arch-second-review` (not the
+/// test-only `arch-second-review` shorthand used elsewhere in this file) because
+/// mika#1254's fix inverted the guard predicate from "tool present" to
+/// `!has_verdict_producer_skill` against the `VERDICT_PRODUCER_SKILLS` const in
+/// `agent.rs`. That const lists the canonical production names; the test must
+/// use them to exercise the verdict-producer-exempt path correctly.
 #[tokio::test]
 async fn test_required_finding_list_no_op_on_verdict_groomed() -> anyhow::Result<()> {
     let skills = SkillRegistry::from_test_entries(vec![make_groom_skill(
-        "arch-second-review",
+        "mika-arch-second-review",
         &["second-review"],
         SECOND_REVIEW_SUFFIX_LINES,
         FINDING_PREFIXES,
