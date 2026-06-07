@@ -77,8 +77,14 @@ fn make_suffix_skill(name: &str, keywords: &[&str], suffix_lines: &[&str]) -> Sk
 /// appends the verdict line on retry.
 #[tokio::test]
 async fn test_required_suffix_line_caught_and_corrected() -> anyhow::Result<()> {
+    // mika#1254: use the production skill identifier so the new
+    // fabrication-guard predicate (`!has_verdict_producer_skill`) treats this
+    // skill as a verdict producer. The required-suffix-line guard under test
+    // is orthogonal and still fires; without the production name, the
+    // fabrication guard would fire as an extra retry and the mock LLM
+    // responses (sized for the required-suffix-line guard alone) exhaust.
     let skills = SkillRegistry::from_test_entries(vec![make_suffix_skill(
-        "arch-second-review",
+        "mika-arch-second-review",
         &["second-review"],
         &["Verdict: GROOMED", "Verdict: ESCALATE"],
     )]);
@@ -127,8 +133,14 @@ async fn test_required_suffix_line_caught_and_corrected() -> anyhow::Result<()> 
 /// on retry (single-retry semantics — guard is exhausted).
 #[tokio::test]
 async fn test_regression_required_suffix_line_pre_fix_shape() -> anyhow::Result<()> {
+    // mika#1254: use the production skill identifier so the new
+    // fabrication-guard predicate (`!has_verdict_producer_skill`) treats this
+    // skill as a verdict producer. The required-suffix-line guard under test
+    // is orthogonal and still fires; without the production name, the
+    // fabrication guard would fire as an extra retry and the mock LLM
+    // responses (sized for the required-suffix-line guard alone) exhaust.
     let skills = SkillRegistry::from_test_entries(vec![make_suffix_skill(
-        "arch-second-review",
+        "mika-arch-second-review",
         &["second-review"],
         &["Verdict: GROOMED", "Verdict: ESCALATE"],
     )]);
@@ -172,8 +184,14 @@ async fn test_regression_required_suffix_line_pre_fix_shape() -> anyhow::Result<
 /// The verdict line is the third-from-last non-empty line — should satisfy the guard.
 #[tokio::test]
 async fn test_required_suffix_line_position_3_boundary() -> anyhow::Result<()> {
+    // mika#1254: use the production skill identifier so the new
+    // fabrication-guard predicate (`!has_verdict_producer_skill`) treats this
+    // skill as a verdict producer. The required-suffix-line guard under test
+    // is orthogonal and still fires; without the production name, the
+    // fabrication guard would fire as an extra retry and the mock LLM
+    // responses (sized for the required-suffix-line guard alone) exhaust.
     let skills = SkillRegistry::from_test_entries(vec![make_suffix_skill(
-        "arch-second-review",
+        "mika-arch-second-review",
         &["second-review"],
         &["Verdict: GROOMED", "Verdict: ESCALATE"],
     )]);
@@ -216,8 +234,14 @@ async fn test_required_suffix_line_position_3_boundary() -> anyhow::Result<()> {
 /// The verdict line is the fourth-from-last non-empty line — should NOT satisfy.
 #[tokio::test]
 async fn test_required_suffix_line_position_4_violation() -> anyhow::Result<()> {
+    // mika#1254: use the production skill identifier so the new
+    // fabrication-guard predicate (`!has_verdict_producer_skill`) treats this
+    // skill as a verdict producer. The required-suffix-line guard under test
+    // is orthogonal and still fires; without the production name, the
+    // fabrication guard would fire as an extra retry and the mock LLM
+    // responses (sized for the required-suffix-line guard alone) exhaust.
     let skills = SkillRegistry::from_test_entries(vec![make_suffix_skill(
-        "arch-second-review",
+        "mika-arch-second-review",
         &["second-review"],
         &["Verdict: GROOMED", "Verdict: ESCALATE"],
     )]);

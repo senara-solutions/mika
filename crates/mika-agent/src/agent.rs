@@ -57,6 +57,21 @@ const CONTINUATION_TIMEOUT_SECS: u64 = 60;
 /// container memory limits (256 MB target).
 const MAX_IMAGE_BYTES_PER_STEP: usize = 20 * 1024 * 1024;
 
+/// Skills whose LLM output legitimately contains `Verdict:` lines.
+/// Used by the dev-groom fabrication guard (#1133, #1254) to exempt
+/// verdict-producer agents. When a skill in this list is loaded, the
+/// guard skips — verdict text is the agent's real output, not fabrication.
+///
+/// Adding a new verdict-producing skill? Add it here — single point of truth.
+const VERDICT_PRODUCER_SKILLS: &[&str] = &["mika-arch-groom-ticket", "mika-arch-second-review"];
+
+/// Check if any skill in the registry is a known verdict producer.
+fn has_verdict_producer_skill(skills: &[crate::skills::index::SkillEntry]) -> bool {
+    skills
+        .iter()
+        .any(|s| VERDICT_PRODUCER_SKILLS.contains(&s.manifest.skill.name.as_str()))
+}
+
 /// Fallback message sent when the agent completes without producing text output
 /// (e.g., all work done via tool calls).
 pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
@@ -801,6 +816,11 @@ fn strip_prior_images(messages: &mut [LlmMessage]) {
 /// `required_finding_list_prefixes` specifies finding-line prefixes (from matched skills'
 /// `[output]` sections) that must appear in the message body on terminal dispositions
 /// (ITERATE/ESCALATE). See #901.
+///
+/// `is_verdict_producer` is true when the agent has a known verdict-producer skill loaded
+/// (e.g. mika-arch-groom-ticket, mika-arch-second-review). When true, the dev-groom
+/// fabrication guard (position 5b) is exempted — verdict lines are legitimate output,
+/// not fabrication. See #1254.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     llm: &dyn LlmProvider,
@@ -818,6 +838,7 @@ async fn run_loop(
     required_suffix_lines: &[String],
     required_finding_list_prefixes: &[String],
     enabled_tool_names: &HashSet<String>,
+    is_verdict_producer: bool,
     store_llm_calls: bool,
     store_tool_calls: bool,
     prompt_variant: Option<&str>,
@@ -1508,24 +1529,28 @@ async fn run_loop(
                         continue;
                     }
 
-                    // #1133 — dev-groom fabrication guard (position 5b). Detects
-                    // "Verdict: GROOMED" / "Verdict: ESCALATE" in conversation-mode
-                    // mika-dev text without a satisfying run_claude_pilot_groom tool
-                    // call in the turn. dev-groom is a dispatcher — verdicts arrive
-                    // via callback, not from this turn.
+                    // #1133, #1254 — dev-groom fabrication guard (position 5b).
+                    // Detects "Verdict: GROOMED" / "Verdict: ESCALATE" in
+                    // conversation-mode text without a satisfying
+                    // run_claude_pilot_groom call in the turn. dev-groom is a
+                    // dispatcher — verdicts arrive via callback, not from this turn.
                     //
                     // Gating:
-                    //   - Only when `run_claude_pilot_groom` is in the agent's tool
-                    //     set (the dev-groom skill is loaded). Producer skills like
-                    //     mika-arch-second-review legitimately emit Verdict lines —
-                    //     they don't have this tool and bypass the guard entirely.
+                    //   - `!is_verdict_producer`: fires for all agents EXCEPT known
+                    //     verdict-producer skills (mika-arch-groom-ticket,
+                    //     mika-arch-second-review) that legitimately emit Verdict
+                    //     lines. Inverted from the pre-#1254 predicate which gated
+                    //     on `enabled_tool_names.contains("run_claude_pilot_groom")`
+                    //     — that silently bypassed when the tool was absent (loader
+                    //     bug, identity allowlist denial), exactly when fabrication
+                    //     risk was highest.
                     //   - Conversation mode only (`mode.is_conversation()`). Callback
                     //     turns legitimately carry Verdict lines from the inner session
                     //     and must pass through unaffected.
                     //   - EndTurn only (don't fire mid-tool).
                     //   - Single-retry (mirror of #864 retry pattern).
                     if !skip_remaining_guards
-                        && enabled_tool_names.contains("run_claude_pilot_groom")
+                        && !is_verdict_producer
                         && mode.is_conversation()
                         && matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !dev_groom_fabrication_retry_done
@@ -1701,6 +1726,10 @@ async fn run_loop(
                     // assistant text (not user input) and needs enabled_tool_names
                     // + dynamic correction message. See gate-evasion compound doc
                     // Rule 2.
+                    //
+                    // enabled_tool_names is used as ground truth for the check (is
+                    // the LLM lying about tool availability?), not as a gate on it.
+                    // Reviewed in mika#1254 audit, classified Decision B.
                     if matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !intent_guard_retries.contains(ASSERTED_UNAVAILABILITY_LABEL)
                         && let Some(tool_name) =
@@ -2964,6 +2993,7 @@ async fn run_agent_inner(
 
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
+    let is_verdict_producer = has_verdict_producer_skill(params.skills.skills());
     let result = run_loop(
         effective_llm,
         tools,
@@ -2980,6 +3010,7 @@ async fn run_agent_inner(
         &required_suffix_lines,
         &required_finding_list_prefixes,
         &enabled_tool_names,
+        is_verdict_producer,
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -4139,6 +4170,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         &no_required_suffix_lines,
         &no_required_finding_list_prefixes,
         &enabled_tool_names,
+        false, // silent mode: mode.is_conversation() gate handles callback turns (#1254)
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -4543,6 +4575,7 @@ async fn run_team_agent_inner_impl(
         &required_suffix_lines,
         &required_finding_list_prefixes,
         &enabled_tool_names,
+        has_verdict_producer_skill(params.skills.skills()),
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -5272,8 +5305,12 @@ async fn evaluate_completion_claim(
         None => return GuardDecision::Pass,
     };
 
-    // Only enforce if the agent has the tool available
-    // (delegates and team agents don't — they get default_tools() only)
+    // Only enforce if the agent has the tool available.
+    // Delegates and team agents legitimately lack update_task_status (they
+    // receive default_tools() only). This guard is a nudge for task hygiene,
+    // not a security boundary — the skip-when-absent failure mode is benign
+    // (missed nudge, not a fabrication bypass). Reviewed in mika#1254 audit,
+    // classified Decision B (stay gated).
     if tools.get("update_task_status").is_none() || tools_called.contains("update_task_status") {
         return GuardDecision::Pass;
     }
