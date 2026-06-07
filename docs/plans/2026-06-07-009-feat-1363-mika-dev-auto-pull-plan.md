@@ -75,14 +75,37 @@ In the task callback path that handles `trigger: heartbeat | reflection`, add a 
 
 ```rust
 async fn auto_pull_groomed_ticket(db: &AsyncDatabase, github_token: &str) -> Option<u64> {
-    // 1. Queue-empty gate: count in_progress + pending long_running tasks
+    // 1. Queue-empty gate (mika#1363 F2): exact predicate.
+    // Count tasks for mika-dev that are currently active (i.e., the loop is
+    // not idle). Includes:
+    //   - status='in_progress' (currently running)
+    //   - status='pending' (awaiting dispatch slot)
+    // Restricted to source='self_dev' to exclude system-tasks (heartbeat,
+    // reflection, recurring auto_pull itself). Excludes 'completed', 'failed',
+    // 'blocked' — those are terminal.
+    //
+    // SQL (in db.rs::count_active_self_dev_tasks):
+    //   SELECT COUNT(*) FROM tasks
+    //   WHERE agent_id = 'mika-dev'
+    //     AND source = 'self_dev'
+    //     AND status IN ('in_progress', 'pending')
     let queue_count = db.count_active_self_dev_tasks().await?;
     if queue_count > 0 {
-        return None; // not idle
+        return None; // not idle — webhook-driven dispatch already covering
     }
 
-    // 2. Query open groomed-not-ready tickets
-    let issues = gh::list_open_issues_without_label("ready").await?;
+    // 2. Query open groomed-not-ready tickets (mika#1363 F4).
+    // gh CLI has no negative label filter. Pattern: fetch all open + filter
+    // client-side for absence of 'ready'.
+    //
+    // CLI: gh issue list --repo senara-solutions/mika --state open \
+    //        --json number,body,labels,updatedAt --limit 100
+    // Filter: keep only issues where labels[].name does NOT contain "ready"
+    // (`!issue.labels.iter().any(|l| l.name == "ready")`).
+    let all_open = gh::list_open_issues_with_labels().await?;
+    let issues: Vec<_> = all_open.into_iter()
+        .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
+        .collect();
 
     // 3. Filter to groomed-only (body has Branch + Plan + GROOMED markers)
     let groomed: Vec<_> = issues.into_iter()
@@ -103,19 +126,51 @@ async fn auto_pull_groomed_ticket(db: &AsyncDatabase, github_token: &str) -> Opt
 }
 
 fn is_groomed(body: &str) -> bool {
-    // Match canonical body callouts shape (from _write_canonical_callout)
-    body.contains("> - **Branch:** `") && body.contains("> - **Plan:** `")
-        && body.contains("GROOMED")
+    // mika#1363 F1: parse canonical callout block structurally. Matches the
+    // exact grooming-history line shape emitted by _write_canonical_callout +
+    // by the /mika-ask-arch by-hand workflow. The full regex anchors the
+    // verdict keyword to the grooming-history callout — not any prose
+    // "GROOMED" elsewhere in the body.
+    //
+    // Canonical shape (must all three present):
+    //   > - **Branch:** `<branch>`
+    //   > - **Plan:** `docs/plans/<file>.md` (committed on branch @ <sha>)
+    //   > - **Grooming history:** <...> → second-pass (GROOMED) — session-id: <uuid>
+    //
+    // Regex: anchored multiline; matches the second-pass-GROOMED-callout shape.
+    static GROOMING_HISTORY_RE: OnceLock<Regex> = OnceLock::new();
+    let re = GROOMING_HISTORY_RE.get_or_init(|| {
+        Regex::new(r"(?m)^> - \*\*Grooming history:\*\*.+second-pass \(GROOMED\)")
+            .unwrap()
+    });
+    re.is_match(body)
+        && body.contains("> - **Branch:** `")
+        && body.contains("> - **Plan:** `docs/plans/")
 }
 ```
 
-### D. Circuit-breaker (AC3)
+### D. Circuit-breaker (AC3) — committed storage
 
-Maintain a `auto_pull_failures` table or per-ticket metadata. Increment on cascade-failure detection:
-- After auto-pull fires `ready`, the dispatch-pipeline runs. If parent task hits `failed` within N minutes, increment counter for that ticket.
-- If counter reaches 3, skip the ticket on future auto-pulls AND emit a "ticket stuck" audit-event.
+New table `auto_pull_stats` (additive — no migration of existing rows):
 
-Simpler v1: store per-ticket counters in `task_metadata` or a new `auto_pull_stats` table.
+```sql
+CREATE TABLE IF NOT EXISTS auto_pull_stats (
+    repo_full_name TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    last_auto_pull_at TEXT,
+    last_failure_at TEXT,
+    PRIMARY KEY (repo_full_name, issue_number)
+);
+```
+
+Counter lifecycle:
+- Increment when: parent task created by auto-pull (within 60min window) hits status='failed'
+- Reset when: parent task by auto-pull or operator hits status='completed' (success path observed)
+- Skip threshold: `failure_count >= 3` → auto-pull skips this ticket
+- Audit-event on skip: `target_key='auto_pull_skip'`, value cites `failure_count`
+
+The new table keeps stats independent of the tasks table (which has per-task semantics, not per-issue). Single primary key on (repo, issue#) makes lookup O(log n).
 
 ### E. Operator override (AC4)
 
