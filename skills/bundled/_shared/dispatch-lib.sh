@@ -1970,32 +1970,56 @@ ${RESULT}"
 
     _push_branch
 
-    # Unit 2 (mika#1282): open a draft PR when content was rescued by dispatch-lib's
-    # git-workflow ownership (content/workflow split per mika#1271 architect verdict).
-    # Draft status signals "pilot failed to drive git; substrate owns recovery workflow."
-    # Runs after _push_branch (which handles first-push natively — lines 558-564)
-    # and before _deliver_callback.
-    if [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
+    # Unit 2 (mika#1282 + mika#1396): open a draft PR when content was rescued
+    # by dispatch-lib's git-workflow ownership.
+    #
+    # Recovery classes:
+    # - "dirty-worktree" (mika#1282 original): pilot wrote files but never committed.
+    #   dispatch-lib staged + committed with wip() + pushed; this opens the PR.
+    # - "commit-pushed-no-pr" (mika#1396): pilot committed AND pushed but
+    #   gh pr create failed (e.g., AxiosError 5000ms timeout). Branch has the
+    #   commit on origin; PR was never opened. dispatch-lib opens it.
+    #
+    # Runs after _push_branch (lines 558-564) and before _deliver_callback.
+    local RECOVERY_CLASS=""
+    if [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ]; then
+        RECOVERY_CLASS="dirty-worktree"
+    elif [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] \
+         && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ]; then
+        RECOVERY_CLASS="commit-pushed-no-pr"
+    fi
+
+    if [ -n "$RECOVERY_CLASS" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
+        # Recovery-class-specific PR body
+        local _rescue_title
+        local _rescue_body_note
+        if [ "$RECOVERY_CLASS" = "dirty-worktree" ]; then
+            _rescue_title="wip(${REPO}#${ISSUE_NUM}): rescued impl (dispatch-lib recovery)"
+            _rescue_body_note="The dev-pilot session wrote file changes but never completed the git workflow (no \`git commit\` or \`gh pr create\`). Per the mika#1271 content/workflow split contract, dispatch-lib took ownership of the git layer: staged, committed with \`wip()\` prefix, pushed, and opened this draft PR to preserve the content.
+
+**This is a draft PR requiring human review.** The content has NOT passed \`/ce:review\` and may contain partially-coherent multi-file changes."
+        else
+            _rescue_title="${REPO}#${ISSUE_NUM}: pilot impl (dispatch-lib PR-create recovery, mika#1396)"
+            _rescue_body_note="The dev-pilot session committed and pushed the implementation but \`gh pr create\` failed (typically a transient AxiosError 5000ms timeout from claude-cli's internal HTTP relay). Branch is on origin with the impl commit; only the final PR-creation step needed recovery.
+
+**This is a draft PR — operator should verify pilot's pipeline (/ce:work, /ce:review, /ce:compound) completed before marking ready.** The recovery path is uniform with mika#1282's draft-PR pattern for audit consistency."
+        fi
+
         RESCUED_PR_URL=$(gh pr create \
             --repo "senara-solutions/$REPO" \
             --head "$BRANCH" \
             --base main \
             --draft \
-            --title "wip(${REPO}#${ISSUE_NUM}): rescued impl (dispatch-lib recovery)" \
+            --title "$_rescue_title" \
             --body "$(cat <<RESCUEBODY
-## Rescued implementation (dispatch-lib content/workflow split)
+## Auto-rescued PR (dispatch-lib recovery, class: ${RECOVERY_CLASS})
 
-This PR was created by dispatch-lib's git-workflow recovery (mika#1282).
+This PR was created by dispatch-lib's git-workflow recovery.
 
-The dev-pilot session wrote file changes but never completed the git workflow
-(no \`git commit\` or \`gh pr create\`). Per the mika#1271 content/workflow split
-contract, dispatch-lib took ownership of the git layer: staged, committed with
-\`wip()\` prefix, pushed, and opened this draft PR to preserve the content.
-
-**This is a draft PR requiring human review.** The content has NOT passed
-\`/ce:review\` and may contain partially-coherent multi-file changes.
+${_rescue_body_note}
 
 ### Recovery metadata
+- Recovery class: \`${RECOVERY_CLASS}\`
 - Pilot session: \`${SESSION_ID:-unknown}\`
 - Turns: ${TURNS:-unknown}
 - Cost: \$${COST:-unknown}
