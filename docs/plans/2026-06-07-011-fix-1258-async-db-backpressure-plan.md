@@ -176,9 +176,9 @@ This is generally safe with the existing call patterns. Plan calls for a grep au
 ## Risk
 
 Medium.
-- **SQLite + tokio thread-shape decision (D1 vs D2)** is the highest-risk choice. Plan explicitly flags this for pre-implementation verification. If verification reveals SQLite constraints force D1 (block_on bridge), the runtime gain is smaller but still positive (the SEND side is async; only the RECV side has block_on overhead).
-- **Cancellation semantics**: `send().await` cancellation drops values; most call sites are inside tokio::spawn and tolerate this, but a manual audit is required (AC5).
-- **Existing tests passing alone is insufficient evidence** — the bug only manifests under saturation. AC4's regression test (even if `#[ignore]`-gated) is the actual binding.
+- **D1 chosen (dedicated thread + block_on bridge per Section D).** The send side becomes async (the actual bottleneck the Codex audit identified); the recv side stays sync via `Handle::block_on(rx.recv())`. The recv side is a single dedicated thread — blocking it when no work is present is correct behavior, not a Tokio worker pin.
+- **Cancellation semantics**: `send().await` cancellation drops values; most call sites are inside `tokio::spawn` and tolerate this, but a manual audit is required (AC5).
+- **Existing tests passing alone is insufficient evidence** — the bug only manifests under saturation. AC4's regression test (CI-gated, runs in default `cargo test`) is the structural binding.
 
 ## Implementation order
 
