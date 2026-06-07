@@ -183,6 +183,21 @@ if [[ -n "${GITHUB_EVENT_PATH:-}" ]]; then
   fi
 fi
 
+# mika#1395: Live API fallback for label-freeze on workflow rerun.
+# $GITHUB_EVENT_PATH is a frozen snapshot taken at workflow trigger time;
+# labels applied after the workflow starts are invisible to the gate on
+# `gh run rerun --failed`. Fall back to a live `gh pr view` fetch when the
+# frozen snapshot did not surface the label, so operators don't need to
+# push an empty commit just to re-trigger CI for label visibility.
+if [[ "$EXEMPT_PR_LABEL_DOCS" == "0" ]] && command -v gh >/dev/null 2>&1; then
+  _pr_number=$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH" 2>/dev/null)
+  if [[ -n "$_pr_number" ]]; then
+    if gh pr view "$_pr_number" --json labels --jq '.labels[].name' 2>/dev/null | grep -qx "pipeline-exempt"; then
+      EXEMPT_PR_LABEL_DOCS=1
+    fi
+  fi
+fi
+
 # --- Docs-only check (labels exempt source-required; trailer is escape hatch) ---
 if [[ -n "$DOCS_BUCKET" && -z "$SOURCE_BUCKET" ]]; then
   if [ "$ISSUE_HAS_DOCUMENTATION_LABEL" = true ]; then
