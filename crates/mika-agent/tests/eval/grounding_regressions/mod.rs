@@ -44,6 +44,8 @@ pub mod callback_state_claim_unverified;
 pub mod current_priorities_drift;
 pub mod dev_groom_dispatched_no_verdict;
 pub mod dev_groom_fabricated_verdict_caught;
+pub mod dev_groom_fabricated_verdict_tool_absent;
+pub mod dev_groom_verdict_producer_exempt;
 pub mod engine_correction_rejection;
 pub mod fabricated_shell_errors;
 pub mod graphql_field_fabrication;
