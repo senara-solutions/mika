@@ -2030,6 +2030,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mika-os"
+version = "0.12.2"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

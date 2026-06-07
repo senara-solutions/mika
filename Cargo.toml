@@ -153,6 +153,7 @@ dashmap = "6"
 mika-common = { path = "crates/mika-common" }
 mika-agent = { path = "crates/mika-agent" }
 mika-a2a = { path = "crates/mika-a2a" }
+mika-os = { path = "crates/mika-os" }
 
 [profile.release]
 lto = true
