@@ -24,9 +24,25 @@
 | `list_team_runs_paginated_with_count` | 9840 | team runs + total count |
 | `list_dev_runs_paginated_with_count` | 9877 | dev runs + total count |
 
-Plus dashboard-relevant `list_*` methods at lines 4383, 4423, 4588, 5044, 7517, 7599, 7691, 7743, 8375, 9032.
+**Additional `list_*` methods classified per §6 module ownership** (per architect F1 — body-read each method's domain):
 
-Estimated LoC: ~1,500-2,000 lines of SQL + Rust deserialization.
+| Line | Function | §6 module owner | In #1445 scope? |
+|---|---|---|---|
+| 4383 | `list_agent_corpora` | memory/ (KG corpora = "KG bridges" per §6) | NO — belongs to #1446 memory/ |
+| 4423 | `list_agents_db` | dashboard_queries/ (core agents list, read-only aggregation) | YES |
+| 4588 | `list_teams_db` | dashboard_queries/ (teams list, read-only) | YES |
+| 5044 | `list_manual_tasks` | task_state/ (Task-kind owner per §6: "task lifecycle") | NO — belongs to #1448 task_state/ |
+| 5194 | `list_active_tasks` | task_state/ (Task-kind owner) | NO — belongs to #1448 task_state/ |
+| 7517 | `list_people` | memory/ (Person = memory-layer entity per §6: "structured facts") | NO — belongs to #1446 memory/ |
+| 7599 | `list_commitments` | commitments/ (Commitment-kind owner per §6: "promise tracking") | NO — belongs to #1449 commitments/ |
+| 7691 | `list_preferences` | memory/ (preferences = memory-layer per §6: "structured facts") | NO — belongs to #1446 memory/ |
+| 7743 | `list_events` | memory/ (events = facts-of-state per §6: "structured facts") — ambiguous; classify as memory/ pending body-read at #1446 grooming | NO (provisional) — flag for #1446 grooming review |
+| 8375 | `list_customer_config` | dashboard_queries/ (config-read for dashboard surfaces; not a §6-domain-owner) | YES |
+| 9032 | `list_facts_paginated_with_count` | memory/ ("structured facts" per §6) | NO — belongs to #1446 memory/ |
+
+**Reduced #1445 scope**: only `list_agents_db` (4423), `list_teams_db` (4588), `list_customer_config` (8375) from the secondary group qualify as dashboard_queries/. The other 8 line-pinned methods belong to sibling §6 modules (#1446 memory/, #1448 task_state/, #1449 commitments/) and stay in db.rs until those sub-issues groom.
+
+**Revised LoC estimate**: the 11 methods at 9194-9877 are the bulk (~1,200-1,500 LoC). Plus list_agents_db + list_teams_db + list_customer_config (~150-250 LoC combined). **Total #1445 scope: ~1,400-1,750 lines moved.**
 
 **D. Cross-module dependencies** (verified via grep on each candidate function):
 
@@ -110,7 +126,7 @@ If `server/dashboard.rs` or any other file imports specific method names via `us
 
 1. **AC1**: `crates/mika-agent/src/dashboard_queries/mod.rs` created with one-paragraph doc-comment naming "read-side aggregation for dashboard surfaces" per Foundation §6 (per parent AC4).
 
-2. **AC2**: All 11+ dashboard-aggregation query methods from `db.rs` lines 9194-9877 + the dashboard-relevant `list_*` methods relocate to `dashboard_queries/mod.rs`. Methods stay `impl Database` to minimize call-site churn.
+2. **AC2**: Exactly the 14 classified dashboard-aggregation methods (per Phase 0 §C revised table) relocate to `dashboard_queries/mod.rs`. Methods stay `impl Database` to minimize call-site churn. The other 8 line-pinned `list_*` methods (memory/-grade, task_state/-grade, commitments/-grade) stay in db.rs for sibling §6 module extractions.
 
 3. **AC3**: `crates/mika-agent/src/lib.rs` declares `pub mod dashboard_queries;` (per parent AC4).
 
@@ -120,7 +136,7 @@ If `server/dashboard.rs` or any other file imports specific method names via `us
 
 6. **AC6**: No behavior change — pure module split, query semantics identical (per parent AC3). Verified by test suite.
 
-7. **AC7**: `wc -l crates/mika-agent/src/db.rs` shows reduction by ~1,500 lines (from ~17,645 to ~16,000-16,200). Confirms the extraction-volume claim.
+7. **AC7**: `wc -l crates/mika-agent/src/db.rs` shows reduction by ~1,400-1,750 lines (from 17,645 to ~15,900-16,250). Confirms the extraction-volume claim per Phase 0 §C revised classification.
 
 ## Files to change
 
@@ -155,7 +171,7 @@ Low.
 
 ## Implementation order
 
-1. Read `db.rs:9194-9877` and `db.rs:4383, 4423, 4588, 5044, 7517, 7599, 7691, 7743, 8375, 9032` to confirm which methods are dashboard-aggregation-grade (vs orthogonal `list_*` methods that belong to other §6 modules — e.g., `list_commitments` is `commitments/` territory, `list_people` is `memory/` territory)
+1. Per Phase 0 §C classification: move ONLY `list_agents_with_stats` (9194), `get_agent_with_stats` (9217), `list_sessions_paginated` (9242), `list_audit_events_paginated` (9495), `list_tasks_paginated` (9566), `list_team_runs_paginated` (9694), `list_sessions_paginated_with_count` (9775), `list_audit_events_paginated_with_count` (9813), `list_tasks_paginated_with_count` (9828), `list_team_runs_paginated_with_count` (9840), `list_dev_runs_paginated_with_count` (9877), `list_agents_db` (4423), `list_teams_db` (4588), `list_customer_config` (8375) — the 14 dashboard-aggregation-grade methods. Leave the other 8 line-pinned methods (`list_agent_corpora`, `list_manual_tasks`, `list_active_tasks`, `list_people`, `list_commitments`, `list_preferences`, `list_events`, `list_facts_paginated_with_count`) in db.rs for their respective §6 module extractions (#1446 memory/, #1448 task_state/, #1449 commitments/).
 2. Build the new `dashboard_queries/mod.rs` with doc-comment + extracted impl block
 3. Remove relocated methods from `db.rs`
 4. Add `pub mod dashboard_queries;` to `lib.rs`
