@@ -13,6 +13,8 @@
 
 `crates/mika-agent/src/db.rs` is 17,645 lines. The audit_events chunk:
 
+**Total: 10 methods + 1 struct + ~5 tests** in evidence/ scope (revised from 12 per F1 — see C.3 below for the 2 paginated methods removed from this scope).
+
 | Symbol | Line | Description |
 |---|---|---|
 | `pub struct AuditEvent` | 371 | Audit-event row schema (id/agent_id/session_id/tool_name/target_key/before_value/after_value/reasoning/trace_id/rewound_by_trace_id/created_at) |
@@ -24,9 +26,7 @@
 | `pub fn compact_old_audit_events` | 7886 | DELETE older than N days |
 | `pub fn get_audit_events_by_trace_ids` | 7929 | SELECT by trace_id IN (…) (rewind path) |
 | `pub fn mark_audit_events_rewound` | 8023 | UPDATE rewound_by_trace_id (rewind path) |
-| `pub fn list_audit_events_paginated` | 9495 | dashboard paginated list |
-| `pub fn count_audit_events` | 9518 | dashboard count |
-| `pub fn list_audit_events_paginated_with_count` | 9813 | dashboard combined-query optimization |
+| `pub fn count_audit_events` | 9518 | Count helper (used by both evidence-domain and dashboard-paginator callers — kept in evidence/ as the count IS audit-event-domain; dashboard_queries/ list-paginators call it via `Database::*`) |
 | Tests | 10982-11348 | `test_log_and_get_audit_events`, `test_get_audit_events_since`, `test_compact_old_audit_events`, plus inline test fixtures |
 
 ### C.2 — agent.rs fabrication-guard predicate surface
@@ -54,9 +54,35 @@ There's also likely a `fn extract_affirmative_state_claim` helper used by the `a
 
 ### C.3 — What stays OUT
 
-- **`post_condition.rs` (51 lines)**: Generic `PostConditionGuard` struct + `GuardDecision` enum — a registry pattern used by ALL guards, not just evidence-domain ones (some guards are agent-loop-specific: max-steps, intent-precondition, required-suffix-line). Stays in `src/` root; future grooming may relocate it to `agent_loop/` (#1452) or keep it shared.
+**Per architect F1 (BLOCKING, addressed) — sibling-ticket conflict resolution with #1445 dashboard_queries/:**
+
+- **`list_audit_events_paginated` (db.rs:9495)** — claimed by #1445 dashboard_queries/ GROOMED plan as dashboard-aggregation surface. §6 reading: "Read-side aggregation for dashboard surfaces" covers paginated reads of audit_events. STAYS in #1445 scope, NOT evidence/.
+- **`list_audit_events_paginated_with_count` (db.rs:9813)** — same sibling-ownership as 9495. STAYS in #1445 scope.
+
+Verified via `git show origin/refactor/1445/dashboard-queries-module-extraction:docs/plans/2026-06-08-001-refactor-1445-dashboard-queries-extract-plan.md` — #1445's Phase 0 §C explicitly lists both 9495 and 9813 in its 11-method dashboard-aggregation table. F1 finding was correct; this plan's original 12-method count was wrong. Revised to **10 methods**.
+
+`count_audit_events` (9518) IS kept in evidence/ scope per this revision — #1445's plan does NOT claim it (the architect's F1 only flagged the two `list_*paginated*` methods, not the count helper). The count itself is an audit-event domain measurement, called by both evidence-domain code and (potentially) dashboard paginators via `Database::*`.
+
+**Other excluded surfaces:**
+
+- **`post_condition.rs` (51 lines)**: Generic `PostConditionGuard` struct + `GuardDecision` enum — a registry pattern used by ALL guards, not just evidence-domain ones (some guards are agent-loop-specific: max-steps, intent-precondition, required-suffix-line). Stays in `src/` root; future grooming may relocate it to `agent_loop/` (#1452) or keep it shared. Architect-confirmed: the registry's purpose is loop-level infrastructure; moving it to evidence/ would invert the dependency (agent_loop/ → evidence/ just for registry semantics).
 - **Guard-dispatch site (where the predicate is called + reject decision happens) in agent.rs**: stays in agent.rs as part of `run_agent()` flow — owned by agent_loop/ (#1452). Evidence/ owns the *predicates*; agent_loop/ owns the *enforcement timing*.
 - **`rewind.rs` AuditEvent consumers**: `rewind::audit_events_by_trace_ids` callers stay in rewind.rs. The rewind module is a future-grooming target (not part of §6 partition). After this extraction, rewind.rs imports `crate::evidence::AuditEvent` and `crate::evidence::audit::*`.
+
+### C.3.1 — F2 sharpening (addressed): private-access enumeration for moved tests
+
+Architect F2 flagged that moved tests may depend on private helpers requiring visibility changes. Body-read enumeration:
+
+**evidence/guards.rs tests (assert_grounded_satisfied family, ~5 tests)** depend on:
+- `ToolCallSummary` — verified at agent.rs:289 as `pub struct ToolCallSummary` (already crate-public). After move, evidence/guards.rs imports via `use crate::agent::ToolCallSummary;`. **No visibility change needed.**
+- `AffirmativeStateClaim` — moves with the tests to evidence/guards.rs. **No visibility change needed.**
+- `assert_grounded_satisfied`, helpers — move with the tests. **No visibility change needed.**
+
+**evidence/audit.rs tests (audit_events family, ~5 tests)** depend on:
+- `db.conn` direct INSERT access (test_get_audit_events_since uses `db.conn.execute("INSERT INTO audit_events ...")`) — verified at db.rs:869 as `pub(crate) conn: Connection` (already crate-public). After move, evidence/audit.rs tests still access `db.conn` from within the same crate. **No visibility change needed.**
+- `db()` test-helper constructor — defined in db.rs's `#[cfg(test)] mod tests`. After move, evidence/audit.rs tests need to either re-import this helper or define a local equivalent. **Option chosen:** import via `use super::super::db::tests::*;` (or `pub(crate)` promotion if Rust visibility blocks the inner import-path). Verify at implementation time; document outcome in PR body.
+
+**Risk assessment**: Both source-side helpers (`ToolCallSummary`, `db.conn`) are already crate-public via `pub` and `pub(crate)`. No visibility-surface changes required by this extraction. The only non-trivial test-relocation concern is the `db()` constructor's accessibility from a sibling test module — a small Rust-mechanics question that's resolved at implementation time, not a structural blocker. Documented as PR-body risk; no AC required.
 
 ### C.4 — Cross-module dependency direction
 
@@ -74,7 +100,7 @@ One-way fan-in to evidence/. No reverse dependencies. Pure leaf with respect to 
 **Extraction shape**: split into 3 files inside `crates/mika-agent/src/evidence/`:
 
 - `evidence/mod.rs` — module-level doc-comment per Foundation §6 + re-exports of public surface
-- `evidence/audit.rs` — `AuditEvent` struct + 12 db methods + tests (relocated from `db.rs`)
+- `evidence/audit.rs` — `AuditEvent` struct + 10 db methods (revised from 12 per F1) + tests (relocated from `db.rs`)
 - `evidence/guards.rs` — fabrication-guard predicates + grounding-rule enforcement helpers + regex statics + tests (relocated from `agent.rs`)
 
 Rationale for 3-file split (deviation from #1447's pure-relocation shape): the source code is currently distributed across two giant files (agent.rs, db.rs). A 1:1 file relocation isn't possible — there's no `evidence.rs` to `git mv`. Splitting by sub-concern (audit vs guards) keeps each file under ~1000 LoC and matches Foundation §6's enumeration ("grounding-rule enforcement, fabrication-guard predicates, tool-call audit trail").
@@ -155,7 +181,7 @@ pub mod evidence;
 
 1. **AC1**: `crates/mika-agent/src/evidence/mod.rs` created with doc-comment per Foundation §6 (parent AC4). Re-exports `AuditEvent`, `AffirmativeStateClaim`, `GROUNDING_TOOLS`, `ASSERT_GROUNDED_LABEL` for shorter import paths.
 
-2. **AC2**: `crates/mika-agent/src/evidence/audit.rs` contains the `AuditEvent` struct + 12 audit_events `Database` methods + their tests, fully relocated from db.rs.
+2. **AC2**: `crates/mika-agent/src/evidence/audit.rs` contains the `AuditEvent` struct + 10 audit_events `Database` methods (revised from 12 per F1) + their tests, fully relocated from db.rs.
 
 3. **AC3**: `crates/mika-agent/src/evidence/guards.rs` contains the 5 regex statics + 5-7 predicate functions + `AffirmativeStateClaim` + constants + tests, fully relocated from agent.rs.
 
