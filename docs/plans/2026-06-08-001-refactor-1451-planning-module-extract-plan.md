@@ -15,19 +15,41 @@ Per #1450 tool_execution/ GROOMED plan: `validate_dispatch_readiness` and `check
 
 **C. Surfaces body-read against current `crates/mika-agent/`:**
 
-### C.1 — Agent-loop policy constants (the substantive content)
+### C.1 — Agent-loop policy constants (**EXHAUSTIVE ENUMERATION per pass-1 F1**)
 
-`crates/mika-agent/src/agent.rs:35-58` — five policy constants:
+Per pass-1 sharpening F1 — full grep on agent.rs:1-400 reveals **18 const declarations**, of which **12 classify as planning/policy/ scope** (the initial "5 constants" claim was incomplete).
 
-| Line | Symbol | Description |
-|---|---|---|
-| 35 | `const MAX_TOOL_STEPS: usize = 20` | Per-turn max tool steps for conversation mode |
-| 36 | `const MAX_CALLBACK_TOOL_STEPS: usize = 20` | Per-turn max for callback/reminder triggers |
-| 37 | `const MAX_TEAM_TOOL_STEPS: usize = 20` | Per-turn max for team agent mode |
-| 58 | `const MAX_IMAGE_BYTES_PER_STEP: usize = 20 * 1024 * 1024` | Per-step image-byte budget (~20 MB) |
-| 321 | `const MAX_REFLECTION_DIGEST_CHARS: usize = 50_000` | Per-reflection-digest char cap |
+Grep: `grep -nE "^const |^pub const " crates/mika-agent/src/agent.rs | awk -F: '$1+0 <= 321'`
 
-**Total: 5 constants ≈ 5 LoC of substance** (with comments/context, ~15 LoC of surface).
+| Line | Symbol | Type | §6 owner | In #1451 scope? |
+|---|---|---|---|---|
+| 35 | `MAX_TOOL_STEPS: usize = 20` | step budget | planning/policy | **YES** |
+| 36 | `MAX_CALLBACK_TOOL_STEPS: usize = 20` | step budget | planning/policy | **YES** |
+| 37 | `MAX_TEAM_TOOL_STEPS: usize = 20` | step budget | planning/policy | **YES** |
+| 38 | `TOOL_TIMEOUT_SECS: u64 = 30` | timeout policy | planning/policy | **YES** |
+| 39 | `AGENT_TOTAL_TIMEOUT_SECS: u64 = 300` | timeout policy | planning/policy | **YES** |
+| 41 | `TOOL_TIMEOUT_INPUT_EXCERPT_LEN: usize = 200` | diagnostic excerpt | agent_loop/ (debug helper) | NO |
+| 46 | `CALLBACK_RESULT_MAX_BYTES: usize = 10_240` | result truncation | planning/policy | **YES** |
+| 50 | `TEAM_AGENT_TIMEOUT_SECS: u64 = 300` | timeout policy | planning/policy | **YES** |
+| 53 | `CONTINUATION_TIMEOUT_SECS: u64 = 60` | timeout policy | planning/policy | **YES** |
+| 58 | `MAX_IMAGE_BYTES_PER_STEP: usize = 20 * 1024 * 1024` | byte budget | planning/policy | **YES** |
+| 66 | `VERDICT_PRODUCER_SKILLS: &[&str]` | skill-name enumeration | agent_loop/ (skill-domain enum) | NO |
+| 77 | `EMPTY_RESPONSE_FALLBACK: &str` | UX fallback string | agent_loop/ (text const) | NO |
+| 80 | `FAILED_TASK_FALLBACK: &str` | UX fallback string | agent_loop/ (text const) | NO |
+| 85 | `STALE_FAILED_CALLBACK_MINUTES: i64 = 5` | staleness threshold | planning/policy | **YES** |
+| 314 | `TOOL_METADATA_MAX: usize = 4000` | metadata cap | planning/policy | **YES** |
+| 316 | `INPUT_SUMMARY_MAX: usize = 200` | summary cap | planning/policy | **YES** |
+| 318 | `OUTPUT_SUMMARY_MAX: usize = 300` | summary cap | planning/policy | **YES** |
+| 321 | `MAX_REFLECTION_DIGEST_CHARS: usize = 50_000` | reflection cap | planning/policy | **YES** |
+
+**Total in #1451 scope: 12 policy constants** (revised from initial "5" per F1).
+
+**6 constants stay in agent.rs:**
+- `TOOL_TIMEOUT_INPUT_EXCERPT_LEN` (41) — pure diagnostic excerpt size for timeout error messages; not policy
+- `VERDICT_PRODUCER_SKILLS` (66) — skill-name enumeration; belongs in skills/ domain or agent_loop/ context
+- `EMPTY_RESPONSE_FALLBACK` (77), `FAILED_TASK_FALLBACK` (80) — UX fallback strings; agent_loop/ text constants
+
+**Classification rule applied**: constants are policy-scope if they answer "how much/how long is the agent allowed?" (budgets, timeouts, byte/char caps, staleness windows). Constants are NOT policy if they're diagnostic-aid sizes, UX text, or enumerations of skill/tool names.
 
 ### C.2 — `max_steps()` impl methods (consumers of policy)
 
@@ -77,7 +99,7 @@ One-way fan-in from agent_loop/ only. Pure leaf with respect to §6.
 
 ## Hypothesis (committed)
 
-**SMALLEST Wave 2 firing by relocated LoC** (≈ 5 const lines + ~10 LoC of context = ~15 LoC of substance, plus future-accretion documentation).
+**SMALLEST Wave 2 firing by relocated LoC** (≈ 12 const lines + ~30 LoC of context = ~40 LoC of substance, plus future-accretion documentation).
 
 **Extraction shape**: 2-file split:
 
@@ -85,10 +107,10 @@ One-way fan-in from agent_loop/ only. Pure leaf with respect to §6.
 crates/mika-agent/src/
 ├── planning/
 │   ├── mod.rs          # §6 doc-comment + module-purpose + future-accretion targets
-│   └── policy.rs       # 5 agent-loop policy constants relocated from agent.rs
+│   └── policy.rs       # 12 agent-loop policy constants (post-F1 exhaustive count) relocated from agent.rs
 ```
 
-This is a near-placeholder module. It satisfies parent #1259 AC4 ("each new module has its own mod.rs with a one-paragraph doc-comment naming the operational responsibility") and AC2 ("logic moved" — the 5 policy constants relocate from agent.rs). The other §6 sub-concerns are empty at extraction-time and documented as future-accretion targets.
+This is a slim module. It satisfies parent #1259 AC4 ("each new module has its own mod.rs with a one-paragraph doc-comment naming the operational responsibility") and AC2 ("logic moved" — the 12 policy constants relocate from agent.rs). The other §6 sub-concerns are empty at extraction-time and documented as future-accretion targets.
 
 **Rationale for proceeding despite empty sub-concerns**: parent #1259's goal is the 9-way partition shape; this sub-issue's job is to mark planning/ as a named module so future code lands there by convention. Holding back #1451 until #1363 ships would delay Wave 2 drain. Better: extract the placeholder + the existing policy constants now, let sub-concerns accrete as siblings ship.
 
@@ -102,7 +124,7 @@ mkdir -p crates/mika-agent/src/planning
 
 ### B. Move policy constants from agent.rs → planning/policy.rs
 
-Cut lines 35-37 + 58 + 321 from agent.rs to `planning/policy.rs`. Estimated 5 lines of code + ~30 lines of context comments.
+Cut the 12 policy const declarations from agent.rs (lines 35, 36, 37, 38, 39, 46, 50, 53, 58, 85, 314, 316, 318, 321 — see §C.1 for exact symbol names) to `planning/policy.rs`. The 6 non-policy constants (lines 41, 66, 77, 80) STAY in agent.rs. Estimated 12 LoC of code + ~30 LoC of context comments.
 
 ```rust
 // planning/policy.rs
@@ -132,9 +154,12 @@ pub const MAX_REFLECTION_DIGEST_CHARS: usize = 50_000;
 //! (2026-06-08), only **agent-loop policy** has materialized code; the other
 //! two sub-concerns are documented future-accretion targets.
 //!
-//! - **agent-loop policy** — 5 constants in `policy.rs` bounding tool-step
-//!   budgets per agent mode (conversation/callback/team) plus image-byte and
-//!   reflection-digest caps. Consumed by `crate::agent::RunMode::max_steps`
+//! - **agent-loop policy** — 12 constants in `policy.rs` bounding tool-step
+//!   budgets (conversation/callback/team), timeout policies (per-tool, total
+//!   agent run, team agent, continuation), result/byte/char caps (callback
+//!   result, image bytes, tool metadata, input/output summaries, reflection
+//!   digest), and staleness thresholds (stale-failed callback minutes).
+//!   Consumed by `crate::agent::RunMode::max_steps`
 //!   and `crate::agent::SilentTrigger::max_steps` (which stay in `agent.rs`
 //!   per agent_loop/ #1452 — impls live near their enums).
 //! - **dispatch-readiness predicates** — currently empty. The existing
@@ -176,9 +201,9 @@ pub mod planning;
 
 1. **AC1**: `crates/mika-agent/src/planning/mod.rs` created with Foundation §6 doc-comment naming all 3 sub-concerns (agent-loop policy, dispatch-readiness predicates, plan-doc invariants) + their disposition (1 materialized, 2 future-accretion). Per parent AC4.
 
-2. **AC2**: `crates/mika-agent/src/planning/policy.rs` contains the 5 agent-loop policy constants relocated from agent.rs (MAX_TOOL_STEPS, MAX_CALLBACK_TOOL_STEPS, MAX_TEAM_TOOL_STEPS, MAX_IMAGE_BYTES_PER_STEP, MAX_REFLECTION_DIGEST_CHARS).
+2. **AC2**: `crates/mika-agent/src/planning/policy.rs` contains the 12 agent-loop policy constants (post-F1 exhaustive count) relocated from agent.rs (MAX_TOOL_STEPS, MAX_CALLBACK_TOOL_STEPS, MAX_TEAM_TOOL_STEPS, MAX_IMAGE_BYTES_PER_STEP, MAX_REFLECTION_DIGEST_CHARS).
 
-3. **AC3**: agent.rs has NO definitions of the 5 relocated constants. `grep -nE "^const (MAX_TOOL_STEPS|MAX_CALLBACK_TOOL_STEPS|MAX_TEAM_TOOL_STEPS|MAX_IMAGE_BYTES_PER_STEP|MAX_REFLECTION_DIGEST_CHARS)" crates/mika-agent/src/agent.rs` returns ZERO hits.
+3. **AC3**: agent.rs has NO definitions of the 12 relocated constants. `grep -nE "^const (MAX_TOOL_STEPS|MAX_CALLBACK_TOOL_STEPS|MAX_TEAM_TOOL_STEPS|TOOL_TIMEOUT_SECS|AGENT_TOTAL_TIMEOUT_SECS|CALLBACK_RESULT_MAX_BYTES|TEAM_AGENT_TIMEOUT_SECS|CONTINUATION_TIMEOUT_SECS|MAX_IMAGE_BYTES_PER_STEP|TOOL_METADATA_MAX|INPUT_SUMMARY_MAX|OUTPUT_SUMMARY_MAX|MAX_REFLECTION_DIGEST_CHARS)|^pub const STALE_FAILED_CALLBACK_MINUTES" crates/mika-agent/src/agent.rs` returns ZERO hits. The 6 non-policy constants (TOOL_TIMEOUT_INPUT_EXCERPT_LEN, VERDICT_PRODUCER_SKILLS, EMPTY_RESPONSE_FALLBACK, FAILED_TASK_FALLBACK) STAY in agent.rs.
 
 4. **AC4**: All call sites updated. References to the 5 constants in agent.rs use `crate::planning::policy::*` (or the re-export). `grep -rn "MAX_TOOL_STEPS\|MAX_CALLBACK_TOOL_STEPS\|MAX_TEAM_TOOL_STEPS\|MAX_IMAGE_BYTES_PER_STEP\|MAX_REFLECTION_DIGEST_CHARS" crates/ tests/` returns ONLY qualified-path references (`crate::planning::policy::*` or the re-export), zero bare references in agent.rs that don't resolve through the re-export.
 
