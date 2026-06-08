@@ -109,7 +109,7 @@ Replace `pub mod messaging;` with `pub mod notifications;`.
 
 2. **AC2**: `crates/mika-agent/src/messaging.rs` removed; entire 494-line content relocated to `notifications/mod.rs` via `git mv` (history preserved).
 
-3. **AC3**: All import paths updated from `crate::messaging::*` / `mika_agent::messaging::*` to `crate::notifications::*` / `mika_agent::notifications::*`. Verified by `grep -rn "messaging::" crates/ tests/` returning zero hits (or only docstring mentions).
+3. **AC3**: All references updated from `crate::messaging::*` / `mika_agent::messaging::*` to `crate::notifications::*` / `mika_agent::notifications::*`. Verified by `grep -rn "crate::messaging\|mika_agent::messaging" crates/ tests/` returning **ZERO hits across ALL file types** — Rust source, doc-comments inside Rust files, and non-Rust files (README, docs/, comments). The "no behavior change" contract extends to documentation; stale `crate::messaging` references in comments are a documentation regression and must be eliminated by the sweep. Per F1 sharpening (pass-1 architect review, session `693be6c2-79f4-44b0-b875-e1e3e352ca89`): `cargo build` only catches compile-time breakage, the grep is the completeness check, and it belongs at the AC layer not buried in implementation order.
 
 4. **AC4**: `crates/mika-agent/src/lib.rs` declares `pub mod notifications;` (replaced `pub mod messaging;`) (parent AC4).
 
@@ -150,7 +150,7 @@ Marginally higher risk than pure-impl-block-relocation (#1445, #1446, #1449) bec
 2. `cargo test -p mika-agent --lib` passes
 3. `cargo build -p mika-gateway` clean (verify cross-crate imports)
 4. `cargo clippy -p mika-agent --tests --no-deps -- -D warnings` clean
-5. `grep -rn "messaging::\|crate::messaging\|mika_agent::messaging" crates/ tests/` returns zero hits (excluding docstring mentions)
+5. `grep -rn "crate::messaging\|mika_agent::messaging" crates/ tests/` returns **zero hits across all file types** — Rust source, doc-comments, non-Rust files. AC3 explicitly covers documentation comments; the build will not catch stale doc-comment references, but this grep will.
 6. `git log --follow crates/mika-agent/src/notifications/mod.rs` shows preserved history
 
 ## Implementation order
