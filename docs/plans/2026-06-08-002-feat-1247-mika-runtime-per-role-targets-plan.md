@@ -29,7 +29,17 @@
 - `/app/docs/` documentation (init script needs)
 - `mika` user (per OpenRC conventions)
 
-**E. Ticket ACs (verbatim from #1247):**
+**E. `mika-os-init.sh` (F1 — pinned)** — read full at `mika/os/init/mika-os-init.sh`. Behavior summary:
+- Boots OpenRC via `rc default` (service-agnostic — boots whatever's in /etc/init.d/)
+- SIGTERM handler: `rc-service mika-gateway stop 2>/dev/null || true; rc-service mika-server stop 2>/dev/null || true` (BOTH calls fail-soft via `|| true` — graceful when the service isn't installed)
+- Tails BOTH log files: `tail -F "$LOG_DIR/mika-server.log" "$LOG_DIR/mika-gateway.log"`. Prior `touch` creates empty log files if missing.
+- No hardcoded require-binary references. Compatible with all per-role targets (server-only, gateway-only, all).
+
+**Minor inefficiency on per-role targets**: tail-F always tails both log files even if one daemon isn't running. Empty-file tail is harmless (no data flow, no error). Acceptable for v1 — can be tightened in a follow-up if log noise becomes an issue.
+
+**`mika-runtime-cli` exception**: init.sh is designed for daemon-mode (OpenRC + tail). CLI is interactive (TUI). The cli target MUST set `ENTRYPOINT ["/usr/local/bin/mika"]` directly, NOT mika-os-init.sh. Plan section "## Restructure" Stage 5 already specifies this.
+
+**F. Ticket ACs (verbatim from #1247):**
 - AC1: Dockerfile declares 5 named targets: `mika-os`, `mika-runtime-server`, `mika-runtime-gateway`, `mika-runtime-cli`, `mika-runtime-all`. Legacy `mika-runtime` removed or aliased.
 - AC2: each target builds clean via `docker build --target <target> -f mika/os/Dockerfile .`
 - AC3: each target's image contains ONLY appropriate binaries (server: only mika-server; gateway: only mika-gateway; cli: only mika; all: all three)
@@ -121,9 +131,9 @@ This is the right verification target for AC3 — image contents per role.
 
 3. **AC3:** Each image contains ONLY appropriate binaries (verified via `docker run --rm <image> ls -la /usr/local/bin/`):
    - `mika-runtime-server`: mika-server + gh + ollama present; mika + mika-gateway + gws absent
-   - `mika-runtime-gateway`: mika-gateway present; all others absent
-   - `mika-runtime-cli`: mika present; mika-server + mika-gateway absent
-   - `mika-runtime-all`: all 3 binaries + gh + gws + ollama present
+   - `mika-runtime-gateway`: mika-gateway present; mika + mika-server + gh + gws + ollama absent
+   - `mika-runtime-cli`: mika present; mika-server + mika-gateway + gh + gws + ollama absent
+   - `mika-runtime-all`: mika + mika-server + mika-gateway + gh + gws + ollama all present
 
 4. **AC4:** OpenRC init scripts present per role (verified via `docker run --rm <image> ls /etc/init.d/`):
    - `mika-runtime-server`: only `mika-server`
@@ -164,7 +174,7 @@ Plan + Dockerfile + README. 3 files.
 
 Low-medium.
 - **Docker BuildKit cache invalidation** if base-layer changes propagate inconsistently. Mitigated by Option A's shared-base — single source of truth.
-- **mika-os-init.sh assumptions** about which binaries are present at runtime. Need to verify init.sh handles "server present but cli absent" gracefully (likely fine — init.sh starts OpenRC services per /etc/init.d/ presence; cli has no service).
+- **mika-os-init.sh runtime behavior under partial binary sets** — RESOLVED via Phase 0 Pin E (above): script is init.d-presence-driven via `rc default`, service-stop calls are `|| true` fail-soft, tail-F creates empty log files if missing. Compatible with all per-role targets. `mika-runtime-cli` uses direct ENTRYPOINT to skip OpenRC entirely (TUI is interactive).
 - **Tooling-binary mapping wrong** (gh/gws/ollama per role). Mitigated by AC3 verification — manual inspection after each build.
 
 ## Test plan
