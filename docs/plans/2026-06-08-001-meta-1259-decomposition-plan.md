@@ -122,3 +122,42 @@ Medium-low.
 2. If GROOMED, file the 9 sub-issues via `gh issue create` + GraphQL `addSubIssue` for parent linkage
 3. Update mika#1259 body with the §Sub-issue breakdown
 4. Surface URLs to Mika Prime for bearing-check before next milestone (#1247)
+
+---
+
+## Path C revision (2026-06-08, post-peer-reframing)
+
+After this plan was committed and 9 sub-issues filed (#1444-#1452), body-read on #1444 (the first sub-issue) revealed that the per-row claims encoded in the §Sub-issue breakdown table above (LoC moving, hard dependencies, leaf-ness) were **impression-grade, not body-read-grade**. Row #1 (evidence/) claimed ~1,500 LoC + leaf + no deps; actual scope spans ~3-5k LoC across 7+ files with cross-module co-evolution.
+
+### Peer-reframing — gate-separation
+
+Per peer review on the substrate-finding: the decomposition artifact is **not** supposed to carry grounded per-row claims at all. It encodes durable boundaries; grounding is a different gate.
+
+**Two gates, not one:**
+
+1. **Coherence gate** — mika-arch canvass on the decomposition plan certifies that the N-way module partition is internally consistent. The morning two-pass GROOMED on this plan correctly discharged this gate. (Foundation §6's 9 modules partition the responsibility space cleanly.)
+
+2. **Grounding gate** — per-sub-issue at grooming-time, body-read against fresh code certifies that the sub-issue's stated scope matches what grep+read shows. This gate is opened at the start of each sub-issue groom, not at decomposition-time.
+
+The morning architect-canvass + my own surface-reading conflated these — I treated coherence-GROOMED as dispatch-readiness-GROOMED, which it was not. **The methodology is fine for what it's for. The error was bearing-reading: confusing coherence-output for grounding-output.**
+
+### What Path C does
+
+1. Keep all 9 sub-issues + parent-linkage. Boundaries are the durable artifact.
+2. Strip the per-row scope/dep/leaf-ness claims from sub-issue bodies. Replace with "scope + dependencies determined at grooming-time."
+3. Mark each sub-issue explicitly **decomposed, not groomed** — the "GROOMED = zero TBDs" doctrine (mika#1244) tells us that if grounding were required-and-present, the issue would be groomed; it isn't, so "determined at grooming" is the *correct* state, not a defect.
+
+### What Path C does NOT do
+
+- Re-canvass §6 partition. The coherence gate was the architect's actual job and it discharged correctly. No new coherence-evidence has emerged.
+- Re-decompose from scratch. The boundaries are durable; only the false-precision claims need stripping.
+- Tighten verify-claims-before-plan doctrine to fire on own outputs. Per peer: doctrine fires at *plan commit*; decomposition is boundary-drawing, not plan commit; grounding lands at per-sub-issue grooming (the actual plan-commit point).
+
+### Counter discipline
+
+- **verify-claims-before-plan** stays at n=6 + bedrock-broadening (ticket-currency from #1176). Does NOT advance to n=7. The morning finding-shape was *grounding-output that should always happen at body-read-before-groom* — that's the doctrine working at its correct gate, not catching a new instance.
+- **bearing-keeper-discipline-failure** tracks n=3 of conflated-gates-grain (n=1 at this specific grain). Held lightly; not folded into new bedrock yet — if it recurs, fold as sub-pattern of the existing bedrock from 2026-06-07.
+
+### Source
+
+Peer review via /mika-ask-a-friend, 2026-06-08. Surface-reframing produced the gate-separation insight that the original substrate-finding (which I framed as "methodology failure") missed.
