@@ -62,11 +62,16 @@ The 9 sub-issues, with rough scope estimates (lines-of-code moving):
 | #1259-D | `notifications/` (outbound messages, webhook callbacks) | ~1,000 (agent.rs + messaging.rs + server/) | None significant |
 | #1259-E | `task_state/` (task lifecycle, status transitions) | ~2,500 (agent.rs + task_engine/ + db.rs) | None — but incorporates task_engine/ |
 | #1259-F | `commitments/` (promise tracking, follow-ups, due-date reminders) | ~800 (db.rs primarily — light coverage today) | Depends on task_state/ (Commitment relates-to Task) |
-| #1259-G | `planning/` (plan-doc invariants, dispatch-readiness, agent-loop policy) | ~1,500 (agent.rs primarily) | Depends on evidence/ + tool_execution/ |
+| #1259-G | `planning/` (plan-doc invariants, dispatch-readiness, agent-loop policy) | ~1,500 (agent.rs primarily) | Depends on evidence/ + tool_execution/. **Coupling note (F2):** absorbs `is_groomed(body)` predicate from `auto_pull.rs` if mika#1363 ships first. |
 | #1259-H | `agent_loop/` (iteration: retrieve-context → build-prompt → LLM → match → execute) | ~2,500 (agent.rs core loop) | Depends on planning/ + tool_execution/ |
 | #1259-I | `dashboard_queries/` (read-side aggregation) | ~1,200 (db.rs read methods + server/dashboard*) | None — leaf module |
 
-Total LoC moved: ~16,000 (matches the 29k → 2k+2k target from AC5).
+Total LoC moved: ~16,000 (lower-bound estimate). The 29k → 4k AC5 target requires ~25k LoC moved; the ~9k gap reflects:
+- **Estimate conservatism**: per-module estimates are lower bounds. Actual extraction will likely reach 20-22k LoC moved as functions imported from modules like `task_engine/`, `tools/`, `bundled_skills.rs` get relocated under their new operational domain owners.
+- **Some lines are shared utilities** (small helper functions used by 3+ modules) that consolidate into a single new module owner, not double-counted.
+- **AC5's ~2k target is aspirational**, not the gate. Final residual measured after all 9 sub-issues ship — if residual is materially above ~2k each, the parent ticket gets a follow-up sub-issue (#1259-J or similar) for the rest. Decomposition-progress matters more than hitting exact line counts.
+
+**The ~16k estimate is the plan-time baseline for sub-issue scoping; actual extraction may be larger. Sub-issue grooms will refine the per-module LoC estimates at canvass time.**
 
 ## Sequencing
 
