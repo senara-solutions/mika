@@ -1570,20 +1570,19 @@ async fn webhook_milestone_advance_single_retry_semantics() {
 async fn webhook_milestone_advance_no_marker_no_fire() {
     let harness = EvalHarness::builder()
         .responses(vec![
-            // Step 1: Text-only EndTurn — webhook_milestone_advance guard
-            // should NOT fire (no marker). However, the `webhook_zero_tools`
-            // INTENT_GUARD (entry c) WILL fire on `[GitHub]` messages with
-            // zero tool calls. After that single retry:
+            // Single step: text-only EndTurn — both `webhook_milestone_advance`
+            // and `webhook_zero_tools` should NOT fire.
+            //
+            // Post-mika#1469: `webhook_zero_tools` no longer fires on
+            // `[GitHub] PR closed:` messages (added to the trigger's prefix-skip
+            // list — see agent.rs `webhook_zero_tools_trigger`). PR-closed events
+            // for out-of-band PRs are always informational; the agent's text-only
+            // acknowledgement is the correct response and the engine accepts it
+            // without re-prompting.
+            //
+            // `webhook_milestone_advance` separately does NOT fire because the
+            // message carries no `[milestone-parent: ...]` marker.
             text_response("PR merged. No milestone context."),
-            // Step 2: After webhook_zero_tools re-prompt, agent calls a tool
-            // and responds. Still no milestone advance guard fire because
-            // there's no [milestone-parent:] marker.
-            tool_call_response(
-                "update_task_status",
-                json!({"task_id": "some-task", "status": "completed"}),
-            ),
-            // Step 3: Final text
-            text_response("Task updated after webhook zero-tools correction."),
         ])
         .tools(tools_with_webhook_milestone_stubs())
         .build()
@@ -1601,9 +1600,10 @@ async fn webhook_milestone_advance_no_marker_no_fire() {
         .unwrap();
 
     assert_has_output(&trace);
-    // 3 steps — webhook_zero_tools fires once, but webhook_milestone_advance
-    // does NOT fire (no milestone-parent marker present).
-    assert_exact_steps(&trace, 3);
+    // 1 step — post-mika#1469, `[GitHub] PR closed:` is in the
+    // `webhook_zero_tools` prefix-skip list, so no guard re-prompt fires
+    // and the text-only EndTurn is accepted on the first step.
+    assert_exact_steps(&trace, 1);
 }
 
 // ---------------------------------------------------------------------------
