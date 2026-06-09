@@ -301,7 +301,262 @@ struct SetWebhookPayload {
     max_connections: u32,
 }
 
-/// Telegram API client wrapper.
+// -- Shared helpers used by both TelegramClient and CustomerTelegramClient --
+
+/// Build a Telegram Bot API method URL for the given token and method.
+fn api_url(bot_token: &str, method: &str) -> String {
+    format!("https://api.telegram.org/bot{bot_token}/{method}")
+}
+
+/// Validate a file_path returned by Telegram's `getFile` API.
+///
+/// Rejects empty paths, leading slashes, path traversal (`..`), and URL
+/// manipulation characters (`@`, `?`, `#`) that could redirect the download
+/// request and leak the bot token embedded in the URL.
+fn validate_file_path(file_path: &str) -> Result<(), TelegramApiError> {
+    if file_path.is_empty() {
+        return Err(TelegramApiError::BadRequest {
+            message: "invalid file_path from Telegram API: empty".to_string(),
+        });
+    }
+    if file_path.starts_with('/') {
+        return Err(TelegramApiError::BadRequest {
+            message: "invalid file_path from Telegram API: starts with /".to_string(),
+        });
+    }
+    if file_path.contains("..") {
+        return Err(TelegramApiError::BadRequest {
+            message: "invalid file_path from Telegram API: contains ..".to_string(),
+        });
+    }
+    for ch in ['@', '?', '#'] {
+        if file_path.contains(ch) {
+            return Err(TelegramApiError::BadRequest {
+                message: format!("invalid file_path from Telegram API: contains '{ch}'"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Send a text message to a chat via the Telegram Bot API.
+/// Shared implementation for both client types. Returns the Telegram message_id on success.
+async fn send_message_impl(
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    text: &str,
+) -> Result<i64, TelegramApiError> {
+    let payload = SendMessagePayload {
+        chat_id,
+        text: text.to_string(),
+    };
+
+    let resp = client
+        .post(api_url(bot_token, "sendMessage"))
+        .json(&payload)
+        .send()
+        .await?;
+
+    let status = resp.status().as_u16();
+    if status == 200 {
+        let send_resp: TelegramSendResponse =
+            resp.json().await.map_err(|e| TelegramApiError::Other {
+                status: 200,
+                body: format!("failed to parse sendMessage response: {e}"),
+            })?;
+        let message_id = match send_resp.result {
+            Some(r) => r.message_id,
+            None => {
+                warn!(
+                    chat_id,
+                    "telegram sendMessage returned 200 but no result — using message_id 0, reply routing will not work"
+                );
+                0
+            }
+        };
+        return Ok(message_id);
+    }
+
+    let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
+        ok: false,
+        description: None,
+        parameters: None,
+    });
+
+    match status {
+        401 => Err(TelegramApiError::Unauthorized),
+        403 => Err(TelegramApiError::BotBlocked),
+        429 => Err(TelegramApiError::RateLimited {
+            retry_after: body.parameters.and_then(|p| p.retry_after),
+        }),
+        400 => Err(TelegramApiError::BadRequest {
+            message: body.description.unwrap_or_default(),
+        }),
+        _ => Err(TelegramApiError::Other {
+            status,
+            body: body.description.unwrap_or_default(),
+        }),
+    }
+}
+
+/// Resolve a file_id to a file_path via Telegram's `getFile` API.
+async fn get_file_impl(
+    client: &Client,
+    bot_token: &str,
+    file_id: &str,
+) -> Result<String, TelegramApiError> {
+    let url = api_url(bot_token, "getFile");
+    let resp = client
+        .get(&url)
+        .query(&[("file_id", file_id)])
+        .send()
+        .await?;
+
+    let status = resp.status().as_u16();
+    if status != 200 {
+        let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
+            ok: false,
+            description: None,
+            parameters: None,
+        });
+        return match status {
+            401 => Err(TelegramApiError::Unauthorized),
+            429 => Err(TelegramApiError::RateLimited {
+                retry_after: body.parameters.and_then(|p| p.retry_after),
+            }),
+            _ => Err(TelegramApiError::Other {
+                status,
+                body: body.description.unwrap_or_default(),
+            }),
+        };
+    }
+
+    let file_resp: GetFileResponse = resp.json().await.map_err(|e| TelegramApiError::Other {
+        status: 200,
+        body: format!("failed to parse getFile response: {e}"),
+    })?;
+
+    file_resp
+        .result
+        .and_then(|f| f.file_path)
+        .ok_or(TelegramApiError::Other {
+            status: 200,
+            body: "getFile returned no file_path".to_string(),
+        })
+}
+
+/// Download file bytes from Telegram's file server.
+///
+/// Validates `file_path` against traversal/URL-manipulation attacks, then
+/// checks the `Content-Length` header before reading the body to reject
+/// oversized files early (avoids buffering up to 20 MB only to discard).
+async fn download_file_bytes_impl(
+    client: &Client,
+    bot_token: &str,
+    file_path: &str,
+) -> Result<Bytes, TelegramApiError> {
+    validate_file_path(file_path)?;
+
+    let url = format!(
+        "https://api.telegram.org/file/bot{}/{}",
+        bot_token, file_path
+    );
+    let resp = client.get(&url).send().await?;
+
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return Err(TelegramApiError::Other {
+            status,
+            body: format!("file download returned {status}"),
+        });
+    }
+
+    if let Some(content_length) = resp.content_length()
+        && content_length as usize > MAX_IMAGE_BYTES
+    {
+        return Err(TelegramApiError::BadRequest {
+            message: format!(
+                "file too large ({:.1} MB, max {} MB)",
+                content_length as f64 / 1_048_576.0,
+                MAX_IMAGE_BYTES / 1_048_576
+            ),
+        });
+    }
+
+    let bytes = resp.bytes().await?;
+    Ok(bytes)
+}
+
+/// Download an image by file_id: resolves path, downloads bytes, validates magic bytes, enforces size limit.
+async fn download_image_impl(
+    client: &Client,
+    bot_token: &str,
+    file_id: &str,
+) -> Result<DownloadedImage, TelegramApiError> {
+    let file_path = get_file_impl(client, bot_token, file_id).await?;
+    let bytes = download_file_bytes_impl(client, bot_token, &file_path).await?;
+
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(TelegramApiError::BadRequest {
+            message: format!(
+                "image too large ({:.1} MB, max {} MB)",
+                bytes.len() as f64 / 1_048_576.0,
+                MAX_IMAGE_BYTES / 1_048_576
+            ),
+        });
+    }
+
+    let media_type = detect_media_type(&bytes).ok_or(TelegramApiError::BadRequest {
+        message: "unsupported image format".to_string(),
+    })?;
+
+    Ok(DownloadedImage {
+        data: bytes,
+        media_type: media_type.to_string(),
+    })
+}
+
+/// Register the webhook URL with Telegram. Verifies `ok: true` response.
+async fn set_webhook_impl(
+    client: &Client,
+    bot_token: &str,
+    webhook_url: &str,
+    webhook_secret: &str,
+) -> anyhow::Result<()> {
+    let payload = SetWebhookPayload {
+        url: webhook_url.to_string(),
+        secret_token: webhook_secret.to_string(),
+        allowed_updates: vec!["message".to_string()],
+        max_connections: 30,
+    };
+
+    let resp = client
+        .post(api_url(bot_token, "setWebhook"))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("setWebhook request failed: {e}"))?;
+
+    let body: TelegramResponse = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("setWebhook response parse failed: {e}"))?;
+
+    if !body.ok {
+        anyhow::bail!(
+            "setWebhook failed: {}",
+            body.description
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+
+    Ok(())
+}
+
+// -- TelegramClient (global single-bot mode) --
+
+/// Telegram API client wrapper for the global single-bot mode.
 ///
 /// Bot token stored as SecretString — never logged or displayed.
 #[derive(Clone)]
@@ -315,250 +570,63 @@ impl TelegramClient {
         Self { client, bot_token }
     }
 
-    fn api_url(&self, method: &str) -> String {
-        format!(
-            "https://api.telegram.org/bot{}/{}",
-            self.bot_token.expose_secret(),
-            method
-        )
-    }
-
-    /// Send a text message to a chat. Returns the Telegram message_id on success.
-    pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64, TelegramApiError> {
-        let payload = SendMessagePayload {
-            chat_id,
-            text: text.to_string(),
-        };
-
-        let resp = self
-            .client
-            .post(self.api_url("sendMessage"))
-            .json(&payload)
-            .send()
-            .await?;
-
-        let status = resp.status().as_u16();
-        if status == 200 {
-            // Parse the message_id from the successful response
-            let send_resp: TelegramSendResponse =
-                resp.json().await.map_err(|e| TelegramApiError::Other {
-                    status: 200,
-                    body: format!("failed to parse sendMessage response: {e}"),
-                })?;
-            let message_id = match send_resp.result {
-                Some(r) => r.message_id,
-                None => {
-                    warn!(
-                        chat_id,
-                        "telegram sendMessage returned 200 but no result — using message_id 0, reply routing will not work"
-                    );
-                    0
-                }
-            };
-            return Ok(message_id);
-        }
-
-        let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
-            ok: false,
-            description: None,
-            parameters: None,
-        });
-
-        match status {
-            401 => Err(TelegramApiError::Unauthorized),
-            403 => Err(TelegramApiError::BotBlocked),
-            429 => Err(TelegramApiError::RateLimited {
-                retry_after: body.parameters.and_then(|p| p.retry_after),
-            }),
-            400 => Err(TelegramApiError::BadRequest {
-                message: body.description.unwrap_or_default(),
-            }),
-            _ => Err(TelegramApiError::Other {
-                status,
-                body: body.description.unwrap_or_default(),
-            }),
-        }
-    }
-
-    /// Resolve a file_id to a file_path via Telegram's `getFile` API.
-    async fn get_file(&self, file_id: &str) -> Result<String, TelegramApiError> {
-        let url = self.api_url("getFile");
-        let resp = self
-            .client
-            .get(&url)
-            .query(&[("file_id", file_id)])
-            .send()
-            .await?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
-                ok: false,
-                description: None,
-                parameters: None,
-            });
-            return match status {
-                401 => Err(TelegramApiError::Unauthorized),
-                429 => Err(TelegramApiError::RateLimited {
-                    retry_after: body.parameters.and_then(|p| p.retry_after),
-                }),
-                _ => Err(TelegramApiError::Other {
-                    status,
-                    body: body.description.unwrap_or_default(),
-                }),
-            };
-        }
-
-        let file_resp: GetFileResponse =
-            resp.json().await.map_err(|e| TelegramApiError::Other {
-                status: 200,
-                body: format!("failed to parse getFile response: {e}"),
-            })?;
-
-        file_resp
-            .result
-            .and_then(|f| f.file_path)
-            .ok_or(TelegramApiError::Other {
-                status: 200,
-                body: "getFile returned no file_path".to_string(),
-            })
-    }
-
-    /// Validate a file_path returned by Telegram's `getFile` API.
-    ///
-    /// Rejects empty paths, leading slashes, path traversal (`..`), and URL
-    /// manipulation characters (`@`, `?`, `#`) that could redirect the download
-    /// request and leak the bot token embedded in the URL.
-    fn validate_file_path(file_path: &str) -> Result<(), TelegramApiError> {
-        if file_path.is_empty() {
-            return Err(TelegramApiError::BadRequest {
-                message: "invalid file_path from Telegram API: empty".to_string(),
-            });
-        }
-        if file_path.starts_with('/') {
-            return Err(TelegramApiError::BadRequest {
-                message: "invalid file_path from Telegram API: starts with /".to_string(),
-            });
-        }
-        if file_path.contains("..") {
-            return Err(TelegramApiError::BadRequest {
-                message: "invalid file_path from Telegram API: contains ..".to_string(),
-            });
-        }
-        for ch in ['@', '?', '#'] {
-            if file_path.contains(ch) {
-                return Err(TelegramApiError::BadRequest {
-                    message: format!("invalid file_path from Telegram API: contains '{ch}'"),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Download file bytes from Telegram's file server.
-    ///
-    /// Validates `file_path` against traversal/URL-manipulation attacks, then
-    /// checks the `Content-Length` header before reading the body to reject
-    /// oversized files early (avoids buffering up to 20 MB only to discard).
-    async fn download_file_bytes(&self, file_path: &str) -> Result<Bytes, TelegramApiError> {
-        Self::validate_file_path(file_path)?;
-
-        let url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token.expose_secret(),
-            file_path
-        );
-        let resp = self.client.get(&url).send().await?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(TelegramApiError::Other {
-                status,
-                body: format!("file download returned {status}"),
-            });
-        }
-
-        // Early rejection: check Content-Length header before reading the body.
-        // This avoids downloading files between 5-20 MB just to discard them.
-        if let Some(content_length) = resp.content_length()
-            && content_length as usize > MAX_IMAGE_BYTES
-        {
-            return Err(TelegramApiError::BadRequest {
-                message: format!(
-                    "file too large ({:.1} MB, max {} MB)",
-                    content_length as f64 / 1_048_576.0,
-                    MAX_IMAGE_BYTES / 1_048_576
-                ),
-            });
-        }
-
-        let bytes = resp.bytes().await?;
-        Ok(bytes)
-    }
-
-    /// Download an image by file_id: resolves path, downloads bytes, validates magic bytes, enforces size limit.
-    /// Returns the raw bytes and detected media type.
-    pub async fn download_image(&self, file_id: &str) -> Result<DownloadedImage, TelegramApiError> {
-        let file_path = self.get_file(file_id).await?;
-        let bytes = self.download_file_bytes(&file_path).await?;
-
-        if bytes.len() > MAX_IMAGE_BYTES {
-            return Err(TelegramApiError::BadRequest {
-                message: format!(
-                    "image too large ({:.1} MB, max {} MB)",
-                    bytes.len() as f64 / 1_048_576.0,
-                    MAX_IMAGE_BYTES / 1_048_576
-                ),
-            });
-        }
-
-        let media_type = detect_media_type(&bytes).ok_or(TelegramApiError::BadRequest {
-            message: "unsupported image format".to_string(),
-        })?;
-
-        Ok(DownloadedImage {
-            data: bytes,
-            media_type: media_type.to_string(),
-        })
+    /// Clone the bot token (for constructing a `CustomerTelegramClient` from the global token).
+    pub fn bot_token_cloned(&self) -> SecretString {
+        SecretString::from(self.bot_token.expose_secret().to_string())
     }
 
     /// Register the webhook URL with Telegram. Verifies `ok: true` response.
     pub async fn set_webhook(&self, webhook_url: &str, webhook_secret: &str) -> anyhow::Result<()> {
-        let payload = SetWebhookPayload {
-            url: webhook_url.to_string(),
-            secret_token: webhook_secret.to_string(),
-            allowed_updates: vec!["message".to_string()],
-            max_connections: 30,
-        };
-
-        let resp = self
-            .client
-            .post(self.api_url("setWebhook"))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("setWebhook request failed: {e}"))?;
-
-        let body: TelegramResponse = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("setWebhook response parse failed: {e}"))?;
-
-        if !body.ok {
-            anyhow::bail!(
-                "setWebhook failed: {}",
-                body.description
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
-
-        Ok(())
+        set_webhook_impl(
+            &self.client,
+            self.bot_token.expose_secret(),
+            webhook_url,
+            webhook_secret,
+        )
+        .await
     }
 }
 
 impl std::fmt::Debug for TelegramClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelegramClient")
+            .field("bot_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// -- CustomerTelegramClient (per-customer bot token) --
+
+/// Lightweight Telegram API client for per-customer bot tokens.
+///
+/// Shares the `reqwest::Client` connection pool from `AppState` but carries
+/// a customer-specific bot token. Constructed per-request from the customer's
+/// `bot_token` column in the `customers` table.
+#[derive(Clone)]
+pub struct CustomerTelegramClient {
+    client: Client,
+    bot_token: SecretString,
+}
+
+impl CustomerTelegramClient {
+    pub fn new(client: Client, bot_token: SecretString) -> Self {
+        Self { client, bot_token }
+    }
+
+    /// Send a text message to a chat. Returns the Telegram message_id on success.
+    pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64, TelegramApiError> {
+        send_message_impl(&self.client, self.bot_token.expose_secret(), chat_id, text).await
+    }
+
+    /// Download an image by file_id: resolves path, downloads bytes, validates magic bytes, enforces size limit.
+    pub async fn download_image(&self, file_id: &str) -> Result<DownloadedImage, TelegramApiError> {
+        download_image_impl(&self.client, self.bot_token.expose_secret(), file_id).await
+    }
+}
+
+impl std::fmt::Debug for CustomerTelegramClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomerTelegramClient")
             .field("bot_token", &"[REDACTED]")
             .finish()
     }
@@ -1164,53 +1232,81 @@ mod tests {
 
     #[test]
     fn test_validate_file_path_accepts_normal_path() {
-        assert!(TelegramClient::validate_file_path("photos/file_1.jpg").is_ok());
+        assert!(validate_file_path("photos/file_1.jpg").is_ok());
     }
 
     #[test]
     fn test_validate_file_path_accepts_nested_path() {
-        assert!(TelegramClient::validate_file_path("documents/user/photo.png").is_ok());
+        assert!(validate_file_path("documents/user/photo.png").is_ok());
     }
 
     #[test]
     fn test_validate_file_path_rejects_empty() {
-        let err = TelegramClient::validate_file_path("").unwrap_err();
+        let err = validate_file_path("").unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
     #[test]
     fn test_validate_file_path_rejects_leading_slash() {
-        let err = TelegramClient::validate_file_path("/etc/passwd").unwrap_err();
+        let err = validate_file_path("/etc/passwd").unwrap_err();
         assert!(err.to_string().contains("starts with /"));
     }
 
     #[test]
     fn test_validate_file_path_rejects_traversal() {
-        let err = TelegramClient::validate_file_path("photos/../../etc/passwd").unwrap_err();
+        let err = validate_file_path("photos/../../etc/passwd").unwrap_err();
         assert!(err.to_string().contains("contains .."));
     }
 
     #[test]
     fn test_validate_file_path_rejects_bare_traversal() {
-        let err = TelegramClient::validate_file_path("..").unwrap_err();
+        let err = validate_file_path("..").unwrap_err();
         assert!(err.to_string().contains("contains .."));
     }
 
     #[test]
     fn test_validate_file_path_rejects_at_sign() {
-        let err = TelegramClient::validate_file_path("photos/@evil.com/file").unwrap_err();
+        let err = validate_file_path("photos/@evil.com/file").unwrap_err();
         assert!(err.to_string().contains("contains '@'"));
     }
 
     #[test]
     fn test_validate_file_path_rejects_question_mark() {
-        let err = TelegramClient::validate_file_path("photos/file?token=leak").unwrap_err();
+        let err = validate_file_path("photos/file?token=leak").unwrap_err();
         assert!(err.to_string().contains("contains '?'"));
     }
 
     #[test]
     fn test_validate_file_path_rejects_hash() {
-        let err = TelegramClient::validate_file_path("photos/file#fragment").unwrap_err();
+        let err = validate_file_path("photos/file#fragment").unwrap_err();
         assert!(err.to_string().contains("contains '#'"));
+    }
+
+    // -- api_url tests --
+
+    #[test]
+    fn test_api_url_constructs_correct_url() {
+        let url = api_url("123456:ABC-DEF", "sendMessage");
+        assert_eq!(
+            url,
+            "https://api.telegram.org/bot123456:ABC-DEF/sendMessage"
+        );
+    }
+
+    #[test]
+    fn test_api_url_get_file() {
+        let url = api_url("tok", "getFile");
+        assert_eq!(url, "https://api.telegram.org/bottok/getFile");
+    }
+
+    // -- CustomerTelegramClient tests --
+
+    #[test]
+    fn test_customer_telegram_client_debug_redacts_token() {
+        let client =
+            CustomerTelegramClient::new(Client::new(), SecretString::from("123456:ABC-DEF"));
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("ABC-DEF"));
+        assert!(debug.contains("[REDACTED]"));
     }
 }
