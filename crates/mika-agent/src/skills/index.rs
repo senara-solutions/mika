@@ -452,6 +452,15 @@ pub struct ScanResult {
 
 /// Scan a skills directory and load all valid skill manifests.
 ///
+/// Returns `true` if `name` is a valid bundled-skill directory name.
+///
+/// Rejects empty names, dotfile prefixes (`.`), and underscore prefixes (`_`).
+/// Mirrors `build_support::bundled_skills_discover::is_bundled_skill_dir` —
+/// both must stay in sync per CLAUDE.md skills/bundled/ contract.
+fn is_bundled_skill_dir(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && !name.starts_with('_')
+}
+
 /// Each immediate subdirectory is expected to contain a `skill.toml`.
 /// Invalid skills are logged at `warn` and skipped — never break startup.
 /// Legacy-format skills (has `[handler]` section) are skipped with a
@@ -485,13 +494,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> ScanResult {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
 
-        // Skip dotfiles (.gitkeep, .DS_Store, etc.) and underscore-prefixed
-        // support directories (_shared/, _templates/, etc.) — convention reserved
-        // for non-skill plumbing per CLAUDE.md skills/bundled/ contract.
-        // Mirrors the filter in `build_support/bundled_skills_discover.rs`. DRY
-        // violation: file follow-up to extract a shared `is_bundled_skill_dir(&str) -> bool`
-        // helper consumed by both build-time and runtime scanners.
-        if dir_name.starts_with('.') || dir_name.starts_with('_') {
+        if !is_bundled_skill_dir(dir_name) {
             continue;
         }
 
