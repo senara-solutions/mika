@@ -411,7 +411,18 @@ fn build_agent_kg_states(
                     let resolved = db
                         .kg_count_resolved_for_corpus(agent_name, &corpus.docs_root_hash)
                         .unwrap_or(0);
-                    let pending = subjects.saturating_sub(resolved);
+                    // Pending = resolver-actionable subjects only (#999).
+                    // Mirrors the resolver's 5-type allowlist (skill/tool/agent/
+                    // problem_type/concept). Excludes subject-graph-only types
+                    // (pattern/failure_mode/solution_path) which the resolver
+                    // intentionally never processes — counting them as "pending"
+                    // misled operators into chasing non-existent backlog.
+                    let pending = db
+                        .kg_count_pending_resolver_actionable_for_corpus(
+                            agent_name,
+                            &corpus.docs_root_hash,
+                        )
+                        .unwrap_or(0);
                     let last_extraction =
                         db.kg_last_extraction(&corpus.docs_root_hash).ok().flatten();
 
