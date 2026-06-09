@@ -24,6 +24,17 @@ use telegram::TelegramClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install rustls aws-lc-rs CryptoProvider before any TLS operation. Both
+    // aws-lc-rs and ring are compiled in transitively (sqlx via tls-rustls-aws-lc-rs
+    // and reqwest via rustls-tls-native-roots), so rustls cannot auto-select a
+    // process-default crypto provider. Mirrors the mika-cloud console fix
+    // (mika-cloud#97). Resolves "TLS upgrade required by connect options but
+    // SQLx was built without TLS support enabled" when connecting to RDS with
+    // force_ssl=1.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls aws-lc-rs CryptoProvider");
+
     // Load .env from CWD (gateway has no ~/.mika/ home directory)
     let _ = dotenvy::dotenv();
 
