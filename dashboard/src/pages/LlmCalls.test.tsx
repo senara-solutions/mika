@@ -6,7 +6,7 @@ import LlmCalls from './LlmCalls.tsx'
 
 // Mock recharts to avoid rendering issues in jsdom
 vi.mock('recharts', () => ({
-  AreaChart: ({ children }: { children: React.ReactNode }) => <div data-testid="area-chart">{children}</div>,
+  AreaChart: ({ children }: { children: React.ReactNode }) => <svg data-testid="area-chart">{children}</svg>,
   Area: ({ dataKey }: { dataKey: string }) => <div data-testid={`area-${dataKey}`} />,
   XAxis: () => <div data-testid="x-axis" />,
   YAxis: () => <div data-testid="y-axis" />,
