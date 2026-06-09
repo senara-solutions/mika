@@ -82,6 +82,8 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 
 **Key invariant:** The database is shared across all agents (`~/.mika/data/mika.db`). Agent/team home directories are used only for config, skills, and file I/O — never for database paths. Always use `home::container_db_path()`.
 
+**Remote mode bypass (R1 ascension architecture, 2026-06-09):** `mika ask --remote <URL>` (or `MIKA_REMOTE_AGENT_URL`) dispatches via A2A to a cloud Mika agent. The local `~/.mika/data/mika.db` is **not touched** in this path — no session row, no messages, no LLM call accounting. Session state for the conversation lives on the cloud agent's container. The runtime directory is still consulted for `.env` loading (auth tokens), but no writes occur.
+
 ### Bundled-Skill Library + Per-Agent Symlinks (mika#1213)
 
 Bundled skills use a **canonical runtime library** at `~/.mika/skills/` with **per-agent symlinks**. On startup, `seed_bundled_skills_if_needed()` performs two concerns:

@@ -226,6 +226,16 @@ pub struct AskArgs {
     /// Useful for cross-command integration where downstream consumers need session context.
     #[arg(long, conflicts_with = "team")]
     pub verbose: bool,
+
+    /// Remote Mika endpoint to proxy this ask to (e.g.,
+    /// `https://gw.example.com/a2a/{customer_id}/{agent}`). When set, bypasses the
+    /// local in-process agent loop and dispatches via the A2A protocol. Also settable
+    /// via the `MIKA_REMOTE_AGENT_URL` env var. The flag overrides the env var when
+    /// both are set (env precedence handled in `main.rs` since the workspace clap
+    /// does not enable the `env` feature). Authentication uses `MIKA_INTERNAL_TOKEN`
+    /// as a bearer header. Conflicts with `--team` (team mode runs locally).
+    #[arg(long, conflicts_with = "team")]
+    pub remote: Option<String>,
 }
 
 #[derive(clap::Args)]
