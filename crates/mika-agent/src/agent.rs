@@ -5847,10 +5847,22 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
              [GitHub] events (comments, other labels, edits) use Webhook \
              Fallthrough: the engine expects acknowledgement without dispatching.",
     },
-    // #696 — webhook events require at least one successful tool call.
+    // #696, #1469 — webhook events require at least one successful tool call.
+    //
+    // Prefix-narrowed (mika#1469): three always-informational event classes are
+    // excluded from the trigger so the guard does not misfire on no-op webhooks:
+    //   - `[GitHub] Check suite success on …` — no agent action for green CI
+    //   - `[GitHub] PR closed: …` — informational; merge/close is complete
+    //   - `[GitHub] discussion.*` — discussion events have no actionable response
+    //
+    // These three classes produced 25+ documented misfires (2026-06-09) where
+    // the guard pressured the agent to call a tool just to satisfy the
+    // precondition.  Correlation-aware filtering for the remaining long-tail
+    // misfires (e.g., CI failure on untracked branches) is deferred to a
+    // follow-up — see mika#1469 plan § Deferred to Follow-Up Work.
     IntentPrecondition {
         label: "webhook_zero_tools",
-        trigger: |msg| msg.starts_with("[GitHub]"),
+        trigger: webhook_zero_tools_trigger,
         satisfied: |summaries| summaries.iter().any(|s| s.success),
         correction_message: "[mika-engine] A GitHub webhook event was received but the \
              response was text-only with zero tool calls. Webhook events require \
@@ -5957,6 +5969,28 @@ fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
     summaries
         .iter()
         .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
+}
+
+/// #696, #1469 — Triggers on `[GitHub]` webhook turns that are potentially
+/// action-bearing.  Excludes three always-informational prefix classes that
+/// have no actionable response regardless of correlation state:
+///   - `Check suite success on` — green CI, nothing to do
+///   - `PR closed:` — merge/close is terminal
+///   - `discussion.` — discussion events are informational
+///
+/// See mika#1469 for the empirical misfire evidence (25+ incidents).
+fn webhook_zero_tools_trigger(msg: &str) -> bool {
+    if !msg.starts_with("[GitHub]") {
+        return false;
+    }
+    // Skip: always-informational event classes (mika#1469).
+    if msg.starts_with("[GitHub] Check suite success on")
+        || msg.starts_with("[GitHub] PR closed:")
+        || msg.starts_with("[GitHub] discussion.")
+    {
+        return false;
+    }
+    true
 }
 
 /// #910, #1102 — Triggers on `[GitHub]` webhook turns that represent
@@ -10542,6 +10576,70 @@ mod tests {
              webhook_zero_tools (idx={zero_idx}) so the more specific trigger \
              fires first"
         );
+    }
+
+    // -- #1469 webhook_zero_tools_trigger prefix-narrowing tests --
+
+    #[test]
+    fn webhook_zero_tools_trigger_skips_check_suite_success() {
+        assert!(!webhook_zero_tools_trigger(
+            "[GitHub] Check suite success on senara-solutions/mika (branch: main)"
+        ));
+    }
+
+    #[test]
+    fn webhook_zero_tools_trigger_skips_pr_closed() {
+        assert!(!webhook_zero_tools_trigger(
+            "[GitHub] PR closed: senara-solutions/mika#1000 — title (branch: foo)"
+        ));
+    }
+
+    #[test]
+    fn webhook_zero_tools_trigger_skips_discussion() {
+        assert!(!webhook_zero_tools_trigger(
+            "[GitHub] discussion.created on senara-solutions/mika"
+        ));
+    }
+
+    #[test]
+    fn webhook_zero_tools_trigger_fires_on_check_suite_failure() {
+        assert!(webhook_zero_tools_trigger(
+            "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/foo)"
+        ));
+    }
+
+    #[test]
+    fn webhook_zero_tools_trigger_fires_on_ready_label() {
+        assert!(webhook_zero_tools_trigger(
+            "[GitHub] Issue labeled ready on senara-solutions/mika#933 — title"
+        ));
+    }
+
+    #[test]
+    fn webhook_zero_tools_trigger_fires_on_pr_review() {
+        assert!(webhook_zero_tools_trigger(
+            "[GitHub] PR review (approved) on senara-solutions/mika#1000 (title) by @reviewer"
+        ));
+    }
+
+    #[test]
+    fn webhook_zero_tools_trigger_fires_on_new_comment() {
+        assert!(webhook_zero_tools_trigger(
+            "[GitHub] New comment on senara-solutions/mika#933 (title) by @samidarko"
+        ));
+    }
+
+    #[test]
+    fn webhook_zero_tools_trigger_fires_on_non_ready_label() {
+        assert!(webhook_zero_tools_trigger(
+            "[GitHub] Issue labeled bug on senara-solutions/mika#999"
+        ));
+    }
+
+    #[test]
+    fn webhook_zero_tools_trigger_skips_non_github() {
+        assert!(!webhook_zero_tools_trigger("[Slack] message"));
+        assert!(!webhook_zero_tools_trigger(""));
     }
 
     // -- #910 webhook_no_unauthorized_dispatch trigger tests --
