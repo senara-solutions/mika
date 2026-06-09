@@ -386,7 +386,7 @@ impl TaskEngine {
         };
 
         let stale_threshold =
-            chrono::Duration::minutes(crate::agent::STALE_FAILED_CALLBACK_MINUTES);
+            chrono::Duration::minutes(crate::planning::policy::STALE_FAILED_CALLBACK_MINUTES);
         let mut stale_skipped: usize = 0;
 
         let now = crate::timestamp::now();
