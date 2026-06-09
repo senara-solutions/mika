@@ -4,7 +4,7 @@ import CostTrendChart, { type CostTrendBucket, type ChartVariant } from './CostT
 
 // Mock recharts to avoid rendering issues in jsdom
 vi.mock('recharts', () => ({
-  AreaChart: ({ children }: { children: React.ReactNode }) => <div data-testid="area-chart">{children}</div>,
+  AreaChart: ({ children }: { children: React.ReactNode }) => <svg data-testid="area-chart">{children}</svg>,
   Area: ({ dataKey, name }: { dataKey: string; name?: string }) => <div data-testid={`area-${dataKey}`} data-name={name} />,
   XAxis: () => <div data-testid="x-axis" />,
   YAxis: () => <div data-testid="y-axis" />,
