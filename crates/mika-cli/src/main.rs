@@ -244,6 +244,32 @@ async fn main() -> Result<()> {
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
         Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
         Some(Commands::Ask(args)) => {
+            // Remote mode (R1, plan 2026-06-09-003): bypass the in-process agent loop and
+            // dispatch to a cloud Mika agent via the gateway's A2A proxy. Flag wins over env.
+            let remote_url = args
+                .remote
+                .clone()
+                .or_else(|| std::env::var("MIKA_REMOTE_AGENT_URL").ok());
+            if let Some(remote_url) = remote_url.as_deref() {
+                let fmt = match args.format {
+                    cli::OutputFormat::Text => mika_cli::remote_ask::OutputFormat::Text,
+                    cli::OutputFormat::Json => mika_cli::remote_ask::OutputFormat::Json,
+                };
+                return match mika_cli::remote_ask::run_remote(
+                    &args.message,
+                    remote_url,
+                    fmt,
+                    args.verbose,
+                )
+                .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        eprintln!("Error: {e:#}");
+                        std::process::exit(1);
+                    }
+                };
+            }
             match commands::ask::run(
                 &args.message,
                 &agent_name,
