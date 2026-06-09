@@ -274,6 +274,15 @@ components:
         chat_id:
           type: integer
           format: int64
+        customer_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: |-
+            Customer ID for per-customer bot token lookup.
+            When present, the gateway looks up the customer's bot token and sends
+            via their bot. When absent, falls back to the global single-bot client.
         request_id:
           type:
           - string

@@ -59,11 +59,20 @@ All existing `TelegramClient` methods (`send_message`, `download_image`, `get_fi
 
 **Rationale:** The agent pod already knows its `customer_id` (it's the container identity). Looking up bot_token by `chat_id` would require joining `customers` on a non-indexed path and is fragile when a customer hasn't paired yet (no `telegram_chat_id`). Primary key lookup is O(1).
 
-### KTD-3: Bot token storage — plaintext in Postgres
+### KTD-3: Bot token storage — ESCALATE to operator (security boundary decision)
 
-**Decision:** Store `bot_token` as `TEXT` in the `customers` table, wrapped in `SecretString` in Rust code. No pgcrypto column-level encryption in this PR.
+**Status: Requires operator sign-off.** Two sound but conflicting arguments exist. The plan cannot unilaterally override the issue body's explicit security guidance. Citation: user_summary ("Operator can correct spec; architect cannot ratify divergence unilaterally"); review-guide.md § Orthogonality (security boundary decisions propagate to every consumer of the customers table).
 
-**Rationale:** The gateway already holds `MIKA_TELEGRAM_BOT_TOKEN` in process memory. The customers table is in the same trust boundary (gateway's own Postgres). Per-customer k8s Secret lookups would add N API calls per webhook (unacceptable latency at the webhook path). Encrypt-at-rest via Postgres TDE or pgcrypto is a follow-up concern.
+**Option A — Plaintext in Postgres (plan's original position):**
+Store `bot_token` as `TEXT` in the `customers` table, wrapped in `SecretString` in Rust code. The gateway already holds `MIKA_TELEGRAM_BOT_TOKEN` in process memory. The customers table is in the same trust boundary (gateway's own Postgres). Per-customer k8s Secret lookups would add N API calls per webhook (unacceptable latency at the webhook path — every inbound message would pay a k8s API call).
+
+**Option B — k8s Secret refs (issue body's position):**
+Store a secret-ref to a per-customer k8s Secret object. Gateway reads on-demand. Matches the existing `mika-agent-{id}-secrets` pattern. Avoids pgcrypto operational complexity. The latency concern is real but could be mitigated by caching.
+
+**Option C — Middle ground (proposed):**
+Store `bot_token` in Postgres but encrypted via `pgp_sym_encrypt` (pgcrypto). Gateway holds a symmetric key (from env var `MIKA_BOT_TOKEN_ENCRYPTION_KEY`). Query becomes `SELECT pgp_sym_decrypt(bot_token, $key) FROM customers WHERE id = $1`. This addresses the encrypt-at-rest intent (a DB dump does not leak plaintext tokens) while keeping the lookup to a single Postgres query (no k8s API latency). Operational cost: one additional env var on the gateway, pgcrypto extension enabled in Postgres.
+
+**Implementation note:** Until the operator decides, this plan implements **Option A** (plaintext + `SecretString` in Rust) as the structural default. The column type is `TEXT` regardless of option chosen — Option C wraps the value at write time, transparent to the schema. Switching from A to C is a non-breaking follow-up (backfill existing rows + add decryption to the SELECT).
 
 ### KTD-4: Webhook registration — not in gateway startup
 
@@ -86,8 +95,8 @@ All existing `TelegramClient` methods (`send_message`, `download_image`, `get_fi
 
 ### Deferred to Follow-Up Work
 - **mika-cloud provisioning**: `setWebhook`/`deleteWebhook` calls at customer create/delete time (separate mika-cloud ticket)
-- **Helm chart updates**: Remove gateway-level `MIKA_TELEGRAM_BOT_TOKEN` from `mika-cloud/helm/mika-gateway/values.yaml`
-- **pgcrypto encryption**: Column-level encryption for `bot_token` in Postgres
+- **Helm chart updates**: Remove gateway-level `MIKA_TELEGRAM_BOT_TOKEN` from `mika-cloud/helm/mika-gateway/values.yaml`. **Note (scope divergence from issue body AC):** The issue body lists "mika-cloud Helm chart updated to remove the obsolete gateway env vars" as an acceptance criterion. This plan defers it because it is a `mika-cloud` repo change, not a `mika` repo change — the plan's scope is the `mika` crate workspace only. The issue body should be updated to move this AC to "Out of scope / Follow-up" with an edit-notice comment per the issue-as-versioned-contract convention. Citation: user_summary (issue-as-versioned-contract)
+- **pgcrypto encryption**: Column-level encryption for `bot_token` in Postgres (see KTD-3 — awaiting operator sign-off on storage approach; if Option C is chosen, this becomes in-scope rather than deferred)
 - **Bot token rotation**: Pattern for customer-initiated token rotation
 - **Admin API**: Endpoint for manual webhook registration (useful for dev/debug)
 - **Webhook registration verification**: Startup health check that validates webhook registration state
@@ -230,8 +239,8 @@ Add a new handler `handle_customer_webhook` that:
 
 1. Extracts `customer_id: Uuid` from the path (Axum `Path` extractor)
 2. Queries `SELECT id, status, bot_token, webhook_secret FROM customers WHERE id = $1` — extend `CustomerRow` or create a new query struct with the additional fields
-3. Validates `x-telegram-bot-api-secret-token` header against the customer's `webhook_secret` using `constant_time_eq`. Returns 401 if invalid. Returns 404 if customer not found (do not distinguish "not found" from "invalid secret" to avoid enumeration)
-4. Returns 401 if `bot_token` is NULL (customer not yet configured for per-customer bot)
+3. Validates `x-telegram-bot-api-secret-token` header against the customer's `webhook_secret` using `constant_time_eq`. Returns **401 Unauthorized** for all failure cases: customer not found, invalid secret, or missing webhook_secret. A single 401 for all three prevents customer_id enumeration (an attacker cannot distinguish valid-but-wrong-secret from nonexistent). Citation: review-guide.md § KISS; standard webhook security practice (Stripe, GitHub webhooks return identical responses for invalid vs missing endpoints).
+4. Returns 401 if `bot_token` is NULL (customer not yet configured for per-customer bot) — same 401, no distinguishable error shape
 5. Parses update via existing `parse_update()`
 6. Constructs `CustomerTelegramClient` from `state.http_client` and the customer's `bot_token`
 7. Dispatches to modified handler functions that accept a generic telegram client
@@ -254,7 +263,7 @@ Approach **(B)** is simpler — `CustomerTelegramClient` is already the right ab
 **Test scenarios:**
 - Valid customer_id + valid webhook_secret → 200, message forwarded to container
 - Valid customer_id + invalid webhook_secret → 401
-- Non-existent customer_id → 404
+- Non-existent customer_id → 401 (unified with invalid-secret to prevent enumeration)
 - Customer with NULL bot_token → 401 (not configured)
 - Customer with status "suspended" → 200 (silent drop, same as existing behavior)
 - UUID parsing failure in path → 400 (Axum's Path extractor handles this)
@@ -331,7 +340,7 @@ Error responses (`BotBlocked` → 410, `RateLimited` → 429, etc.) remain uncha
 
 The `outbound_messages` INSERT for reply routing remains unchanged — it stores `(telegram_message_id, chat_id, agent_name)` regardless of which bot sent the message.
 
-**Note:** Agent pods must start sending `customer_id` in their `/send` payload. This is a backward-compatible additive field — existing agents without `customer_id` fall back to the global bot.
+**Agent-side change required (resolves OQ1):** Agent pods send outbound messages through the gateway's `/send` endpoint via `GatewayMessageSender` (`crates/mika-agent/src/messaging.rs`). The issue body's claim "Already works as-is … No change needed in agent code" is incorrect — the gateway's `/send` handler needs `customer_id` to look up the correct bot token. The required change is small and additive: add `customer_id: Option<String>` to `GatewayMessageSender` (populated from `Settings` or agent identity at construction time in `crates/mika-agent/src/server/mod.rs`), and include it in the JSON payload sent to `/send`. This is a backward-compatible additive field — existing agents without `customer_id` fall back to the global bot. The `GatewayMessageSender` is constructed in ~8 callsites in `server/mod.rs` and `server/handlers.rs`; all receive `customer_id` from the same source (the agent's container identity). This is a **mika-agent change**, not a gateway change, but is required for the gateway's per-customer outbound path to function. The issue body should be updated to correct the "no change needed" statement.
 
 **Patterns to follow:** Existing `handle_send` structure. The `customer_id` field follows the same optional-additive pattern as `request_id` and `agent_name` in `SendPayload`.
 
@@ -369,7 +378,6 @@ The `outbound_messages` INSERT for reply routing remains unchanged — it stores
 - `telegram_bot_token: SecretString` → `telegram_bot_token: Option<SecretString>`
 - `telegram_webhook_secret: SecretString` → `telegram_webhook_secret: Option<SecretString>`
 - Add `telegram_single_bot_mode: Option<String>` (parsed as bool, default false)
-- Add `telegram_webhook_url_template: Option<String>` — base URL template for per-customer webhook URLs (e.g., `https://gateway.getmika.ai/webhook/telegram/{customer_id}`). Used when the gateway needs to construct webhook URLs (future admin endpoint).
 
 **Validation at startup:**
 - If `MIKA_TELEGRAM_SINGLE_BOT_MODE=1`: require `telegram_bot_token` and `telegram_webhook_secret` (fail-fast if missing). Register the global webhook as today.
@@ -384,8 +392,9 @@ The `outbound_messages` INSERT for reply routing remains unchanged — it stores
 - The per-customer `/webhook/telegram/{customer_id}` route is always registered.
 
 **CLAUDE.md updates:**
-- Document `MIKA_TELEGRAM_SINGLE_BOT_MODE`, `MIKA_TELEGRAM_WEBHOOK_URL_TEMPLATE`
+- Document `MIKA_TELEGRAM_SINGLE_BOT_MODE`
 - Note that `MIKA_TELEGRAM_BOT_TOKEN` and `MIKA_TELEGRAM_WEBHOOK_SECRET` are now optional (required only in single-bot mode)
+- `telegram_webhook_url_template` removed per YAGNI — no consumer exists in this plan. Add it in the future ticket that implements webhook registration (admin endpoint or mika-cloud provisioning). Citation: review-guide.md § YAGNI
 
 **Patterns to follow:** The `orchestrator_inbox_enabled` pattern in settings/main for feature-flag gating. The `github_webhook_secret: Option<SecretString>` pattern for optional secrets.
 
@@ -403,8 +412,8 @@ The `outbound_messages` INSERT for reply routing remains unchanged — it stores
 
 ## Open Questions
 
-- **OQ1. Agent-side SendPayload update:** Agent pods need to include `customer_id` in their `/send` requests. The `GatewayMessageSender` in `crates/mika-agent/src/messaging.rs` constructs the `/send` payload — it may already have access to customer_id. If not, this is a small additive change in mika-agent, not gateway. Resolve during implementation.
-- **OQ2. Webhook URL template source:** When mika-cloud calls `setWebhook`, it needs to know the gateway's public URL. Currently `MIKA_TELEGRAM_WEBHOOK_URL` is a single URL. The template pattern (`https://gateway.getmika.ai/webhook/telegram/{customer_id}`) may need to be stored in mika-cloud's provisioning config rather than the gateway. Resolve in the mika-cloud follow-up ticket.
+- **~~OQ1.~~ Agent-side SendPayload update (RESOLVED):** Agent pods send outbound messages via `GatewayMessageSender` (`crates/mika-agent/src/messaging.rs`) through the gateway's `/send` endpoint. `GatewayMessageSender` does NOT currently carry `customer_id`. The required change: add `customer_id: Option<String>` to `GatewayMessageSender`, populated from agent container identity at construction time, and serialize it into the `/send` JSON payload. This contradicts the issue body's "no change needed in agent code" claim — the issue body should be updated. See U5 for the full agent-side change description.
+- **OQ2. Webhook URL template source:** When mika-cloud calls `setWebhook`, it needs to know the gateway's public URL. Currently `MIKA_TELEGRAM_WEBHOOK_URL` is a single URL. The template pattern (`https://gateway.getmika.ai/webhook/telegram/{customer_id}`) belongs in mika-cloud's provisioning config, not the gateway — the gateway does not construct webhook URLs in this plan (KTD-4 defers registration to mika-cloud). Resolve in the mika-cloud follow-up ticket. The `telegram_webhook_url_template` setting was removed from U6 per YAGNI (no consumer in this plan).
 
 ---
 
@@ -425,3 +434,9 @@ The `outbound_messages` INSERT for reply routing remains unchanged — it stores
 - `docs/solutions/best-practices/secretstring-expose-at-boundary-pattern.md` — SecretString handling pattern
 - `docs/solutions/logic-errors/send-message-chat-id-zero-no-channel-sentinel.md` — chat_id=0 sentinel handling (relevant for /send backward compat)
 - `crates/mika-gateway/CLAUDE.md` — gateway architecture reference
+
+---
+
+## Revision history
+
+- rev 2 (2026-06-09): addressed F1 by resolving OQ1 — confirmed agent pods use `GatewayMessageSender` via gateway `/send`, documented required `customer_id` addition to `GatewayMessageSender` in U5, corrected issue body's "no change needed" claim; addressed F2 by adding explicit scope-divergence note to the Helm chart deferral with citation to issue-as-versioned-contract convention; addressed F3 by restructuring KTD-3 as an operator-escalation with three options (plaintext, k8s secret-ref, pgcrypto middle ground) — cannot resolve unilaterally per "operator can correct spec; architect cannot ratify divergence" (architect's call on second-pass); addressed F4 by unifying all webhook validation failures to 401 Unauthorized (customer not found, invalid secret, missing secret all return 401) to prevent customer_id enumeration, updated test scenarios; addressed F5 by removing `telegram_webhook_url_template` from U6 settings — no consumer exists in this plan, add in the future ticket that needs it (YAGNI per review-guide.md).

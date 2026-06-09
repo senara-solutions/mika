@@ -533,10 +533,10 @@ mod tests {
 
         AppState {
             pool,
-            telegram,
+            telegram: Some(telegram),
             http_client,
             internal_token: SecretString::from("a".repeat(64)),
-            webhook_secret: SecretString::from("b".repeat(64)),
+            webhook_secret: Some(SecretString::from("b".repeat(64))),
             ready: Arc::new(AtomicBool::new(true)),
             webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
             agent_base_url: None,

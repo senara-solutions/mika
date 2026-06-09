@@ -6,7 +6,8 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
-| `/webhook/telegram` | POST | Webhook secret | Inbound Telegram messages |
+| `/webhook/telegram` | POST | Webhook secret | Inbound Telegram messages (single-bot mode) |
+| `/webhook/telegram/{customer_id}` | POST | Per-customer webhook secret | Inbound Telegram messages (per-customer bot) |
 | `/webhook/github` | POST | HMAC-SHA256 | Inbound GitHub App events |
 | `/send` | POST | Internal token | Outbound relay with `agent_name` identification |
 | `/health`, `/readyz`, `/livez` | GET | None | Health probes |
@@ -67,7 +68,8 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 - Migration 004: creates `github_repos` table (maps `repo_full_name` -> `customer_id` for multi-tenant GitHub webhook routing)
 - Migration 005: adds `agent_mapping JSONB NOT NULL DEFAULT '{}'` to `github_repos` for per-repo agent name overrides (keys are default agent names from `route_event()`, values are customer's replacement names; `apply_agent_mapping()` validates names via `is_valid_agent_name()` and falls back to defaults for invalid values)
 - Migration 006: creates `webhook_deliveries` table for dead-letter queue (delivery_id PK, event_type, target_agent, repo_full_name, payload, request_id, status CHECK IN pending/delivered/dead, attempts, last_attempt_at, last_error). Partial indexes on `(status, last_attempt_at) WHERE status='pending'` and `(created_at DESC) WHERE status='dead'`.
-- Migration 007: creates `orchestrator_inbox_messages` table for the orchestrator inbox v2 channel (mika#1189). Columns: `id BIGSERIAL PK`, `orchestrator_id TEXT NOT NULL`, `spawn_id TEXT` (nullable), `kind TEXT NOT NULL CHECK IN ('handoff','update','ack')`, `body JSONB NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`, `delivered_at TIMESTAMPTZ`. Indexes: `(orchestrator_id, id)` for cursor replay; partial `(orchestrator_id, created_at) WHERE delivered_at IS NULL` for diagnostic queries on undelivered rows (retention sweeps purge by `created_at` alone and don't use this partial index — see migration comment).
+- Migration 007: creates `orchestrator_inbox_messages` table
+- Migration 008: adds `bot_token`, `bot_username`, `webhook_secret` columns to `customers` table (per-customer Telegram bot support, mika#1454). All nullable — NULL means single-bot mode fallback. for the orchestrator inbox v2 channel (mika#1189). Columns: `id BIGSERIAL PK`, `orchestrator_id TEXT NOT NULL`, `spawn_id TEXT` (nullable), `kind TEXT NOT NULL CHECK IN ('handoff','update','ack')`, `body JSONB NOT NULL`, `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`, `delivered_at TIMESTAMPTZ`. Indexes: `(orchestrator_id, id)` for cursor replay; partial `(orchestrator_id, created_at) WHERE delivered_at IS NULL` for diagnostic queries on undelivered rows (retention sweeps purge by `created_at` alone and don't use this partial index — see migration comment).
 
 ## build.rs
 
@@ -77,9 +79,10 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 ## Gateway Environment Variables
 
 - `MIKA_DATABASE_URL` — Postgres connection string
-- `MIKA_TELEGRAM_BOT_TOKEN` — Telegram Bot API token
-- `MIKA_TELEGRAM_WEBHOOK_SECRET` — 64-char hex secret for webhook validation
-- `MIKA_TELEGRAM_WEBHOOK_URL` — Public HTTPS URL for Telegram webhook delivery
+- `MIKA_TELEGRAM_BOT_TOKEN` — Telegram Bot API token. Required only in single-bot mode.
+- `MIKA_TELEGRAM_WEBHOOK_SECRET` — 64-char hex secret for webhook validation. Required only in single-bot mode.
+- `MIKA_TELEGRAM_WEBHOOK_URL` — Public HTTPS URL for Telegram webhook delivery. Required only in single-bot mode.
+- `MIKA_TELEGRAM_SINGLE_BOT_MODE` — When `1` or `true`, the gateway uses the global `MIKA_TELEGRAM_BOT_TOKEN` for all customers (legacy single-bot behavior). Requires `MIKA_TELEGRAM_BOT_TOKEN`, `MIKA_TELEGRAM_WEBHOOK_SECRET`, and `MIKA_TELEGRAM_WEBHOOK_URL` to be set. Default: off (per-customer bot mode).
 - `MIKA_INTERNAL_TOKEN` — Shared 64-char hex bearer token
 - `MIKA_AGENTS_NAMESPACE` — K8s namespace where agent pods run (default: `mika-agents`). Used for FQDN construction in cross-namespace DNS resolution (`http://mika-{id}.{ns}.svc.cluster.local:8080`). Override for environment-scoped namespaces (e.g. `mika-agents-prd`).
 - `MIKA_GITHUB_WEBHOOK_SECRET` — Secret for validating inbound GitHub App webhooks via HMAC-SHA256. Arbitrary string (not hex-constrained like Telegram). When absent, `POST /webhook/github` returns 404.
