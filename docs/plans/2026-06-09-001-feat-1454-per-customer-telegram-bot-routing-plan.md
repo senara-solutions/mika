@@ -427,6 +427,23 @@ The `outbound_messages` INSERT for reply routing remains unchanged — it stores
 
 ---
 
+## Acceptance Criteria
+
+Reconciled from issue mika#1454 and plan scope boundaries. Items marked **(deferred)** are out of scope for this plan — see [Scope Boundaries § Deferred to Follow-Up Work](#deferred-to-follow-up-work).
+
+- **AC1.** Migration adds `bot_token`, `bot_username`, `webhook_secret` columns to `customers` table (U1)
+- **AC2.** `handle_webhook` routes by `customer_id` from URL path, validates per-customer `webhook_secret` (U3)
+- **AC3.** Outbound `/send` uses the customer's own bot token when `customer_id` is provided (U5)
+- **AC4.** Inbound photo/document downloads use the customer's bot token — Telegram `file_id`s are bot-specific (U4)
+- **AC5.** Pairing flow (`/start <token>`) works through the per-customer webhook route (U3, U4)
+- **AC6.** Gateway boots without `MIKA_TELEGRAM_BOT_TOKEN` when not in single-bot mode; `MIKA_TELEGRAM_SINGLE_BOT_MODE=1` preserves legacy behavior (U6)
+- **AC7.** Existing tests pass; new tests cover per-customer routing, per-customer webhook-secret validation, outbound per-customer send, and backward-compat single-bot mode
+- **AC8.** `setWebhook` automated at provisioning time **(deferred — mika-cloud scope)**
+- **AC9.** `deleteWebhook` automated at deprovisioning **(deferred — mika-cloud scope)**
+- **AC10.** mika-cloud Helm chart updated to remove obsolete gateway env vars **(deferred — mika-cloud scope, see Scope Boundaries note)**
+
+---
+
 ## Sources & Research
 
 - Ticket: mika#1454 — full architecture analysis and scope definition
