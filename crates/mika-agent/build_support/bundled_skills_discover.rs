@@ -172,6 +172,15 @@ fn collect_support_dir_files(dir: &Path, rel_prefix: &str) -> Vec<DiscoveredFile
     files
 }
 
+/// Returns `true` if `name` is a valid bundled-skill directory name.
+///
+/// Rejects empty names, dotfile prefixes (`.`), and underscore prefixes (`_`).
+/// Used by both build-time discovery ([`discover_bundled_skills`]) and runtime
+/// skill scanning (`scan_skills_dir` in `src/skills/index.rs`).
+pub fn is_bundled_skill_dir(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && !name.starts_with('_')
+}
+
 /// Walk `base` and return bundled skills sorted alphabetically by name.
 ///
 /// Rules:
@@ -201,13 +210,7 @@ pub fn discover_bundled_skills(base: &Path) -> Vec<DiscoveredSkill> {
         }
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Skip dotfile directories (.gitkeep, .DS_Store, etc.)
-        if name_str.starts_with('.') {
-            continue;
-        }
-        // Skip underscore-prefixed directories (_shared/, _templates/, etc.)
-        // These are convention-reserved for non-skill support directories.
-        if name_str.starts_with('_') {
+        if !is_bundled_skill_dir(&name_str) {
             continue;
         }
         let path = entry.path();
