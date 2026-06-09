@@ -1,5 +1,9 @@
 # === Builder stage ===
-FROM rust:1.93-slim AS builder
+# Use rust:1.93-bookworm (NOT -slim) to match mika-cloud console image baseline.
+# The -slim variant produced binaries with GLIBC_2.38 link-time symbols that
+# fail to load on debian:bookworm-slim runtime (only has glibc 2.36).
+# See mika-cloud#97 + the 06-18 mission gateway-deploy unblock (2026-06-09).
+FROM rust:1.93-bookworm AS builder
 
 # No native deps needed: uses rustls (no OpenSSL), no rusqlite
 
