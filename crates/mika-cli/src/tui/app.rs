@@ -1568,7 +1568,7 @@ impl<'a> App<'a> {
         };
 
         let stale_threshold =
-            chrono::Duration::minutes(mika_agent::agent::STALE_FAILED_CALLBACK_MINUTES);
+            chrono::Duration::minutes(mika_agent::planning::policy::STALE_FAILED_CALLBACK_MINUTES);
         let mut stale_skipped: usize = 0;
 
         for task in tasks {
@@ -1653,7 +1653,7 @@ impl<'a> App<'a> {
                     "Cleared {} stale failed {} (older than {} minutes)",
                     stale_skipped,
                     noun,
-                    mika_agent::agent::STALE_FAILED_CALLBACK_MINUTES
+                    mika_agent::planning::policy::STALE_FAILED_CALLBACK_MINUTES
                 ),
                 rendered: None,
                 channel: None,

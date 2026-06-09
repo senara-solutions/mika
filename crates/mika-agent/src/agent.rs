@@ -32,30 +32,8 @@ use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::ProviderKind;
 
-const MAX_TOOL_STEPS: usize = 20;
-const MAX_CALLBACK_TOOL_STEPS: usize = 20;
-const MAX_TEAM_TOOL_STEPS: usize = 20;
-const TOOL_TIMEOUT_SECS: u64 = 30;
-const AGENT_TOTAL_TIMEOUT_SECS: u64 = 300;
 /// Max chars of serialized tool input to include in timeout log lines (#900).
 const TOOL_TIMEOUT_INPUT_EXCERPT_LEN: usize = 200;
-/// Maximum bytes for callback results injected into the system prompt via
-/// `format_callback_framing()`. Results exceeding this are truncated to prevent
-/// oversized prompts from consuming the agent timeout during serialization.
-/// Full results remain available in task logs.
-const CALLBACK_RESULT_MAX_BYTES: usize = 10_240;
-/// Per-agent timeout for team sub-agents (matches AGENT_TOTAL_TIMEOUT_SECS).
-/// Since team agents run in parallel, the constraint is fitting within the global
-/// team run budget (max of agent times, not sum).
-const TEAM_AGENT_TIMEOUT_SECS: u64 = 300;
-/// Timeout for the continuation API call after max tool steps are exceeded.
-/// Longer than TOOL_TIMEOUT_SECS because this is a full generation call, not a tool.
-const CONTINUATION_TIMEOUT_SECS: u64 = 60;
-/// Maximum total base64 image bytes across all tool results in a single agent step.
-/// Prevents memory spikes when multiple tools return images in one step.
-/// 5 images at 5 MB each ≈ 33 MB base64 — this caps at ~20 MB to stay within
-/// container memory limits (256 MB target).
-const MAX_IMAGE_BYTES_PER_STEP: usize = 20 * 1024 * 1024;
 
 /// Skills whose LLM output legitimately contains `Verdict:` lines.
 /// Used by the dev-groom fabrication guard (#1133, #1254) to exempt
@@ -78,11 +56,6 @@ pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 
 /// Fallback message used when a failed callback task has no error details in its result.
 pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
-
-/// Maximum age (in minutes) for a failed callback to be delivered to the agent.
-/// Failed callbacks older than this are silently marked as delivered to prevent
-/// flooding the conversation with stale failures (e.g., after an upgrade).
-pub const STALE_FAILED_CALLBACK_MINUTES: i64 = 5;
 
 /// Outcome of a team agent run. Typed to distinguish timeout from success
 /// so callers can make informed fallback decisions (#1128).
@@ -180,13 +153,14 @@ pub fn format_callback_framing(
     // the agent timeout (see #259). Full result is available in task logs.
     const TRUNCATION_SUFFIX: &str = "\n...\n[truncated — full result available in task logs]";
     let truncated;
-    let result = if result.len() > CALLBACK_RESULT_MAX_BYTES {
+    let result = if result.len() > crate::planning::policy::CALLBACK_RESULT_MAX_BYTES {
         warn!(
             original_bytes = result.len(),
-            truncated_to = CALLBACK_RESULT_MAX_BYTES,
+            truncated_to = crate::planning::policy::CALLBACK_RESULT_MAX_BYTES,
             "callback result truncated before prompt injection"
         );
-        let cut = CALLBACK_RESULT_MAX_BYTES.saturating_sub(TRUNCATION_SUFFIX.len());
+        let cut = crate::planning::policy::CALLBACK_RESULT_MAX_BYTES
+            .saturating_sub(TRUNCATION_SUFFIX.len());
         let mut boundary = cut;
         while boundary > 0 && !result.is_char_boundary(boundary) {
             boundary -= 1;
@@ -269,9 +243,9 @@ impl LoopMode {
 
     fn max_steps(&self) -> usize {
         match self {
-            Self::Team => MAX_TEAM_TOOL_STEPS,
+            Self::Team => crate::planning::policy::MAX_TEAM_TOOL_STEPS,
             Self::Silent { max_steps } => *max_steps,
-            _ => MAX_TOOL_STEPS,
+            _ => crate::planning::policy::MAX_TOOL_STEPS,
         }
     }
 
@@ -310,16 +284,6 @@ fn has_non_zero_exit_prefix(content: &str) -> bool {
     }
 }
 
-/// Maximum total characters for serialized tool call metadata.
-const TOOL_METADATA_MAX: usize = 4000;
-/// Maximum characters for tool input summary in metadata.
-const INPUT_SUMMARY_MAX: usize = 200;
-/// Maximum characters for tool output summary in metadata.
-const OUTPUT_SUMMARY_MAX: usize = 300;
-/// Maximum characters of conversation/memory digest injected into the reflection prompt.
-/// ~12,500 tokens at 4 chars/token -- keeps total prompt well within Claude's context.
-const MAX_REFLECTION_DIGEST_CHARS: usize = 50_000;
-
 /// Truncate a string to approximately `max_len` bytes, appending "..." if truncated.
 /// Always cuts at a valid UTF-8 char boundary to avoid panics on multi-byte input.
 fn truncate_summary(s: &str, max_len: usize) -> String {
@@ -336,7 +300,7 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Serialize tool call summaries to JSON metadata string, capped at [`TOOL_METADATA_MAX`].
+/// Serialize tool call summaries to JSON metadata string, capped at [`crate::planning::policy::TOOL_METADATA_MAX`].
 ///
 /// Strategy: preserve all entries by progressively truncating per-field content.
 /// 1. Try full serialization with the initial field lengths.
@@ -348,7 +312,7 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
     }
     let wrapper = serde_json::json!({ "tool_calls": summaries });
     let json = serde_json::to_string(&wrapper).ok()?;
-    if json.len() <= TOOL_METADATA_MAX {
+    if json.len() <= crate::planning::policy::TOOL_METADATA_MAX {
         return Some(json);
     }
 
@@ -366,7 +330,7 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
         .collect();
     let wrapper = serde_json::json!({ "tool_calls": shrunk });
     if let Ok(json) = serde_json::to_string(&wrapper)
-        && json.len() <= TOOL_METADATA_MAX
+        && json.len() <= crate::planning::policy::TOOL_METADATA_MAX
     {
         return Some(json);
     }
@@ -374,13 +338,13 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
     // Phase 2: Last resort — drop tail entries from the already-shrunk vector.
     warn!(
         total_entries = summaries.len(),
-        max = TOOL_METADATA_MAX,
+        max = crate::planning::policy::TOOL_METADATA_MAX,
         "tool_calls metadata exceeds cap after field truncation, dropping tail entries"
     );
     for count in (1..shrunk.len()).rev() {
         let wrapper = serde_json::json!({ "tool_calls": &shrunk[..count] });
         if let Ok(json) = serde_json::to_string(&wrapper)
-            && json.len() <= TOOL_METADATA_MAX
+            && json.len() <= crate::planning::policy::TOOL_METADATA_MAX
         {
             return Some(json);
         }
@@ -485,9 +449,9 @@ struct ContinuationResult {
 /// (extracted from `LoopResult::MaxStepsExceeded` by the caller) so this helper
 /// stays decoupled from the variant shape.
 ///
-/// `deadline` clamps the inner LLM-call timeout to `min(CONTINUATION_TIMEOUT_SECS,
+/// `deadline` clamps the inner LLM-call timeout to `min(crate::planning::policy::CONTINUATION_TIMEOUT_SECS,
 /// deadline - now)`. The caller is expected to gate entry on `deadline > now +
-/// CONTINUATION_TIMEOUT_SECS` (see mika#848 F3a). If the gate ever drifts and we
+/// crate::planning::policy::CONTINUATION_TIMEOUT_SECS` (see mika#848 F3a). If the gate ever drifts and we
 /// land here with the deadline already passed, the runtime fast-path below
 /// returns the structured fallback without firing a zero-timeout LLM call —
 /// otherwise we would re-introduce the in-flight-cancel bug at smaller scale.
@@ -543,8 +507,10 @@ async fn attempt_continuation_turn(
         };
     }
     let remaining = deadline.saturating_duration_since(now);
-    let continuation_timeout =
-        std::cmp::min(Duration::from_secs(CONTINUATION_TIMEOUT_SECS), remaining);
+    let continuation_timeout = std::cmp::min(
+        Duration::from_secs(crate::planning::policy::CONTINUATION_TIMEOUT_SECS),
+        remaining,
+    );
 
     let llm_call_start = std::time::Instant::now();
     let continuation = tokio::time::timeout(
@@ -732,7 +698,7 @@ enum LoopResult {
         /// Original system prompt length before step-awareness nudge was appended.
         system_prompt_original_len: usize,
     },
-    /// Loop exited because `MAX_TOOL_STEPS` was reached without an EndTurn.
+    /// Loop exited because `crate::planning::policy::MAX_TOOL_STEPS` was reached without an EndTurn.
     /// Caller is expected to attempt a continuation turn for a final summary.
     MaxStepsExceeded {
         thinking: Option<String>,
@@ -800,7 +766,7 @@ fn strip_prior_images(messages: &mut [LlmMessage]) {
 
 /// Shared tool-step loop used by all three agent variants.
 ///
-/// Iterates up to `MAX_TOOL_STEPS`, dispatching tool calls and collecting the
+/// Iterates up to `crate::planning::policy::MAX_TOOL_STEPS`, dispatching tool calls and collecting the
 /// final text response. Behavior is parameterized by `LoopMode`.
 ///
 /// `required_tools` specifies tool names (from matched skills' `[constraints]` sections)
@@ -2549,7 +2515,8 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         span.record("correlated_task_id", task_id.as_str());
     }
 
-    let deadline = Instant::now() + Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS);
+    let deadline =
+        Instant::now() + Duration::from_secs(crate::planning::policy::AGENT_TOTAL_TIMEOUT_SECS);
     let result = run_agent_inner(params, &trace_id, deadline)
         .instrument(span)
         .await;
@@ -2579,7 +2546,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
 /// **Test-only entry point** that exposes the `deadline: Instant` parameter.
 ///
 /// Production callers use [`run_agent`], which computes the deadline internally
-/// from `AGENT_TOTAL_TIMEOUT_SECS`. Tests construct a short deadline (often
+/// from `crate::planning::policy::AGENT_TOTAL_TIMEOUT_SECS`. Tests construct a short deadline (often
 /// under a `tokio::time::pause()` clock) and pass it here to exercise the
 /// deadline-exceeded code path without waiting wall-clock seconds.
 ///
@@ -3039,7 +3006,10 @@ async fn run_agent_inner(
         } => {
             // Continuation entry gate (mika#848 F3a) — skip continuation when its 60s
             // ceiling would push us past the agent total deadline.
-            if Instant::now() + Duration::from_secs(CONTINUATION_TIMEOUT_SECS) > deadline {
+            if Instant::now()
+                + Duration::from_secs(crate::planning::policy::CONTINUATION_TIMEOUT_SECS)
+                > deadline
+            {
                 warn!(
                     target: "mika::otel",
                     trace_id = %trace_id,
@@ -3143,7 +3113,7 @@ async fn process_tool_calls(
 ) -> Vec<ToolCallSummary> {
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
-    let mut image_bytes_budget = MAX_IMAGE_BYTES_PER_STEP;
+    let mut image_bytes_budget = crate::planning::policy::MAX_IMAGE_BYTES_PER_STEP;
     // Per-turn dedup: if the LLM emits two tool_use blocks with identical
     // (name, arguments) in a single response, execute the tool once and reuse
     // the cached output for subsequent blocks. This defends the engine against
@@ -3166,8 +3136,10 @@ async fn process_tool_calls(
             // The inter-step gate (after process_tool_calls returns) prevents
             // cross-step writes by forcing EndTurn.
             if *send_message_boundary_active && name == "send_message" && conversation_mode {
-                let input_summary_for_suppressed =
-                    truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX);
+                let input_summary_for_suppressed = truncate_summary(
+                    &arguments.to_string(),
+                    crate::planning::policy::INPUT_SUMMARY_MAX,
+                );
                 let suppressed_msg =
                     "[mika-engine] Tool call suppressed: send_message turn boundary (#771). \
                      A second send_message is not permitted after the first in the same turn. \
@@ -3183,7 +3155,10 @@ async fn process_tool_calls(
                     step,
                     name: name.clone(),
                     input_summary: scrub_secrets(&input_summary_for_suppressed).into_owned(),
-                    output_summary: truncate_summary(&suppressed_msg, OUTPUT_SUMMARY_MAX),
+                    output_summary: truncate_summary(
+                        &suppressed_msg,
+                        crate::planning::policy::OUTPUT_SUMMARY_MAX,
+                    ),
                     success: false,
                     non_zero_exit: false,
                 });
@@ -3220,9 +3195,11 @@ async fn process_tool_calls(
                 reused
             } else {
                 debug!(tool = %name, "executing tool");
-                let input_summary =
-                    scrub_secrets(&truncate_summary(&arguments.to_string(), INPUT_SUMMARY_MAX))
-                        .into_owned();
+                let input_summary = scrub_secrets(&truncate_summary(
+                    &arguments.to_string(),
+                    crate::planning::policy::INPUT_SUMMARY_MAX,
+                ))
+                .into_owned();
                 let dispatch = ToolDispatchCtx {
                     tools,
                     skill_tools,
@@ -3286,10 +3263,13 @@ async fn process_tool_calls(
                     let raw = if image_count > 0 {
                         truncate_summary(
                             &format!("{} [+{image_count} image(s)]", output.content),
-                            OUTPUT_SUMMARY_MAX,
+                            crate::planning::policy::OUTPUT_SUMMARY_MAX,
                         )
                     } else {
-                        truncate_summary(&output.content, OUTPUT_SUMMARY_MAX)
+                        truncate_summary(
+                            &output.content,
+                            crate::planning::policy::OUTPUT_SUMMARY_MAX,
+                        )
                     };
                     // Scrub secret-shaped values from metadata summaries (#908).
                     scrub_secrets(&raw).into_owned()
@@ -3420,7 +3400,9 @@ async fn execute_tool(
 
     // 1. Try builtin tool
     if let Some(tool) = dispatch.tools.get(name) {
-        let timeout = tool.timeout_secs().unwrap_or(TOOL_TIMEOUT_SECS);
+        let timeout = tool
+            .timeout_secs()
+            .unwrap_or(crate::planning::policy::TOOL_TIMEOUT_SECS);
         return match tokio::time::timeout(
             std::time::Duration::from_secs(timeout),
             tool.execute(input, dispatch.ctx),
@@ -3478,7 +3460,7 @@ async fn execute_tool(
         && mcp.is_mcp_tool(name)
     {
         return match tokio::time::timeout(
-            std::time::Duration::from_secs(TOOL_TIMEOUT_SECS),
+            std::time::Duration::from_secs(crate::planning::policy::TOOL_TIMEOUT_SECS),
             mcp.call_tool(name, input),
         )
         .await
@@ -3486,9 +3468,8 @@ async fn execute_tool(
             Ok(output) => output,
             Err(_) => {
                 warn!(tool = %name, "MCP tool execution timed out");
-                ToolOutput::error(format!(
-                    "MCP tool '{name}' timed out after {TOOL_TIMEOUT_SECS}s"
-                ))
+                let timeout_secs = crate::planning::policy::TOOL_TIMEOUT_SECS;
+                ToolOutput::error(format!("MCP tool '{name}' timed out after {timeout_secs}s"))
             }
         };
     }
@@ -3605,15 +3586,17 @@ impl SilentTrigger {
     /// Returns the max tool steps budget for this trigger type.
     ///
     /// All trigger types currently share the same 20-step budget. Callbacks and
-    /// Reminders use `MAX_CALLBACK_TOOL_STEPS` (separate constant) to allow
+    /// Reminders use `crate::planning::policy::MAX_CALLBACK_TOOL_STEPS` (separate constant) to allow
     /// independent adjustment if needed in the future. See #375, #386, #397.
     fn max_steps(&self) -> usize {
         match self {
             Self::Callback { .. }
             | Self::Reminder { .. }
             | Self::PostCallbackAdvance { .. }
-            | Self::DeferredDispatch { .. } => MAX_CALLBACK_TOOL_STEPS,
-            Self::Heartbeat | Self::Reflection | Self::SkillRun { .. } => MAX_TOOL_STEPS,
+            | Self::DeferredDispatch { .. } => crate::planning::policy::MAX_CALLBACK_TOOL_STEPS,
+            Self::Heartbeat | Self::Reflection | Self::SkillRun { .. } => {
+                crate::planning::policy::MAX_TOOL_STEPS
+            }
         }
     }
 }
@@ -3667,7 +3650,8 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         trigger = %trigger_label,
     );
 
-    let deadline = Instant::now() + Duration::from_secs(AGENT_TOTAL_TIMEOUT_SECS);
+    let deadline =
+        Instant::now() + Duration::from_secs(crate::planning::policy::AGENT_TOTAL_TIMEOUT_SECS);
     run_silent_inner(params, deadline)
         .instrument(silent_span)
         .await
@@ -3707,7 +3691,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                 let mut buf = String::new();
                 for msg in &conversations {
                     let line = format!("[{}] {}: {}\n", msg.created_at, msg.role, msg.content);
-                    if buf.len() + line.len() > MAX_REFLECTION_DIGEST_CHARS {
+                    if buf.len() + line.len() > crate::planning::policy::MAX_REFLECTION_DIGEST_CHARS
+                    {
                         buf.push_str("... (truncated)\n");
                         break;
                     }
@@ -3716,7 +3701,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                 Some(buf)
             };
 
-            // Load today's memory events (capped at MAX_REFLECTION_DIGEST_CHARS)
+            // Load today's memory events (capped at crate::planning::policy::MAX_REFLECTION_DIGEST_CHARS)
             let audit_events = db.get_audit_events_since(&midnight_str).await?;
             let mem_digest = if audit_events.is_empty() {
                 None
@@ -3731,7 +3716,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                         evt.before_value.as_deref().unwrap_or("(none)"),
                         evt.after_value.as_deref().unwrap_or("(none)")
                     );
-                    if buf.len() + line.len() > MAX_REFLECTION_DIGEST_CHARS {
+                    if buf.len() + line.len() > crate::planning::policy::MAX_REFLECTION_DIGEST_CHARS
+                    {
                         buf.push_str("... (truncated)\n");
                         break;
                     }
@@ -4197,7 +4183,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
 
             // Gate continuation entry (mika#848 F3a) — skip when its 60s ceiling
             // would push past the deadline.
-            if Instant::now() + Duration::from_secs(CONTINUATION_TIMEOUT_SECS) > deadline {
+            if Instant::now()
+                + Duration::from_secs(crate::planning::policy::CONTINUATION_TIMEOUT_SECS)
+                > deadline
+            {
                 warn!(
                     target: "mika::otel",
                     trigger_label,
@@ -4344,7 +4333,8 @@ pub struct TeamAgentParams<'a> {
 /// - Returns `Some(text)` when the assistant produced a text response,
 ///   or `None` for tool-use-only turns.
 pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<TeamAgentOutcome> {
-    let deadline = Instant::now() + Duration::from_secs(TEAM_AGENT_TIMEOUT_SECS);
+    let deadline =
+        Instant::now() + Duration::from_secs(crate::planning::policy::TEAM_AGENT_TIMEOUT_SECS);
     run_team_agent_inner(params, deadline).await
 }
 
@@ -4609,7 +4599,10 @@ async fn run_team_agent_inner_impl(
             ..
         } => {
             // Gate continuation entry (mika#848 F3a).
-            if Instant::now() + Duration::from_secs(CONTINUATION_TIMEOUT_SECS) > deadline {
+            if Instant::now()
+                + Duration::from_secs(crate::planning::policy::CONTINUATION_TIMEOUT_SECS)
+                > deadline
+            {
                 warn!(
                     target: "mika::otel",
                     agent = %params.agent_name,
@@ -4820,14 +4813,14 @@ fn resolve_skill_llm_override(
 }
 
 /// Compute the maximum timeout across matched skills (for skill tool execution).
-/// Falls back to TOOL_TIMEOUT_SECS if no skills matched.
+/// Falls back to crate::planning::policy::TOOL_TIMEOUT_SECS if no skills matched.
 /// Uses provider-specific timeout overrides when available.
 fn max_skill_timeout(matched: &[&SkillEntry], provider_name: &str, model_name: &str) -> u64 {
     matched
         .iter()
         .map(|e| e.effective_timeout(provider_name, model_name))
         .max()
-        .unwrap_or(TOOL_TIMEOUT_SECS)
+        .unwrap_or(crate::planning::policy::TOOL_TIMEOUT_SECS)
 }
 
 /// Collect the union of all `required_tools` from keyword-matched skills' `[constraints]` sections.
@@ -6484,13 +6477,13 @@ mod tests {
     #[test]
     fn test_loop_mode_silent_properties() {
         let mode = LoopMode::Silent {
-            max_steps: MAX_TOOL_STEPS,
+            max_steps: crate::planning::policy::MAX_TOOL_STEPS,
         };
         assert!(!mode.is_conversation());
         assert!(!mode.follow_up_on_empty());
         assert!(mode.saves_to_db());
         assert_eq!(mode.label(), "silent agent");
-        assert_eq!(mode.max_steps(), MAX_TOOL_STEPS);
+        assert_eq!(mode.max_steps(), crate::planning::policy::MAX_TOOL_STEPS);
     }
 
     #[test]
@@ -6513,25 +6506,37 @@ mod tests {
             failed: false,
             parent_task_id: None,
         };
-        assert_eq!(trigger.max_steps(), MAX_CALLBACK_TOOL_STEPS);
+        assert_eq!(
+            trigger.max_steps(),
+            crate::planning::policy::MAX_CALLBACK_TOOL_STEPS
+        );
 
         let reminder = SilentTrigger::Reminder {
             task_id: "test".to_string(),
             message: "check CI".to_string(),
         };
-        assert_eq!(reminder.max_steps(), MAX_CALLBACK_TOOL_STEPS);
+        assert_eq!(
+            reminder.max_steps(),
+            crate::planning::policy::MAX_CALLBACK_TOOL_STEPS
+        );
     }
 
     #[test]
     fn test_silent_trigger_non_callback_gets_default_step_limit() {
-        assert_eq!(SilentTrigger::Heartbeat.max_steps(), MAX_TOOL_STEPS);
-        assert_eq!(SilentTrigger::Reflection.max_steps(), MAX_TOOL_STEPS);
+        assert_eq!(
+            SilentTrigger::Heartbeat.max_steps(),
+            crate::planning::policy::MAX_TOOL_STEPS
+        );
+        assert_eq!(
+            SilentTrigger::Reflection.max_steps(),
+            crate::planning::policy::MAX_TOOL_STEPS
+        );
         assert_eq!(
             SilentTrigger::SkillRun {
                 skill_name: "test".to_string()
             }
             .max_steps(),
-            MAX_TOOL_STEPS
+            crate::planning::policy::MAX_TOOL_STEPS
         );
     }
 
@@ -6740,7 +6745,7 @@ mod tests {
         let matched: Vec<&SkillEntry> = vec![];
         assert_eq!(
             max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
-            TOOL_TIMEOUT_SECS
+            crate::planning::policy::TOOL_TIMEOUT_SECS
         );
     }
 
@@ -7194,7 +7199,7 @@ mod tests {
 
     #[test]
     fn test_tool_calls_metadata_json_respects_max_size() {
-        // Create many tool calls with large outputs to exceed TOOL_METADATA_MAX
+        // Create many tool calls with large outputs to exceed crate::planning::policy::TOOL_METADATA_MAX
         let summaries: Vec<ToolCallSummary> = (0..50)
             .map(|i| ToolCallSummary {
                 step: i,
@@ -7208,8 +7213,8 @@ mod tests {
         let json = tool_calls_metadata_json(&summaries).unwrap();
         // Must produce valid JSON within the size cap
         assert!(
-            json.len() <= TOOL_METADATA_MAX,
-            "metadata exceeded TOOL_METADATA_MAX: {} chars",
+            json.len() <= crate::planning::policy::TOOL_METADATA_MAX,
+            "metadata exceeded crate::planning::policy::TOOL_METADATA_MAX: {} chars",
             json.len()
         );
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -7221,16 +7226,18 @@ mod tests {
         // Simulate what happens when building a ToolCallSummary with large content
         let large_input = "x".repeat(10_000);
         let large_output = "y".repeat(10_000);
-        let input_summary = truncate_summary(&large_input, INPUT_SUMMARY_MAX);
-        let output_summary = truncate_summary(&large_output, OUTPUT_SUMMARY_MAX);
+        let input_summary =
+            truncate_summary(&large_input, crate::planning::policy::INPUT_SUMMARY_MAX);
+        let output_summary =
+            truncate_summary(&large_output, crate::planning::policy::OUTPUT_SUMMARY_MAX);
 
         assert!(
-            input_summary.len() <= INPUT_SUMMARY_MAX,
+            input_summary.len() <= crate::planning::policy::INPUT_SUMMARY_MAX,
             "input_summary too long: {} chars",
             input_summary.len()
         );
         assert!(
-            output_summary.len() <= OUTPUT_SUMMARY_MAX,
+            output_summary.len() <= crate::planning::policy::OUTPUT_SUMMARY_MAX,
             "output_summary too long: {} chars",
             output_summary.len()
         );
@@ -7241,20 +7248,26 @@ mod tests {
     #[test]
     fn test_all_entries_preserved_at_max_steps() {
         // With reduced per-field limits, 10 entries with typical tool names should
-        // all fit within TOOL_METADATA_MAX without tail-drop
+        // all fit within crate::planning::policy::TOOL_METADATA_MAX without tail-drop
         let summaries: Vec<ToolCallSummary> = (0..10)
             .map(|i| ToolCallSummary {
                 step: i,
                 name: "search_memory".to_string(),
-                input_summary: truncate_summary(&"x".repeat(10_000), INPUT_SUMMARY_MAX),
-                output_summary: truncate_summary(&"y".repeat(10_000), OUTPUT_SUMMARY_MAX),
+                input_summary: truncate_summary(
+                    &"x".repeat(10_000),
+                    crate::planning::policy::INPUT_SUMMARY_MAX,
+                ),
+                output_summary: truncate_summary(
+                    &"y".repeat(10_000),
+                    crate::planning::policy::OUTPUT_SUMMARY_MAX,
+                ),
                 success: true,
                 non_zero_exit: false,
             })
             .collect();
         let json = tool_calls_metadata_json(&summaries).unwrap();
         assert!(
-            json.len() <= TOOL_METADATA_MAX,
+            json.len() <= crate::planning::policy::TOOL_METADATA_MAX,
             "truncated summaries exceed cap: {} chars",
             json.len()
         );
@@ -7274,15 +7287,15 @@ mod tests {
             .map(|i| ToolCallSummary {
                 step: i,
                 name: format!("mcp__very_long_server_name__tool_with_long_name_{i}"),
-                input_summary: "x".repeat(INPUT_SUMMARY_MAX),
-                output_summary: "y".repeat(OUTPUT_SUMMARY_MAX),
+                input_summary: "x".repeat(crate::planning::policy::INPUT_SUMMARY_MAX),
+                output_summary: "y".repeat(crate::planning::policy::OUTPUT_SUMMARY_MAX),
                 success: true,
                 non_zero_exit: false,
             })
             .collect();
         let json = tool_calls_metadata_json(&summaries).unwrap();
         assert!(
-            json.len() <= TOOL_METADATA_MAX,
+            json.len() <= crate::planning::policy::TOOL_METADATA_MAX,
             "safety net failed: {} chars",
             json.len()
         );
@@ -7300,7 +7313,7 @@ mod tests {
     #[test]
     fn test_metadata_cap_drops_tail_on_milestone_workflow_turns() {
         // Simulate a milestone-workflow turn: 14 bookkeeping calls + 7 status updates + 1 dispatch
-        // Use INPUT_SUMMARY_MAX/OUTPUT_SUMMARY_MAX length strings to guarantee the 4KB cap is hit
+        // Use crate::planning::policy::INPUT_SUMMARY_MAX/crate::planning::policy::OUTPUT_SUMMARY_MAX length strings to guarantee the 4KB cap is hit
         let tool_names = [
             "run_gh",
             "create_task",
@@ -7330,8 +7343,14 @@ mod tests {
             .map(|(i, name)| ToolCallSummary {
                 step: i as u32 / 3, // group into steps like the real agent loop
                 name: name.to_string(),
-                input_summary: truncate_summary(&"x".repeat(10_000), INPUT_SUMMARY_MAX),
-                output_summary: truncate_summary(&"y".repeat(10_000), OUTPUT_SUMMARY_MAX),
+                input_summary: truncate_summary(
+                    &"x".repeat(10_000),
+                    crate::planning::policy::INPUT_SUMMARY_MAX,
+                ),
+                output_summary: truncate_summary(
+                    &"y".repeat(10_000),
+                    crate::planning::policy::OUTPUT_SUMMARY_MAX,
+                ),
                 success: true,
                 non_zero_exit: false,
             })
@@ -7345,7 +7364,7 @@ mod tests {
 
         let json = tool_calls_metadata_json(&summaries).unwrap();
         assert!(
-            json.len() <= TOOL_METADATA_MAX,
+            json.len() <= crate::planning::policy::TOOL_METADATA_MAX,
             "metadata must respect cap: {} chars",
             json.len()
         );
@@ -7821,7 +7840,7 @@ mod tests {
 
     #[test]
     fn test_format_callback_framing_short_result_not_truncated() {
-        let short = "a".repeat(CALLBACK_RESULT_MAX_BYTES);
+        let short = "a".repeat(crate::planning::policy::CALLBACK_RESULT_MAX_BYTES);
         let result = format_callback_framing("task", "id-1", None, &short, false);
         assert!(result.contains(&short));
         assert!(!result.contains("[truncated"));
@@ -7829,13 +7848,13 @@ mod tests {
 
     #[test]
     fn test_format_callback_framing_long_result_truncated() {
-        let long = "x".repeat(CALLBACK_RESULT_MAX_BYTES + 5000);
+        let long = "x".repeat(crate::planning::policy::CALLBACK_RESULT_MAX_BYTES + 5000);
         let result = format_callback_framing("task", "id-2", None, &long, false);
         assert!(!result.contains(&long));
         assert!(result.contains("[truncated — full result available in task logs]"));
         // The truncated content should be present (up to the cut boundary)
         let suffix_len = "\n...\n[truncated — full result available in task logs]".len();
-        let prefix = &"x".repeat(CALLBACK_RESULT_MAX_BYTES - suffix_len);
+        let prefix = &"x".repeat(crate::planning::policy::CALLBACK_RESULT_MAX_BYTES - suffix_len);
         assert!(result.contains(prefix));
     }
 
@@ -7843,16 +7862,16 @@ mod tests {
     fn test_format_callback_framing_truncation_utf8_safe() {
         // Place a 4-byte emoji so it straddles the cut point, forcing the
         // char-boundary walk-back loop to execute.
-        // cut = CALLBACK_RESULT_MAX_BYTES - suffix_len ≈ 10_185
+        // cut = crate::planning::policy::CALLBACK_RESULT_MAX_BYTES - suffix_len ≈ 10_185
         // Emoji at byte (cut-1) spans (cut-1)..(cut+2), so cut lands mid-emoji.
         let suffix_len = "\n...\n[truncated — full result available in task logs]".len();
-        let cut = CALLBACK_RESULT_MAX_BYTES - suffix_len;
+        let cut = crate::planning::policy::CALLBACK_RESULT_MAX_BYTES - suffix_len;
         let mut s = "a".repeat(cut - 1); // one byte before the cut point
         s.push('🦀'); // 4-byte char that straddles the cut boundary
-        // Pad with enough trailing data to exceed CALLBACK_RESULT_MAX_BYTES
-        let pad = CALLBACK_RESULT_MAX_BYTES - s.len() + 1;
+        // Pad with enough trailing data to exceed crate::planning::policy::CALLBACK_RESULT_MAX_BYTES
+        let pad = crate::planning::policy::CALLBACK_RESULT_MAX_BYTES - s.len() + 1;
         s.push_str(&"z".repeat(pad));
-        assert!(s.len() > CALLBACK_RESULT_MAX_BYTES);
+        assert!(s.len() > crate::planning::policy::CALLBACK_RESULT_MAX_BYTES);
         let result = format_callback_framing("task", "id-3", None, &s, true);
         assert!(result.contains("[truncated"));
         // The emoji should NOT be in the output (it was at the boundary)
@@ -9491,8 +9510,8 @@ mod tests {
             r#"{{"command":["api","-X","PATCH","/repos/{}/mika/milestones/17","-f","state=closed"]}}"#,
             long_org
         );
-        // Truncate to INPUT_SUMMARY_MAX to simulate what ToolCallSummary does.
-        let truncated = truncate_summary(&input, INPUT_SUMMARY_MAX);
+        // Truncate to crate::planning::policy::INPUT_SUMMARY_MAX to simulate what ToolCallSummary does.
+        let truncated = truncate_summary(&input, crate::planning::policy::INPUT_SUMMARY_MAX);
         let summaries = vec![run_gh_summary(&truncated)];
 
         let result = detect_milestone_close_claim_without_patch(
