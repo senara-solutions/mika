@@ -282,6 +282,22 @@ impl SubjectEntityResolver {
             event = "resolution_pending_start",
         );
 
+        // Batch-start operator-visibility log (#761).
+        let expected_cycles = if budget == 0 {
+            0u32
+        } else {
+            ((pending.len() as u32).saturating_sub(1) / budget).saturating_add(1)
+        };
+        info!(
+            trace_id = %self.trace_id,
+            agent_id = %agent_id,
+            scope = "resolution",
+            pending = pending.len(),
+            budget = budget,
+            expected_cycles = expected_cycles,
+            event = "kg_batch_start",
+        );
+
         if pending.is_empty() {
             return Ok(ResolutionStats {
                 duration_ms: start.elapsed().as_millis() as u64,
