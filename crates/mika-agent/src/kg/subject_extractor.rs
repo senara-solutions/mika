@@ -855,6 +855,22 @@ impl SubjectExtractor {
             event = "subject_extraction_start",
         );
 
+        // Batch-start operator-visibility log (#761).
+        let expected_cycles = if budget == 0 {
+            0u32
+        } else {
+            ((pending_docs.len() as u32).saturating_sub(1) / budget).saturating_add(1)
+        };
+        info!(
+            trace_id = %self.trace_id,
+            agent_id = %agent_id,
+            scope = "extraction",
+            pending = pending_docs.len(),
+            budget = budget,
+            expected_cycles = expected_cycles,
+            event = "kg_batch_start",
+        );
+
         if pending_docs.is_empty() {
             return Ok(BatchStats {
                 duration_ms: start.elapsed().as_millis() as u64,
