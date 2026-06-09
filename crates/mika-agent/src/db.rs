@@ -10014,6 +10014,46 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Count resolver-actionable pending subjects for an agent within a corpus (#999).
+    ///
+    /// Mirrors `entity_resolver::count_pending_for_corpus`: only counts subject
+    /// entities of the five resolver-actionable types (`skill`, `tool`, `agent`,
+    /// `problem_type`, `concept`) that have no resolution log row OR whose
+    /// source extraction trace_id diverges from the latest one.
+    ///
+    /// Subject-graph-only types (`pattern`, `failure_mode`, `solution_path`)
+    /// are intentionally excluded — they have no canonical domain projection
+    /// and the resolver never touches them. Showing them as "pending" misleads
+    /// the operator into thinking there is actionable backlog when there is
+    /// none.
+    pub fn kg_count_pending_resolver_actionable_for_corpus(
+        &self,
+        agent_id: &str,
+        docs_root_hash: &str,
+    ) -> Result<u64> {
+        let sql = "SELECT COUNT(*)
+             FROM kg_subject_entities e
+             LEFT JOIN kg_resolutions_log r
+                 ON r.subject_entity_id = e.id AND r.agent_id = ?1
+             WHERE e.docs_root_hash = ?2
+               AND e.type IN ('skill', 'tool', 'agent', 'problem_type', 'concept')
+               AND (
+                 r.id IS NULL
+                 OR r.source_extraction_trace_id != (
+                     SELECT cs.extraction_trace_id
+                     FROM kg_chunk_subjects cs
+                     WHERE cs.subject_entity_id = e.id
+                     ORDER BY cs.created_at DESC LIMIT 1
+                 )
+               )";
+        let count = self
+            .conn
+            .query_row(sql, params![agent_id, docs_root_hash], |r| {
+                r.get::<_, i64>(0)
+            })?;
+        Ok(count as u64)
+    }
+
     /// Get the most recent extraction timestamp for a docs_root_hash.
     pub fn kg_last_extraction(&self, docs_root_hash: &str) -> Result<Option<String>> {
         self.conn
