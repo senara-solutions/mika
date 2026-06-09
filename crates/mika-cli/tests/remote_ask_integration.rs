@@ -151,6 +151,116 @@ async fn dispatch_surfaces_connection_error_for_dead_endpoint() {
 }
 
 #[tokio::test]
+async fn dispatch_surfaces_failed_task_state_as_error() {
+    let (addr, _) = spawn_mock(|_cap, _body| {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "id": "task-mock-failed",
+                "status": {
+                    "state": "failed",
+                    "message": {
+                        "messageId": "msg-agent-1",
+                        "role": "agent",
+                        "parts": [{"kind": "text", "text": "tool execution exceeded budget"}],
+                        "kind": "message",
+                    }
+                },
+                "kind": "task",
+            }
+        });
+        (StatusCode::OK, Json(response))
+    })
+    .await;
+
+    let url = format!("http://{addr}/a2a/cust-7/mika-prime");
+    let err = dispatch_remote("hi", &url, OutputFormat::Text, false)
+        .await
+        .expect_err("should fail when remote task state is Failed");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("ended in state 'failed'"),
+        "expected failed-state error, got: {chain}"
+    );
+    assert!(
+        chain.contains("task-mock-failed"),
+        "expected task id in error, got: {chain}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_renders_input_required_state_to_output() {
+    // InputRequired is a terminal-for-this-call state where the agent is asking the
+    // user a clarifying question. The text content should reach the user; only
+    // Failed/Canceled/Rejected (and in-progress states) should error.
+    let (addr, _) = spawn_mock(|_cap, _body| {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "id": "task-mock-ir",
+                "status": {
+                    "state": "input-required",
+                    "message": {
+                        "messageId": "msg-agent-1",
+                        "role": "agent",
+                        "parts": [{"kind": "text", "text": "which sprint did you mean?"}],
+                        "kind": "message",
+                    }
+                },
+                "kind": "task",
+            }
+        });
+        (StatusCode::OK, Json(response))
+    })
+    .await;
+
+    let url = format!("http://{addr}/a2a/cust-8/mika-prime");
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false)
+        .await
+        .expect("InputRequired should render content, not error");
+    assert_eq!(out, "which sprint did you mean?");
+}
+
+#[tokio::test]
+async fn dispatch_prefers_artifacts_over_status_message() {
+    // Per A2A v0.3 spec, completed-task output lives in artifacts. status.message
+    // is a fallback only when artifacts/history are absent.
+    let (addr, _) = spawn_mock(|_cap, _body| {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "id": "task-mock-art",
+                "status": {
+                    "state": "completed",
+                    "message": {
+                        "messageId": "msg-agent-1",
+                        "role": "agent",
+                        "parts": [{"kind": "text", "text": "fallback-ignored"}],
+                        "kind": "message",
+                    }
+                },
+                "artifacts": [{
+                    "artifactId": "art-1",
+                    "parts": [{"kind": "text", "text": "artifact-output"}]
+                }],
+                "kind": "task",
+            }
+        });
+        (StatusCode::OK, Json(response))
+    })
+    .await;
+
+    let url = format!("http://{addr}/a2a/cust-9/mika-prime");
+    let out = dispatch_remote("hi", &url, OutputFormat::Text, false)
+        .await
+        .expect("dispatch should succeed");
+    assert_eq!(out, "artifact-output");
+}
+
+#[tokio::test]
 async fn dispatch_renders_file_part_as_placeholder() {
     let (addr, _) = spawn_mock(|_cap, _body| {
         let response = serde_json::json!({

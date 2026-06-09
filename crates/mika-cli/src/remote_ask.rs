@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result};
 use mika_a2a::client::A2aClient;
-use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task};
+use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
 use uuid::Uuid;
 
 /// Output format selector. Mirrors `crate::cli::OutputFormat` to keep the
@@ -27,26 +27,60 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Render the agent's most-recent message parts on a `Task` to a flat string.
+/// Render an A2A `Task`'s text content to a flat string using the same three-tier
+/// extraction strategy as the in-process `a2a_call` builtin tool
+/// (`crates/mika-agent/src/tools/a2a_call.rs`): artifacts → agent-role history →
+/// status-message fallback. The A2A spec carries completed-task output in
+/// artifacts, so reading only `status.message` would silently render empty for
+/// spec-conformant remote agents.
 ///
-/// Text parts are emitted verbatim; non-text parts surface as placeholder strings
-/// (`[file: <name>]`, `[data]`) — full multi-modal CLI rendering is deferred.
+/// Non-text parts surface as placeholder strings (`[file: <name>]`, `[data]`);
+/// multi-text parts are joined with blank-line separators to preserve paragraph
+/// boundaries from the remote agent.
 pub fn render_task_parts(task: &Task) -> String {
-    let Some(msg) = task.status.message.as_ref() else {
-        return String::new();
-    };
-    let mut out = String::new();
-    for part in &msg.parts {
-        match part {
-            Part::Text { text, .. } => out.push_str(text),
-            Part::File { file, .. } => {
-                let name = file.name.as_deref().unwrap_or("unnamed");
-                out.push_str(&format!("[file: {name}]"));
+    let mut parts_text: Vec<String> = Vec::new();
+
+    // Tier 1: artifacts
+    if let Some(artifacts) = &task.artifacts {
+        for artifact in artifacts {
+            for part in &artifact.parts {
+                push_rendered_part(part, &mut parts_text);
             }
-            Part::Data { .. } => out.push_str("[data]"),
         }
     }
-    out
+
+    // Tier 2: agent-role messages in history
+    if let Some(history) = &task.history {
+        for msg in history {
+            if msg.role == Role::Agent {
+                for part in &msg.parts {
+                    push_rendered_part(part, &mut parts_text);
+                }
+            }
+        }
+    }
+
+    // Tier 3: status.message fallback (only if tiers 1+2 produced nothing)
+    if parts_text.is_empty()
+        && let Some(msg) = task.status.message.as_ref()
+    {
+        for part in &msg.parts {
+            push_rendered_part(part, &mut parts_text);
+        }
+    }
+
+    parts_text.join("\n\n")
+}
+
+fn push_rendered_part(part: &Part, out: &mut Vec<String>) {
+    match part {
+        Part::Text { text, .. } => out.push(text.clone()),
+        Part::File { file, .. } => {
+            let name = file.name.as_deref().unwrap_or("unnamed");
+            out.push(format!("[file: {name}]"));
+        }
+        Part::Data { .. } => out.push("[data]".to_string()),
+    }
 }
 
 /// Build a `MessageSendParams` containing the user's single text prompt.
@@ -91,7 +125,18 @@ pub async fn dispatch_remote(
     reqwest::Url::parse(remote_url)
         .with_context(|| format!("invalid --remote URL: {remote_url}"))?;
 
-    let auth_token = std::env::var("MIKA_INTERNAL_TOKEN").ok();
+    // Filter out an empty MIKA_INTERNAL_TOKEN — set-but-empty (common with a
+    // misconfigured .env) would otherwise forward `Authorization: Bearer `, which
+    // the gateway 401s with no diagnostic hint. Treating empty as unset surfaces
+    // the same 401 but at least matches the no-auth diagnostic shape.
+    // Note on secrets discipline: `mika/CLAUDE.md` mandates `secrecy::SecretString`
+    // at the `Settings` accessor boundary, with downstream types using plain `String`.
+    // `A2aClient::new` takes `Option<String>` — its API IS the downstream boundary,
+    // so a plain-String read here is consistent with the convention. `A2aClient`
+    // does not derive `Debug`, so accidental log leakage is constrained.
+    let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     let client = A2aClient::new(remote_url, auth_token);
 
     let task = match client.send_message(build_send_params(message)).await {
@@ -103,6 +148,33 @@ pub async fn dispatch_remote(
             anyhow::bail!("invalid state transition from {from} to {to}")
         }
     };
+
+    // Inspect the terminal Task state. Per A2A v0.3 §6, a synchronous
+    // `message/send` returns a Task in one of: Completed, Failed, Canceled,
+    // Rejected, InputRequired, AuthRequired (terminal-or-pending). Submitted /
+    // Working are async-dispatch states the gateway should not return here.
+    //
+    // Render output for Completed and the pending-input states (the latter
+    // carry meaningful text content the user needs to see). Surface terminal-bad
+    // states and async-in-progress states as errors so the shell exit code
+    // matches the local `mika ask` contract.
+    match task.status.state {
+        TaskState::Completed | TaskState::InputRequired | TaskState::AuthRequired => {}
+        TaskState::Failed | TaskState::Canceled | TaskState::Rejected => {
+            anyhow::bail!(
+                "remote task {} ended in state '{}'",
+                task.id,
+                task.status.state
+            );
+        }
+        TaskState::Submitted | TaskState::Working | TaskState::Unknown => {
+            anyhow::bail!(
+                "remote task {} is still in state '{}' — sync dispatch expected a terminal state",
+                task.id,
+                task.status.state
+            );
+        }
+    }
 
     render(&task, format, verbose)
 }
@@ -188,6 +260,64 @@ mod tests {
     }
 
     #[test]
+    fn render_prefers_artifacts_over_status_message() {
+        let mut task = task_with_text("status-fallback-text");
+        task.artifacts = Some(vec![mika_a2a::Artifact {
+            artifact_id: "art-1".to_string(),
+            name: None,
+            description: None,
+            parts: vec![Part::Text {
+                text: "artifact-text".to_string(),
+                metadata: None,
+            }],
+            metadata: None,
+            extensions: None,
+        }]);
+        assert_eq!(render_task_parts(&task), "artifact-text");
+    }
+
+    #[test]
+    fn render_prefers_agent_history_over_status_message_when_no_artifacts() {
+        let mut task = task_with_text("status-fallback-text");
+        task.history = Some(vec![Message {
+            message_id: "history-msg-1".to_string(),
+            role: Role::Agent,
+            parts: vec![Part::Text {
+                text: "history-text".to_string(),
+                metadata: None,
+            }],
+            context_id: None,
+            task_id: None,
+            metadata: None,
+            reference_task_ids: None,
+            extensions: None,
+            kind: "message".to_string(),
+        }]);
+        assert_eq!(render_task_parts(&task), "history-text");
+    }
+
+    #[test]
+    fn render_ignores_user_role_history_messages() {
+        let mut task = task_with_text("status-fallback-text");
+        task.history = Some(vec![Message {
+            message_id: "history-msg-1".to_string(),
+            role: Role::User,
+            parts: vec![Part::Text {
+                text: "user-prompt".to_string(),
+                metadata: None,
+            }],
+            context_id: None,
+            task_id: None,
+            metadata: None,
+            reference_task_ids: None,
+            extensions: None,
+            kind: "message".to_string(),
+        }]);
+        // User-role history is skipped; falls through to status.message
+        assert_eq!(render_task_parts(&task), "status-fallback-text");
+    }
+
+    #[test]
     fn render_empty_message_emits_empty_string() {
         let mut task = task_with_text("ignored");
         task.status.message = None;
@@ -235,11 +365,11 @@ mod tests {
     }
 
     #[test]
-    fn render_mixed_parts_concatenates() {
+    fn render_mixed_parts_joins_with_blank_lines() {
         let mut task = task_with_text("");
         task.status.message.as_mut().unwrap().parts = vec![
             Part::Text {
-                text: "see file: ".to_string(),
+                text: "see file:".to_string(),
                 metadata: None,
             },
             Part::File {
@@ -252,7 +382,9 @@ mod tests {
                 metadata: None,
             },
         ];
-        assert_eq!(render_task_parts(&task), "see file: [file: a.txt]");
+        // Parts are joined with blank-line separators to preserve agent paragraph
+        // boundaries; mirrors a2a_call's render contract.
+        assert_eq!(render_task_parts(&task), "see file:\n\n[file: a.txt]");
     }
 
     #[tokio::test]
