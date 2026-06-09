@@ -22,6 +22,7 @@ telemetry = ["mika-common/telemetry"]
 [dependencies]
 mika-common.workspace = true
 mika-agent.workspace = true
+mika-a2a.workspace = true
 tokio.workspace = true
 clap.workspace = true
 clap-markdown.workspace = true
@@ -54,3 +55,4 @@ hex.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 tempfile.workspace = true
+axum.workspace = true
