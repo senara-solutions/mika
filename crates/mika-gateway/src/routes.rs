@@ -24,8 +24,8 @@ use crate::a2a_routes;
 use crate::github;
 use crate::orchestrator_inbox;
 use crate::telegram::{
-    ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate, parse_agent_prefix,
-    parse_update,
+    CustomerTelegramClient, ParsedMessage, TelegramApiError, TelegramClient, TelegramUpdate,
+    parse_agent_prefix, parse_update,
 };
 
 /// Carries HTTP method and path from request to response extensions,
@@ -85,10 +85,13 @@ pub(crate) async fn handle_version() -> Json<VersionInfo> {
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
-    pub telegram: TelegramClient,
+    /// Global Telegram client — populated only in single-bot mode
+    /// (`MIKA_TELEGRAM_SINGLE_BOT_MODE=1`). `None` in per-customer mode.
+    pub telegram: Option<TelegramClient>,
     pub http_client: reqwest::Client,
     pub internal_token: SecretString,
-    pub webhook_secret: SecretString,
+    /// Global webhook secret — populated only in single-bot mode. `None` in per-customer mode.
+    pub webhook_secret: Option<SecretString>,
     pub ready: Arc<AtomicBool>,
     pub webhook_semaphore: Arc<tokio::sync::Semaphore>,
     /// Optional override for agent container base URL (local E2E testing).
@@ -123,7 +126,10 @@ impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field("internal_token", &"[REDACTED]")
-            .field("webhook_secret", &"[REDACTED]")
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("agent_base_url", &self.agent_base_url)
             .field("agents_namespace", &self.agents_namespace)
             .field("webhook_counter", &self.webhook_counter)
@@ -144,6 +150,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/webhook/telegram",
             post(handle_webhook).layer(RequestBodyLimitLayer::new(64 * 1024)),
+        )
+        // Webhook: Per-customer Telegram bots — validated by per-customer webhook_secret
+        .route(
+            "/webhook/telegram/{customer_id}",
+            post(handle_customer_webhook).layer(RequestBodyLimitLayer::new(64 * 1024)),
         )
         // Send: Containers POST outbound messages (validated by Bearer token)
         .route(
@@ -301,13 +312,20 @@ pub(crate) async fn handle_webhook(
     headers: HeaderMap,
     Json(update): Json<TelegramUpdate>,
 ) -> StatusCode {
+    // Single-bot mode only — return 404 when not configured
+    let (global_telegram, global_secret) =
+        match (state.telegram.as_ref(), state.webhook_secret.as_ref()) {
+            (Some(tg), Some(secret)) => (tg, secret),
+            _ => return StatusCode::NOT_FOUND,
+        };
+
     // Validate secret_token header (constant-time)
     let secret = headers
         .get("x-telegram-bot-api-secret-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !constant_time_eq(secret, state.webhook_secret.expose_secret()) {
+    if !constant_time_eq(secret, global_secret.expose_secret()) {
         return StatusCode::UNAUTHORIZED;
     }
 
@@ -331,100 +349,211 @@ pub(crate) async fn handle_webhook(
         });
     }
 
+    // Construct a CustomerTelegramClient from the global bot token for handler dispatch.
+    // In single-bot mode, all handlers use this wrapper over the global token.
+    let tg = CustomerTelegramClient::new(
+        state.http_client.clone(),
+        global_telegram.bot_token_cloned(),
+    );
+
     // Dispatch asynchronously — always return 200 to Telegram
     let s = state.clone();
     tokio::spawn(async move {
         let _permit = permit; // held until task completes
-        match parsed {
-            ParsedMessage::Start {
-                chat_id,
-                pairing_token,
-            } => {
-                handle_pairing(&s, chat_id, &pairing_token).await;
-            }
-            ParsedMessage::Text {
-                chat_id,
-                text,
-                update_id,
-                reply_to_message_id,
-                reply_to_text,
-            } => {
-                handle_text_message(
-                    &s,
-                    chat_id,
-                    &text,
-                    update_id,
-                    reply_to_message_id,
-                    reply_to_text.as_deref(),
-                )
-                .await;
-            }
-            ParsedMessage::Photo {
-                chat_id,
-                file_id,
-                caption,
-                update_id,
-                reply_to_message_id,
-                reply_to_text,
-            } => {
-                handle_photo_message(
-                    &s,
-                    chat_id,
-                    &file_id,
-                    caption.as_deref(),
-                    update_id,
-                    reply_to_message_id,
-                    reply_to_text.as_deref(),
-                )
-                .await;
-            }
-            ParsedMessage::Document {
-                chat_id,
-                file_id,
-                mime_type: _,
-                caption,
-                update_id,
-                reply_to_message_id,
-                reply_to_text,
-            } => {
-                // Image documents use the same flow as photos
-                handle_photo_message(
-                    &s,
-                    chat_id,
-                    &file_id,
-                    caption.as_deref(),
-                    update_id,
-                    reply_to_message_id,
-                    reply_to_text.as_deref(),
-                )
-                .await;
-            }
-            ParsedMessage::BareStart { chat_id } => {
-                let _ = s
-                    .telegram
-                    .send_message(
-                        chat_id,
-                        "Welcome! If you have an invite link, please use it to get started. If you're already set up, just type a message.",
-                    )
-                    .await;
-            }
-            ParsedMessage::Unsupported { chat_id } => {
-                // Fire-and-forget reply for non-image media (sticker/voice/video/etc.)
-                let _ = s
-                    .telegram
-                    .send_message(
-                        chat_id,
-                        "I can read text and image messages. This media type isn't supported yet.",
-                    )
-                    .await;
-            }
-            ParsedMessage::NoMessage => {
-                // Non-message update (e.g., edited_message, channel_post) — ignore
-            }
-        }
+        dispatch_parsed_message(&s, &tg, parsed).await;
     });
 
     StatusCode::OK
+}
+
+// -- Per-customer webhook handler --
+
+/// DB row for per-customer webhook lookup (includes bot_token and webhook_secret).
+#[derive(Debug, sqlx::FromRow)]
+struct CustomerWebhookRow {
+    #[allow(dead_code)]
+    id: Uuid,
+    bot_token: Option<String>,
+    webhook_secret: Option<String>,
+}
+
+/// POST /webhook/telegram/{customer_id} — receive per-customer Telegram updates.
+///
+/// Validates the `X-Telegram-Bot-Api-Secret-Token` header against the customer's
+/// stored `webhook_secret`. Returns unified 401 for all failure cases (missing
+/// customer, wrong secret, no bot_token) to prevent customer_id enumeration.
+pub(crate) async fn handle_customer_webhook(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(update): Json<TelegramUpdate>,
+) -> StatusCode {
+    // Look up customer with per-customer Telegram columns
+    let customer = match sqlx::query_as::<_, CustomerWebhookRow>(
+        "SELECT id, bot_token, webhook_secret FROM customers WHERE id = $1",
+    )
+    .bind(customer_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => return StatusCode::UNAUTHORIZED,
+        Err(e) => {
+            warn!(error = %e, %customer_id, "customer webhook lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+
+    // Validate webhook_secret (constant-time). Unified 401 for missing secret,
+    // invalid secret, or missing bot_token to prevent customer_id enumeration.
+    let stored_secret = match customer.webhook_secret.as_deref() {
+        Some(s) => s,
+        None => return StatusCode::UNAUTHORIZED,
+    };
+
+    let header_secret = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !constant_time_eq(header_secret, stored_secret) {
+        return StatusCode::UNAUTHORIZED;
+    }
+
+    // Require bot_token to be configured
+    let bot_token = match customer.bot_token {
+        Some(t) => t,
+        None => return StatusCode::UNAUTHORIZED,
+    };
+
+    // Concurrency limit: shed load when at capacity (Telegram will retry)
+    let permit = match state.webhook_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!(%customer_id, "webhook at capacity, shedding load");
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    };
+
+    let parsed = parse_update(&update);
+
+    // Periodic cleanup of old outbound message mappings (~every 100 webhooks)
+    let count = state.webhook_counter.fetch_add(1, Ordering::Relaxed);
+    if count % 100 == 0 {
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            cleanup_old_outbound_messages(&cleanup_state).await;
+        });
+    }
+
+    // Build per-customer telegram client
+    let tg = CustomerTelegramClient::new(state.http_client.clone(), SecretString::from(bot_token));
+
+    // Dispatch asynchronously — always return 200 to Telegram
+    let s = state.clone();
+    tokio::spawn(async move {
+        let _permit = permit; // held until task completes
+        dispatch_parsed_message(&s, &tg, parsed).await;
+    });
+
+    StatusCode::OK
+}
+
+/// Dispatch a parsed Telegram message to the appropriate handler.
+/// Shared between `handle_webhook` (single-bot) and `handle_customer_webhook` (per-customer).
+async fn dispatch_parsed_message(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    parsed: ParsedMessage,
+) {
+    match parsed {
+        ParsedMessage::Start {
+            chat_id,
+            pairing_token,
+        } => {
+            handle_pairing(state, tg, chat_id, &pairing_token).await;
+        }
+        ParsedMessage::Text {
+            chat_id,
+            text,
+            update_id,
+            reply_to_message_id,
+            reply_to_text,
+        } => {
+            handle_text_message(
+                state,
+                tg,
+                chat_id,
+                &text,
+                update_id,
+                reply_to_message_id,
+                reply_to_text.as_deref(),
+            )
+            .await;
+        }
+        ParsedMessage::Photo {
+            chat_id,
+            file_id,
+            caption,
+            update_id,
+            reply_to_message_id,
+            reply_to_text,
+        } => {
+            handle_photo_message(
+                state,
+                tg,
+                chat_id,
+                &file_id,
+                caption.as_deref(),
+                update_id,
+                reply_to_message_id,
+                reply_to_text.as_deref(),
+            )
+            .await;
+        }
+        ParsedMessage::Document {
+            chat_id,
+            file_id,
+            mime_type: _,
+            caption,
+            update_id,
+            reply_to_message_id,
+            reply_to_text,
+        } => {
+            // Image documents use the same flow as photos
+            handle_photo_message(
+                state,
+                tg,
+                chat_id,
+                &file_id,
+                caption.as_deref(),
+                update_id,
+                reply_to_message_id,
+                reply_to_text.as_deref(),
+            )
+            .await;
+        }
+        ParsedMessage::BareStart { chat_id } => {
+            let _ = tg
+                .send_message(
+                    chat_id,
+                    "Welcome! If you have an invite link, please use it to get started. If you're already set up, just type a message.",
+                )
+                .await;
+        }
+        ParsedMessage::Unsupported { chat_id } => {
+            // Fire-and-forget reply for non-image media (sticker/voice/video/etc.)
+            let _ = tg
+                .send_message(
+                    chat_id,
+                    "I can read text and image messages. This media type isn't supported yet.",
+                )
+                .await;
+        }
+        ParsedMessage::NoMessage => {
+            // Non-message update (e.g., edited_message, channel_post) — ignore
+        }
+    }
 }
 
 // -- Shared routing helpers --
@@ -458,7 +587,11 @@ pub(crate) fn container_url_str(
 
 /// Look up a customer by Telegram chat ID.
 /// Returns the customer row, or None after sending an appropriate reply.
-async fn resolve_customer(state: &AppState, chat_id: i64) -> Option<CustomerRow> {
+async fn resolve_customer(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+) -> Option<CustomerRow> {
     match sqlx::query_as::<_, CustomerRow>(
         "SELECT id, status FROM customers WHERE telegram_chat_id = $1",
     )
@@ -468,8 +601,7 @@ async fn resolve_customer(state: &AppState, chat_id: i64) -> Option<CustomerRow>
     {
         Ok(Some(c)) => Some(c),
         Ok(None) => {
-            let _ = state
-                .telegram
+            let _ = tg
                 .send_message(
                     chat_id,
                     "Please pair your account first. Use your invite link to get started.",
@@ -479,7 +611,7 @@ async fn resolve_customer(state: &AppState, chat_id: i64) -> Option<CustomerRow>
         }
         Err(e) => {
             warn!(error = %e, chat_id, "customer lookup failed");
-            reply_transient_error(&state.telegram, chat_id).await;
+            reply_transient_error(tg, chat_id).await;
             None
         }
     }
@@ -522,6 +654,7 @@ async fn reset_dedup(state: &AppState, customer_id: Uuid, update_id: i64) {
 /// On success: no-op. On error response: warn + reply. On network failure: reset dedup + warn + reply.
 async fn handle_forward_result(
     state: &AppState,
+    tg: &CustomerTelegramClient,
     result: Result<reqwest::Response, reqwest::Error>,
     chat_id: i64,
     customer_id: Uuid,
@@ -535,14 +668,14 @@ async fn handle_forward_result(
         Ok(resp) => {
             let status = resp.status().as_u16();
             warn!(status, %customer_id, "container returned error for {msg_kind}");
-            reply_transient_error(&state.telegram, chat_id).await;
+            reply_transient_error(tg, chat_id).await;
         }
         Err(e) => {
             reset_dedup(state, customer_id, update_id).await;
             let is_connect = e.is_connect();
             warn!(error = %e, %customer_id, is_connect, "container unreachable for {msg_kind}, dedup reset");
             let msg = forward_error_message(is_connect);
-            let _ = state.telegram.send_message(chat_id, msg).await;
+            let _ = tg.send_message(chat_id, msg).await;
         }
     }
 }
@@ -552,13 +685,14 @@ async fn handle_forward_result(
 /// Route a text message to the correct customer container.
 async fn handle_text_message(
     state: &AppState,
+    tg: &CustomerTelegramClient,
     chat_id: i64,
     text: &str,
     update_id: i64,
     reply_to_message_id: Option<i64>,
     reply_to_text: Option<&str>,
 ) {
-    let row = match resolve_customer(state, chat_id).await {
+    let row = match resolve_customer(state, tg, chat_id).await {
         Some(r) => r,
         None => return,
     };
@@ -609,7 +743,7 @@ async fn handle_text_message(
         .send()
         .await;
 
-    handle_forward_result(state, result, chat_id, row.id, update_id, "text").await;
+    handle_forward_result(state, tg, result, chat_id, row.id, update_id, "text").await;
 }
 
 // -- Photo message routing --
@@ -619,8 +753,10 @@ async fn handle_text_message(
 /// Downloads the image from Telegram, base64-encodes it, and forwards
 /// alongside the caption (or synthetic text) to the agent container.
 /// Dedup is claimed *after* a successful download to prevent message loss.
+#[allow(clippy::too_many_arguments)]
 async fn handle_photo_message(
     state: &AppState,
+    tg: &CustomerTelegramClient,
     chat_id: i64,
     file_id: &str,
     caption: Option<&str>,
@@ -628,7 +764,7 @@ async fn handle_photo_message(
     reply_to_message_id: Option<i64>,
     reply_to_text: Option<&str>,
 ) {
-    let row = match resolve_customer(state, chat_id).await {
+    let row = match resolve_customer(state, tg, chat_id).await {
         Some(r) => r,
         None => return,
     };
@@ -639,11 +775,10 @@ async fn handle_photo_message(
     }
 
     // Download image BEFORE claiming dedup (prevents message loss on download failure)
-    let image = match state.telegram.download_image(file_id).await {
+    let image = match tg.download_image(file_id).await {
         Ok(img) => img,
         Err(TelegramApiError::BadRequest { ref message }) if message.contains("too large") => {
-            let _ = state
-                .telegram
+            let _ = tg
                 .send_message(
                     chat_id,
                     "That image is too large for me to process. Please send a smaller photo (under 5 MB).",
@@ -652,8 +787,7 @@ async fn handle_photo_message(
             return;
         }
         Err(TelegramApiError::BadRequest { ref message }) if message.contains("unsupported") => {
-            let _ = state
-                .telegram
+            let _ = tg
                 .send_message(
                     chat_id,
                     "I couldn't recognize that image format. Please send a JPEG, PNG, GIF, or WebP image.",
@@ -663,8 +797,7 @@ async fn handle_photo_message(
         }
         Err(e) => {
             error!(error = %e, chat_id, "failed to download image from Telegram");
-            let _ = state
-                .telegram
+            let _ = tg
                 .send_message(
                     chat_id,
                     "Sorry, I couldn't download your photo. Please try sending it again.",
@@ -736,7 +869,7 @@ async fn handle_photo_message(
         .send()
         .await;
 
-    handle_forward_result(state, result, chat_id, row.id, update_id, "photo").await;
+    handle_forward_result(state, tg, result, chat_id, row.id, update_id, "photo").await;
 }
 
 // -- Pairing --
@@ -747,11 +880,15 @@ fn is_valid_pairing_token(token: &str) -> bool {
 }
 
 /// Handle /start <pairing_token> deep link for customer pairing.
-async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
+async fn handle_pairing(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    pairing_token: &str,
+) {
     // Reject malformed tokens before hitting the database
     if !is_valid_pairing_token(pairing_token) {
-        let _ = state
-            .telegram
+        let _ = tg
             .send_message(chat_id, "Invalid or expired invite link.")
             .await;
         return;
@@ -797,8 +934,7 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
         }
         Ok(None) => {
             // Don't reveal why — could be expired, used, or invalid
-            let _ = state
-                .telegram
+            let _ = tg
                 .send_message(chat_id, "Invalid or expired invite link.")
                 .await;
         }
@@ -814,11 +950,11 @@ async fn handle_pairing(state: &AppState, chat_id: i64, pairing_token: &str) {
                 } else {
                     "Pairing failed. Please contact support."
                 };
-                let _ = state.telegram.send_message(chat_id, msg).await;
+                let _ = tg.send_message(chat_id, msg).await;
                 return;
             }
             warn!(error = %e, chat_id, "pairing query failed");
-            reply_transient_error(&state.telegram, chat_id).await;
+            reply_transient_error(tg, chat_id).await;
         }
     }
 }
@@ -922,12 +1058,57 @@ pub(crate) async fn handle_send(
         None => &payload.text,
     };
 
-    // Send to Telegram (no message splitting — send as-is)
-    match state
-        .telegram
-        .send_message(payload.chat_id, text_to_send)
+    // Resolve the Telegram client: per-customer bot token if customer_id is provided,
+    // otherwise fall back to the global single-bot client.
+    let tg_client: CustomerTelegramClient = if let Some(cid) = payload.customer_id {
+        // Per-customer: look up bot token by primary key
+        match sqlx::query_scalar::<_, Option<String>>(
+            "SELECT bot_token FROM customers WHERE id = $1",
+        )
+        .bind(cid)
+        .fetch_optional(&state.pool)
         .await
-    {
+        {
+            Ok(Some(Some(token))) => {
+                CustomerTelegramClient::new(state.http_client.clone(), SecretString::from(token))
+            }
+            Ok(Some(None)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "customer has no bot_token configured"})),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "customer not found"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                error!(error = %e, %cid, "customer lookup failed for /send");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    } else {
+        // Backward compat: use global single-bot client
+        match state.telegram.as_ref() {
+            Some(global_tg) => {
+                CustomerTelegramClient::new(state.http_client.clone(), global_tg.bot_token_cloned())
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "no customer_id provided and gateway is not in single-bot mode"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // Send to Telegram (no message splitting — send as-is)
+    match tg_client.send_message(payload.chat_id, text_to_send).await {
         Ok(message_id) => {
             info!(chat_id = payload.chat_id, request_id = ?payload.request_id, telegram_message_id = message_id, "sent to telegram");
 
@@ -977,6 +1158,12 @@ pub(crate) struct SendPayload {
     text: String,
     #[serde(default)]
     request_id: Option<String>,
+    /// Customer ID for per-customer bot token lookup.
+    /// When present, the gateway looks up the customer's bot token and sends
+    /// via their bot. When absent, falls back to the global single-bot client.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    customer_id: Option<Uuid>,
     /// Agent name for identification in multi-agent setups.
     /// When present, outbound messages are prefixed with `[agent_name]`.
     #[serde(default)]
@@ -1175,8 +1362,8 @@ fn forward_error_message(is_connect: bool) -> &'static str {
 }
 
 /// Send a generic transient error reply (fire-and-forget).
-async fn reply_transient_error(telegram: &TelegramClient, chat_id: i64) {
-    let _ = telegram.send_message(chat_id, TRANSIENT_ERROR_MSG).await;
+async fn reply_transient_error(tg: &CustomerTelegramClient, chat_id: i64) {
+    let _ = tg.send_message(chat_id, TRANSIENT_ERROR_MSG).await;
 }
 
 // -- DB row types (for sqlx runtime queries) --
@@ -1405,6 +1592,23 @@ mod tests {
         let json = r#"{"chat_id": -100123456789, "text": "hello"}"#;
         let payload: SendPayload = serde_json::from_str(json).unwrap();
         assert_eq!(payload.chat_id, -100_123_456_789);
+    }
+
+    #[test]
+    fn test_send_payload_with_customer_id() {
+        let json = r#"{"chat_id": 42, "text": "hello", "customer_id": "12345678-1234-1234-1234-123456789abc"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            payload.customer_id,
+            Some(Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_send_payload_without_customer_id() {
+        let json = r#"{"chat_id": 42, "text": "hello"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert!(payload.customer_id.is_none());
     }
 
     #[test]

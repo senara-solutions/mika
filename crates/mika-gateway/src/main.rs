@@ -73,17 +73,37 @@ async fn main() -> Result<()> {
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()?;
 
-    // Create Telegram client
-    let telegram = TelegramClient::new(http_client.clone(), settings.telegram_bot_token.clone());
+    // Create Telegram client (only in single-bot mode)
+    let single_bot_mode =
+        settings::telegram_single_bot_mode_is_enabled(settings.telegram_single_bot_mode.as_deref());
+    let telegram = if single_bot_mode {
+        let bot_token = settings
+            .telegram_bot_token
+            .clone()
+            .expect("validated in GatewaySettings::load");
+        let tg = TelegramClient::new(http_client.clone(), bot_token);
 
-    // Register webhook with Telegram (idempotent)
-    telegram
-        .set_webhook(
-            &settings.telegram_webhook_url,
-            settings.telegram_webhook_secret.expose_secret(),
+        // Register webhook with Telegram (idempotent)
+        let webhook_url = settings
+            .telegram_webhook_url
+            .as_ref()
+            .expect("validated in GatewaySettings::load");
+        tg.set_webhook(
+            webhook_url,
+            settings
+                .telegram_webhook_secret
+                .as_ref()
+                .expect("validated in GatewaySettings::load")
+                .expose_secret(),
         )
         .await?;
-    info!(url = %settings.telegram_webhook_url, "telegram webhook registered");
+        info!(url = %webhook_url, "telegram webhook registered (single-bot mode)");
+
+        Some(tg)
+    } else {
+        info!("per-customer Telegram bot mode — global webhook registration skipped");
+        None
+    };
 
     // Log GitHub webhook configuration status
     if settings.github_webhook_secret.is_some() {

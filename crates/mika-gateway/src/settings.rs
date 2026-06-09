@@ -8,14 +8,24 @@ pub struct GatewaySettings {
     /// Postgres connection string
     pub database_url: SecretString,
 
-    /// Telegram Bot API token
-    pub telegram_bot_token: SecretString,
+    /// Telegram Bot API token (required only in single-bot mode)
+    #[serde(default)]
+    pub telegram_bot_token: Option<SecretString>,
 
-    /// Secret token for validating inbound Telegram webhooks
-    pub telegram_webhook_secret: SecretString,
+    /// Secret token for validating inbound Telegram webhooks (required only in single-bot mode)
+    #[serde(default)]
+    pub telegram_webhook_secret: Option<SecretString>,
 
-    /// Public URL Telegram calls for webhook delivery
-    pub telegram_webhook_url: String,
+    /// Public URL Telegram calls for webhook delivery (required only in single-bot mode)
+    #[serde(default)]
+    pub telegram_webhook_url: Option<String>,
+
+    /// Single-bot mode: when "1" or "true", the gateway uses the global
+    /// MIKA_TELEGRAM_BOT_TOKEN for all customers (legacy behavior).
+    /// Requires MIKA_TELEGRAM_BOT_TOKEN, MIKA_TELEGRAM_WEBHOOK_SECRET,
+    /// and MIKA_TELEGRAM_WEBHOOK_URL to be set. Default: false.
+    #[serde(default)]
+    pub telegram_single_bot_mode: Option<String>,
 
     /// Shared bearer token for gateway ↔ container auth
     pub internal_token: SecretString,
@@ -108,16 +118,38 @@ impl GatewaySettings {
                 )
             })?;
 
-        // Validate webhook URL is well-formed
-        reqwest::Url::parse(&settings.telegram_webhook_url)
-            .map_err(|e| anyhow::anyhow!("MIKA_TELEGRAM_WEBHOOK_URL is not a valid URL: {e}"))?;
-
-        // Validate tokens are fixed-length hex (eliminates constant_time_eq length timing leak)
+        // Validate internal token
         validate_hex_token(&settings.internal_token, "MIKA_INTERNAL_TOKEN")?;
-        validate_hex_token(
-            &settings.telegram_webhook_secret,
-            "MIKA_TELEGRAM_WEBHOOK_SECRET",
-        )?;
+
+        // Single-bot mode requires bot token, webhook secret, and webhook URL
+        if telegram_single_bot_mode_is_enabled(settings.telegram_single_bot_mode.as_deref()) {
+            if settings.telegram_bot_token.is_none() {
+                anyhow::bail!(
+                    "MIKA_TELEGRAM_SINGLE_BOT_MODE is enabled but MIKA_TELEGRAM_BOT_TOKEN is not set"
+                );
+            }
+            if settings.telegram_webhook_secret.is_none() {
+                anyhow::bail!(
+                    "MIKA_TELEGRAM_SINGLE_BOT_MODE is enabled but MIKA_TELEGRAM_WEBHOOK_SECRET is not set"
+                );
+            }
+            if settings.telegram_webhook_url.is_none() {
+                anyhow::bail!(
+                    "MIKA_TELEGRAM_SINGLE_BOT_MODE is enabled but MIKA_TELEGRAM_WEBHOOK_URL is not set"
+                );
+            }
+
+            // Validate webhook URL is well-formed
+            reqwest::Url::parse(settings.telegram_webhook_url.as_ref().unwrap()).map_err(|e| {
+                anyhow::anyhow!("MIKA_TELEGRAM_WEBHOOK_URL is not a valid URL: {e}")
+            })?;
+
+            // Validate webhook secret format
+            validate_hex_token(
+                settings.telegram_webhook_secret.as_ref().unwrap(),
+                "MIKA_TELEGRAM_WEBHOOK_SECRET",
+            )?;
+        }
 
         // Validate agent_base_url scheme when set (dev-only override)
         if let Some(ref url_str) = settings.agent_base_url {
@@ -166,9 +198,16 @@ impl std::fmt::Debug for GatewaySettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GatewaySettings")
             .field("database_url", &"[REDACTED]")
-            .field("telegram_bot_token", &"[REDACTED]")
-            .field("telegram_webhook_secret", &"[REDACTED]")
+            .field(
+                "telegram_bot_token",
+                &self.telegram_bot_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "telegram_webhook_secret",
+                &self.telegram_webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("telegram_webhook_url", &self.telegram_webhook_url)
+            .field("telegram_single_bot_mode", &self.telegram_single_bot_mode)
             .field("internal_token", &"[REDACTED]")
             .field("gateway_port", &self.gateway_port)
             .field("log_level", &self.log_level)
@@ -194,6 +233,18 @@ impl std::fmt::Debug for GatewaySettings {
                 &self.orchestrator_inbox_enabled,
             )
             .finish()
+    }
+}
+
+/// Parse `MIKA_TELEGRAM_SINGLE_BOT_MODE`. Treats `1` / `true` (case-insensitive)
+/// as enabled; everything else as disabled.
+pub fn telegram_single_bot_mode_is_enabled(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some(v) => {
+            let lower = v.to_ascii_lowercase();
+            lower == "1" || lower == "true"
+        }
+        None => false,
     }
 }
 
@@ -262,9 +313,10 @@ mod tests {
             "{:?}",
             GatewaySettings {
                 database_url: SecretString::from("postgres://user:pass@localhost/db"),
-                telegram_bot_token: SecretString::from("123:ABC"),
-                telegram_webhook_secret: SecretString::from("a".repeat(64)),
-                telegram_webhook_url: "https://example.com/webhook".to_string(),
+                telegram_bot_token: Some(SecretString::from("123:ABC")),
+                telegram_webhook_secret: Some(SecretString::from("a".repeat(64))),
+                telegram_webhook_url: Some("https://example.com/webhook".to_string()),
+                telegram_single_bot_mode: Some("1".to_string()),
                 internal_token: SecretString::from("b".repeat(64)),
                 gateway_port: 8080,
                 log_level: "info".to_string(),
@@ -323,5 +375,37 @@ mod tests {
     fn test_orchestrator_inbox_enabled_handles_whitespace() {
         assert!(orchestrator_inbox_is_enabled(Some(" 1 ")));
         assert!(orchestrator_inbox_is_enabled(Some("\ttrue\n")));
+    }
+
+    // -- telegram_single_bot_mode tests --
+
+    #[test]
+    fn test_single_bot_mode_default_off() {
+        assert!(!telegram_single_bot_mode_is_enabled(None));
+        assert!(!telegram_single_bot_mode_is_enabled(Some("")));
+    }
+
+    #[test]
+    fn test_single_bot_mode_accepts_one() {
+        assert!(telegram_single_bot_mode_is_enabled(Some("1")));
+    }
+
+    #[test]
+    fn test_single_bot_mode_accepts_true_case_insensitive() {
+        assert!(telegram_single_bot_mode_is_enabled(Some("true")));
+        assert!(telegram_single_bot_mode_is_enabled(Some("True")));
+        assert!(telegram_single_bot_mode_is_enabled(Some("TRUE")));
+    }
+
+    #[test]
+    fn test_single_bot_mode_rejects_zero() {
+        assert!(!telegram_single_bot_mode_is_enabled(Some("0")));
+        assert!(!telegram_single_bot_mode_is_enabled(Some("false")));
+    }
+
+    #[test]
+    fn test_single_bot_mode_handles_whitespace() {
+        assert!(telegram_single_bot_mode_is_enabled(Some(" 1 ")));
+        assert!(telegram_single_bot_mode_is_enabled(Some("\ttrue\n")));
     }
 }
