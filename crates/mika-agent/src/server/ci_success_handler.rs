@@ -45,7 +45,7 @@ use super::verdict::{Verdict, parse_verdict};
 use super::verdict_handler::VerdictAction;
 
 /// Parsed fields from a gateway-formatted check_suite success event.
-struct CheckSuiteEvent {
+pub(crate) struct CheckSuiteEvent {
     repo: String,
     branch: String,
 }
@@ -53,7 +53,7 @@ struct CheckSuiteEvent {
 /// Parse the gateway-formatted check_suite success event text.
 ///
 /// Expected format: `[GitHub] Check suite success on {repo} (branch: {branch})`
-fn parse_check_suite_success(text: &str) -> Option<CheckSuiteEvent> {
+pub(crate) fn parse_check_suite_success(text: &str) -> Option<CheckSuiteEvent> {
     let first_line = text.lines().next()?;
 
     // Must be a check_suite success event
