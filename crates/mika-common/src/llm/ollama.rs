@@ -179,6 +179,10 @@ pub struct OllamaProvider {
     max_tokens: u32,
     #[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
     log_llm_bodies: bool,
+    /// The provider kind this instance was created for. Distinguishes
+    /// `ProviderKind::Ollama` from `ProviderKind::MikaModel` (both use the
+    /// same Ollama transport but report different `provider_name()`).
+    provider_kind: super::ProviderKind,
 }
 
 impl OllamaProvider {
@@ -188,6 +192,28 @@ impl OllamaProvider {
         model: String,
         max_tokens: u32,
         log_llm_bodies: bool,
+    ) -> Self {
+        Self::with_provider_kind(
+            base_url,
+            api_key,
+            model,
+            max_tokens,
+            log_llm_bodies,
+            super::ProviderKind::Ollama,
+        )
+    }
+
+    /// Create an `OllamaProvider` with an explicit `ProviderKind`.
+    ///
+    /// Used by `ProviderKind::MikaModel` so the instance reports
+    /// `"mikamodel"` from `provider_name()` while sharing the same transport.
+    pub fn with_provider_kind(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        max_tokens: u32,
+        log_llm_bodies: bool,
+        provider_kind: super::ProviderKind,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
@@ -204,6 +230,7 @@ impl OllamaProvider {
             model,
             max_tokens,
             log_llm_bodies,
+            provider_kind,
         }
     }
 
@@ -630,7 +657,7 @@ impl LlmProvider for OllamaProvider {
     }
 
     fn provider_name(&self) -> &str {
-        "ollama"
+        self.provider_kind.config_prefix()
     }
 
     fn model_name(&self) -> &str {
