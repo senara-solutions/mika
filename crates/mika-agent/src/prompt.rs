@@ -797,10 +797,13 @@ Core memory tracks key people briefly — the people table is the full record.\n
 
 /// Build a compact system prompt for `ProviderKind::MikaModel`.
 ///
-/// Emits ≤5 KB with at most 3 sections (Personality, Identity, Tool Usage).
-/// The full prompt overwhelms the provider's small context window and causes
-/// OOD-prior-dominated completions (fictional status reports instead of
-/// agent-mode responses).
+/// Emits ≤5 KB with at most 2 sections (Personality, Identity). The full
+/// mika-server prompt overwhelms the provider's small context window and
+/// causes OOD-prior-dominated completions (fictional status reports instead
+/// of agent-mode responses). A Tool Usage section is deliberately deferred:
+/// the MikaModel provider expects ≤5-10 tools max, so tool catalog injection
+/// is gated upstream at the call site (see `is_compact_provider` check in
+/// `agent.rs`), not inside this builder.
 pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     let mut prompt = String::with_capacity(512);
 
