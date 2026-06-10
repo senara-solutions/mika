@@ -344,6 +344,23 @@ _seed_worktree_slash_commands() {
     done
 }
 
+# Set up a git worktree for the target issue's branch. Parses the repo#number
+# prompt format, derives branch name and canonical worktree path, creates or
+# reuses the worktree, rebases onto origin/main, and seeds slash commands.
+#
+# Pre-flight cleanup (mika#1472): before creating a new worktree, detects if the
+# target branch is already checked out at a non-canonical path (e.g. a slashed-path
+# relic from before the derive-worktree-path invariant). Stashes any dirty state
+# with a descriptive name (mirroring _clean_worktree_for_rebase's discipline from
+# mika#1414) and removes the relic so the worktree add can succeed on the canonical
+# dashed-slug path.
+#
+# Dual-failure diagnostic (mika#1472): when both worktree add attempts fail, emits
+# a structured worktree_setup_failed: line to stderr with per-attempt error text,
+# replacing the previous silent exit-128 trap. This is the fifth dispatch-lib
+# silent-failure defense — siblings: mika#1364 (force-with-lease gap), #1407
+# (stale-main mis-diagnosis), #1414 (dirty-worktree on resume), #1415 (worktree-
+# setup clobbers .claude/commands).
 _set_up_worktree() {
     # --- Parse repo#number format ---
     # Matches: mika#214, mika-skills#8, mika-cloud#50
@@ -415,6 +432,36 @@ _set_up_worktree() {
         # Worktree path is centralized in mika-platform/scripts/derive-worktree-path
         WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO")
 
+        # --- Pre-flight: detect and clean up non-canonical worktree paths (mika#1472) ---
+        # Before the canonical dashed-path collision check below, detect if the target
+        # branch is already checked out at a DIFFERENT (non-canonical) worktree path —
+        # e.g. a slashed-path relic from before the derive-worktree-path invariant
+        # (worktree_path_slug == sanitize(branch_ref)). If found, stash any dirty state
+        # (mirroring _clean_worktree_for_rebase's discipline from mika#1414) and remove
+        # the relic so the subsequent worktree add can proceed on the canonical path.
+        local existing_wt
+        existing_wt=$(git -C "$SUB_REPO_DIR" worktree list --porcelain 2>/dev/null \
+            | awk -v b="refs/heads/$BRANCH" '/^worktree / {wt = substr($0, 10)} $0 == "branch " b {print wt; exit}')
+        if [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
+            echo "[dispatch-lib] pre-flight: branch $BRANCH is checked out at non-canonical path $existing_wt (canonical: $WORKTREE_DIR); cleaning up relic" >&2
+            if [ -d "$existing_wt" ]; then
+                local dirty_state
+                dirty_state=$(git -C "$existing_wt" status --porcelain 2>/dev/null || true)
+                if [ -n "$dirty_state" ]; then
+                    local stash_name
+                    stash_name="dispatch-lib-stale-worktree-cleanup-$(printf '%s' "$BRANCH" | tr / -)-$(date -u +%Y%m%dT%H%M%SZ)"
+                    if git -C "$existing_wt" stash push --include-untracked -m "$stash_name" >/dev/null 2>&1; then
+                        local stash_sha
+                        stash_sha=$(git -C "$existing_wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
+                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $SUB_REPO_DIR stash apply ${stash_sha:-<sha>})" >&2
+                    else
+                        echo "[dispatch-lib] stash push failed or nothing to stash in $existing_wt; proceeding with remove" >&2
+                    fi
+                fi
+            fi
+            git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
+        fi
+
         # Reuse existing worktree if valid
         if [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
             git -C "$WORKTREE_DIR" checkout "$BRANCH" 2>/dev/null || true
@@ -434,16 +481,34 @@ _set_up_worktree() {
             # handles cherry-mark dedup of any merged-but-still-present
             # commits — so basing on origin/$BRANCH first and rebasing
             # afterward composes cleanly with the existing flow.
+            # Stderr capture for dual-failure diagnostic (mika#1472 U2).
+            # Each worktree add attempt captures stderr to a temp file; on
+            # dual-failure, both are emitted as a structured worktree_setup_failed:
+            # diagnostic so the operator sees WHY instead of a silent exit-128 trap.
+            local wt_err_1="/tmp/wt-add-1-err.$$" wt_err_2="/tmp/wt-add-2-err.$$"
+            local wt_add_ok=0
             if git -C "$SUB_REPO_DIR" ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
                 git -C "$SUB_REPO_DIR" fetch origin "$BRANCH" 2>/dev/null || true
-                if ! git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$BRANCH" 2>/dev/null; then
-                    git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH"
+                if git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$BRANCH" 2>"$wt_err_1"; then
+                    wt_add_ok=1
+                elif git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH" 2>"$wt_err_2"; then
+                    wt_add_ok=1
                 fi
             else
-                if ! git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" origin/main 2>/dev/null; then
-                    git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH"
+                if git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" origin/main 2>"$wt_err_1"; then
+                    wt_add_ok=1
+                elif git -C "$SUB_REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH" 2>"$wt_err_2"; then
+                    wt_add_ok=1
                 fi
             fi
+            if [ "$wt_add_ok" -eq 0 ]; then
+                echo "[dispatch-lib] worktree_setup_failed: branch=$BRANCH path=$WORKTREE_DIR" >&2
+                echo "  attempt 1 (with -b): $(cat "$wt_err_1" 2>/dev/null)" >&2
+                echo "  attempt 2 (without -b): $(cat "$wt_err_2" 2>/dev/null)" >&2
+                rm -f "$wt_err_1" "$wt_err_2"
+                return 1
+            fi
+            rm -f "$wt_err_1" "$wt_err_2"
         fi
 
         # Rebase-or-abort guard
