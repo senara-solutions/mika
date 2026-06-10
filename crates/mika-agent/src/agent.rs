@@ -2734,18 +2734,11 @@ async fn run_agent_inner(
         skill_tool_defs.extend_from_slice(mcp.tool_definitions());
     }
 
-    // mika#1324 — Structural tool filter for CI webhook events.
-    // When the user message is a check_suite event (success or failure), remove
-    // dispatch tools so the LLM cannot attempt autonomous dispatches on CI noise.
-    // The discrimination is deterministic (same parsers the CI handlers use).
-    const CI_EXCLUDED_TOOLS: &[&str] = &["run_claude_pilot", "run_claude_pilot_groom"];
-    let is_ci_webhook =
-        crate::server::ci_success_handler::parse_check_suite_success(params.user_message).is_some()
-            || crate::server::ci_failure_handler::parse_check_suite_failure(params.user_message)
-                .is_some();
-    if is_ci_webhook {
-        skill_tool_defs.retain(|d| !CI_EXCLUDED_TOOLS.contains(&d.name.as_str()));
-    }
+    // mika#1324 — Structural tool filter for CI webhook events. Extracted to a
+    // helper so the predicate + filter are unit-testable without standing up the
+    // full agent loop. See `filter_ci_excluded_tools` definition for the
+    // load-bearing invariant (CI prefix → no dispatch tools).
+    filter_ci_excluded_tools(params.user_message, &mut skill_tool_defs);
 
     // #862 — Turn-start snapshot of enabled tool names for the
     // asserted-unavailability guard. Captures the tool set the LLM actually
@@ -6501,6 +6494,32 @@ fn assert_grounded_satisfied(claim: &AffirmativeStateClaim, summaries: &[ToolCal
         .any(|s| GROUNDING_TOOLS.contains(&s.name.as_str()) && s.input_summary.contains(bare_ref))
 }
 
+/// mika#1324 — Structural tool filter for CI webhook events.
+///
+/// When `user_message` matches a check_suite event (success or failure) the
+/// dispatch tools (`run_claude_pilot`, `run_claude_pilot_groom`) are removed
+/// from `tools` so the LLM cannot make autonomous dispatches from CI-only
+/// signal. Discrimination uses the same parsers the CI handlers themselves
+/// use (`server::ci_success_handler::parse_check_suite_success` +
+/// `server::ci_failure_handler::parse_check_suite_failure`), so the predicate
+/// stays in lock-step with the handler routing.
+///
+/// `pub(crate)` so callers under `agent::run_agent_inner` can invoke it and
+/// inline `#[cfg(test)] mod tests` can unit-test the predicate + filter
+/// behavior without standing up the full agent loop.
+pub(crate) fn filter_ci_excluded_tools(
+    user_message: &str,
+    tools: &mut Vec<mika_common::claude::ToolDefinition>,
+) {
+    const CI_EXCLUDED_TOOLS: &[&str] = &["run_claude_pilot", "run_claude_pilot_groom"];
+    let is_ci_webhook = crate::server::ci_success_handler::parse_check_suite_success(user_message)
+        .is_some()
+        || crate::server::ci_failure_handler::parse_check_suite_failure(user_message).is_some();
+    if is_ci_webhook {
+        tools.retain(|d| !CI_EXCLUDED_TOOLS.contains(&d.name.as_str()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6509,6 +6528,126 @@ mod tests {
     use crate::test_utils::test_helpers::test_async_db;
     use mika_common::claude::ToolDefinition;
     use std::path::PathBuf;
+
+    // ===========================================================================
+    // mika#1324 — Structural tool filter (CI webhook → no dispatch tools)
+    // ===========================================================================
+
+    fn tool_def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("test stub for {name}"),
+            input_schema: serde_json::json!({}),
+        }
+    }
+
+    fn full_tool_set() -> Vec<ToolDefinition> {
+        vec![
+            tool_def("run_claude_pilot"),
+            tool_def("run_claude_pilot_groom"),
+            tool_def("send_message"),
+            tool_def("run_gh"),
+            tool_def("update_task_status"),
+        ]
+    }
+
+    // AC1 — unit test on the predicate via filter behavior. check_suite.success
+    // → both dispatch tools removed; benign tools retained.
+    #[test]
+    fn filter_ci_excluded_tools_check_suite_success_removes_dispatch_tools() {
+        let mut tools = full_tool_set();
+        // Canonical check_suite.success message shape from the gateway. Branch
+        // matches the original mika#1324 incident (fix/1318/dev-groom-no-force-push)
+        // to verify the substring contains "dev-groom" yet the dispatch tools
+        // are still removed by the CI prefix check, not by branch substring
+        // matching (the architect's diagnostic correction in the ticket body).
+        let user_message = "[GitHub] Check suite success on senara-solutions/mika \
+                            (branch: fix/1318/dev-groom-no-force-push)";
+        filter_ci_excluded_tools(user_message, &mut tools);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"run_claude_pilot"),
+            "run_claude_pilot must be removed on CI success: {names:?}"
+        );
+        assert!(
+            !names.contains(&"run_claude_pilot_groom"),
+            "run_claude_pilot_groom must be removed on CI success: {names:?}"
+        );
+        assert!(
+            names.contains(&"send_message"),
+            "send_message must be retained: {names:?}"
+        );
+        assert!(
+            names.contains(&"run_gh"),
+            "run_gh must be retained: {names:?}"
+        );
+    }
+
+    // AC2 — integration-style coverage on the failure prefix. check_suite.failure
+    // also removes dispatch tools.
+    #[test]
+    fn filter_ci_excluded_tools_check_suite_failure_removes_dispatch_tools() {
+        let mut tools = full_tool_set();
+        let user_message = "[GitHub] Check suite failure on senara-solutions/mika \
+                            (branch: fix/1318/dev-groom-no-force-push)";
+        filter_ci_excluded_tools(user_message, &mut tools);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"run_claude_pilot"),
+            "run_claude_pilot must be removed on CI failure: {names:?}"
+        );
+        assert!(
+            !names.contains(&"run_claude_pilot_groom"),
+            "run_claude_pilot_groom must be removed on CI failure: {names:?}"
+        );
+    }
+
+    // AC3 — ready-label dispatch flow continues to work. The ready-label
+    // marker is NOT a check_suite event; dispatch tools must remain available
+    // so `webhook_ready_label_dispatch` intent guard can fire and the agent
+    // can call `run_claude_pilot` to actually dispatch.
+    #[test]
+    fn filter_ci_excluded_tools_ready_label_event_retains_dispatch_tools() {
+        let mut tools = full_tool_set();
+        let user_message =
+            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 — fix some thing";
+        filter_ci_excluded_tools(user_message, &mut tools);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"run_claude_pilot"),
+            "run_claude_pilot must be retained on ready-label dispatch: {names:?}"
+        );
+        assert!(
+            names.contains(&"run_claude_pilot_groom"),
+            "run_claude_pilot_groom must be retained on ready-label dispatch: {names:?}"
+        );
+        assert!(
+            names.contains(&"send_message"),
+            "send_message must be retained: {names:?}"
+        );
+    }
+
+    // Boundary: non-webhook conversational input never trips the filter.
+    #[test]
+    fn filter_ci_excluded_tools_non_webhook_input_retains_all_tools() {
+        let mut tools = full_tool_set();
+        let user_message = "hey can you check the status of the dev-groom dispatch?";
+        filter_ci_excluded_tools(user_message, &mut tools);
+        assert_eq!(
+            tools.len(),
+            5,
+            "non-webhook input must not affect the tool set"
+        );
+    }
+
+    // Boundary: empty tools list is a no-op (defensive).
+    #[test]
+    fn filter_ci_excluded_tools_empty_tools_is_noop() {
+        let mut tools: Vec<ToolDefinition> = Vec::new();
+        let user_message = "[GitHub] Check suite success on senara-solutions/mika (branch: main)";
+        filter_ci_excluded_tools(user_message, &mut tools);
+        assert!(tools.is_empty());
+    }
 
     // -- LoopMode tests --
 
