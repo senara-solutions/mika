@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# Test fixture for the deploy-info target (mika#1210).
+# Test fixture for the deploy-info target (mika#1210, mika#1475).
 #
-# Exercises the three AC2 outcome paths of the deploy-info recipe in
-# a disposable git fixture:
-#   (a) up-to-date    — fresh clone of an in-test bare repo,
-#                       deploy-info says "origin/main: up to date"
-#   (b) behind        — add a commit to origin's main without pulling locally,
-#                       deploy-info warns with the correct count + behind string
-#   (c) unreachable   — point origin URL to a nonexistent path, deploy-info
-#                       prints the "could not reach origin" note and exits zero
+# Exercises the deploy-info recipe in a disposable git fixture:
 #
-# AC8 also requires asserting the fixture recipe (scripts/fixtures/deploy-info-Makefile)
-# is byte-identical to the production deploy-info recipe in Makefile — any drift
-# fails the test immediately, not at deploy time.
+# Off-main branch guard (mika#1475):
+#   (a) off-main without FORCE — ABORT, exit != 0
+#   (b) off-main with FORCE    — WARN, exit 0, continues to freshness check
+#   (c) on main                — no guard output, proceeds normally
+#
+# Freshness check (mika#1210):
+#   (d) up-to-date    — "origin/main: up to date"
+#   (e) behind        — WARNING with count + behind string
+#   (f) unreachable   — "could not reach origin" note, exits zero
+#
+# Also asserts the fixture recipe (scripts/fixtures/deploy-info-Makefile)
+# is byte-identical to the production deploy-info recipe in Makefile — any
+# drift fails the test immediately, not at deploy time.
 #
 # Usage: bash scripts/deploy-info-test.sh
 # Exit codes:
@@ -115,15 +118,80 @@ assert_contains() {
   fi
 }
 
-# -------------------------------------------------------------------------
-# 2. AC2.1 — up-to-date
-# -------------------------------------------------------------------------
-out=$(run_recipe)
-assert_contains "AC2.1 up-to-date prints freshness OK" "origin/main: up to date" "$out"
-assert_contains "AC2.1 prints Building from: line" "Building from:" "$out"
+assert_not_contains() {
+  local name="$1" unexpected="$2" output="$3"
+  if echo "$output" | grep -qF -- "$unexpected"; then
+    echo "FAIL: $name"
+    echo "  expected NOT to contain: $unexpected"
+    echo "  output: $output"
+    FAIL=$((FAIL + 1))
+  else
+    echo "PASS: $name"
+    PASS=$((PASS + 1))
+  fi
+}
+
+# =========================================================================
+# Off-main branch guard (mika#1475)
+# =========================================================================
 
 # -------------------------------------------------------------------------
-# 3. AC2.2 — behind
+# 2. Off-main without FORCE — ABORT, exit != 0
+# -------------------------------------------------------------------------
+(
+  cd "$WORK"
+  git checkout -q -b test/off-main
+)
+exit_code=0
+out=$(run_recipe) || exit_code=$?
+if [ "$exit_code" -ne 0 ]; then
+  echo "PASS: off-main without FORCE exits non-zero"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: off-main without FORCE should exit non-zero, got 0"
+  FAIL=$((FAIL + 1))
+fi
+assert_contains "off-main ABORT message present" "ABORT" "$out"
+assert_contains "off-main ABORT names the branch" "test/off-main" "$out"
+assert_contains "off-main ABORT names the override" "FORCE_DEPLOY_FROM_BRANCH=1" "$out"
+assert_not_contains "off-main ABORT does not reach Building from:" "Building from:" "$out"
+
+# -------------------------------------------------------------------------
+# 3. Off-main with FORCE — WARN, exit 0, continues
+# -------------------------------------------------------------------------
+exit_code=0
+out=$(cd "$WORK" && FORCE_DEPLOY_FROM_BRANCH=1 make -s -f deploy-info.mk deploy-info 2>&1) || exit_code=$?
+if [ "$exit_code" -eq 0 ]; then
+  echo "PASS: off-main with FORCE exits zero"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: off-main with FORCE should exit zero, got $exit_code"
+  FAIL=$((FAIL + 1))
+fi
+assert_contains "off-main FORCE WARN message present" "WARN" "$out"
+assert_contains "off-main FORCE names the branch" "test/off-main" "$out"
+assert_contains "off-main FORCE continues to Building from:" "Building from:" "$out"
+
+# Return to main for the freshness tests.
+(
+  cd "$WORK"
+  git checkout -q main
+)
+
+# =========================================================================
+# Freshness check (mika#1210)
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# 4. Up-to-date (on main)
+# -------------------------------------------------------------------------
+out=$(run_recipe)
+assert_contains "up-to-date prints freshness OK" "origin/main: up to date" "$out"
+assert_contains "up-to-date prints Building from: line" "Building from:" "$out"
+assert_not_contains "up-to-date does not print ABORT" "ABORT" "$out"
+
+# -------------------------------------------------------------------------
+# 5. Behind (on main)
 # -------------------------------------------------------------------------
 # Push a new commit to origin without pulling locally.
 (
@@ -133,13 +201,13 @@ assert_contains "AC2.1 prints Building from: line" "Building from:" "$out"
   git push -q origin main
 )
 out=$(run_recipe)
-assert_contains "AC2.2 behind prints WARNING with count + behind string" \
+assert_contains "behind prints WARNING with count + behind string" \
   "WARNING: HEAD is 2 commits behind origin/main." "$out"
-assert_contains "AC2.2 behind prints pull suggestion" \
+assert_contains "behind prints pull suggestion" \
   "Run 'git pull --ff-only' if you intended to deploy origin/main." "$out"
 
 # -------------------------------------------------------------------------
-# 4. AC2.3 — unreachable
+# 6. Unreachable (on main)
 # -------------------------------------------------------------------------
 # Point origin at a nonexistent path so `git fetch` fails fast.
 (
@@ -147,17 +215,18 @@ assert_contains "AC2.2 behind prints pull suggestion" \
   git remote set-url origin "$TEST_DIR/nonexistent.git"
 )
 # Use a guarded run so a non-zero exit is treated as test failure, not
-# script abort under set -e. AC2 mandates exit-zero on all three paths.
+# script abort under set -e. On-main must exit zero even if origin is
+# unreachable.
 exit_code=0
 out=$(run_recipe) || exit_code=$?
 if [ "$exit_code" -eq 0 ]; then
-  echo "PASS: AC2.3 unreachable exits zero (recipe does not fail deploy)"
+  echo "PASS: unreachable exits zero (recipe does not fail deploy)"
   PASS=$((PASS + 1))
 else
-  echo "FAIL: AC2.3 unreachable exited $exit_code (expected 0)"
+  echo "FAIL: unreachable exited $exit_code (expected 0)"
   FAIL=$((FAIL + 1))
 fi
-assert_contains "AC2.3 unreachable prints could-not-reach-origin note" \
+assert_contains "unreachable prints could-not-reach-origin note" \
   "NOTE: could not reach origin" "$out"
 
 # -------------------------------------------------------------------------
