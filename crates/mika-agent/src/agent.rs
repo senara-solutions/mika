@@ -2734,6 +2734,19 @@ async fn run_agent_inner(
         skill_tool_defs.extend_from_slice(mcp.tool_definitions());
     }
 
+    // mika#1324 — Structural tool filter for CI webhook events.
+    // When the user message is a check_suite event (success or failure), remove
+    // dispatch tools so the LLM cannot attempt autonomous dispatches on CI noise.
+    // The discrimination is deterministic (same parsers the CI handlers use).
+    const CI_EXCLUDED_TOOLS: &[&str] = &["run_claude_pilot", "run_claude_pilot_groom"];
+    let is_ci_webhook =
+        crate::server::ci_success_handler::parse_check_suite_success(params.user_message).is_some()
+            || crate::server::ci_failure_handler::parse_check_suite_failure(params.user_message)
+                .is_some();
+    if is_ci_webhook {
+        skill_tool_defs.retain(|d| !CI_EXCLUDED_TOOLS.contains(&d.name.as_str()));
+    }
+
     // #862 — Turn-start snapshot of enabled tool names for the
     // asserted-unavailability guard. Captures the tool set the LLM actually
     // sees (after identity denylist + skill overrides + MCP) so the guard

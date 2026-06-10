@@ -50,7 +50,7 @@ const MAX_LOG_LINES_PER_JOB: usize = 100;
 const MAX_CI_FIX_COUNT: u64 = 2;
 
 /// Parsed fields from a gateway-formatted check_suite failure/timed_out event.
-struct CheckSuiteFailureEvent {
+pub(crate) struct CheckSuiteFailureEvent {
     repo: String,
     branch: String,
     conclusion: String,
@@ -60,7 +60,7 @@ struct CheckSuiteFailureEvent {
 ///
 /// Expected format: `[GitHub] Check suite {conclusion} on {repo} (branch: {branch})`
 /// where conclusion is `failure` or `timed_out`.
-fn parse_check_suite_failure(text: &str) -> Option<CheckSuiteFailureEvent> {
+pub(crate) fn parse_check_suite_failure(text: &str) -> Option<CheckSuiteFailureEvent> {
     let first_line = text.lines().next()?;
 
     // Must be a check_suite event with a failure-class conclusion
