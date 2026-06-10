@@ -2625,7 +2625,12 @@ async fn run_agent_inner(
             None
         },
     };
-    let mut system = prompt::build_system_prompt(&prompt_ctx);
+    let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
+    let mut system = if is_compact_provider {
+        prompt::build_compact_system_prompt(&prompt_ctx)
+    } else {
+        prompt::build_system_prompt(&prompt_ctx)
+    };
 
     // Axis 4 + Axis 3 summary gate (mika#1019, mika#1021).
     // Conversation mode: silent_trigger is None — Axis 3 cap does not fire.
@@ -4389,12 +4394,19 @@ async fn run_team_agent_inner_impl(
         home_dir: Some(params.home_dir),
         callback_context: None,
     };
-    let mut system = prompt::build_system_prompt(&prompt_ctx);
+    let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
+    let mut system = if is_compact_provider {
+        prompt::build_compact_system_prompt(&prompt_ctx)
+    } else {
+        prompt::build_system_prompt(&prompt_ctx)
+    };
 
     // Inject team context after the base system prompt
-    system.push_str("\n## Team Context\n");
-    system.push_str(params.team_context);
-    system.push('\n');
+    if !is_compact_provider {
+        system.push_str("\n## Team Context\n");
+        system.push_str(params.team_context);
+        system.push('\n');
+    }
 
     // Resolve GitHub token once: prefer GitHub App installation token, fall back to PAT.
     let team_resolved_github_token = if let Some(settings) = params.settings {

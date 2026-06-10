@@ -795,6 +795,34 @@ Core memory tracks key people briefly — the people table is the full record.\n
     prompt
 }
 
+/// Build a compact system prompt for `ProviderKind::MikaModel`.
+///
+/// Emits ≤5 KB with at most 2 sections (Personality, Identity). The full
+/// mika-server prompt overwhelms the provider's small context window and
+/// causes OOD-prior-dominated completions (fictional status reports instead
+/// of agent-mode responses). A Tool Usage section is deliberately deferred:
+/// the MikaModel provider expects ≤5-10 tools max, so tool catalog injection
+/// is gated upstream at the call site (see `is_compact_provider` check in
+/// `agent.rs`), not inside this builder.
+pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
+    let mut prompt = String::with_capacity(512);
+
+    // ## Personality — soul summary or identity persona line (~100 chars)
+    if !ctx.soul_content.is_empty() {
+        prompt.push_str("## Personality\n");
+        // Take the first line of the soul content as a short persona summary.
+        let first_line = ctx.soul_content.lines().next().unwrap_or(ctx.soul_content);
+        prompt.push_str(first_line);
+        prompt.push_str("\n\n");
+    }
+
+    // ## Identity — agent name + role (~50 chars)
+    prompt.push_str("## Identity\n");
+    write!(prompt, "You are {}.\n\n", ctx.identity.name).unwrap();
+
+    prompt
+}
+
 /// Context for building a silent mode (heartbeat/reminder/reflection) system prompt.
 pub struct SilentPromptContext<'a> {
     pub soul_content: &'a str,
@@ -2593,5 +2621,80 @@ inject = false
         .unwrap();
         assert!(!identity.context.summary.inject);
         assert!(identity.context.summary.max_tokens.is_none());
+    }
+
+    #[test]
+    fn test_build_compact_system_prompt_size_bound() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "You are a sharp, proactive executive assistant.",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: Some("America/New_York".to_string()),
+            global_home_dir: None,
+            channel_type: Some("telegram"),
+            telegram_configured: true,
+            home_dir: None,
+            callback_context: None,
+        };
+
+        let prompt = build_compact_system_prompt(&ctx);
+
+        // AC1: ≤5 KB
+        assert!(
+            prompt.len() <= 5120,
+            "compact prompt is {} bytes, exceeds 5 KB limit",
+            prompt.len()
+        );
+
+        // AC1: ≤3 sections
+        let section_count = prompt.matches("## ").count();
+        assert!(
+            section_count <= 3,
+            "compact prompt has {} sections, exceeds 3-section limit",
+            section_count
+        );
+
+        // Must include personality and identity
+        assert!(prompt.contains("## Personality"));
+        assert!(prompt.contains("## Identity"));
+        assert!(prompt.contains("You are Mika."));
+
+        // Must NOT include heavy sections from the full prompt
+        assert!(!prompt.contains("## Instructions"));
+        assert!(!prompt.contains("## Current Time"));
+        assert!(!prompt.contains("<core-memory>"));
+        assert!(!prompt.contains("## Communication Channel"));
+    }
+
+    #[test]
+    fn test_build_compact_system_prompt_empty_soul() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+        };
+
+        let prompt = build_compact_system_prompt(&ctx);
+
+        // No Personality section when soul is empty
+        assert!(!prompt.contains("## Personality"));
+        // Identity section still present
+        assert!(prompt.contains("## Identity"));
+        // Only 1 section
+        assert_eq!(prompt.matches("## ").count(), 1);
     }
 }

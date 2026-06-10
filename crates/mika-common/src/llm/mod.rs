@@ -428,12 +428,13 @@ pub fn create_provider(
             let base_url = spec
                 .effective_base_url()
                 .ok_or_else(|| anyhow::anyhow!("base URL is required for mikamodel provider"))?;
-            let provider = ollama::OllamaProvider::new(
+            let provider = ollama::OllamaProvider::with_provider_kind(
                 base_url,
                 spec.api_key.clone(),
                 spec.model.clone(),
                 max_tokens,
                 log_llm_bodies,
+                ProviderKind::MikaModel,
             );
             Ok(Arc::new(provider))
         }
