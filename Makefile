@@ -54,6 +54,18 @@ check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
 	fi
 
 deploy-info: ## Print built SHA and warn if local HEAD is behind origin/main
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$BRANCH" != "main" ]; then \
+	  if [ "$${FORCE_DEPLOY_FROM_BRANCH:-}" = "1" ]; then \
+	    printf "\033[1;33mWARN: deploying from '%s' (FORCE_DEPLOY_FROM_BRANCH=1)\033[0m\n" "$$BRANCH" >&2; \
+	  else \
+	    printf "\033[1;31mABORT: on '%s', not main.\033[0m\n" "$$BRANCH" >&2; \
+	    echo "  Fix:      git checkout main && git pull --ff-only" >&2; \
+	    echo "  Override: FORCE_DEPLOY_FROM_BRANCH=1 make deploy" >&2; \
+	    echo "  Canonical: cd ../mika-platform && make deploy" >&2; \
+	    exit 1; \
+	  fi; \
+	fi
 	@echo "Building from: $$(git rev-parse --abbrev-ref HEAD) @ $$(git rev-parse --short HEAD) ($$(git log -1 --pretty=format:'%s'))"
 	@if git fetch -q origin main 2>/dev/null; then \
 	  AHEAD=$$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0); \
