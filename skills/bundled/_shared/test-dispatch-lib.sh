@@ -1937,6 +1937,111 @@ else
     FAIL=$((FAIL + 1)); echo "  ✗ Resume half-finished-rebase abort (mika#1414): $RESULT_12K"
 fi
 
+# ============================================================================
+# Pre-flight stale-relic cleanup + dual-failure diagnostic (mika#1472)
+# ============================================================================
+
+echo ""
+echo "Test: Pre-flight stale-relic cleanup (mika#1472 U1)"
+echo "---------------------------------------------------"
+
+# Extract the _set_up_worktree function body for structural assertions
+SET_UP_WT_FUNC=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
+
+# U1: Pre-flight block contains worktree list --porcelain detection
+assert_contains "Pre-flight uses worktree list --porcelain" \
+    'worktree list --porcelain' "$SET_UP_WT_FUNC"
+
+# U1: Pre-flight block contains the branch-comparison awk script
+assert_contains "Pre-flight awk matches refs/heads/\$BRANCH" \
+    'refs/heads/$BRANCH' "$SET_UP_WT_FUNC"
+
+# U1: Pre-flight block contains the directory-exists guard
+assert_contains "Pre-flight has directory-exists guard for existing_wt" \
+    '[ -d "$existing_wt" ]' "$SET_UP_WT_FUNC"
+
+# U1: Pre-flight block contains status --porcelain check
+assert_contains "Pre-flight checks dirty state via status --porcelain" \
+    'status --porcelain' "$SET_UP_WT_FUNC"
+
+# U1: Pre-flight block contains stash push -u -m with descriptive name pattern
+assert_contains "Pre-flight stashes with descriptive name (stash push --include-untracked -m)" \
+    'stash push --include-untracked -m "$stash_name"' "$SET_UP_WT_FUNC"
+
+# U1: Pre-flight block contains the stale-worktree-cleanup naming convention
+assert_contains "Pre-flight stash name uses dispatch-lib-stale-worktree-cleanup prefix" \
+    'dispatch-lib-stale-worktree-cleanup' "$SET_UP_WT_FUNC"
+
+# U1: Pre-flight block contains worktree remove --force for the existing_wt
+assert_contains "Pre-flight removes non-canonical worktree with --force" \
+    'worktree remove --force "$existing_wt"' "$SET_UP_WT_FUNC"
+
+# U1: Call ordering — pre-flight cleanup runs BEFORE the existing dashed-path
+# collision check (the "Reuse existing worktree if valid" block).
+PREFLIGHT_LINE=$(printf '%s\n' "$SET_UP_WT_FUNC" | grep -n 'worktree list --porcelain' | head -1 | cut -d: -f1)
+COLLISION_LINE=$(printf '%s\n' "$SET_UP_WT_FUNC" | grep -n 'Reuse existing worktree if valid' | head -1 | cut -d: -f1)
+if [ -n "$PREFLIGHT_LINE" ] && [ -n "$COLLISION_LINE" ] && [ "$PREFLIGHT_LINE" -lt "$COLLISION_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Pre-flight cleanup (line $PREFLIGHT_LINE) runs before dashed-path collision check (line $COLLISION_LINE)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Pre-flight cleanup must run before dashed-path collision check"
+    echo "    preflight_line=$PREFLIGHT_LINE collision_line=$COLLISION_LINE"
+fi
+
+echo ""
+echo "Test: Dual-failure diagnostic (mika#1472 U2)"
+echo "---------------------------------------------"
+
+# U2: Wrapped block contains stderr-capture redirects
+assert_contains "Worktree add captures stderr to wt-add-1-err temp file" \
+    'wt_err_1' "$SET_UP_WT_FUNC"
+assert_contains "Worktree add captures stderr to wt-add-2-err temp file" \
+    'wt_err_2' "$SET_UP_WT_FUNC"
+
+# U2: Wrapped block contains the worktree_setup_failed: diagnostic prefix
+assert_contains "Dual-failure emits worktree_setup_failed: structured diagnostic" \
+    'worktree_setup_failed:' "$SET_UP_WT_FUNC"
+
+# U2: Diagnostic includes both attempts' stderr content
+assert_contains "Diagnostic includes attempt 1 stderr (cat wt_err_1)" \
+    'cat "$wt_err_1"' "$SET_UP_WT_FUNC"
+assert_contains "Diagnostic includes attempt 2 stderr (cat wt_err_2)" \
+    'cat "$wt_err_2"' "$SET_UP_WT_FUNC"
+
+# U2: Temp files cleaned up in both success and dual-failure paths
+CLEANUP_COUNT=$(printf '%s\n' "$SET_UP_WT_FUNC" | grep -c 'rm -f "$wt_err_1" "$wt_err_2"')
+if [ "$CLEANUP_COUNT" -ge 2 ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Temp files cleaned up in both success and dual-failure paths ($CLEANUP_COUNT occurrences)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Temp file cleanup must appear in both success and failure paths"
+    echo "    found $CLEANUP_COUNT occurrences, expected >= 2"
+fi
+
+# U2: Call ordering — worktree_setup_failed: appears AFTER the pre-flight cleanup
+DIAGNOSTIC_LINE=$(printf '%s\n' "$SET_UP_WT_FUNC" | grep -n 'worktree_setup_failed:' | head -1 | cut -d: -f1)
+if [ -n "$PREFLIGHT_LINE" ] && [ -n "$DIAGNOSTIC_LINE" ] && [ "$PREFLIGHT_LINE" -lt "$DIAGNOSTIC_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Pre-flight (line $PREFLIGHT_LINE) runs before dual-failure diagnostic (line $DIAGNOSTIC_LINE)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Pre-flight must run before dual-failure diagnostic"
+    echo "    preflight_line=$PREFLIGHT_LINE diagnostic_line=$DIAGNOSTIC_LINE"
+fi
+
+echo ""
+echo "Test: Doc comment on _set_up_worktree (mika#1472 U3)"
+echo "----------------------------------------------------"
+
+# U3: Doc comment exists above _set_up_worktree citing mika#1472
+DOC_COMMENT=$(sed -n '/^# Pre-flight cleanup (mika#1472)/,/^_set_up_worktree()/p' "$DISPATCH_LIB")
+assert_contains "Doc comment cites mika#1472" 'mika#1472' "$DOC_COMMENT"
+assert_contains "Doc comment cites sibling mika#1414" 'mika#1414' "$DOC_COMMENT"
+assert_contains "Doc comment cites sibling mika#1364" 'mika#1364' "$DOC_COMMENT"
+assert_contains "Doc comment mentions worktree_setup_failed:" 'worktree_setup_failed:' "$DOC_COMMENT"
+
 # --- Summary ---
 
 echo ""
