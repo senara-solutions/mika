@@ -1,14 +1,40 @@
-# Plan: What's Next Engine — Deterministic Scoring + LLM Explainer
+# Plan: What's Next Engine — Sub-Issue 2a: Scoring Engine + Status Re-Derivation
 
-**Ticket:** mika#1263  
-**Layer:** 2 of Operational Partner Foundation  
+**Ticket:** mika#1263 (Layer 2 of Operational Partner Foundation)  
+**Sub-issue scope:** 2a — Scoring engine + calibration constants + status re-derivation  
 **Depends on:** Layer 1 (mika#1262, merged — `operational_items` table at schema v39)
+
+## Decomposition
+
+Per review-guide.md § Single Responsibility and the #1259 decomposition precedent, mika#1263 is decomposed into five sub-issues. Each gets its own grooming, architect review, and PR.
+
+| Sub-issue | Scope | Depends on |
+|-----------|-------|------------|
+| **2a (this plan)** | Scoring engine (`scoring.rs`, `calibration.rs`) + status re-derivation (`status.rs`) + `AsyncDatabase` canonical read path. Pure Rust, no LLM, no IO beyond DB. Foundation for everything else. | Layer 1 only |
+| **2b** | CLI `mika next` + agent prompt injection. First consumer surfaces — proves the engine end-to-end. | 2a |
+| **2c** | LLM explainer (`explainer.rs`) + daily brief integration. Adds narration on top of working scoring. | 2a |
+| **2d** | Dashboard `OperationalInbox` page + API endpoint extensions. Largest frontend surface, ships last. | 2a, 2c |
+| **2e** | Memory rule encoding + documentation updates. Structural tests and docs. | 2a, 2c |
+
+**This plan covers sub-issue 2a only.** Sub-issues 2b–2e will be filed as separate tickets with their own plans after 2a merges.
 
 ## Summary
 
-Implement the What's Next engine: a deterministic priority scoring formula that ranks `OperationalItem`s, a status re-derivation pass that enforces the foundation's status taxonomy, an LLM explainer that narrates rankings without changing them, and four read surfaces (CLI `mika next`, dashboard inbox, daily brief, agent prompt injection).
+Implement the deterministic scoring engine and status re-derivation pass for `OperationalItem`s. This is the computational core of the What's Next engine — all read surfaces (CLI, dashboard, prompt injection, daily brief) depend on it. No LLM involvement, no HTTP endpoints, no frontend. Pure Rust scoring and status derivation with batch-optimized DB access.
 
-The core principle: **the LLM explains, never decides.** The scoring formula is deterministic, calibratable, and debuggable. The LLM's role is downstream narration only.
+The core principle: **the scoring formula is deterministic, calibratable, and debuggable.** The LLM's role (sub-issue 2c) is downstream narration only.
+
+## Phase 0 — Pin Load-Bearing Sources
+
+Before coding, verify:
+
+1. `crates/mika-agent/src/operational/mod.rs` — confirm module structure and existing exports from Layer 1.
+2. `crates/mika-agent/src/operational/types.rs` — confirm `OperationalItem`, `OperationalKind`, `OperationalStatus`, `Owner` struct shapes match foundation doc §3.
+3. `crates/mika-agent/src/operational/query.rs` — confirm existing query methods and their signatures.
+4. `crates/mika-agent/src/db.rs` — confirm `AsyncDatabase` wrapper patterns for operational items.
+5. `docs/architecture/operational-partner-frame.md` §4 (status taxonomy) and §5 (scoring formula) — pin exact formula terms.
+6. `crates/mika-agent/src/db/operational.rs` — confirm `complete_operational_item()` body. **Pre-pinned (second-pass review):** the function only UPDATEs the single target row to `status = 'done'`; it does **NOT** cascade clear `blocked_by` on dependent items. `resolve_cleared_blockers()` (§2.3) is the primary cascade mechanism, not defense-in-depth. The Layer 1 write path is unchanged by this plan.
+7. `crates/mika-agent/src/db.rs` `operational_items` index list — confirm 5 indexes exist: `idx_operational_items_agent_status`, `idx_operational_items_agent_kind`, `idx_operational_items_agent_priority`, `idx_operational_items_source`, `idx_operational_items_source_unique`. **Pre-pinned (second-pass review):** there is **NO** `idx_operational_items_blocked_by` index. The Phase 1.3 GROUP BY query runs as a full table scan, which is acceptable at N≤50 (per the bounded-cost analysis below); no v39→v40 migration is added by this plan to introduce a new index.
 
 ## Phase 1 — Scoring Engine (`crates/mika-agent/src/operational/scoring.rs`)
 
@@ -21,10 +47,16 @@ New file at `crates/mika-agent/src/operational/scoring.rs`, exported from `mod.r
 ```rust
 /// Compute composite priority score for a single item.
 /// Returns a ScoreBreakdown with each term's contribution.
-pub fn priority(item: &OperationalItem, now: DateTime<Utc>, db: &Database) -> ScoreBreakdown
+/// `blocked_counts` is a pre-loaded map of item_id -> count of items blocked by it.
+pub fn priority(
+    item: &OperationalItem,
+    now: DateTime<Utc>,
+    blocked_counts: &HashMap<String, u32>,
+) -> ScoreBreakdown
 
 /// Score and rank a list of items. Returns items sorted by priority DESC.
-pub fn rank(items: &mut [OperationalItem], now: DateTime<Utc>, db: &Database) -> Vec<ScoredItem>
+/// Batch-loads dependency counts in a single query before scoring.
+pub fn rank(items: &[OperationalItem], now: DateTime<Utc>, db: &Database) -> Vec<ScoredItem>
 ```
 
 **`ScoreBreakdown` struct:**
@@ -60,18 +92,56 @@ Per foundation doc §5, using constants from `calibration.rs`:
 | `commitment_weight` | `item.kind == Commitment` → weight by `item.owner`: `User` → `COMMITMENT_WEIGHT_USER` (50.0), `Mika` → `COMMITMENT_WEIGHT_MIKA` (35.0), `Person(_)`/`Agent(_)` → `COMMITMENT_WEIGHT_THIRD_PARTY` (20.0). Non-commitments → 0.0. |
 | `user_importance` | `item.user_importance.min(USER_IMPORTANCE_MAX)` (clamped at 50.0). |
 | `stale_time` | Hours since `item.updated_at`. `log(hours + 1.0) * STALE_TIME_MULTIPLIER` capped at `STALE_TIME_CAP` (30.0). Uses `f32::ln()`. |
-| `dependency_risk` | `db.count_blocked_items(&item.id)` × `DEPENDENCY_RISK_PER_BLOCKED` (10.0), capped at `DEPENDENCY_RISK_CAP` (40.0). Existing DB method. |
+| `dependency_risk` | Lookup `blocked_counts[&item.id]` × `DEPENDENCY_RISK_PER_BLOCKED` (10.0), capped at `DEPENDENCY_RISK_CAP` (40.0). **No per-item DB query** — counts are batch-loaded (see §1.3). |
 | `confidence_penalty` | `(1.0 - item.confidence) * CONFIDENCE_PENALTY_MULTIPLIER` (50.0). Subtracted from total. |
 
 **Composite:** `urgency + commitment_weight + user_importance + stale_time + dependency_risk - confidence_penalty`.
 
-### 1.3 Priority cache write-back
+### 1.3 Batch-load dependency counts (addresses F3: N+1 query elimination)
+
+The `dependency_risk` term requires knowing how many items are blocked by each item. Instead of per-item `COUNT(*)` queries (N+1 pattern), `rank()` batch-loads all blocked counts in a single query before entering the scoring loop:
+
+```sql
+SELECT blocked_by, COUNT(*) as blocked_count
+FROM operational_items
+WHERE agent_id = ?1 AND blocked_by IS NOT NULL AND status != 'done'
+GROUP BY blocked_by
+```
+
+This returns a `HashMap<String, u32>` passed to each `priority()` call. Cost: **one indexed GROUP BY query per rank invocation**, regardless of item count.
+
+The `priority()` function takes `blocked_counts: &HashMap<String, u32>` instead of a `&Database` reference, making it a pure function (no IO) — testable without DB fixtures.
+
+**Bounded cost:** For the maximum realistic item set (50 items per agent, per the `MIKA_OPERATIONAL_PARTNER` design), this is a single query returning at most 50 rows. **No `idx_operational_items_blocked_by` index exists** (verified at Phase 0 pin 7) — the GROUP BY runs as a full table scan over the agent's operational_items rows. This is acceptable at N≤50 (sub-millisecond on SQLite); no migration is added to introduce a new index. Should item counts grow significantly beyond 50, a v39→v40 migration adding `CREATE INDEX idx_operational_items_blocked_by ON operational_items(agent_id, blocked_by) WHERE blocked_by IS NOT NULL` is the natural follow-up — out of scope for this plan.
+
+Citation: review-guide.md § KISS (batch query eliminates hidden N+1 complexity); review-guide.md § DRY (batch query pattern already exists in the codebase for similar count aggregations).
+
+### 1.4 Priority cache write-back
 
 After scoring, call `db.update_operational_item_priority(id, total)` to persist the computed score. This keeps the `priority` column in sync for dashboard queries that sort by priority without re-computing.
 
-### 1.4 Tests
+### 1.5 Calibration constants (`calibration.rs`)
 
-- Unit tests for each term in isolation with synthetic `OperationalItem` fixtures.
+New file at `crates/mika-agent/src/operational/calibration.rs`:
+
+```rust
+pub const URGENCY_MAX: f32 = 100.0;
+pub const COMMITMENT_WEIGHT_USER: f32 = 50.0;
+pub const COMMITMENT_WEIGHT_MIKA: f32 = 35.0;
+pub const COMMITMENT_WEIGHT_THIRD_PARTY: f32 = 20.0;
+pub const USER_IMPORTANCE_MAX: f32 = 50.0;
+pub const STALE_TIME_MULTIPLIER: f32 = 5.0;
+pub const STALE_TIME_CAP: f32 = 30.0;
+pub const DEPENDENCY_RISK_PER_BLOCKED: f32 = 10.0;
+pub const DEPENDENCY_RISK_CAP: f32 = 40.0;
+pub const CONFIDENCE_PENALTY_MULTIPLIER: f32 = 50.0;
+pub const TODAY_WINDOW_HOURS: f64 = 24.0;
+pub const STALE_NEAR_DEADLINE_HOURS: f64 = 48.0;
+```
+
+### 1.6 Tests
+
+- Unit tests for each term in isolation with synthetic `OperationalItem` fixtures. `priority()` is a pure function (no DB) — tests pass `HashMap` directly.
 - Deterministic ranking test: 5+ items with known field values, assert exact ordering.
 - Edge cases: `due_at = None`, `confidence = 0.0`, `confidence = 1.0`, past-due item, commitment vs non-commitment, item with high dependency fan-out.
 - Calibration suite: `#[cfg(test)] mod calibration_tests` with fixtures that produce expected rankings deterministically (no LLM in the loop).
@@ -91,26 +161,56 @@ pub fn derive_status(item: &OperationalItem, now: DateTime<Utc>) -> OperationalS
 **Derivation rules (precedence per Decision G: AtRisk > Now > Waiting > Delegated > Scheduled):**
 
 1. **Done** → skip (terminal, excluded from re-derivation).
-2. **AtRisk** — any of: `due_at` within 24h AND `updated_at` > 48h ago (stale near deadline); CI failure evidence; callback failure evidence. AtRisk overrides all non-terminal statuses.
-3. **Now** — `due_at` is within the today window (next 24h) AND `blocked_by IS NULL`. Or: `due_at IS NULL` AND `blocked_by IS NULL` AND `status` was explicitly set to `Now`.
+2. **AtRisk** — any of: (a) `due_at` within `TODAY_WINDOW_HOURS` AND `updated_at` > `STALE_NEAR_DEADLINE_HOURS` ago (stale near deadline); (b) callback failure evidence in `evidence_refs`. AtRisk overrides all non-terminal statuses.
+3. **Now** — `due_at` is within the today window (`TODAY_WINDOW_HOURS` = 24h) AND `blocked_by IS NULL`. Or: `due_at IS NULL` AND `blocked_by IS NULL` AND `status` was explicitly set to `Now`.
 4. **Waiting** — `blocked_by IS NOT NULL`.
 5. **Delegated** — `owner` is `Mika` or `Agent(_)` AND there's an active source task.
 6. **Scheduled** — `due_at` is set AND beyond the today window.
 
-### 2.2 Integrate re-derivation into the read path
+### 2.2 Read-path re-derivation with bounded cost analysis (addresses F2)
 
-`OperationalItem::query()` (in `query.rs`) calls `derive_status()` on each returned non-Done item. If the derived status differs from the cached status, issue a `db.update_operational_item_status()` call to update the cache. This ensures reads are always fresh.
+`OperationalItem::query()` (in `query.rs`) calls `derive_status()` on each returned non-Done item. If the derived status differs from the cached status, issue a `db.update_operational_item_status()` call to update the cache.
 
-**Important:** The re-derivation runs at read time, not write time. This means the `operational_items.status` column is a cache — the derivation rules are the authority.
+**Cost analysis — worst-case write amplification:**
 
-### 2.3 `Blocked_by` cascade
+The re-derivation runs at read time on every non-Done item returned by a query. The bounded costs per read surface:
 
-When the query returns items, check for transitive unblocks: if a `Waiting` item's `blocked_by` ID points to an item that is now `Done`, the blocked item should re-derive (likely to `Now`). This is handled naturally by the derivation rules — `blocked_by IS NOT NULL` checks the ID, and if that blocker is Done, the write path should have cleared `blocked_by`. Add a helper:
+| Surface | Max items per read | Max status-change writes | Frequency |
+|---------|-------------------|--------------------------|-----------|
+| Agent prompt injection | 20 (hardcoded limit) | 20 | Every agent turn (~30s–5min intervals) |
+| CLI `mika next` | 5 | 5 | On-demand (human-initiated) |
+| Dashboard list page | 50 (paginated) | 50 | On-demand (human-initiated) |
+| Daily brief | 10 | 10 | Once per day |
+
+**Worst case:** 20 items × status change probability. In practice, status changes are rare events — they require a condition change (due_at entering the today window, a blocker resolving, staleness crossing the threshold). On a typical read, 0–2 items change status. The write is a single `UPDATE operational_items SET status = ?2 WHERE id = ?1` per changed item — indexed, sub-millisecond on SQLite.
+
+**Accepted trade-off:** The synchronous write-back on the read path is acceptable because: (a) N ≤ 20 for the hottest path (prompt injection); (b) each write is a single indexed UPDATE, not a transaction; (c) status changes are infrequent (condition changes, not every read); (d) the alternative (periodic sweep) adds complexity and staleness without meaningful performance gain at this scale.
+
+This is an explicit acceptance of the write amplification pattern, per foundation doc §4 Decision G which establishes derivation as the authority.
+
+Citation: review-guide.md § KISS (explicit cost model over hidden complexity); foundation doc §4 Decision G (establishes derivation principle).
+
+### 2.3 `Blocked_by` cascade — **primary mechanism** (not defense-in-depth)
+
+When the query returns items, check for transitive unblocks: if a `Waiting` item's `blocked_by` ID points to an item that is now `Done`, the blocked item should re-derive (likely to `Now`).
+
+**Cascade ownership (verified at Phase 0 pin 6):** Layer 1's `complete_operational_item()` only UPDATEs the single target row — it does **NOT** clear `blocked_by` on dependent items. `resolve_cleared_blockers()` is therefore the **primary cascade mechanism**, not a belt-and-suspenders check. This makes it critical-path code: the read path is the only place where transitive unblocks happen.
+
+The helper:
 
 ```rust
-/// Check if blockers are resolved and clear blocked_by if so.
+/// Primary cascade mechanism for transitive unblocks.
+/// For each Waiting item in the slice, check if its blocked_by ID
+/// points to a Done item; if so, clear blocked_by in the DB.
+/// Layer 1's complete_operational_item does NOT cascade — this is
+/// where the blocker→waiting unblock happens.
 pub fn resolve_cleared_blockers(items: &[OperationalItem], db: &Database) -> Result<()>
 ```
+
+**Critical-path implications:**
+- Must run before `derive_status()` so the cleared `blocked_by` is reflected in the next status derivation pass.
+- A read with N=20 items has at most 20 cascade-check queries (each is `SELECT status FROM operational_items WHERE id = ?` — indexed by primary key, sub-millisecond). The bounded cost analysis in §2.2 covers this — the write-amplification table's "20 items × status change probability" includes any cascade-induced status changes.
+- Tests must assert that completing a blocker results in dependent items unblocking on the next `query()` call, not on the `complete_operational_item()` call itself.
 
 ### 2.4 Tests
 
@@ -119,246 +219,86 @@ pub fn resolve_cleared_blockers(items: &[OperationalItem], db: &Database) -> Res
 - Done exclusion: Done item with past-due `due_at` stays Done.
 - Blocker cascade: Waiting item unblocks when blocker moves to Done.
 
-## Phase 3 — LLM Explainer (`crates/mika-agent/src/operational/explainer.rs`)
+## Phase 3 — `AsyncDatabase` Canonical Read Path
 
-### 3.1 Create `explainer.rs` module
-
-The explainer takes a ranked list of `ScoredItem`s and produces human-facing prose explaining **why** each item is at its position. It does NOT change the ranking.
-
-```rust
-/// Generate narration for ranked items.
-pub async fn explain_ranking(
-    items: &[ScoredItem],
-    llm_provider: &dyn LlmProvider,
-    model: &str,
-    max_items: usize,
-) -> Result<Vec<ExplainedItem>>
-
-pub struct ExplainedItem {
-    pub item_id: String,
-    pub rank: usize,
-    pub rationale: String, // One-line human-facing explanation
-}
-```
-
-### 3.2 Prompt design
-
-The prompt receives the ranked list with score breakdowns and produces one-line rationales. Key prompt constraints:
-
-- "You are narrating a pre-computed ranking. Do NOT suggest reordering."
-- "Each rationale must reference the dominant scoring term (e.g., 'Past-due commitment to Sarah — urgency drove this to the top')."
-- "Do NOT contradict the ranking. If an item is ranked #1, do not say it's low priority."
-- Output format: JSON array of `{"item_id": "...", "rationale": "..."}` for reliable parsing.
-
-### 3.3 Model routing
-
-Per Decision H: route through the agent's default LLM provider/model. Cost is ~100 tokens per item — cheap enough for per-surface invocation. The explainer is a simple single-turn LLM call, not a multi-step agent loop.
-
-### 3.4 Regression test: narration must not contradict ranking
-
-A test that:
-1. Creates a fixed ranked list with known #1 and #5 items.
-2. Calls the explainer.
-3. Asserts the rationale for #1 does NOT contain "low priority", "less important", etc.
-4. Asserts the rationale for #5 does NOT contain "highest priority", "most urgent", etc.
-
-This is a `MockLlmProvider` test — the mock returns a valid JSON response, and the test verifies parsing and contract enforcement. Real-provider variant gated behind `#[ignore]`.
-
-### 3.5 Fallback
-
-If the LLM call fails (timeout, rate limit, parse error), the surfaces degrade gracefully: they show the ranked list without rationales. The explainer returns `ExplainedItem` with an empty `rationale` string on failure, not an error.
-
-## Phase 4 — Read Surfaces
-
-### 4.1 CLI: `mika next` (`crates/mika-cli/src/commands/next.rs`)
-
-New subcommand. Shows the top 5 operational items by priority with one-line rationale per item.
-
-**Implementation:**
-- Add `Next` variant to the CLI command enum in `cli.rs`.
-- New `commands/next.rs` module.
-- Query `operational_items` via the HTTP API (`GET /api/v1/operational-items?agent_id=<id>&sort=priority_desc&limit=5`).
-- Call the explainer API endpoint (new: `GET /api/v1/operational-items/explained?agent_id=<id>&limit=5`) for rationales.
-- Format: numbered list with kind emoji, title, status badge, and rationale.
-- Supports `--format text|json` and `--agent <name>`.
-- Feature-gated: returns "Operational partner mode is not enabled" when `MIKA_OPERATIONAL_PARTNER` is not set.
-
-**Example output:**
-```
-What's Next:
-1. [Task] Deploy v0.39 schema migration — urgency: past-due, drove to #1
-   Status: Now | Due: 2026-06-10 | Priority: 185.3
-2. [Commitment] Call Sarah re: partnership — commitment to user, approaching deadline
-   Status: Scheduled | Due: 2026-06-12 | Priority: 142.1
-3. [Blocker] Waiting on CI approval for mika#1200 — blocks 3 downstream items
-   Status: Waiting | Priority: 98.5
-...
-```
-
-### 4.2 Dashboard: Operational Inbox (`dashboard/`)
-
-New dashboard page accessible via the sidebar.
-
-**Implementation:**
-- New route `/operational` in the dashboard router.
-- New page component `OperationalInbox.tsx` consuming `GET /api/v1/operational-items`.
-- Uses existing `@senara-solutions/ui` components: `StatusBadge` (map operational status to badge variant), `SelectFilter` (kind/status filters), `TimeRangeFilter`, `ListRow`, `Pagination`, `LoadingState`, `ErrorState`, `EmptyState`.
-- Sortable by priority (default), created_at, due_at.
-- Filterable by status (Now/Waiting/Delegated/Scheduled/AtRisk/Done) and kind.
-- Each row shows: kind icon, title, status badge, owner, priority score, due_at, confidence.
-- Priority column shows the score with a `TokenBudgetBar`-style visual (map 0-250 range to bar width).
-- Live refresh via `LiveRefreshToggle` (reuses dashboard pattern).
-
-**Server endpoint enhancement:**
-- Extend `GET /api/v1/operational-items` to include `score_breakdown` in the response when `?include_breakdown=true` query param is set.
-- New `GET /api/v1/operational-items/explained` endpoint for LLM-narrated rationales (lazy, on-demand — not computed on every list load).
-
-### 4.3 Daily Brief Integration
-
-The daily brief is a scheduled task that fires on the heartbeat/reminder cadence. Layer 2 adds operational items to it.
-
-**Implementation:**
-- In the heartbeat/daily-brief code path, query top 10 items by priority.
-- Call the explainer for rationales.
-- Format as a markdown section in the brief: `## What's Next` with the ranked list.
-- Include an `## At Risk` section for any items with `status = AtRisk`.
-- The brief is delivered via the existing `send_message` channel (Telegram, etc.).
-
-**Location:** The daily brief logic lives in the heartbeat handler. Add a `build_operational_brief()` function in `operational/` that the heartbeat calls.
-
-### 4.4 Agent Prompt Injection (`crates/mika-agent/src/prompt.rs`)
-
-The load-bearing surface. Inject a `## Current Workload` section into the system prompt so every turn, the agent has the user's operational context.
-
-**Injection point:** After core memory section (line ~495 in `prompt.rs`), before callback context.
-
-**Implementation:**
-- Add `operational_items: Option<Vec<OperationalItem>>` to `PromptContext`.
-- In `build_system_prompt()`, after `write_core_memory_section()`, add:
-
-```rust
-if let Some(items) = ctx.operational_items {
-    if !items.is_empty() {
-        write_operational_section(&mut prompt, items);
-    }
-}
-```
-
-- `write_operational_section()` formats top 20 items (by pre-computed priority) as a concise list:
-
-```
-## Current Workload
-<operational-context trust="data">
-20 active items. Top priorities:
-- [Now] Deploy v0.39 migration (priority: 185.3, due: 2026-06-10)
-- [Scheduled] Call Sarah re: partnership (priority: 142.1, due: 2026-06-12)
-- [Waiting] CI approval for mika#1200 (priority: 98.5, blocked)
-- [AtRisk] Helm chart update stale 3d (priority: 87.2)
-...
-3 items at risk. 2 items waiting.
-</operational-context>
-```
-
-- Feature-gated behind `settings.operational_partner`. When disabled, no injection.
-- The items are queried from the DB at prompt-assembly time (same pattern as core memory).
-- **No LLM explainer in prompt injection.** Per Decision H cost note: "Reassess if narrating ranking becomes a hot path (e.g., agent prompt injection at every turn)." The prompt surface shows raw scores and status — the agent can reference these to proactively surface context. Rationales are reserved for human-facing surfaces (CLI, daily brief).
-
-**Caller changes:**
-- `run_agent()` / `run_silent_agent()` / `run_team_agent()` — query operational items and pass to `PromptContext`. Gated by `settings.operational_partner`.
-- For silent mode: include only top 5 items (smaller context budget).
-
-## Phase 5 — Memory Rule Encoding
-
-### 5.1 Feedback memory
-
-Create `feedback_llm_explains_never_decides.md` in the memory system documenting the principle. This is a structural rule, not a preference.
-
-### 5.2 Explainer prompt assertion
-
-The explainer prompt must contain the literal string "do NOT suggest reordering" or equivalent. A `#[test]` asserts this invariant (same pattern as `summarization_prompt_enforces_factual_shape` in `compaction.rs`).
-
-### 5.3 Regression test: ranking immutability
-
-A test that calls `explain_ranking()` and verifies the returned `ExplainedItem` list preserves the input ordering exactly. The explainer must not reorder, insert, or remove items.
-
-## Phase 6 — Wiring and Integration
-
-### 6.1 Feature gate progression
-
-The `MIKA_OPERATIONAL_PARTNER=1` flag gates all read surfaces. Writes remain always-on (Layer 1). The gate check happens at each surface's entry point:
-- CLI: early return with guidance message.
-- Dashboard: endpoint returns 404 (existing behavior).
-- Agent prompt: section omitted.
-- Daily brief: operational section omitted.
-
-### 6.2 `AsyncDatabase` wrappers
+### 3.1 `AsyncDatabase` wrapper
 
 Add `async fn score_and_rank_items(&self, agent_id: &str, limit: u32) -> Result<Vec<ScoredItem>>` to `AsyncDatabase` that:
+
 1. Queries non-Done items for the agent.
-2. Runs `derive_status()` on each, updating cache if changed.
-3. Runs `priority()` scoring on each.
-4. Sorts by priority DESC.
-5. Returns top `limit` items with breakdowns.
+2. Batch-loads blocked counts (single GROUP BY query — §1.3).
+3. Runs `resolve_cleared_blockers()` to clear stale `blocked_by` references.
+4. Runs `derive_status()` on each non-Done item, updating cache if changed.
+5. Runs `priority()` scoring on each item using the batch-loaded counts.
+6. Writes back updated priority scores.
+7. Sorts by priority DESC.
+8. Returns top `limit` items with breakdowns.
 
-This is the canonical read-path entry point for all surfaces.
+This is the **canonical read-path entry point** for all surfaces (sub-issues 2b–2d). The method encapsulates the full score-derive-rank pipeline so consumers don't need to orchestrate the steps.
 
-### 6.3 HTTP API extensions
+### 3.2 Feature gate placement (addresses F6)
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `GET /api/v1/operational-items` | Existing | Add `include_breakdown=true` query param |
-| `GET /api/v1/operational-items/explained` | New | Returns top-N items with LLM rationales |
-| `GET /api/v1/operational-items/stats` | New | Summary counts by status + kind (for dashboard header) |
+The `MIKA_OPERATIONAL_PARTNER` gate check happens at each **read surface's entry point** — not inside `score_and_rank_items()`. This follows the Layer 1 pattern (PR #1266: "Writes always-on; reads gated behind `MIKA_OPERATIONAL_PARTNER=1`") where the gate lives at the surface, not the DB method.
 
-### 6.4 Documentation update
+Concretely (for sub-issues 2b–2d):
+- CLI: early return with guidance message before calling `score_and_rank_items()`.
+- Dashboard endpoint: return 404 before calling `score_and_rank_items()`.
+- Agent prompt injection: skip the `score_and_rank_items()` call entirely when gate is off. The gate check happens once in the caller (`run_agent()` / `run_silent_agent()` / `run_team_agent()`), before the DB query — not after.
+- Daily brief: skip operational section before calling `score_and_rank_items()`.
 
-- Update `docs/architecture/operational-partner-frame.md` § Status taxonomy with implementation notes.
-- Update `crates/mika-agent/CLAUDE.md` with the new modules and scoring details.
-- Update `crates/mika-cli/CLAUDE.md` with the `mika next` command.
+This means the DB method has no knowledge of the feature flag. The flag is a surface concern.
 
-## Phase 7 — Testing Strategy
+Citation: PR #1266 — established pattern for `MIKA_OPERATIONAL_PARTNER` gating; review-guide.md § Orthogonality (gate check placement affects which layer knows about the feature flag).
 
-### 7.1 Unit tests (Phase 1-3)
+### 3.3 Integration test
 
-- Scoring term isolation tests.
-- Status derivation tests.
-- Explainer prompt invariant test.
-- Ranking immutability test.
-
-### 7.2 Integration tests (`tests/eval/`)
-
-- Full-stack eval scenario: synthetic items → score → rank → explain → verify output format.
-- Agent prompt injection test: build prompt with operational items, assert `<operational-context>` block present.
-- Feature gate test: with `operational_partner = false`, assert no operational section in prompt.
-
-### 7.3 Dashboard tests
-
-- API endpoint tests for new/extended endpoints.
-- Component rendering tests for `OperationalInbox`.
-
-## Implementation Order
-
-1. **Phase 1** — Scoring engine (pure Rust, no LLM, no IO beyond DB reads). Foundation for everything else.
-2. **Phase 2** — Status re-derivation. Integrates with Phase 1's read path.
-3. **Phase 6.2** — `AsyncDatabase` wrapper. The canonical entry point.
-4. **Phase 4.4** — Agent prompt injection. The load-bearing surface — proves the engine works end-to-end.
-5. **Phase 4.1** — CLI `mika next`. Human-visible validation.
-6. **Phase 3** — LLM explainer. Needed for CLI rationales and daily brief.
-7. **Phase 4.3** — Daily brief integration. Uses explainer.
-8. **Phase 4.2** — Dashboard inbox. Largest frontend surface, benefits from all prior work.
-9. **Phase 5** — Memory rule encoding and regression tests.
-10. **Phase 6.3-6.4** — API extensions and documentation.
+- Full-stack test: synthetic items → `score_and_rank_items()` → verify correct ordering, status re-derivation, and batch-loaded dependency counts.
+- Feature gate is not tested here (it's a surface concern for sub-issue 2b–2d tests).
 
 ## Decisions
 
-- **No LLM in the ranking loop.** The scoring formula is the sole ranking authority. The LLM narrates after-the-fact.
-- **Re-derivation at read time.** Status is a cache of derivable state. Every read re-derives and updates. This avoids complex event-driven status propagation.
-- **Prompt injection without rationales.** The agent prompt surface shows raw scores, not LLM narration. Keeps the hot path cheap.
-- **Graceful degradation.** All surfaces work without the explainer. Explainer failure = no rationales, not broken surfaces.
+- **No LLM in the ranking loop.** The scoring formula is the sole ranking authority. The LLM narrates after-the-fact (sub-issue 2c).
+- **Re-derivation at read time with bounded cost.** Status is a cache of derivable state. Every read re-derives and updates. Worst case: 20 single-row UPDATEs per prompt-injection read, with 0–2 actual changes in practice. The alternative (periodic sweep) adds complexity without meaningful performance gain at N ≤ 50.
+- **Batch-loaded dependency counts.** A single `GROUP BY blocked_by` query replaces per-item `COUNT(*)` calls. `priority()` is a pure function taking a pre-loaded HashMap — no DB access in the scoring loop.
 - **Score persistence.** The computed `priority` score is written back to the DB column. Dashboard sorting uses the cached score. The re-computation on read ensures freshness for the specific surface that triggered it.
+- **Today window = 24 hours.** Defined as `TODAY_WINDOW_HOURS` constant in `calibration.rs`. The foundation doc §4 says "today window" without defining exact hours; 24h is the default, tunable via the constant. This is a decision, not an open question.
+- **AtRisk heuristics (initial set).** Two triggers: (a) stale near deadline (`updated_at` > 48h ago AND `due_at` within 24h); (b) callback failure evidence in `evidence_refs`. Expand heuristics based on operational experience in future sub-issues. This is a decision with a minimal-viable starting set — not an open question.
+- **Feature gate at the surface, not the DB method.** Follows the Layer 1 pattern (PR #1266). `score_and_rank_items()` has no knowledge of `MIKA_OPERATIONAL_PARTNER`.
 
-## Open Questions
+## Acceptance Criteria
 
-1. **Today window for Now/Scheduled threshold.** Foundation says "today window" without defining the exact hours. Propose 24 hours as the default, configurable via a constant in `calibration.rs`.
-2. **AtRisk detection heuristics.** Beyond the stale+near-deadline case, what specific evidence patterns should trigger AtRisk? Propose starting with: (a) stale near deadline (updated_at > 48h ago + due_at within 24h), (b) callback failure on a Delegated item. Expand heuristics based on operational experience.
-3. **Daily brief frequency.** Currently the heartbeat fires on a configurable cadence. The operational brief should fire once per day (morning). If the heartbeat cadence is more frequent, add a "last_brief_at" check to avoid spamming.
+1. `scoring.rs` implements the foundation §5 formula with all 6 terms, using batch-loaded dependency counts (no N+1 queries).
+2. `calibration.rs` defines all scoring constants as named constants.
+3. `status.rs` implements the 6-status derivation rules with Decision G precedence.
+4. `score_and_rank_items()` on `AsyncDatabase` is the canonical read-path entry point.
+5. Read-path re-derivation updates cached status with bounded worst-case: ≤ N single-row UPDATEs where N is the query limit (20 for prompt injection, 50 for dashboard pagination).
+6. Unit tests cover each scoring term in isolation, deterministic ranking, status derivation precedence, and blocker cascade.
+7. Integration test exercises the full `score_and_rank_items()` pipeline.
+
+## Out of Scope (deferred to sub-issues 2b–2e)
+
+- **CLI `mika next` command** → sub-issue 2b
+- **Agent prompt injection** → sub-issue 2b
+- **LLM explainer** → sub-issue 2c (F4 sharpening — test concerns — addressed there)
+- **Daily brief integration** → sub-issue 2c
+- **Dashboard `OperationalInbox`** → sub-issue 2d (F5 sharpening — component availability pin — addressed there)
+- **HTTP API endpoint extensions** → sub-issue 2d
+- **Memory rule encoding** → sub-issue 2e
+- **Documentation updates** → sub-issue 2e
+
+## Revision History
+
+- rev 1 (2026-06-11): Initial plan — full 7-phase scope covering all of mika#1263.
+- rev 2 (2026-06-11): Addressed architect first-pass findings:
+  - **F1** (BLOCKING): Decomposed into 5 sub-issues (2a–2e) per review-guide.md § Single Responsibility and the #1259 decomposition precedent. This plan now covers sub-issue 2a only (scoring engine + status re-derivation + AsyncDatabase canonical read path).
+  - **F2** (BLOCKING): Added explicit cost analysis table for read-path write amplification (§2.2). Worst case: ≤20 single-row UPDATEs per prompt-injection read; 0–2 actual changes in practice. Explicitly accepted with rationale.
+  - **F3** (BLOCKING): Replaced per-item `db.count_blocked_items()` with batch-loaded `GROUP BY blocked_by` query (§1.3). `priority()` is now a pure function taking `&HashMap<String, u32>` — no DB access in the scoring loop.
+  - **F4** (sharpening): Explainer test concerns deferred to sub-issue 2c plan. Noted in Out of Scope.
+  - **F5** (sharpening): Dashboard component availability pin deferred to sub-issue 2d plan. Noted in Out of Scope.
+  - **F6** (sharpening): Specified feature gate placement — gate at the surface, not the DB method, following PR #1266 pattern (§3.2).
+  - **F7** (sharpening): Converted all 3 open questions to decisions with defaults and rationale (see Decisions section). No open questions remain.
+- rev 3 (2026-06-11): Addressed architect second-pass findings (escalate-second-pass-after-iterate.md):
+  - **F1** (sharpening): Verified against current code — `idx_operational_items_blocked_by` does **NOT** exist (5 indexes on `operational_items`: agent_status, agent_kind, agent_priority, source, source_unique). Removed the "uses existing index" claim in §1.3. Reframed as: full-scan acceptable at N≤50, sub-millisecond on SQLite. Added Phase 0 pin 7 with explicit index list verification and the v40-migration deferral note. No new migration added by this plan.
+  - **F2** (sharpening): Verified against current code — `complete_operational_item()` (`crates/mika-agent/src/db/operational.rs:239`) only UPDATEs the single target row to `status = 'done'`; it does **NOT** cascade clear `blocked_by`. Reframed §2.3 `resolve_cleared_blockers()` as **primary cascade mechanism** (critical-path code), not defense-in-depth. Added critical-path implications (ordering requirement, bounded cost, test assertion shape). Added Phase 0 pin 6 with the verified `complete_operational_item` behavior pinned. Layer 1 write path is unchanged by this plan.
+
+  Resolution methodology: orchestrator-CC verified both findings directly against the codebase (grep on index list, sed read on function body) before editing. Both findings resolved by plan-text revision — no code change required to address them; the verification is the work.
