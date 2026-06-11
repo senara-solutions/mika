@@ -205,6 +205,7 @@ impl TaskDispatcher {
         match trigger_name {
             "heartbeat" => Ok(self.dispatch_heartbeat(task).await?),
             "reflection" => Ok(self.dispatch_reflection(task).await?),
+            "auto_pull_groomed" => Ok(self.dispatch_auto_pull_groomed(task).await?),
             other => Err(anyhow!("unknown run_skill trigger: {}", other).into()),
         }
     }
@@ -829,6 +830,59 @@ impl TaskDispatcher {
         // Record send for rate-limit tracking
         if let Err(e) = self.db.record_heartbeat_send().await {
             warn!(task_id = %task.id, error = %e, "failed to record heartbeat send");
+        }
+
+        Ok(())
+    }
+
+    /// Run the auto-pull groomed ticket logic (mika#1363).
+    ///
+    /// This does NOT run a silent agent turn — it directly executes the
+    /// auto-pull selection logic which calls `gh` CLI and applies the `ready`
+    /// label on the selected ticket. The webhook-driven dispatch flow then
+    /// picks up the labelled ticket.
+    async fn dispatch_auto_pull_groomed(&self, task: &Task) -> Result<()> {
+        let github_token = match self.github_token.as_deref() {
+            Some(t) => t,
+            None => {
+                debug!(task_id = %task.id, "auto_pull: no github_token configured, skipping");
+                return Ok(());
+            }
+        };
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let session_id = format!("auto-pull-{}", uuid::Uuid::new_v4());
+
+        info!(
+            task_id = %task.id,
+            trace_id = %trace_id,
+            "auto_pull: running groomed ticket selection"
+        );
+
+        let result = crate::auto_pull::auto_pull_groomed_ticket(
+            &self.db,
+            github_token,
+            &trace_id,
+            &session_id,
+        )
+        .await;
+
+        match result {
+            Some(issue_number) => {
+                info!(
+                    task_id = %task.id,
+                    issue = issue_number,
+                    trace_id = %trace_id,
+                    "auto_pull: selected and labelled #{issue_number} ready"
+                );
+            }
+            None => {
+                debug!(
+                    task_id = %task.id,
+                    trace_id = %trace_id,
+                    "auto_pull: no action taken"
+                );
+            }
         }
 
         Ok(())

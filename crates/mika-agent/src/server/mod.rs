@@ -79,6 +79,10 @@ use state::{AgentState, AppState};
 /// Pre-filters (active hours, rate limits, recent activity) are applied at dispatch time.
 const HEARTBEAT_CRON: &str = "0 0 * * * *";
 
+/// Cron schedule for the auto-pull check: every 10 minutes (mika#1363).
+/// Pre-filters (groomed-not-ready, priority ordering, queue-empty gate) applied at dispatch time.
+const AUTO_PULL_CRON: &str = "0 */10 * * * *";
+
 /// Build the Axum router with all routes and middleware.
 ///
 /// Shared between production `run_server` and test `test_app`.
@@ -1287,6 +1291,28 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             .await;
         } else if let Err(e) = db.cancel_recurring_task_by_label("reflection").await {
             warn!(agent = %agent_name, error = %e, "failed to cancel stale reflection task");
+        }
+
+        // Register auto-pull recurring task for mika-dev only (mika#1363, AC4).
+        if name == "mika-dev" {
+            if std::env::var("MIKA_DEV_AUTO_PULL")
+                .map(|v| v == "0")
+                .unwrap_or(false)
+            {
+                info!(agent = %name, "auto_pull disabled via MIKA_DEV_AUTO_PULL=0");
+                // Cancel any existing auto_pull task if the feature was just disabled
+                if let Err(e) = db.cancel_recurring_task_by_label("auto_pull_groomed").await {
+                    warn!(agent = %name, error = %e, "failed to cancel stale auto_pull_groomed task");
+                }
+            } else {
+                task_engine::ensure_recurring_task(
+                    &db,
+                    "auto_pull_groomed",
+                    AUTO_PULL_CRON,
+                    r#"{"trigger":"auto_pull_groomed"}"#,
+                )
+                .await;
+            }
         }
 
         // Startup recovery (expire timed-out tasks, mark orphaned in_progress as failed, load heap)
