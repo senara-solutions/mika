@@ -430,6 +430,101 @@ impl Database {
         )?;
         Ok(count as u32)
     }
+
+    /// Batch-load dependency counts for all items of an agent in a single query.
+    ///
+    /// Returns a `HashMap<blocked_by_id, count>` — how many non-Done items are
+    /// blocked by each item. Used by the scoring engine to avoid N+1 queries
+    /// (plan §1.3).
+    pub fn batch_blocked_counts(
+        &self,
+        agent_id: &str,
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT blocked_by, COUNT(*) as blocked_count
+             FROM operational_items
+             WHERE agent_id = ?1 AND blocked_by IS NOT NULL AND status != 'done'
+             GROUP BY blocked_by",
+        )?;
+
+        let mut counts = std::collections::HashMap::new();
+        let rows = stmt.query_map(params![agent_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        for row in rows {
+            let (blocked_by, count) = row?;
+            counts.insert(blocked_by, count as u32);
+        }
+
+        Ok(counts)
+    }
+
+    /// Get the status of a single operational item by ID.
+    ///
+    /// Used by `resolve_cleared_blockers()` to check if a blocker is Done.
+    pub fn get_operational_item_status(&self, id: &str) -> Result<Option<OperationalStatus>> {
+        let result = self.conn.query_row(
+            "SELECT status FROM operational_items WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        );
+
+        match result {
+            Ok(status_str) => Ok(OperationalStatus::from_str_opt(&status_str)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Clear the `blocked_by` field for an operational item.
+    ///
+    /// Primary cascade mechanism: when a blocker moves to Done, dependent
+    /// items have their `blocked_by` cleared so they re-derive to a non-Waiting
+    /// status (plan §2.3).
+    pub fn clear_operational_item_blocked_by(&self, id: &str) -> Result<()> {
+        let now = timestamp::now();
+        self.conn.execute(
+            "UPDATE operational_items SET blocked_by = NULL, updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Query non-Done items for an agent, ordered by priority DESC.
+    ///
+    /// Used by the canonical read path (`score_and_rank_items`).
+    pub fn query_active_operational_items(
+        &self,
+        agent_id: &str,
+        limit: u32,
+    ) -> Result<Vec<OperationalItem>> {
+        let effective_limit = limit.clamp(1, 100) as i64;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, title, status, owner_type, owner_name,
+                    priority, user_importance, due_at, blocked_by, next_action,
+                    evidence_refs, confidence, source_table, source_id,
+                    agent_id, created_at, updated_at
+             FROM operational_items WHERE agent_id = ?1 AND status != 'done'
+             ORDER BY priority DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![agent_id, effective_limit], |row| {
+            Ok(row_to_operational_item(row))
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            match row? {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    debug!(error = %e, "skipping malformed operational item row");
+                }
+            }
+        }
+        Ok(items)
+    }
 }
 
 /// Map a row to an [`OperationalItem`]. Returns `Result` to allow skipping

@@ -42,3 +42,13 @@ pub const URGENCY_MAX: f32 = 100.0;
 
 /// Maximum user-importance score.
 pub const USER_IMPORTANCE_MAX: f32 = 50.0;
+
+// -- Time windows (status re-derivation) --
+
+/// Items with `due_at` within this many hours are in the "today window"
+/// and may derive to `Now` or `AtRisk`.
+pub const TODAY_WINDOW_HOURS: f64 = 24.0;
+
+/// Items with `updated_at` older than this many hours AND `due_at` within
+/// the today window are considered stale-near-deadline → AtRisk.
+pub const STALE_NEAR_DEADLINE_HOURS: f64 = 48.0;
