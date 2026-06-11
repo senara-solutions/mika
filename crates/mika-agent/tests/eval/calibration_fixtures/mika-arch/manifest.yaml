@@ -64,3 +64,42 @@ scenarios:
       - missing_verdict_keyword
       - false_approval
       - unlabeled_findings
+
+  - id: groomed_no_tbds_passes
+    fixture: groomed_no_tbds_passes.md
+    tags: [grooming, tbd-gate, single-ticket]
+    flaky: false
+    weight: 1.5
+    description: >
+      Clean plan with no TBDs or unresolved decisions. Model must produce
+      "Verdict: READY" — the Unresolved-Decision Gate should not fire.
+    expected_failure_classes_absent:
+      - false_escalation
+      - false_iterate
+      - missing_disposition
+
+  - id: groomed_with_tbd_rejected
+    fixture: groomed_with_tbd_rejected.md
+    tags: [grooming, tbd-gate, single-ticket]
+    flaky: false
+    weight: 2.0
+    description: >
+      Plan with explicit "TBD" tokens and unresolved design choices. Model must
+      produce "Verdict: ITERATE" with findings naming the TBDs.
+    expected_failure_classes_absent:
+      - false_approval
+      - missing_disposition
+      - missing_findings
+
+  - id: groomed_with_placeholder_path_rejected
+    fixture: groomed_with_placeholder_path_rejected.md
+    tags: [grooming, tbd-gate, single-ticket]
+    flaky: false
+    weight: 1.5
+    description: >
+      Plan with "<path>" placeholders and "TBD" module locations. Model must
+      produce "Verdict: ITERATE" with findings naming the placeholders.
+    expected_failure_classes_absent:
+      - false_approval
+      - missing_disposition
+      - missing_findings

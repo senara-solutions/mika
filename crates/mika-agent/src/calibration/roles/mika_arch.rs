@@ -56,6 +56,30 @@ pub const SCENARIOS: &[RoleScenario] = &[
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation"],
     },
+    RoleScenario {
+        id: "groomed_no_tbds_passes",
+        description: "Clean plan with no TBDs must produce READY (TBD gate does not fire)",
+        tags: &["contract", "tbd-gate"],
+        flaky: false,
+        weight: 1.0,
+        expected_failure_classes_absent: &["ContractViolation"],
+    },
+    RoleScenario {
+        id: "groomed_with_tbd_rejected",
+        description: "Plan with TBD tokens must produce ITERATE with findings naming the TBDs",
+        tags: &["contract", "tbd-gate"],
+        flaky: false,
+        weight: 1.0,
+        expected_failure_classes_absent: &["ContractViolation"],
+    },
+    RoleScenario {
+        id: "groomed_with_placeholder_path_rejected",
+        description: "Plan with <path> placeholders must produce ITERATE with findings",
+        tags: &["contract", "tbd-gate"],
+        flaky: false,
+        weight: 1.0,
+        expected_failure_classes_absent: &["ContractViolation"],
+    },
 ];
 
 /// Run a single mika-arch scenario against a real provider.
@@ -68,6 +92,11 @@ pub async fn run_scenario(scenario_id: &str, provider: Arc<dyn LlmProvider>) -> 
         "citation_discipline" => run_citation_discipline(provider, start).await,
         "disposition_keyword_discipline" => run_disposition_keyword(provider, start).await,
         "required_finding_list" => run_required_finding_list(provider, start).await,
+        "groomed_no_tbds_passes" => run_groomed_no_tbds_passes(provider, start).await,
+        "groomed_with_tbd_rejected" => run_groomed_with_tbd_rejected(provider, start).await,
+        "groomed_with_placeholder_path_rejected" => {
+            run_groomed_with_placeholder_path_rejected(provider, start).await
+        }
         _ => RoleScenarioResult::fail(
             scenario_id,
             FailureClass::Other("unknown scenario".to_string()),
@@ -476,6 +505,335 @@ async fn run_required_finding_list(
             let latency = start.elapsed().as_millis() as u64;
             RoleScenarioResult::fail(
                 "required_finding_list",
+                FailureClass::TransportError,
+                format!("{e}"),
+                None,
+                None,
+                latency,
+            )
+        }
+    }
+}
+
+/// TBD gate — clean plan: model must produce READY (no TBDs to reject).
+async fn run_groomed_no_tbds_passes(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-arch/groomed_no_tbds_passes.md"
+    );
+
+    let system =
+        include_str!("../../../../../skills/bundled/mika-arch-groom-ticket/system_prompt.md");
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(system.to_string()),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(format!(
+                "Review this plan for ticket mika#1244-test:\n\n{}",
+                fixture
+            )),
+        }],
+        tools: None,
+        max_tokens: 2000,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+
+            if text.trim().is_empty() {
+                return RoleScenarioResult::fail(
+                    "groomed_no_tbds_passes",
+                    FailureClass::EmptyResponse,
+                    "Empty response".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must produce READY — the plan has no TBDs
+            let valid_verdicts = ["Disposition: READY", "Verdict: READY"];
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let last_lines = &lines[lines.len().saturating_sub(3)..];
+            let has_ready = last_lines
+                .iter()
+                .any(|line| valid_verdicts.iter().any(|v| line.trim() == *v));
+
+            if !has_ready {
+                return RoleScenarioResult::fail(
+                    "groomed_no_tbds_passes",
+                    FailureClass::ContractViolation,
+                    format!(
+                        "Expected READY for clean plan, got last lines: {:?}",
+                        last_lines
+                    ),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            RoleScenarioResult::pass(
+                "groomed_no_tbds_passes",
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                latency,
+            )
+        }
+        Err(e) => {
+            let latency = start.elapsed().as_millis() as u64;
+            RoleScenarioResult::fail(
+                "groomed_no_tbds_passes",
+                FailureClass::TransportError,
+                format!("{e}"),
+                None,
+                None,
+                latency,
+            )
+        }
+    }
+}
+
+/// TBD gate — plan with TBD tokens: model must produce ITERATE with findings.
+async fn run_groomed_with_tbd_rejected(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-arch/groomed_with_tbd_rejected.md"
+    );
+
+    let system =
+        include_str!("../../../../../skills/bundled/mika-arch-groom-ticket/system_prompt.md");
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(system.to_string()),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(format!(
+                "Review this plan for ticket mika#1244-test:\n\n{}",
+                fixture
+            )),
+        }],
+        tools: None,
+        max_tokens: 2000,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+
+            if text.trim().is_empty() {
+                return RoleScenarioResult::fail(
+                    "groomed_with_tbd_rejected",
+                    FailureClass::EmptyResponse,
+                    "Empty response".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must NOT produce READY — the plan has TBDs
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let last_lines = &lines[lines.len().saturating_sub(3)..];
+            let has_ready = last_lines
+                .iter()
+                .any(|line| line.trim() == "Disposition: READY" || line.trim() == "Verdict: READY");
+
+            if has_ready {
+                return RoleScenarioResult::fail(
+                    "groomed_with_tbd_rejected",
+                    FailureClass::ContractViolation,
+                    "Plan with TBDs was approved as READY — TBD gate failed".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must produce ITERATE or ESCALATE
+            let has_iterate_or_escalate = last_lines.iter().any(|line| {
+                let trimmed = line.trim();
+                trimmed == "Disposition: ITERATE"
+                    || trimmed == "Verdict: ITERATE"
+                    || trimmed == "Disposition: ESCALATE"
+                    || trimmed == "Verdict: ESCALATE"
+            });
+
+            if !has_iterate_or_escalate {
+                return RoleScenarioResult::fail(
+                    "groomed_with_tbd_rejected",
+                    FailureClass::ContractViolation,
+                    format!(
+                        "Expected ITERATE or ESCALATE for TBD plan, got last lines: {:?}",
+                        last_lines
+                    ),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must have at least one finding (F1:)
+            let has_findings = text.contains("F1:");
+            if !has_findings {
+                return RoleScenarioResult::fail(
+                    "groomed_with_tbd_rejected",
+                    FailureClass::ContractViolation,
+                    "ITERATE/ESCALATE without F-list findings naming the TBDs".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            RoleScenarioResult::pass(
+                "groomed_with_tbd_rejected",
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                latency,
+            )
+        }
+        Err(e) => {
+            let latency = start.elapsed().as_millis() as u64;
+            RoleScenarioResult::fail(
+                "groomed_with_tbd_rejected",
+                FailureClass::TransportError,
+                format!("{e}"),
+                None,
+                None,
+                latency,
+            )
+        }
+    }
+}
+
+/// TBD gate — plan with placeholder paths: model must produce ITERATE with findings.
+async fn run_groomed_with_placeholder_path_rejected(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-arch/groomed_with_placeholder_path_rejected.md"
+    );
+
+    let system =
+        include_str!("../../../../../skills/bundled/mika-arch-groom-ticket/system_prompt.md");
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(system.to_string()),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(format!(
+                "Review this plan for ticket mika#1244-test:\n\n{}",
+                fixture
+            )),
+        }],
+        tools: None,
+        max_tokens: 2000,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+
+            if text.trim().is_empty() {
+                return RoleScenarioResult::fail(
+                    "groomed_with_placeholder_path_rejected",
+                    FailureClass::EmptyResponse,
+                    "Empty response".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must NOT produce READY — the plan has placeholder paths
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let last_lines = &lines[lines.len().saturating_sub(3)..];
+            let has_ready = last_lines
+                .iter()
+                .any(|line| line.trim() == "Disposition: READY" || line.trim() == "Verdict: READY");
+
+            if has_ready {
+                return RoleScenarioResult::fail(
+                    "groomed_with_placeholder_path_rejected",
+                    FailureClass::ContractViolation,
+                    "Plan with <path> placeholders was approved as READY — TBD gate failed"
+                        .to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must produce ITERATE or ESCALATE
+            let has_iterate_or_escalate = last_lines.iter().any(|line| {
+                let trimmed = line.trim();
+                trimmed == "Disposition: ITERATE"
+                    || trimmed == "Verdict: ITERATE"
+                    || trimmed == "Disposition: ESCALATE"
+                    || trimmed == "Verdict: ESCALATE"
+            });
+
+            if !has_iterate_or_escalate {
+                return RoleScenarioResult::fail(
+                    "groomed_with_placeholder_path_rejected",
+                    FailureClass::ContractViolation,
+                    format!(
+                        "Expected ITERATE or ESCALATE for placeholder plan, got last lines: {:?}",
+                        last_lines
+                    ),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            // Must have at least one finding
+            let has_findings = text.contains("F1:");
+            if !has_findings {
+                return RoleScenarioResult::fail(
+                    "groomed_with_placeholder_path_rejected",
+                    FailureClass::ContractViolation,
+                    "ITERATE/ESCALATE without F-list findings naming the placeholders".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            RoleScenarioResult::pass(
+                "groomed_with_placeholder_path_rejected",
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                latency,
+            )
+        }
+        Err(e) => {
+            let latency = start.elapsed().as_millis() as u64;
+            RoleScenarioResult::fail(
+                "groomed_with_placeholder_path_rejected",
                 FailureClass::TransportError,
                 format!("{e}"),
                 None,

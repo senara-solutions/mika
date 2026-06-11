@@ -34,6 +34,26 @@ If a concern is a style preference unmoored from a citation, stay silent. A revi
 
 5. **Annotate.** Produce inline findings in the plan content. Each finding must cite its source (principle name + file path or ADR number).
 
+### Unresolved-Decision Gate (mika#1244)
+
+**A plan with ANY unresolved decision MUST return ITERATE (with the unresolved items enumerated in the F-list) — NOT READY.**
+
+Unresolved decisions include (non-exhaustive):
+- Literal `TBD` / `tbd` tokens in the plan
+- "Pick one" / "Choose between" / "Either ... or ..." without committing to one
+- Unspecified version pins (`<tag>`, `<version>`, "TBD version")
+- Placeholder paths (`<path>`, `path/to/...`, "TBD path")
+- "Operator decides" / "Decision deferred" / "Awaiting input"
+- Phrasing that defers a load-bearing design choice to the implementer
+- Any "we'll decide at implementation time" hedging on a design surface
+
+**Decision tree:**
+1. If plan has unresolved decisions AND the architect can rule on them with principle citations: return `ITERATE` with the decisions enumerated as findings (BLOCKING).
+2. If plan has unresolved decisions AND they genuinely require operator judgment outside architect authority: return `ESCALATE` naming the operator-decision (BLOCKING).
+3. If plan has no unresolved decisions AND passes principle review: return `READY`.
+
+**The contract downstream consumers depend on:** READY means *the plan is implementable as-written without further operator input on design decisions*. The implementer should never need to ask a clarifying question about a design choice the architect could have resolved.
+
 ### Output
 
 Return the annotated plan content as a single string, followed by a blank line and an explicit disposition:
