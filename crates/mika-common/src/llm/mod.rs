@@ -36,6 +36,7 @@ const INTERNAL_TAG_NAMES: &[&str] = &[
     "active-work-items",
     "anomalies",
     "rewind_reversals",
+    "think",
 ];
 
 /// Regex to collapse runs of 3+ newlines (left behind after tag removal) into 2.
@@ -772,6 +773,48 @@ Bye."#;
         let input =
             r#"Hi <context type="x">data</context> and <context type="y">more data context > end"#;
         assert_eq!(strip_internal_tags(input), "Hi  and  end");
+    }
+
+    // -- strip_internal_tags: <think> tag tests (#750) --
+
+    #[test]
+    fn test_strip_think_tag_well_formed() {
+        let input = "<think>some CoT reasoning in english</think>actual answer";
+        assert_eq!(strip_internal_tags(input), "actual answer");
+    }
+
+    #[test]
+    fn test_strip_think_tag_non_english_cot() {
+        // kimi-k2.5 sometimes reasons in Thai/Chinese regardless of prompt language
+        let input = "<think>ดึงข้อมูลจากก่อนหน้านี้ งั้นเช็ค task อีกรอบ</think>4 active tasks corrected.";
+        assert_eq!(strip_internal_tags(input), "4 active tasks corrected.");
+    }
+
+    #[test]
+    fn test_strip_think_tag_multiple_blocks() {
+        let input =
+            "<think>first reasoning</think>answer one <think>second reasoning</think>answer two";
+        assert_eq!(strip_internal_tags(input), "answer one answer two");
+    }
+
+    #[test]
+    fn test_strip_think_tag_with_attributes() {
+        let input = r#"<think type="cot">reasoning here</think>final answer"#;
+        assert_eq!(strip_internal_tags(input), "final answer");
+    }
+
+    #[test]
+    fn test_strip_think_tag_malformed_bare_closing() {
+        // #453 tolerance: bare `think>` without `</`
+        let input = "<think>internal reasoning\nthink>\nActual response.";
+        assert_eq!(strip_internal_tags(input), "Actual response.");
+    }
+
+    #[test]
+    fn test_strip_think_tag_malformed_whitespace_closing() {
+        // Whitespace in closing tag: </ think>
+        let input = "<think>reasoning content</ think>the answer";
+        assert_eq!(strip_internal_tags(input), "the answer");
     }
 
     // -- truncate_chars tests --
