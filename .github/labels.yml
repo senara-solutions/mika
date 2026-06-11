@@ -103,6 +103,10 @@
   color: "2ea44f"
   description: Approved for autonomous dispatch
 
+- name: operator-gated
+  color: "8a2be2"
+  description: "Groomed work requiring operator-host-time. Distinct from parked/blocked. No ready label."
+
 - name: pipeline-exempt
   color: "bfdadc"
   description: "Docs-only or non-code PR exempt from pipeline gates"
