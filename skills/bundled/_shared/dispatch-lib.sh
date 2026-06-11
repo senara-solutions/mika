@@ -856,15 +856,17 @@ ${RESULT}"
             fi
         fi
 
-        # Post-flight plan validation (mika#1033, mika#1032): detect dev-groom
-        # drift where the session exits "success" but produced no valid plan file
-        # (or only a stub/empty one) and/or never invoked /ce:plan. The plan-file-
-        # size check is the primary structural defense; the log-grep for /ce:plan
-        # adds root-cause diagnostic specificity. Both checks are merged into a
-        # single block and fire before callback delivery.
+        # Post-flight plan validation (mika#1033, mika#1032, mika#1394): detect
+        # dev-groom drift where the session exits "success" but produced no valid
+        # plan file (or only a stub/empty one) and/or never invoked /ce:plan.
+        #
+        # mika#1394: replaced date-specific `${TODAY_PREFIX}-*-plan.md` with
+        # `_find_issue_plan` (issue-number match + content fallback). The old
+        # date-prefix pattern false-negatived on re-dispatch when the plan was
+        # committed on a prior day, poisoning RESULT with PIPELINE_INCOMPLETE
+        # and preventing the GROOMED outcome from reaching mika-dev.
         if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
-            TODAY_PREFIX=$(date +%Y-%m-%d)
-            VALID_PLAN=$(find "$WORKTREE_DIR/docs/plans" -name "${TODAY_PREFIX}-*-plan.md" -size +500c 2>/dev/null | head -1)
+            VALID_PLAN=$(_find_issue_plan 2>/dev/null) || VALID_PLAN=""
 
             # Check session log for /ce:plan invocation (mika#1032).
             # Broad pattern covers Skill tool call JSON, command strings, etc.
@@ -883,12 +885,12 @@ ${RESULT}"
 
             if [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
                 # Both checks failed: no plan file AND /ce:plan never called
-                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no docs/plans/${TODAY_PREFIX}-*-plan.md >500 bytes found) and no /ce:plan invocation detected in session log. Session drifted into executor mode.
+                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no issue-scoped plan >500 bytes found via _find_issue_plan for $REPO#$ISSUE_NUM) and no /ce:plan invocation detected in session log. Session drifted into executor mode.
 
 ${RESULT}"
             elif [ -z "$VALID_PLAN" ]; then
                 # Plan file missing but /ce:plan was called (or log unavailable)
-                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no docs/plans/${TODAY_PREFIX}-*-plan.md >500 bytes found). Session likely drifted into executor mode.
+                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no issue-scoped plan >500 bytes found via _find_issue_plan for $REPO#$ISSUE_NUM). Session likely drifted into executor mode.
 
 ${RESULT}"
             elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
@@ -2019,14 +2021,34 @@ EOF
     # ships. See docs/plans/2026-05-25-009-feat-1271-class-d-shim-retire-plan.md.
     if [ "$SKILL" = "dev-groom" ]; then
         if _iterate_groom_loop; then
-            # Architect converged on GROOMED — upgrade outcome from PLAN_COMMITTED
-            # to PLAN_GROOMED (the only path that earns this outcome name).
-            RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: PLAN_COMMITTED/Outcome: PLAN_GROOMED/')
+            # mika#1394: Architect converged on GROOMED — unconditionally override
+            # the outcome to PLAN_GROOMED. The previous sed only matched
+            # "Outcome: PLAN_COMMITTED"; on re-dispatch the plan validation block
+            # may have already set PIPELINE_INCOMPLETE (e.g., plan created on a
+            # prior day), making the old sed a no-op. The canonical callout was
+            # written and the grooming is complete — strip any stale PIPELINE
+            # FAILURE markers and set the authoritative outcome.
+            RESULT=$(printf '%s' "$RESULT" | sed '/^PIPELINE FAILURE:/d')
+            RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: .*/Outcome: PLAN_GROOMED/')
+            # Safety net: if no Outcome: line existed (edge case), append one.
+            if ! printf '%s' "$RESULT" | grep -qF 'Outcome: PLAN_GROOMED'; then
+                RESULT="${RESULT}
+
+Outcome: PLAN_GROOMED"
+            fi
         else
             # mika#1333: propagate architect-convergence failure into RESULT.
             # Replaces the silent-tolerance pattern that caused mid-flow
             # short-circuit (plan committed but architect never ran/failed).
-            RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: PLAN_COMMITTED.*$/Outcome: PIPELINE_INCOMPLETE — architect convergence did not complete./')
+            # mika#1394: match any Outcome: line (not just PLAN_COMMITTED) to
+            # handle re-dispatch where PIPELINE_INCOMPLETE was already set.
+            RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: .*/Outcome: PIPELINE_INCOMPLETE — architect convergence did not complete./')
+            # If no Outcome: line existed, append one.
+            if ! printf '%s' "$RESULT" | grep -qF 'Outcome: PIPELINE_INCOMPLETE'; then
+                RESULT="${RESULT}
+
+Outcome: PIPELINE_INCOMPLETE — architect convergence did not complete."
+            fi
             RESULT="PIPELINE FAILURE: architect convergence did not complete (_iterate_groom_loop returned non-zero). Plan exists on branch but architect verdict is missing.
 
 ${RESULT}"
