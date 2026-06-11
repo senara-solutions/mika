@@ -2233,6 +2233,83 @@ impl AsyncDatabase {
         let a = agent_id.to_owned();
         self.with_db(move |db| db.list_agent_corpora(&a)).await
     }
+
+    // -- Operational: What's Next canonical read path (mika#1263) --
+
+    /// Canonical read-path entry point for the What's Next engine.
+    ///
+    /// Encapsulates the full score-derive-rank pipeline:
+    /// 1. Query non-Done items for the agent.
+    /// 2. Batch-load blocked counts (single GROUP BY query).
+    /// 3. Run `resolve_cleared_blockers()` to clear stale `blocked_by` references.
+    /// 4. Run `derive_status()` on each non-Done item, updating cache if changed.
+    /// 5. Run `priority()` scoring on each item using batch-loaded counts.
+    /// 6. Write back updated priority scores.
+    /// 7. Sort by priority DESC.
+    /// 8. Return top `limit` items with breakdowns.
+    ///
+    /// Feature gate (`MIKA_OPERATIONAL_PARTNER`) is NOT checked here — that's
+    /// a surface concern (CLI, dashboard, agent prompt injection). This method
+    /// has no knowledge of the feature flag.
+    pub async fn score_and_rank_items(
+        &self,
+        agent_id: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::operational::scoring::ScoredItem>> {
+        let aid = agent_id.to_owned();
+        self.with_db(move |db| {
+            use crate::operational::scoring;
+            use crate::operational::status;
+            use crate::operational::types::{NonTerminalStatus, OperationalStatus};
+            use chrono::Utc;
+
+            let now = Utc::now();
+
+            // 1. Query non-Done items
+            let mut items = db.query_active_operational_items(&aid, limit)?;
+
+            // 2. Batch-load blocked counts
+            let blocked_counts = db.batch_blocked_counts(&aid)?;
+
+            // 3. Resolve cleared blockers (primary cascade mechanism)
+            status::resolve_cleared_blockers(&items, db)?;
+
+            // Re-read items after cascade (blocked_by may have changed)
+            items = db.query_active_operational_items(&aid, limit)?;
+
+            // 4. Re-derive status and update cache
+            for item in &items {
+                let derived = status::derive_status(item, now);
+                if derived != item.status {
+                    // Convert to NonTerminalStatus for the update method
+                    let non_terminal = match derived {
+                        OperationalStatus::Now => NonTerminalStatus::Now,
+                        OperationalStatus::Waiting => NonTerminalStatus::Waiting,
+                        OperationalStatus::Delegated => NonTerminalStatus::Delegated,
+                        OperationalStatus::Scheduled => NonTerminalStatus::Scheduled,
+                        OperationalStatus::AtRisk => NonTerminalStatus::AtRisk,
+                        OperationalStatus::Done => continue, // should not happen for active items
+                    };
+                    db.update_operational_item_status(&item.id, non_terminal)?;
+                }
+            }
+
+            // Re-read after status updates (status changes affect presentation)
+            let items = db.query_active_operational_items(&aid, limit)?;
+
+            // 5-7. Score, rank, and write back priorities
+            let ranked = scoring::rank(items, now, &blocked_counts);
+
+            // 6. Write back priority scores
+            for scored in &ranked {
+                db.update_operational_item_priority(&scored.item.id, scored.breakdown.total)?;
+            }
+
+            // 8. Return top `limit` items
+            Ok(ranked)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
