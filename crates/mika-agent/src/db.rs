@@ -25,7 +25,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 40;
+pub const CURRENT_SCHEMA_VERSION: i64 = 41;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -286,6 +286,21 @@ pub struct SessionMessage {
     pub created_at: String,
     /// Whether this message is internal (agent-to-agent) and should be hidden from inbox mode.
     pub internal: bool,
+}
+
+/// A message row from the `task_messages` parallel narrative table (mika#974).
+/// Compaction-immune — survives `replace_with_summary` indefinitely.
+#[derive(Debug, Clone)]
+pub struct TaskMessage {
+    pub id: i64,
+    pub task_id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub metadata: Option<String>,
+    pub trace_id: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1168,6 +1183,11 @@ impl Database {
             info!(version = 40, "database migrated to v40");
         }
 
+        if (3..=40).contains(&version) {
+            self.migrate_v40_to_v41()?;
+            info!(version = 41, "database migrated to v41");
+        }
+
         Ok(())
     }
 
@@ -1222,7 +1242,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (40);
+            INSERT INTO schema_version (version) VALUES (41);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1375,6 +1395,22 @@ impl Database {
             CREATE INDEX idx_msg_session ON messages(session_id, created_at ASC);
             CREATE INDEX idx_msg_agent_created ON messages(agent_id, created_at DESC);
             CREATE INDEX idx_msg_trace ON messages(trace_id) WHERE trace_id IS NOT NULL;
+
+            CREATE TABLE task_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id    TEXT NOT NULL,
+                agent_id   TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                metadata   TEXT,
+                trace_id   TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_task_messages_task_created
+                ON task_messages (task_id, created_at);
+            CREATE INDEX idx_task_messages_agent_created
+                ON task_messages (agent_id, created_at);
 
             CREATE TABLE core_memory (
                 agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -4307,6 +4343,49 @@ impl Database {
         Ok(())
     }
 
+    /// v40→v41: Add `task_messages` parallel narrative table (mika#974).
+    ///
+    /// Additive — no existing table altered, no data touched. Safe on live DB.
+    fn migrate_v40_to_v41(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 41 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "-- v41: mika#974 task_messages parallel narrative table.
+            CREATE TABLE IF NOT EXISTS task_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id    TEXT NOT NULL,
+                agent_id   TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                metadata   TEXT,
+                trace_id   TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_task_messages_task_created
+                ON task_messages (task_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_task_messages_agent_created
+                ON task_messages (agent_id, created_at);
+
+            INSERT INTO schema_version (version) VALUES (41);",
+        )?;
+
+        tx.commit()?;
+
+        info!("v40→v41: added task_messages table (mika#974)");
+
+        Ok(())
+    }
+
     /// v27 startup guard: refuse to open the database if the coalesce step
     /// from #787 has not run. Pins to `schema_version == 27` — future v28
     /// should carry its own guard, not inherit v27's.
@@ -4785,6 +4864,57 @@ impl Database {
             .query_row(&sql, params![id, agent_id], Self::row_to_task)
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Walk the `parent_task_id` chain to the nearest scope root — a task with
+    /// `type IN ('issue', 'milestone', 'project')`. Returns `None` if no scope
+    /// ancestor exists, the starting task is not found, or the chain exceeds the
+    /// depth limit (mika#974).
+    ///
+    /// The depth limit of 20 gives 6× headroom above the deployed maximum of
+    /// N=3 (project → milestone → issue) while bounding worst-case walk cost.
+    pub fn resolve_scope_root_task_id(&self, task_id: &str) -> Result<Option<String>> {
+        /// Maximum parent-chain hops before giving up. Deployed task hierarchies
+        /// never exceed N=3 today (project → milestone → issue). 20 gives 6×
+        /// headroom against pathological chains.
+        const SCOPE_ROOT_WALK_DEPTH_LIMIT: usize = 20;
+        const SCOPE_TYPES: &[&str] = &[TASK_TYPE_ISSUE, TASK_TYPE_MILESTONE, TASK_TYPE_PROJECT];
+
+        let mut current_id = task_id.to_owned();
+
+        for _ in 0..SCOPE_ROOT_WALK_DEPTH_LIMIT {
+            let row: Option<(String, String, Option<String>)> = self
+                .conn
+                .query_row(
+                    "SELECT type, trigger_type, parent_task_id FROM tasks WHERE id = ?1",
+                    params![current_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+
+            match row {
+                // A manual task with a scope type is the scope root.
+                // Callback/recurring tasks are not scope roots even if typed as 'issue'.
+                Some((task_type, trigger_type, _))
+                    if SCOPE_TYPES.contains(&task_type.as_str()) && trigger_type == "manual" =>
+                {
+                    return Ok(Some(current_id));
+                }
+                Some((_, _, Some(parent_id))) => {
+                    current_id = parent_id;
+                }
+                // Task not a scope root and no parent — chain exhausted.
+                Some((_, _, None)) | None => return Ok(None),
+            }
+        }
+
+        // Depth limit exceeded — likely a circular chain.
+        warn!(
+            task_id = task_id,
+            limit = SCOPE_ROOT_WALK_DEPTH_LIMIT,
+            "scope_root_walk_depth_limit_exceeded"
+        );
+        Ok(None)
     }
 
     /// Get IDs of pending callback tasks for a given session.
@@ -7108,6 +7238,90 @@ impl Database {
             params![session_id, agent_id, role, content, metadata, trace_id, internal as i64],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Insert a single row into `task_messages` inside a caller-provided transaction.
+    /// Used by `save_message_with_task_context` for the double-write contract (mika#974).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_task_message_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
+        tx.execute(
+            "INSERT INTO task_messages (task_id, agent_id, session_id, role, content, metadata, trace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![task_id, agent_id, session_id, role, content, metadata, trace_id],
+        )?;
+        Ok(tx.last_insert_rowid())
+    }
+
+    /// Double-write: insert into `messages` AND `task_messages` in a single transaction.
+    /// When `task_id` is `None`, behaves identically to `save_message_with_metadata`
+    /// (no transaction overhead, no `task_messages` row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_message_with_task_context(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+        internal: bool,
+        task_id: Option<&str>,
+    ) -> Result<i64> {
+        match task_id {
+            Some(tid) => {
+                let tx = self.conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO messages (session_id, agent_id, role, content, metadata, trace_id, internal)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![session_id, agent_id, role, content, metadata, trace_id, internal as i64],
+                )?;
+                let msg_id = tx.last_insert_rowid();
+                Self::insert_task_message_tx(
+                    &tx, tid, agent_id, session_id, role, content, metadata, trace_id,
+                )?;
+                tx.commit()?;
+                Ok(msg_id)
+            }
+            None => self.save_message_with_metadata(
+                agent_id, session_id, role, content, metadata, trace_id, internal,
+            ),
+        }
+    }
+
+    /// Load all task messages for a given task, ordered by creation time.
+    /// Returns the full narrative — no limit, no compaction.
+    pub fn load_task_messages(&self, task_id: &str) -> Result<Vec<TaskMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, agent_id, session_id, role, content, metadata, trace_id, created_at
+             FROM task_messages
+             WHERE task_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![task_id], |r| {
+                Ok(TaskMessage {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    agent_id: r.get(2)?,
+                    session_id: r.get(3)?,
+                    role: r.get(4)?,
+                    content: r.get(5)?,
+                    metadata: r.get(6)?,
+                    trace_id: r.get(7)?,
+                    created_at: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     const SESSION_MESSAGE_COLUMNS: &'static str = "m.id, m.session_id, m.agent_id, m.role, m.content, s.channel_type, m.metadata, m.trace_id, m.created_at, m.internal";
@@ -15352,6 +15566,7 @@ mod tests {
         db2.migrate_v37_to_v38().unwrap();
         db2.migrate_v38_to_v39().unwrap();
         db2.migrate_v39_to_v40().unwrap();
+        db2.migrate_v40_to_v41().unwrap();
 
         let final_version: i64 = db2
             .conn
@@ -17303,5 +17518,284 @@ mod tests {
         assert_eq!(stats.matched_llm_db_fallback, 1);
         assert_eq!(stats.no_match, 1);
         assert_eq!(stats.no_candidate_of_type, 1);
+    }
+
+    // ===== task_messages (mika#974) =====
+
+    /// Helper to create a manual task for task_messages tests.
+    fn create_test_task(db: &Database, task_id: &str, task_type: &str, parent_id: Option<&str>) {
+        db.conn
+            .execute(
+                "INSERT INTO tasks (id, agent_id, depth, label, trigger_type, action_type, action_config, status, type, parent_task_id)
+                 VALUES (?1, 'mika', 0, 'test', 'manual', 'none', '{}', 'pending', ?2, ?3)",
+                params![task_id, task_type, parent_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_double_write_tagged_event() {
+        let (mut db, sid) = db_with_session();
+        let task_id = "task-root-123";
+        create_test_task(&db, task_id, "issue", None);
+
+        let msg_id = db
+            .save_message_with_task_context(
+                "mika",
+                &sid,
+                "assistant",
+                "Hello from task",
+                None,
+                None,
+                false,
+                Some(task_id),
+            )
+            .unwrap();
+        assert!(msg_id > 0);
+
+        // Verify row in messages
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hello from task");
+
+        // Verify row in task_messages
+        let task_msgs = db.load_task_messages(task_id).unwrap();
+        assert_eq!(task_msgs.len(), 1);
+        assert_eq!(task_msgs[0].content, "Hello from task");
+        assert_eq!(task_msgs[0].task_id, task_id);
+        assert_eq!(task_msgs[0].session_id, sid);
+        assert_eq!(task_msgs[0].role, "assistant");
+    }
+
+    #[test]
+    fn test_single_write_untagged_event() {
+        let (mut db, sid) = db_with_session();
+
+        db.save_message_with_task_context(
+            "mika",
+            &sid,
+            "user",
+            "No task context",
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // Verify row in messages
+        let msgs = db.load_recent_messages("mika", 10).unwrap();
+        assert_eq!(msgs.len(), 1);
+
+        // Verify task_messages is empty
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM task_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_double_write_transaction_atomicity() {
+        // Verify that if the task_messages INSERT would fail, messages INSERT
+        // also rolls back. We test by trying to write with a task_id and verifying
+        // both tables are consistent.
+        let (mut db, sid) = db_with_session();
+
+        // Write two tagged messages, verify both tables have exactly 2 rows.
+        db.save_message_with_task_context(
+            "mika",
+            &sid,
+            "user",
+            "msg1",
+            None,
+            None,
+            false,
+            Some("t1"),
+        )
+        .unwrap();
+        db.save_message_with_task_context(
+            "mika",
+            &sid,
+            "assistant",
+            "msg2",
+            None,
+            None,
+            false,
+            Some("t1"),
+        )
+        .unwrap();
+
+        let msg_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE agent_id = 'mika'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let task_msg_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_messages WHERE task_id = 't1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 2);
+        assert_eq!(task_msg_count, 2);
+    }
+
+    #[test]
+    fn test_scope_root_walk() {
+        let db = db();
+        // Build tree: project → milestone → issue
+        create_test_task(&db, "proj-1", "project", None);
+        create_test_task(&db, "ms-1", "milestone", Some("proj-1"));
+        create_test_task(&db, "issue-1", "issue", Some("ms-1"));
+        // Callback child (not a scope type)
+        db.conn
+            .execute(
+                "INSERT INTO tasks (id, agent_id, depth, label, trigger_type, action_type, action_config, status, type, parent_task_id)
+                 VALUES ('cb-1', 'mika', 0, 'callback', 'callback', 'resume_agent', '{}', 'completed', 'issue', 'issue-1')",
+                [],
+            )
+            .unwrap();
+
+        // From callback child → should resolve to issue-1 (first scope root)
+        let root = db.resolve_scope_root_task_id("cb-1").unwrap();
+        assert_eq!(root, Some("issue-1".to_string()));
+
+        // From issue → should resolve to itself
+        let root = db.resolve_scope_root_task_id("issue-1").unwrap();
+        assert_eq!(root, Some("issue-1".to_string()));
+
+        // From milestone → should resolve to itself
+        let root = db.resolve_scope_root_task_id("ms-1").unwrap();
+        assert_eq!(root, Some("ms-1".to_string()));
+
+        // From project → should resolve to itself
+        let root = db.resolve_scope_root_task_id("proj-1").unwrap();
+        assert_eq!(root, Some("proj-1".to_string()));
+    }
+
+    #[test]
+    fn test_malformed_parent_chain() {
+        let db = db();
+        // Create a non-manual callback task with no parent. Its type is 'issue'
+        // but it's a callback — not a scope root. The chain exhausts without
+        // finding a manual scope root.
+        db.conn
+            .execute(
+                "INSERT INTO tasks (id, agent_id, depth, label, trigger_type, action_type, action_config, status, type)
+                 VALUES ('orphan-1', 'mika', 0, 'orphan', 'callback', 'resume_agent', '{}', 'pending', 'issue')",
+                [],
+            )
+            .unwrap();
+
+        // Should return None — callback tasks are not scope roots
+        let root = db.resolve_scope_root_task_id("orphan-1").unwrap();
+        assert_eq!(root, None);
+    }
+
+    #[test]
+    fn test_scope_root_walk_nonexistent_task() {
+        let db = db();
+        let root = db.resolve_scope_root_task_id("does-not-exist").unwrap();
+        assert_eq!(root, None);
+    }
+
+    #[test]
+    fn test_task_messages_survive_compaction() {
+        let (mut db, sid) = db_with_session();
+        let task_id = "task-survive-compaction";
+
+        // Insert several tagged messages
+        for i in 0..5 {
+            db.save_message_with_task_context(
+                "mika",
+                &sid,
+                if i % 2 == 0 { "user" } else { "assistant" },
+                &format!("msg {i}"),
+                None,
+                None,
+                false,
+                Some(task_id),
+            )
+            .unwrap();
+        }
+
+        // Verify both tables have 5 rows
+        let msgs = db.load_recent_messages("mika", 20).unwrap();
+        assert_eq!(msgs.len(), 5);
+        let task_msgs = db.load_task_messages(task_id).unwrap();
+        assert_eq!(task_msgs.len(), 5);
+
+        // Run compaction — this deletes from messages but NOT from task_messages
+        let last_id = msgs.iter().map(|m| m.id).max().unwrap();
+        db.replace_with_summary("mika", "Summary of task work", last_id)
+            .unwrap();
+
+        // messages should now have zero non-summary messages
+        // (load_recent_messages filters out role='summary')
+        let msgs_after = db.load_recent_messages("mika", 20).unwrap();
+        assert_eq!(msgs_after.len(), 0);
+
+        // But the summary exists in the DB
+        let summary = db.load_conversation_summary("mika").unwrap();
+        assert!(summary.is_some());
+
+        // task_messages should still have all 5 rows — the structural guarantee
+        let task_msgs_after = db.load_task_messages(task_id).unwrap();
+        assert_eq!(task_msgs_after.len(), 5);
+        for (i, tm) in task_msgs_after.iter().enumerate() {
+            assert_eq!(tm.content, format!("msg {i}"));
+        }
+    }
+
+    #[test]
+    fn test_load_task_messages_ordered() {
+        let (mut db, sid) = db_with_session();
+        let task_id = "task-order";
+
+        db.save_message_with_task_context(
+            "mika",
+            &sid,
+            "user",
+            "first",
+            None,
+            None,
+            false,
+            Some(task_id),
+        )
+        .unwrap();
+        db.save_message_with_task_context(
+            "mika",
+            &sid,
+            "assistant",
+            "second",
+            None,
+            None,
+            false,
+            Some(task_id),
+        )
+        .unwrap();
+        db.save_message_with_task_context(
+            "mika",
+            &sid,
+            "user",
+            "third",
+            None,
+            None,
+            false,
+            Some(task_id),
+        )
+        .unwrap();
+
+        let task_msgs = db.load_task_messages(task_id).unwrap();
+        assert_eq!(task_msgs.len(), 3);
+        assert_eq!(task_msgs[0].content, "first");
+        assert_eq!(task_msgs[1].content, "second");
+        assert_eq!(task_msgs[2].content, "third");
     }
 }

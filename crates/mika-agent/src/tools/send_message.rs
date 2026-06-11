@@ -56,9 +56,18 @@ impl Tool for SendMessageTool {
             return Ok(ToolOutput::success("Message was empty after processing."));
         }
 
-        // Persist the outbound message for conversation history
+        // Persist the outbound message for conversation history.
+        // Uses task-context double-write when a scope_task_id is active (mika#974).
         ctx.db
-            .save_message(ctx.session_id, "assistant", &cleaned, Some(ctx.trace_id))
+            .save_message_with_task_context(
+                ctx.session_id,
+                "assistant",
+                &cleaned,
+                None,
+                Some(ctx.trace_id),
+                false,
+                ctx.scope_task_id,
+            )
             .await?;
 
         match &ctx.message_sender {
@@ -224,6 +233,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+            scope_task_id: None,
         };
         let tool = SendMessageTool;
 
@@ -299,6 +309,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+            scope_task_id: None,
         };
         let tool = SendMessageTool;
 
@@ -356,6 +367,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+            scope_task_id: None,
         };
         let tool = SendMessageTool;
 
@@ -414,6 +426,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+            scope_task_id: None,
         };
         let tool = SendMessageTool;
 
@@ -471,6 +484,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+            scope_task_id: None,
         };
         let tool = SendMessageTool;
 

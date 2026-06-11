@@ -810,6 +810,7 @@ async fn run_loop(
     prompt_variant: Option<&str>,
     internal: bool,
     deadline: Instant,
+    scope_task_id: Option<&str>,
 ) -> Result<LoopResult> {
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
@@ -2081,13 +2082,14 @@ async fn run_loop(
 
                     if mode.saves_to_db() {
                         let metadata = tool_calls_metadata_json(&all_tool_summaries);
-                        db.save_message_with_metadata(
+                        db.save_message_with_task_context(
                             session_id,
                             "assistant",
                             &text,
                             metadata.as_deref(),
                             Some(tool_ctx.trace_id),
                             internal,
+                            scope_task_id,
                         )
                         .await?;
                     }
@@ -2315,13 +2317,14 @@ async fn run_loop(
                         // No assistant text to save — the turn ended with tools only.
                         // The send_message content was already delivered via the tool.
                         let _ = db
-                            .save_message_with_metadata(
+                            .save_message_with_task_context(
                                 session_id,
                                 "assistant",
                                 "",
                                 metadata.as_deref(),
                                 Some(tool_ctx.trace_id),
                                 internal,
+                                scope_task_id,
                             )
                             .await;
                     }
@@ -2471,6 +2474,21 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         .clone()
         .unwrap_or_else(mika_common::trace::generate_trace_id);
 
+    // mika#974 — Resolve scope-root task_id for the parallel narrative double-write.
+    // Resolved once at turn start and cached as turn-local. The user message save
+    // and run_agent_inner both use this resolved value.
+    let scope_task_id = if let Some(ref tid) = params.correlated_task_id {
+        match params.db.resolve_scope_root_task_id(tid).await {
+            Ok(root) => root,
+            Err(e) => {
+                warn!(task_id = %tid, error = %e, "scope_root_resolution_failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Save the user message (with image annotation if images attached).
     // Skip for callback turns — the raw result is already persisted as role='tool_result'
     // by the caller, and the framing wrapper is an internal prompt construct.
@@ -2486,13 +2504,14 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
         };
         params
             .db
-            .save_message_with_metadata(
+            .save_message_with_task_context(
                 params.session_id,
                 "user",
                 &save_text,
                 None,
                 Some(&trace_id),
                 params.internal,
+                scope_task_id.as_deref(),
             )
             .await?;
     }
@@ -2517,7 +2536,7 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
 
     let deadline =
         Instant::now() + Duration::from_secs(crate::planning::policy::AGENT_TOTAL_TIMEOUT_SECS);
-    let result = run_agent_inner(params, &trace_id, deadline)
+    let result = run_agent_inner(params, &trace_id, deadline, scope_task_id.as_deref())
         .instrument(span)
         .await;
 
@@ -2591,7 +2610,7 @@ pub async fn run_agent_with_deadline(
             )
             .await?;
     }
-    run_agent_inner(params, &trace_id, deadline).await
+    run_agent_inner(params, &trace_id, deadline, None).await
 }
 
 /// Inner agent loop, separated so the outer function can compute the deadline.
@@ -2599,6 +2618,7 @@ async fn run_agent_inner(
     params: &AgentParams<'_>,
     trace_id: &str,
     deadline: Instant,
+    scope_task_id: Option<&str>,
 ) -> Result<AgentOutput> {
     let db = params.db;
     let llm = params.llm;
@@ -2837,6 +2857,7 @@ async fn run_agent_inner(
         callback_task_id: None, // Conversation mode: not a callback turn
         required_tool_arg_suffixes: &required_tool_arg_suffixes,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+        scope_task_id,
     };
 
     // Auto-adjust max_tokens when thinking is enabled
@@ -2966,12 +2987,13 @@ async fn run_agent_inner(
             mode = "conversation",
             "agent deadline exceeded during prelude — skipping loop"
         );
-        return persist_deadline_fallback(db, session_id, trace_id, params.internal).await;
+        return persist_deadline_fallback(db, session_id, trace_id, params.internal, None).await;
     }
 
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     let is_verdict_producer = has_verdict_producer_skill(params.skills.skills());
+
     let result = run_loop(
         effective_llm,
         tools,
@@ -2994,6 +3016,7 @@ async fn run_agent_inner(
         prompt_variant.as_deref(),
         params.internal,
         deadline,
+        scope_task_id,
     )
     .await?;
 
@@ -3027,7 +3050,14 @@ async fn run_agent_inner(
                     mode = "conversation",
                     "max-steps exceeded but deadline too close for continuation — emitting fallback"
                 );
-                return persist_deadline_fallback(db, session_id, trace_id, params.internal).await;
+                return persist_deadline_fallback(
+                    db,
+                    session_id,
+                    trace_id,
+                    params.internal,
+                    scope_task_id,
+                )
+                .await;
             }
             let cont = attempt_continuation_turn(
                 &mut request,
@@ -3045,13 +3075,14 @@ async fn run_agent_inner(
             .await;
 
             let metadata = tool_calls_metadata_json(&tool_call_summaries);
-            db.save_message_with_metadata(
+            db.save_message_with_task_context(
                 session_id,
                 "assistant",
                 &cont.text,
                 metadata.as_deref(),
                 Some(trace_id),
                 params.internal,
+                scope_task_id,
             )
             .await?;
             Ok(AgentOutput {
@@ -3061,7 +3092,8 @@ async fn run_agent_inner(
             })
         }
         LoopResult::DeadlineExceeded { .. } => {
-            persist_deadline_fallback(db, session_id, trace_id, params.internal).await
+            persist_deadline_fallback(db, session_id, trace_id, params.internal, scope_task_id)
+                .await
         }
     }
 }
@@ -3075,15 +3107,17 @@ async fn persist_deadline_fallback(
     session_id: &str,
     trace_id: &str,
     internal: bool,
+    scope_task_id: Option<&str>,
 ) -> Result<AgentOutput> {
     let fallback = "I'm sorry, that took too long. Let me try a simpler approach next time.";
-    db.save_message_with_metadata(
+    db.save_message_with_task_context(
         session_id,
         "assistant",
         fallback,
         None,
         Some(trace_id),
         internal,
+        scope_task_id,
     )
     .await?;
     Ok(AgentOutput {
@@ -4025,6 +4059,26 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         _ => None,
     };
 
+    // mika#974 — Resolve scope-root task_id from the trigger's task context.
+    let trigger_task_id = match &params.trigger {
+        SilentTrigger::Callback { task_id, .. } => Some(task_id.as_str()),
+        SilentTrigger::DeferredDispatch { task_id, .. } => Some(task_id.as_str()),
+        SilentTrigger::PostCallbackAdvance { parent_task_id, .. } => Some(parent_task_id.as_str()),
+        SilentTrigger::Reminder { task_id, .. } => Some(task_id.as_str()),
+        _ => None,
+    };
+    let scope_task_id = if let Some(tid) = trigger_task_id {
+        match db.resolve_scope_root_task_id(tid).await {
+            Ok(root) => root,
+            Err(e) => {
+                warn!(task_id = %tid, error = %e, "scope_root_resolution_failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let core_memory_edit_count = AtomicU32::new(0);
     let pr_review_posted = AtomicBool::new(false);
     let tool_ctx = ToolContext {
@@ -4064,6 +4118,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         callback_task_id,
         required_tool_arg_suffixes: &required_tool_arg_suffixes_silent,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_silent,
+        scope_task_id: scope_task_id.as_deref(),
     };
 
     // #862 — Turn-start snapshot of enabled tool names (silent mode).
@@ -4173,6 +4228,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         prompt_variant.as_deref(),
         false, // silent mode messages are never internal
         deadline,
+        scope_task_id.as_deref(),
     )
     .await?;
 
@@ -4519,6 +4575,7 @@ async fn run_team_agent_inner_impl(
         callback_task_id: None,  // Team mode: not a callback turn
         required_tool_arg_suffixes: &required_tool_arg_suffixes_team,
         tool_arg_suffix_rejected: &tool_arg_suffix_rejected_team,
+        scope_task_id: None, // Team mode: no task context for parallel narrative
     };
 
     let llm_tool_defs: Vec<LlmToolDefinition> =
@@ -4589,6 +4646,7 @@ async fn run_team_agent_inner_impl(
         prompt_variant.as_deref(),
         false, // team mode messages are never internal
         deadline,
+        None, // team mode: no task context for parallel narrative
     )
     .await?;
 

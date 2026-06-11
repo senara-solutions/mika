@@ -11,8 +11,8 @@ use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, BackgroundTaskCounts, Commitment, CoreMemoryEntry,
     Database, Event, FailedSend, NewTask, Person, Preference, SearchResult, Session,
     SessionMessage, SessionWithStats, SkillOverride, Task, TaskFilters, TaskHealthSummary,
-    TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary, TeamWorkspaceEntry,
-    TimelineFilters, TimelineRow,
+    TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary,
+    TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&mut Database) + Send>;
@@ -241,6 +241,13 @@ impl AsyncDatabase {
         let i = id.to_owned();
         let a = self.agent_id.clone();
         self.with_db(move |db| db.get_manual_task(&i, &a)).await
+    }
+
+    /// Walk the parent_task_id chain to the nearest scope root (mika#974).
+    pub async fn resolve_scope_root_task_id(&self, task_id: &str) -> Result<Option<String>> {
+        let tid = task_id.to_owned();
+        self.with_db(move |db| db.resolve_scope_root_task_id(&tid))
+            .await
     }
 
     pub async fn get_pending_callbacks_for_session(&self, session_id: &str) -> Result<Vec<String>> {
@@ -821,6 +828,49 @@ impl AsyncDatabase {
             db.save_message_with_metadata(&a, &sid, &r, &c, m.as_deref(), t.as_deref(), internal)
         })
         .await
+    }
+
+    /// Double-write: insert into `messages` AND `task_messages` in a single transaction.
+    /// When `task_id` is `None`, behaves identically to `save_message_with_metadata`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_message_with_task_context(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+        internal: bool,
+        task_id: Option<&str>,
+    ) -> Result<i64> {
+        let (a, sid, r, c, m, t, tid) = (
+            self.agent_id.clone(),
+            session_id.to_owned(),
+            role.to_owned(),
+            content.to_owned(),
+            metadata.map(|s| s.to_owned()),
+            trace_id.map(|s| s.to_owned()),
+            task_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.save_message_with_task_context(
+                &a,
+                &sid,
+                &r,
+                &c,
+                m.as_deref(),
+                t.as_deref(),
+                internal,
+                tid.as_deref(),
+            )
+        })
+        .await
+    }
+
+    /// Load all task messages for a given task, ordered by creation time.
+    pub async fn load_task_messages(&self, task_id: &str) -> Result<Vec<TaskMessage>> {
+        let tid = task_id.to_owned();
+        self.with_db(move |db| db.load_task_messages(&tid)).await
     }
 
     /// Save a message with an explicit `agent_id` (instead of using `self.agent_id`).
