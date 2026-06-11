@@ -2,19 +2,27 @@
 #
 # Mika OS — Handbook-style Gentoo multi-stage build
 #
-# Two named build targets:
-#   mika-os      — Full build environment (toolchain + binaries + portage tree)
-#                  For developers, forkable reference, single-box self-host
-#   mika-runtime — Production runtime (binaries + runtime deps only)
-#                  For mika-cloud Helm deployments, minimal attack surface
+# Six named build targets:
+#   mika-os              — Full build environment (toolchain + binaries + portage tree)
+#   mika-runtime-base    — Shared runtime base (no role-specific binaries) — internal
+#   mika-runtime-server  — mika-server only (per-customer agent container)
+#   mika-runtime-gateway — mika-gateway only (gateway deployment)
+#   mika-runtime-cli     — mika TUI only (operator desktop)
+#   mika-runtime-all     — All three binaries (single-box self-host)
 #
 # Build:
-#   docker build --target mika-os      -f os/Dockerfile -t mika-os:dev .
-#   docker build --target mika-runtime -f os/Dockerfile -t mika-runtime:dev .
+#   docker build --target mika-os              -f os/Dockerfile -t mika-os:dev .
+#   docker build --target mika-runtime-server  -f os/Dockerfile -t mika-runtime-server:dev .
+#   docker build --target mika-runtime-gateway -f os/Dockerfile -t mika-runtime-gateway:dev .
+#   docker build --target mika-runtime-cli     -f os/Dockerfile -t mika-runtime-cli:dev .
+#   docker build --target mika-runtime-all     -f os/Dockerfile -t mika-runtime-all:dev .
 #
-# Run (either target):
+# Run (daemon targets — server, gateway, all):
 #   docker run --cap-add=SYS_ADMIN --security-opt apparmor=unconfined \
-#     -v mika-data:/home/mika/.mika mika-runtime:dev
+#     -v mika-data:/home/mika/.mika mika-runtime-server:dev
+#
+# Run (CLI target — interactive TUI):
+#   docker run -it --rm -v mika-data:/home/mika/.mika mika-runtime-cli:dev
 #
 # Requires BuildKit (DOCKER_BUILDKIT=1) for:
 #   - Per-Dockerfile .dockerignore (os/Dockerfile.dockerignore)
@@ -179,9 +187,9 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
 ENTRYPOINT ["/usr/local/bin/mika-os-init.sh"]
 
 # ============================================================================
-# Stage 2: mika-runtime — Production runtime (no compilers, no portage tree)
+# Stage 2a: mika-runtime-base — Shared runtime base (no role-specific binaries)
 # ============================================================================
-FROM gentoo/stage3:20250505 AS mika-runtime
+FROM gentoo/stage3:20250505 AS mika-runtime-base
 
 LABEL mika.image-type="runtime"
 
@@ -196,24 +204,6 @@ RUN emerge-webrsync && \
 # ── Create non-root user (no login shell — hardened for production) ──
 RUN useradd -m -u 1000 -s /bin/false mika
 
-# ── Copy binaries from mika-os ──
-COPY --from=mika-os /usr/local/bin/mika /usr/local/bin/mika
-COPY --from=mika-os /usr/local/bin/mika-server /usr/local/bin/mika-server
-COPY --from=mika-os /usr/local/bin/mika-gateway /usr/local/bin/mika-gateway
-COPY --from=mika-os /usr/local/bin/gh /usr/local/bin/gh
-COPY --from=mika-os /usr/local/bin/gws /usr/local/bin/gws
-COPY --from=mika-os /usr/local/bin/ollama /usr/local/bin/ollama
-
-# ── Copy OpenRC service definitions ──
-COPY --from=mika-os /etc/init.d/mika-server /etc/init.d/mika-server
-COPY --from=mika-os /etc/init.d/mika-gateway /etc/init.d/mika-gateway
-COPY --from=mika-os /etc/conf.d/mika-server /etc/conf.d/mika-server
-COPY --from=mika-os /etc/conf.d/mika-gateway /etc/conf.d/mika-gateway
-
-# Register services with default runlevel
-RUN rc-update add mika-server default && \
-    rc-update add mika-gateway default
-
 # ── Copy default configs (FHS-compliant) ──
 COPY --from=mika-os /etc/mika/ /etc/mika/
 
@@ -224,8 +214,78 @@ COPY --from=mika-os /app/docs/ /app/docs/
 COPY --from=mika-os /usr/local/bin/mika-os-init.sh /usr/local/bin/mika-os-init.sh
 
 ENV MIKA_HOME=/home/mika/.mika
-
 WORKDIR /app
+
+# ============================================================================
+# Stage 2b: mika-runtime-server — Per-customer agent container
+# ============================================================================
+FROM mika-runtime-base AS mika-runtime-server
+
+COPY --from=mika-os /usr/local/bin/mika-server /usr/local/bin/mika-server
+COPY --from=mika-os /usr/local/bin/gh /usr/local/bin/gh
+COPY --from=mika-os /usr/local/bin/ollama /usr/local/bin/ollama
+
+# ── OpenRC service definition ──
+COPY --from=mika-os /etc/init.d/mika-server /etc/init.d/mika-server
+COPY --from=mika-os /etc/conf.d/mika-server /etc/conf.d/mika-server
+RUN rc-update add mika-server default
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD rc-service mika-server status
+
+ENTRYPOINT ["/usr/local/bin/mika-os-init.sh"]
+
+# ============================================================================
+# Stage 2c: mika-runtime-gateway — Gateway deployment
+# ============================================================================
+FROM mika-runtime-base AS mika-runtime-gateway
+
+COPY --from=mika-os /usr/local/bin/mika-gateway /usr/local/bin/mika-gateway
+
+# ── OpenRC service definition ──
+COPY --from=mika-os /etc/init.d/mika-gateway /etc/init.d/mika-gateway
+COPY --from=mika-os /etc/conf.d/mika-gateway /etc/conf.d/mika-gateway
+RUN rc-update add mika-gateway default
+
+EXPOSE 3001
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD rc-service mika-gateway status
+
+ENTRYPOINT ["/usr/local/bin/mika-os-init.sh"]
+
+# ============================================================================
+# Stage 2d: mika-runtime-cli — Operator desktop (interactive TUI)
+# ============================================================================
+FROM mika-runtime-base AS mika-runtime-cli
+
+COPY --from=mika-os /usr/local/bin/mika /usr/local/bin/mika
+
+# No OpenRC services — TUI is interactive
+ENTRYPOINT ["/usr/local/bin/mika"]
+
+# ============================================================================
+# Stage 2e: mika-runtime-all — Single-box self-host (all binaries)
+# ============================================================================
+FROM mika-runtime-base AS mika-runtime-all
+
+COPY --from=mika-os /usr/local/bin/mika /usr/local/bin/mika
+COPY --from=mika-os /usr/local/bin/mika-server /usr/local/bin/mika-server
+COPY --from=mika-os /usr/local/bin/mika-gateway /usr/local/bin/mika-gateway
+COPY --from=mika-os /usr/local/bin/gh /usr/local/bin/gh
+COPY --from=mika-os /usr/local/bin/gws /usr/local/bin/gws
+COPY --from=mika-os /usr/local/bin/ollama /usr/local/bin/ollama
+
+# ── OpenRC service definitions ──
+COPY --from=mika-os /etc/init.d/mika-server /etc/init.d/mika-server
+COPY --from=mika-os /etc/init.d/mika-gateway /etc/init.d/mika-gateway
+COPY --from=mika-os /etc/conf.d/mika-server /etc/conf.d/mika-server
+COPY --from=mika-os /etc/conf.d/mika-gateway /etc/conf.d/mika-gateway
+RUN rc-update add mika-server default && \
+    rc-update add mika-gateway default
+
 EXPOSE 8080 3001
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \

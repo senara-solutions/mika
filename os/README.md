@@ -6,18 +6,38 @@ Mika OS is a complete runtime image (Gentoo base + OpenRC + mika binaries + olla
 
 ## Build Targets
 
-Two named multi-stage targets serve different audiences:
+Six named multi-stage targets serve different audiences:
 
-| Target | Purpose | Includes portage tree | Size |
-|--------|---------|----------------------|------|
-| `mika-os` | Developer reference, single-box self-host | Yes (can `emerge` post-build) | ~1.5GB+ |
-| `mika-runtime` | Production deployment (mika-cloud Helm) | No (minimal attack surface) | ~800MB+ |
+| Target | Binary set | Tooling | OpenRC services | Audience |
+|--------|------------|---------|-----------------|----------|
+| `mika-os` | All three + full toolchain | gh, gws, ollama + portage tree | mika-server, mika-gateway | Forkable reference, dev environment |
+| `mika-runtime-base` | None (shared base) | None | None | Internal — not pushed standalone |
+| `mika-runtime-server` | mika-server | gh, ollama | mika-server | mika-cloud per-customer agent container |
+| `mika-runtime-gateway` | mika-gateway | None | mika-gateway | mika-cloud gateway deployment |
+| `mika-runtime-cli` | mika (TUI) | None | None | Operator desktop install via Docker |
+| `mika-runtime-all` | All three binaries | gh, gws, ollama | mika-server, mika-gateway | Single-box self-host |
 
-## Audiences
+### Stage hierarchy
 
-1. **mika-cloud base image** — Use `mika-runtime` as per-customer container base for Helm deployments.
-2. **Single-box self-host** — Use either target. `mika-runtime` is smaller; `mika-os` has developer tools.
-3. **Developer reference** — Use `mika-os` for a forkable environment with full Gentoo toolchain (Rust, Node.js, gcc, portage tree).
+```
+┌─────────────────────────────────────┐
+│  mika-os  (gentoo/stage3, pinned)   │
+│  Full toolchain + portage tree      │
+│  Builds dashboard, Rust binaries,   │
+│  installs non-portage CLIs          │
+└──────────────┬──────────────────────┘
+               │ COPY binaries + configs
+               ▼
+┌─────────────────────────────────────┐
+│  mika-runtime-base  (gentoo/stage3) │
+│  Runtime deps only (jq, sqlite)     │
+│  No compilers, no portage tree      │
+│  No role-specific binaries          │
+└──────┬──────┬──────┬──────┬─────────┘
+       │      │      │      │
+       ▼      ▼      ▼      ▼
+   server  gateway  cli    all
+```
 
 ## Quick Start
 
@@ -26,8 +46,17 @@ Two named multi-stage targets serve different audiences:
 ```bash
 # From the mika repo root (requires BuildKit for per-Dockerfile .dockerignore)
 
-# Production runtime (recommended)
-docker build --target mika-runtime -f os/Dockerfile -t mika-runtime:dev .
+# Per-customer agent container (recommended for mika-cloud)
+docker build --target mika-runtime-server -f os/Dockerfile -t mika-runtime-server:dev .
+
+# Gateway deployment
+docker build --target mika-runtime-gateway -f os/Dockerfile -t mika-runtime-gateway:dev .
+
+# Interactive TUI
+docker build --target mika-runtime-cli -f os/Dockerfile -t mika-runtime-cli:dev .
+
+# Single-box self-host (all binaries)
+docker build --target mika-runtime-all -f os/Dockerfile -t mika-runtime-all:dev .
 
 # Full developer image
 docker build --target mika-os -f os/Dockerfile -t mika-os:dev .
@@ -36,6 +65,7 @@ docker build --target mika-os -f os/Dockerfile -t mika-os:dev .
 ### Run
 
 ```bash
+# Daemon targets (server, gateway, all) — OpenRC supervision
 docker run -d \
   --name mika \
   --cap-add=SYS_ADMIN \
@@ -43,10 +73,15 @@ docker run -d \
   -v mika-data:/home/mika/.mika \
   -p 8080:8080 \
   -e MIKA_ANTHROPIC_API_KEY=sk-ant-... \
-  mika-runtime:dev
+  mika-runtime-server:dev
+
+# CLI target — interactive TUI
+docker run -it --rm \
+  -v mika-data:/home/mika/.mika \
+  mika-runtime-cli:dev
 ```
 
-**Required runtime flags:**
+**Required runtime flags (daemon targets only):**
 
 - `--cap-add=SYS_ADMIN` — Required for OpenRC process supervision inside the container. Preferred over `--privileged`.
 - `--security-opt apparmor=unconfined` — Required on hosts with AppArmor enforcing (Ubuntu, Debian). Not needed on hosts without AppArmor (Gentoo, Alpine, most minimal container hosts).
@@ -54,9 +89,8 @@ docker run -d \
 ### Verify
 
 ```bash
-# Check services are running
+# Check services are running (server or all targets)
 docker exec mika rc-service mika-server status
-docker exec mika rc-service mika-gateway status
 
 # Check version
 docker exec mika mika-server --version
@@ -83,7 +117,7 @@ docker run -d \
   --security-opt apparmor=unconfined \
   -v mika-data:/home/mika/.mika \
   --env-file /path/to/your/mika.env \
-  mika-runtime:dev
+  mika-runtime-server:dev
 ```
 
 See `os/config/mika.env` for a template with all available variables.
@@ -96,12 +130,12 @@ See `os/config/mika.env` for a template with all available variables.
 
 ### OpenRC Services
 
-The image runs two services under OpenRC supervision:
+Daemon targets run services under OpenRC supervision:
 
-| Service | Binary | Port | Config |
-|---------|--------|------|--------|
-| `mika-server` | `/usr/local/bin/mika-server` | 8080 | `/etc/conf.d/mika-server` |
-| `mika-gateway` | `/usr/local/bin/mika-gateway` | 3001 | `/etc/conf.d/mika-gateway` |
+| Service | Binary | Port | Config | Present in |
+|---------|--------|------|--------|------------|
+| `mika-server` | `/usr/local/bin/mika-server` | 8080 | `/etc/conf.d/mika-server` | server, all |
+| `mika-gateway` | `/usr/local/bin/mika-gateway` | 3001 | `/etc/conf.d/mika-gateway` | gateway, all |
 
 Manage services inside the container:
 
@@ -112,7 +146,7 @@ docker exec mika rc-service mika-gateway stop
 
 ### Ollama
 
-Ollama is installed but no models are pulled at build time. Pull models at runtime:
+Ollama is included in `mika-runtime-server` and `mika-runtime-all` targets. No models are pulled at build time. Pull models at runtime:
 
 ```bash
 docker exec mika ollama pull llama3
@@ -121,32 +155,14 @@ docker exec mika ollama pull llama3
 ## What's Inside
 
 - **Gentoo stage3** base (glibc, OpenRC) — handbook-style `emerge` for all portage-available packages
-- **mika** — TUI CLI
-- **mika-server** — HTTP agent server (Axum, with telemetry)
-- **mika-gateway** — Telegram + GitHub webhook router
-- **ollama** — Local LLM inference (v0.6.0, sha256-verified, no models pre-loaded)
-- **gh** CLI — GitHub operations (v2.65.0, sha256-verified)
-- **gws** CLI — Google Workspace operations (v0.13.3, sha256-verified)
-- **OpenRC** process supervision with automatic restart (`supervise-daemon`)
+- **mika** — TUI CLI (cli, all targets)
+- **mika-server** — HTTP agent server (Axum, with telemetry) (server, all targets)
+- **mika-gateway** — Telegram + GitHub webhook router (gateway, all targets)
+- **ollama** — Local LLM inference (v0.6.0, sha256-verified, no models pre-loaded) (server, all targets)
+- **gh** CLI — GitHub operations (v2.65.0, sha256-verified) (server, all targets)
+- **gws** CLI — Google Workspace operations (v0.13.3, sha256-verified) (all target only)
+- **OpenRC** process supervision with automatic restart (`supervise-daemon`) (server, gateway, all targets)
 - **Dashboard** — Built-in React observability dashboard (embedded in mika-server)
-
-## Architecture
-
-```
-┌─────────────────────────────────────┐
-│  mika-os  (gentoo/stage3, pinned)   │
-│  Full toolchain + portage tree      │
-│  Builds dashboard, Rust binaries,   │
-│  installs non-portage CLIs          │
-└──────────────┬──────────────────────┘
-               │ COPY binaries + configs
-               ▼
-┌─────────────────────────────────────┐
-│  mika-runtime  (gentoo/stage3)      │
-│  Runtime deps only (jq, sqlite)     │
-│  No compilers, no portage tree      │
-└─────────────────────────────────────┘
-```
 
 ## License
 
