@@ -7,5 +7,7 @@
 
 pub mod calibration;
 pub mod query;
+pub mod scoring;
+pub mod status;
 pub mod types;
 pub mod write;
