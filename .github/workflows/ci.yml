@@ -170,8 +170,17 @@ jobs:
             target: mika-os
             tag: mika-os
           - dockerfile: os/Dockerfile
-            target: mika-runtime
-            tag: mika-runtime
+            target: mika-runtime-server
+            tag: mika-runtime-server
+          - dockerfile: os/Dockerfile
+            target: mika-runtime-gateway
+            tag: mika-runtime-gateway
+          - dockerfile: os/Dockerfile
+            target: mika-runtime-cli
+            tag: mika-runtime-cli
+          - dockerfile: os/Dockerfile
+            target: mika-runtime-all
+            tag: mika-runtime-all
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       - name: Set up Docker Buildx
