@@ -2581,4 +2581,343 @@ mod tests {
         assert_eq!(msgs[0].content, "deliverable content");
         assert!(msgs[0].metadata.as_ref().unwrap().contains("writer"));
     }
+
+    /// Integration test for the full `score_and_rank_items()` 8-step pipeline (AC7).
+    ///
+    /// Exercises: query non-Done items → batch blocked counts → resolve cleared
+    /// blockers → status re-derivation → scoring → priority write-back → sort →
+    /// return top N.
+    #[tokio::test]
+    async fn test_score_and_rank_items_pipeline() {
+        use crate::operational::types::{
+            EvidenceRef, EvidenceRefKind, NewOperationalItem, OperationalKind, OperationalStatus,
+            Owner,
+        };
+
+        let db = test_async_db();
+        let agent = "test-agent";
+
+        // --- Insert 5 items with varied scoring properties ---
+
+        // Item A: User commitment, high importance, near deadline → should score highest
+        let id_a = db
+            .with_db({
+                let agent = agent.to_string();
+                move |db_inner| {
+                    let item = NewOperationalItem {
+                        kind: OperationalKind::Commitment,
+                        title: "Urgent user commitment".to_string(),
+                        status: OperationalStatus::Now,
+                        owner: Owner::User,
+                        priority: 0.0,
+                        user_importance: 40.0,
+                        due_at: Some(
+                            (chrono::Utc::now() + chrono::Duration::hours(2))
+                                .format("%Y-%m-%dT%H:%M:%SZ")
+                                .to_string(),
+                        ),
+                        blocked_by: None,
+                        next_action: None,
+                        evidence_refs: Vec::new(),
+                        confidence: 1.0,
+                        source_table: None,
+                        source_id: None,
+                        agent_id: agent,
+                    };
+                    // Stale: set updated_at 10 hours ago to get stale_time contribution
+                    let id = db_inner.insert_operational_item(&item)?;
+                    let stale_ts = (chrono::Utc::now() - chrono::Duration::hours(10))
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string();
+                    db_inner.conn.execute(
+                        "UPDATE operational_items SET updated_at = ?1 WHERE id = ?2",
+                        rusqlite::params![stale_ts, id],
+                    )?;
+                    Ok::<String, anyhow::Error>(id)
+                }
+            })
+            .await
+            .unwrap();
+
+        // Item B: Regular task, medium importance, low confidence → moderate score with penalty
+        let id_b = db
+            .with_db({
+                let agent = agent.to_string();
+                move |db_inner| {
+                    let item = NewOperationalItem {
+                        kind: OperationalKind::Task,
+                        title: "Low confidence task".to_string(),
+                        status: OperationalStatus::Now,
+                        owner: Owner::User,
+                        priority: 0.0,
+                        user_importance: 20.0,
+                        due_at: None,
+                        blocked_by: None,
+                        next_action: None,
+                        evidence_refs: Vec::new(),
+                        confidence: 0.3, // 70% penalty
+                        source_table: None,
+                        source_id: None,
+                        agent_id: agent,
+                    };
+                    db_inner.insert_operational_item(&item)
+                }
+            })
+            .await
+            .unwrap();
+
+        // Item C: Blocker that blocks other items → gets dependency_risk bonus
+        let id_c = db
+            .with_db({
+                let agent = agent.to_string();
+                move |db_inner| {
+                    db_inner.insert_operational_item(&NewOperationalItem {
+                        kind: OperationalKind::Blocker,
+                        title: "Critical blocker".to_string(),
+                        status: OperationalStatus::Now,
+                        owner: Owner::User,
+                        priority: 0.0,
+                        user_importance: 10.0,
+                        due_at: None,
+                        blocked_by: None,
+                        next_action: None,
+                        evidence_refs: Vec::new(),
+                        confidence: 1.0,
+                        source_table: None,
+                        source_id: None,
+                        agent_id: agent,
+                    })
+                }
+            })
+            .await
+            .unwrap();
+
+        // Item D: Waiting on item C (blocker) → should derive as Waiting
+        let id_d = db
+            .with_db({
+                let agent = agent.to_string();
+                let blocked_by = id_c.clone();
+                move |db_inner| {
+                    db_inner.insert_operational_item(&NewOperationalItem {
+                        kind: OperationalKind::Task,
+                        title: "Blocked task".to_string(),
+                        status: OperationalStatus::Now, // inserted as Now, should re-derive to Waiting
+                        owner: Owner::User,
+                        priority: 0.0,
+                        user_importance: 30.0,
+                        due_at: None,
+                        blocked_by: Some(blocked_by),
+                        next_action: None,
+                        evidence_refs: Vec::new(),
+                        confidence: 1.0,
+                        source_table: None,
+                        source_id: None,
+                        agent_id: agent,
+                    })
+                }
+            })
+            .await
+            .unwrap();
+
+        // Item E: Mika-owned commitment (lower weight than User commitment).
+        // Inserted as Scheduled so derive_status() can re-derive to Delegated
+        // (Now has higher precedence than Delegated, so inserting as Now would
+        // preserve Now via the explicit-Now rule in is_now()).
+        let id_e = db
+            .with_db({
+                let agent = agent.to_string();
+                move |db_inner| {
+                    db_inner.insert_operational_item(&NewOperationalItem {
+                        kind: OperationalKind::Commitment,
+                        title: "Mika commitment".to_string(),
+                        status: OperationalStatus::Scheduled,
+                        owner: Owner::Mika,
+                        priority: 0.0,
+                        user_importance: 15.0,
+                        due_at: None,
+                        blocked_by: None,
+                        next_action: None,
+                        evidence_refs: Vec::new(),
+                        confidence: 1.0,
+                        source_table: Some("tasks".to_string()),
+                        source_id: Some("task-100".to_string()),
+                        agent_id: agent,
+                    })
+                }
+            })
+            .await
+            .unwrap();
+
+        // Item F: Done item — should NOT appear in results
+        let _id_f = db
+            .with_db({
+                let agent = agent.to_string();
+                move |db_inner| {
+                    let id = db_inner.insert_operational_item(&NewOperationalItem {
+                        kind: OperationalKind::Task,
+                        title: "Completed task".to_string(),
+                        status: OperationalStatus::Now,
+                        owner: Owner::User,
+                        priority: 100.0,
+                        user_importance: 50.0,
+                        due_at: None,
+                        blocked_by: None,
+                        next_action: None,
+                        evidence_refs: Vec::new(),
+                        confidence: 1.0,
+                        source_table: None,
+                        source_id: None,
+                        agent_id: agent,
+                    })?;
+                    db_inner.complete_operational_item(
+                        &id,
+                        EvidenceRef {
+                            kind: EvidenceRefKind::External,
+                            id: "test-completion".to_string(),
+                        },
+                    )?;
+                    Ok::<String, anyhow::Error>(id)
+                }
+            })
+            .await
+            .unwrap();
+
+        // --- Execute the pipeline ---
+        let results = db.score_and_rank_items(agent, 50).await.unwrap();
+
+        // --- Assertions ---
+
+        // 1. Done item (F) excluded
+        assert_eq!(results.len(), 5, "should return 5 non-Done items");
+        assert!(
+            !results.iter().any(|s| s.item.title == "Completed task"),
+            "Done items must be excluded"
+        );
+
+        // 2. All items have non-zero or computed priorities written back
+        // (item A should have a high score due to urgency + commitment + importance + stale)
+        let item_a = results.iter().find(|s| s.item.id == id_a).unwrap();
+        assert!(
+            item_a.breakdown.total > 0.0,
+            "Item A should have a positive score"
+        );
+        assert!(
+            item_a.breakdown.urgency > 0.0,
+            "Item A has a near deadline — urgency should be positive"
+        );
+        assert!(
+            item_a.breakdown.commitment_weight > 0.0,
+            "Item A is a User commitment — weight should be positive"
+        );
+        assert!(
+            item_a.breakdown.stale_time > 0.0,
+            "Item A was set stale — stale_time should be positive"
+        );
+        assert!(
+            (item_a.breakdown.confidence_penalty - 0.0).abs() < f32::EPSILON,
+            "Item A has confidence=1.0 — no penalty"
+        );
+
+        // 3. Confidence penalty applied to item B
+        let item_b = results.iter().find(|s| s.item.id == id_b).unwrap();
+        assert!(
+            item_b.breakdown.confidence_penalty > 30.0,
+            "Item B confidence=0.3 → penalty = 0.7 * 50 = 35"
+        );
+
+        // 4. Item C (blocker) gets dependency_risk from item D blocking on it
+        let item_c = results.iter().find(|s| s.item.id == id_c).unwrap();
+        assert!(
+            item_c.breakdown.dependency_risk > 0.0,
+            "Item C has an item blocked on it — dependency_risk should be positive"
+        );
+
+        // 5. Status re-derivation: Item D should now be Waiting (blocked_by is set)
+        let item_d = results.iter().find(|s| s.item.id == id_d).unwrap();
+        assert_eq!(
+            item_d.item.status,
+            OperationalStatus::Waiting,
+            "Item D has blocked_by set — status should be re-derived to Waiting"
+        );
+
+        // 6. Item E (Mika-owned with source_table) should be Delegated after re-derivation
+        let item_e = results.iter().find(|s| s.item.id == id_e).unwrap();
+        assert_eq!(
+            item_e.item.status,
+            OperationalStatus::Delegated,
+            "Item E is Mika-owned with source_table — should re-derive to Delegated"
+        );
+        // Mika commitment weight = 35.0
+        assert!(
+            (item_e.breakdown.commitment_weight - 35.0).abs() < f32::EPSILON,
+            "Item E is a Mika commitment — weight should be 35.0"
+        );
+
+        // 7. Ordering: Item A should be first (highest score)
+        assert_eq!(
+            results[0].item.id, id_a,
+            "Item A (urgent user commitment + high importance + stale) should rank first"
+        );
+
+        // 8. Results are sorted DESC by total
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].breakdown.total >= pair[1].breakdown.total,
+                "Results must be sorted by priority DESC: {} >= {}",
+                pair[0].breakdown.total,
+                pair[1].breakdown.total,
+            );
+        }
+
+        // 9. Priority write-back: verify the DB column matches the computed score
+        let written_priorities = db
+            .with_db({
+                let ids: Vec<String> = results.iter().map(|s| s.item.id.clone()).collect();
+                move |db_inner| {
+                    let mut out = Vec::new();
+                    for id in &ids {
+                        let p: f32 = db_inner.conn.query_row(
+                            "SELECT priority FROM operational_items WHERE id = ?1",
+                            rusqlite::params![id],
+                            |row| row.get(0),
+                        )?;
+                        out.push((id.clone(), p));
+                    }
+                    Ok::<Vec<(String, f32)>, anyhow::Error>(out)
+                }
+            })
+            .await
+            .unwrap();
+
+        for (id, db_priority) in &written_priorities {
+            let scored = results.iter().find(|s| &s.item.id == id).unwrap();
+            assert!(
+                (db_priority - scored.breakdown.total).abs() < f32::EPSILON,
+                "Priority write-back mismatch for {id}: DB={db_priority}, computed={}",
+                scored.breakdown.total,
+            );
+        }
+
+        // 10. Status write-back: verify the DB status column matches re-derived status
+        let db_status_d: String = db
+            .with_db({
+                let id = id_d.clone();
+                move |db_inner| {
+                    db_inner
+                        .conn
+                        .query_row(
+                            "SELECT status FROM operational_items WHERE id = ?1",
+                            rusqlite::params![id],
+                            |row| row.get(0),
+                        )
+                        .map_err(Into::into)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            db_status_d, "waiting",
+            "DB status for blocked item D should be updated to 'waiting'"
+        );
+    }
 }
