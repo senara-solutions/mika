@@ -291,7 +291,22 @@ pub async fn auto_pull_groomed_ticket(
             issue = candidate.number,
             "auto_pull: failed to apply ready label"
         );
+        // AC3: increment circuit-breaker failure counter on label-apply failure.
+        if let Err(e) = db
+            .increment_auto_pull_failure(DEFAULT_REPO, candidate.number)
+            .await
+        {
+            warn!(error = %e, "auto_pull: failed to increment failure counter");
+        }
         return None;
+    }
+
+    // AC3: reset circuit-breaker failure counter on successful label application.
+    if let Err(e) = db
+        .reset_auto_pull_failure(DEFAULT_REPO, candidate.number)
+        .await
+    {
+        warn!(error = %e, "auto_pull: failed to reset failure counter");
     }
 
     info!(
