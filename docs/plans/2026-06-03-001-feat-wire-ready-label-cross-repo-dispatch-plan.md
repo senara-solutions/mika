@@ -70,9 +70,13 @@ The plan must not assume one without verifying.
   orgs/senara-solutions/hooks` (needs `admin:org_hook`) or the gateway access log
   (`grep webhook/github gateway.log` for non-mika `repo_full_name`). If events never arrive, no
   amount of routing code helps — the webhook config is the fix.
+
+  **✓ RESOLVED 2026-06-12 (orchestrator-CC):** Webhook delivery confirmed via `/var/log/mika/gateway.log` inspection. Both `senara-solutions/mika-cloud` and `senara-solutions/mika-skills` events are present (multiple `pull_request` events captured, e.g. `delivery_id=3a310e10-625d-11f1-80d7-6d7669577d77` for mika-skills, `delivery_id=3b375a80-625d-11f1-8ce6-53e10c6d96bf` for mika-cloud). The gateway **is** receiving the events — they were just being dropped in the `Ok(None)` branch of `resolve_github_container_url` before this PR's allowlist fix. No webhook-config change needed.
 - **O2 — tenancy.** Is the loop's gateway single-tenant (`MIKA_AGENT_BASE_URL` set) or multi-tenant?
   Inspect the running gateway's config. Determines whether Layer-2 work is needed for the *local*
   loop or only for prod.
+
+  **✓ RESOLVED 2026-06-12 (orchestrator-CC):** Local dev loop is **single-tenant**. Verified via `cat /proc/<pid>/environ` on the running mika-gateway process — `MIKA_AGENT_BASE_URL=http://localhost:8081` is set. So the allowlist code's `agent_base_url.is_some()` branch fires on dev-host (routes the non-mika event to the local agent) and the `agent_base_url.is_none()` branch fires only on multi-tenant prod cluster (where it correctly `warn!`s + drops because there's no single agent to route to). No additional Layer-2 work needed for the local loop; the prod multi-tenant `warn!` is the correct architecturally-honest behavior per Approach B.
 - **O3 — drop-guard safety (architect Q4, MANDATORY before U1 ships).** Trace
   `is_unauthorized_webhook_dispatch` (`crates/mika-agent/src/webhook_dispatch.rs`) and any downstream
   code that processes a routed webhook event and consults `github_repos`. Confirm: does any guard
