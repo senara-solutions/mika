@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-server mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install test lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch
+.PHONY: build build-dashboard deploy stop restart install test test-async-db-saturation lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -90,6 +90,9 @@ test: ## Run all tests
 	cargo test
 	@bash scripts/test-dispatch-symmetry.sh
 	@bash scripts/deploy-info-test.sh
+
+test-async-db-saturation: ## Run async DB channel saturation regression test (mika#1258)
+	cargo test -p mika-agent --lib -- async_db::tests::test_async_db_saturated_channel_does_not_pin_workers --nocapture
 
 test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structurally symmetric (mika#893 R5)
 	@bash scripts/test-dispatch-symmetry.sh
