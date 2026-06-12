@@ -657,6 +657,7 @@ impl<'a> App<'a> {
         agent_name: String,
         global_home: PathBuf,
         provider: mika_common::llm::ProviderKind,
+        start_in_audit_mode: bool,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -709,7 +710,8 @@ impl<'a> App<'a> {
             team_name: None,
             team_dir: None,
             verbose_mode: false,
-            inbox_mode: true,
+            // When --inbox flag is set, start in audit mode (inbox_mode=false shows internals).
+            inbox_mode: !start_in_audit_mode,
             hidden_internal_count: 0,
             team_dashboard: None,
             dashboard_running: false,
@@ -720,6 +722,7 @@ impl<'a> App<'a> {
     }
 
     /// Create a new App in team mode.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_team(
         team_tx: mpsc::UnboundedSender<TeamRequest>,
         team_rx: mpsc::UnboundedReceiver<TeamEvent>,
@@ -728,6 +731,7 @@ impl<'a> App<'a> {
         global_home: PathBuf,
         db: AsyncDatabase,
         previous_run: Option<TeamRunSummary>,
+        start_in_audit_mode: bool,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -798,7 +802,8 @@ impl<'a> App<'a> {
             team_name: Some(team_name.to_string()),
             team_dir: Some(team_dir),
             verbose_mode: false,
-            inbox_mode: true,
+            // When --inbox flag is set, start in audit mode (inbox_mode=false shows internals).
+            inbox_mode: !start_in_audit_mode,
             hidden_internal_count: 0,
             team_dashboard: None,
             dashboard_running: false,
@@ -2097,6 +2102,7 @@ mod tests {
             "mika".to_string(),
             global_home,
             mika_common::llm::ProviderKind::Anthropic,
+            false,
         );
 
         (app, response_tx, temp_dir)

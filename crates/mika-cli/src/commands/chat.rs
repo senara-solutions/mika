@@ -535,6 +535,7 @@ pub async fn run(
     agent_name: &str,
     session: Option<&str>,
     model_override: Option<&str>,
+    start_in_audit_mode: bool,
 ) -> Result<()> {
     let mut ctx = init::init_for_agent(agent_name)?;
 
@@ -560,6 +561,7 @@ pub async fn run(
         agent_name.to_string(),
         worker._ctx.global_home.clone(),
         worker._ctx.settings.llm_provider,
+        start_in_audit_mode, // audit mode launch (#773)
     );
 
     // Load recent conversation history so the user sees prior messages on restart.
@@ -926,7 +928,12 @@ pub async fn run(
 }
 
 /// Run the TUI in team mode. Each user message is sent as a goal to `run_team()`.
-pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>) -> Result<()> {
+pub async fn run_team(
+    team_name: &str,
+    global_home: &Path,
+    run_id: Option<&str>,
+    start_in_audit_mode: bool,
+) -> Result<()> {
     let team_dir = team::team_dir(global_home, team_name);
 
     let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
@@ -1041,6 +1048,7 @@ pub async fn run_team(team_name: &str, global_home: &Path, run_id: Option<&str>)
         global_home.to_path_buf(),
         team_db,
         previous_run,
+        start_in_audit_mode, // audit mode launch (#773)
     );
 
     // Inject warning message if there was a run reference issue
