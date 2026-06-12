@@ -37,6 +37,7 @@ pub mod assert_grounded_pr_state_satisfied;
 pub mod assert_grounded_task_state_caught;
 pub mod asserted_unavailability_caught;
 pub mod asserted_unavailability_elided_copula;
+pub mod asserted_unavailability_extension_shapes;
 pub mod asserted_unavailability_genuine;
 pub mod asserted_unavailability_pr_review_composition;
 pub mod auto_merge_vs_merged;

@@ -98,34 +98,67 @@ pub(crate) fn detect_unverified_callback_state_claim(text: &str) -> Option<&str>
 /// snapshot + dynamic correction message.
 pub(crate) const ASSERTED_UNAVAILABILITY_LABEL: &str = "asserted_unavailability";
 
-/// Five regex patterns from the gate-evasion compound doc (Rule 2).
+/// Regex patterns from the gate-evasion compound doc (Rule 2).
 /// Each uses a named capture group `(?P<tool>...)` so extraction is
 /// `captures["tool"]` uniformly (F2 resolution).
+///
+/// P1-P5: original five patterns (#862, #894).
+/// P6-P9: extension shapes (#1177) — descriptor-word absorption (P6),
+///        antonym `unavailable` (P7), modal/periphrastic negation (P8),
+///        inverted modal `unable to` (P9).
 static ASSERTED_UNAVAILABILITY_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| {
         vec![
+            // P1: "I don't have access to X"
             regex::Regex::new(
                 r"(?i)\bi (?:don'?t|do not) have access to (?P<tool>[a-z_][a-z0-9_]*)",
             )
             .expect("asserted_unavailability pattern 1"),
+            // P2: "X [is] [adverb] not available/callable/accessible"
             regex::Regex::new(
                 r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) (?:is )?(?:\w+ly )?not (?:available|callable|accessible)",
             )
             .expect("asserted_unavailability pattern 2"),
+            // P3: "X isn't [adverb] available/callable/accessible"
             regex::Regex::new(
                 r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) isn'?t (?:\w+ly )?(?:available|callable|accessible)",
             )
             .expect("asserted_unavailability pattern 3"),
+            // P4: "X [is] skill-scoped"
             regex::Regex::new(r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) (?:is )?skill-scoped")
                 .expect("asserted_unavailability pattern 4"),
+            // P5: "cannot call [the] X"
             regex::Regex::new(r"(?i)\bcannot call (?:the )?(?P<tool>[a-z_][a-z0-9_]*)")
                 .expect("asserted_unavailability pattern 5"),
+            // P6 (#1177 Shape A): "the X tool/function/feature/skill/handler is not available"
+            // Descriptor-word absorption — captures the tool name before the descriptor noun.
+            regex::Regex::new(
+                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) (?:tool|function|feature|skill|handler) (?:is )?(?:\w+ly )?not (?:available|callable|accessible)",
+            )
+            .expect("asserted_unavailability pattern 6"),
+            // P7 (#1177 Shape B): "X [is] [adverb] unavailable"
+            regex::Regex::new(
+                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) (?:is )?(?:\w+ly )?unavailable\b",
+            )
+            .expect("asserted_unavailability pattern 7"),
+            // P8 (#1177 Shape C): "X may/could/cannot/can't/won't/wouldn't [not] be called/invoked/used/accessed/reached"
+            // Also covers "X doesn't/doesn't appear/seem to be callable/..."
+            regex::Regex::new(
+                r"(?i)\b(?P<tool>[a-z_][a-z0-9_]*) (?:doesn'?t (?:appear|seem) to (?:be )?|(?:may|could|cannot|can'?t|won'?t|wouldn'?t) (?:not )?be )(?:called|invoked|used|accessed|reached|callable|accessible)",
+            )
+            .expect("asserted_unavailability pattern 8"),
+            // P9 (#1177 Shape C inverted): "unable to call/invoke/use/access/reach X"
+            regex::Regex::new(
+                r"(?i)\bunable to (?:call|invoke|use|access|reach) (?P<tool>[a-z_][a-z0-9_]*)\b",
+            )
+            .expect("asserted_unavailability pattern 9"),
         ]
     });
 
 /// Detects asserted-unavailability phrases in assistant text.
 ///
-/// Scans the text for one of the five compound-doc-cited patterns. If a match
+/// Scans the text for one of nine compound-doc-cited patterns (P1-P5 original,
+/// P6-P9 from #1177). If a match
 /// is found AND the captured tool name is in the `enabled_tools` set (turn-start
 /// snapshot), returns `Some(tool_name)`. Otherwise returns `None`.
 ///
@@ -638,6 +671,186 @@ mod tests {
             None,
             "Natural language 'service not available' (elided copula) must still be \
              filtered by the enabled-set lookup — 'service' is not a tool"
+        );
+    }
+
+    // -- #1177 Shape A: descriptor-word absorption tests --
+
+    #[test]
+    fn test_detect_asserted_unavailability_descriptor_word_absorption() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // Shape A: "the gh_read tool is not available" — must capture "gh_read", not "tool"
+        let result = detect_asserted_unavailability("the gh_read tool is not available", &enabled);
+        assert_eq!(
+            result,
+            Some("gh_read".to_string()),
+            "Descriptor-word 'the gh_read tool is not available' must capture 'gh_read' \
+             (not 'tool') and match (mika#1177 Shape A)"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_descriptor_word_variants() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // "function" descriptor
+        assert_eq!(
+            detect_asserted_unavailability("the gh_read function is not callable", &enabled),
+            Some("gh_read".to_string()),
+            "Descriptor 'function': must capture gh_read"
+        );
+        // "skill" descriptor
+        assert_eq!(
+            detect_asserted_unavailability("the gh_read skill is not accessible", &enabled),
+            Some("gh_read".to_string()),
+            "Descriptor 'skill': must capture gh_read"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_descriptor_word_filter_preserved() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // "the service tool is not available" — "service" not in enabled set → None
+        assert_eq!(
+            detect_asserted_unavailability("the service tool is not available right now", &enabled),
+            None,
+            "Natural language 'the service tool is not available' must still be \
+             filtered — 'service' is not a tool"
+        );
+        // "the storage feature is not callable" — "storage" not in enabled set → None
+        assert_eq!(
+            detect_asserted_unavailability("the storage feature is not callable", &enabled),
+            None,
+            "Natural language 'the storage feature is not callable' must still be \
+             filtered — 'storage' is not a tool"
+        );
+    }
+
+    // -- #1177 Shape B: antonym `unavailable` tests --
+
+    #[test]
+    fn test_detect_asserted_unavailability_antonym_unavailable() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // "gh_read is currently unavailable"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read is currently unavailable", &enabled),
+            Some("gh_read".to_string()),
+            "Antonym 'gh_read is currently unavailable' must match (mika#1177 Shape B)"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_antonym_unavailable_variants() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // bare "gh_read unavailable"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read unavailable in this session", &enabled),
+            Some("gh_read".to_string()),
+            "'gh_read unavailable' (no copula) must match"
+        );
+        // "gh_read is unavailable"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read is unavailable", &enabled),
+            Some("gh_read".to_string()),
+            "'gh_read is unavailable' must match"
+        );
+        // "gh_read structurally unavailable"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read structurally unavailable", &enabled),
+            Some("gh_read".to_string()),
+            "'gh_read structurally unavailable' (adverb) must match"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_antonym_unavailable_filter_preserved() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // "the service is currently unavailable" — "service" not in enabled set → None
+        assert_eq!(
+            detect_asserted_unavailability("the service is currently unavailable", &enabled),
+            None,
+            "Natural language 'the service is currently unavailable' must still be \
+             filtered — 'service' is not a tool"
+        );
+    }
+
+    // -- #1177 Shape C: modal / periphrastic negation tests --
+
+    #[test]
+    fn test_detect_asserted_unavailability_modal_negation() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // "gh_read may not be callable"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read may not be callable", &enabled),
+            Some("gh_read".to_string()),
+            "Modal 'gh_read may not be callable' must match (mika#1177 Shape C)"
+        );
+        // "gh_read could not be called"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read could not be called", &enabled),
+            Some("gh_read".to_string()),
+            "Modal 'gh_read could not be called' must match"
+        );
+        // "gh_read cannot be invoked here"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read cannot be invoked here", &enabled),
+            Some("gh_read".to_string()),
+            "Modal 'gh_read cannot be invoked' must match"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_doesnt_appear() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // "gh_read doesn't appear to be callable"
+        assert_eq!(
+            detect_asserted_unavailability("gh_read doesn't appear to be callable", &enabled),
+            Some("gh_read".to_string()),
+            "'gh_read doesn't appear to be callable' must match (mika#1177 Shape C)"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_unable_to() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // "unable to call gh_read"
+        assert_eq!(
+            detect_asserted_unavailability("unable to call gh_read", &enabled),
+            Some("gh_read".to_string()),
+            "Inverted 'unable to call gh_read' must match (mika#1177 Shape C)"
+        );
+        // "unable to invoke gh_read in this session"
+        assert_eq!(
+            detect_asserted_unavailability("unable to invoke gh_read in this session", &enabled),
+            Some("gh_read".to_string()),
+            "Inverted 'unable to invoke gh_read in this session' must match"
+        );
+    }
+
+    #[test]
+    fn test_detect_asserted_unavailability_modal_filter_preserved() {
+        let mut enabled = HashSet::new();
+        enabled.insert("gh_read".to_string());
+        // "service may not be called from this context" — "service" not in enabled set → None
+        assert_eq!(
+            detect_asserted_unavailability("service may not be called from this context", &enabled),
+            None,
+            "Natural language 'service may not be called' must still be filtered"
+        );
+        // "unable to reach the storage service" — "storage" not in enabled set → None
+        assert_eq!(
+            detect_asserted_unavailability("unable to reach the storage service", &enabled),
+            None,
+            "Natural language 'unable to reach the storage service' must still be \
+             filtered — 'storage' is not a tool (and 'service' is trailing)"
         );
     }
 
