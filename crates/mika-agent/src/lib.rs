@@ -8,6 +8,7 @@ pub mod calibration;
 pub mod compaction;
 pub mod config_keys;
 pub mod db;
+pub mod evidence;
 pub(crate) mod github_graphql;
 pub mod kg;
 pub mod mcp;
