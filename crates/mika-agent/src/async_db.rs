@@ -906,6 +906,18 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Rebuild conversation context with optional task-mode hybrid merge (mika#974).
+    pub async fn rebuild_context(
+        &self,
+        task_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let a = self.agent_id.clone();
+        let tid = task_id.map(|s| s.to_owned());
+        self.with_db(move |db| db.rebuild_context(&a, tid.as_deref(), limit))
+            .await
+    }
+
     /// Load recent messages with optional internal-message filtering.
     pub async fn load_recent_messages_filtered(
         &self,

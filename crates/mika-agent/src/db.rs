@@ -7349,6 +7349,70 @@ impl Database {
         self.load_recent_messages_filtered(agent_id, limit, false)
     }
 
+    /// Rebuild conversation context for prompt assembly (mika#974).
+    ///
+    /// - `task_id = None` → existing `load_recent_messages` path (channel-mode).
+    /// - `task_id = Some(tid)` → hybrid merge: load both `task_messages` (full narrative)
+    ///   and `messages` (recent channel context), merge sorted by `created_at`,
+    ///   dedup on `(session_id, role, content, created_at)`.
+    pub fn rebuild_context(
+        &self,
+        agent_id: &str,
+        task_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let tid = match task_id {
+            Some(t) => t,
+            None => return self.load_recent_messages(agent_id, limit),
+        };
+
+        // Load channel messages (recent window).
+        let channel_msgs = self.load_recent_messages(agent_id, limit)?;
+
+        // Load task narrative (full history, no limit).
+        let task_msgs = self.load_task_messages(tid)?;
+
+        // Convert TaskMessages to SessionMessages for uniform handling.
+        // task_messages don't have channel_type or internal — use sensible defaults.
+        let task_as_session: Vec<SessionMessage> = task_msgs
+            .into_iter()
+            .map(|tm| SessionMessage {
+                id: tm.id,
+                session_id: tm.session_id,
+                agent_id: tm.agent_id,
+                role: tm.role,
+                content: tm.content,
+                channel_type: String::new(),
+                metadata: tm.metadata,
+                trace_id: tm.trace_id,
+                created_at: tm.created_at,
+                internal: false,
+            })
+            .collect();
+
+        // Merge both sets, dedup on (session_id, role, content, created_at),
+        // sort by created_at ASC.
+        let mut seen = std::collections::HashSet::new();
+        let mut merged: Vec<SessionMessage> =
+            Vec::with_capacity(channel_msgs.len() + task_as_session.len());
+
+        for msg in task_as_session.into_iter().chain(channel_msgs.into_iter()) {
+            let key = (
+                msg.session_id.clone(),
+                msg.role.clone(),
+                msg.content.clone(),
+                msg.created_at.clone(),
+            );
+            if seen.insert(key) {
+                merged.push(msg);
+            }
+        }
+
+        merged.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        Ok(merged)
+    }
+
     /// Load recent messages with optional internal-message filtering.
     /// When `exclude_internal` is true, messages with `internal = 1` are excluded.
     pub fn load_recent_messages_filtered(
@@ -17699,6 +17763,68 @@ mod tests {
     }
 
     #[test]
+    fn test_scope_root_walk_depth_limit_21_hops() {
+        let db = db();
+        // Build a chain of 21 callback tasks (non-scope-root), no scope root reachable.
+        // The depth limit is 20, so at hop 21 the guard fires and returns None.
+        let mut prev_id: Option<String> = None;
+        for i in 0..21 {
+            let id = format!("chain-{i}");
+            db.conn
+                .execute(
+                    "INSERT INTO tasks (id, agent_id, depth, label, trigger_type, action_type, action_config, status, type, parent_task_id)
+                     VALUES (?1, 'mika', 0, 'chain', 'callback', 'resume_agent', '{}', 'pending', 'issue', ?2)",
+                    params![id, prev_id],
+                )
+                .unwrap();
+            prev_id = Some(id);
+        }
+
+        // Walk from the deepest node (chain-20). The chain has 21 nodes,
+        // all callback (not scope roots). After 20 hops the depth limit fires.
+        let root = db.resolve_scope_root_task_id("chain-20").unwrap();
+        assert_eq!(
+            root, None,
+            "21-hop chain must hit the depth limit and return None"
+        );
+
+        // Verify a 20-hop chain with a scope root at the end DOES resolve.
+        // Create a manual project at the root.
+        create_test_task(&db, "scope-root", "project", None);
+        // Re-parent chain-0 to point at the scope root.
+        db.conn
+            .execute(
+                "UPDATE tasks SET parent_task_id = 'scope-root' WHERE id = 'chain-0'",
+                [],
+            )
+            .unwrap();
+
+        // From chain-18 (19 hops through chain + 1 hop to scope-root = 20 iterations).
+        // The loop runs for 0..20, so 20 iterations fit exactly.
+        let root = db.resolve_scope_root_task_id("chain-18").unwrap();
+        assert_eq!(
+            root,
+            Some("scope-root".to_string()),
+            "chain with scope-root reachable within 20 iterations should resolve"
+        );
+
+        // From chain-19 (20 hops through chain + 1 hop to scope-root = 21 iterations).
+        // Exceeds the 20-iteration limit — depth guard fires.
+        let root = db.resolve_scope_root_task_id("chain-19").unwrap();
+        assert_eq!(
+            root, None,
+            "chain requiring 21 iterations must exceed depth limit"
+        );
+
+        // From chain-20 (21 hops through chain + 1 hop = 22 iterations): also exceeds.
+        let root = db.resolve_scope_root_task_id("chain-20").unwrap();
+        assert_eq!(
+            root, None,
+            "chain requiring 22 iterations must exceed depth limit"
+        );
+    }
+
+    #[test]
     fn test_scope_root_walk_nonexistent_task() {
         let db = db();
         let root = db.resolve_scope_root_task_id("does-not-exist").unwrap();
@@ -17797,5 +17923,163 @@ mod tests {
         assert_eq!(task_msgs[0].content, "first");
         assert_eq!(task_msgs[1].content, "second");
         assert_eq!(task_msgs[2].content, "third");
+    }
+
+    /// Happy-path replay: simulate a milestone dispatch with multiple children.
+    /// Verify that messages from dispatch session (turn 1), child callback (turn 2),
+    /// and subsequent dispatch (turn 3) are all present in task_messages sorted by
+    /// created_at. Verify rebuild_context in task-mode surfaces the full narrative
+    /// from a different (callback) session.
+    #[test]
+    fn test_happy_path_multi_session_replay() {
+        let mut db = db();
+        let scope_root = "milestone-1";
+        create_test_task(&db, scope_root, "milestone", None);
+
+        // Three sessions simulating dispatch → callback → re-dispatch lifecycle.
+        let sid_dispatch1 = "session-dispatch-1";
+        let sid_callback = "session-callback";
+        let sid_dispatch2 = "session-dispatch-2";
+        db.create_session(sid_dispatch1, "mika", "cli").unwrap();
+        db.create_session(sid_callback, "mika", "cli").unwrap();
+        db.create_session(sid_dispatch2, "mika", "cli").unwrap();
+
+        // Turn 1: dispatch session — orchestrator dispatches child issue #1.
+        // Use explicit created_at to guarantee ordering across sessions.
+        db.save_message_with_task_context(
+            "mika",
+            sid_dispatch1,
+            "user",
+            "dispatch child issue #1",
+            None,
+            None,
+            false,
+            Some(scope_root),
+        )
+        .unwrap();
+        db.save_message_with_task_context(
+            "mika",
+            sid_dispatch1,
+            "assistant",
+            "dispatched child #1, advance to item #2",
+            None,
+            None,
+            false,
+            Some(scope_root),
+        )
+        .unwrap();
+
+        // Turn 2: callback session — child #1 completes.
+        db.save_message_with_task_context(
+            "mika",
+            sid_callback,
+            "user",
+            "[callback: child #1 completed]",
+            None,
+            None,
+            false,
+            Some(scope_root),
+        )
+        .unwrap();
+        db.save_message_with_task_context(
+            "mika",
+            sid_callback,
+            "assistant",
+            "child #1 done, updating status",
+            None,
+            None,
+            false,
+            Some(scope_root),
+        )
+        .unwrap();
+
+        // Turn 3: re-dispatch session — orchestrator dispatches child issue #2.
+        db.save_message_with_task_context(
+            "mika",
+            sid_dispatch2,
+            "user",
+            "dispatch child issue #2",
+            None,
+            None,
+            false,
+            Some(scope_root),
+        )
+        .unwrap();
+        db.save_message_with_task_context(
+            "mika",
+            sid_dispatch2,
+            "assistant",
+            "dispatched child #2",
+            None,
+            None,
+            false,
+            Some(scope_root),
+        )
+        .unwrap();
+
+        // Verify: load_task_messages returns all 6 messages across 3 sessions,
+        // in created_at order.
+        let task_msgs = db.load_task_messages(scope_root).unwrap();
+        assert_eq!(
+            task_msgs.len(),
+            6,
+            "all messages across all sessions must be present"
+        );
+        assert_eq!(task_msgs[0].content, "dispatch child issue #1");
+        assert_eq!(
+            task_msgs[1].content,
+            "dispatched child #1, advance to item #2"
+        );
+        assert_eq!(task_msgs[2].content, "[callback: child #1 completed]");
+        assert_eq!(task_msgs[3].content, "child #1 done, updating status");
+        assert_eq!(task_msgs[4].content, "dispatch child issue #2");
+        assert_eq!(task_msgs[5].content, "dispatched child #2");
+
+        // Verify: sessions span 3 distinct session IDs.
+        let session_ids: std::collections::HashSet<&str> =
+            task_msgs.iter().map(|m| m.session_id.as_str()).collect();
+        assert_eq!(session_ids.len(), 3);
+
+        // Verify: rebuild_context from the callback session with task-mode
+        // surfaces the "advance to item #2" intent from the dispatch session.
+        let ctx = db.rebuild_context("mika", Some(scope_root), 20).unwrap();
+        assert!(
+            ctx.iter().any(|m| m.content.contains("advance to item #2")),
+            "rebuild_context in task-mode must surface cross-session dispatch intent"
+        );
+
+        // Verify: messages table also has rows (double-write contract).
+        let channel_msgs = db.load_recent_messages("mika", 100).unwrap();
+        assert_eq!(
+            channel_msgs.len(),
+            6,
+            "messages table should also have all 6 rows"
+        );
+
+        // Verify: after compaction, task_messages still has all 6 rows.
+        let last_id = channel_msgs.iter().map(|m| m.id).max().unwrap();
+        db.replace_with_summary("mika", "Summary of milestone work", last_id)
+            .unwrap();
+        let channel_msgs_after = db.load_recent_messages("mika", 100).unwrap();
+        assert_eq!(channel_msgs_after.len(), 0, "channel messages compacted");
+        let task_msgs_after = db.load_task_messages(scope_root).unwrap();
+        assert_eq!(
+            task_msgs_after.len(),
+            6,
+            "task narrative survives compaction"
+        );
+
+        // Verify: rebuild_context still surfaces full narrative post-compaction.
+        let ctx_after = db.rebuild_context("mika", Some(scope_root), 20).unwrap();
+        assert_eq!(
+            ctx_after.len(),
+            6,
+            "task-mode rebuild returns full narrative post-compaction"
+        );
+        assert!(
+            ctx_after
+                .iter()
+                .any(|m| m.content.contains("advance to item #2"))
+        );
     }
 }

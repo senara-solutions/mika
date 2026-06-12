@@ -2772,7 +2772,7 @@ async fn run_agent_inner(
     let enabled_tool_names: HashSet<String> =
         skill_tool_defs.iter().map(|d| d.name.clone()).collect();
 
-    let history = db.load_recent_messages(20).await?;
+    let history = db.rebuild_context(scope_task_id, 20).await?;
 
     // Build initial message list from history.
     // The last message in history is the user message we just saved.
