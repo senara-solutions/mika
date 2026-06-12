@@ -2558,6 +2558,7 @@ async fn run_agent_inner(
         model,
         &resolved_context,
         &ctx.identity.tools.disabled,
+        is_compact_provider,
     );
     let _ = emit_system_prompt_assembled(
         &system,
@@ -2567,6 +2568,8 @@ async fn run_agent_inner(
         trace_id,
         "conversation",
         None,
+        is_compact_provider,
+        skill_tool_defs.len(),
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
@@ -3412,6 +3415,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         model,
         &no_context,
         &ctx.identity.tools.disabled,
+        false, // Silent mode: never compact (engine-driven triggers, not MikaModel targets)
     );
     let skill_tool_map = build_skill_tool_map(&matched);
     let skill_timeout = max_skill_timeout(&matched, provider, model);
@@ -3493,6 +3497,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         &trace_id,
         "silent",
         Some(emit_trigger_label),
+        false,
+        skill_tool_defs.len(),
     );
 
     // Resolve GitHub token: prefer GitHub App installation token, fall back to PAT.
@@ -3961,6 +3967,7 @@ async fn run_team_agent_inner_impl(
         model,
         &resolved_context,
         &ctx.identity.tools.disabled,
+        false, // Team mode: never compact (engine-driven, not MikaModel targets)
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
@@ -3997,6 +4004,8 @@ async fn run_team_agent_inner_impl(
         &trace_id,
         "team",
         None,
+        false,
+        skill_tool_defs.len(),
     );
 
     let core_memory_edit_count = AtomicU32::new(0);
@@ -4668,6 +4677,25 @@ pub(crate) fn apply_agent_tool_visibility(
     }
 }
 
+/// Core tools allowed for compact providers (ProviderKind::MikaModel).
+/// When `is_compact_provider == true`, only these tools are sent to the LLM.
+/// Matches the fundamental agent capabilities: communication, memory, facts,
+/// reminders, and file access. No management, task, skill-defined, KG, or PR
+/// tools. See mika#1491.
+const COMPACT_PROVIDER_CORE_TOOLS: &[&str] = &[
+    "send_message",
+    "update_core_memory",
+    "store_fact",
+    "search_memory",
+    "update_fact",
+    "create_reminder",
+    "list_reminders",
+    "read_agent_file",
+    "write_agent_file",
+    "list_agent_files",
+];
+
+#[allow(clippy::too_many_arguments)]
 fn inject_skills_and_resolve_tools(
     matched: &[&SkillEntry],
     tools: &ToolRegistry,
@@ -4676,6 +4704,7 @@ fn inject_skills_and_resolve_tools(
     model_name: &str,
     resolved_context: &HashMap<String, context::ContextBlock>,
     disabled_tools: &[String],
+    is_compact_provider: bool,
 ) -> (
     Vec<mika_common::claude::ToolDefinition>,
     Option<String>,
@@ -4686,6 +4715,18 @@ fn inject_skills_and_resolve_tools(
     // Apply per-agent visibility filter BEFORE skill tools are added — this
     // is the named hook that future allowlist migration will reuse.
     apply_agent_tool_visibility(&mut tool_defs, disabled_tools);
+
+    // Compact provider gate (mika#1491): filter tools to core-only allowlist
+    // and skip all skill prompts + skill tools.
+    if is_compact_provider {
+        tool_defs.retain(|d| {
+            COMPACT_PROVIDER_CORE_TOOLS
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&d.name))
+        });
+        return (tool_defs, None, HashMap::new());
+    }
+
     let mut seen: std::collections::HashSet<String> =
         tool_defs.iter().map(|d| d.name.clone()).collect();
 
@@ -4746,6 +4787,7 @@ fn inject_skills_and_resolve_tools(
 /// assembled system prompt's byte count and per-skill prompt bytes
 /// (mika#1217). Returns `total_bytes` as `Some(i64)` for storage in
 /// `llm_calls.system_prompt_bytes`.
+#[allow(clippy::too_many_arguments)]
 fn emit_system_prompt_assembled(
     system: &str,
     per_skill_bytes: &HashMap<String, usize>,
@@ -4754,6 +4796,8 @@ fn emit_system_prompt_assembled(
     trace_id: &str,
     mode: &str,
     trigger: Option<&str>,
+    is_compact_provider: bool,
+    tool_count: usize,
 ) -> Option<i64> {
     let total_bytes = system.len();
     let total_chars = system.chars().count();
@@ -4771,6 +4815,8 @@ fn emit_system_prompt_assembled(
         total_chars = total_chars,
         active_skill_count = active_skill_count,
         per_skill_bytes = per_skill_json.as_deref().unwrap_or("{}"),
+        is_compact_provider = is_compact_provider,
+        tool_count = tool_count,
         "system prompt assembled"
     );
     Some(total_bytes as i64)
@@ -6198,6 +6244,7 @@ mod tests {
             "claude-sonnet-4-6",
             &no_ctx,
             &no_disabled,
+            false,
         );
 
         // Should append skill snippet to system prompt
@@ -6255,6 +6302,7 @@ mod tests {
             "claude-sonnet-4-6",
             &no_ctx,
             &no_disabled,
+            false,
         );
 
         // "overlap" should appear exactly once (builtin wins)
@@ -6335,6 +6383,7 @@ mod tests {
             "claude-sonnet-4-6",
             &no_ctx,
             &[],
+            false,
         );
 
         // Should NOT add skill context section when snippet is empty
@@ -6362,6 +6411,7 @@ mod tests {
             "llama-3.3-70b-versatile",
             &no_ctx,
             &[],
+            false,
         );
 
         assert!(system.contains("Root prompt for search."));
@@ -6384,6 +6434,7 @@ mod tests {
             "claude-sonnet-4-6",
             &no_ctx,
             &[],
+            false,
         );
 
         // Should NOT add any skill context section
@@ -6412,6 +6463,7 @@ mod tests {
             "claude-sonnet-4-6",
             &no_ctx,
             &[],
+            false,
         );
 
         assert!(system.contains("Sonnet-specific prompt."));
@@ -6447,6 +6499,7 @@ mod tests {
             "claude-opus-4",
             &no_ctx,
             &[],
+            false,
         );
 
         assert!(system.contains("Root prompt."));
@@ -6474,6 +6527,7 @@ mod tests {
             "llama-3.3-70b-versatile",
             &no_ctx,
             &[],
+            false,
         );
 
         assert!(system.contains("Root prompt."));
@@ -6501,6 +6555,7 @@ mod tests {
             "anthropic/claude-sonnet-4",
             &no_ctx,
             &[],
+            false,
         );
 
         assert!(system.contains("OpenRouter model prompt."));
@@ -9834,5 +9889,128 @@ mod tests {
         };
         let result = load_gated_summary(&db, &config, None).await.unwrap();
         assert_eq!(result, None);
+    }
+
+    // -- Compact provider gate tests (mika#1491) --
+
+    #[test]
+    fn test_inject_skills_compact_provider_filters_tools() {
+        // When is_compact_provider = true: no skill prompts appended,
+        // tools filtered to COMPACT_PROVIDER_CORE_TOOLS only, per_skill_bytes empty.
+        let tools = crate::tools::default_tools();
+        let mut entry = make_skill_entry("self-dev", 30, &["run_claude_pilot"]);
+        entry.prompt_snippet = "A very large skill prompt that should NOT appear.".to_string();
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = "Base compact prompt.".to_string();
+
+        let no_ctx = HashMap::new();
+        let no_disabled: Vec<String> = vec![];
+        let (defs, variant, per_skill_bytes) = inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "mikamodel",
+            "mika",
+            &no_ctx,
+            &no_disabled,
+            true, // compact provider
+        );
+
+        // No skill prompts should be appended
+        assert!(
+            !system.contains("<context type=\"skill\""),
+            "compact provider should skip all skill prompts"
+        );
+        assert!(
+            !system.contains("self-dev Skill"),
+            "compact provider should not inject skill name"
+        );
+
+        // Only core tools should be present
+        let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        for core_tool in COMPACT_PROVIDER_CORE_TOOLS {
+            assert!(
+                tool_names.contains(core_tool),
+                "core tool '{core_tool}' should be in compact tool set"
+            );
+        }
+        assert!(
+            defs.len() <= COMPACT_PROVIDER_CORE_TOOLS.len(),
+            "compact provider should have at most {} tools, got {}",
+            COMPACT_PROVIDER_CORE_TOOLS.len(),
+            defs.len()
+        );
+        // Skill-defined tools should NOT be present
+        assert!(
+            !tool_names.contains(&"run_claude_pilot"),
+            "skill-defined tools should be excluded in compact mode"
+        );
+
+        // No variant info (skills skipped)
+        assert!(variant.is_none());
+        // No per-skill bytes
+        assert!(per_skill_bytes.is_empty());
+    }
+
+    #[test]
+    fn test_inject_skills_non_compact_provider_unchanged() {
+        // When is_compact_provider = false: behavior unchanged — skills appended, all tools present.
+        let tools = crate::tools::default_tools();
+        let mut entry = make_skill_entry("test-skill", 30, &["test_tool"]);
+        entry.prompt_snippet = "Use this skill.".to_string();
+        let matched: Vec<&SkillEntry> = vec![&entry];
+        let mut system = "Base prompt.".to_string();
+
+        let no_ctx = HashMap::new();
+        let no_disabled: Vec<String> = vec![];
+        let (defs, variant, per_skill_bytes) = inject_skills_and_resolve_tools(
+            &matched,
+            &tools,
+            &mut system,
+            "anthropic",
+            "claude-sonnet-4-6",
+            &no_ctx,
+            &no_disabled,
+            false, // non-compact
+        );
+
+        // Skills should be appended
+        assert!(
+            system.contains("<context type=\"skill\""),
+            "non-compact provider should include skill prompts"
+        );
+        assert!(system.contains("test-skill Skill"));
+
+        // All default tools + skill tools should be present
+        assert!(
+            defs.len() > COMPACT_PROVIDER_CORE_TOOLS.len(),
+            "non-compact should have more tools than core set"
+        );
+        let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            tool_names.contains(&"test_tool"),
+            "skill tools should be included"
+        );
+
+        // Variant and per_skill_bytes should be populated
+        assert!(variant.is_some());
+        assert!(!per_skill_bytes.is_empty());
+    }
+
+    #[test]
+    fn test_compact_provider_core_tools_are_valid() {
+        // Every name in COMPACT_PROVIDER_CORE_TOOLS must exist in default_tools().
+        // Prevents drift when tools are renamed or removed.
+        let tools = crate::tools::default_tools();
+        let tool_names: std::collections::HashSet<String> =
+            tools.definitions().iter().map(|d| d.name.clone()).collect();
+
+        for &core_tool in COMPACT_PROVIDER_CORE_TOOLS {
+            assert!(
+                tool_names.contains(core_tool),
+                "COMPACT_PROVIDER_CORE_TOOLS entry '{core_tool}' not found in default_tools() — \
+                 was it renamed or removed?"
+            );
+        }
     }
 }
