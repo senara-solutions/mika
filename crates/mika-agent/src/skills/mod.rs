@@ -217,10 +217,10 @@ impl SkillRegistry {
     /// Call **after** both [`apply_overrides()`](Self::apply_overrides) and
     /// [`apply_load_safety_check()`](Self::apply_load_safety_check) so the counts reflect the
     /// final registry state (validation may promote broken skills to skipped).
-    /// Emits one `INFO` summary line and a per-skip `WARN` line for each
+    /// Emits one `DEBUG` summary line and a per-skip `WARN` line for each
     /// skipped skill.
     pub fn log_summary(&self) {
-        tracing::info!(
+        tracing::debug!(
             loaded = self.skills.len(),
             disabled = self.disabled.len(),
             skipped = self.skipped.len(),
