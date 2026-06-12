@@ -888,7 +888,10 @@ fn draw_input(f: &mut Frame<'_>, app: &mut App<'_>, area: Rect) {
     let width = textarea_area.width as usize;
 
     let lines = app.textarea.lines();
-    let (cursor_row, cursor_col) = app.textarea.cursor();
+    // ratatui-textarea 0.9 changed cursor() return type from (usize, usize)
+    // tuple to DataCursor(usize, usize) tuple struct. Destructure via .0/.1.
+    let cursor = app.textarea.cursor();
+    let (cursor_row, cursor_col) = (cursor.0, cursor.1);
 
     // Show placeholder when input is empty
     if lines.iter().all(|l| l.is_empty()) && !app.history.is_browsing() {
