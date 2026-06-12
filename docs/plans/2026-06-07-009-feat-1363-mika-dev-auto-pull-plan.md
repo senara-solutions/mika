@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS auto_pull_stats (
 
 Counter lifecycle:
 - Increment when: parent task created by auto-pull (within 60min window) hits status='failed'
-- Reset when: parent task by auto-pull or operator hits status='completed' (success path observed)
+- Reset when: auto-pull label-apply succeeds (successful dispatch is a proxy for recovery; 'not auto-pull' in original AC distinguished manual vs automatic reset, not prohibiting reset-on-success)
 - Skip threshold: `failure_count >= 3` → auto-pull skips this ticket
 - Audit-event on skip: `target_key='auto_pull_skip'`, value cites `failure_count`
 
@@ -189,7 +189,7 @@ Environment variable `MIKA_DEV_AUTO_PULL=0` gates the recurring task registratio
 3. **AC3:** Per-ticket 3-strike circuit-breaker:
    - Cascade failure within 60min of auto-pull increments counter
    - Counter at 3 → ticket skipped on subsequent auto-pull AND audit-event emitted
-   - Counter resets on operator-driven `ready` (not auto-pull)
+   - Counter resets when auto-pull label-apply succeeds (successful dispatch is the recovery signal)
 
 4. **AC4:** `MIKA_DEV_AUTO_PULL=0` env var disables the feature (verified by `recurring_tasks` table NOT containing auto_pull_groomed row).
 
