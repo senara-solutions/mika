@@ -4,7 +4,8 @@
 use anyhow::{Result, bail};
 
 use crate::async_db::AsyncDatabase;
-use crate::db::{AuditEvent, SessionMessage, Task};
+use crate::db::{SessionMessage, Task};
+use crate::evidence::AuditEvent;
 
 /// Result of resolving recent exchanges — identifies the session and anchor point.
 #[derive(Debug, Clone)]
