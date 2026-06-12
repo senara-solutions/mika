@@ -26,6 +26,7 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 - `mika tasks list` — List active tasks (pending, in_progress, recurring_active). Bare `mika tasks` is an alias. Supports `--format text|json`.
 - `mika tasks get <id>` — Show full details for a single task. Supports `--format text|json`.
 - `mika tasks cancel <id>` — Cancel a task and kill its process if running.
+- `mika tasks promote-deferred <class>` — Force-promote the next pending deferred dispatch wrapper for a class (`implement` or `groom`). Fails if the per-class slot is occupied unless `--override` is set (cancel-then-promote).
 - `mika reminders list` — List pending reminders. Bare `mika reminders` is an alias. Supports `--format text|json`.
 - `mika reminders get <id>` — Show full details for a single reminder. Validates the task is a reminder (trigger_type: time/recurring). Supports `--format text|json`.
 - `mika reminders cancel <id>` — Cancel a reminder by ID.
