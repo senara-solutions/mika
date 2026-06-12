@@ -25,7 +25,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 41;
+pub const CURRENT_SCHEMA_VERSION: i64 = 42;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1188,6 +1188,11 @@ impl Database {
             info!(version = 41, "database migrated to v41");
         }
 
+        if (3..=41).contains(&version) {
+            self.migrate_v41_to_v42()?;
+            info!(version = 42, "database migrated to v42");
+        }
+
         Ok(())
     }
 
@@ -1242,7 +1247,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (41);
+            INSERT INTO schema_version (version) VALUES (42);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1855,6 +1860,16 @@ impl Database {
             CREATE UNIQUE INDEX idx_operational_items_source_unique
                 ON operational_items(agent_id, source_table, source_id)
                 WHERE source_table IS NOT NULL AND source_id IS NOT NULL;
+
+            -- Auto-pull circuit-breaker stats (mika#1363)
+            CREATE TABLE auto_pull_stats (
+                repo_full_name TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_auto_pull_at TEXT,
+                last_failure_at TEXT,
+                PRIMARY KEY (repo_full_name, issue_number)
+            );
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -4386,6 +4401,37 @@ impl Database {
         Ok(())
     }
 
+    /// v41→v42: Add `auto_pull_stats` circuit-breaker tracking table (mika#1363).
+    fn migrate_v41_to_v42(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 42 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "-- v42: mika#1363 auto-pull circuit-breaker stats table.
+            CREATE TABLE IF NOT EXISTS auto_pull_stats (
+                repo_full_name TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_auto_pull_at TEXT,
+                last_failure_at TEXT,
+                PRIMARY KEY (repo_full_name, issue_number)
+            );",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (42)", [])?;
+        tx.commit()?;
+
+        info!("v41→v42: created auto_pull_stats table (mika#1363)");
+
+        Ok(())
+    }
+
     /// v27 startup guard: refuse to open the database if the coalesce step
     /// from #787 has not run. Pins to `schema_version == 27` — future v28
     /// should carry its own guard, not inherit v27's.
@@ -5663,6 +5709,24 @@ impl Database {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks
              WHERE agent_id = ?1 AND status IN ('pending','in_progress','recurring_active')",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Count active self_dev tasks for mika-dev (mika#1363 F2).
+    ///
+    /// Returns the number of tasks that indicate mika-dev is not idle:
+    /// - status='in_progress' (currently running) or status='pending' (awaiting dispatch)
+    /// - source='self_dev' (excludes system tasks: heartbeat, reflection, recurring auto_pull)
+    /// - Excludes 'completed', 'failed', 'blocked', 'cancelled' (terminal states)
+    pub fn count_active_self_dev_tasks(&self, agent_id: &str) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND source = 'self_dev'
+               AND status IN ('in_progress', 'pending')",
             params![agent_id],
             |r| r.get(0),
         )?;
@@ -7864,6 +7928,66 @@ impl Database {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    // ===== Auto-Pull Stats (mika#1363) =====
+
+    /// Get the failure count for a specific issue in `auto_pull_stats`.
+    /// Returns 0 if no row exists.
+    pub fn get_auto_pull_failure_count(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<i64> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(failure_count, 0) FROM auto_pull_stats
+                 WHERE repo_full_name = ?1 AND issue_number = ?2",
+                params![repo_full_name, issue_number as i64],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(n)
+    }
+
+    /// Record an auto-pull event: upsert the row with `last_auto_pull_at = now`.
+    pub fn record_auto_pull(&self, repo_full_name: &str, issue_number: u64) -> Result<()> {
+        let now = crate::timestamp::now();
+        self.conn.execute(
+            "INSERT INTO auto_pull_stats (repo_full_name, issue_number, failure_count, last_auto_pull_at)
+             VALUES (?1, ?2, 0, ?3)
+             ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET last_auto_pull_at = ?3",
+            params![repo_full_name, issue_number as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Increment the failure counter for a ticket (circuit-breaker).
+    pub fn increment_auto_pull_failure(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let now = crate::timestamp::now();
+        self.conn.execute(
+            "INSERT INTO auto_pull_stats (repo_full_name, issue_number, failure_count, last_failure_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(repo_full_name, issue_number)
+             DO UPDATE SET failure_count = failure_count + 1, last_failure_at = ?3",
+            params![repo_full_name, issue_number as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Reset the failure counter for a ticket (on success or operator-driven ready).
+    pub fn reset_auto_pull_failure(&self, repo_full_name: &str, issue_number: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE auto_pull_stats SET failure_count = 0, last_failure_at = NULL
+             WHERE repo_full_name = ?1 AND issue_number = ?2",
+            params![repo_full_name, issue_number as i64],
+        )?;
+        Ok(())
     }
 
     // ===== Audit Events =====
@@ -15550,6 +15674,7 @@ mod tests {
                 || lower.contains("idx_agent_kg_corpora")
                 || lower.contains("schema_meta")
                 || lower.contains("operational_items")
+                || lower.contains("auto_pull_stats")
             {
                 continue;
             }
@@ -15631,6 +15756,7 @@ mod tests {
         db2.migrate_v38_to_v39().unwrap();
         db2.migrate_v39_to_v40().unwrap();
         db2.migrate_v40_to_v41().unwrap();
+        db2.migrate_v41_to_v42().unwrap();
 
         let final_version: i64 = db2
             .conn

@@ -2,6 +2,7 @@ pub mod a2a_card;
 pub mod a2a_db;
 pub mod agent;
 pub mod async_db;
+pub mod auto_pull;
 pub mod bundled_skills;
 pub mod calibration;
 pub mod compaction;

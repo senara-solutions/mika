@@ -428,6 +428,53 @@ impl AsyncDatabase {
         self.with_db(move |db| db.count_pending_tasks(&id)).await
     }
 
+    /// Count active self_dev tasks (mika#1363 F2).
+    pub async fn count_active_self_dev_tasks(&self) -> Result<i64> {
+        let id = self.agent_id.clone();
+        self.with_db(move |db| db.count_active_self_dev_tasks(&id))
+            .await
+    }
+
+    /// Get auto-pull failure count for circuit-breaker (mika#1363).
+    pub async fn get_auto_pull_failure_count(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<i64> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.get_auto_pull_failure_count(&repo, issue_number))
+            .await
+    }
+
+    /// Record an auto-pull event (mika#1363).
+    pub async fn record_auto_pull(&self, repo_full_name: &str, issue_number: u64) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.record_auto_pull(&repo, issue_number))
+            .await
+    }
+
+    /// Increment auto-pull failure counter (mika#1363).
+    pub async fn increment_auto_pull_failure(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.increment_auto_pull_failure(&repo, issue_number))
+            .await
+    }
+
+    /// Reset auto-pull failure counter (mika#1363).
+    pub async fn reset_auto_pull_failure(
+        &self,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<()> {
+        let repo = repo_full_name.to_owned();
+        self.with_db(move |db| db.reset_auto_pull_failure(&repo, issue_number))
+            .await
+    }
+
     pub async fn get_user_visible_tasks(&self) -> Result<Vec<Task>> {
         let id = self.agent_id.clone();
         self.with_db(move |db| db.get_user_visible_tasks(&id)).await
