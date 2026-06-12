@@ -31,6 +31,7 @@ pub mod teams;
 #[cfg(test)]
 pub mod test_utils;
 pub mod timestamp;
+pub mod tool_execution;
 pub mod tools;
 pub mod validate;
 pub(crate) mod webhook_dispatch;
