@@ -94,7 +94,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 ForcePromoteResult::Promoted { task_id } => {
                     db.log_audit_event(
                         "cli",
-                        "force_promote_deferred",
+                        "deferred_dispatch_force_promote_succeeded",
                         &format!("dispatch_class:{class}"),
                         None,
                         Some(&format!("promoted:{task_id}")),
@@ -152,7 +152,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                         // Emit override audit event.
                         db.log_audit_event(
                             "cli",
-                            "force_promote_deferred",
+                            "deferred_dispatch_force_promote_override",
                             &format!("dispatch_class:{class}"),
                             Some(&format!("cancelled:{blocker_id}")),
                             Some("override"),
@@ -166,7 +166,7 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                             ForcePromoteResult::Promoted { task_id } => {
                                 db.log_audit_event(
                                     "cli",
-                                    "force_promote_deferred",
+                                    "deferred_dispatch_force_promote_succeeded",
                                     &format!("dispatch_class:{class}"),
                                     None,
                                     Some(&format!("promoted:{task_id}")),

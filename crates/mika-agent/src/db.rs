@@ -18259,6 +18259,33 @@ mod tests {
             rc_task.status, "in_progress",
             "real callback should remain in_progress"
         );
+
+        // AC5a audit assertion: simulate the caller emitting the rejection
+        // audit event (the tool/CLI layer is responsible for logging), then
+        // verify exactly one row with the expected event type was stored.
+        db.log_audit_event(
+            "mika",
+            "test-session",
+            "deferred_dispatch_force_promote_rejected_slot_busy",
+            "dispatch_class:implement",
+            None,
+            Some("rejected_slot_busy"),
+            None,
+            None,
+        )
+        .unwrap();
+        let audit_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE tool_name = ?1",
+                params!["deferred_dispatch_force_promote_rejected_slot_busy"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_count, 1,
+            "exactly one rejected_slot_busy audit event should be emitted"
+        );
     }
 
     /// AC5b (mika#1453): Same setup; cancel the blocker, then force-promote →

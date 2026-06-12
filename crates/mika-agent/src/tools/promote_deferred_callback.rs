@@ -64,7 +64,7 @@ impl Tool for PromoteDeferredCallbackTool {
                 ctx.db
                     .log_audit_event(
                         ctx.session_id,
-                        "force_promote_deferred",
+                        "deferred_dispatch_force_promote_succeeded",
                         &format!("dispatch_class:{dispatch_class}"),
                         None,
                         Some(&format!("promoted:{task_id}")),
@@ -81,7 +81,7 @@ impl Tool for PromoteDeferredCallbackTool {
                 ctx.db
                     .log_audit_event(
                         ctx.session_id,
-                        "force_promote_deferred",
+                        "deferred_dispatch_force_promote_rejected_slot_busy",
                         &format!("dispatch_class:{dispatch_class}"),
                         None,
                         Some("rejected_slot_busy"),
