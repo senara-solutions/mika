@@ -34,11 +34,35 @@ struct AskJsonResponse {
 /// Mirrors the text-mode trailer's role: separates the assistant message
 /// (`role`/`content`) from CLI/runtime concerns. Fields here may be
 /// individually gated by `--verbose` (e.g., `session_id`) or unconditional
-/// (future ops fields like `trace_id` could ship without the flag).
-#[derive(serde::Serialize)]
+/// (e.g., `task_id` when the CLI flag is provided).
+#[derive(Default, serde::Serialize)]
 struct MetadataEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<TokensMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_task_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct TokensMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_write: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,6 +344,7 @@ pub async fn run(
     let skills_dirty = AtomicBool::new(false);
     let mcp_manager = init::connect_mcp(&ctx.home_dir).await;
 
+    let started = std::time::Instant::now();
     let output = agent::run_agent(&AgentParams {
         db: &ctx.async_db,
         llm: ctx.llm.as_ref(),
@@ -376,6 +401,57 @@ pub async fn run(
         }
     };
 
+    // Build the metadata envelope. Verbose-gated fields are populated only
+    // when `--verbose`; unconditional fields (`task_id`, `parent_task_id`)
+    // are populated whenever their CLI flag was provided.
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let model_string = {
+        let provider = ctx.settings.llm_provider;
+        let (model_name, _, _) = ctx.settings.provider_fields(provider);
+        model_name.map(|m| format!("{provider}/{m}"))
+    };
+
+    let envelope = MetadataEnvelope {
+        // Unconditional fields — present whenever the CLI flag was provided
+        task_id: task_id.map(|s| s.to_string()),
+        parent_task_id: parent_task_id.map(|s| s.to_string()),
+        // Verbose-gated fields
+        session_id: if verbose {
+            Some(session_id.clone())
+        } else {
+            None
+        },
+        model: if verbose { model_string } else { None },
+        agent_id: if verbose {
+            Some(agent_name.to_string())
+        } else {
+            None
+        },
+        latency_ms: if verbose { Some(elapsed_ms) } else { None },
+        tokens: if verbose {
+            output.usage.as_ref().map(|u| TokensMetadata {
+                input: Some(u.input_tokens),
+                output: Some(u.output_tokens),
+                cache_read: u.cache_read_input_tokens,
+                cache_write: u.cache_creation_input_tokens,
+            })
+        } else {
+            None
+        },
+    };
+
+    // Emit None when all fields are absent so the top-level `metadata` key
+    // is omitted from JSON (preserves byte-identical output for non-verbose,
+    // non-task invocations).
+    let has_any_field = envelope.session_id.is_some()
+        || envelope.model.is_some()
+        || envelope.agent_id.is_some()
+        || envelope.latency_ms.is_some()
+        || envelope.tokens.is_some()
+        || envelope.task_id.is_some()
+        || envelope.parent_task_id.is_some();
+    let metadata = if has_any_field { Some(envelope) } else { None };
+
     match format {
         OutputFormat::Text => {
             match output.text {
@@ -389,25 +465,45 @@ pub async fn run(
                     pending_callbacks.len()
                 );
             }
-            if verbose {
-                // Blank line separates response body from metadata trailer,
-                // making `grep ^session_id:` reliable even when LLM prose
-                // contains "session_id:" text.
+            // Text-mode trailer: one key: value per populated field.
+            // Blank line separates response body from metadata trailer.
+            if let Some(ref meta) = metadata {
                 println!();
-                println!("session_id: {session_id}");
+                if let Some(ref v) = meta.session_id {
+                    println!("session_id: {v}");
+                }
+                if let Some(ref v) = meta.model {
+                    println!("model: {v}");
+                }
+                if let Some(ref v) = meta.agent_id {
+                    println!("agent_id: {v}");
+                }
+                if let Some(v) = meta.latency_ms {
+                    println!("latency_ms: {v}");
+                }
+                if let Some(ref t) = meta.tokens {
+                    if let Some(v) = t.input {
+                        println!("tokens.input: {v}");
+                    }
+                    if let Some(v) = t.output {
+                        println!("tokens.output: {v}");
+                    }
+                    if let Some(v) = t.cache_read {
+                        println!("tokens.cache_read: {v}");
+                    }
+                    if let Some(v) = t.cache_write {
+                        println!("tokens.cache_write: {v}");
+                    }
+                }
+                if let Some(ref v) = meta.task_id {
+                    println!("task_id: {v}");
+                }
+                if let Some(ref v) = meta.parent_task_id {
+                    println!("parent_task_id: {v}");
+                }
             }
         }
         OutputFormat::Json => {
-            // `--verbose` populates the metadata envelope; without it,
-            // metadata stays None and the field is skipped on serialization,
-            // keeping the output byte-identical for existing consumers.
-            let metadata = if verbose {
-                Some(MetadataEnvelope {
-                    session_id: Some(session_id.clone()),
-                })
-            } else {
-                None
-            };
             let response = AskJsonResponse {
                 role: "assistant",
                 content: output.text,
@@ -744,6 +840,7 @@ mod tests {
             pending_tasks: vec![],
             metadata: Some(MetadataEnvelope {
                 session_id: Some(session_id.clone()),
+                ..Default::default()
             }),
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -763,12 +860,116 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_envelope_omits_none_session_id() {
-        // Per-field gating inside the envelope: if a future field is
-        // unconditional (e.g., trace_id) it can land alongside an absent
-        // session_id without forcing `"session_id":null` into the output.
-        let envelope = MetadataEnvelope { session_id: None };
+    fn test_metadata_envelope_default_serializes_empty() {
+        // Default envelope with all fields None serializes to `{}`.
+        let envelope = MetadataEnvelope::default();
         let json = serde_json::to_string(&envelope).unwrap();
         assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn test_metadata_envelope_partial_population() {
+        // Only session_id set — other fields absent from JSON.
+        let envelope = MetadataEnvelope {
+            session_id: Some("abc-123".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["session_id"], "abc-123");
+        assert!(parsed.get("model").is_none());
+        assert!(parsed.get("agent_id").is_none());
+        assert!(parsed.get("latency_ms").is_none());
+        assert!(parsed.get("tokens").is_none());
+        assert!(parsed.get("task_id").is_none());
+        assert!(parsed.get("parent_task_id").is_none());
+    }
+
+    #[test]
+    fn test_metadata_envelope_full_population() {
+        // All fields populated — complete JSON shape.
+        let envelope = MetadataEnvelope {
+            session_id: Some("sess-1".to_string()),
+            model: Some("anthropic/claude-sonnet-4-6".to_string()),
+            agent_id: Some("mika-dev".to_string()),
+            latency_ms: Some(1234),
+            tokens: Some(TokensMetadata {
+                input: Some(100),
+                output: Some(50),
+                cache_read: Some(80),
+                cache_write: Some(20),
+            }),
+            task_id: Some("task-1".to_string()),
+            parent_task_id: Some("parent-1".to_string()),
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["session_id"], "sess-1");
+        assert_eq!(parsed["model"], "anthropic/claude-sonnet-4-6");
+        assert_eq!(parsed["agent_id"], "mika-dev");
+        assert_eq!(parsed["latency_ms"], 1234);
+        assert_eq!(parsed["tokens"]["input"], 100);
+        assert_eq!(parsed["tokens"]["output"], 50);
+        assert_eq!(parsed["tokens"]["cache_read"], 80);
+        assert_eq!(parsed["tokens"]["cache_write"], 20);
+        assert_eq!(parsed["task_id"], "task-1");
+        assert_eq!(parsed["parent_task_id"], "parent-1");
+    }
+
+    #[test]
+    fn test_metadata_envelope_verbose_without_usage() {
+        // Verbose with no LLM usage — tokens field absent.
+        let envelope = MetadataEnvelope {
+            session_id: Some("sess-2".to_string()),
+            model: Some("openai/gpt-4o".to_string()),
+            agent_id: Some("mika".to_string()),
+            latency_ms: Some(500),
+            tokens: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["model"], "openai/gpt-4o");
+        assert_eq!(parsed["latency_ms"], 500);
+        assert!(parsed.get("tokens").is_none());
+    }
+
+    #[test]
+    fn test_metadata_envelope_unconditional_task_id_only() {
+        // Non-verbose with --task-id: envelope has only task_id.
+        let envelope = MetadataEnvelope {
+            task_id: Some("abc".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["task_id"], "abc");
+        // No verbose-gated fields
+        assert!(parsed.get("session_id").is_none());
+        assert!(parsed.get("model").is_none());
+        assert!(parsed.get("agent_id").is_none());
+        assert!(parsed.get("latency_ms").is_none());
+        assert!(parsed.get("tokens").is_none());
+    }
+
+    #[test]
+    fn test_tokens_metadata_partial_cache() {
+        // Only input/output tokens, no cache fields.
+        let tokens = TokensMetadata {
+            input: Some(200),
+            output: Some(100),
+            cache_read: None,
+            cache_write: None,
+        };
+        let json = serde_json::to_string(&tokens).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["input"], 200);
+        assert_eq!(parsed["output"], 100);
+        assert!(parsed.get("cache_read").is_none());
+        assert!(parsed.get("cache_write").is_none());
     }
 }
