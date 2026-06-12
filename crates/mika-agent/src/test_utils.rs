@@ -59,6 +59,7 @@ pub mod test_helpers {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+            scope_task_id: None,
         }
     }
 
@@ -138,6 +139,7 @@ pub mod test_helpers {
                 callback_task_id: None,
                 required_tool_arg_suffixes: &[],
                 tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+                scope_task_id: None,
             }
         }
 
@@ -171,6 +173,7 @@ pub mod test_helpers {
                 callback_task_id: None,
                 required_tool_arg_suffixes: &[],
                 tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+                scope_task_id: None,
             }
         }
         /// Create a ToolContext with custom home and global home directories.
@@ -208,6 +211,7 @@ pub mod test_helpers {
                 callback_task_id: None,
                 required_tool_arg_suffixes: &[],
                 tool_arg_suffix_rejected: &TOOL_ARG_SUFFIX_REJECTED,
+                scope_task_id: None,
             }
         }
     }

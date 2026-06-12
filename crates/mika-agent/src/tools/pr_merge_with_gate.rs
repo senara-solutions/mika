@@ -1548,6 +1548,7 @@ mod tests {
             callback_task_id,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected,
+            scope_task_id: None,
         }
     }
 

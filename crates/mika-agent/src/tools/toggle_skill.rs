@@ -300,6 +300,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+            scope_task_id: None,
         };
         // Pre-disable via DB
         ctx.db
@@ -353,6 +354,7 @@ mod tests {
             callback_task_id: None,
             required_tool_arg_suffixes: &[],
             tool_arg_suffix_rejected: &tool_arg_suffix_rejected,
+            scope_task_id: None,
         };
         let tool = ToggleSkillTool;
 
