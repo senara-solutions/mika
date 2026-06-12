@@ -1,0 +1,24 @@
+{
+  "_comment": "Frozen pre-fix trace shape from mika#1177 Shape C. The agent claimed 'unable to call search_memory in this mode' and the asserted-unavailability guard did not fire because no P1-P5 pattern covers the inverted modal 'unable to call X'. P5 only matches 'cannot call X' (literal), not 'unable to call X' (natural synonym). This fixture reproduces the modal/periphrastic negation failure class for regression assertions.",
+  "incident": "mika#1177",
+  "related": ["mika#862", "mika#894"],
+  "agent": "mika-arch",
+  "failure_class": "unavailability-asserted-without-attempt",
+  "failure_shape": "modal-periphrastic-negation",
+  "turns": [
+    {
+      "turn": 1,
+      "role": "assistant",
+      "text": "unable to call search_memory in this mode \u2014 proceeding with only the conversation context.",
+      "tool_calls": [],
+      "guard_fired": false,
+      "note": "Pre-fix: P5 only matches 'cannot call X' (literal). The inverted form 'unable to call X' does not match any P1-P5 pattern \u2192 guard did not fire."
+    }
+  ],
+  "expected_with_fix": {
+    "turn_1_guard_fires": true,
+    "corrective_reprompt_injected": true,
+    "turn_2_calls_search_memory": true,
+    "note": "With P9 (mika#1177), the inverted modal 'unable to call/invoke/use/access/reach X' is matched. The guard fires on turn 1."
+  }
+}
