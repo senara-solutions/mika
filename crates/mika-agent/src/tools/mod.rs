@@ -708,6 +708,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "get_session_messages",
     "list_audit_events",
     "search_tool_history",
+    "promote_deferred_callback",
     // management_tools_if_needed() — always-added management tools
     "create_agent",
     "create_team",
