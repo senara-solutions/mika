@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use tracing::debug;
 
-use crate::agent::ToolCallSummary;
+use crate::tool_execution::ToolCallSummary;
 
 // ---------------------------------------------------------------------------
 // #308 — Fabricated action-claim detection
@@ -324,7 +324,7 @@ pub(crate) fn assert_grounded_satisfied(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::ToolCallSummary;
+    use crate::tool_execution::ToolCallSummary;
 
     // -- detect_fabricated_action_claim tests (#308) --
 

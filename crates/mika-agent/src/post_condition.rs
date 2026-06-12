@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use crate::agent::ToolCallSummary;
+use crate::tool_execution::ToolCallSummary;
 use crate::tools::ToolRegistry;
 use mika_common::llm::LlmStopReason;
 
