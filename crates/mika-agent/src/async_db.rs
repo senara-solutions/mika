@@ -2982,7 +2982,8 @@ mod tests {
             db_status_d, "waiting",
             "DB status for blocked item D should be updated to 'waiting'"
         );
-=======
+    }
+
     /// Regression test for mika#1258: under channel saturation, the Tokio worker
     /// pool must remain responsive (async backpressure via tokio::sync::mpsc).
     ///
