@@ -89,4 +89,7 @@ mod eval {
 
     // Multi-agent corpus parity: regression guard for #1155 search_content gap
     mod kg_multi_agent_corpus_parity;
+
+    // Compact provider gate: MikaModel request shape regression (mika#1491)
+    mod test_compact_provider_gate;
 }
