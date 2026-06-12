@@ -231,6 +231,32 @@ async fn commits_have_file_changes(
 /// is dropped with a warning — the skill never reaches the agent.
 const WEBHOOK_SKILL_DENYLIST: &[&str] = &["dev-groom"];
 
+/// Internal org repos that should route to the well-known mika-dev agent container
+/// without requiring a `github_repos` row. These are org-internal development repos,
+/// not customer repos — they bypass the customer-registry lookup in multi-tenant mode.
+///
+/// When a webhook event arrives for one of these repos and no explicit `github_repos`
+/// registration exists, the gateway resolves to the `agent_base_url` route (same as
+/// single-tenant fallback) instead of dropping the event.
+///
+/// Adding a repo here is a code change + deploy — intentionally not env-tunable
+/// (security-adjacent: changes on release cadence, not ops cadence).
+///
+/// See: mika#1382 (cross-repo ready-label dispatch).
+const INTERNAL_REPOS: &[&str] = &[
+    "senara-solutions/mika",
+    "senara-solutions/mika-cloud",
+    "senara-solutions/mika-skills",
+    "senara-solutions/claude-pilot-py",
+    "senara-solutions/mika-platform",
+    "senara-solutions/wizzard",
+];
+
+/// Returns `true` if the given repository full name is in the internal-repo allowlist.
+fn is_internal_repo(repo_full_name: &str) -> bool {
+    INTERNAL_REPOS.contains(&repo_full_name)
+}
+
 const DEFAULT_GITHUB_BODY_TRUNCATION_CHARS: usize = 2_000;
 const GITHUB_REVIEW_BODY_TRUNCATION_CHARS: usize = 16_000;
 
@@ -863,7 +889,32 @@ pub(crate) async fn resolve_github_container_url(
                 });
             }
             Ok(None) => {
-                // debug when fallback will handle it (single-tenant), warn when event will be dropped
+                // Internal-repo allowlist: org-internal repos resolve to the well-known
+                // agent route without requiring a github_repos registration (mika#1382).
+                // Explicit registrations (above) always take precedence.
+                if is_internal_repo(repo_name) {
+                    if let Some(ref base) = state.agent_base_url {
+                        info!(
+                            repo = repo_name,
+                            "internal repo resolved via allowlist to agent_base_url"
+                        );
+                        return Some(ResolvedRoute {
+                            container_url: base.clone(),
+                            agent_mapping: serde_json::Value::Object(serde_json::Map::new()),
+                        });
+                    }
+                    // Multi-tenant without agent_base_url: internal repos cannot be routed.
+                    // This is expected in K8s prod where internal repos should have explicit
+                    // github_repos rows pointing to the mika-dev customer container.
+                    warn!(
+                        repo = repo_name,
+                        "internal repo matched allowlist but no MIKA_AGENT_BASE_URL configured, \
+                         dropping event (add a github_repos row for multi-tenant routing)"
+                    );
+                    return None;
+                }
+
+                // Non-internal repo with no registration
                 if state.agent_base_url.is_some() {
                     debug!(
                         repo = repo_name,
@@ -1366,6 +1417,26 @@ mod tests {
     #[test]
     fn test_route_event_no_action() {
         assert_eq!(route_event("issues", None, None), None);
+    }
+
+    // -- Internal repo allowlist tests (mika#1382) --
+
+    #[test]
+    fn test_is_internal_repo_known_repos() {
+        assert!(is_internal_repo("senara-solutions/mika"));
+        assert!(is_internal_repo("senara-solutions/mika-cloud"));
+        assert!(is_internal_repo("senara-solutions/mika-skills"));
+        assert!(is_internal_repo("senara-solutions/claude-pilot-py"));
+        assert!(is_internal_repo("senara-solutions/mika-platform"));
+        assert!(is_internal_repo("senara-solutions/wizzard"));
+    }
+
+    #[test]
+    fn test_is_internal_repo_unknown_repos() {
+        assert!(!is_internal_repo("senara-solutions/other-repo"));
+        assert!(!is_internal_repo("other-org/mika"));
+        assert!(!is_internal_repo(""));
+        assert!(!is_internal_repo("mika"));
     }
 
     // -- Message text formatting tests --
