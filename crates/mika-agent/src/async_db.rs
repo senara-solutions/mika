@@ -1,9 +1,6 @@
 use anyhow::{Result, anyhow};
 use std::path::Path;
-use std::sync::{
-    Arc, Mutex,
-    mpsc::{self, SyncSender},
-};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
@@ -11,8 +8,8 @@ use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, BackgroundTaskCounts, Commitment, CoreMemoryEntry,
     Database, Event, FailedSend, NewTask, Person, Preference, SearchResult, Session,
     SessionMessage, SessionWithStats, SkillOverride, Task, TaskFilters, TaskHealthSummary,
-    TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary, TeamWorkspaceEntry,
-    TimelineFilters, TimelineRow,
+    TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters, TeamRunRow, TeamRunSummary,
+    TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 
 type DbClosure = Box<dyn FnOnce(&mut Database) + Send>;
@@ -33,7 +30,7 @@ pub struct AsyncDatabase {
 }
 
 struct AsyncDatabaseInner {
-    sender: Mutex<Option<SyncSender<DbClosure>>>,
+    sender: Mutex<Option<tokio::sync::mpsc::Sender<DbClosure>>>,
     thread_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -45,12 +42,18 @@ impl AsyncDatabase {
 
     /// Spawn with a specific agent_id.
     pub fn new_with_agent(mut db: Database, agent_id: &str) -> Self {
-        // Bounded channel: backpressure when DB thread falls behind
-        let (tx, rx) = mpsc::sync_channel::<DbClosure>(512);
+        // Bounded channel: async backpressure when DB thread falls behind.
+        // tokio::sync::mpsc::Sender::send().await yields to the executor
+        // instead of blocking the Tokio worker thread (mika#1258).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DbClosure>(512);
         let handle = std::thread::Builder::new()
             .name("mika-db".to_string())
             .spawn(move || {
-                while let Ok(f) = rx.recv() {
+                // rusqlite::Connection is !Send, so the worker MUST be a dedicated
+                // OS thread — not a tokio task. blocking_recv() is the sync bridge
+                // for tokio::sync::mpsc — it blocks the current thread until a
+                // message arrives or all senders are dropped.
+                while let Some(f) = rx.blocking_recv() {
                     if let Err(_panic) =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             f(&mut db);
@@ -125,6 +128,7 @@ impl AsyncDatabase {
             .send(Box::new(move |db| {
                 let _ = tx.send(f(db));
             }))
+            .await
             .map_err(|_| anyhow!("database thread has stopped"))?;
         rx.await
             .map_err(|_| anyhow!("database thread dropped reply"))?
@@ -241,6 +245,13 @@ impl AsyncDatabase {
         let i = id.to_owned();
         let a = self.agent_id.clone();
         self.with_db(move |db| db.get_manual_task(&i, &a)).await
+    }
+
+    /// Walk the parent_task_id chain to the nearest scope root (mika#974).
+    pub async fn resolve_scope_root_task_id(&self, task_id: &str) -> Result<Option<String>> {
+        let tid = task_id.to_owned();
+        self.with_db(move |db| db.resolve_scope_root_task_id(&tid))
+            .await
     }
 
     pub async fn get_pending_callbacks_for_session(&self, session_id: &str) -> Result<Vec<String>> {
@@ -870,6 +881,49 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Double-write: insert into `messages` AND `task_messages` in a single transaction.
+    /// When `task_id` is `None`, behaves identically to `save_message_with_metadata`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_message_with_task_context(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+        internal: bool,
+        task_id: Option<&str>,
+    ) -> Result<i64> {
+        let (a, sid, r, c, m, t, tid) = (
+            self.agent_id.clone(),
+            session_id.to_owned(),
+            role.to_owned(),
+            content.to_owned(),
+            metadata.map(|s| s.to_owned()),
+            trace_id.map(|s| s.to_owned()),
+            task_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.save_message_with_task_context(
+                &a,
+                &sid,
+                &r,
+                &c,
+                m.as_deref(),
+                t.as_deref(),
+                internal,
+                tid.as_deref(),
+            )
+        })
+        .await
+    }
+
+    /// Load all task messages for a given task, ordered by creation time.
+    pub async fn load_task_messages(&self, task_id: &str) -> Result<Vec<TaskMessage>> {
+        let tid = task_id.to_owned();
+        self.with_db(move |db| db.load_task_messages(&tid)).await
+    }
+
     /// Save a message with an explicit `agent_id` (instead of using `self.agent_id`).
     ///
     /// Used by the team engine where the calling DB handle belongs to the orchestrator
@@ -900,6 +954,18 @@ impl AsyncDatabase {
     pub async fn load_recent_messages(&self, limit: usize) -> Result<Vec<SessionMessage>> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.load_recent_messages(&a, limit))
+            .await
+    }
+
+    /// Rebuild conversation context with optional task-mode hybrid merge (mika#974).
+    pub async fn rebuild_context(
+        &self,
+        task_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let a = self.agent_id.clone();
+        let tid = task_id.map(|s| s.to_owned());
+        self.with_db(move |db| db.rebuild_context(&a, tid.as_deref(), limit))
             .await
     }
 
@@ -2429,16 +2495,13 @@ mod tests {
             .await
             .unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        db.inner
-            .sender
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
+        let sender = db.inner.sender.lock().unwrap().as_ref().unwrap().clone();
+        sender
             .send(Box::new(move |_db| {
                 let _ = tx.send(());
                 panic!("intentional test panic");
             }))
+            .await
             .unwrap();
         rx.await.unwrap();
         let messages = db.load_recent_messages(10).await.unwrap();
@@ -2966,5 +3029,66 @@ mod tests {
             db_status_d, "waiting",
             "DB status for blocked item D should be updated to 'waiting'"
         );
+    }
+
+    /// Regression test for mika#1258: under channel saturation, the Tokio worker
+    /// pool must remain responsive (async backpressure via tokio::sync::mpsc).
+    ///
+    /// Strategy: spawn many slow DB closures (each sleeps 100ms) to fill the
+    /// channel, then verify a concurrent "control" task continues incrementing
+    /// a counter without being blocked.
+    #[tokio::test]
+    async fn test_async_db_saturated_channel_does_not_pin_workers() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        let db = test_async_db();
+        let control_counter = Arc::new(AtomicU32::new(0));
+
+        // Spawn a control task that increments a counter every 10ms.
+        // If Tokio workers are pinned, this task won't get scheduled.
+        let counter_clone = Arc::clone(&control_counter);
+        let control_handle = tokio::spawn(async move {
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                counter_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Flood the channel with slow closures that simulate DB saturation.
+        // 50 closures × 100ms sleep = enough to keep the worker thread busy
+        // while the channel fills up (channel capacity = 512).
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let db_clone = db.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = db_clone
+                    .with_db(|_db| {
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok(())
+                    })
+                    .await;
+            }));
+        }
+
+        // Wait for the control task to finish (should take ~2s).
+        control_handle.await.unwrap();
+
+        // The control counter should have incremented substantially.
+        // With async backpressure, the Tokio worker pool stays free to
+        // schedule the control task. With the old blocking send, workers
+        // would pin on send() and the counter would stall.
+        let final_count = control_counter.load(Ordering::Relaxed);
+        assert!(
+            final_count >= 100,
+            "control task only ran {final_count}/200 times — \
+             Tokio workers may be pinned by blocking channel send"
+        );
+
+        // Clean up: wait for all DB tasks to finish.
+        for h in handles {
+            let _ = h.await;
+        }
+        db.shutdown();
     }
 }

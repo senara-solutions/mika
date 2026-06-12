@@ -153,6 +153,10 @@ pub struct ToolContext<'a> {
     /// a tool call. On second rejection in the same turn, the handler escalates
     /// instead of retrying. Mirrors `pr_review_posted` pattern. See mika#899.
     pub tool_arg_suffix_rejected: &'a std::sync::atomic::AtomicBool,
+    /// Resolved scope-root task ID for the parallel narrative double-write (mika#974).
+    /// When `Some`, outbound `send_message` calls also write to `task_messages`.
+    /// Resolved once at turn start and cached as turn-local.
+    pub scope_task_id: Option<&'a str>,
 }
 
 /// A tool that the agent can invoke via Claude's tool_use.
