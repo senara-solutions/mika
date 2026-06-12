@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
@@ -58,6 +60,11 @@ jobs:
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Attest mika archive
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v4
+        with:
+          subject-path: mika-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
       # mika-server is the HTTP server binary (from mika-agent crate).
       # Dashboard assets are not embedded in release builds (empty placeholder);
       # the /dashboard/ endpoint shows a branded "disabled" page.
@@ -71,3 +78,71 @@ jobs:
           archive: mika-server-$tag-$target
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest mika-server archive
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v4
+        with:
+          subject-path: mika-server-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-22.04
+    if: github.repository_owner == 'senara-solutions'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx
+
+      - name: Generate SBOM
+        run: cargo cyclonedx --all --format json
+
+      - name: Upload SBOMs to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.ref_name }}"
+          # cargo-cyclonedx generates per-crate bom.json in each crate directory
+          for bom in crates/*/bom.json; do
+            crate="$(basename "$(dirname "$bom")")"
+            name="${crate}-${tag}-sbom.cdx.json"
+            cp "$bom" "$name"
+            gh release upload "$tag" "$name"
+          done
+
+  sign:
+    name: Sign release artifacts
+    runs-on: ubuntu-22.04
+    needs: [build, sbom]
+    if: github.repository_owner == 'senara-solutions'
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release download "$tag" \
+            --repo "${{ github.repository }}" \
+            --dir artifacts
+
+      - name: Sign artifacts
+        run: |
+          cd artifacts
+          for file in *.tar.gz *.sha256 *.cdx.json; do
+            [ -f "$file" ] || continue
+            cosign sign-blob --yes --bundle "${file}.bundle" "$file"
+          done
+
+      - name: Upload signatures to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release upload "$tag" artifacts/*.bundle \
+            --repo "${{ github.repository }}"
