@@ -1,9 +1,11 @@
 use anyhow::Result;
-use mika_agent::db::{Task, format_ts};
+use mika_agent::db::{ForcePromoteResult, Task, format_ts};
 use serde_json::{Value, json};
 
 use crate::cli::{OutputFormat, TaskArgs, TaskCommand};
 use crate::init;
+
+const VALID_DISPATCH_CLASSES: &[&str] = &["implement", "groom"];
 
 pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
     let ctx = init::init_db_only_for_agent(agent_name)?;
@@ -76,6 +78,130 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 },
                 None => {
                     println!("\n  Task {id} not found or already completed.\n");
+                }
+            }
+        }
+        Some(TaskCommand::PromoteDeferred { class, r#override }) => {
+            if !VALID_DISPATCH_CLASSES.contains(&class.as_str()) {
+                eprintln!(
+                    "\n  Invalid dispatch class '{class}'. Must be one of: {}\n",
+                    VALID_DISPATCH_CLASSES.join(", ")
+                );
+                std::process::exit(1);
+            }
+
+            match db.force_promote_deferred_for_class(&class).await? {
+                ForcePromoteResult::Promoted { task_id } => {
+                    db.log_audit_event(
+                        "cli",
+                        "deferred_dispatch_force_promote_succeeded",
+                        &format!("dispatch_class:{class}"),
+                        None,
+                        Some(&format!("promoted:{task_id}")),
+                        None,
+                        None,
+                    )
+                    .await?;
+                    println!(
+                        "\n  Promoted deferred wrapper for class '{class}'. Task ID: {task_id}\n"
+                    );
+                }
+                ForcePromoteResult::RejectedSlotBusy { blocking_label } => {
+                    if r#override {
+                        // Override path: cancel the blocker, then retry promotion.
+                        let blocker_id = db.find_active_callback_for_class(&class).await?;
+                        let Some(blocker_id) = blocker_id else {
+                            eprintln!(
+                                "\n  Slot reported busy but could not find the blocker task. Try again.\n"
+                            );
+                            std::process::exit(1);
+                        };
+
+                        // Cancel the blocker via the shared cancel+kill path.
+                        match mika_agent::task_engine::process_kill::cancel_task_and_kill(
+                            db,
+                            &blocker_id,
+                        )
+                        .await?
+                        {
+                            Some(outcome) => {
+                                let kill_msg = match (outcome.process_killed, outcome.pid) {
+                                    (Some(true), Some(pid)) => {
+                                        format!(" Process (PID {pid}) terminated.")
+                                    }
+                                    (Some(false), Some(pid)) => {
+                                        format!(
+                                            " Warning: process (PID {pid}) may still be running."
+                                        )
+                                    }
+                                    _ => String::new(),
+                                };
+                                println!(
+                                    "\n  Override: cancelled blocker {blocker_id} (\"{}\").{kill_msg}",
+                                    outcome.label
+                                );
+                            }
+                            None => {
+                                eprintln!(
+                                    "\n  Override: blocker {blocker_id} not found or already completed.\n"
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+
+                        // Emit override audit event.
+                        db.log_audit_event(
+                            "cli",
+                            "deferred_dispatch_force_promote_override",
+                            &format!("dispatch_class:{class}"),
+                            Some(&format!("cancelled:{blocker_id}")),
+                            Some("override"),
+                            None,
+                            None,
+                        )
+                        .await?;
+
+                        // Retry promotion after cancel.
+                        match db.force_promote_deferred_for_class(&class).await? {
+                            ForcePromoteResult::Promoted { task_id } => {
+                                db.log_audit_event(
+                                    "cli",
+                                    "deferred_dispatch_force_promote_succeeded",
+                                    &format!("dispatch_class:{class}"),
+                                    None,
+                                    Some(&format!("promoted:{task_id}")),
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                println!(
+                                    "  Promoted deferred wrapper for class '{class}'. Task ID: {task_id}\n"
+                                );
+                            }
+                            ForcePromoteResult::NoPendingWrapper => {
+                                eprintln!(
+                                    "  No pending deferred wrapper for class '{class}' after override.\n"
+                                );
+                                std::process::exit(1);
+                            }
+                            ForcePromoteResult::RejectedSlotBusy { blocking_label } => {
+                                eprintln!(
+                                    "  Slot still busy after override (blocker: '{blocking_label}'). Try again.\n"
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "\n  Cannot promote: dispatch slot for class '{class}' is occupied by '{blocking_label}'."
+                        );
+                        eprintln!("  Use --override to cancel the blocker and force promotion.\n");
+                        std::process::exit(1);
+                    }
+                }
+                ForcePromoteResult::NoPendingWrapper => {
+                    eprintln!("\n  No pending deferred wrapper for class '{class}'.\n");
+                    std::process::exit(1);
                 }
             }
         }

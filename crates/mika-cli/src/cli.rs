@@ -659,6 +659,15 @@ pub enum TaskCommand {
     },
     /// Cancel a task by ID (from `mika tasks`)
     Cancel { id: String },
+    /// Force-promote the next pending deferred dispatch wrapper for a class.
+    /// Fails if the per-class dispatch slot is occupied, unless --override is set.
+    PromoteDeferred {
+        /// Dispatch class: 'implement' or 'groom'
+        class: String,
+        /// Cancel the slot-occupying callback first, then promote
+        #[arg(long = "override")]
+        r#override: bool,
+    },
 }
 
 #[derive(clap::Args)]

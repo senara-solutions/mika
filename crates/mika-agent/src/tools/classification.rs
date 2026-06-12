@@ -19,6 +19,8 @@ pub fn is_write_tool(name: &str) -> bool {
             | "update_task_status"
             | "cancel_task"
             | "complete_task"
+            // Dispatch state mutations
+            | "promote_deferred_callback"
             // Reminder mutations
             | "create_reminder"
             | "cancel_reminder"
