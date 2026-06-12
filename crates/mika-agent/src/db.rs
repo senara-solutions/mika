@@ -25,7 +25,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 41;
+pub const CURRENT_SCHEMA_VERSION: i64 = 42;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1168,9 +1168,9 @@ impl Database {
             info!(version = 40, "database migrated to v40");
         }
 
-        if (3..=40).contains(&version) {
-            self.migrate_v40_to_v41()?;
-            info!(version = 41, "database migrated to v41");
+        if (3..=41).contains(&version) {
+            self.migrate_v41_to_v42()?;
+            info!(version = 42, "database migrated to v42");
         }
 
         Ok(())
@@ -1227,7 +1227,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (41);
+            INSERT INTO schema_version (version) VALUES (42);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -4322,9 +4322,9 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v40_to_v41(&mut self) -> Result<()> {
+    fn migrate_v41_to_v42(&mut self) -> Result<()> {
         let version = self.schema_version()?;
-        if version >= 41 {
+        if version >= 42 {
             return Ok(());
         }
 
@@ -4333,7 +4333,7 @@ impl Database {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         tx.execute_batch(
-            "-- v41: mika#1363 auto-pull circuit-breaker stats table.
+            "-- v42: mika#1363 auto-pull circuit-breaker stats table.
             CREATE TABLE IF NOT EXISTS auto_pull_stats (
                 repo_full_name TEXT NOT NULL,
                 issue_number INTEGER NOT NULL,
@@ -4344,10 +4344,10 @@ impl Database {
             );",
         )?;
 
-        tx.execute("INSERT INTO schema_version (version) VALUES (41)", [])?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (42)", [])?;
         tx.commit()?;
 
-        info!("v40→v41: created auto_pull_stats table (mika#1363)");
+        info!("v41→v42: created auto_pull_stats table (mika#1363)");
 
         Ok(())
     }
@@ -15476,7 +15476,7 @@ mod tests {
         db2.migrate_v37_to_v38().unwrap();
         db2.migrate_v38_to_v39().unwrap();
         db2.migrate_v39_to_v40().unwrap();
-        db2.migrate_v40_to_v41().unwrap();
+        db2.migrate_v41_to_v42().unwrap();
 
         let final_version: i64 = db2
             .conn
