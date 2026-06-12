@@ -995,9 +995,11 @@ fn handle_verbose(app: &mut App<'_>) -> String {
 async fn handle_inbox(app: &mut App<'_>) -> String {
     app.inbox_mode = !app.inbox_mode;
 
-    // Reload messages from DB with the new filter setting
+    // Reload messages from DB with the new filter setting.
+    // Discard the hidden count — /inbox toggle resets the counter to track
+    // only messages arriving during the new mode session.
     app.messages.clear();
-    if let Ok(recent) = app
+    if let Ok((recent, _hidden_count)) = app
         .db
         .load_recent_messages_filtered(20, app.inbox_mode)
         .await
@@ -1239,7 +1241,7 @@ async fn handle_rewind_impl(
             // that are never in app.messages, so counting-based truncation is unreliable.
             // This mirrors the startup loader in chat.rs.
             app.messages.clear();
-            if let Ok(recent) = app
+            if let Ok((recent, _hidden_count)) = app
                 .db
                 .load_recent_messages_filtered(20, app.inbox_mode)
                 .await

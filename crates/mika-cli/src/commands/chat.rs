@@ -566,17 +566,19 @@ pub async fn run(
 
     // Load recent conversation history so the user sees prior messages on restart.
     // In inbox mode (default), internal messages are filtered at the DB level.
-    if let Ok(history) = worker
+    // The hidden count seeds the [N hidden] footer badge (mika#593).
+    if let Ok((history, hidden_at_startup)) = worker
         ._ctx
         .async_db
         .load_recent_messages_filtered(20, app.inbox_mode)
         .await
     {
-        for msg in history {
-            if let Some(chat_msg) = session_message_to_chat_message(&msg) {
+        for msg in &history {
+            if let Some(chat_msg) = session_message_to_chat_message(msg) {
                 app.messages.push(chat_msg);
             }
         }
+        app.hidden_internal_count = hidden_at_startup;
     }
 
     // Load persisted thinking level ("off" resolves to None → stays default)
