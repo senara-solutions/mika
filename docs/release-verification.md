@@ -1,3 +1,8 @@
+---
+title: Release Artifact Verification
+description: How to verify SHA-256 checksums, cosign signatures, build provenance, and SBOMs for Mika releases
+---
+
 # Release Artifact Verification
 
 Every Mika release on GitHub includes checksums, cosign signatures, an SBOM, and build provenance attestations. This document explains how to verify each.
