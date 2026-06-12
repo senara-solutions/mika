@@ -843,3 +843,177 @@ async fn run_groomed_with_placeholder_path_rejected(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Check if the last N non-empty lines contain any of the given verdicts.
+    fn last_lines_contain_verdict(text: &str, verdicts: &[&str], window: usize) -> bool {
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let last_lines = &lines[lines.len().saturating_sub(window)..];
+        last_lines
+            .iter()
+            .any(|line| verdicts.iter().any(|v| line.trim() == *v))
+    }
+
+    // --- Fixture invariants ---
+
+    #[test]
+    fn fixture_tbd_rejected_contains_tbd_tokens() {
+        let fixture = include_str!(
+            "../../../tests/eval/calibration_fixtures/mika-arch/groomed_with_tbd_rejected.md"
+        );
+        assert!(
+            fixture.contains("TBD"),
+            "TBD-rejection fixture must contain literal TBD tokens"
+        );
+    }
+
+    #[test]
+    fn fixture_placeholder_rejected_contains_angle_bracket_placeholders() {
+        let fixture = include_str!(
+            "../../../tests/eval/calibration_fixtures/mika-arch/groomed_with_placeholder_path_rejected.md"
+        );
+        assert!(
+            fixture.contains("<path>"),
+            "Placeholder-rejection fixture must contain <path> placeholders"
+        );
+    }
+
+    #[test]
+    fn fixture_clean_plan_has_no_tbd_tokens_in_body() {
+        let fixture = include_str!(
+            "../../../tests/eval/calibration_fixtures/mika-arch/groomed_no_tbds_passes.md"
+        );
+        // Skip heading lines (metadata) — check only plan body content
+        let body: String = fixture
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+        assert!(
+            !body.contains("tbd"),
+            "Clean-plan fixture body must not contain TBD tokens"
+        );
+        assert!(
+            !fixture.contains("<path>") && !fixture.contains("<version>"),
+            "Clean-plan fixture must not contain angle-bracket placeholders"
+        );
+    }
+
+    // --- System prompt invariants ---
+
+    #[test]
+    fn groom_ticket_prompt_contains_unresolved_decision_gate() {
+        let prompt =
+            include_str!("../../../../../skills/bundled/mika-arch-groom-ticket/system_prompt.md");
+        assert!(
+            prompt.contains("Unresolved-Decision Gate"),
+            "groom-ticket system prompt must contain the Unresolved-Decision Gate section"
+        );
+        assert!(
+            prompt.contains("TBD"),
+            "gate must enumerate TBD as an unresolved-decision pattern"
+        );
+    }
+
+    #[test]
+    fn second_review_prompt_contains_unresolved_decision_gate() {
+        let prompt =
+            include_str!("../../../../../skills/bundled/mika-arch-second-review/system_prompt.md");
+        assert!(
+            prompt.contains("Unresolved-Decision Gate"),
+            "second-review system prompt must contain the Unresolved-Decision Gate section"
+        );
+    }
+
+    // --- Assertion logic regression tests ---
+
+    #[test]
+    fn verdict_ready_detected_in_last_three_lines() {
+        let text = "Analysis complete.\n\nVerdict: READY\n";
+        let ready_verdicts = ["Disposition: READY", "Verdict: READY"];
+        assert!(last_lines_contain_verdict(text, &ready_verdicts, 3));
+    }
+
+    #[test]
+    fn verdict_iterate_rejects_ready_for_tbd_plan() {
+        // Simulate a correct rejection: ITERATE with findings
+        let text = "The plan has unresolved decisions.\n\n\
+                     F1: (BLOCKING) Auth method is TBD — pick HMAC-SHA256 or API key\n\
+                     F2: (BLOCKING) Port number is TBD\n\n\
+                     Verdict: ITERATE\n";
+
+        let ready_verdicts = ["Disposition: READY", "Verdict: READY"];
+        assert!(
+            !last_lines_contain_verdict(text, &ready_verdicts, 3),
+            "TBD plan must NOT get READY"
+        );
+
+        let iterate_verdicts = [
+            "Disposition: ITERATE",
+            "Verdict: ITERATE",
+            "Disposition: ESCALATE",
+            "Verdict: ESCALATE",
+        ];
+        assert!(
+            last_lines_contain_verdict(text, &iterate_verdicts, 3),
+            "TBD plan must get ITERATE or ESCALATE"
+        );
+
+        assert!(text.contains("F1:"), "Must include F-list findings");
+    }
+
+    #[test]
+    fn false_ready_on_tbd_plan_caught_by_assertion() {
+        // Simulate the failure mode: LLM incorrectly returns READY for a TBD plan
+        let text = "Plan looks good.\n\nVerdict: READY\n";
+        let ready_verdicts = ["Disposition: READY", "Verdict: READY"];
+        assert!(
+            last_lines_contain_verdict(text, &ready_verdicts, 3),
+            "Should detect READY so the scenario can flag it as a contract violation"
+        );
+    }
+
+    // --- Scenario metadata ---
+
+    #[test]
+    fn scenario_count_is_eight() {
+        assert_eq!(
+            SCENARIOS.len(),
+            8,
+            "mika-arch should have 8 calibration scenarios (5 original + 3 TBD-gate)"
+        );
+    }
+
+    #[test]
+    fn tbd_gate_scenarios_present_with_correct_tags() {
+        let tbd_scenarios: Vec<_> = SCENARIOS
+            .iter()
+            .filter(|s| s.tags.contains(&"tbd-gate"))
+            .collect();
+        assert_eq!(
+            tbd_scenarios.len(),
+            3,
+            "Expected 3 tbd-gate tagged scenarios"
+        );
+
+        let ids: Vec<&str> = tbd_scenarios.iter().map(|s| s.id).collect();
+        assert!(ids.contains(&"groomed_no_tbds_passes"));
+        assert!(ids.contains(&"groomed_with_tbd_rejected"));
+        assert!(ids.contains(&"groomed_with_placeholder_path_rejected"));
+    }
+
+    #[test]
+    fn tbd_rejection_scenarios_are_not_flaky() {
+        for scenario in SCENARIOS.iter().filter(|s| s.tags.contains(&"tbd-gate")) {
+            assert!(
+                !scenario.flaky,
+                "TBD-gate scenario '{}' must not be marked flaky — it's a hard contract",
+                scenario.id
+            );
+        }
+    }
+}
