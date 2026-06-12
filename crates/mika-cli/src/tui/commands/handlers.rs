@@ -1359,6 +1359,7 @@ mod tests {
             "mika".to_string(),
             global_home,
             ProviderKind::Anthropic,
+            false,
         );
 
         (app, agent_rx, temp_dir)

@@ -166,6 +166,11 @@ pub struct ChatArgs {
     /// Use the most recent finished team run as context (requires --team)
     #[arg(long, requires = "team", conflicts_with = "run_id")]
     pub last_run: bool,
+
+    /// Launch directly in audit mode (show internal messages, equivalent to typing `/inbox` after launch).
+    /// Default off — chat opens in inbox mode (internal messages filtered).
+    #[arg(long)]
+    pub inbox: bool,
 }
 
 #[derive(clap::Args)]
@@ -1035,4 +1040,56 @@ pub enum WebhookCommand {
     /// Replay all dead DLQ entries
     #[command(name = "replay-all")]
     ReplayAll,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn chat_inbox_flag_default_off() {
+        let cli = parse_cli(&["mika", "chat"]);
+        match cli.command {
+            Some(Commands::Chat(args)) => assert!(!args.inbox),
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_inbox_flag_on() {
+        let cli = parse_cli(&["mika", "chat", "--inbox"]);
+        match cli.command {
+            Some(Commands::Chat(args)) => assert!(args.inbox),
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_inbox_with_agent() {
+        let cli = parse_cli(&["mika", "chat", "--agent", "mika-relay", "--inbox"]);
+        match cli.command {
+            Some(Commands::Chat(args)) => {
+                assert!(args.inbox);
+                assert_eq!(args.agent_flag.agent, Some("mika-relay".to_string()));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_inbox_with_team() {
+        let cli = parse_cli(&["mika", "chat", "--team", "my-team", "--inbox"]);
+        match cli.command {
+            Some(Commands::Chat(args)) => {
+                assert!(args.inbox);
+                assert_eq!(args.team, Some("my-team".to_string()));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
 }

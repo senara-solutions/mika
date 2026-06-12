@@ -77,9 +77,11 @@ async fn main() -> Result<()> {
         match cli.command {
             // `mika --team` or `mika chat --team`
             None | Some(Commands::Chat(_)) => {
-                let (explicit_run_id, last_run) = match cli.command {
-                    Some(Commands::Chat(ref args)) => (args.run_id.as_deref(), args.last_run),
-                    _ => (None, false),
+                let (explicit_run_id, last_run, inbox) = match cli.command {
+                    Some(Commands::Chat(ref args)) => {
+                        (args.run_id.as_deref(), args.last_run, args.inbox)
+                    }
+                    _ => (None, false, false),
                 };
 
                 let run_id = if last_run {
@@ -99,7 +101,13 @@ async fn main() -> Result<()> {
 
                 let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
 
-                return commands::chat::run_team(&team_name, &global_home, run_id.as_deref()).await;
+                return commands::chat::run_team(
+                    &team_name,
+                    &global_home,
+                    run_id.as_deref(),
+                    inbox,
+                )
+                .await;
             }
             // `mika ask --team`
             Some(Commands::Ask(ref args)) => {
@@ -225,13 +233,14 @@ async fn main() -> Result<()> {
             if !home::is_initialized(&home_dir) {
                 commands::setup::run(&agent_name, cli::SetupMode::Cli, None).await?;
             }
-            commands::chat::run(&agent_name, cli.session_id.as_deref(), None).await
+            commands::chat::run(&agent_name, cli.session_id.as_deref(), None, false).await
         }
         Some(Commands::Chat(ref args)) => {
             commands::chat::run(
                 &agent_name,
                 cli.session_id.as_deref(),
                 args.model.as_deref(),
+                args.inbox,
             )
             .await
         }
