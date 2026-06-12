@@ -30,6 +30,7 @@ mod list_tasks;
 mod list_teams;
 mod list_workspace;
 pub(crate) mod pr_merge_with_gate;
+mod promote_deferred_callback;
 mod query_knowledge_graph;
 mod query_timeline;
 mod read_agent_file;
@@ -744,6 +745,9 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(list_reminders::ListRemindersTool));
     registry.register(Box::new(cancel_reminder::CancelReminderTool));
     registry.register(Box::new(cancel_task::CancelTaskTool));
+    registry.register(Box::new(
+        promote_deferred_callback::PromoteDeferredCallbackTool,
+    ));
     registry.register(Box::new(complete_task::CompleteTaskTool));
     registry.register(Box::new(get_task::GetTaskTool));
     registry.register(Box::new(send_message::SendMessageTool));

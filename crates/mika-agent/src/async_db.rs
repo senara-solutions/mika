@@ -676,6 +676,30 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Force-promote the next pending deferred wrapper for a dispatch class
+    /// with fail-closed slot-availability semantics (mika#1453).
+    pub async fn force_promote_deferred_for_class(
+        &self,
+        dispatch_class: &str,
+    ) -> Result<crate::db::ForcePromoteResult> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_string();
+        self.with_db(move |db| db.force_promote_deferred_for_class(&a, &c))
+            .await
+    }
+
+    /// Returns the task ID of the active non-deferred callback occupying the
+    /// per-class dispatch slot. Used by the CLI override path (mika#1453).
+    pub async fn find_active_callback_for_class(
+        &self,
+        dispatch_class: &str,
+    ) -> Result<Option<String>> {
+        let a = self.agent_id.clone();
+        let c = dispatch_class.to_string();
+        self.with_db(move |db| db.find_active_callback_for_class(&a, &c))
+            .await
+    }
+
     pub async fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
         self.with_db(move |db| db.prune_completed_tasks(older_than_secs))
             .await

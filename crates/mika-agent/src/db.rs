@@ -174,6 +174,20 @@ pub struct Task {
     pub dispatch_class: Option<String>,
 }
 
+/// Result of a force-promote attempt on a deferred dispatch wrapper (mika#1453).
+/// Used by both the CLI verb and agent tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForcePromoteResult {
+    /// The next pending deferred wrapper was promoted for dispatch.
+    Promoted { task_id: String },
+    /// The per-class dispatch slot is occupied by a non-deferred callback;
+    /// promotion is refused (fail-closed). The `blocking_label` identifies
+    /// the occupying task for operator diagnostics.
+    RejectedSlotBusy { blocking_label: String },
+    /// No pending deferred wrapper exists for the given dispatch class.
+    NoPendingWrapper,
+}
+
 /// Split counts of active background callback tasks. `executing` = subprocess alive
 /// (`process_id IS NOT NULL`), `queued` = waiting for dispatch slot (`process_id IS NULL`).
 /// Used by TUI footer badge to distinguish `[1 running, 2 queued]` (#1057).
@@ -6370,6 +6384,83 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// Force-promote the next pending deferred wrapper for a dispatch class,
+    /// with fail-closed slot-availability semantics. Checks
+    /// `has_any_active_callback_for_class()` first; if the slot is occupied,
+    /// returns `RejectedSlotBusy` without mutating state. If free, promotes
+    /// via `promote_next_deferred_callback_for_class()` and returns `Promoted`
+    /// or `NoPendingWrapper`. Used by both the CLI verb and agent tool
+    /// (mika#1453).
+    ///
+    /// Paired predicates: the slot check shares the same SQL predicate as
+    /// `has_any_active_callback_for_class` — see mika#1163 for the
+    /// asymmetric-predicate-drift failure class.
+    pub fn force_promote_deferred_for_class(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<ForcePromoteResult> {
+        // Slot-availability check (fail-closed) — same predicate as the
+        // periodic backstop in engine.rs (mika#1163 parity).
+        if self.has_any_active_callback_for_class(agent_id, dispatch_class)? {
+            // Fetch the blocker's label for the rejection message.
+            let blocking_label: String = self
+                .conn
+                .query_row(
+                    "SELECT label FROM tasks
+                     WHERE agent_id = ?1
+                       AND trigger_type = 'callback'
+                       AND action_type = 'resume_agent'
+                       AND status IN ('pending', 'in_progress')
+                       AND label NOT LIKE '%:deferred'
+                       AND COALESCE(dispatch_class, 'implement') = ?2
+                     LIMIT 1",
+                    params![agent_id, dispatch_class],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| "<unknown>".to_string());
+
+            return Ok(ForcePromoteResult::RejectedSlotBusy { blocking_label });
+        }
+
+        match self.promote_next_deferred_callback_for_class(agent_id, dispatch_class)? {
+            Some(task_id) => Ok(ForcePromoteResult::Promoted { task_id }),
+            None => Ok(ForcePromoteResult::NoPendingWrapper),
+        }
+    }
+
+    /// Returns the task ID of the active non-deferred callback occupying the
+    /// per-class dispatch slot. Same SQL predicate as
+    /// `has_any_active_callback_for_class` but `SELECT id LIMIT 1` instead of
+    /// `SELECT COUNT(*)`. Used by the CLI override path to identify the blocker
+    /// before cancellation (mika#1453).
+    ///
+    /// Paired predicate: shares the `:deferred` exclusion and COALESCE
+    /// semantics with `has_any_active_callback_for_class` — keep in sync
+    /// (mika#1163).
+    pub fn find_active_callback_for_class(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<Option<String>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE agent_id = ?1
+                   AND trigger_type = 'callback'
+                   AND action_type = 'resume_agent'
+                   AND status IN ('pending', 'in_progress')
+                   AND label NOT LIKE '%:deferred'
+                   AND COALESCE(dispatch_class, 'implement') = ?2
+                 LIMIT 1",
+                params![agent_id, dispatch_class],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id)
     }
 
     pub fn prune_completed_tasks(&self, older_than_secs: i64) -> Result<usize> {
@@ -18081,5 +18172,247 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("advance to item #2"))
         );
+    }
+    // ── Force-promote regression tests (mika#1453) ──────────────────────
+
+    /// Helper: create a deferred callback with a specific dispatch class.
+    fn deferred_wrapper(agent: &str, class: &str) -> NewTask {
+        let mut t = new_task(
+            agent,
+            "long_running:run_claude_pilot:deferred",
+            "callback",
+            "resume_agent",
+        );
+        t.dispatch_class = Some(class.to_string());
+        t
+    }
+
+    /// Helper: create a real (non-deferred) callback with a specific dispatch class.
+    fn real_callback(agent: &str, class: &str) -> NewTask {
+        let mut t = new_task(
+            agent,
+            "long_running:run_claude_pilot",
+            "callback",
+            "resume_agent",
+        );
+        t.dispatch_class = Some(class.to_string());
+        t
+    }
+
+    /// AC5a (mika#1453): 2 pending wrappers + 1 in-flight real callback →
+    /// force-promote WITHOUT override → RejectedSlotBusy, no state mutation.
+    #[test]
+    fn test_force_promote_rejected_slot_busy_no_state_mutation() {
+        let db = db();
+
+        // Parent tasks (FK requirement for callbacks).
+        let p1 = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+        let p2 = db
+            .create_task(&new_task("mika", "p2", "manual", "none"))
+            .unwrap();
+        let p3 = db
+            .create_task(&new_task("mika", "p3", "manual", "none"))
+            .unwrap();
+
+        // 2 pending deferred wrappers.
+        let mut d1 = deferred_wrapper("mika", "implement");
+        d1.parent_task_id = Some(p1.clone());
+        let d1_id = db.create_task(&d1).unwrap();
+
+        let mut d2 = deferred_wrapper("mika", "implement");
+        d2.parent_task_id = Some(p2.clone());
+        let d2_id = db.create_task(&d2).unwrap();
+
+        // 1 in-flight real callback (pending status occupies the slot).
+        let mut rc = real_callback("mika", "implement");
+        rc.parent_task_id = Some(p3.clone());
+        let rc_id = db.create_task(&rc).unwrap();
+        // Transition to in_progress to simulate a dispatched subprocess.
+        db.claim_and_fire_task(&rc_id, "mika").unwrap();
+
+        // Force-promote should be rejected.
+        let result = db
+            .force_promote_deferred_for_class("mika", "implement")
+            .unwrap();
+        assert!(
+            matches!(result, ForcePromoteResult::RejectedSlotBusy { .. }),
+            "Expected RejectedSlotBusy, got {result:?}"
+        );
+
+        // Both deferred wrappers should still be pending (no state mutation).
+        let t1 = db.get_task_unscoped(&d1_id).unwrap().unwrap();
+        assert_eq!(
+            t1.status, "pending",
+            "deferred wrapper 1 should remain pending"
+        );
+        let t2 = db.get_task_unscoped(&d2_id).unwrap().unwrap();
+        assert_eq!(
+            t2.status, "pending",
+            "deferred wrapper 2 should remain pending"
+        );
+
+        // Real callback should still be in_progress.
+        let rc_task = db.get_task_unscoped(&rc_id).unwrap().unwrap();
+        assert_eq!(
+            rc_task.status, "in_progress",
+            "real callback should remain in_progress"
+        );
+    }
+
+    /// AC5b (mika#1453): Same setup; cancel the blocker, then force-promote →
+    /// oldest deferred wrapper promoted, per-class invariant holds (≤1 active
+    /// real callback).
+    #[test]
+    fn test_force_promote_override_cancel_then_promote() {
+        let db = db();
+
+        // Parent tasks (FK requirement for callbacks).
+        let p1 = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+        let p2 = db
+            .create_task(&new_task("mika", "p2", "manual", "none"))
+            .unwrap();
+        let p3 = db
+            .create_task(&new_task("mika", "p3", "manual", "none"))
+            .unwrap();
+
+        // 2 pending deferred wrappers.
+        let mut d1 = deferred_wrapper("mika", "implement");
+        d1.parent_task_id = Some(p1.clone());
+        let d1_id = db.create_task(&d1).unwrap();
+
+        let mut d2 = deferred_wrapper("mika", "implement");
+        d2.parent_task_id = Some(p2.clone());
+        let d2_id = db.create_task(&d2).unwrap();
+
+        // 1 in-flight real callback.
+        let mut rc = real_callback("mika", "implement");
+        rc.parent_task_id = Some(p3.clone());
+        let rc_id = db.create_task(&rc).unwrap();
+        db.claim_and_fire_task(&rc_id, "mika").unwrap();
+
+        // Step 1: Confirm slot is busy.
+        let result = db
+            .force_promote_deferred_for_class("mika", "implement")
+            .unwrap();
+        assert!(matches!(
+            result,
+            ForcePromoteResult::RejectedSlotBusy { .. }
+        ));
+
+        // Step 2: Find and identify the blocker.
+        let blocker = db
+            .find_active_callback_for_class("mika", "implement")
+            .unwrap();
+        assert_eq!(blocker.as_deref(), Some(rc_id.as_str()));
+
+        // Step 3: Cancel the blocker (simulating `cancel_task_and_kill`).
+        db.cancel_task(&rc_id, "mika").unwrap();
+
+        // Step 4: Retry force-promote — should succeed now.
+        let result = db
+            .force_promote_deferred_for_class("mika", "implement")
+            .unwrap();
+        match &result {
+            ForcePromoteResult::Promoted { task_id } => {
+                assert_eq!(
+                    task_id, &d1_id,
+                    "oldest deferred wrapper should be promoted first"
+                );
+            }
+            other => panic!("Expected Promoted, got {other:?}"),
+        }
+
+        // Step 5: Verify only the first wrapper was promoted.
+        let t1 = db.get_task_unscoped(&d1_id).unwrap().unwrap();
+        assert_eq!(
+            t1.status, "completed",
+            "first wrapper should be promoted (completed)"
+        );
+
+        let t2 = db.get_task_unscoped(&d2_id).unwrap().unwrap();
+        assert_eq!(t2.status, "pending", "second wrapper should remain pending");
+
+        // Step 6: Verify per-class invariant — no real callback active.
+        assert!(
+            !db.has_any_active_callback_for_class("mika", "implement")
+                .unwrap(),
+            "no active real callback should remain after cancel"
+        );
+    }
+
+    #[test]
+    fn test_force_promote_slot_free_promoted() {
+        let db = db();
+        let p1 = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+
+        let mut d1 = deferred_wrapper("mika", "implement");
+        d1.parent_task_id = Some(p1.clone());
+        let d1_id = db.create_task(&d1).unwrap();
+
+        let result = db
+            .force_promote_deferred_for_class("mika", "implement")
+            .unwrap();
+        match &result {
+            ForcePromoteResult::Promoted { task_id } => {
+                assert_eq!(task_id, &d1_id);
+            }
+            other => panic!("Expected Promoted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_force_promote_slot_free_no_pending_wrapper() {
+        let db = db();
+        let result = db
+            .force_promote_deferred_for_class("mika", "implement")
+            .unwrap();
+        assert!(
+            matches!(result, ForcePromoteResult::NoPendingWrapper),
+            "Expected NoPendingWrapper, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_active_callback_for_class_excludes_deferred() {
+        let db = db();
+        let p1 = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+
+        // Only a deferred wrapper exists — should return None.
+        let mut d1 = deferred_wrapper("mika", "implement");
+        d1.parent_task_id = Some(p1.clone());
+        db.create_task(&d1).unwrap();
+
+        let blocker = db
+            .find_active_callback_for_class("mika", "implement")
+            .unwrap();
+        assert!(
+            blocker.is_none(),
+            "deferred wrappers should not count as slot occupiers"
+        );
+    }
+
+    #[test]
+    fn test_find_active_callback_for_class_returns_real_callback() {
+        let db = db();
+        let p1 = db
+            .create_task(&new_task("mika", "p1", "manual", "none"))
+            .unwrap();
+
+        let mut rc = real_callback("mika", "implement");
+        rc.parent_task_id = Some(p1.clone());
+        let rc_id = db.create_task(&rc).unwrap();
+
+        let blocker = db
+            .find_active_callback_for_class("mika", "implement")
+            .unwrap();
+        assert_eq!(blocker.as_deref(), Some(rc_id.as_str()));
     }
 }
