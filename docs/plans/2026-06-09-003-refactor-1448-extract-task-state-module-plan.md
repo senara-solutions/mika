@@ -9,13 +9,13 @@ created: 2026-06-09
 
 Extract task lifecycle logic — status transition rules, the LLM-facing `UpdateTaskStatusTool`, and status-transition DB write methods — into a dedicated `task_state/` module under `crates/mika-agent/src/`. This is a pure code-relocation refactor per Foundation doc §6's domain boundary for task_state: "Task lifecycle: created → in_progress → blocked → done. Status transition rules."
 
-The extraction moves ~1,750 lines from two primary sources (`tools/update_task_status.rs` and `db.rs`) into two new locations (`task_state/` top-level module and `db/task_state.rs` sub-module), following the existing `db/operational.rs` and `db/kg_schema.rs` convention for DB method grouping. *(Line references updated 2026-06-12 against db.rs at 18,571 lines — +921 from original plan due to v39 operational_items additions.)*
+The extraction moves ~1,750 lines from two primary sources (`tools/update_task_status.rs` and `db.rs`) into two new locations (`task_state/` top-level module and `db/task_state.rs` sub-module), following the existing `db/operational.rs` and `db/kg_schema.rs` convention for DB method grouping. *(Line references updated 2026-06-12 against db.rs at 18,290 lines.)*
 
 ---
 
 ## Problem Frame
 
-`crates/mika-agent/src/db.rs` is 18,571 lines and `tools/` hosts a 1,520-line file (`update_task_status.rs`) that is really a state machine module wearing a tool skin. The decomposition plan (mika#1259) identifies task_state/ as a leaf module with no hard dependencies on other #1259 modules, making it safe to extract independently.
+`crates/mika-agent/src/db.rs` is 18,290 lines and `tools/` hosts a 1,520-line file (`update_task_status.rs`) that is really a state machine module wearing a tool skin. The decomposition plan (mika#1259) identifies task_state/ as a leaf module with no hard dependencies on other #1259 modules, making it safe to extract independently.
 
 The extraction creates a clear architectural seam: **task_state/** owns the rules (what transitions are valid, validation predicates), while **task_engine/** owns the execution (scheduling, dispatching, process liveness). Today these concerns are interleaved across db.rs and tools/.
 
@@ -150,18 +150,18 @@ The extraction creates a clear architectural seam: **task_state/** owns the rule
 
 **Approach:**
 - Create `db/task_state.rs` containing an `impl Database` block with these methods cut from db.rs:
-  - `update_task_status()` (line 5031)
-  - `update_task_execution_trace_id()` (line 5042)
-  - `claim_and_fire_task()` (line 5053)
-  - `update_task_completed()` (line 5064)
-  - `update_task_failed()` (line 5079)
-  - `update_task_dispatch_class()` (line 5096)
-  - `write_task_dispatch_rejection()` (line 5118)
-  - `promote_task_completed()` (line 5133)
-  - `update_task_next_fire_at()` (line 5144)
-  - `update_task_rescheduled()` (line 5154)
-  - `cancel_task()` (line 5162)
-  - `update_manual_task_status()` (line 5187)
+  - `update_task_status()` (line 5017)
+  - `update_task_execution_trace_id()` (line 5028)
+  - `claim_and_fire_task()` (line 5039)
+  - `update_task_completed()` (line 5050)
+  - `update_task_failed()` (line 5065)
+  - `update_task_dispatch_class()` (line 5082)
+  - `write_task_dispatch_rejection()` (line 5104)
+  - `promote_task_completed()` (line 5119)
+  - `update_task_next_fire_at()` (line 5130)
+  - `update_task_rescheduled()` (line 5140)
+  - `cancel_task()` (line 5148)
+  - `update_manual_task_status()` (line 5173)
 - Add `pub mod task_state;` to the top of `db.rs` (alongside existing `pub mod kg_schema;` and `pub mod operational;`).
 - The new file needs `use anyhow::Result;` and `use rusqlite::{params, OptionalExtension};` — match the exact imports each method needs.
 - Import `super::Database;` to write the `impl Database` block.
