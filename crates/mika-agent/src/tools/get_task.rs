@@ -36,7 +36,11 @@ impl Tool for GetTaskTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("'id' is required."));
         }
-        let task = match super::validate_task_exists(ctx.db, "id", id).await {
+        let scoped = match super::AgentScopedTaskId::from_tool_context(ctx, id) {
+            Ok(s) => s,
+            Err(e) => return Ok(e),
+        };
+        let task = match super::validate_task_exists(ctx.db, "id", &scoped).await {
             Ok(t) => t,
             Err(e) => return Ok(e),
         };

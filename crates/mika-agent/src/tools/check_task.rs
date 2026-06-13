@@ -205,7 +205,11 @@ impl Tool for CheckTaskTool {
         }
 
         // Format + existence + agent-scope validation in one call
-        let task = match super::validate_task_exists(ctx.db, "task_id", task_id).await {
+        let scoped = match super::AgentScopedTaskId::from_tool_context(ctx, task_id) {
+            Ok(s) => s,
+            Err(e) => return Ok(e),
+        };
+        let task = match super::validate_task_exists(ctx.db, "task_id", &scoped).await {
             Ok(t) if t.trigger_type == "manual" => t,
             Ok(t) => {
                 return Ok(ToolOutput::error(format!(

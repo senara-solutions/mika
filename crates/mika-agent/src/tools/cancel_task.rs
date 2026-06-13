@@ -42,7 +42,11 @@ impl Tool for CancelTaskTool {
         // Format + existence pre-check — catches fabricated UUIDs before they reach
         // the cancel_task_and_kill infrastructure layer. The kill path does its own
         // get_task internally, so this is an intentional extra DB read for safety.
-        if let Err(e) = super::validate_task_exists(ctx.db, "id", id).await {
+        let scoped = match super::AgentScopedTaskId::from_tool_context(ctx, id) {
+            Ok(s) => s,
+            Err(e) => return Ok(e),
+        };
+        if let Err(e) = super::validate_task_exists(ctx.db, "id", &scoped).await {
             return Ok(e);
         }
 

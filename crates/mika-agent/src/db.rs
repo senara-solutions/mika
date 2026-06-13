@@ -9275,10 +9275,11 @@ impl Database {
 
     // ===== Dashboard: Paginated Task Listing =====
 
-    /// Cross-agent task lookup — for correlation and observability only.
+    /// Cross-agent task lookup — raw `&str`, for correlation and observability only.
     ///
-    /// Does NOT enforce agent ownership. For state-mutating agent tools that require
-    /// the caller own the task, use [`crate::tools::validate_task_exists`] instead.
+    /// Does NOT enforce agent ownership. For agent-scoped tool paths, use
+    /// [`crate::tools::AgentScopedTaskId`] + [`crate::tools::validate_task_exists`]
+    /// instead — the newtype makes the ownership invariant compile-checked (mika#755).
     ///
     /// Current callers: `mika ask --task-id` correlation branch at
     /// `crates/mika-cli/src/commands/ask.rs`, dashboard task detail endpoint.
