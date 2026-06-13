@@ -406,6 +406,9 @@ impl TaskDispatcher {
         // are captured even if the agent exhausts its step budget.
         if is_callback {
             try_extract_callback_metadata(&self.db, task).await;
+            // mika#965: Write a human-readable callback summary to task_messages
+            // so the dispatch session's next rebuild_context() includes it.
+            try_write_callback_summary(&self.db, task).await;
             // #958: If the callback carries a pr_url (success indicator) and the
             // parent was reaped to `failed`, promote it back to `completed`.
             try_promote_parent_on_retry_success(&self.db, task).await;
@@ -1433,6 +1436,110 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
     }
 }
 
+/// Write a human-readable callback summary to `task_messages` keyed to the
+/// scope-root task_id (mika#965).
+///
+/// This closes the narrative gap where `rebuild_context()` merges `task_messages`
+/// but no callback outcome was ever written there. The dispatch session's next
+/// turn sees the callback result in its rebuilt context.
+///
+/// Best-effort, fire-and-forget — same pattern as `try_extract_callback_metadata`.
+async fn try_write_callback_summary(db: &AsyncDatabase, task: &Task) {
+    // 1. Need a parent to resolve scope root from.
+    let parent_id = match &task.parent_task_id {
+        Some(id) => id.clone(),
+        None => return,
+    };
+
+    // 2. Parse result text — if empty or no extractable fields, nothing to write.
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let extracted = extract_callback_fields(result);
+    if extracted.is_null() {
+        return;
+    }
+
+    // 3. Resolve scope root — the task_messages row is keyed to the scope root
+    //    so the dispatching session's rebuild_context() picks it up.
+    let scope_root_id = match db.resolve_scope_root_task_id(&parent_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // No scope root — parent is not part of a scoped hierarchy.
+            // Fall back to parent_id itself so the summary still lands
+            // somewhere the dispatch session can read.
+            parent_id.clone()
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                error = %e,
+                "callback_summary: failed to resolve scope root"
+            );
+            return;
+        }
+    };
+
+    // 4. Build human-readable summary from extracted fields.
+    let pilot = &extracted["claude_pilot"];
+    let mut parts = Vec::new();
+
+    if let Some(s) = pilot.get("session_id").and_then(|v| v.as_str()) {
+        parts.push(format!("session={s}"));
+    }
+    if let Some(n) = pilot.get("turns").and_then(|v| v.as_u64()) {
+        parts.push(format!("turns={n}"));
+    }
+    if let Some(c) = pilot.get("cost_usd").and_then(|v| v.as_f64()) {
+        parts.push(format!("cost=${c:.2}"));
+    }
+    if let Some(d) = pilot.get("duration_ms").and_then(|v| v.as_u64()) {
+        parts.push(format!("duration={d}ms"));
+    }
+    if let Some(url) = pilot.get("pr_url").and_then(|v| v.as_str()) {
+        parts.push(format!("PR: {url}"));
+    }
+
+    if parts.is_empty() {
+        return;
+    }
+
+    let summary = format!("Callback completed: {}", parts.join(", "));
+
+    // 5. Use the callback's session as the session_id for the task_message row.
+    let session_id = task.created_by_session.as_deref().unwrap_or("callback");
+    let trace_id = task.execution_trace_id.as_deref();
+    let metadata_json = extracted.to_string();
+
+    match db
+        .insert_task_message(
+            &scope_root_id,
+            &task.agent_id,
+            session_id,
+            "system",
+            &summary,
+            Some(&metadata_json),
+            trace_id,
+        )
+        .await
+    {
+        Ok(_) => info!(
+            scope_root_id = %scope_root_id,
+            callback_task_id = %task.id,
+            "callback_summary: wrote summary to task_messages"
+        ),
+        Err(e) => warn!(
+            scope_root_id = %scope_root_id,
+            callback_task_id = %task.id,
+            error = %e,
+            "callback_summary: failed to write summary to task_messages"
+        ),
+    }
+}
+
 /// Promote the parent task from `failed` → `completed` when a retry callback
 /// succeeds (#958).
 ///
@@ -2388,6 +2495,280 @@ mod tests {
         let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
         // Should not panic or error — just returns early
         try_extract_callback_metadata(&db, &task).await;
+    }
+
+    // ===== try_write_callback_summary tests (mika#965) =====
+
+    #[tokio::test]
+    async fn test_callback_summary_writes_to_scope_root() {
+        let db = test_db();
+
+        // Create a manual parent task (acts as scope root)
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement feature #965".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        // Create a callback child with result text including pr_url
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("session-cb-1".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(
+            &callback_id,
+            Some(
+                "claude-pilot completed (status: done).\n\
+                 Session: test-session-abc\n\
+                 Turns: 42\n\
+                 Cost: $3.50\n\
+                 Duration: 120000ms\n\
+                 PR: https://github.com/senara-solutions/mika/pull/999",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_write_callback_summary(&db, &task).await;
+
+        // Verify task_messages row was written keyed to the parent (scope root)
+        let msgs = db.load_task_messages(&parent_id).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system");
+        assert!(msgs[0].content.contains("session=test-session-abc"));
+        assert!(msgs[0].content.contains("turns=42"));
+        assert!(msgs[0].content.contains("cost=$3.50"));
+        assert!(msgs[0].content.contains("duration=120000ms"));
+        assert!(
+            msgs[0]
+                .content
+                .contains("PR: https://github.com/senara-solutions/mika/pull/999")
+        );
+        // Metadata should contain the extracted JSON
+        let meta: serde_json::Value =
+            serde_json::from_str(msgs[0].metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(meta["claude_pilot"]["session_id"], "test-session-abc");
+        assert_eq!(meta["claude_pilot"]["turns"], 42);
+    }
+
+    #[tokio::test]
+    async fn test_callback_summary_noop_no_parent() {
+        let db = test_db();
+
+        // Callback with no parent — should silently return
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some("Session: abc\nTurns: 10"))
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        // Should not panic or error — just returns early
+        try_write_callback_summary(&db, &task).await;
+    }
+
+    #[tokio::test]
+    async fn test_callback_summary_noop_empty_result() {
+        let db = test_db();
+
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "parent".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        // Complete with empty result — no fields extractable
+        db.update_task_completed(&callback_id, Some(""))
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_write_callback_summary(&db, &task).await;
+
+        // No task_messages should be written
+        let msgs = db.load_task_messages(&parent_id).await.unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_callback_summary_handles_missing_optional_fields() {
+        let db = test_db();
+
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "groom task".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "run_claude_pilot_groom".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("session-groom".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        // Groom callback — no pr_url, just session and turns
+        db.update_task_completed(&callback_id, Some("Session: groom-123\nTurns: 15"))
+            .await
+            .unwrap();
+
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        try_write_callback_summary(&db, &task).await;
+
+        let msgs = db.load_task_messages(&parent_id).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.contains("session=groom-123"));
+        assert!(msgs[0].content.contains("turns=15"));
+        // Should NOT contain pr_url since it's not in the result
+        assert!(!msgs[0].content.contains("PR:"));
     }
 
     // ===== is_team_child_callback predicate tests =====

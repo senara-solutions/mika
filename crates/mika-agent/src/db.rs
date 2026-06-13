@@ -7289,6 +7289,28 @@ impl Database {
         Ok(tx.last_insert_rowid())
     }
 
+    /// Insert a single row into `task_messages` without a transaction.
+    /// Used by the dispatcher to write engine-internal task narrative (e.g., callback
+    /// summaries) that should NOT appear in `messages` (mika#965).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_task_message(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO task_messages (task_id, agent_id, session_id, role, content, metadata, trace_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![task_id, agent_id, session_id, role, content, metadata, trace_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Double-write: insert into `messages` AND `task_messages` in a single transaction.
     /// When `task_id` is `None`, behaves identically to `save_message_with_metadata`
     /// (no transaction overhead, no `task_messages` row).
@@ -17804,6 +17826,57 @@ mod tests {
         assert_eq!(task_msgs[0].content, "first");
         assert_eq!(task_msgs[1].content, "second");
         assert_eq!(task_msgs[2].content, "third");
+    }
+
+    #[test]
+    fn test_insert_task_message_standalone() {
+        let (db, sid) = db_with_session();
+        let task_id = "task-standalone";
+
+        let row_id = db
+            .insert_task_message(
+                task_id,
+                "mika",
+                &sid,
+                "system",
+                "Callback completed: session=abc, turns=5",
+                Some(r#"{"claude_pilot":{"session_id":"abc","turns":5}}"#),
+                Some("trace-123"),
+            )
+            .unwrap();
+        assert!(row_id > 0);
+
+        let msgs = db.load_task_messages(task_id).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].task_id, task_id);
+        assert_eq!(msgs[0].agent_id, "mika");
+        assert_eq!(msgs[0].session_id, sid);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[0].content, "Callback completed: session=abc, turns=5");
+        assert!(
+            msgs[0]
+                .metadata
+                .as_deref()
+                .unwrap()
+                .contains("claude_pilot")
+        );
+        assert_eq!(msgs[0].trace_id.as_deref(), Some("trace-123"));
+    }
+
+    #[test]
+    fn test_insert_task_message_with_none_optional_fields() {
+        let (db, sid) = db_with_session();
+        let task_id = "task-none-fields";
+
+        let row_id = db
+            .insert_task_message(task_id, "mika", &sid, "system", "summary", None, None)
+            .unwrap();
+        assert!(row_id > 0);
+
+        let msgs = db.load_task_messages(task_id).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].metadata.is_none());
+        assert!(msgs[0].trace_id.is_none());
     }
 
     /// Happy-path replay: simulate a milestone dispatch with multiple children.

@@ -942,6 +942,35 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Insert a single row into `task_messages` without a transaction (mika#965).
+    /// Used by the dispatcher for engine-internal task narrative that should NOT
+    /// appear in `messages`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_task_message(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        metadata: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<i64> {
+        let (tid, aid, sid, r, c, m, t) = (
+            task_id.to_owned(),
+            agent_id.to_owned(),
+            session_id.to_owned(),
+            role.to_owned(),
+            content.to_owned(),
+            metadata.map(|s| s.to_owned()),
+            trace_id.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| {
+            db.insert_task_message(&tid, &aid, &sid, &r, &c, m.as_deref(), t.as_deref())
+        })
+        .await
+    }
+
     /// Load all task messages for a given task, ordered by creation time.
     pub async fn load_task_messages(&self, task_id: &str) -> Result<Vec<TaskMessage>> {
         let tid = task_id.to_owned();
