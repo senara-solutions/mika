@@ -33,6 +33,7 @@ use mika_common::llm::LlmProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Tick interval in seconds. Hard-coded for v1 (#906).
@@ -58,6 +59,7 @@ const RESOLVER_TICK_INTERVAL_SECS: u64 = 30 * 60;
 /// * `budget` — Per-batch LLM call cap (from `MIKA_KG_BATCH_BUDGET`).
 /// * `interval_secs` — Tick interval override (for testing). Pass `None` to
 ///   use the default 30-minute interval.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_resolver_tick_task(
     agent_id: String,
     db: AsyncDatabase,
@@ -66,6 +68,7 @@ pub fn spawn_resolver_tick_task(
     kg_config: &KgAgentConfig,
     budget: u32,
     interval_secs: Option<u64>,
+    cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let (docs_root_hashes, corpora_roots): (Vec<String>, Vec<PathBuf>) = match kg_config {
         KgAgentConfig::Enabled { corpora } => (
@@ -87,7 +90,22 @@ pub fn spawn_resolver_tick_task(
         interval.tick().await;
 
         loop {
-            interval.tick().await;
+            // Cooperative cancellation: exit between ticks on SIGTERM (#802).
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = cancel.cancelled() => {
+                    info!(
+                        agent_id = %agent_id,
+                        event = "kg_tick_cancelled",
+                        "KG resolver tick cancelled (graceful shutdown)"
+                    );
+                    return;
+                }
+            }
+            // Double-check before starting a potentially long batch.
+            if cancel.is_cancelled() {
+                return;
+            }
             tick_body(
                 &agent_id,
                 &db,
@@ -96,12 +114,14 @@ pub fn spawn_resolver_tick_task(
                 &corpora_roots,
                 &docs_root_hashes,
                 budget,
+                &cancel,
             )
             .await;
         }
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tick_body(
     agent_id: &str,
     db: &AsyncDatabase,
@@ -110,6 +130,7 @@ async fn tick_body(
     corpora_roots: &[PathBuf],
     docs_root_hashes: &[String],
     budget: u32,
+    cancel: &CancellationToken,
 ) {
     let trace_id = mika_common::trace::generate_trace_id();
 
@@ -117,7 +138,21 @@ async fn tick_body(
     // Run extraction before resolution so newly-extracted entities are
     // immediately available for resolution in the same tick.
     if let Some(ext_llm) = extraction_llm {
-        tick_extraction(agent_id, db, ext_llm, corpora_roots, budget, &trace_id).await;
+        tick_extraction(
+            agent_id,
+            db,
+            ext_llm,
+            corpora_roots,
+            budget,
+            &trace_id,
+            cancel,
+        )
+        .await;
+    }
+
+    // Graceful shutdown: skip remaining phases if cancelled (#802).
+    if cancel.is_cancelled() {
+        return;
     }
 
     // --- Phase 2: Resolution (#906) ---
@@ -128,8 +163,14 @@ async fn tick_body(
         docs_root_hashes,
         budget,
         &trace_id,
+        cancel,
     )
     .await;
+
+    // Graceful shutdown: skip coverage report if cancelled (#802).
+    if cancel.is_cancelled() {
+        return;
+    }
 
     // --- Phase 3: Coverage report (#1052) ---
     // Log per-corpus extraction coverage after both phases complete.
@@ -153,6 +194,7 @@ async fn tick_extraction(
     corpora_roots: &[PathBuf],
     budget: u32,
     trace_id: &str,
+    cancel: &CancellationToken,
 ) {
     // Phase 1: Count pending docs per corpus.
     let mut corpus_pending: Vec<u32> = Vec::new();
@@ -204,9 +246,14 @@ async fn tick_extraction(
     let mut total_failed: usize = 0;
 
     for (idx, (extractor, per_budget)) in extractors.into_iter().zip(allocated.iter()).enumerate() {
+        // Graceful shutdown: skip remaining corpora (#802).
+        if cancel.is_cancelled() {
+            break;
+        }
         if *per_budget == 0 {
             continue;
         }
+        let extractor = extractor.with_cancel_token(cancel.child_token());
         match extractor.extract_pending(*per_budget).await {
             Ok(stats) => {
                 let corpus_key = corpora_roots[idx].display().to_string();
@@ -252,13 +299,15 @@ async fn tick_resolution(
     docs_root_hashes: &[String],
     budget: u32,
     trace_id: &str,
+    cancel: &CancellationToken,
 ) {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         llm.clone(),
         docs_root_hashes.to_vec(),
         Some(trace_id),
-    );
+    )
+    .with_cancel_token(cancel.child_token());
 
     // Count pending before resolution for observability.
     let pending_before = match resolver.count_pending().await {
@@ -499,6 +548,7 @@ mod tests {
             &kg_config,
             500,
             Some(1), // 1-second interval (won't fire since task exits)
+            CancellationToken::new(),
         );
 
         // Task should complete quickly since KG is disabled.
@@ -533,6 +583,7 @@ mod tests {
             &kg_config,
             500,
             Some(3600), // long interval so we can abort before it fires
+            CancellationToken::new(),
         );
 
         handle.abort();
@@ -541,6 +592,44 @@ mod tests {
         assert!(
             result.unwrap_err().is_cancelled(),
             "error should be cancellation"
+        );
+    }
+
+    /// Test that cancelling the token exits the tick loop cleanly (#802).
+    #[tokio::test]
+    async fn test_cancellation_token_exits_cleanly() {
+        use crate::kg::config::CorpusConfig;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Database::open(tmp.path()).unwrap();
+        let async_db = AsyncDatabase::new_with_agent(db, "test-agent");
+
+        let kg_config = KgAgentConfig::Enabled {
+            corpora: vec![CorpusConfig {
+                docs_root: PathBuf::from("/nonexistent"),
+                docs_root_hash: "abcdef1234567890".to_string(),
+            }],
+        };
+
+        let cancel = CancellationToken::new();
+        let handle = spawn_resolver_tick_task(
+            "test-agent".to_string(),
+            async_db,
+            None,
+            None,
+            &kg_config,
+            500,
+            Some(3600), // long interval
+            cancel.clone(),
+        );
+
+        // Cancel the token — the task should exit cleanly (Ok, not Err).
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(result.is_ok(), "task should complete within timeout");
+        assert!(
+            result.unwrap().is_ok(),
+            "cancelled task should exit cleanly (Ok), not via abort (Err)"
         );
     }
 }
