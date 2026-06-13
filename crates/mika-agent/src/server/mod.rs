@@ -1270,6 +1270,36 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
     ready.store(true, Ordering::Release);
 
+    // Cancel orphan recurring tasks for agents no longer on disk (mika#1436).
+    // Runs against the startup-time agent set before per-agent recurring-task setup.
+    // #1399's lazy-insert path runs later and adds tasks via ensure_recurring_task
+    // when the agent is first exercised — no conflict.
+    {
+        let known_agent_ids: Vec<String> = state.agents.iter().map(|e| e.key().clone()).collect();
+        if !known_agent_ids.is_empty() {
+            let db = state.dashboard_db.clone();
+            match db
+                .with_db(move |db| db.cancel_orphan_recurring_tasks(&known_agent_ids))
+                .await
+            {
+                Ok(orphans) if !orphans.is_empty() => {
+                    let agent_ids: Vec<&str> = orphans.iter().map(|(_, a)| a.as_str()).collect();
+                    info!(
+                        count = orphans.len(),
+                        agent_ids = ?agent_ids,
+                        "cancelled orphan recurring tasks for agents no longer on disk"
+                    );
+                }
+                Ok(_) => {} // no orphans, no log noise
+                Err(e) => warn!(error = %e, "orphan recurring task sweep failed"),
+            }
+        } else {
+            warn!(
+                "startup-time agent set is empty; skipping orphan recurring task sweep as safety measure"
+            );
+        }
+    }
+
     // Start task engines for all agents:
     // 1. Register recurring tasks (heartbeat, reflection) if missing
     // 2. Run startup recovery (expire/recover in_progress, load heap)
