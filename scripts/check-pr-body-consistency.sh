@@ -59,12 +59,14 @@ add_error() {
 get_open_sub_issues() {
     local parent_number="$1"
     local query
+    # GitHub's GraphQL `trackedIssues` field doesn't accept a `states` argument
+    # (mika#527 hotfix). Fetch all and filter to OPEN client-side via jq.
     query='query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
-      trackedIssues(first: 50, states: OPEN) {
+      trackedIssues(first: 50) {
         totalCount
-        nodes { number }
+        nodes { number state }
       }
     }
   }
@@ -91,10 +93,11 @@ get_open_sub_issues() {
     local total_count
     total_count="$(echo "$result" | jq -r '.data.repository.issue.trackedIssues.totalCount')"
     if [[ "$total_count" -gt 50 ]]; then
-        echo "WARNING: Issue #${parent_number} has ${total_count} open sub-issues; only the first 50 are checked." >&2
+        echo "WARNING: Issue #${parent_number} has ${total_count} tracked sub-issues; only the first 50 are inspected." >&2
     fi
 
-    echo "$result" | jq -r '.data.repository.issue.trackedIssues.nodes[].number'
+    # Filter to OPEN sub-issues (states arg not supported on trackedIssues — mika#527 hotfix)
+    echo "$result" | jq -r '.data.repository.issue.trackedIssues.nodes[] | select(.state == "OPEN") | .number'
 }
 
 # ---------------------------------------------------------------------------
