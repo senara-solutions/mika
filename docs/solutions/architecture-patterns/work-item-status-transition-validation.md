@@ -31,13 +31,14 @@ const VALID_TRANSITIONS: &[(&str, &[&str])] = &[
     ("in_progress", &["blocked", "completed", "cancelled"]),
     ("blocked", &["in_progress", "completed", "cancelled"]),
     ("completed", &[]),
-    ("cancelled", &[]),
+    ("cancelled", &["in_progress"]),
 ];
 ```
 
 Key decisions:
 - **Validation in tool layer, not DB.** The DB method `update_manual_task_status` remains general-purpose. The tool does a `get_task` first to read current status, validates, then calls the update.
-- **Terminal states are final (status locked, metadata writable).** `completed` and `cancelled` have no outbound status transitions. However, metadata can still be written to terminal-state tasks (#617) — the tool applies the metadata and returns success without changing the status. This matches `validate_task()` which already treats them as non-active.
+- **`completed` is terminal (status locked, metadata writable).** `completed` has no outbound status transitions. Metadata can still be written to completed tasks (#617) — the tool applies the metadata and returns success without changing the status.
+- **`cancelled → in_progress` allowed** (the cancel-and-retry case, mika#856). Reuses the existing task row instead of creating a new one. Other transitions from `cancelled` remain disallowed. While cancelled, metadata writes via the same-status path continue to work.
 - **`blocked → in_progress` allowed** (the un-block case). `blocked → pending` is not — if unblocked, resume work, don't regress.
 - **Clear error messages** include the allowed transitions: `"Cannot transition from 'completed' to 'in_progress'. 'completed' is a terminal state."`
 
