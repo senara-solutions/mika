@@ -114,12 +114,14 @@ pub fn spawn_resolver_tick_task(
                 &corpora_roots,
                 &docs_root_hashes,
                 budget,
+                &cancel,
             )
             .await;
         }
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tick_body(
     agent_id: &str,
     db: &AsyncDatabase,
@@ -128,6 +130,7 @@ async fn tick_body(
     corpora_roots: &[PathBuf],
     docs_root_hashes: &[String],
     budget: u32,
+    cancel: &CancellationToken,
 ) {
     let trace_id = mika_common::trace::generate_trace_id();
 
@@ -135,7 +138,21 @@ async fn tick_body(
     // Run extraction before resolution so newly-extracted entities are
     // immediately available for resolution in the same tick.
     if let Some(ext_llm) = extraction_llm {
-        tick_extraction(agent_id, db, ext_llm, corpora_roots, budget, &trace_id).await;
+        tick_extraction(
+            agent_id,
+            db,
+            ext_llm,
+            corpora_roots,
+            budget,
+            &trace_id,
+            cancel,
+        )
+        .await;
+    }
+
+    // Graceful shutdown: skip remaining phases if cancelled (#802).
+    if cancel.is_cancelled() {
+        return;
     }
 
     // --- Phase 2: Resolution (#906) ---
@@ -146,8 +163,14 @@ async fn tick_body(
         docs_root_hashes,
         budget,
         &trace_id,
+        cancel,
     )
     .await;
+
+    // Graceful shutdown: skip coverage report if cancelled (#802).
+    if cancel.is_cancelled() {
+        return;
+    }
 
     // --- Phase 3: Coverage report (#1052) ---
     // Log per-corpus extraction coverage after both phases complete.
@@ -171,6 +194,7 @@ async fn tick_extraction(
     corpora_roots: &[PathBuf],
     budget: u32,
     trace_id: &str,
+    cancel: &CancellationToken,
 ) {
     // Phase 1: Count pending docs per corpus.
     let mut corpus_pending: Vec<u32> = Vec::new();
@@ -222,9 +246,14 @@ async fn tick_extraction(
     let mut total_failed: usize = 0;
 
     for (idx, (extractor, per_budget)) in extractors.into_iter().zip(allocated.iter()).enumerate() {
+        // Graceful shutdown: skip remaining corpora (#802).
+        if cancel.is_cancelled() {
+            break;
+        }
         if *per_budget == 0 {
             continue;
         }
+        let extractor = extractor.with_cancel_token(cancel.child_token());
         match extractor.extract_pending(*per_budget).await {
             Ok(stats) => {
                 let corpus_key = corpora_roots[idx].display().to_string();
@@ -270,13 +299,15 @@ async fn tick_resolution(
     docs_root_hashes: &[String],
     budget: u32,
     trace_id: &str,
+    cancel: &CancellationToken,
 ) {
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         llm.clone(),
         docs_root_hashes.to_vec(),
         Some(trace_id),
-    );
+    )
+    .with_cancel_token(cancel.child_token());
 
     // Count pending before resolution for observability.
     let pending_before = match resolver.count_pending().await {

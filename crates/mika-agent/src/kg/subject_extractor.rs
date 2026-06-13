@@ -577,6 +577,10 @@ pub struct SubjectExtractor {
     docs_root: PathBuf,
     /// Precomputed `hash_docs_root(&docs_root)` — shared-corpus key for v27 KG tables.
     docs_root_hash: String,
+    /// Optional cancellation token for graceful shutdown (#802).
+    /// When set and cancelled, the per-doc extraction loop abandons
+    /// remaining work — half-extracted docs stay pending for next startup.
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl SubjectExtractor {
@@ -602,7 +606,18 @@ impl SubjectExtractor {
             trace_id,
             docs_root,
             docs_root_hash,
+            cancel_token: None,
         }
+    }
+
+    /// Set the cancellation token for graceful shutdown (#802).
+    ///
+    /// When cancelled, the per-doc extraction loop abandons remaining
+    /// work between LLM calls. In-flight calls complete (bounded by reqwest
+    /// timeout); unextracted docs stay pending for next startup.
+    pub fn with_cancel_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
     }
 
     /// Returns the precomputed docs_root_hash (shared-corpus key for v27 KG tables).
@@ -936,6 +951,21 @@ impl SubjectExtractor {
         }
 
         for (i, doc_path) in pending_docs.iter().enumerate() {
+            // Graceful shutdown: abandon remaining docs (#802).
+            if let Some(ref ct) = self.cancel_token
+                && ct.is_cancelled()
+            {
+                info!(
+                    trace_id = %self.trace_id,
+                    agent_id = %agent_id,
+                    extracted_so_far = stats.docs_extracted,
+                    remaining = pending_docs.len() - i,
+                    event = "kg_extraction_cancelled_mid_batch",
+                    "extraction abandoned mid-batch (graceful shutdown) — remaining docs stay pending"
+                );
+                break;
+            }
+
             // Budget guard: abort cleanly once we've made `budget` LLM calls.
             if stats.llm_calls >= budget {
                 warn!(
