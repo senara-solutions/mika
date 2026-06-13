@@ -29,6 +29,7 @@ mod list_skills;
 mod list_tasks;
 mod list_teams;
 mod list_workspace;
+pub(crate) mod post_action_hooks;
 pub(crate) mod pr_merge_with_gate;
 mod promote_deferred_callback;
 mod query_knowledge_graph;
