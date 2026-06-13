@@ -144,7 +144,7 @@ jobs:
 
   docker-build-filter:
     name: Docker Build Filter
-    runs-on: [self-hosted, Linux, X64, gentux]
+    runs-on: ubuntu-22.04
     if: github.event_name == 'pull_request'
     outputs:
       docker-relevant: ${{ steps.filter.outputs.docker-relevant }}
@@ -166,7 +166,7 @@ jobs:
 
   docker-build:
     name: Docker Build
-    runs-on: [self-hosted, Linux, X64, gentux, docker]
+    runs-on: ubuntu-22.04
     needs: docker-build-filter
     if: github.event_name == 'pull_request' && needs.docker-build-filter.outputs.docker-relevant == 'true'
     strategy:
