@@ -1402,7 +1402,7 @@ async fn try_extract_callback_metadata(db: &AsyncDatabase, task: &Task) {
     let merged = match &parent.metadata {
         Some(existing) => {
             if let Ok(mut base) = serde_json::from_str::<serde_json::Value>(existing) {
-                crate::task_metadata::merge_metadata(&mut base, &extracted);
+                crate::task_state::merge_metadata(&mut base, &extracted);
                 base
             } else {
                 extracted

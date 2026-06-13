@@ -20,7 +20,7 @@ use crate::async_db::AsyncDatabase;
 use crate::github_graphql::{
     add_label_to_issue, fetch_milestone_issues_by_state, parse_phase_label,
 };
-use crate::task_metadata::merge_metadata;
+use crate::task_state::merge_metadata;
 use tracing::{debug, info, warn};
 
 /// Prefix on PR-closed webhook messages from the gateway.

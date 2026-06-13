@@ -26,7 +26,7 @@ pub mod server;
 pub mod skills;
 pub mod startup;
 pub mod task_engine;
-pub mod task_metadata;
+pub mod task_state;
 pub mod teams;
 #[cfg(test)]
 pub mod test_utils;
