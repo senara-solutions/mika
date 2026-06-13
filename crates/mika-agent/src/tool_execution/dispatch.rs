@@ -166,6 +166,14 @@ pub(crate) async fn process_tool_calls(
                 let output = execute_tool(&dispatch, name, arguments.clone()).await;
                 let tool_latency_ms = tool_start.elapsed().as_millis() as u64;
 
+                // Post-action hooks (mika#772): side-effect-only callbacks that
+                // fire after a tool call succeeds, before the result returns to
+                // the LLM. Failure is warn-and-continue.
+                crate::tools::post_action_hooks::run_post_action_hooks(
+                    name, arguments, &output, db,
+                )
+                .await;
+
                 // Record full tool call in database
                 if store_tool_calls {
                     let tool_id = uuid::Uuid::new_v4().to_string();

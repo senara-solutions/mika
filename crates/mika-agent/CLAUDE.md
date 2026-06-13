@@ -105,6 +105,20 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 
 **Context-redundancy guards (#647):** Pre-tool checks that detect when read tools request data already in the agent's context. Three guards extend the #645 pattern: (1) `read_agent_file` rejects paths matching active skill prompt files (`is_active_skill_prompt()` checks `ToolContext.active_skill_paths`); (2) `search_memory` hard-redirects `category="core_memory"` since core memory is always in the system prompt; (3) `search_memory` appends a soft hint when `category="all"` and the query matches a `core_memory_section_names()` entry. All guards use `ToolOutput::error()` for definitive redirects and hints prepended to success results for soft nudges. Path normalization shared via `normalize_path_prefix()` helper. Guard ordering: core_memory path guard → skill prompt guard → normal execution.
 
+### Post-Action Hooks (mika#772)
+
+`src/tools/post_action_hooks.rs` — Registry-driven side-effect callbacks that fire after specific tool calls succeed. Architecturally distinct from the EndTurn post-condition guard chain (§ Post-Conditions): hooks run AFTER a tool call's side effects commit, BEFORE the tool result returns to the LLM. Failure is warn-and-continue — hooks never affect the tool's own result or the agent loop.
+
+**Registered hooks:**
+
+| Hook | Tool | Fires when | Action |
+|------|------|-----------|--------|
+| Task completion auto-fact | `update_task_status` | `status="completed"` on non-milestone, non-project tasks | Emits `store_fact(category="event")` via `db.add_event()` with structured description (repo#issue, PR URL, turns, cost, task ID) |
+
+**Wiring:** `run_post_action_hooks()` is called from `tool_execution/dispatch.rs` after `execute_tool()` returns, before tool-call recording and summary building. Uses `AsyncDatabase` directly (same write path as the `store_fact` tool), NOT re-dispatch through `ToolRegistry` (avoids recursive dispatch + audit_events double-counting).
+
+**Milestone/project exclusion:** Iteration 1 excludes `type="milestone"` and `type="project"` tasks — existing prompt directives handle those. **Graceful degradation:** Missing `claude_pilot` metadata fields (hand-completed tasks) use `—` placeholders.
+
 ### Management Tools
 
 14 tools for multi-agent/team workflows (`create_agent`, `list_agents`, `create_team`, `delete_team`, `update_team`, `add_team_member`, `remove_team_member`, `delegate_task`, `list_teams`, `run_team`, `get_team_status`, `get_team_history`, `create_task`, `update_task_status`). `create_agent`, `list_agents`, `create_team` always registered; others added when `agents.len() > 1 || !teams.is_empty()`. Orchestrator guards: only default agent or team-listed orchestrators can delegate/run teams; self-delegation blocked. **Task guard:** `delegate_task` and long-running skills require `task_id` referencing an active manual task. Per-tool timeouts: `run_team` (300s), `delegate_task` (120s).
