@@ -289,7 +289,7 @@ async fn merge_and_persist_metadata(
     let merged = if let Ok(Some(task)) = ctx.db.get_task_unscoped(task_id).await {
         if let Some(existing_str) = &task.metadata {
             if let Ok(mut existing) = serde_json::from_str::<Value>(existing_str) {
-                crate::task_metadata::merge_metadata(&mut existing, new_meta);
+                crate::task_state::merge_metadata(&mut existing, new_meta);
                 existing
             } else {
                 new_meta.clone()

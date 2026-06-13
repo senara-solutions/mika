@@ -738,7 +738,7 @@ async fn write_auto_merge_pr_url_to_supervisor(ctx: &ToolContext<'_>, pr_url: &s
     let merged = match &parent.metadata {
         Some(existing) => {
             if let Ok(mut base) = serde_json::from_str::<serde_json::Value>(existing) {
-                crate::task_metadata::merge_metadata(&mut base, &patch);
+                crate::task_state::merge_metadata(&mut base, &patch);
                 base
             } else {
                 patch

@@ -31,7 +31,7 @@ use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
-use crate::task_metadata::merge_metadata;
+use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     CheckClassification, classify_checks, run_gh_checks, run_gh_subprocess,
 };
