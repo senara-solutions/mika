@@ -192,6 +192,10 @@ pub struct SubjectEntityResolver {
     /// instead of `agent_id`. Writes to `kg_subject_resolutions` and
     /// `kg_resolutions_log` still use `agent_id` (per-agent).
     docs_root_hashes: Vec<String>,
+    /// Optional cancellation token for graceful shutdown (#802).
+    /// When set and cancelled, the per-entity resolution loop abandons
+    /// remaining work — half-resolved subjects stay pending for next startup.
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl SubjectEntityResolver {
@@ -225,7 +229,18 @@ impl SubjectEntityResolver {
             llm,
             trace_id,
             docs_root_hashes,
+            cancel_token: None,
         }
+    }
+
+    /// Set the cancellation token for graceful shutdown (#802).
+    ///
+    /// When cancelled, the per-entity resolution loop abandons remaining
+    /// work between LLM calls. In-flight calls complete (bounded by reqwest
+    /// timeout); unresolved subjects stay pending for next startup.
+    pub fn with_cancel_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
     }
 
     /// Resolve entities produced by a single doc's extraction (D5).
@@ -354,6 +369,21 @@ impl SubjectEntityResolver {
         };
 
         for (i, entity) in entities.iter().enumerate() {
+            // Graceful shutdown: abandon remaining entities (#802).
+            if let Some(ref ct) = self.cancel_token
+                && ct.is_cancelled()
+            {
+                info!(
+                    trace_id = %self.trace_id,
+                    agent_id = %agent_id,
+                    resolved_so_far = i,
+                    remaining = entities.len() - i,
+                    event = "kg_resolution_cancelled_mid_batch",
+                    "resolution abandoned mid-batch (graceful shutdown) — remaining subjects stay pending"
+                );
+                break;
+            }
+
             // Per-corpus fairness tracking (#927).
             *stats
                 .per_corpus_attempted
