@@ -355,7 +355,7 @@ impl Tool for SearchMemoryTool {
 
 /// Tool: get agent info (stats, core memory, soul).
 struct GetAgentInfoTool {
-    agents: Arc<std::collections::HashMap<String, Arc<super::state::AgentState>>>,
+    agents: Arc<dashmap::DashMap<String, Arc<super::state::AgentState>>>,
 }
 
 #[async_trait::async_trait]
@@ -402,7 +402,7 @@ impl Tool for GetAgentInfoTool {
 
         // Get core memory and soul from per-agent state
         let normalized = mika_common::agent::normalize_agent_name(&agent_id);
-        if let Some(agent_state) = self.agents.get(&normalized) {
+        if let Some(agent_state) = self.agents.get(&normalized).map(|r| r.value().clone()) {
             // Core memory
             if let Ok(entries) = agent_state.db.get_all_core_memory().await {
                 output.push_str("\nCore Memory:\n");
@@ -561,7 +561,7 @@ impl Tool for CreateGithubIssueTool {
 
 /// Configuration for building investigation tools.
 pub struct InvestigationToolsConfig {
-    pub agents: Arc<std::collections::HashMap<String, Arc<super::state::AgentState>>>,
+    pub agents: Arc<dashmap::DashMap<String, Arc<super::state::AgentState>>>,
     pub http_client: reqwest::Client,
     pub investigate_github_token: Option<String>,
     pub github_repo: Option<String>,
@@ -615,7 +615,7 @@ struct ToolCallMeta {
 /// Build the system prompt and context for an investigation.
 async fn build_investigation_context(
     db: &AsyncDatabase,
-    agents: &std::collections::HashMap<String, Arc<super::state::AgentState>>,
+    agents: &dashmap::DashMap<String, Arc<super::state::AgentState>>,
     message: &SessionMessage,
     tool_call_index: Option<usize>,
     has_github_tool: bool,
@@ -665,7 +665,7 @@ async fn build_investigation_context(
 
     // Include core memory if available
     let normalized = mika_common::agent::normalize_agent_name(agent_id);
-    if let Some(agent_state) = agents.get(&normalized)
+    if let Some(agent_state) = agents.get(&normalized).map(|r| r.value().clone())
         && let Ok(entries) = agent_state.db.get_all_core_memory().await
         && !entries.is_empty()
     {
@@ -1121,6 +1121,7 @@ pub async fn handle_investigate(
     // The default agent is guaranteed to exist (validated in run_server).
     let llm = state
         .resolve_agent(&state.default_agent)
+        .await
         .expect("default agent must exist")
         .llm
         .clone();

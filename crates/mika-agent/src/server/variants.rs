@@ -25,12 +25,17 @@ fn find_skill_dir(
     (std::path::PathBuf, crate::skills::manifest::SkillManifest),
     (StatusCode, Json<serde_json::Value>),
 > {
-    let agent_state = state.agents.values().next().ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "no agents configured"})),
-        )
-    })?;
+    let agent_state = state
+        .agents
+        .iter()
+        .next()
+        .map(|r| r.value().clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "no agents configured"})),
+            )
+        })?;
 
     let registry = agent_state.skills.lock().unwrap().clone();
     let entry = registry
@@ -52,7 +57,7 @@ fn find_skill_dir(
 // ---------------------------------------------------------------------------
 
 pub async fn handle_variants_summary(State(state): State<AppState>) -> impl IntoResponse {
-    let agent_state = match state.agents.values().next() {
+    let agent_state = match state.agents.iter().next().map(|r| r.value().clone()) {
         Some(a) => a,
         None => {
             return (
@@ -299,8 +304,8 @@ pub async fn handle_variant_promote(
     State(state): State<AppState>,
     Path((skill_name, provider, model)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    let agent_state = match state.agents.values().next() {
-        Some(a) => a.clone(),
+    let agent_state = match state.agents.iter().next().map(|r| r.value().clone()) {
+        Some(a) => a,
         None => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,

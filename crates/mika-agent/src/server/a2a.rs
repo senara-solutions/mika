@@ -59,7 +59,7 @@ pub async fn handle_a2a_jsonrpc(
     }
 
     // Resolve agent
-    let agent_state = match state.resolve_agent(&agent_name) {
+    let agent_state = match state.resolve_agent(&agent_name).await {
         Some(a) => a,
         None => {
             return Json(JsonRpcResponse::error(
@@ -822,7 +822,7 @@ pub async fn handle_agent_card(
     State(state): State<AppState>,
     Path(agent_name): Path<String>,
 ) -> Response {
-    let agent_state = match state.resolve_agent(&agent_name) {
+    let agent_state = match state.resolve_agent(&agent_name).await {
         Some(a) => a,
         None => {
             return (

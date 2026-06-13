@@ -504,6 +504,8 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 
 **Dashboard API:** `/api/v1/*` — timeline, agents, sessions, messages, traces, investigate, tasks (+ detail/children/descendants/sessions), team-runs (+ summary), llm-calls (+ detail), tool-calls (+ detail), dev-runs (+ detail), github proxy endpoints. CORS scoped to `MIKA_CORS_ORIGIN`.
 
+**Lazy agent resolution (#1399):** `AppState.agents` uses `DashMap` for concurrent mutable access. `resolve_agent()` is async — on cache miss (agent created after server startup), it checks for `identity.toml` on disk + DB row, lazy-constructs the `AgentState` via the same `init_agent` factory used at startup, and inserts into the map. Subsequent calls hit the fast path. Emits `agent_resolved_lazily` INFO event on successful lazy insert. Agents whose dir is deleted while running remain in the map (orphan removal is mika#1436).
+
 **Time-range filtering (#659):** All list endpoints (timeline, sessions, llm-calls, tool-calls, team-runs, tasks, dev-runs) accept `from`/`to` ISO 8601 string query params for server-side filtering against the surface's primary timestamp column (`created_at` or `started_at`). String comparison is correct because ISO 8601 ordering matches chronological ordering. Frontend emits via `<TimeRangeFilter />` from `@senara-solutions/ui`.
 
 **Request logging:** `tower_http::trace::TraceLayer` middleware. `inject_request_meta` middleware copies method+path for top-level JSON fields. `/health` logged at DEBUG. Agent lock via `tokio::sync::Mutex<()>` with non-blocking `try_lock` (429 if busy).
