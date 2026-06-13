@@ -154,7 +154,7 @@ pub async fn handle_agent_detail(
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
     // Find the agent in our agents map to get home_dir
-    let agent_state = match state.resolve_agent(&agent_id) {
+    let agent_state = match state.resolve_agent(&agent_id).await {
         Some(a) => a,
         None => {
             return (
@@ -330,7 +330,7 @@ pub async fn handle_agent_facts(
     Path(agent_id): Path<String>,
     Query(q): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    let agent_state = match state.resolve_agent(&agent_id) {
+    let agent_state = match state.resolve_agent(&agent_id).await {
         Some(a) => a,
         None => {
             return (

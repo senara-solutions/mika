@@ -119,7 +119,7 @@ pub async fn handle_rewind_resolve(
             .into_response();
     }
 
-    let agent_state = match state.resolve_agent(&req.agent) {
+    let agent_state = match state.resolve_agent(&req.agent).await {
         Some(a) => a,
         None => {
             return (
@@ -168,7 +168,7 @@ pub async fn handle_rewind_preview(
     State(state): State<AppState>,
     Json(req): Json<RewindRequest>,
 ) -> impl IntoResponse {
-    let agent_state = match state.resolve_agent(&req.agent) {
+    let agent_state = match state.resolve_agent(&req.agent).await {
         Some(a) => a,
         None => {
             return (
@@ -254,7 +254,7 @@ pub async fn handle_rewind_execute(
     State(state): State<AppState>,
     Json(req): Json<RewindRequest>,
 ) -> impl IntoResponse {
-    let agent_state = match state.resolve_agent(&req.agent) {
+    let agent_state = match state.resolve_agent(&req.agent).await {
         Some(a) => a,
         None => {
             return (

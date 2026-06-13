@@ -29,7 +29,6 @@ use axum::{
     routing::{get, post},
 };
 use secrecy::ExposeSecret;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -660,7 +659,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     }
 
     // Discover and initialize all agents
-    let mut agents = HashMap::new();
+    let agents: dashmap::DashMap<String, Arc<AgentState>> = dashmap::DashMap::new();
 
     // Session-scoped PR review dedup map (#821). Created once, shared across
     // all agents via their TaskDispatchers and AppState.
@@ -724,23 +723,26 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     }
 
     let mut default_agent = home::read_active_agent(global_home);
-    info!(
-        agents = ?agents.keys().collect::<Vec<_>>(),
-        default = %default_agent,
-        "discovered {} agent(s)",
-        agents.len()
-    );
+    {
+        let agent_names: Vec<_> = agents.iter().map(|r| r.key().clone()).collect();
+        info!(
+            agents = ?agent_names,
+            default = %default_agent,
+            "discovered {} agent(s)",
+            agent_names.len()
+        );
+    }
 
     // Validate the active agent exists; fall back to the first available agent
     // if the active_agent file points to a name that no longer exists.
-    if !agents.contains_key(&default_agent) {
-        if let Some(fallback) = agents.keys().next() {
+    if agents.get(&default_agent).is_none() {
+        if let Some(fallback) = agents.iter().next().map(|r| r.key().clone()) {
             warn!(
                 requested = %default_agent,
                 fallback = %fallback,
                 "active agent not found, falling back"
             );
-            default_agent = fallback.clone();
+            default_agent = fallback;
             let _ = home::write_active_agent(global_home, &default_agent);
         } else {
             anyhow::bail!("no agents available");
@@ -752,6 +754,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let dashboard_db = agents
         .get(&default_agent)
         .expect("default agent must exist")
+        .value()
         .db
         .clone();
 
@@ -767,16 +770,18 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     {
         let default_state = agents
             .get(&default_agent)
-            .expect("default agent must exist");
+            .expect("default agent must exist")
+            .value()
+            .clone();
         // Clone the Arc<SkillRegistry> and drop the MutexGuard before the await
         // to avoid holding a std::sync::Mutex across an async boundary.
         let skill_reg = default_state.skills.lock().expect("skills lock").clone();
         let agent_infos: Vec<crate::kg::domain_builder::AgentInfo> = agents
             .iter()
-            .map(|(name, state)| crate::kg::domain_builder::AgentInfo {
-                name: name.clone(),
+            .map(|entry| crate::kg::domain_builder::AgentInfo {
+                name: entry.key().clone(),
                 role: None,
-                model: Some(state.llm.model_name().to_string()),
+                model: Some(entry.value().llm.model_name().to_string()),
             })
             .collect();
         let builder = crate::kg::domain_builder::DomainGraphBuilder::new(
@@ -812,7 +817,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // Agents with matching docs_root share a corpus via docs_root_hash (v27).
     // Agents with [kg] enabled=false are skipped entirely.
     {
-        for (agent_name, agent_state) in &agents {
+        for entry in agents.iter() {
+            let agent_name = entry.key();
+            let agent_state = entry.value();
             let KgAgentConfig::Enabled { ref corpora } = agent_state.kg_config else {
                 info!(
                     agent = agent_name.as_str(),
@@ -955,7 +962,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                          MIKA_KG_EXTRACTION_MODEL=openrouter/<model> for cost-sensitive deployments."
                     );
                 }
-                for (agent_name, agent_state) in &agents {
+                for entry in agents.iter() {
+                    let agent_name = entry.key();
+                    let agent_state = entry.value();
                     let KgAgentConfig::Enabled { ref corpora } = agent_state.kg_config else {
                         info!(
                             agent = agent_name.as_str(),
@@ -1121,7 +1130,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 None => None,
             };
 
-            for (agent_name, agent_state) in &agents {
+            for entry in agents.iter() {
+                let agent_name = entry.key();
+                let agent_state = entry.value();
                 let KgAgentConfig::Enabled { ref corpora } = agent_state.kg_config else {
                     info!(
                         agent = agent_name.as_str(),
@@ -1267,7 +1278,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let mut tick_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut total_tasks_loaded: usize = 0;
 
-    for (name, agent_state) in state.agents.iter() {
+    for entry in state.agents.iter() {
+        let name = entry.key();
+        let agent_state = entry.value();
         let engine = agent_state.task_engine.clone();
         let db = agent_state.db.clone();
         let agent_name = name.clone();
@@ -1449,7 +1462,7 @@ mod tests {
             },
         };
 
-        let mut agents = HashMap::new();
+        let agents = dashmap::DashMap::new();
         agents.insert("mika".to_string(), Arc::new(agent_state));
 
         AppState {
@@ -1627,7 +1640,7 @@ mod tests {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
 
-        let agent_state = state.agents.get("mika").unwrap();
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
         let _guard = agent_state.agent_lock.clone().lock_owned().await;
 
         let app = test_app(state);
@@ -1658,7 +1671,7 @@ mod tests {
     async fn test_message_stores_chat_id() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("mika").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
         let app = test_app(state);
 
         let _resp = app
@@ -2054,7 +2067,7 @@ mod tests {
     async fn test_task_complete_success() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("mika").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
         let task_id = create_callback_task(&db).await;
         let app = test_app(state);
 
@@ -2088,7 +2101,7 @@ mod tests {
     async fn test_task_complete_empty_result_rejected() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("mika").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
         let task_id = create_callback_task(&db).await;
         let app = test_app(state);
 
@@ -2133,7 +2146,7 @@ mod tests {
     async fn test_task_complete_already_completed_returns_conflict() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("mika").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
         let task_id = create_callback_task(&db).await;
 
         // Mark the task completed before the HTTP request
@@ -2175,7 +2188,7 @@ mod tests {
     async fn test_task_complete_non_callback_task_rejected() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("mika").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
 
         // Create a time-triggered task (not callback)
         let task_id = db
@@ -2309,7 +2322,7 @@ mod tests {
     async fn test_timeline_returns_data_after_message_insert() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("mika").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
 
         // Insert a message so the timeline view has data
         db.save_message("test-session", "user", "hello timeline", None)
@@ -2436,7 +2449,7 @@ mod tests {
     async fn test_session_messages_returns_paginated() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("mika").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
 
         db.save_message("test-session", "user", "hi", None)
             .await
@@ -2493,7 +2506,7 @@ mod tests {
     async fn test_trace_messages_returns_matching_messages() {
         let state = test_state();
         state.ready.store(true, Ordering::Release);
-        let db = state.agents.get("mika").unwrap().db.clone();
+        let db = state.agents.get("mika").unwrap().value().db.clone();
 
         let trace_id = "aabb0011ccddeeff0011223344556677";
         db.save_message_with_metadata(

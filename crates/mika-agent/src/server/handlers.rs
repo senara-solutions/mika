@@ -125,7 +125,7 @@ pub async fn handle_message(
     }
 
     // Resolve agent state (Arc clone — cheap atomic increment)
-    let agent_state = match state.resolve_agent(&req.agent) {
+    let agent_state = match state.resolve_agent(&req.agent).await {
         Some(a) => a,
         None => {
             return (
@@ -333,7 +333,7 @@ pub async fn handle_task_complete(
             .into_response();
     }
 
-    let agent_state = match state.resolve_agent(&req.agent) {
+    let agent_state = match state.resolve_agent(&req.agent).await {
         Some(a) => a,
         None => {
             return (
@@ -595,7 +595,7 @@ pub async fn handle_task_cancel(
     Path(task_id): Path<String>,
     JsonBody(req): JsonBody<TaskCancelRequest>,
 ) -> impl IntoResponse {
-    let agent_state = match state.resolve_agent(&req.agent) {
+    let agent_state = match state.resolve_agent(&req.agent).await {
         Some(a) => a,
         None => {
             return (

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -9,6 +8,7 @@ use mika_common::agent;
 use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::github_app::GitHubApp;
+use mika_common::home;
 use mika_common::llm::LlmProvider;
 use secrecy::SecretString;
 use tokio::sync::{OnceCell, broadcast};
@@ -61,7 +61,8 @@ pub struct AppState {
     /// Per-agent state, keyed by agent name (e.g. "mika", "work").
     /// Each AgentState is Arc-wrapped so handler clones are a cheap atomic increment
     /// instead of 3 heap allocations (PathBuf + EmbeddingClient strings).
-    pub agents: Arc<HashMap<String, Arc<AgentState>>>,
+    /// DashMap allows lazy-insertion of agents created after server startup (#1399).
+    pub agents: Arc<DashMap<String, Arc<AgentState>>>,
     /// Default agent name (resolved from active_agent file).
     pub default_agent: String,
     pub tools: Arc<ToolRegistry>,
@@ -100,14 +101,70 @@ impl AppState {
     /// Falls back to the default agent if the name is empty.
     /// Returns an Arc clone (cheap atomic increment) instead of a reference,
     /// so callers don't need to clone the inner AgentState.
-    pub fn resolve_agent(&self, name: &str) -> Option<Arc<AgentState>> {
+    ///
+    /// On cache miss, checks if the agent exists on disk (identity.toml) AND
+    /// has a DB row. If so, lazy-constructs the AgentState via `init_agent`
+    /// and inserts it into the map (#1399). Subsequent calls hit the fast path.
+    pub async fn resolve_agent(&self, name: &str) -> Option<Arc<AgentState>> {
         let effective = if name.is_empty() {
             &self.default_agent
         } else {
             name
         };
         let normalized = agent::normalize_agent_name(effective);
-        self.agents.get(&normalized).cloned()
+
+        // Fast path: already in the map.
+        if let Some(r) = self.agents.get(&normalized) {
+            return Some(r.value().clone());
+        }
+
+        // Slow path: lazy-construct from disk + DB (#1399).
+        let agent_home = home::resolve_agent_home(&self.global_home_dir, &normalized);
+        if !agent_home.join("identity.toml").exists() {
+            return None;
+        }
+        self.dashboard_db
+            .get_agent_with_stats(&normalized)
+            .await
+            .ok()
+            .flatten()?;
+
+        // Construct via the same factory as startup.
+        let embedding_client = self.settings.make_embedding_client();
+        match super::init_agent(
+            &normalized,
+            &agent_home,
+            &self.global_home_dir,
+            &self.tools,
+            &self.gateway_url,
+            &self.internal_token,
+            &self.http_client,
+            embedding_client,
+            self.brave_api_key.clone(),
+            self.settings.disable_bundled_skills,
+            self.pr_reviews_posted.clone(),
+        )
+        .await
+        {
+            Ok(agent_state) => {
+                let agent_state = Arc::new(agent_state);
+                self.agents.insert(normalized.clone(), agent_state.clone());
+                tracing::info!(
+                    agent = normalized.as_str(),
+                    event = "agent_resolved_lazily",
+                    "lazy-constructed agent state for dashboard access"
+                );
+                Some(agent_state)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = normalized.as_str(),
+                    error = %e,
+                    "lazy agent construction failed"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -121,7 +178,14 @@ impl std::fmt::Debug for AppState {
             )
             .field("gateway_url", &self.gateway_url)
             .field("default_agent", &self.default_agent)
-            .field("agents", &self.agents.keys().collect::<Vec<_>>())
+            .field(
+                "agents",
+                &self
+                    .agents
+                    .iter()
+                    .map(|r| r.key().clone())
+                    .collect::<Vec<_>>(),
+            )
             .field("dashboard_db", &"AsyncDatabase(unscoped)")
             .finish_non_exhaustive()
     }
