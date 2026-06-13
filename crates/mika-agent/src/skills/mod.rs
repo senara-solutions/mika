@@ -156,6 +156,67 @@ pub struct TransientDisableResult {
     pub not_found: Vec<String>,
 }
 
+/// Skill origin for filtering (mika#606).
+///
+/// Groups the four-tier origin display (`[built-in]`, `[marketplace]`,
+/// `[marketplace/linked]`, `[custom]`) into two filter buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillSource {
+    /// Engine-bundled skills (`[built-in]` display origin).
+    Bundle,
+    /// All non-bundled skills (`[marketplace]`, `[marketplace/linked]`, `[custom]`).
+    Marketplace,
+}
+
+impl SkillSource {
+    /// Parse from a CLI / HTTP string value. Case-insensitive.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "bundle" | "bundled" => Some(Self::Bundle),
+            "marketplace" => Some(Self::Marketplace),
+            _ => None,
+        }
+    }
+}
+
+/// Property filter for skill listing (mika#606). Plain data, no behavior.
+///
+/// All fields use AND semantics — a skill must match every non-`None` predicate.
+#[derive(Debug, Clone, Default)]
+pub struct SkillListFilter {
+    pub source: Option<SkillSource>,
+    pub always_on: Option<bool>,
+}
+
+/// Apply property filters to a skill iterator (mika#606).
+///
+/// Each predicate is independent with AND semantics — a skill must match all
+/// non-`None` fields. `SkillListFilter::default()` passes everything through.
+pub fn apply_filter<'a>(
+    skills: impl Iterator<Item = &'a SkillEntry> + 'a,
+    filter: &'a SkillListFilter,
+) -> impl Iterator<Item = &'a SkillEntry> + 'a {
+    skills.filter(move |s| {
+        if let Some(want) = filter.source {
+            let is_bundled = crate::bundled_skills::is_bundled_skill(&s.manifest.skill.name);
+            let actual = if is_bundled {
+                SkillSource::Bundle
+            } else {
+                SkillSource::Marketplace
+            };
+            if actual != want {
+                return false;
+            }
+        }
+        if let Some(want) = filter.always_on
+            && s.manifest.skill.always_on != want
+        {
+            return false;
+        }
+        true
+    })
+}
+
 #[derive(Debug)]
 pub struct SkillRegistry {
     skills: Vec<SkillEntry>,
@@ -846,6 +907,144 @@ mod tests {
     fn test_always_on_skills_empty() {
         let registry = SkillRegistry::empty();
         assert!(registry.always_on_skills().is_empty());
+    }
+
+    // ── SkillSource parse tests ──
+
+    #[test]
+    fn test_skill_source_parse_bundle() {
+        assert_eq!(SkillSource::parse("bundle"), Some(SkillSource::Bundle));
+        assert_eq!(SkillSource::parse("Bundle"), Some(SkillSource::Bundle));
+        assert_eq!(SkillSource::parse("BUNDLED"), Some(SkillSource::Bundle));
+        assert_eq!(SkillSource::parse("bundled"), Some(SkillSource::Bundle));
+    }
+
+    #[test]
+    fn test_skill_source_parse_marketplace() {
+        assert_eq!(
+            SkillSource::parse("marketplace"),
+            Some(SkillSource::Marketplace)
+        );
+        assert_eq!(
+            SkillSource::parse("Marketplace"),
+            Some(SkillSource::Marketplace)
+        );
+    }
+
+    #[test]
+    fn test_skill_source_parse_invalid() {
+        assert_eq!(SkillSource::parse("junk"), None);
+        assert_eq!(SkillSource::parse(""), None);
+        assert_eq!(SkillSource::parse("built-in"), None);
+    }
+
+    // ── apply_filter tests ──
+
+    #[test]
+    fn test_filter_default_passes_all() {
+        let skills = [
+            make_entry("alpha", true, true),
+            make_entry("beta", false, true),
+        ];
+        let filter = SkillListFilter::default();
+        let result: Vec<_> = apply_filter(skills.iter(), &filter).collect();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_by_always_on() {
+        let skills = [
+            make_entry("alpha", true, true),
+            make_entry("beta", false, true),
+            make_entry("gamma", true, true),
+        ];
+        let filter = SkillListFilter {
+            always_on: Some(true),
+            ..Default::default()
+        };
+        let result: Vec<_> = apply_filter(skills.iter(), &filter).collect();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].manifest.skill.name, "alpha");
+        assert_eq!(result[1].manifest.skill.name, "gamma");
+    }
+
+    #[test]
+    fn test_filter_by_always_on_false() {
+        let skills = [
+            make_entry("alpha", true, true),
+            make_entry("beta", false, true),
+        ];
+        let filter = SkillListFilter {
+            always_on: Some(false),
+            ..Default::default()
+        };
+        let result: Vec<_> = apply_filter(skills.iter(), &filter).collect();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].manifest.skill.name, "beta");
+    }
+
+    #[test]
+    fn test_filter_by_source_bundle() {
+        // "tmux" is a bundled skill name that is_bundled_skill recognizes
+        let skills = [
+            make_entry("tmux", false, true),
+            make_entry("my-custom-skill", false, true),
+        ];
+        let filter = SkillListFilter {
+            source: Some(SkillSource::Bundle),
+            ..Default::default()
+        };
+        let result: Vec<_> = apply_filter(skills.iter(), &filter).collect();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].manifest.skill.name, "tmux");
+    }
+
+    #[test]
+    fn test_filter_by_source_marketplace() {
+        let skills = [
+            make_entry("tmux", false, true),
+            make_entry("my-custom-skill", false, true),
+        ];
+        let filter = SkillListFilter {
+            source: Some(SkillSource::Marketplace),
+            ..Default::default()
+        };
+        let result: Vec<_> = apply_filter(skills.iter(), &filter).collect();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].manifest.skill.name, "my-custom-skill");
+    }
+
+    #[test]
+    fn test_filter_composed_and_semantics() {
+        let skills = [
+            make_entry("tmux", true, true),         // bundled + always_on
+            make_entry("tmux", false, true),        // bundled + not always_on (hypothetical)
+            make_entry("my-skill", true, true),     // marketplace + always_on
+            make_entry("other-skill", false, true), // marketplace + not always_on
+        ];
+        // Only bundled AND always_on
+        let filter = SkillListFilter {
+            source: Some(SkillSource::Bundle),
+            always_on: Some(true),
+        };
+        let result: Vec<_> = apply_filter(skills.iter(), &filter).collect();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].manifest.skill.name, "tmux");
+        assert!(result[0].manifest.skill.always_on);
+    }
+
+    #[test]
+    fn test_filter_no_matches() {
+        let skills = [
+            make_entry("alpha", true, true),
+            make_entry("beta", true, true),
+        ];
+        let filter = SkillListFilter {
+            always_on: Some(false),
+            ..Default::default()
+        };
+        let result: Vec<_> = apply_filter(skills.iter(), &filter).collect();
+        assert!(result.is_empty());
     }
 
     #[test]

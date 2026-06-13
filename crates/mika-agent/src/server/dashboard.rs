@@ -1153,6 +1153,62 @@ pub async fn handle_session_tool_calls(
     .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/skills — list skills with optional property filters (mika#606)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct SkillsListQuery {
+    pub source: Option<String>,
+    pub always_on: Option<String>,
+}
+
+pub async fn handle_skills_list(
+    State(state): State<AppState>,
+    Query(q): Query<SkillsListQuery>,
+) -> impl IntoResponse {
+    use crate::bundled_skills::is_bundled_skill;
+    use crate::skills::{SkillListFilter, SkillSource, apply_filter};
+
+    let agent_state = match state.agents.iter().next().map(|r| r.value().clone()) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "no agents configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let filter = SkillListFilter {
+        source: q.source.as_deref().and_then(SkillSource::parse),
+        always_on: q.always_on.as_deref().and_then(|s| s.parse::<bool>().ok()),
+    };
+
+    let registry = agent_state.skills.lock().unwrap().clone();
+    let skills: Vec<serde_json::Value> = apply_filter(registry.skills().iter(), &filter)
+        .map(|entry| {
+            let name = &entry.manifest.skill.name;
+            let origin = if is_bundled_skill(name) {
+                "built-in"
+            } else {
+                "marketplace"
+            };
+            serde_json::json!({
+                "name": name,
+                "description": entry.manifest.skill.description,
+                "origin": origin,
+                "enabled": entry.enabled,
+                "always_on": entry.manifest.skill.always_on,
+                "tools": entry.skill_tools.len(),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "skills": skills })).into_response()
+}
+
 /// GET /api/v1/sessions/:id/skills — loaded skills from session metadata.
 pub async fn handle_session_skills(
     State(state): State<AppState>,

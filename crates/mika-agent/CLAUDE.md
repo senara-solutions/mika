@@ -522,7 +522,9 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 
 **Mutation endpoints:** `/message` (202 async, 10MB limit), `/tasks/{id}/complete` (200 sync, 100KB cap), `/tasks/{id}/cancel` (200 sync), `/api/v1/rewind/*`, `/a2a/*`.
 
-**Dashboard API:** `/api/v1/*` — timeline, agents, sessions, messages, traces, investigate, tasks (+ detail/children/descendants/sessions), team-runs (+ summary), llm-calls (+ detail), tool-calls (+ detail), dev-runs (+ detail), github proxy endpoints. CORS scoped to `MIKA_CORS_ORIGIN`.
+**Dashboard API:** `/api/v1/*` — timeline, agents, sessions, messages, traces, investigate, tasks (+ detail/children/descendants/sessions), team-runs (+ summary), llm-calls (+ detail), tool-calls (+ detail), dev-runs (+ detail), skills (+ property filters), github proxy endpoints. CORS scoped to `MIKA_CORS_ORIGIN`.
+
+**Skills listing (#606):** `GET /api/v1/skills` lists loaded skills with optional property filters: `?source=bundle|marketplace` and `?always_on=true|false`. AND semantics. Invalid param values silently ignored (no filter applied for that property). Returns `{ "skills": [...] }` with per-skill `name`, `description`, `origin`, `enabled`, `always_on`, `tools` fields.
 
 **Lazy agent resolution (#1399):** `AppState.agents` uses `DashMap` for concurrent mutable access. `resolve_agent()` is async — on cache miss (agent created after server startup), it checks for `identity.toml` on disk + DB row, lazy-constructs the `AgentState` via the same `init_agent` factory used at startup, and inserts into the map. Subsequent calls hit the fast path. Emits `agent_resolved_lazily` INFO event on successful lazy insert. Agents whose dir is deleted while running remain in the map (orphan removal is mika#1436).
 

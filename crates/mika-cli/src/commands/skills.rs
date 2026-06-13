@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, bail};
 use mika_agent::bundled_skills;
-use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::executor;
 use mika_agent::skills::git;
 use mika_agent::skills::index::{DiagnosticLevel, scan_skills_dir, validate_skill};
 use mika_agent::skills::install;
 use mika_agent::skills::marketplace;
+use mika_agent::skills::{SkillListFilter, SkillRegistry, SkillSource};
 use mika_agent::tools::create_skill::validate_skill_name;
 use mika_common::home;
 use std::io::IsTerminal;
@@ -25,13 +25,35 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
             let mut registry = SkillRegistry::from_dir(&skills_dir);
             apply_db_overrides_if_available(&global_home, agent_name, &agent_home, &mut registry);
             registry.log_summary();
-            list_skills(&registry, &agent_home, &crate::cli::OutputFormat::Text)?;
+            list_skills(
+                &registry,
+                &agent_home,
+                &crate::cli::OutputFormat::Text,
+                &SkillListFilter::default(),
+            )?;
         }
-        Some(SkillsCommand::List { format }) => {
+        Some(SkillsCommand::List {
+            format,
+            source,
+            always_on,
+        }) => {
+            // Validate --source early so the user gets a clear error.
+            if let Some(ref s) = source
+                && SkillSource::parse(s).is_none()
+            {
+                bail!(
+                    "invalid --source value '{}': expected 'bundle' or 'marketplace'",
+                    s
+                );
+            }
+            let filter = SkillListFilter {
+                source: source.as_deref().and_then(SkillSource::parse),
+                always_on,
+            };
             let mut registry = SkillRegistry::from_dir(&skills_dir);
             apply_db_overrides_if_available(&global_home, agent_name, &agent_home, &mut registry);
             registry.log_summary();
-            list_skills(&registry, &agent_home, &format)?;
+            list_skills(&registry, &agent_home, &format, &filter)?;
         }
         Some(SkillsCommand::Info { name }) => {
             let registry = SkillRegistry::from_dir(&skills_dir);
@@ -292,8 +314,10 @@ fn list_skills(
     registry: &SkillRegistry,
     agent_home: &Path,
     format: &crate::cli::OutputFormat,
+    filter: &SkillListFilter,
 ) -> Result<()> {
-    let skills = registry.skills();
+    let all_skills = registry.skills();
+    let skills: Vec<_> = mika_agent::skills::apply_filter(all_skills.iter(), filter).collect();
     let disabled = registry.disabled();
     let skipped = registry.skipped();
     if skills.is_empty() && disabled.is_empty() && skipped.is_empty() {
