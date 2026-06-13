@@ -1786,7 +1786,11 @@ async fn execute_long_running(
     // The agent passes the task UUID via the `task_id` input field.
     // See mika#596 / mika-skills#151.
     let task_id = input.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-    if let Some(err) = crate::tools::validate_task(&ctx.db, task_id).await {
+    let scoped = match crate::tools::AgentScopedTaskId::from_agent_context(&ctx.db, task_id) {
+        Ok(s) => s,
+        Err(e) => return ToolOutput::error(e.content),
+    };
+    if let Some(err) = crate::tools::validate_task(&ctx.db, &scoped).await {
         return ToolOutput::error(err);
     }
 
@@ -3065,8 +3069,8 @@ mod tests {
 
         assert!(output.is_error);
         assert!(
-            output.content.contains("create a task first"),
-            "expected task error, got: {}",
+            output.content.contains("invalid_uuid"),
+            "expected UUID validation error, got: {}",
             output.content
         );
     }

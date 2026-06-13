@@ -324,37 +324,74 @@ pub(crate) fn validate_uuid(
     })
 }
 
+/// A task UUID that has been validated as format-correct AND obtained inside an
+/// agent-tool context. The [`validate_task_exists`] function takes only this type,
+/// so non-agent-scoped paths (CLI correlation, raw introspection) physically
+/// cannot pass it raw `&str`s — they must use `db.get_task_unscoped` instead.
+///
+/// Constructor is `pub(crate)` and requires a [`ToolContext`], encoding the
+/// invariant: this type only exists in agent-tool execution paths.
+///
+/// See mika#755 for the structural rationale; mika#752 for the original bug.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentScopedTaskId(String);
+
+impl AgentScopedTaskId {
+    /// Construct from a raw string inside a tool's `execute` body.
+    ///
+    /// The `_ctx` parameter is unused at runtime but is the structural anchor —
+    /// you cannot call this function without a `ToolContext` in scope, which
+    /// means you cannot get an `AgentScopedTaskId` from a non-tool context.
+    pub(crate) fn from_tool_context(
+        _ctx: &ToolContext<'_>,
+        raw: &str,
+    ) -> std::result::Result<Self, ToolOutput> {
+        validate_uuid("task_id", raw)?;
+        Ok(Self(raw.to_string()))
+    }
+
+    /// Construct from a raw string in any agent-scoped execution path (e.g.,
+    /// long-running skill executor). The `_db` parameter proves agent-scope
+    /// context exists — `AsyncDatabase` carries the agent_id.
+    pub(crate) fn from_agent_context(
+        _db: &crate::async_db::AsyncDatabase,
+        raw: &str,
+    ) -> std::result::Result<Self, ToolOutput> {
+        validate_uuid("task_id", raw)?;
+        Ok(Self(raw.to_string()))
+    }
+
+    /// Read-only access to the underlying UUID string for query construction.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Agent-scoped task lookup — for intra-agent state mutation only.
 ///
-/// Validates that a UUID-typed task parameter references an existing task owned by
-/// the calling agent. Combines format validation ([`validate_uuid`]) with a DB
-/// existence + agent-scope check in a single call.
-///
-/// For correlation-only / observability existence checks that cross agent boundaries
-/// (e.g., `mika ask --task-id` from a relay agent referencing a task owned by another
-/// agent), use [`crate::db::Database::get_task_unscoped`] instead. This function will
-/// return `task_not_found` if the task exists but belongs to a different agent, which
-/// is the intended behavior for ownership checks and the wrong behavior for correlation.
+/// Takes [`AgentScopedTaskId`] to make the ownership invariant compile-checked
+/// (mika#755). Compare with [`crate::db::Database::get_task_unscoped`] for
+/// raw-id correlation paths that intentionally cross agent boundaries (e.g.,
+/// CLI introspection, internal queries).
 ///
 /// Returns `Ok(Task)` on success, or `Err(ToolOutput)` with structured JSON:
-/// - Format error: `{"error": "invalid_uuid", "field": ..., ...}` (from `validate_uuid`)
 /// - Not found / wrong agent: `{"error": "task_not_found", "field": ..., "task_id": ..., "reason": ...}`
 /// - DB error: `{"error": "db_error", "field": ..., "reason": ...}` (fail-closed)
 ///
 /// # Example
 /// ```ignore
-/// let task = validate_task_exists(ctx.db, "task_id", id).await
-///     .map_err(|e| return Ok(e))?; // or: match ... { Err(e) => return Ok(e), Ok(t) => t }
+/// let scoped = AgentScopedTaskId::from_tool_context(ctx, id)?;
+/// let task = validate_task_exists(ctx.db, "task_id", &scoped).await
+///     .map_err(|e| return Ok(e))?;
 /// ```
 pub(crate) async fn validate_task_exists(
     db: &crate::async_db::AsyncDatabase,
     field_name: &str,
-    value: &str,
+    task_id: &AgentScopedTaskId,
 ) -> std::result::Result<crate::db::Task, ToolOutput> {
-    // Layer 1: format validation (cheap, no I/O)
-    validate_uuid(field_name, value)?;
+    let value = task_id.as_str();
 
-    // Layer 2: DB existence + agent-scope check
+    // DB existence + agent-scope check (format already validated in constructor)
     match db.get_task(value).await {
         Ok(Some(task)) => Ok(task),
         Ok(None) => {
@@ -387,9 +424,9 @@ pub(crate) async fn validate_task_exists(
 /// Returns `Some(error_message)` if validation fails, `None` if valid.
 pub(crate) async fn validate_task(
     db: &crate::async_db::AsyncDatabase,
-    task_id: &str,
+    task_id: &AgentScopedTaskId,
 ) -> Option<String> {
-    if task_id.is_empty() {
+    if task_id.as_str().is_empty() {
         return Some(
             "You must create a task first using create_task, then pass its ID here. \
              No delegation without tracking."
@@ -408,8 +445,9 @@ pub(crate) async fn validate_task(
         None
     } else {
         Some(format!(
-            "Task '{task_id}' is not an active task. \
-             It must be a manual task with status pending, in_progress, or blocked."
+            "Task '{}' is not an active task. \
+             It must be a manual task with status pending, in_progress, or blocked.",
+            task_id.as_str()
         ))
     }
 }
@@ -1039,7 +1077,7 @@ mod tests {
         assert_eq!(uuid.to_string(), "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
     }
 
-    // === validate_task_exists tests ===
+    // === AgentScopedTaskId + validate_task_exists tests ===
 
     use crate::db::NewTask;
     use crate::test_utils::test_helpers::TestHarness;
@@ -1075,23 +1113,14 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn test_validate_task_exists_valid() {
-        let harness = TestHarness::new();
-        let id = create_test_task(&harness, "valid task").await;
-
-        let result = validate_task_exists(&harness.db, "task_id", &id).await;
-        assert!(result.is_ok());
-        let task = result.unwrap();
-        assert_eq!(task.label, "valid task");
-        assert_eq!(task.id, id);
-    }
+    // === AgentScopedTaskId constructor tests ===
 
     #[tokio::test]
-    async fn test_validate_task_exists_invalid_format() {
+    async fn test_agent_scoped_task_id_invalid_format() {
         let harness = TestHarness::new();
+        let ctx = harness.ctx();
 
-        let result = validate_task_exists(&harness.db, "task_id", "not-a-uuid").await;
+        let result = AgentScopedTaskId::from_tool_context(&ctx, "not-a-uuid");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.is_error);
@@ -1100,25 +1129,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_task_exists_empty_string() {
+    async fn test_agent_scoped_task_id_empty_string() {
         let harness = TestHarness::new();
+        let ctx = harness.ctx();
 
-        let result = validate_task_exists(&harness.db, "id", "").await;
+        let result = AgentScopedTaskId::from_tool_context(&ctx, "");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.content.contains("invalid_uuid"));
     }
 
     #[tokio::test]
+    async fn test_agent_scoped_task_id_valid() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result =
+            AgentScopedTaskId::from_tool_context(&ctx, "00000000-0000-0000-0000-000000000000");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().as_str(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    // === validate_task_exists tests ===
+
+    #[tokio::test]
+    async fn test_validate_task_exists_valid() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let id = create_test_task(&harness, "valid task").await;
+
+        let scoped = AgentScopedTaskId::from_tool_context(&ctx, &id).unwrap();
+        let result = validate_task_exists(&harness.db, "task_id", &scoped).await;
+        assert!(result.is_ok());
+        let task = result.unwrap();
+        assert_eq!(task.label, "valid task");
+        assert_eq!(task.id, id);
+    }
+
+    #[tokio::test]
     async fn test_validate_task_exists_not_in_db() {
         let harness = TestHarness::new();
+        let ctx = harness.ctx();
 
-        let result = validate_task_exists(
-            &harness.db,
-            "task_id",
-            "00000000-0000-0000-0000-000000000000",
-        )
-        .await;
+        let scoped =
+            AgentScopedTaskId::from_tool_context(&ctx, "00000000-0000-0000-0000-000000000000")
+                .unwrap();
+        let result = validate_task_exists(&harness.db, "task_id", &scoped).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.is_error);
@@ -1136,7 +1195,9 @@ mod tests {
 
         // Try to validate with agent "agent-b" — should get task_not_found (not info disclosure)
         let harness_b = TestHarness::with_agent("agent-b");
-        let result = validate_task_exists(&harness_b.db, "task_id", &task_id).await;
+        let ctx_b = harness_b.ctx();
+        let scoped = AgentScopedTaskId::from_tool_context(&ctx_b, &task_id).unwrap();
+        let result = validate_task_exists(&harness_b.db, "task_id", &scoped).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.content.contains("task_not_found"));
@@ -1152,17 +1213,18 @@ mod tests {
         let task_id = create_test_task(&harness_a, "agent-a task").await;
 
         let harness_b = TestHarness::with_agent("agent-b");
-        let cross_agent_err = validate_task_exists(&harness_b.db, "task_id", &task_id)
+        let ctx_b = harness_b.ctx();
+        let scoped_cross = AgentScopedTaskId::from_tool_context(&ctx_b, &task_id).unwrap();
+        let cross_agent_err = validate_task_exists(&harness_b.db, "task_id", &scoped_cross)
             .await
             .unwrap_err();
 
-        let nonexistent_err = validate_task_exists(
-            &harness_b.db,
-            "task_id",
-            "00000000-0000-0000-0000-000000000001",
-        )
-        .await
-        .unwrap_err();
+        let scoped_nonexist =
+            AgentScopedTaskId::from_tool_context(&ctx_b, "00000000-0000-0000-0000-000000000001")
+                .unwrap();
+        let nonexistent_err = validate_task_exists(&harness_b.db, "task_id", &scoped_nonexist)
+            .await
+            .unwrap_err();
 
         // Parse both as JSON and compare structure (excluding task_id values which differ)
         let cross: serde_json::Value = serde_json::from_str(&cross_agent_err.content).unwrap();
@@ -1176,13 +1238,12 @@ mod tests {
     #[tokio::test]
     async fn test_validate_task_exists_error_json_parseable() {
         let harness = TestHarness::new();
+        let ctx = harness.ctx();
 
-        let result = validate_task_exists(
-            &harness.db,
-            "my_field",
-            "00000000-0000-0000-0000-000000000000",
-        )
-        .await;
+        let scoped =
+            AgentScopedTaskId::from_tool_context(&ctx, "00000000-0000-0000-0000-000000000000")
+                .unwrap();
+        let result = validate_task_exists(&harness.db, "my_field", &scoped).await;
         let err = result.unwrap_err();
 
         let json: serde_json::Value = serde_json::from_str(&err.content).unwrap();
@@ -1195,19 +1256,13 @@ mod tests {
     #[tokio::test]
     async fn test_validate_task_exists_field_name_propagated() {
         let harness = TestHarness::new();
-
-        // Invalid format — field propagated through validate_uuid
-        let result = validate_task_exists(&harness.db, "task_id", "bad").await;
-        let err = result.unwrap_err();
-        assert!(err.content.contains("task_id"));
+        let ctx = harness.ctx();
 
         // Not found — field propagated through task_not_found
-        let result = validate_task_exists(
-            &harness.db,
-            "parent_id",
-            "00000000-0000-0000-0000-000000000000",
-        )
-        .await;
+        let scoped =
+            AgentScopedTaskId::from_tool_context(&ctx, "00000000-0000-0000-0000-000000000000")
+                .unwrap();
+        let result = validate_task_exists(&harness.db, "parent_id", &scoped).await;
         let err = result.unwrap_err();
         assert!(err.content.contains("parent_id"));
     }

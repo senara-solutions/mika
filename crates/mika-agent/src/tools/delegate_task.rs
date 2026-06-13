@@ -98,8 +98,12 @@ impl Tool for DelegateTaskTool {
         }
 
         // Validate task_id — delegation requires a tracked task
-        let task_id = input["task_id"].as_str().unwrap_or("");
-        if let Some(err) = super::validate_task(ctx.db, task_id).await {
+        let task_id_raw = input["task_id"].as_str().unwrap_or("");
+        let scoped = match super::AgentScopedTaskId::from_tool_context(ctx, task_id_raw) {
+            Ok(s) => s,
+            Err(e) => return Ok(e),
+        };
+        if let Some(err) = super::validate_task(ctx.db, &scoped).await {
             return Ok(ToolOutput::error(err));
         }
 
@@ -243,7 +247,7 @@ impl Tool for DelegateTaskTool {
         let delegate_metadata = serde_json::json!({
             "trigger": "delegate",
             "orchestrator": current_agent_id,
-            "task_id": task_id
+            "task_id": task_id_raw
         })
         .to_string();
         if let Err(e) = async_db
@@ -253,10 +257,10 @@ impl Tool for DelegateTaskTool {
                 "delegate",
                 Some(&delegate_metadata),
                 Some(ctx.session_id),
-                if task_id.is_empty() {
+                if task_id_raw.is_empty() {
                     None
                 } else {
-                    Some(task_id)
+                    Some(task_id_raw)
                 },
             )
             .await
@@ -418,8 +422,8 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(
-            result.content.contains("create a task first"),
-            "expected task error, got: {}",
+            result.content.contains("invalid_uuid"),
+            "expected UUID validation error, got: {}",
             result.content
         );
     }
