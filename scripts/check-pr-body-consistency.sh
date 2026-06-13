@@ -169,7 +169,7 @@ fi
 # ---------------------------------------------------------------------------
 
 # Trigger phrases (case-insensitive).
-TRIGGER_PATTERN='follow-up PR|will be (handled|done|fixed) in a (separate|follow-up|follow up) (PR|issue)|deferred to a separate (PR|issue)|tracked in a follow-up|addressed in a follow-up'
+TRIGGER_PATTERN='follow-up PR|will be (handled|done|fixed) in a (separate|follow-up|follow up) (PR|issue)|will be fixed in a follow-up|deferred to a separate (PR|issue)|tracked in a follow-up|addressed in a follow-up'
 
 MATCHED_TRIGGER="$(echo "$PR_BODY" | grep -oiE "$TRIGGER_PATTERN" | head -1)" || true
 
