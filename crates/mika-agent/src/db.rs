@@ -4671,6 +4671,68 @@ impl Database {
         Ok(())
     }
 
+    /// Cancel active recurring tasks for agents no longer on disk (mika#1436).
+    ///
+    /// Called once at startup after the filesystem walk populates the agent set.
+    /// Cancels (not deletes) so the audit trail via audit_events is preserved.
+    /// Returns the list of (task_id, agent_id) pairs for operator observability.
+    ///
+    /// Agent-unscoped: operates across all agents in the DB, not filtered by
+    /// this `Database` instance's implicit agent context.
+    pub fn cancel_orphan_recurring_tasks(
+        &self,
+        known_agent_ids: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        if known_agent_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Build a parameterized placeholder list for the NOT IN clause.
+        let placeholders: Vec<String> = (1..=known_agent_ids.len())
+            .map(|i| format!("?{}", i))
+            .collect();
+        let placeholders_str = placeholders.join(", ");
+
+        // SELECT orphan tasks first for logging.
+        let select_sql = format!(
+            "SELECT id, agent_id FROM tasks
+             WHERE trigger_type = 'recurring'
+               AND status IN ('pending', 'recurring_active', 'in_progress')
+               AND agent_id NOT IN ({placeholders_str})"
+        );
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = known_agent_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        let orphans: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(&select_sql)?;
+            stmt.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        if orphans.is_empty() {
+            tx.commit()?;
+            return Ok(vec![]);
+        }
+
+        // UPDATE to cancelled.
+        let update_sql = format!(
+            "UPDATE tasks SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE trigger_type = 'recurring'
+               AND status IN ('pending', 'recurring_active', 'in_progress')
+               AND agent_id NOT IN ({placeholders_str})"
+        );
+        tx.execute(&update_sql, params.as_slice())?;
+
+        tx.commit()?;
+        Ok(orphans)
+    }
+
     fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         Ok(Task {
             id: r.get(0)?,
@@ -18169,5 +18231,180 @@ mod tests {
             .find_active_callback_for_class("mika", "implement")
             .unwrap();
         assert_eq!(blocker.as_deref(), Some(rc_id.as_str()));
+    }
+
+    // --- cancel_orphan_recurring_tasks (mika#1436) ---
+
+    fn recurring_task(agent: &str, label: &str) -> NewTask {
+        NewTask {
+            agent_id: agent.to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "recurring".to_string(),
+            cron_expr: Some("0 0 * * * *".to_string()),
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
+            timeout_at: None,
+            action_type: "inject_context".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        }
+    }
+
+    #[test]
+    fn test_cancel_orphan_recurring_tasks_one_orphan() {
+        let db = db();
+        db.register_agent("agent-a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent-b", "Agent B", "/tmp/b").unwrap();
+
+        let id_a = db
+            .create_task(&recurring_task("agent-a", "heartbeat"))
+            .unwrap();
+        let id_b = db
+            .create_task(&recurring_task("agent-b", "heartbeat"))
+            .unwrap();
+
+        // Only agent-a is known (agent-b was deleted from disk).
+        let orphans = db
+            .cancel_orphan_recurring_tasks(&["agent-a".to_string()])
+            .unwrap();
+
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].0, id_b);
+        assert_eq!(orphans[0].1, "agent-b");
+
+        // agent-a's task is unchanged (create_task sets status to 'pending').
+        let ta = db.get_task(&id_a, "agent-a").unwrap().unwrap();
+        assert_eq!(ta.status, "pending");
+
+        // agent-b's task is cancelled.
+        let tb = db.get_task(&id_b, "agent-b").unwrap().unwrap();
+        assert_eq!(tb.status, "cancelled");
+    }
+
+    #[test]
+    fn test_cancel_orphan_recurring_tasks_no_orphans() {
+        let db = db();
+        db.register_agent("agent-a", "Agent A", "/tmp/a").unwrap();
+
+        db.create_task(&recurring_task("agent-a", "heartbeat"))
+            .unwrap();
+
+        let orphans = db
+            .cancel_orphan_recurring_tasks(&["agent-a".to_string()])
+            .unwrap();
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn test_cancel_orphan_recurring_tasks_multiple_orphans_same_agent() {
+        let db = db();
+        db.register_agent("agent-a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("mika-relay", "Relay", "/tmp/relay")
+            .unwrap();
+
+        db.create_task(&recurring_task("agent-a", "heartbeat"))
+            .unwrap();
+        let r1 = db
+            .create_task(&recurring_task("mika-relay", "heartbeat"))
+            .unwrap();
+        let r2 = db
+            .create_task(&recurring_task("mika-relay", "reflection"))
+            .unwrap();
+
+        let orphans = db
+            .cancel_orphan_recurring_tasks(&["agent-a".to_string()])
+            .unwrap();
+
+        assert_eq!(orphans.len(), 2);
+        let orphan_ids: Vec<&str> = orphans.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(orphan_ids.contains(&r1.as_str()));
+        assert!(orphan_ids.contains(&r2.as_str()));
+
+        // Both relay tasks cancelled.
+        let t1 = db.get_task(&r1, "mika-relay").unwrap().unwrap();
+        let t2 = db.get_task(&r2, "mika-relay").unwrap().unwrap();
+        assert_eq!(t1.status, "cancelled");
+        assert_eq!(t2.status, "cancelled");
+    }
+
+    #[test]
+    fn test_cancel_orphan_recurring_tasks_already_cancelled_idempotent() {
+        let db = db();
+        db.register_agent("agent-b", "Agent B", "/tmp/b").unwrap();
+
+        let id = db
+            .create_task(&recurring_task("agent-b", "heartbeat"))
+            .unwrap();
+        // Pre-cancel the task.
+        db.cancel_task(&id, "agent-b").unwrap();
+
+        let orphans = db
+            .cancel_orphan_recurring_tasks(&["agent-a".to_string()])
+            .unwrap();
+        // Already cancelled — not in the active set, so not returned.
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn test_cancel_orphan_recurring_tasks_empty_known_set_returns_empty() {
+        let db = db();
+        db.register_agent("agent-a", "Agent A", "/tmp/a").unwrap();
+        db.create_task(&recurring_task("agent-a", "heartbeat"))
+            .unwrap();
+
+        // Empty known set triggers early return (safety guard).
+        let orphans = db.cancel_orphan_recurring_tasks(&[]).unwrap();
+        assert!(orphans.is_empty());
+
+        // Task should still be active (no mutation on empty set).
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE agent_id = 'agent-a' AND status IN ('pending', 'recurring_active')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_cancel_orphan_recurring_tasks_skips_manual_tasks() {
+        let db = db();
+        db.register_agent("agent-b", "Agent B", "/tmp/b").unwrap();
+
+        // Create a manual task for agent-b (should NOT be cancelled).
+        let manual_id = db
+            .create_task(&new_task("agent-b", "some-work", "manual", "none"))
+            .unwrap();
+
+        // Create a recurring task for agent-b (should be cancelled).
+        let recurring_id = db
+            .create_task(&recurring_task("agent-b", "heartbeat"))
+            .unwrap();
+
+        let orphans = db
+            .cancel_orphan_recurring_tasks(&["agent-a".to_string()])
+            .unwrap();
+
+        // Only the recurring task is cancelled.
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].0, recurring_id);
+
+        // Manual task is still pending.
+        let mt = db.get_task(&manual_id, "agent-b").unwrap().unwrap();
+        assert_eq!(mt.status, "pending");
     }
 }

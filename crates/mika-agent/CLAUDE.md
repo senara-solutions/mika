@@ -482,7 +482,7 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 ## Unified Task Engine
 
-`src/task_engine/` — single SQLite-backed scheduler. Min-heap + dedup set; 1-second tick loop; periodic DB scan (60 ticks). `TaskDispatcher` matches on `action_type`. `ensure_recurring_task()` idempotently registers heartbeat and reflection at startup.
+`src/task_engine/` — single SQLite-backed scheduler. Min-heap + dedup set; 1-second tick loop; periodic DB scan (60 ticks). `TaskDispatcher` matches on `action_type`. `ensure_recurring_task()` idempotently registers heartbeat and reflection at startup. **Orphan recurring task sweep (mika#1436):** At server startup, after the filesystem walk populates `state.agents`, the engine cancels any active recurring tasks (`trigger_type='recurring'`, status in `pending|recurring_active|in_progress`) whose `agent_id` is not in the on-disk set. Cancellation preserves the audit trail (vs deletion). Companion to #1399's lazy-insert: lazy-resolved post-boot agents add their recurring tasks via `ensure_recurring_task` on demand.
 
 **Callback/resume lifecycle:** agent creates callback task -> external process completes it -> server dispatches silent agent run with `SilentTrigger::Callback`. Loop prevention: callback turns cannot **directly** spawn new long-running tasks; the executor's `long_running_ctx == None` rejection is intercepted and re-routed through `DeferredDispatch` with `(repo, issue_number, skill)` lineage cycle detection (mika#1058). Direct spawn from callback context still hits the gate; deferred re-dispatch is the safe path.
 
