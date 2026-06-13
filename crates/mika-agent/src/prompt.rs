@@ -721,8 +721,8 @@ Core memory tracks key people briefly — the people table is the full record.\n
          \"is the PR merged?\"), call check_task to read details and any linked GitHub PR/issue \
          status. Present findings and wait for the user's decision before changing status.\n\
          - Status transitions: pending can go to any status; in_progress can go to blocked/completed/cancelled; \
-         blocked can go to in_progress/completed/cancelled. Completed and cancelled are terminal \
-         (status locked, metadata still writable).\n",
+         blocked can go to in_progress/completed/cancelled; cancelled can return to in_progress \
+         (cancel-and-retry, mika#856). Completed is terminal (status locked, metadata still writable).\n",
     );
     prompt.push_str(
         "- **Delegation Rule:** Before delegating any implementation work (via delegate_task \

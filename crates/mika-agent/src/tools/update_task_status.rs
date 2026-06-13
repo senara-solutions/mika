@@ -13,7 +13,8 @@ const VALID_STATUSES: &[&str] = &[
     "cancelled",
 ];
 
-/// Permitted status transitions. Terminal states (completed, cancelled) have no outbound edges.
+/// Permitted status transitions. `completed` is terminal (no outbound edges).
+/// `cancelled` can return to `in_progress` (cancel-and-retry, mika#856).
 const VALID_TRANSITIONS: &[(&str, &[&str])] = &[
     (
         "pending",
@@ -22,7 +23,7 @@ const VALID_TRANSITIONS: &[(&str, &[&str])] = &[
     ("in_progress", &["blocked", "completed", "cancelled"]),
     ("blocked", &["in_progress", "completed", "cancelled"]),
     ("completed", &[]),
-    ("cancelled", &[]),
+    ("cancelled", &["in_progress"]),
 ];
 
 /// Check whether transitioning from `from` to `to` is permitted.
@@ -61,9 +62,10 @@ impl Tool for UpdateTaskStatusTool {
                 Only works on manual tasks, not system tasks (reminders, callbacks, etc.). \
                 Transitions are validated: pending can go to any status; in_progress can go to \
                 blocked/completed/cancelled; blocked can go to in_progress/completed/cancelled. \
-                Completed and cancelled are terminal — status cannot be changed, but metadata \
-                can still be attached by passing the metadata field (the status field is ignored \
-                in that case and the call succeeds). \
+                Cancelled can return to in_progress (cancel-and-retry — reuses the same task \
+                row, mika#856). Completed is terminal. For completed tasks, status \
+                cannot be changed, but metadata can still be attached by passing the metadata \
+                field (the status field is ignored in that case and the call succeeds). \
                 Every transition is logged as an audit event. \
                 Optionally attach or merge structured metadata (JSON object) on the task."
                 .to_string(),
@@ -222,7 +224,7 @@ impl Tool for UpdateTaskStatusTool {
                 }
                 return Ok(ToolOutput::error(format!(
                     "Cannot transition from '{old_status}' to '{status}'. \
-                     '{old_status}' is a terminal state — completed and cancelled tasks cannot be changed."
+                     '{old_status}' is a terminal state — completed tasks cannot change status."
                 )));
             }
 
@@ -838,6 +840,127 @@ mod tests {
         assert!(result.content.contains("blocked → in_progress"));
     }
 
+    /// mika#856: cancelled → in_progress reuses the existing task row.
+    #[tokio::test]
+    async fn test_cancelled_to_in_progress_reuses_row() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateTaskStatusTool;
+
+        let id = create_task(&harness, "Cancel and retry").await;
+
+        // pending → in_progress → cancelled
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "in_progress"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "cancelled", "note": "Wrong approach"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // cancelled → in_progress (revert)
+        let result = tool
+            .execute(
+                serde_json::json!({"task_id": id, "status": "in_progress", "note": "Retry with new approach"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "cancelled→in_progress failed: {}",
+            result.content
+        );
+        assert!(result.content.contains("cancelled → in_progress"));
+
+        // Same task_id, status is now in_progress
+        let task = ctx.db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(task.status, "in_progress");
+    }
+
+    /// mika#856: cancelled can only go to in_progress, not blocked/pending/completed.
+    #[tokio::test]
+    async fn test_cancelled_disallowed_transitions() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateTaskStatusTool;
+
+        for target in &["pending", "blocked", "completed"] {
+            let id = create_task(&harness, &format!("Cancel→{target}")).await;
+            tool.execute(
+                serde_json::json!({"task_id": id, "status": "cancelled"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            let result = tool
+                .execute(serde_json::json!({"task_id": id, "status": target}), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                result.is_error,
+                "cancelled→{target} should be rejected, got: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("Cannot transition"),
+                "missing error preamble for cancelled→{target}: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("in_progress"),
+                "should list in_progress as only allowed target for cancelled→{target}: {}",
+                result.content
+            );
+        }
+    }
+
+    /// mika#856: metadata-only write on a cancelled task (same-status path) still works.
+    #[tokio::test]
+    async fn test_cancelled_metadata_only_write() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = UpdateTaskStatusTool;
+
+        let id = create_task(&harness, "Cancelled meta write").await;
+        tool.execute(
+            serde_json::json!({"task_id": id, "status": "cancelled"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Same-status metadata write (status="cancelled" on a cancelled task)
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "task_id": id,
+                    "status": "cancelled",
+                    "metadata": {"cancelled_reason": "duplicate"}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "same-status metadata write should succeed: {}",
+            result.content
+        );
+        assert!(result.content.contains("already 'cancelled'"));
+        assert!(result.content.contains("Metadata updated"));
+
+        // Status unchanged
+        let task = ctx.db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+    }
+
     #[tokio::test]
     async fn test_rejected_backward_transition() {
         let harness = TestHarness::new();
@@ -903,7 +1026,8 @@ mod tests {
             );
         }
 
-        // Test cancelled → anything
+        // Test cancelled → disallowed targets (pending, blocked, completed)
+        // Note: cancelled → in_progress is allowed (mika#856), tested separately
         let id2 = create_task(&harness, "Cancelled item").await;
         tool.execute(
             serde_json::json!({"task_id": id2, "status": "cancelled"}),
@@ -912,7 +1036,7 @@ mod tests {
         .await
         .unwrap();
 
-        for target in &["pending", "in_progress", "blocked", "completed"] {
+        for target in &["pending", "blocked", "completed"] {
             let result = tool
                 .execute(serde_json::json!({"task_id": id2, "status": target}), &ctx)
                 .await
@@ -923,8 +1047,10 @@ mod tests {
                 result.content
             );
             assert!(
-                result.content.contains("terminal state"),
-                "expected terminal state message for cancelled→{target}, got: {}",
+                result
+                    .content
+                    .contains("Valid transitions from 'cancelled'"),
+                "expected valid-transitions message for cancelled→{target}, got: {}",
                 result.content
             );
         }
@@ -987,12 +1113,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_terminal_metadata_fallback_cancelled_with_metadata() {
+    async fn test_cancelled_to_in_progress_with_metadata() {
+        // After mika#856, cancelled → in_progress is a real transition (not a
+        // terminal-metadata fallback). The task row is reused.
         let harness = TestHarness::new();
         let ctx = harness.ctx();
         let tool = UpdateTaskStatusTool;
 
-        let id = create_task(&harness, "Cancelled with late metadata").await;
+        let id = create_task(&harness, "Cancelled then reverted").await;
         tool.execute(
             serde_json::json!({"task_id": id, "status": "cancelled"}),
             &ctx,
@@ -1005,7 +1133,7 @@ mod tests {
                 serde_json::json!({
                     "task_id": id,
                     "status": "in_progress",
-                    "metadata": {"reason": "auto-cancelled"}
+                    "metadata": {"reason": "cancel-and-retry"}
                 }),
                 &ctx,
             )
@@ -1014,19 +1142,19 @@ mod tests {
 
         assert!(
             !result.is_error,
-            "should succeed on cancelled, got: {}",
+            "cancelled→in_progress should succeed, got: {}",
             result.content
         );
-        assert!(result.content.contains("terminal"));
+        assert!(result.content.contains("cancelled → in_progress"));
         assert!(result.content.contains("Metadata updated"));
 
+        // Status actually changed (not the terminal-metadata fallback)
         let task = ctx.db.get_task(&id).await.unwrap().unwrap();
-        assert_eq!(task.status, "cancelled");
+        assert_eq!(task.status, "in_progress");
 
-        // Verify metadata was persisted
         let meta: serde_json::Value =
             serde_json::from_str(task.metadata.as_deref().unwrap()).unwrap();
-        assert_eq!(meta["reason"], "auto-cancelled");
+        assert_eq!(meta["reason"], "cancel-and-retry");
     }
 
     #[tokio::test]
@@ -1497,7 +1625,10 @@ mod tests {
         assert!(is_valid_transition("blocked", "in_progress"));
         assert!(!is_valid_transition("in_progress", "pending"));
         assert!(!is_valid_transition("completed", "pending"));
-        assert!(!is_valid_transition("cancelled", "in_progress"));
+        assert!(is_valid_transition("cancelled", "in_progress")); // mika#856
+        assert!(!is_valid_transition("cancelled", "pending"));
+        assert!(!is_valid_transition("cancelled", "blocked"));
+        assert!(!is_valid_transition("cancelled", "completed"));
         assert!(!is_valid_transition("unknown", "pending"));
 
         // allowed_transitions
@@ -1514,7 +1645,7 @@ mod tests {
             &["in_progress", "completed", "cancelled"]
         );
         assert!(allowed_transitions("completed").is_empty());
-        assert!(allowed_transitions("cancelled").is_empty());
+        assert_eq!(allowed_transitions("cancelled"), &["in_progress"]); // mika#856
         assert!(allowed_transitions("unknown").is_empty());
     }
 }
