@@ -2604,4 +2604,39 @@ mod tests {
             }
         }
     }
+
+    /// U2 verification (mika#737): display_name fields on the static specs
+    /// match the expected full names (not bare "Dev"/"QA").
+    #[test]
+    fn test_display_names_are_full_names() {
+        assert_eq!(MIKA_DEV.display_name, "Mika Dev");
+        assert_eq!(MIKA_QA.display_name, "Mika QA");
+    }
+
+    /// U3 verification (mika#737): provisioned identity.toml files must NOT
+    /// contain a `[reflection]` section. Timezone data and other user-specific
+    /// runtime customizations must not bootstrap from template.
+    #[test]
+    fn test_provisioned_identity_excludes_reflection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("agents")).unwrap();
+
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
+
+        for spec in WELL_KNOWN_AGENTS {
+            let identity_path =
+                mika_common::agent::agent_dir(home, spec.name).join("identity.toml");
+            if !identity_path.exists() {
+                continue; // mika-arch may be skipped if kg_docs_roots paths don't exist
+            }
+            let content = fs::read_to_string(&identity_path).unwrap();
+            assert!(
+                !content.contains("[reflection]"),
+                "agent {} identity.toml must NOT contain [reflection] — \
+                 user-specific timezone data must not bootstrap from template",
+                spec.name
+            );
+        }
+    }
 }
