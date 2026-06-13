@@ -49,6 +49,11 @@ Permitted post-callback actions are described prosaically in the success/failure
 
 **Auto-skip recognition (MANDATORY — first):** if the callback's first line parses as JSON with `"status": "auto_skipped"`, treat as no-op completion. Call `update_task_status(task_id, "completed")` with metadata `{"auto_skipped": true, "skip_reason": "issue_closed"}` and proceed to Step 6 silently (#988).
 
+**Cancel discriminator (mika#749 — MANDATORY, before pipeline result classification):** If the callback `RESULT` starts with:
+- `STATUS=CANCELLED_BY_OPERATOR`: operator explicitly cancelled this dispatch via `cancel_task`. Do NOT retry. Call `update_task_status(task_id, "cancelled")` with metadata `{"cancelled_reason": "operator_cancel"}`. Call `send_message`: "Dispatch cancelled by operator — not retrying. Issue status unchanged." Proceed to Step 6.
+- `STATUS=CANCELLED_BY_SIGNAL`: dispatch was terminated by signal (potentially operator-initiated cancel without the pre-write path, or external signal). Treat as operator-cancel for retry-decision purposes (do NOT retry). Call `update_task_status(task_id, "cancelled")` with metadata `{"cancelled_reason": "signal_cancel"}`. Call `send_message`: "Dispatch terminated by signal — not retrying. Issue status unchanged." Proceed to Step 6.
+- Anything else (no `STATUS=CANCELLED_` prefix): fall through to existing classification paths below.
+
 **Pipeline result classification (MANDATORY — before generic failure handling):**
 
 > **Primary trigger (marker-match):** `tasks.result` contains literal substring `error_max_turns` → run grounding check.

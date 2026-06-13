@@ -6,8 +6,15 @@
 # Sets up worktree, scrubs env, installs EXIT trap, runs claude-pilot,
 # and delivers the result via mika callback.
 #
-# Callers MUST NOT set their own EXIT trap (it would be overwritten silently —
-# bash trap is process-scoped, not function-scoped).
+# Callers MUST NOT set their own EXIT or TERM trap (they would be overwritten
+# silently — bash trap is process-scoped, not function-scoped).
+#
+# Cancel discriminator protocol (mika#749):
+#   Reason file: /tmp/mika-cancel-reason-{PID}
+#   Writer (cancel-time): cancel_task_and_kill pre-writes STATUS=CANCELLED_BY_OPERATOR
+#   Writer (signal-time): TERM trap self-writes STATUS=CANCELLED_BY_SIGNAL (if absent)
+#   Reader (exit-time): EXIT trap reads the file and prefixes the callback envelope
+#   Consumer: self-dev-callback recognizes STATUS=CANCELLED_BY_* and skips retry
 #
 # Per-skill tool ownership (mika#1173 restored after the prompt-only design
 # regressed 5 times since #934): each dispatch skill registers its OWN tool —
@@ -19,6 +26,18 @@
 # dispatch-class derivation (executor.rs derive_dispatch_class).
 
 # --- Internal helpers (underscore-prefixed, not part of the API contract) ---
+
+# mika#749: TERM trap writes cancel discriminator before exit.
+# Convention: reason file at /tmp/mika-cancel-reason-$$ (PID-based).
+# cancel_task pre-writes CANCELLED_BY_OPERATOR before SIGTERM; this trap
+# writes CANCELLED_BY_SIGNAL only if no reason file exists yet (the "if
+# not exists" check ensures operator pre-write wins the race).
+_dispatch_lib_term_trap() {
+    if [ ! -e "/tmp/mika-cancel-reason-$$" ]; then
+        echo "STATUS=CANCELLED_BY_SIGNAL" > "/tmp/mika-cancel-reason-$$" 2>/dev/null || true
+    fi
+    exit 143
+}
 
 _dispatch_lib_exit_trap() {
     _EXIT_CODE=$?
@@ -87,6 +106,22 @@ ${_TRACE_TAIL}"
 PR: ${_PR_URL}"
         fi
     fi
+    # --- Cancel discriminator envelope prefix (mika#749) ---
+    # Read the reason file written by cancel_task (CANCELLED_BY_OPERATOR) or
+    # the TERM trap (CANCELLED_BY_SIGNAL). Prefix the RESULT so the consumer
+    # (mika-dev callback parser) sees the STATUS= line first.
+    _CANCEL_REASON=""
+    if [ -f "/tmp/mika-cancel-reason-$$" ]; then
+        _CANCEL_REASON=$(cat "/tmp/mika-cancel-reason-$$" 2>/dev/null || true)
+        rm -f "/tmp/mika-cancel-reason-$$" 2>/dev/null || true
+    fi
+    if [ -n "$_CANCEL_REASON" ]; then
+        RESULT="${_CANCEL_REASON}
+
+Original exit code: ${_EXIT_CODE}
+${RESULT}"
+    fi
+
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
     set +e
     if [ -n "$AGENT" ]; then
@@ -1954,6 +1989,8 @@ EOF
 
     # Install EXIT trap for crash-recovery callback delivery
     trap '_dispatch_lib_exit_trap' EXIT
+    # Install TERM trap for cancel discriminator (mika#749)
+    trap '_dispatch_lib_term_trap' TERM
 
     _validate_inputs
 
