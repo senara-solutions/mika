@@ -418,6 +418,14 @@ pub enum SkillsCommand {
         /// Output format: text (default) or json
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+
+        /// Filter by source: bundle or marketplace
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Filter by always-on state
+        #[arg(long = "always-on")]
+        always_on: Option<bool>,
     },
     /// Show details for a specific skill
     Info {

@@ -80,6 +80,8 @@ Requires `MIKA_GATEWAY_URL` (default: `http://localhost:3001`) and `MIKA_INTERNA
 
 `mika skills install/uninstall/update/list/validate/info` — skill architecture details in `crates/mika-agent/CLAUDE.md`.
 
+`mika skills list` supports property filters (mika#606): `--source <bundle|marketplace>` filters by origin, `--always-on <true|false>` filters by activation state. Both are optional, AND semantics. Invalid `--source` values produce a clear error. HTTP equivalent: `GET /api/v1/skills?source=bundle&always_on=true`.
+
 ## Knowledge Graph CLI
 
 `mika kg status` — show KG state summary across all agents (entity counts, chunk counts, last extraction, enabled flag, corpus grouping by `docs_root_hash`). Multi-corpus agents (e.g., mika-arch) display one row per corpus with per-corpus resolution counts (#877); agent name and enabled flag are shown on the first row only. `--agent X` filters to one agent. Supports `--format text|json`.

@@ -181,6 +181,8 @@ fn build_router(state: AppState) -> Router {
             "/sessions/{id}/skills",
             get(dashboard::handle_session_skills),
         )
+        // Skills listing with optional property filters (mika#606)
+        .route("/skills", get(dashboard::handle_skills_list))
         .route("/dev-runs", get(dashboard_dev_runs::handle_dev_runs_list))
         .route(
             "/dev-runs/{task_id}",
