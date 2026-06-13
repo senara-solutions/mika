@@ -994,11 +994,14 @@ impl AsyncDatabase {
     }
 
     /// Load recent messages with optional internal-message filtering.
+    ///
+    /// Returns `(visible_messages, hidden_internal_count)`. See
+    /// `Database::load_recent_messages_filtered` for semantics.
     pub async fn load_recent_messages_filtered(
         &self,
         limit: usize,
         exclude_internal: bool,
-    ) -> Result<Vec<SessionMessage>> {
+    ) -> Result<(Vec<SessionMessage>, usize)> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.load_recent_messages_filtered(&a, limit, exclude_internal))
             .await

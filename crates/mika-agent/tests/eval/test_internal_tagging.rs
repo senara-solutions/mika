@@ -62,7 +62,7 @@ async fn test_filtered_load_excludes_internal_messages() {
     let _trace = harness.run("internal relay").await.unwrap();
 
     // Filtered load (inbox mode) should exclude internal messages
-    let filtered = harness
+    let (filtered, hidden_count) = harness
         .db
         .load_recent_messages_filtered(50, true)
         .await
@@ -79,13 +79,21 @@ async fn test_filtered_load_excludes_internal_messages() {
         !visible_asst,
         "internal assistant message should be hidden in inbox mode"
     );
+    assert!(
+        hidden_count > 0,
+        "hidden_internal_count should be > 0 when internal messages exist"
+    );
 
     // Unfiltered load should still see them
-    let unfiltered = harness
+    let (unfiltered, unfiltered_hidden) = harness
         .db
         .load_recent_messages_filtered(50, false)
         .await
         .unwrap();
+    assert_eq!(
+        unfiltered_hidden, 0,
+        "unfiltered load should report 0 hidden"
+    );
     assert!(
         unfiltered.iter().any(|m| m.role == "user"),
         "internal user message should be visible in audit mode"

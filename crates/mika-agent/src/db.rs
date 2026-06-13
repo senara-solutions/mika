@@ -7312,7 +7312,8 @@ impl Database {
         agent_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        self.load_recent_messages_filtered(agent_id, limit, false)
+        let (msgs, _) = self.load_recent_messages_filtered(agent_id, limit, false)?;
+        Ok(msgs)
     }
 
     /// Rebuild conversation context for prompt assembly (mika#974).
@@ -7380,34 +7381,51 @@ impl Database {
     }
 
     /// Load recent messages with optional internal-message filtering.
-    /// When `exclude_internal` is true, messages with `internal = 1` are excluded.
+    ///
+    /// Returns `(visible_messages, hidden_internal_count)`. When `exclude_internal`
+    /// is true, internal messages within the limit-bound window are counted but
+    /// excluded from the returned Vec. The count is best-effort: it reflects
+    /// internals discarded from the limit-bound window, not the total across all
+    /// history. When `exclude_internal` is false, the count is always 0.
     pub fn load_recent_messages_filtered(
         &self,
         agent_id: &str,
         limit: usize,
         exclude_internal: bool,
-    ) -> Result<Vec<SessionMessage>> {
-        let internal_filter = if exclude_internal {
-            " AND m.internal = 0"
-        } else {
-            ""
-        };
+    ) -> Result<(Vec<SessionMessage>, usize)> {
+        // Always fetch without the internal filter so we can count hidden rows.
         let sql = format!(
             "SELECT {} FROM messages m JOIN sessions s ON m.session_id = s.id
-              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'{}
+              WHERE m.agent_id = ?1 AND m.role != 'summary' AND s.channel_type != 'team'
               ORDER BY m.created_at DESC, m.id DESC LIMIT ?2",
             Self::SESSION_MESSAGE_COLUMNS,
-            internal_filter,
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut messages = stmt
+        let all_rows = stmt
             .query_map(
                 params![agent_id, limit as i64],
                 Self::row_to_session_message,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if !exclude_internal {
+            let mut messages = all_rows;
+            messages.reverse();
+            return Ok((messages, 0));
+        }
+
+        // Partition: visible messages and count of hidden internals.
+        let mut hidden_count = 0usize;
+        let mut messages = Vec::with_capacity(all_rows.len());
+        for msg in all_rows {
+            if msg.internal {
+                hidden_count += 1;
+            } else {
+                messages.push(msg);
+            }
+        }
         messages.reverse();
-        Ok(messages)
+        Ok((messages, hidden_count))
     }
 
     pub fn load_conversation_summary(&self, agent_id: &str) -> Result<Option<SessionMessage>> {
@@ -14743,14 +14761,54 @@ mod tests {
         db.save_message("mika", &sid, "assistant", "visible 2", None)
             .unwrap();
 
-        // Without filter: all 3
-        let all = db.load_recent_messages_filtered("mika", 10, false).unwrap();
+        // Without filter: all 3, hidden count 0
+        let (all, hidden) = db.load_recent_messages_filtered("mika", 10, false).unwrap();
         assert_eq!(all.len(), 3);
+        assert_eq!(hidden, 0);
 
-        // With filter: only 2 visible
-        let visible = db.load_recent_messages_filtered("mika", 10, true).unwrap();
+        // With filter: only 2 visible, 1 hidden
+        let (visible, hidden) = db.load_recent_messages_filtered("mika", 10, true).unwrap();
         assert_eq!(visible.len(), 2);
+        assert_eq!(hidden, 1);
         assert!(visible.iter().all(|m| !m.internal));
+    }
+
+    #[test]
+    fn test_load_recent_messages_filtered_hidden_count_empty() {
+        let (db, _sid) = db_with_session();
+        let (msgs, hidden) = db.load_recent_messages_filtered("mika", 20, true).unwrap();
+        assert!(msgs.is_empty());
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn test_load_recent_messages_filtered_hidden_count_limit() {
+        let (db, sid) = db_with_session();
+        // Create 5 internal + 5 visible messages
+        for i in 0..5 {
+            db.save_message_with_metadata(
+                "mika",
+                &sid,
+                "user",
+                &format!("internal {i}"),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+            db.save_message("mika", &sid, "assistant", &format!("visible {i}"), None)
+                .unwrap();
+        }
+
+        // Limit 10 fetches all 10 rows from DB; 5 visible returned, 5 hidden counted
+        let (visible, hidden) = db.load_recent_messages_filtered("mika", 10, true).unwrap();
+        assert_eq!(visible.len(), 5);
+        assert_eq!(hidden, 5);
+
+        // Without filter: all 10 returned, 0 hidden
+        let (all, hidden) = db.load_recent_messages_filtered("mika", 10, false).unwrap();
+        assert_eq!(all.len(), 10);
+        assert_eq!(hidden, 0);
     }
 
     // -- find_active_task_by_pr_url tests --
