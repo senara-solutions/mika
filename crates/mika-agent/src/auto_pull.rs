@@ -6,6 +6,7 @@
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
@@ -74,27 +75,27 @@ pub fn priority_rank(labels: &[IssueLabel]) -> u8 {
 
 /// Select the best groomed-not-ready ticket from a list of open issues.
 ///
-/// Filters to groomed-only, ranks by priority (p0 > p1 > p2 > p3 > unlabelled),
-/// then by oldest `updated_at` within same priority.
-pub fn select_best_candidate(issues: Vec<Issue>) -> Option<Issue> {
-    // Filter out issues that already have the `ready` label
-    let without_ready: Vec<_> = issues
+/// Filters to groomed-only, excludes issues that already have an open PR
+/// closing them (mika#1517 — prevents duplicate pilot dispatch when
+/// dispatch-lib's recovery paths leave a DRAFT PR), then ranks by priority
+/// (p0 > p1 > p2 > p3 > unlabelled) and by oldest `updated_at` within same
+/// priority.
+pub fn select_best_candidate(
+    issues: Vec<Issue>,
+    open_pr_issue_numbers: &HashSet<u64>,
+) -> Option<Issue> {
+    let candidates: Vec<_> = issues
         .into_iter()
         .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
-        .collect();
-
-    // Filter to groomed-only
-    let groomed: Vec<_> = without_ready
-        .into_iter()
+        .filter(|i| !open_pr_issue_numbers.contains(&i.number))
         .filter(|i| is_groomed(&i.body))
         .collect();
 
-    if groomed.is_empty() {
+    if candidates.is_empty() {
         return None;
     }
 
-    // Sort by priority (descending), then by updated_at (ascending = oldest first)
-    groomed.into_iter().max_by(|a, b| {
+    candidates.into_iter().max_by(|a, b| {
         let pa = priority_rank(&a.labels);
         let pb = priority_rank(&b.labels);
         pa.cmp(&pb).then_with(|| b.updated_at.cmp(&a.updated_at))
@@ -166,6 +167,54 @@ async fn gh_list_open_issues(github_token: &str) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
+/// List open PR closing-issue references via `gh pr list` (mika#1517).
+///
+/// Returns the set of issue numbers that have at least one open PR closing
+/// them. Powered by GitHub's `closingIssuesReferences` field — populated when
+/// a PR body contains `Closes #N` (or equivalent keyword) or the PR is
+/// manually linked to an issue. Issues not so linked are absent from the set.
+async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u64>> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args([
+        "pr",
+        "list",
+        "--repo",
+        DEFAULT_REPO,
+        "--state",
+        "open",
+        "--json",
+        "number,closingIssuesReferences",
+        "--limit",
+        "100",
+    ]);
+    cmd.env("GH_TOKEN", github_token);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("gh pr list failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
+
+    let mut closed_issue_numbers = HashSet::new();
+    for pr in raw {
+        if let Some(refs) = pr["closingIssuesReferences"].as_array() {
+            for ref_obj in refs {
+                if let Some(n) = ref_obj["number"].as_u64() {
+                    closed_issue_numbers.insert(n);
+                }
+            }
+        }
+    }
+    Ok(closed_issue_numbers)
+}
+
 /// Apply a label to a GitHub issue.
 async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> Result<()> {
     let mut cmd = tokio::process::Command::new("gh");
@@ -233,8 +282,18 @@ pub async fn auto_pull_groomed_ticket(
         }
     };
 
-    // 3. Select the best groomed-not-ready candidate.
-    let candidate = match select_best_candidate(issues) {
+    // 2b. Fetch open-PR closing-issue refs to skip tickets already in flight (mika#1517).
+    // Fail-open: an empty set preserves pre-fix behavior on infra glitches.
+    let open_pr_issue_numbers = match gh_list_open_pr_closing_issues(github_token).await {
+        Ok(set) => set,
+        Err(e) => {
+            warn!(error = %e, "auto_pull: failed to list open PR closing-issue refs; proceeding without filter");
+            HashSet::new()
+        }
+    };
+
+    // 3. Select the best groomed-not-ready candidate (skip those with open PRs).
+    let candidate = match select_best_candidate(issues, &open_pr_issue_numbers) {
         Some(c) => c,
         None => {
             debug!("auto_pull: no groomed-not-ready candidates found");
@@ -516,7 +575,7 @@ This ticket has been GROOMED and is ready.
             make_issue(1, UNGROOMED_BODY, &["p0"], "2026-06-01T00:00:00Z"),
             make_issue(2, GROOMED_BODY, &["p1"], "2026-06-01T00:00:00Z"),
         ];
-        let selected = select_best_candidate(issues).unwrap();
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
         assert_eq!(selected.number, 2);
     }
 
@@ -526,7 +585,7 @@ This ticket has been GROOMED and is ready.
             make_issue(1, GROOMED_BODY, &["p0", "ready"], "2026-06-01T00:00:00Z"),
             make_issue(2, GROOMED_BODY, &["p1"], "2026-06-01T00:00:00Z"),
         ];
-        let selected = select_best_candidate(issues).unwrap();
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
         assert_eq!(selected.number, 2);
     }
 
@@ -537,7 +596,7 @@ This ticket has been GROOMED and is ready.
             make_issue(2, GROOMED_BODY, &["p0"], "2026-06-01T00:00:00Z"),
             make_issue(3, GROOMED_BODY, &["p1"], "2026-06-01T00:00:00Z"),
         ];
-        let selected = select_best_candidate(issues).unwrap();
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
         assert_eq!(selected.number, 2, "p0 should be selected");
     }
 
@@ -548,7 +607,7 @@ This ticket has been GROOMED and is ready.
             make_issue(2, GROOMED_BODY, &["p1"], "2026-06-01T00:00:00Z"),
             make_issue(3, GROOMED_BODY, &["p1"], "2026-06-03T00:00:00Z"),
         ];
-        let selected = select_best_candidate(issues).unwrap();
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
         assert_eq!(
             selected.number, 2,
             "oldest updated_at within same priority should win"
@@ -563,12 +622,12 @@ This ticket has been GROOMED and is ready.
             &["p0"],
             "2026-06-01T00:00:00Z",
         )];
-        assert!(select_best_candidate(issues).is_none());
+        assert!(select_best_candidate(issues, &HashSet::new()).is_none());
     }
 
     #[test]
     fn test_select_empty_list() {
-        assert!(select_best_candidate(vec![]).is_none());
+        assert!(select_best_candidate(vec![], &HashSet::new()).is_none());
     }
 
     #[test]
@@ -577,7 +636,47 @@ This ticket has been GROOMED and is ready.
             make_issue(1, GROOMED_BODY, &[], "2026-06-01T00:00:00Z"),
             make_issue(2, GROOMED_BODY, &["p3"], "2026-06-01T00:00:00Z"),
         ];
-        let selected = select_best_candidate(issues).unwrap();
+        let selected = select_best_candidate(issues, &HashSet::new()).unwrap();
         assert_eq!(selected.number, 2, "p3 beats unlabelled");
+    }
+
+    #[test]
+    fn test_select_skips_issues_with_open_pr() {
+        // mika#1517: when an issue has an open PR closing it, skip it even if
+        // it's groomed and unlabeled — the previous pilot's work is in flight,
+        // re-dispatching produces a duplicate.
+        let issues = vec![
+            make_issue(606, GROOMED_BODY, &["p2"], "2026-06-13T15:18:00Z"),
+            make_issue(851, GROOMED_BODY, &["p2"], "2026-06-13T16:00:00Z"),
+        ];
+        let mut open_pr_set = HashSet::new();
+        open_pr_set.insert(606); // mika#606 has an open PR — should be skipped
+
+        let selected = select_best_candidate(issues, &open_pr_set);
+        assert!(
+            selected.is_some(),
+            "non-PR-blocked issue should still be selectable"
+        );
+        assert_eq!(
+            selected.unwrap().number,
+            851,
+            "issue with open PR (606) should be skipped; 851 wins"
+        );
+    }
+
+    #[test]
+    fn test_select_skips_all_issues_when_all_have_open_prs() {
+        // When every candidate has an open PR, the selector returns None
+        // (auto-pull will skip this tick — correct behavior).
+        let issues = vec![
+            make_issue(606, GROOMED_BODY, &["p2"], "2026-06-13T15:18:00Z"),
+            make_issue(802, GROOMED_BODY, &["p1"], "2026-06-13T15:00:00Z"),
+        ];
+        let mut open_pr_set = HashSet::new();
+        open_pr_set.insert(606);
+        open_pr_set.insert(802);
+
+        let selected = select_best_candidate(issues, &open_pr_set);
+        assert!(selected.is_none(), "all candidates have open PRs → None");
     }
 }
