@@ -12,10 +12,14 @@ env:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: Check
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, gentux]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       - name: Install Rust toolchain
@@ -134,7 +138,7 @@ jobs:
 
   docker-build-filter:
     name: Docker Build Filter
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, gentux]
     if: github.event_name == 'pull_request'
     outputs:
       docker-relevant: ${{ steps.filter.outputs.docker-relevant }}
@@ -156,7 +160,7 @@ jobs:
 
   docker-build:
     name: Docker Build
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, X64, gentux, docker]
     needs: docker-build-filter
     if: github.event_name == 'pull_request' && needs.docker-build-filter.outputs.docker-relevant == 'true'
     strategy:
