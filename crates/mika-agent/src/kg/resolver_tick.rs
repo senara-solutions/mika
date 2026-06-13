@@ -33,6 +33,7 @@ use mika_common::llm::LlmProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Tick interval in seconds. Hard-coded for v1 (#906).
@@ -58,6 +59,7 @@ const RESOLVER_TICK_INTERVAL_SECS: u64 = 30 * 60;
 /// * `budget` — Per-batch LLM call cap (from `MIKA_KG_BATCH_BUDGET`).
 /// * `interval_secs` — Tick interval override (for testing). Pass `None` to
 ///   use the default 30-minute interval.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_resolver_tick_task(
     agent_id: String,
     db: AsyncDatabase,
@@ -66,6 +68,7 @@ pub fn spawn_resolver_tick_task(
     kg_config: &KgAgentConfig,
     budget: u32,
     interval_secs: Option<u64>,
+    cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let (docs_root_hashes, corpora_roots): (Vec<String>, Vec<PathBuf>) = match kg_config {
         KgAgentConfig::Enabled { corpora } => (
@@ -87,7 +90,22 @@ pub fn spawn_resolver_tick_task(
         interval.tick().await;
 
         loop {
-            interval.tick().await;
+            // Cooperative cancellation: exit between ticks on SIGTERM (#802).
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = cancel.cancelled() => {
+                    info!(
+                        agent_id = %agent_id,
+                        event = "kg_tick_cancelled",
+                        "KG resolver tick cancelled (graceful shutdown)"
+                    );
+                    return;
+                }
+            }
+            // Double-check before starting a potentially long batch.
+            if cancel.is_cancelled() {
+                return;
+            }
             tick_body(
                 &agent_id,
                 &db,
@@ -499,6 +517,7 @@ mod tests {
             &kg_config,
             500,
             Some(1), // 1-second interval (won't fire since task exits)
+            CancellationToken::new(),
         );
 
         // Task should complete quickly since KG is disabled.
@@ -533,6 +552,7 @@ mod tests {
             &kg_config,
             500,
             Some(3600), // long interval so we can abort before it fires
+            CancellationToken::new(),
         );
 
         handle.abort();
@@ -541,6 +561,44 @@ mod tests {
         assert!(
             result.unwrap_err().is_cancelled(),
             "error should be cancellation"
+        );
+    }
+
+    /// Test that cancelling the token exits the tick loop cleanly (#802).
+    #[tokio::test]
+    async fn test_cancellation_token_exits_cleanly() {
+        use crate::kg::config::CorpusConfig;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Database::open(tmp.path()).unwrap();
+        let async_db = AsyncDatabase::new_with_agent(db, "test-agent");
+
+        let kg_config = KgAgentConfig::Enabled {
+            corpora: vec![CorpusConfig {
+                docs_root: PathBuf::from("/nonexistent"),
+                docs_root_hash: "abcdef1234567890".to_string(),
+            }],
+        };
+
+        let cancel = CancellationToken::new();
+        let handle = spawn_resolver_tick_task(
+            "test-agent".to_string(),
+            async_db,
+            None,
+            None,
+            &kg_config,
+            500,
+            Some(3600), // long interval
+            cancel.clone(),
+        );
+
+        // Cancel the token — the task should exit cleanly (Ok, not Err).
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(result.is_ok(), "task should complete within timeout");
+        assert!(
+            result.unwrap().is_ok(),
+            "cancelled task should exit cleanly (Ok), not via abort (Err)"
         );
     }
 }

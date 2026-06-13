@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -816,6 +817,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // Per-agent docs_root resolved from identity.toml [kg] section (#778).
     // Agents with matching docs_root share a corpus via docs_root_hash (v27).
     // Agents with [kg] enabled=false are skipped entirely.
+    //
+    // Graceful shutdown token for KG background tasks (#802).
+    // Cancelled on SIGTERM/Ctrl-C before tick handle abort, giving
+    // in-flight batches a cooperative exit point.
+    let kg_shutdown_token = CancellationToken::new();
+    let mut kg_tick_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     {
         for entry in agents.iter() {
             let agent_name = entry.key();
@@ -1223,7 +1230,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 // at the existing budget, decoupling drain rate from restart
                 // cadence. The startup spawn above handles the immediate
                 // post-restart drain; this tick handles steady-state.
-                crate::kg::resolver_tick::spawn_resolver_tick_task(
+                let kg_tick_handle = crate::kg::resolver_tick::spawn_resolver_tick_task(
                     agent_name.clone(),
                     agent_state.db.clone(),
                     extraction_llm_for_tick.clone(),
@@ -1231,7 +1238,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     &agent_state.kg_config,
                     kg_batch_budget,
                     None, // default 30-min interval
+                    kg_shutdown_token.child_token(),
                 );
+                kg_tick_handles.push(kg_tick_handle);
             }
         }
     }
@@ -1365,11 +1374,19 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         info!("server ready");
     }
 
-    // Serve with graceful shutdown; abort all tick loops once the signal fires
+    // Serve with graceful shutdown; cancel KG tasks cooperatively first (#802),
+    // then abort all remaining tick loops.
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+            // Signal KG background tasks to stop cooperatively. They check
+            // this between iterations and between per-entity LLM calls,
+            // so worst-case latency is one LLM call (~1-2s).
+            kg_shutdown_token.cancel();
             for handle in &tick_handles {
+                handle.abort();
+            }
+            for handle in &kg_tick_handles {
                 handle.abort();
             }
         })

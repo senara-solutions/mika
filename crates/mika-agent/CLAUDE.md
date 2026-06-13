@@ -390,7 +390,9 @@ docs_roots = [
 
 **Sole-writer contract:** This module is the sole writer of `kg_subject_entities`, `kg_subject_relationships`, `kg_chunk_subjects`, `kg_chunk_subject_relationships`, and `kg_extractions` rows.
 
-**Execution contexts (D2):** (1) Startup: background `tokio::spawn` per agent after lexical ingestion, non-blocking. (2) Compound hook: synchronous inline after doc write via `IngestionOrchestrator`, failure non-fatal (C2.3 log-and-skip).
+**Execution contexts (D2):** (1) Startup: background `tokio::spawn` per agent after lexical ingestion, non-blocking. (2) Compound hook: synchronous inline after doc write via `IngestionOrchestrator`, failure non-fatal (C2.3 log-and-skip). (3) Periodic tick (#1052): runs as Phase 1 of `resolver_tick` every 30 minutes.
+
+**Graceful shutdown (mika#802):** The periodic tick loop accepts a `CancellationToken` (parent created in `server/mod.rs`, child tokens per agent). On SIGTERM, the parent token cancels all per-agent child tokens. The loop checks cancellation between iterations via `tokio::select!` and before starting each batch. In-flight LLM calls complete (bounded by reqwest timeout, typically <2s); remaining pending work is abandoned (not written). Half-extracted docs stay pending for the next startup. This prevents the OLD-binary-writes-under-stale-config drift documented in mika#802's incident.
 
 **Extraction flow (D1, D4):** Read full doc from disk → insert `[CHUNK N]` markers at chunk boundaries → LLM call → parse/validate JSON output → UPSERT entities and relationships with provenance in single transaction.
 
@@ -414,7 +416,9 @@ docs_roots = [
 
 **Two-stage pipeline (D1):** Stage 1: case-insensitive exact match against `kg_entities.entity_key`. If match found and extraction confidence > 0.9, resolve immediately (confidence = extraction_confidence). Stage 2: LLM disambiguation with candidate list (max 50) and source chunk prose context. Combined confidence = min(extraction_confidence, llm_confidence). Discovered types (solution_path, failure_mode, pattern) skip resolution entirely — no domain counterpart exists.
 
-**Execution contexts (D5):** (1) Startup: background `tokio::spawn` per agent after extraction tasks, non-blocking. (2) Compound hook: `IngestionOrchestrator` spawns async resolution after extraction commits. (3) Periodic tick (#906): `kg::resolver_tick::spawn_resolver_tick_task()` runs `resolve_pending(budget)` every 30 minutes per KG-enabled agent, decoupling drain rate from restart cadence. First fire skipped (startup spawn covers it). Fail-open (log-and-skip per C2.3). Lifecycle tied to tokio runtime drop (same pattern as `checkpoint_task`). Structured log events: `kg_resolver_tick.start`, `kg_resolver_tick.complete`, `kg_resolver_tick.error`.
+**Execution contexts (D5):** (1) Startup: background `tokio::spawn` per agent after extraction tasks, non-blocking. (2) Compound hook: `IngestionOrchestrator` spawns async resolution after extraction commits. (3) Periodic tick (#906): `kg::resolver_tick::spawn_resolver_tick_task()` runs `resolve_pending(budget)` every 30 minutes per KG-enabled agent, decoupling drain rate from restart cadence. First fire skipped (startup spawn covers it). Fail-open (log-and-skip per C2.3). Structured log events: `kg_resolver_tick.start`, `kg_resolver_tick.complete`, `kg_resolver_tick.error`.
+
+**Graceful shutdown (mika#802):** The periodic tick loop accepts a `CancellationToken` (parent created in `server/mod.rs`, child tokens per agent). On SIGTERM, the parent token cancels all per-agent child tokens. The loop checks cancellation between iterations via `tokio::select!` and before starting each batch. In-flight LLM calls complete (bounded by reqwest timeout, typically <2s); remaining pending work is abandoned (not written). Half-resolved subjects stay `pending` for the next startup. This prevents the OLD-binary-writes-under-stale-config drift documented in mika#802's incident (279-424 rows/agent written under stale `docs_root_hash` during a 3-5s deploy window).
 
 **Pending-entity detection (D4):** `kg_resolutions_log` tracking table with `UNIQUE(agent_id, subject_entity_id)`. Pending query: subject entities with well-known types that have no log row, or whose `source_extraction_trace_id` differs from the latest `kg_chunk_subjects` extraction.
 
