@@ -243,6 +243,22 @@ pub async fn cancel_task_and_kill(
             start_time = ?start_time,
             "killing process for cancelled task"
         );
+
+        // Pre-write cancel reason file before SIGTERM (mika#749).
+        // Convention: /tmp/mika-cancel-reason-{pid} — the shell-side TERM trap
+        // checks this file and skips its own write if already present, so the
+        // CANCELLED_BY_OPERATOR discriminator wins the race.
+        let reason_path = format!("/tmp/mika-cancel-reason-{pid}");
+        if let Err(e) = std::fs::write(&reason_path, "STATUS=CANCELLED_BY_OPERATOR\n") {
+            warn!(
+                task_id,
+                pid,
+                reason_path,
+                error = %e,
+                "failed to write cancel reason file — TERM trap will fall back to CANCELLED_BY_SIGNAL"
+            );
+        }
+
         let killed = kill_process_gracefully(pid, start_time).await;
         let _ = db.clear_task_process_id(task_id).await;
         Some(killed)
@@ -376,5 +392,106 @@ mod tests {
         assert!(!kill_process_gracefully(-1, None).await);
         assert!(!kill_process_gracefully(0, Some(123)).await);
         assert!(!kill_process_gracefully(-1, Some(123)).await);
+    }
+
+    /// mika#749: cancel_task_and_kill pre-writes the reason file before SIGTERM.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn cancel_task_and_kill_writes_reason_file() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+        let task_id = harness
+            .db
+            .create_task(crate::db::NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "long_running:run_claude_pilot test".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap();
+
+        // Spawn a real child and record its PID on the task
+        let (pid, _start_time) = spawn_test_child();
+        harness
+            .db
+            .set_task_process_id(&task_id, Some(pid))
+            .await
+            .unwrap();
+
+        let reason_path = format!("/tmp/mika-cancel-reason-{pid}");
+        // Ensure no leftover from a prior run
+        let _ = std::fs::remove_file(&reason_path);
+
+        let outcome = cancel_task_and_kill(&harness.db, &task_id).await.unwrap();
+        assert!(outcome.is_some());
+
+        // The reason file should have been written before SIGTERM
+        let contents = std::fs::read_to_string(&reason_path).unwrap_or_default();
+        assert_eq!(
+            contents, "STATUS=CANCELLED_BY_OPERATOR\n",
+            "reason file should contain CANCELLED_BY_OPERATOR"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_file(&reason_path);
+        cleanup_pid(pid);
+    }
+
+    /// mika#749: no reason file when task has no subprocess.
+    #[tokio::test]
+    async fn cancel_task_and_kill_no_reason_file_without_subprocess() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+        let task_id = harness
+            .db
+            .create_task(crate::db::NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "manual task".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap();
+
+        // No process_id set — cancel should not write any reason file
+        let outcome = cancel_task_and_kill(&harness.db, &task_id).await.unwrap();
+        assert!(outcome.is_some());
+        assert!(outcome.as_ref().unwrap().process_killed.is_none());
+        // No PID means no reason file path to check — the code path is skipped entirely
     }
 }
