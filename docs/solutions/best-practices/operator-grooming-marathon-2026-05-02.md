@@ -22,7 +22,7 @@ date: 2026-05-02
 
 1. **mika-arch citation-fabrication** (mika#952 filed). Two confirmed instances: mika#931 pass-1 cited a non-existent prior architect session; mika#928 pass-1 fabricated "verbatim" concept lists. Distinct from persistence-meta (mika#947). Self-corrects when challenged in pass-2.
 2. **mika-arch persistence-meta** (mika#947 filed). Skill envelope's system prompt triggers memory-tool conditioning. "No new facts warrant persistence from this turn" instead of review.
-3. **Opus 4.7 transient-error chain** (mika#939, fixed via PR #941). 3 retry attempts × 2-min timeout = 8 min wall time before agent deadline; mika-server emits "I'm sorry, that took too long" fallback. Mitigated by deadline-aware retry abort.
+3. **Opus 4.7 transient-error chain** (mika#939, fixed via PR #941). 3 retry attempts × 2-min timeout = 8 min wall time before agent deadline; mika-spirit emits "I'm sorry, that took too long" fallback. Mitigated by deadline-aware retry abort.
 4. **Pipeline-truncation on /mika dispatch** (mika#940, severity downgraded to N=1). claude-pilot exits cleanly after compound doc Write without continuing to gh pr create. Mika#938 hit it; mika#939 didn't (118-turn full pipeline). Not universal pattern.
 5. **dev-groom canary chain — 4 distinct deny-cause layers**. (1) relay LLM Bash-classifier (mika#935/PR#937 fixed). (2) Phase 1 step 4 interactive prose (mika-platform#76/PR#78 fixed). (3) backtick-in-message rejection (mika#938/PR#945 fixed). (4) env-var-prefix-cmd-substitution rejection (caught in canary v8 v2; recovers via inside-quotes form). Each layer required its own ticket and fix.
 

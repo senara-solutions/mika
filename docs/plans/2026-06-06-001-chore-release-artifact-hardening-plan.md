@@ -6,7 +6,7 @@
 
 ## Context
 
-The `release.yml` workflow already uses `taiki-e/upload-rust-binary-action` with `checksum: sha256` for both `mika` and `mika-server` binaries. Archive naming follows the pattern `mika-$tag-$target` / `mika-server-$tag-$target`, which is already reasonable.
+The `release.yml` workflow already uses `taiki-e/upload-rust-binary-action` with `checksum: sha256` for both `mika` and `mika-spirit` binaries. Archive naming follows the pattern `mika-$tag-$target` / `mika-spirit-$tag-$target`, which is already reasonable.
 
 This ticket hardens the release pipeline as a foundation for the packaging sub-issues (#623 Debian, #624 Gentoo, #625 Homebrew). Those packaging workflows will consume release artifacts and need reliable checksums, attestations, and consistent naming.
 
@@ -15,7 +15,7 @@ This ticket hardens the release pipeline as a foundation for the packaging sub-i
 | Area | Status | Notes |
 |------|--------|-------|
 | SHA-256 checksums | ✅ Present | `checksum: sha256` on both upload steps |
-| Archive naming | ✅ Consistent | `mika-$tag-$target` / `mika-server-$tag-$target` |
+| Archive naming | ✅ Consistent | `mika-$tag-$target` / `mika-spirit-$tag-$target` |
 | Build provenance | ❌ Missing | No `actions/attest-build-provenance` |
 | SBOM | ❌ Missing | No SBOM generation or attestation |
 | Cosign/sigstore signing | ❌ Missing | No keyless signing of release artifacts |

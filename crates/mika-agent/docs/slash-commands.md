@@ -580,11 +580,11 @@ log on every crash for post-incident triage.
 
 The TUI footer bar shows a colored dot indicating dashboard status (green when
 enabled, red when disabled) with clickable `[start]`/`[stop]` and `[open]`
-buttons. Status is polled every ~5 seconds by querying the mika-server
+buttons. Status is polled every ~5 seconds by querying the mika-spirit
 `GET /api/v1/dashboard/status` endpoint.
 
 Requires `MIKA_INTERNAL_TOKEN` or `MIKA_DASHBOARD_TOKEN` to be set. Server URL
-defaults to `http://localhost:8080`, overridable via `MIKA_SERVER_URL`.
+defaults to `http://localhost:8080`, overridable via `MIKA_SPIRIT_URL`.
 
 The CLI commands (`mika dashboard start/stop/status/open`) remain available for
 non-interactive use.

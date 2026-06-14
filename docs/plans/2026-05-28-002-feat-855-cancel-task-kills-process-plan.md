@@ -8,7 +8,7 @@
 
 Cancelling a task today flips the DB status to `cancelled` and **does** send SIGTERM/SIGKILL to the `claude-pilot` process via `cancel_task_and_kill()` in `process_kill.rs`. However, two gaps remain:
 
-1. **No process group isolation at spawn.** `executor.rs` spawns `claude-pilot` without `setsid()` or `process_group(0)`, so the child inherits the parent's (mika-server's) process group. The `kill(-pid, SIGTERM)` call in `kill_process_gracefully()` sends to process group `pid` — which doesn't exist because `claude-pilot` is not a group leader. The fallback `kill(pid, SIGTERM)` only kills `claude-pilot` itself; Claude Code (its child) continues as an orphan consuming tokens.
+1. **No process group isolation at spawn.** `executor.rs` spawns `claude-pilot` without `setsid()` or `process_group(0)`, so the child inherits the parent's (mika-spirit's) process group. The `kill(-pid, SIGTERM)` call in `kill_process_gracefully()` sends to process group `pid` — which doesn't exist because `claude-pilot` is not a group leader. The fallback `kill(pid, SIGTERM)` only kills `claude-pilot` itself; Claude Code (its child) continues as an orphan consuming tokens.
 
 2. **No PID reuse guard in the cancel path.** `kill_process_gracefully()` uses a basic `/proc/<pid>/stat` existence check, but does NOT compare process start times. The callback watchdog (`engine.rs`) correctly uses `is_same_process_alive(pid, expected_start_time)`, but the cancel path doesn't — creating a TOCTOU window where cancel could kill a wrong process if PID was reused between task death and operator-initiated cancel.
 

@@ -19,7 +19,7 @@ symptoms:
 
 ## Problem
 
-`LexicalIngestor` resolved its docs root via `std::env::current_dir().join("docs/solutions")`. Inside Docker containers this works because the Dockerfile COPYs `docs/` into the workdir. On non-container hosts where an init system (OpenRC `supervise-daemon`, systemd) launches `mika-server` with CWD=`/`, the path resolves to `/docs/solutions` which does not exist. The ingestor silently skips, and the entire lexical/subject/resolution KG pipeline never populates.
+`LexicalIngestor` resolved its docs root via `std::env::current_dir().join("docs/solutions")`. Inside Docker containers this works because the Dockerfile COPYs `docs/` into the workdir. On non-container hosts where an init system (OpenRC `supervise-daemon`, systemd) launches `mika-spirit` with CWD=`/`, the path resolves to `/docs/solutions` which does not exist. The ingestor silently skips, and the entire lexical/subject/resolution KG pipeline never populates.
 
 This was a hard block for KG milestone #14 on the Gentoo OpenRC host — only the in-memory domain graph survived across restarts.
 
@@ -111,7 +111,7 @@ All tests use `#[serial]` + env cleanup to avoid cross-test interference from `s
 
 ## Operator Guidance
 
-For non-container hosts where `mika-server` starts with CWD != repo root:
+For non-container hosts where `mika-spirit` starts with CWD != repo root:
 
 ```bash
 # Option A: env var (recommended for init scripts)
@@ -122,7 +122,7 @@ MIKA_KG_DOCS_ROOT=/path/to/mika-repo/docs/solutions
 kg_docs_root = "/path/to/mika-repo/docs/solutions"
 
 # Option C: init-script --chdir (existing workaround, still works)
-supervise-daemon mika-server --chdir /path/to/mika-repo ...
+supervise-daemon mika-spirit --chdir /path/to/mika-repo ...
 ```
 
 ## Related

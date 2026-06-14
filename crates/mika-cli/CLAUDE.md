@@ -100,7 +100,7 @@ See `crates/mika-agent/CLAUDE.md` for KG architecture and schema details.
 
 Two subcommands; bare `mika logs` defaults to `paths` for backward compatibility.
 
-`mika logs` / `mika logs paths` — Show resolved log file paths for an agent. Prints both the server log path (`MIKA_SERVER_LOG_FILE` or `/var/log/mika/server.log` fallback) and the per-agent CLI log path (`~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`). Includes file existence, size, and a ready-to-use `jq` filter command for querying the server log by agent_id. Supports `--agent <name>` and `--format text|json|yaml`.
+`mika logs` / `mika logs paths` — Show resolved log file paths for an agent. Prints both the server log path (`MIKA_SPIRIT_LOG_FILE` or `/var/log/mika/server.log` fallback) and the per-agent CLI log path (`~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`). Includes file existence, size, and a ready-to-use `jq` filter command for querying the server log by agent_id. Supports `--agent <name>` and `--format text|json|yaml`.
 
 `mika logs activity` — Query cross-surface activity from SQLite (messages, LLM calls, tool calls, tasks) and render as a chronologically-interleaved timeline. Supports:
 - `--since <expr>` — Time window start: `30m`, `2h`, `1d`, `today`, or ISO 8601. Default: `1h`.

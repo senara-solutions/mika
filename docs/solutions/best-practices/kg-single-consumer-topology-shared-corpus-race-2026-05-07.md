@@ -59,7 +59,7 @@ sed -i 's/^enabled = true$/enabled = false/' ~/.mika/agents/mika-dev/identity.to
 sed -i 's/^enabled = true$/enabled = false/' ~/.mika/agents/mika-qa/identity.toml
 
 # 3. Restart
-sudo rc-service mika-server restart
+sudo rc-service mika-spirit restart
 ```
 
 ## Why This Matters

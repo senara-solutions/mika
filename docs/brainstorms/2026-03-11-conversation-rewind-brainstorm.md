@@ -80,7 +80,7 @@ Proceed? [y/N]
 
 ### Dashboard
 
-Click any message -> "Rewind to here" button -> preview -> confirm -> API call to mika-server.
+Click any message -> "Rewind to here" button -> preview -> confirm -> API call to mika-spirit.
 
 ### Server API
 

@@ -418,7 +418,7 @@ graph TD
 
 - [x] **Unit 7: HTTP API endpoints**
 
-**Goal:** Add variant management REST endpoints to mika-server.
+**Goal:** Add variant management REST endpoints to mika-spirit.
 
 **Requirements:** R6
 
@@ -570,7 +570,7 @@ graph TD
 - Update `docs/skills.md` to document the `experimental/` directory convention and the `[variants]` section in `skill.toml`
 - Update `crates/mika-cli/CLAUDE.md` to list the new `mika skills variants` subcommands
 - Update `crates/mika-agent/CLAUDE.md` to mention the `variants.rs` module in the Skills System section
-- Update `docs/openapi/mika-server.yaml` with the new variant endpoints
+- Update `docs/openapi/mika-spirit.yaml` with the new variant endpoints
 
 ## Sources & References
 

@@ -10,12 +10,12 @@ dependencies: []
 
 ## Problem Statement
 
-The 10-line `#[cfg(feature)]` / `#[cfg(not(feature))]` block for building the OTel layer and guard appears 3 times: `mika-server.rs`, `main.rs` (team mode), and `main.rs` (agent mode). The `NoopLayer` re-export exists solely to serve these call sites.
+The 10-line `#[cfg(feature)]` / `#[cfg(not(feature))]` block for building the OTel layer and guard appears 3 times: `mika-spirit.rs`, `main.rs` (team mode), and `main.rs` (agent mode). The `NoopLayer` re-export exists solely to serve these call sites.
 
 ## Findings
 
 - **Source**: Code simplicity reviewer + architecture strategist
-- **Locations**: `crates/mika-cli/src/main.rs:35-47`, `crates/mika-cli/src/main.rs:112-126`, `crates/mika-agent/src/bin/mika-server.rs:15-26`
+- **Locations**: `crates/mika-cli/src/main.rs:35-47`, `crates/mika-cli/src/main.rs:112-126`, `crates/mika-agent/src/bin/mika-spirit.rs:15-26`
 - **Evidence**: ~40 lines of identical cfg-gated boilerplate
 
 ## Proposed Solutions

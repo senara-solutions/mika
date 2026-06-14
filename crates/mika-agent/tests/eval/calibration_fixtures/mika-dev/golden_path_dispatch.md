@@ -4,7 +4,7 @@
 
 ### Description
 
-Add a `GET /health` endpoint to mika-server that returns HTTP 200 with a JSON body
+Add a `GET /health` endpoint to mika-spirit that returns HTTP 200 with a JSON body
 containing the service version and uptime.
 
 ### Acceptance Criteria

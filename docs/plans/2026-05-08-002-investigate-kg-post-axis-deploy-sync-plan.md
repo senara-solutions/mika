@@ -40,7 +40,7 @@ Layer 1 (chunking) is **PRESENT** for all three. Investigation focuses on layers
 
 ### Investigation script approach
 
-A single Bash script at `scripts/investigate-kg-1027.sh` that runs the canonical SQL + log queries against `~/.mika/data/mika.db` and `MIKA_SERVER_LOG_FILE`, prints structured output, and writes the finding doc inline. Reasoning: the queries are concrete and uncached — the investigation IS the queries. Embedding them in a script (rather than running ad-hoc) makes the work reproducible: the next post-deploy KG verification (which the runbook §3 anticipates) reuses the same script.
+A single Bash script at `scripts/investigate-kg-1027.sh` that runs the canonical SQL + log queries against `~/.mika/data/mika.db` and `MIKA_SPIRIT_LOG_FILE`, prints structured output, and writes the finding doc inline. Reasoning: the queries are concrete and uncached — the investigation IS the queries. Embedding them in a script (rather than running ad-hoc) makes the work reproducible: the next post-deploy KG verification (which the runbook §3 anticipates) reuses the same script.
 
 Alternatives rejected:
 - **Single audit doc with copy-paste queries:** less reproducible; future runbook hooks would need to re-derive the queries.
@@ -195,7 +195,7 @@ jq -c '
   | select(.timestamp > "2026-05-07T16:00:00Z")
   | select(.agent_id == "mika-arch")
   | {ts: .timestamp, event, agent_id, pending_after, llm_calls, aborted_budget, per_corpus_attempted}
-' "$MIKA_SERVER_LOG_FILE"
+' "$MIKA_SPIRIT_LOG_FILE"
 ```
 
 | Field | Source | PASS | FAIL |
@@ -215,7 +215,7 @@ jq -c '
   select(.event == "domain_rebuild_start" or .event == "domain_rebuild_complete" or .event == "domain_rebuild_entities" or .event == "domain_rebuild_edges")
   | select(.timestamp > "2026-05-08T08:00:00Z")
   | {ts: .timestamp, event, trace_id}
-' "$MIKA_SERVER_LOG_FILE"
+' "$MIKA_SPIRIT_LOG_FILE"
 ```
 
 ```sql
@@ -261,13 +261,13 @@ The finding doc's TL;DR ends with one of:
 
 Bash script that:
 
-1. Sources `MIKA_SERVER_LOG_FILE` from environment or argv (default `/var/log/mika/server.log`).
+1. Sources `MIKA_SPIRIT_LOG_FILE` from environment or argv (default `/var/log/mika/server.log`).
 2. Runs the six-layer queries from §"What the script checks" verbatim against `~/.mika/data/mika.db` (via `sqlite3`).
 3. Filters the server log for KG events using **jq selectors against `.event` field** (per architect NF3), not text grep — the server emits structured JSON.
 4. Produces a structured stdout report (markdown table per layer).
 5. Captures a timestamp for the finding doc.
 
-The script is idempotent (read-only) — safe to re-run. Uses `MIKA_SERVER_LOG_FILE` env var resolution: if unset, falls back to `/var/log/mika/server.log` and emits a WARN if read access fails.
+The script is idempotent (read-only) — safe to re-run. Uses `MIKA_SPIRIT_LOG_FILE` env var resolution: if unset, falls back to `/var/log/mika/server.log` and emits a WARN if read access fails.
 
 **Per architect NF2: scope of reusability.** The script `investigate-kg-1027.sh` is a **per-ticket one-shot** — its filename is bound to mika#1027 and it queries this specific moment in the KG state. The **methodology** it embodies (six-layer post-deploy KG verification) IS reusable, but the script itself is not the reusable artifact. Future post-deploy verifications either (a) copy this script and rename per-ticket, or (b) consume the methodology distilled into a `solutions/best-practices/` doc per Step 6 below. Do not market this script as "the canonical post-deploy KG verification script" in CLAUDE.md.
 
@@ -339,11 +339,11 @@ Mirroring the ticket body for traceability:
 - **AC#3**: Resolver tick health summary: number of ticks since 2026-05-07T16:00Z, number with `aborted_budget=true`, current `pending_after` value (per agent — mika-arch is the only KG consumer per mika#800). Derived from the L5 jq queries (per architect NF3 — jq selectors, not grep).
 - **AC#4**: Per-corpus fairness summary: any corpus with pending entities and zero attempts on recent ticks (mika#927 violation indicator). Cite the `per_corpus_attempted` JSON field from `kg_resolver_tick.complete` events directly.
 - **AC#5**: Outcome path declared (A/B/C) in the finding doc's TL;DR; follow-up fix ticket(s) filed if Path B (separate from the methodology-extraction follow-up).
-- **AC#6**: Investigation script committed at `mika/scripts/investigate-kg-1027.sh` (per architect F2 — repo-local, not workspace-level). Idempotent (read-only). Sources `MIKA_SERVER_LOG_FILE` from env or argv. Per architect NF2: this is a **per-ticket one-shot**, not a canonical reusable script; methodology extraction (if pursued) is a separate follow-up ticket per Step 6.
+- **AC#6**: Investigation script committed at `mika/scripts/investigate-kg-1027.sh` (per architect F2 — repo-local, not workspace-level). Idempotent (read-only). Sources `MIKA_SPIRIT_LOG_FILE` from env or argv. Per architect NF2: this is a **per-ticket one-shot**, not a canonical reusable script; methodology extraction (if pursued) is a separate follow-up ticket per Step 6.
 
 ## Risks & Open Questions
 
-- **R1 (low):** `MIKA_SERVER_LOG_FILE` access may be restricted (mode 0640 or owner-only). The script must fall back gracefully — if log file is unreadable, layers 5 + 6 are reported as "log access denied" with a recovery note ("re-run with sudo or update MIKA_SERVER_LOG_FILE perms"); SQL layers 1–4 still produce results.
+- **R1 (low):** `MIKA_SPIRIT_LOG_FILE` access may be restricted (mode 0640 or owner-only). The script must fall back gracefully — if log file is unreadable, layers 5 + 6 are reported as "log access denied" with a recovery note ("re-run with sudo or update MIKA_SPIRIT_LOG_FILE perms"); SQL layers 1–4 still produce results.
 - **R2 (low):** v27 schema dependency. The investigation queries use `docs_root_hash` joins (post-v27) implicitly — `kg_extractions` and the shared-corpus tables. If the DB has somehow regressed to pre-v27, the queries fail. Pre-flight check: `SELECT MAX(version) FROM schema_version` — assert ≥ 27 before running the per-layer queries; fail loud if not.
 - **R3 (low):** mika-arch is the only KG consumer (per mika#800); mika-dev/qa have `[kg].enabled = false`. The script must scope agent-specific queries to mika-arch and not falsely flag missing data for the other agents. Layer 1 (chunks) is shared-corpus and agent-independent. Layers 2–4 are agent-scoped via `agent_kg_corpora` join. Layers 5 + 6 are agent-emitted log events; filter by `agent_id="mika-arch"` for resolver-tick analysis.
 - **R4 (low):** Recent-doc skew. The morning's compound docs (#1022, #1025) were committed AFTER server-startup ingest could have indexed them. They depend on the resolver tick (#906) running post-merge. If the most recent server restart was before the doc was committed, the doc would still be missing from extraction layer until the next 30-min tick fires. Pre-flight check: capture the most recent server-startup time + the ingest hook's last-run time; reconcile against doc commit timestamps before declaring an absent-bug-flagged verdict. Time-skew false-positive guard. **Per architect second-pass NF4:** the script must emit a third verdict class — `PENDING` — when `last_chunked > last_tick_complete` (i.e., the chunk landed after the most recent resolver-tick fired). A `PENDING` verdict is NOT an `absent-bug-flagged` outcome; it's "the system hasn't had a chance to process this yet." The finding doc records `PENDING` per doc and re-runs the investigation after the next tick fires (or the operator manually triggers a tick if urgent). Without this, the audit could file a false Outcome B against a system that's working correctly.

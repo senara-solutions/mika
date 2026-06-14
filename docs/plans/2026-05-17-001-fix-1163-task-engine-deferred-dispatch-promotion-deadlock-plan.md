@@ -276,7 +276,7 @@ The issue body speculated this might be downstream of mika#1162 (parent task not
 
 ## Documentation / Operational Notes
 
-- **Operational signal (post-deploy):** On the first restart after deploy, in any DB with wedged pending wrappers, `grep deferred_dispatch_promoted` in `MIKA_SERVER_LOG_FILE` should show wrappers promoting and the corresponding DeferredDispatch turns successfully calling `run_claude_pilot` (NO `global_dispatch_active` rejection in the immediately following dispatch attempt). Real callbacks appear in `tasks` rows with `label = 'long_running:run_claude_pilot:implement'` (or `:groom`) and `status = 'in_progress'` + `process_id` set. Within ~60s of slot-idle, the pending-wrapper count converges to 0 (one promotion → one real dispatch per cycle, FIFO).
+- **Operational signal (post-deploy):** On the first restart after deploy, in any DB with wedged pending wrappers, `grep deferred_dispatch_promoted` in `MIKA_SPIRIT_LOG_FILE` should show wrappers promoting and the corresponding DeferredDispatch turns successfully calling `run_claude_pilot` (NO `global_dispatch_active` rejection in the immediately following dispatch attempt). Real callbacks appear in `tasks` rows with `label = 'long_running:run_claude_pilot:implement'` (or `:groom`) and `status = 'in_progress'` + `process_id` set. Within ~60s of slot-idle, the pending-wrapper count converges to 0 (one promotion → one real dispatch per cycle, FIFO).
 - **No DB migration.** Pure code change. Existing pending wrappers are unblocked by the next backstop tick after deploy.
 - **No deploy ordering constraint.** Single-binary fix in `mika-agent`. `make deploy` from this branch is the deploy.
 - **`/ce:compound` follow-up note (out of scope for this PR — compound step handles it).**

@@ -599,7 +599,7 @@ Post-deploy:
 2. Observe response: contains `"Dispatched"`, contains a task ID, does NOT contain `"Verdict: GROOMED"` or `"Verdict: ESCALATE"`.
 3. Wait for callback (~minutes for a fresh /mika-groom-ticket run).
 4. Observe callback message: legitimate Verdict line from the architect, body callout written, ticket dispatch-ready.
-5. `grep dev_groom_fabrication_guard $MIKA_SERVER_LOG_FILE` — should be empty on healthy ticks; non-empty entries indicate the LLM is still attempting fabrication and the guard is catching it (file follow-up if persistent).
+5. `grep dev_groom_fabrication_guard $MIKA_SPIRIT_LOG_FILE` — should be empty on healthy ticks; non-empty entries indicate the LLM is still attempting fabrication and the guard is catching it (file follow-up if persistent).
 
 ## File list
 

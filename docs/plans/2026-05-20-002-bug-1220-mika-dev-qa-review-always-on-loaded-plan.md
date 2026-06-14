@@ -202,7 +202,7 @@ After the binary lands on the host:
 1. `cat ~/.mika/agents/mika-dev/identity.toml` → expect `[skills].allowlist` present
 2. Trigger a webhook event (`gh issue edit <test-ticket> --add-label ready`) and watch mika-dev process it
 3. Confirm the previously-blocked `gh issue edit ... --remove-label ready` call now succeeds in the agent loop
-4. `grep validate_qa_review_gh_scope $MIKA_SERVER_LOG_FILE` returns no rejection events for mika-dev sessions post-deploy
+4. `grep validate_qa_review_gh_scope $MIKA_SPIRIT_LOG_FILE` returns no rejection events for mika-dev sessions post-deploy
 
 ## Risks and mitigations
 

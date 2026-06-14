@@ -279,12 +279,12 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         backend: ConfigBackend::File,
         env_var: Some("MIKA_LOG_FORMAT"),
         secret: false,
-        description: "Stdout log format for mika-server and mika-gateway (json or pretty). CLI always uses pretty.",
+        description: "Stdout log format for mika-spirit and mika-gateway (json or pretty). CLI always uses pretty.",
     },
     ConfigKeyInfo {
         key: "server_port",
         backend: ConfigBackend::File,
-        env_var: Some("MIKA_SERVER_PORT"),
+        env_var: Some("MIKA_SPIRIT_PORT"),
         secret: false,
         description: "HTTP server port",
     },
@@ -731,7 +731,7 @@ pub struct Settings {
     #[serde(default)]
     pub brave_api_key: Option<SecretString>,
 
-    /// Optional log file path for mika-server (maps to MIKA_SERVER_LOG_FILE)
+    /// Optional log file path for mika-spirit (maps to MIKA_SPIRIT_LOG_FILE)
     #[serde(default)]
     pub server_log_file: Option<PathBuf>,
 

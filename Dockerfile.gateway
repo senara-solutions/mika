@@ -16,7 +16,7 @@ COPY crates/mika-gateway/ crates/mika-gateway/
 
 # Dummy stubs for workspace members not being built
 COPY crates/mika-agent/Cargo.toml crates/mika-agent/Cargo.toml
-RUN mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agent/src/bin/mika-server.rs \
+RUN mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agent/src/bin/mika-spirit.rs \
     && echo "" > crates/mika-agent/src/lib.rs \
     && mkdir -p crates/mika-agent/src && echo "fn main() {}" > crates/mika-agent/src/cli.rs
 

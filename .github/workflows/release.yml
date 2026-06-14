@@ -65,24 +65,24 @@ jobs:
         with:
           subject-path: mika-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
-      # mika-server is the HTTP server binary (from mika-agent crate).
+      # mika-spirit is the HTTP server binary (from mika-agent crate).
       # Dashboard assets are not embedded in release builds (empty placeholder);
       # the /dashboard/ endpoint shows a branded "disabled" page.
       # mika-gateway is excluded — deployed via Docker to Kubernetes, not as a standalone binary.
-      - name: Build and upload mika-server
+      - name: Build and upload mika-spirit
         uses: taiki-e/upload-rust-binary-action@f391289bcff6a7f36b6301c0a74199657bbb4561  # v1
         with:
-          bin: mika-server
+          bin: mika-spirit
           features: telemetry
           target: ${{ matrix.target }}
-          archive: mika-server-$tag-$target
+          archive: mika-spirit-$tag-$target
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Attest mika-server archive
+      - name: Attest mika-spirit archive
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v4
         with:
-          subject-path: mika-server-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          subject-path: mika-spirit-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
   sbom:
     name: Generate SBOM

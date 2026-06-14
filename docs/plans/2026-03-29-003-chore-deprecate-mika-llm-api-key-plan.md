@@ -10,7 +10,7 @@ issue: 317
 
 ## Overview
 
-`MIKA_LLM_API_KEY` is a dead env var — it has no corresponding field in the `Settings` struct, so config-rs never reads it. Yet `setup.rs`, `doctor.rs`, `claude.rs`, and `mika-server.rs` all reference it in user-facing code. This creates a split-brain where:
+`MIKA_LLM_API_KEY` is a dead env var — it has no corresponding field in the `Settings` struct, so config-rs never reads it. Yet `setup.rs`, `doctor.rs`, `claude.rs`, and `mika-spirit.rs` all reference it in user-facing code. This creates a split-brain where:
 
 - **Setup** writes `MIKA_LLM_API_KEY` to `~/.mika/.env`
 - **Config system** reads `MIKA_ANTHROPIC_API_KEY` from env
@@ -52,7 +52,7 @@ Doctor should check the active provider's key. For now, checking `MIKA_ANTHROPIC
 | 344 | `"MIKA_LLM_API_KEY is required but not set..."` | `"MIKA_ANTHROPIC_API_KEY is required but not set. Set it to your Anthropic API key (sk-ant-api03-...) or OAuth token (sk-ant-oat01-...)."` |
 | 504 | `"Check that MIKA_LLM_API_KEY is set to a valid Anthropic API key."` | `"Check that MIKA_ANTHROPIC_API_KEY is set to a valid Anthropic API key."` |
 
-### 4. `crates/mika-agent/src/bin/mika-server.rs`
+### 4. `crates/mika-agent/src/bin/mika-spirit.rs`
 
 | Line | Current | Change |
 |------|---------|--------|
@@ -127,7 +127,7 @@ After updating `docs/`, run `scripts/sync-agent-docs.sh` to sync `crates/mika-ag
 - [x] `mika setup --mode compose` generates `MIKA_ANTHROPIC_API_KEY` in `.env`
 - [x] `mika doctor` checks `MIKA_ANTHROPIC_API_KEY` (not `MIKA_LLM_API_KEY`)
 - [x] Error messages in `claude.rs` reference `MIKA_ANTHROPIC_API_KEY`
-- [x] `mika-server` startup error references `MIKA_ANTHROPIC_API_KEY`
+- [x] `mika-spirit` startup error references `MIKA_ANTHROPIC_API_KEY`
 - [x] Smoke test uses `MIKA_ANTHROPIC_API_KEY`
 - [x] Shell-exec handler unsets all per-provider API keys (security fix)
 - [x] Startup deprecation warning when `MIKA_LLM_API_KEY` is detected in env

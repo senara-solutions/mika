@@ -92,7 +92,7 @@ The builder now starts directly with the global TOML config.
 `load_dotenv()` is called **before** `Settings::load()` in all entry points:
 
 - **CLI** (`mika-cli/src/main.rs`): Both team-mode and normal paths
-- **Server** (`mika-agent/src/bin/mika-server.rs`): After home_dir resolution
+- **Server** (`mika-agent/src/bin/mika-spirit.rs`): After home_dir resolution
 - **Gateway** (`mika-gateway/src/main.rs`): CWD-based `dotenvy::dotenv()` (no home dir)
 
 ### Setup Command
@@ -188,7 +188,7 @@ code review checklist.
 | `crates/mika-common/Cargo.toml` | Added dotenvy dependency |
 | `crates/mika-cli/src/main.rs` | Wired `load_dotenv()` in both paths |
 | `crates/mika-cli/src/commands/setup.rs` | API key prompt writes to `.env` |
-| `crates/mika-agent/src/bin/mika-server.rs` | Wired `load_dotenv()` |
+| `crates/mika-agent/src/bin/mika-spirit.rs` | Wired `load_dotenv()` |
 | `crates/mika-gateway/src/main.rs` | CWD-based `dotenvy::dotenv()` |
 | `Dockerfile.agent` | Removed `config/default.toml` COPY |
 | `config/default.toml` | **DELETED** |

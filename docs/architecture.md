@@ -15,7 +15,7 @@ modes:
   filesystem. No network services are required beyond the Claude API.
 
 - **Hosted mode (per-customer containers):** Each customer gets their own
-  agent container running `mika-server` (Axum HTTP), with an isolated SQLite database
+  agent container running `mika-spirit` (Axum HTTP), with an isolated SQLite database
   on a persistent volume. A shared gateway (`crates/mika-gateway/` in this repo)
   routes messages from Telegram to the correct container.
 
@@ -45,7 +45,7 @@ from the `mika-agent` crate.
 ```
 +----------+     +--------------------+     +----------------------------+
 | Telegram  |---->|  Gateway           |     |  Per-customer container    |
-| Bot API   |<----|  (mika-gateway)    |     |  mika-server (Axum)        |
+| Bot API   |<----|  (mika-gateway)    |     |  mika-spirit (Axum)        |
 +----------+     +--------+-----------+     |                            |
                            |                 |  SQLite (persistent vol)   |
                            |   POST /message |  Agent loop + tools        |
@@ -65,7 +65,7 @@ from the `mika-agent` crate.
 |-------|------|---------------|
 | `mika-common` | `crates/mika-common/` | Shared library: config (config-rs with `MIKA_` prefix, `ConfigKeyInfo` registry with `ConfigBackend` enum for key metadata), validation (`validation.rs` — API key format, file permissions, binary-in-PATH, config value validation), dotenv (`~/.mika/.env` secrets via dotenvy), Claude API client (`ClaudeClient` with typed `ClaudeApiError`), multi-provider LLM abstraction (`LlmProvider` trait, `AnthropicProvider`, `OpenAiCompatibleProvider`), logging (tracing), telemetry (feature-gated OTel export), home directory resolution |
 | `mika-a2a` | `crates/mika-a2a/` | A2A (Agent-to-Agent) protocol v0.3 implementation: JSON-RPC request/response types, task state machine, SSE streaming, A2A client |
-| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 27 builtin tools + 12 management tools (3 always-on + 9 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, A2A server endpoints, HTTP server binary (`mika-server`) |
+| `mika-agent` | `crates/mika-agent/` | Agent container: SQLite database (`Database`, `AsyncDatabase`), agent loop (`run_agent`, `run_silent_agent`), 27 builtin tools + 12 management tools (3 always-on + 9 conditional), prompt assembly, conversation compaction, conversation rewind engine, unified task engine, skills system, MCP client, A2A server endpoints, HTTP server binary (`mika-spirit`) |
 | `mika-cli` | `crates/mika-cli/` | TUI CLI binary (`mika`): ratatui chat interface, clap subcommands (`status`, `memory`, `reminders`, `config`, `setup`, `tasks`, `doctor`) |
 | `mika-gateway` | `crates/mika-gateway/` | Telegram webhook router: Postgres customer registry, message routing to per-customer containers, pairing flow, outbound relay with agent identification and reply routing. Env-var-only config. |
 
@@ -465,7 +465,7 @@ Dispatch chain: builtins → skills → MCP → unknown error.
 |---------|--------------|
 | CLI ask mode (`mika ask`) | Yes (per-invocation connections, graceful shutdown) |
 | CLI chat mode (`mika`) | Yes (session-persistent connections) |
-| Server mode (`mika-server`) | Yes (per-agent manager, startup connections) |
+| Server mode (`mika-spirit`) | Yes (per-agent manager, startup connections) |
 | Silent mode (heartbeat, reflection, callbacks) | No |
 | Team agent runs | No (Phase 4 future) |
 
@@ -661,7 +661,7 @@ Properties:
 - **Graceful shutdown:** `shutdown()` drops the sender, joins the background thread.
 
 
-## 13. HTTP Server (mika-server)
+## 13. HTTP Server (mika-spirit)
 
 The per-customer agent container runs an Axum HTTP server:
 
@@ -748,9 +748,9 @@ Tailwind CSS v4, TanStack React Query, React Router, Lucide icons.
 ### Development
 
 ```bash
-# Terminal 1: Start mika-server
+# Terminal 1: Start mika-spirit
 MIKA_ANTHROPIC_API_KEY=<key> MIKA_INTERNAL_TOKEN=<64-hex> \
-  MIKA_ROUTING_URL=<gateway-url> cargo run --bin mika-server
+  MIKA_ROUTING_URL=<gateway-url> cargo run --bin mika-spirit
 
 # Terminal 2: Start dashboard dev server
 VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard
@@ -787,7 +787,7 @@ external A2A agents via the `a2a_call` tool.
 | `streaming.rs` | SSE streaming types: `StreamEvent`, `TaskStatusUpdateEvent`, `TaskArtifactUpdateEvent` |
 | `client.rs` | `A2aClient` — sends JSON-RPC requests to remote A2A endpoints with optional Bearer auth |
 
-### Server Endpoints (mika-server)
+### Server Endpoints (mika-spirit)
 
 A2A routes are merged into the main router with internal token auth (no CORS):
 
@@ -941,7 +941,7 @@ Three environment variables control export:
 | `MIKA_OTLP_AUTH_HEADER` | Authorization header value (e.g., Base64 credentials) |
 
 `build_otel_layer()` returns a `TelemetryGuard` that flushes pending spans on drop,
-ensuring no traces are lost at shutdown. Both `mika-server` and `mika` CLI hold
+ensuring no traces are lost at shutdown. Both `mika-spirit` and `mika` CLI hold
 the guard alive until process exit.
 
 ### Langfuse Compatibility

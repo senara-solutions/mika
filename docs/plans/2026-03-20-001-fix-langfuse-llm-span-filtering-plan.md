@@ -193,7 +193,7 @@ Provider kinds: `"openai"`, `"ollama"`, `"groq"`, `"together"`, `"vllm"`, etc.
 3. `cargo test` — passes
 4. `cargo test --features telemetry` — passes
 5. `cargo clippy --features telemetry` — clean
-6. Manual verification: run `mika-server` with telemetry enabled pointing at Langfuse, send a message, check Langfuse trace shows:
+6. Manual verification: run `mika-spirit` with telemetry enabled pointing at Langfuse, send a message, check Langfuse trace shows:
    - `process_message` trace root
    - `agent_turn` child span
    - `llm_call` generation span(s) with gen_ai attributes

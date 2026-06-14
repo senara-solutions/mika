@@ -232,7 +232,7 @@ Per architect F9 sharpening, ran `grep -rln "checkpoint_task\|spawn_dashboard\|p
 
   **Verification:**
   - `grep -rn 'kg_resolver_tick' crates/mika-agent/src/` — new logs appear in expected locations.
-  - Run `mika-server`, watch logs for `kg_resolver_tick.start` / `kg_resolver_tick.complete` events firing every 30 min per enabled agent.
+  - Run `mika-spirit`, watch logs for `kg_resolver_tick.start` / `kg_resolver_tick.complete` events firing every 30 min per enabled agent.
   - `mika kg status --agent mika-arch` over multiple half-hour windows — pending count trends to 0 without restart.
   - `cargo test -p mika-agent kg::resolver_tick` — both unit + integration tests pass.
 

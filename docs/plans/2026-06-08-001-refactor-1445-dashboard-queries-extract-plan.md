@@ -166,7 +166,7 @@ Low.
 1. `cargo build -p mika-agent` clean
 2. `cargo test -p mika-agent --lib` passes
 3. `cargo clippy -p mika-agent --tests --no-deps -- -D warnings` clean
-4. Manual: spawn dev mika-server, hit a few dashboard endpoints (`/dashboard/agents`, `/dashboard/sessions`), verify queries return same shape as pre-refactor
+4. Manual: spawn dev mika-spirit, hit a few dashboard endpoints (`/dashboard/agents`, `/dashboard/sessions`), verify queries return same shape as pre-refactor
 5. `wc -l` on `db.rs` post-change confirms ~1,500-line reduction
 
 ## Implementation order

@@ -14,7 +14,7 @@ Three bugs shipped in `Dockerfile.agent` within 24h (mika#1237, mika#1240, mika#
 
 ### Current State: Dockerfile.agent (78 lines)
 
-Three-stage build: dashboard-builder (node:24-slim) → builder (rust:1.93-slim) → runtime (debian:bookworm-slim). Produces `mika-server` + `gh` + `gws` CLIs.
+Three-stage build: dashboard-builder (node:24-slim) → builder (rust:1.93-slim) → runtime (debian:bookworm-slim). Produces `mika-spirit` + `gh` + `gws` CLIs.
 
 **Findings from exhaustive audit:**
 
@@ -22,9 +22,9 @@ Three-stage build: dashboard-builder (node:24-slim) → builder (rust:1.93-slim)
 2. **GWS CLI install (L49-58): CLEAN.** Downloads as `gws.tar.gz`, constructs checksum line from `.sha256` file content. The `.sha256` file from the GWS release contains only the hash (no filename), so the `echo "$(cat gws.tar.gz.sha256)  gws.tar.gz"` pattern is correct.
 3. **`.dockerignore` interaction: CLEAN for Dockerfile.agent.** It excludes `docs/`, `*.md`, and `scripts/` — but Dockerfile.agent doesn't COPY any of these. It copies only `Cargo.toml`, `Cargo.lock`, `crates/`, `packages/`, `dashboard/`, and `package.json`/`package-lock.json`.
 4. **Builder stub for mika-gateway (L22-23):** Creates dummy `src/main.rs` + empty `migrations/.keep`. Correct — workspace compilation needs all members present.
-5. **No `COPY docs/` or `COPY skills/` needed.** Dockerfile.agent builds only `mika-server` from `mika-agent` crate. The `build.rs` in mika-agent embeds docs and skills via `include_str!(concat!(env!("OUT_DIR"), ...))` — but it reads from the source tree, which IS in the build context (`crates/mika-agent/` is COPY'd). Wait — `build.rs` walks `../../docs/` and `../../skills/bundled/` relative to the crate. Since `.dockerignore` excludes `docs/` and `skills/` isn't excluded, let me verify...
+5. **No `COPY docs/` or `COPY skills/` needed.** Dockerfile.agent builds only `mika-spirit` from `mika-agent` crate. The `build.rs` in mika-agent embeds docs and skills via `include_str!(concat!(env!("OUT_DIR"), ...))` — but it reads from the source tree, which IS in the build context (`crates/mika-agent/` is COPY'd). Wait — `build.rs` walks `../../docs/` and `../../skills/bundled/` relative to the crate. Since `.dockerignore` excludes `docs/` and `skills/` isn't excluded, let me verify...
 
-   **CRITICAL FINDING:** `crates/mika-agent/build.rs` copies `docs/` and `skills/bundled/` into `OUT_DIR` at build time. The path resolution is relative to the workspace root (`../../docs/` from `crates/mika-agent/`). With `docs/` in `.dockerignore`, the `os/Dockerfile` builder stage's `COPY docs/ docs/` would fail or be empty. For `Dockerfile.agent`, this is also a latent bug — the build succeeds only because `build.rs` has fallback behavior when docs are missing (it generates empty constants, and `mika-server` doesn't serve them in agent-container mode). **But this means bundled skills with `system_prompt.md` won't embed correctly in Dockerfile.agent either, since `skills/` is NOT in `.dockerignore` but `*.md` IS** — meaning `system_prompt.md` files within `skills/bundled/` are excluded from the Docker build context.
+   **CRITICAL FINDING:** `crates/mika-agent/build.rs` copies `docs/` and `skills/bundled/` into `OUT_DIR` at build time. The path resolution is relative to the workspace root (`../../docs/` from `crates/mika-agent/`). With `docs/` in `.dockerignore`, the `os/Dockerfile` builder stage's `COPY docs/ docs/` would fail or be empty. For `Dockerfile.agent`, this is also a latent bug — the build succeeds only because `build.rs` has fallback behavior when docs are missing (it generates empty constants, and `mika-spirit` doesn't serve them in agent-container mode). **But this means bundled skills with `system_prompt.md` won't embed correctly in Dockerfile.agent either, since `skills/` is NOT in `.dockerignore` but `*.md` IS** — meaning `system_prompt.md` files within `skills/bundled/` are excluded from the Docker build context.
 
    Actually, re-reading `.dockerignore`: the `*.md` glob only matches files at the root level, not recursively. Docker's `.dockerignore` uses Go filepath matching where `*.md` matches only in the root. To match recursively it would need `**/*.md`. So `skills/bundled/*/system_prompt.md` files ARE included. `docs/` is excluded as a directory. This means:
    - `Dockerfile.agent`: builder can access `skills/` (including .md files inside it) but NOT `docs/`. The `build.rs` will fail to copy docs but handles this gracefully. **CLEAN for agent-only use.**
@@ -74,7 +74,7 @@ RUN mkdir -p crates/mika-gateway/src && echo "fn main() {}" > crates/mika-gatewa
     && mkdir -p crates/mika-gateway/migrations && touch crates/mika-gateway/migrations/.keep
 ```
 
-**Bug verification:** Workspace `Cargo.toml` has `members = ["crates/*"]`, which resolves to `mika-common`, `mika-a2a`, `mika-agent`, `mika-gateway`, `mika-cli`. The builder COPY block includes only `mika-common`, `mika-agent`, and `mika-gateway` (as a stub). Missing: `mika-a2a` (full source needed — mika-agent depends on it via `mika-a2a.workspace = true`) and `mika-cli` (stub needed — workspace member but not built by this Dockerfile). With BuildKit cache, a warm build resolves these from the registry cache, masking the bug. A clean `docker build --no-cache` from a fresh checkout will fail at `cargo build --release --bin mika-server` when the resolver can't find `mika-a2a`.
+**Bug verification:** Workspace `Cargo.toml` has `members = ["crates/*"]`, which resolves to `mika-common`, `mika-a2a`, `mika-agent`, `mika-gateway`, `mika-cli`. The builder COPY block includes only `mika-common`, `mika-agent`, and `mika-gateway` (as a stub). Missing: `mika-a2a` (full source needed — mika-agent depends on it via `mika-a2a.workspace = true`) and `mika-cli` (stub needed — workspace member but not built by this Dockerfile). With BuildKit cache, a warm build resolves these from the registry cache, masking the bug. A clean `docker build --no-cache` from a fresh checkout will fail at `cargo build --release --bin mika-spirit` when the resolver can't find `mika-a2a`.
 
 **Fix 1: Add missing mika-a2a crate COPY.**
 Insert after L19 (mika-common COPY), before L20 (mika-agent COPY):
@@ -103,8 +103,8 @@ The mika#1115 GROOMED plan established two contracts that must survive the rewri
 |----------|--------|----------------------|
 | **F1: Full-OpenRC operator decision** | mika#1115 plan, Vincent's call | ✅ Preserved. Both mika-os and mika-runtime use OpenRC with `supervise-daemon` for process supervision. Same `rc-update add` pattern. |
 | **F2: Entrypoint lifecycle** | `os/init/mika-os-init.sh` (8 lines of contract) | ✅ Preserved unchanged. The entrypoint script is COPY'd as-is from `os/init/`. Boot order (rc default → services in dependency graph), SIGTERM trap (reverse-order stop), child-exit respawn (supervise-daemon config), and container-alive tail are all retained. |
-| **OpenRC init.d scripts** | `os/openrc/init.d/{mika-server,mika-gateway}` | ✅ Preserved unchanged. `command_background=yes`, `supervise_daemon_args`, `depend()` ordering, `start_pre()` env sourcing. |
-| **OpenRC conf.d files** | `os/openrc/conf.d/{mika-server,mika-gateway}` | ✅ Preserved unchanged. Env var sourcing pattern. |
+| **OpenRC init.d scripts** | `os/openrc/init.d/{mika-spirit,mika-gateway}` | ✅ Preserved unchanged. `command_background=yes`, `supervise_daemon_args`, `depend()` ordering, `start_pre()` env sourcing. |
+| **OpenRC conf.d files** | `os/openrc/conf.d/{mika-spirit,mika-gateway}` | ✅ Preserved unchanged. Env var sourcing pattern. |
 | **Three audiences** | mika#1115 README | ✅ Preserved: (1) mika-cloud via mika-runtime, (2) single-box self-host via mika-os, (3) developer reference via mika-os with full toolchain. |
 
 **What changes:** The Rust builder stage moves from external `rust:1.93-slim` (Debian) to in-stage `emerge rust-bin` (Gentoo handbook-style). The Debian-pattern binary downloads (`wget` + rename) are replaced with `emerge` for all portage-available packages. Non-portage binaries (gh, gws, ollama) keep the download pattern but with correct sha256 verification. The `node:24-slim` dashboard-builder stage is eliminated — nodejs is emerged and dashboard built in-stage.
@@ -188,7 +188,7 @@ Rationale:
    - `npm ci --ignore-scripts && npm run build --prefix dashboard`
 6. **Mika compilation:**
    - `COPY` workspace source (Cargo.toml, Cargo.lock, crates/, docs/, skills/)
-   - `cargo build --release --features telemetry --bin mika --bin mika-server --bin mika-gateway`
+   - `cargo build --release --features telemetry --bin mika --bin mika-spirit --bin mika-gateway`
    - Install to `/usr/local/bin/`
 7. **OpenRC services:** COPY init.d + conf.d scripts from `os/openrc/`, `rc-update add`
 8. **Default configs at `/etc/mika/` (FHS-compliant, per AC5):**
@@ -214,21 +214,21 @@ Rationale:
    | Source (from mika-os) | Destination | Justification |
    |---|---|---|
    | `/usr/local/bin/mika` | `/usr/local/bin/mika` | TUI CLI binary |
-   | `/usr/local/bin/mika-server` | `/usr/local/bin/mika-server` | Agent HTTP server |
+   | `/usr/local/bin/mika-spirit` | `/usr/local/bin/mika-spirit` | Agent HTTP server |
    | `/usr/local/bin/mika-gateway` | `/usr/local/bin/mika-gateway` | Webhook gateway |
    | `/usr/local/bin/gh` | `/usr/local/bin/gh` | GitHub CLI for builtin skill |
    | `/usr/local/bin/gws` | `/usr/local/bin/gws` | Google Workspace CLI for builtin skill |
    | `/usr/local/bin/ollama` | `/usr/local/bin/ollama` | Local LLM inference |
-   | `/etc/init.d/mika-server` | `/etc/init.d/mika-server` | OpenRC service script |
+   | `/etc/init.d/mika-spirit` | `/etc/init.d/mika-spirit` | OpenRC service script |
    | `/etc/init.d/mika-gateway` | `/etc/init.d/mika-gateway` | OpenRC service script |
-   | `/etc/conf.d/mika-server` | `/etc/conf.d/mika-server` | OpenRC env config |
+   | `/etc/conf.d/mika-spirit` | `/etc/conf.d/mika-spirit` | OpenRC env config |
    | `/etc/conf.d/mika-gateway` | `/etc/conf.d/mika-gateway` | OpenRC service config |
    | `/etc/mika/` | `/etc/mika/` | Default config files (FHS-compliant, per AC5) |
    | `/home/mika/` | `/home/mika/` | User home directory |
    | `/app/docs/` | `/app/docs/` | Docs for KG ingestion |
    | `/usr/local/bin/mika-os-init.sh` | `/usr/local/bin/mika-os-init.sh` | Container entrypoint |
 
-4. **OpenRC registration:** `rc-update add mika-server default && rc-update add mika-gateway default`
+4. **OpenRC registration:** `rc-update add mika-spirit default && rc-update add mika-gateway default`
 5. **Portage cleanup:** `rm -rf /var/tmp/portage /var/cache/distfiles /var/db/repos/gentoo` — strip portage tree in runtime image (no emerge needed post-build, unlike mika-os which keeps it for developer use)
 6. **Same EXPOSE, HEALTHCHECK, ENTRYPOINT** as current os/Dockerfile
 

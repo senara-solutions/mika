@@ -37,7 +37,7 @@ When reviewing agent sessions in the dashboard, you can see *what* happened (too
                               (SSE streaming response)
                                        │
 ┌──────────────────────────────────────┼──────────────────┐
-│  mika-server                         ▼                  │
+│  mika-spirit                         ▼                  │
 │  ┌─────────────────────────────────────────────────┐    │
 │  │  investigate handler                            │    │
 │  │  1. Validate request + load context from DB     │    │

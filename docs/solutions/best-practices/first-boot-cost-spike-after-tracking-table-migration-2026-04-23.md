@@ -22,7 +22,7 @@ tags:
 
 ## Context
 
-On 2026-04-23 09:08 UTC, a routine `mika-server` restart burned ~30,400 Haiku LLM calls over 38 minutes (~\$40–60) against `claude-haiku-4-5`, exhausting Anthropic Console API credit. Tracked as mika#757.
+On 2026-04-23 09:08 UTC, a routine `mika-spirit` restart burned ~30,400 Haiku LLM calls over 38 minutes (~\$40–60) against `claude-haiku-4-5`, exhausting Anthropic Console API credit. Tracked as mika#757.
 
 The fault was structural, not a bug in any single line of code:
 

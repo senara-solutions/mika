@@ -22,15 +22,15 @@ Verbatim from `mika/Makefile` — these are the targets this plan modifies or de
 deploy: build-dashboard build stop install restart check-ngrok ## Build dashboard + binaries, stop, install, and restart
 
 # Lines 20-24
-stop: ## Stop running mika-server and mika-gateway (via OpenRC)
-	@for bin in mika-server mika-gateway; do \
+stop: ## Stop running mika-spirit and mika-gateway (via OpenRC)
+	@for bin in mika-spirit mika-gateway; do \
 		echo "Stopping $$bin..."; \
 		sudo rc-service "$$bin" stop || true; \
 	done
 
 # Lines 26-30
-restart: ## Restart mika-server and mika-gateway (via OpenRC)
-	@for bin in mika-server mika-gateway; do \
+restart: ## Restart mika-spirit and mika-gateway (via OpenRC)
+	@for bin in mika-spirit mika-gateway; do \
 		echo "Restarting $$bin..."; \
 		sudo rc-service "$$bin" restart || true; \
 	done
@@ -49,7 +49,7 @@ install: ## Copy release binaries to INSTALL_DIR
 	done
 ```
 
-**`restart` fully subsumes `stop`:** Both targets iterate over the same two services (`mika-server mika-gateway`) in the same order. `stop` calls `rc-service stop`; `restart` calls `rc-service restart` (which is stop+start). Neither target has additional wait logic, cleanup steps, PID file removal, or socket teardown. The `|| true` error suppression is identical in both. Removing `stop` from the deploy chain loses nothing that `restart` does not already provide.
+**`restart` fully subsumes `stop`:** Both targets iterate over the same two services (`mika-spirit mika-gateway`) in the same order. `stop` calls `rc-service stop`; `restart` calls `rc-service restart` (which is stop+start). Neither target has additional wait logic, cleanup steps, PID file removal, or socket teardown. The `|| true` error suppression is identical in both. Removing `stop` from the deploy chain loses nothing that `restart` does not already provide.
 
 ## Current state
 

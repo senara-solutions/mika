@@ -111,7 +111,7 @@ WHERE s.type = 'skill'
 
 ### D3. Startup-only full rebuild, idempotent via upsert
 
-Builder runs once on `mika-server` startup after `apply_overrides()`. No runtime mutation hooks, no agent-triggerable tool. Rationale:
+Builder runs once on `mika-spirit` startup after `apply_overrides()`. No runtime mutation hooks, no agent-triggerable tool. Rationale:
 
 - **The domain graph is a projection.** SkillRegistry, ToolRegistry, McpManager, and agent configs are the authoritative sources. A projection's rebuild cadence should match the volatility of its sources — and those sources are themselves loaded at startup and only mutated at explicit operator/admin boundaries, not in a hot path. The projection inherits that cadence.
 - **Mutation hooks (rejected)** would assert runtime-mutable skill/MCP lifecycle semantics that Mika doesn't currently adopt. Every hook is a place where the projection can diverge from the source (hook fires but rebuild fails; new code path is added without the hook). Complexity pays for capabilities we don't have consumers for — classic YAGNI violation.
@@ -132,7 +132,7 @@ Domain graph reflects registry state **as of the last server boot**. Between boo
 - Skills installed/uninstalled mid-session via `mika skills install/uninstall` (if such runtime installation is supported; today's flow requires a restart for most skill changes, but this may evolve).
 - `skill_overrides.enabled` changes (expected — this is state, not structure; consumers JOIN against `skill_overrides` directly per D2).
 
-The staleness window is bounded by the time until the next `mika-server` restart, and operators can force a restart to refresh.
+The staleness window is bounded by the time until the next `mika-spirit` restart, and operators can force a restart to refresh.
 
 Consumer implications:
 
@@ -270,7 +270,7 @@ match builder.rebuild().await {
 
 ### Failure policy
 
-Rebuild failures are **logged, not panicked**. If the builder fails (DB error, unexpected registry state), mika-server continues to boot — KG queries will return stale or empty results, but interactive agent turns still work. This matches the "indexing is best-effort" policy from the conventions doc (C1), extended to the domain layer.
+Rebuild failures are **logged, not panicked**. If the builder fails (DB error, unexpected registry state), mika-spirit continues to boot — KG queries will return stale or empty results, but interactive agent turns still work. This matches the "indexing is best-effort" policy from the conventions doc (C1), extended to the domain layer.
 
 ## Implementation Units
 
@@ -439,7 +439,7 @@ Test expectation: none — this unit is scaffolding. Compilation is the success 
 - Error handling in `server/mod.rs` startup path — existing `?` / `match` patterns for subsystem initialization.
 
 **Test scenarios:**
-- Integration: start a mika-server in test mode with a mock registry → startup succeeds and kg_entities contains the expected rows.
+- Integration: start a mika-spirit in test mode with a mock registry → startup succeeds and kg_entities contains the expected rows.
 - Failure path: inject a DB error into the builder → server startup still succeeds, log contains the `domain_rebuild_failed` warning, kg_entities is empty but accessible.
 - Idempotency in server context: restart the test server → second startup logs `domain_rebuild_complete` with added=0, updated=N, removed=0.
 

@@ -9,7 +9,7 @@ date: 2026-03-29
 
 ## Overview
 
-PR #319 (commit c602d98) regenerated `docs/openapi/mika-server.yaml`, removing 3 dashboard toggle endpoints that were previously manually added. The handlers in `embedded_dashboard.rs` lack `#[utoipa::path]` annotations, so code generation doesn't include them.
+PR #319 (commit c602d98) regenerated `docs/openapi/mika-spirit.yaml`, removing 3 dashboard toggle endpoints that were previously manually added. The handlers in `embedded_dashboard.rs` lack `#[utoipa::path]` annotations, so code generation doesn't include them.
 
 ## Problem Statement / Motivation
 
@@ -30,7 +30,7 @@ Add `#[utoipa::path]` annotations to the 3 handler functions in `embedded_dashbo
 - **Annotation pattern:** Follow the existing convention from `handlers.rs` — `#[utoipa::path]` with HTTP method, full path, responses, and bearer security
 - **Response schema:** Use `body = inline(serde_json::Value)` with `example = json!(...)` since these handlers return ad-hoc JSON (no dedicated response struct). The `json!` macro is resolved by utoipa's proc macro internally — no explicit `use serde_json::json` import needed
 - **Full path required:** utoipa doesn't know about Axum's `nest()` routing, so paths must include the full prefix (e.g., `/api/v1/dashboard/enable` not just `/dashboard/enable`)
-- **Two-copy sync:** Both `docs/openapi/mika-server.yaml` (canonical) and `crates/mika-agent/docs/openapi/mika-server.yaml` (crate-local for crates.io) must be updated. `scripts/sync-agent-docs.sh` handles the copy
+- **Two-copy sync:** Both `docs/openapi/mika-spirit.yaml` (canonical) and `crates/mika-agent/docs/openapi/mika-spirit.yaml` (crate-local for crates.io) must be updated. `scripts/sync-agent-docs.sh` handles the copy
 
 ## Implementation Plan
 
@@ -66,7 +66,7 @@ cargo test -p mika-agent --lib -- write_agent_openapi_yaml --ignored
 
 ## Acceptance Criteria
 
-- [x] All 3 dashboard endpoints appear in `docs/openapi/mika-server.yaml`
+- [x] All 3 dashboard endpoints appear in `docs/openapi/mika-spirit.yaml`
 - [x] Each endpoint has correct HTTP method, path, response schema, and security
 - [x] `test_committed_spec_is_current` passes
 - [x] `test_agent_openapi_yaml_contains_endpoints` covers all 3 new paths

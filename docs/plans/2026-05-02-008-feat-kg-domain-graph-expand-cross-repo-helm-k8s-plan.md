@@ -194,7 +194,7 @@ The gap is in the domain graph's coverage breadth, not resolver bugs (mika#874/#
 
 ## Documentation / Operational Notes
 
-- **Rollout:** Standard Rust deploy. PR merge → `cargo build --release` → `make deploy` → mika-server restart → `build_domain_graph()` runs at startup → new entities in `kg_entities`. No data migration needed.
+- **Rollout:** Standard Rust deploy. PR merge → `cargo build --release` → `make deploy` → mika-spirit restart → `build_domain_graph()` runs at startup → new entities in `kg_entities`. No data migration needed.
 - **Verification timeline:** After deploy + 1 hour of resolver-tick activity (allows 2 ticks at 30-min cadence), mika-platform and mika-cloud corpus rates should improve. Track via `mika kg status --agent mika-arch` or DB query.
 - **Iteration plan:** If R1/R2 not met after first deploy, file "expand concept coverage round 2" follow-up with the gap-causing concepts identified from post-deploy NER output.
 - **Pattern claim (deferred to N=2):** This is N=1 of "domain graph coverage gap blocks corpus match rate." If a future corpus surfaces with similar gaps, author a compound doc on the discipline (per `compound_doc_timing_forward_vs_retroactive_groom`).

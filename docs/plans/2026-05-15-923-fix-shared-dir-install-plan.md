@@ -19,7 +19,7 @@ The issue body states "Option 1 is preferred — minimal change, follows the exi
 
 1. **Consistency with existing pipeline.** All bundled skill content reaches the deployed agent via compile-time `include_str!` embedding → generated Rust source → `seed_bundled_skills()` write. Option 1 would introduce a runtime filesystem walk in the install path — a pattern that has no analog in the existing bundled-skills flow. The binary would need to know where the source tree is at runtime (it doesn't today — it's self-contained).
 
-2. **Self-contained binary.** With Option 2, `mika-server` carries `_shared/` content in the binary itself. No dependency on source tree presence at deploy time. This matters for Docker images and crates.io packaging.
+2. **Self-contained binary.** With Option 2, `mika-spirit` carries `_shared/` content in the binary itself. No dependency on source tree presence at deploy time. This matters for Docker images and crates.io packaging.
 
 3. **All ACs are met regardless of approach.** The issue body's acceptance criteria are behavioral (files land, idempotent, tests pass) — they don't constrain implementation approach.
 

@@ -472,7 +472,7 @@ All notable changes to this project will be documented in this file.
 - add --last-run flag and enhance teams log output
 - *(skills)* raise prompt snippet size limit and make it configurable per-skill
 - [#196] show previous run context in TUI when using --last-run or --run-id
-- [#198] embed dashboard SPA in mika-server binary
+- [#198] embed dashboard SPA in mika-spirit binary
 - *(skills)* add local source support for mika skills install with --link mode
 - add skill dependency resolution at install time (#216)
 - *(a2a)* implement A2A protocol v0.3 for agent-to-agent communication

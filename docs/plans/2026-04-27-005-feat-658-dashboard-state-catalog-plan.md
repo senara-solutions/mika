@@ -354,7 +354,7 @@ Estimated diff: ~400-500 lines across 22 files. Largest dashboard touch in tonig
 2. **Visual** — dev server, navigate every migrated page in three test conditions:
    - Loading: throttle network in DevTools to slow-3G; observe skeleton matches column widths.
    - Empty: set filter to a no-result combo (e.g., `?agent_id=nonexistent`); observe contained empty state with "Clear filters" action.
-   - Error: stop the mika-server; observe `<ErrorState />` with retry button. Click retry after restarting server; observe state transitions to loaded.
+   - Error: stop the mika-spirit; observe `<ErrorState />` with retry button. Click retry after restarting server; observe state transitions to loaded.
 3. **Stitch fidelity** — operator at PR review compares migrated pages against Stitch screen `be408326efc949e49b8ab6d7c524b5f9`.
 4. **Drift grep** — `grep -rn ">Loading\.\.\.<\|text-red-400\|Error:.*error" mika/dashboard/src/pages/` returns zero matches outside the new components.
 

@@ -4,7 +4,7 @@
 
 ### Summary
 
-Add per-agent rate limiting to mika-server to prevent abuse and ensure fair resource
+Add per-agent rate limiting to mika-spirit to prevent abuse and ensure fair resource
 allocation across customers.
 
 ### Design

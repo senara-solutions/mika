@@ -9,7 +9,7 @@
 #   bash scripts/investigate-kg-1027.sh [LOG_FILE]
 #
 # Environment:
-#   MIKA_SERVER_LOG_FILE — server log path (default: /var/log/mika/server.log)
+#   MIKA_SPIRIT_LOG_FILE — server log path (default: /var/log/mika/server.log)
 #   MIKA_DB              — SQLite DB path  (default: ~/.mika/data/mika.db)
 #
 # This script is read-only and idempotent — safe to re-run.
@@ -19,7 +19,7 @@ set -euo pipefail
 
 # --- Configuration ---
 DB="${MIKA_DB:-$HOME/.mika/data/mika.db}"
-LOG_FILE="${1:-${MIKA_SERVER_LOG_FILE:-/var/log/mika/server.log}}"
+LOG_FILE="${1:-${MIKA_SPIRIT_LOG_FILE:-/var/log/mika/server.log}}"
 AGENT_ID="mika-arch"  # sole KG consumer per mika#800
 TICK_CUTOFF="2026-05-07T16:00:00Z"
 DOMAIN_CUTOFF="2026-05-08T08:00:00Z"

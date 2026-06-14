@@ -47,7 +47,7 @@ The bulk (376/410 in mika) are plain-named — date-prefix convention is recent.
 
 ### Investigation script approach
 
-Single Bash script at `mika/scripts/investigate-docs-currency-1029.sh` (per architect-NF2 pattern from #1027 — per-ticket one-shot, not marketed as canonical reusable; methodology canonization is a separate decision after this audit). Bash + `find` + `grep` + `sqlite3` + `jq` + `git log`. Read-only, idempotent. Sources `MIKA_SERVER_LOG_FILE` from env or argv.
+Single Bash script at `mika/scripts/investigate-docs-currency-1029.sh` (per architect-NF2 pattern from #1027 — per-ticket one-shot, not marketed as canonical reusable; methodology canonization is a separate decision after this audit). Bash + `find` + `grep` + `sqlite3` + `jq` + `git log`. Read-only, idempotent. Sources `MIKA_SPIRIT_LOG_FILE` from env or argv.
 
 ### What the script checks (six axes)
 
@@ -362,7 +362,7 @@ Finding doc TL;DR ends with one of:
 Bash script that:
 1. **Resolves environment variables** (per architect NF3):
    - `MIKA_PLATFORM_ROOT=${MIKA_PLATFORM_ROOT:-/data/workspace/mika-platform}` — workspace root holding the four sub-repos
-   - `MIKA_SERVER_LOG_FILE=${MIKA_SERVER_LOG_FILE:-/var/log/mika/server.log}` — server log
+   - `MIKA_SPIRIT_LOG_FILE=${MIKA_SPIRIT_LOG_FILE:-/var/log/mika/server.log}` — server log
    - `MIKA_DB=${MIKA_DB:-$HOME/.mika/data/mika.db}` — agent DB
    The script names these explicitly at the top with comments and uses them throughout — no hardcoded paths beyond the env defaults. Future portability without script edits.
 2. Resolves the four corpus paths from `$MIKA_PLATFORM_ROOT/<repo>/docs/solutions/` for `<repo>` in `mika`, `mika-platform`, `mika-cloud`, `mika-skills`. Skips silently with a WARN if a corpus path doesn't exist.
@@ -426,7 +426,7 @@ The LLM-driven Axis 4 (contradiction analysis) is the only stochastic step; the 
 - **AC#7**: mika-arch consumption signal — fraction of last-30-days `query_knowledge_graph` calls surfacing docs ≥ 6 months old. If schema linkage unavailable, axis reported as `unavailable` with note + ticket reference for schema enrichment.
 - **AC#8**: Curation-policy options (6 candidates per groom) with trade-off table; **single recommendation with named runner-up** per architect Q4 ratification. Recommendation derived via the signal-triple → policy mapping table (Axis 7). Operator override is supported.
 - **AC#9**: Outcome path declared (A/B/C); follow-up ticket(s) filed if Path B.
-- **AC#10**: Investigation script committed at `mika/scripts/investigate-docs-currency-1029.sh`. Idempotent. Pre-flight schema-version assertion. Per-ticket one-shot per mika#1027 NF2. Sources `MIKA_PLATFORM_ROOT` / `MIKA_SERVER_LOG_FILE` / `MIKA_DB` env vars with documented defaults (per architect NF3). Zero LLM cost in primary path.
+- **AC#10**: Investigation script committed at `mika/scripts/investigate-docs-currency-1029.sh`. Idempotent. Pre-flight schema-version assertion. Per-ticket one-shot per mika#1027 NF2. Sources `MIKA_PLATFORM_ROOT` / `MIKA_SPIRIT_LOG_FILE` / `MIKA_DB` env vars with documented defaults (per architect NF3). Zero LLM cost in primary path.
 
 ## Risks & Open Questions
 
@@ -442,7 +442,7 @@ The LLM-driven Axis 4 (contradiction analysis) is the only stochastic step; the 
 - F2 (BLOCKING) verbatim queries: all seven axes now have verbatim SQL/bash with PASS/FAIL criteria.
 - NF1 drift: explicitly defined as **resolution-rate drift** (not temporal); thresholds 10pp/25pp ratified.
 - NF2 git-log dates: introduction_date (with `--follow` rename tracking) AND last_modified both recorded. Distinction named in plan text.
-- NF3 env vars: `MIKA_PLATFORM_ROOT` / `MIKA_SERVER_LOG_FILE` / `MIKA_DB` with documented defaults; no hardcoded paths beyond defaults.
+- NF3 env vars: `MIKA_PLATFORM_ROOT` / `MIKA_SPIRIT_LOG_FILE` / `MIKA_DB` with documented defaults; no hardcoded paths beyond defaults.
 - Q3 (one-shot vs canonical): one-shot ratified.
 - Q4 (single vs ranked): single recommendation with named runner-up ratified; signal-triple → policy mapping table added in Axis 7.
 

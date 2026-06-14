@@ -9,7 +9,7 @@ category: architecture-patterns
 
 ## Problem
 
-After mika#1379 shipped the MikaModel provider, smoke testing surfaced that the upstream model returns content unrelated to the user input — multi-section workplace-assistant boilerplate ("## Completed Tasks", "## Pending", "## Blockers") instead of responding to "hello" or "what is 2+2". Five direct `curl` probes against the same Ollama backend with various system-prompt shapes (training-shape, none, math-tutor role, "use status report format" instruction, multi-section markdown) all returned sane conversational output. **The model is healthy in isolation; something specific in mika-server's runtime `/api/chat` payload triggers it.**
+After mika#1379 shipped the MikaModel provider, smoke testing surfaced that the upstream model returns content unrelated to the user input — multi-section workplace-assistant boilerplate ("## Completed Tasks", "## Pending", "## Blockers") instead of responding to "hello" or "what is 2+2". Five direct `curl` probes against the same Ollama backend with various system-prompt shapes (training-shape, none, math-tutor role, "use status report format" instruction, multi-section markdown) all returned sane conversational output. **The model is healthy in isolation; something specific in mika-spirit's runtime `/api/chat` payload triggers it.**
 
 Without the actual payload, diagnosing the trigger means guessing among three candidates: the full multi-section system prompt, the ~82-tool catalog, or appended conversation history. Patching without evidence risks shipping the wrong fix.
 
@@ -68,7 +68,7 @@ A permission-denied or no-such-directory error on first call should be operator-
 
 ### Why a byte cap (not unlimited, not chunked)
 
-mika-server's payload likely combines a 14-section system prompt (~50 KiB) + an ~82-tool catalog (~80 KiB) + variable conversation history. 256 KiB is 2-3× headroom for the static parts. Unlimited writes can produce multi-megabyte files that hang text editors. Chunked / multi-file output rejected as scope creep — the truncation marker signals the operator if more is needed.
+mika-spirit's payload likely combines a 14-section system prompt (~50 KiB) + an ~82-tool catalog (~80 KiB) + variable conversation history. 256 KiB is 2-3× headroom for the static parts. Unlimited writes can produce multi-megabyte files that hang text editors. Chunked / multi-file output rejected as scope creep — the truncation marker signals the operator if more is needed.
 
 ### Why scoped to `OllamaProvider` (not generic)
 

@@ -170,7 +170,7 @@ Options considered (kept for audit):
 |---|---|---|---|
 | **A. mika-gateway** ✅ ratified | Existing K8s service, Postgres | One service to operate; multi-operator works for free; reuses gateway auth pattern | Couples dev infra to customer infra; gateway pod restart affects developer workflow (mitigated by durable Postgres + cursor replay) |
 | **B. mika-coord (new service)** | New K8s service or local daemon | Clean SoC; can be operator-machine-local | New service to operate; deferred multi-operator until deployed remotely |
-| **C. mika-server (agent HTTP server)** of a "personal" agent | Existing per-customer Axum server | Reuses agent infra | Still per-customer scoping; orchestrator is not a customer |
+| **C. mika-spirit (agent HTTP server)** of a "personal" agent | Existing per-customer Axum server | Reuses agent infra | Still per-customer scoping; orchestrator is not a customer |
 
 ### 3. Transport — HTTP/SSE assumed; D-Bus rejected
 

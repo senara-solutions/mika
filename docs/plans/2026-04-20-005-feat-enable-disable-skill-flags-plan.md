@@ -222,7 +222,7 @@ PR #675 changed self-dev to `always_on = false` and added `--skill-always-on` to
 - **Interaction graph:** `ask::run()` → `apply_transient_disable()` → `SkillRegistry.disabled` eviction. No callbacks, middleware, or observers affected.
 - **Error propagation:** Conflict check in `ask.rs` uses `anyhow::bail!` (exits before agent loop). Warnings go to stderr (non-fatal).
 - **State lifecycle risks:** None — transient overrides are per-invocation, no persistence.
-- **API surface parity:** Server path (`mika-server`) does not use transient overrides and is unaffected. `mika chat` (TUI) is unaffected.
+- **API surface parity:** Server path (`mika-spirit`) does not use transient overrides and is unaffected. `mika chat` (TUI) is unaffected.
 - **Unchanged invariants:** `apply_overrides()` DB-based enable/disable is unchanged. `SkillInfo.always_on` field name is unchanged. DB schema is unchanged. `toggle_skill`, `update_skill`, `list_skills` agent tools are unchanged. The `always_on_skills()`, `safe_always_on_skills()`, `callback_safe_skills()` methods are unchanged.
 
 ## Risks & Dependencies

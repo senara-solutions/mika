@@ -31,7 +31,7 @@ Same failure mode applies to the extractor on its periodic tick.
 - Pass a `tokio_util::sync::CancellationToken` into every per-agent tokio::spawn of resolver_tick + extraction_tick in `server/mod.rs`.
 - Inside each tick loop, between iterations: `tokio::select!` on (a) next-tick deadline, (b) cancellation.
 - Inside each LLM batch: check cancellation before initiating the next call; mid-call cancellation is bounded by `reqwest` request timeout (handler doesn't need to abort in-flight HTTP — the next-call check catches it within one call's duration).
-- Wire SIGTERM handler in server main loop to trigger the token (mika-server uses Tokio's signal handlers; the existing graceful-shutdown path may already exist for axum).
+- Wire SIGTERM handler in server main loop to trigger the token (mika-spirit uses Tokio's signal handlers; the existing graceful-shutdown path may already exist for axum).
 - **Out of scope:** cancellation for non-KG background tasks (`checkpoint_task`, watchdog, reaper, parent-completer — those run for ms each cycle and don't have the drift failure mode); per-batch progress checkpointing (atomic-batch is the existing contract — abandon is sufficient); SIGTERM handling unification across all background tasks (separate concern).
 
 ## Implementation Units
@@ -104,7 +104,7 @@ Per-iteration check means worst-case latency is one LLM call (~1-2s). With the 5
 
 **Files:**
 - Modify: `crates/mika-agent/src/server/mod.rs` (the main loop / shutdown path)
-- Modify: `crates/mika-agent/src/bin/mika-server.rs` if signal handling is there
+- Modify: `crates/mika-agent/src/bin/mika-spirit.rs` if signal handling is there
 
 **Approach:**
 
@@ -138,7 +138,7 @@ The 5s grace is enforced naturally by supervise-daemon: it sends SIGTERM, waits 
 - **Tasks observe cancel within 5s.** Smoke test with `kill -TERM` + log monitoring.
 - **Axum's existing shutdown still works.** No regression on HTTP server graceful exit.
 
-**Verification:** integration smoke test on a local mika-server; check for the `kg tick cancelled` log line.
+**Verification:** integration smoke test on a local mika-spirit; check for the `kg tick cancelled` log line.
 
 ### U3 — Document the contract
 
@@ -169,7 +169,7 @@ The 5s grace is enforced naturally by supervise-daemon: it sends SIGTERM, waits 
 - `cargo test -p mika-agent kg::` passes (existing + new tests)
 - `cargo clippy --workspace` clean
 - `cargo fmt --all -- --check` clean
-- Manual smoke: `kill -TERM <mika-server-pid>` mid-tick; verify `kg tick cancelled` log line; verify no DB rows written after the cancel timestamp; confirm no zombie task warnings.
+- Manual smoke: `kill -TERM <mika-spirit-pid>` mid-tick; verify `kg tick cancelled` log line; verify no DB rows written after the cancel timestamp; confirm no zombie task warnings.
 
 ## Risk / known unknowns
 

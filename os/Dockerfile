@@ -5,7 +5,7 @@
 # Six named build targets:
 #   mika-os              — Full build environment (toolchain + binaries + portage tree)
 #   mika-runtime-base    — Shared runtime base (no role-specific binaries) — internal
-#   mika-runtime-server  — mika-server only (per-customer agent container)
+#   mika-runtime-server  — mika-spirit only (per-customer agent container)
 #   mika-runtime-gateway — mika-gateway only (gateway deployment)
 #   mika-runtime-cli     — mika TUI only (operator desktop)
 #   mika-runtime-all     — All three binaries (single-box self-host)
@@ -85,10 +85,10 @@ RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release --features telemetry \
         --bin mika -p mika-cli \
-        --bin mika-server -p mika-agent \
+        --bin mika-spirit -p mika-agent \
         --bin mika-gateway -p mika-gateway \
     && install -m 755 target/release/mika /usr/local/bin/mika \
-    && install -m 755 target/release/mika-server /usr/local/bin/mika-server \
+    && install -m 755 target/release/mika-spirit /usr/local/bin/mika-spirit \
     && install -m 755 target/release/mika-gateway /usr/local/bin/mika-gateway
 
 # ── Non-portage binaries (not available in Gentoo portage, sha256-verified) ──
@@ -148,14 +148,14 @@ RUN ARCH=$(uname -m) && \
 RUN useradd -m -u 1000 -s /bin/bash mika
 
 # ── OpenRC service definitions ──
-COPY os/openrc/init.d/mika-server /etc/init.d/mika-server
+COPY os/openrc/init.d/mika-spirit /etc/init.d/mika-spirit
 COPY os/openrc/init.d/mika-gateway /etc/init.d/mika-gateway
-COPY os/openrc/conf.d/mika-server /etc/conf.d/mika-server
+COPY os/openrc/conf.d/mika-spirit /etc/conf.d/mika-spirit
 COPY os/openrc/conf.d/mika-gateway /etc/conf.d/mika-gateway
-RUN chmod 755 /etc/init.d/mika-server /etc/init.d/mika-gateway
+RUN chmod 755 /etc/init.d/mika-spirit /etc/init.d/mika-gateway
 
 # Register services with default runlevel
-RUN rc-update add mika-server default && \
+RUN rc-update add mika-spirit default && \
     rc-update add mika-gateway default
 
 # ── Default configs at /etc/mika/ (FHS-compliant, AC5) ──
@@ -182,7 +182,7 @@ ENV MIKA_HOME=/home/mika/.mika
 EXPOSE 8080 3001
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-    CMD rc-service mika-server status
+    CMD rc-service mika-spirit status
 
 ENTRYPOINT ["/usr/local/bin/mika-os-init.sh"]
 
@@ -221,19 +221,19 @@ WORKDIR /app
 # ============================================================================
 FROM mika-runtime-base AS mika-runtime-server
 
-COPY --from=mika-os /usr/local/bin/mika-server /usr/local/bin/mika-server
+COPY --from=mika-os /usr/local/bin/mika-spirit /usr/local/bin/mika-spirit
 COPY --from=mika-os /usr/local/bin/gh /usr/local/bin/gh
 COPY --from=mika-os /usr/local/bin/ollama /usr/local/bin/ollama
 
 # ── OpenRC service definition ──
-COPY --from=mika-os /etc/init.d/mika-server /etc/init.d/mika-server
-COPY --from=mika-os /etc/conf.d/mika-server /etc/conf.d/mika-server
-RUN rc-update add mika-server default
+COPY --from=mika-os /etc/init.d/mika-spirit /etc/init.d/mika-spirit
+COPY --from=mika-os /etc/conf.d/mika-spirit /etc/conf.d/mika-spirit
+RUN rc-update add mika-spirit default
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-    CMD rc-service mika-server status
+    CMD rc-service mika-spirit status
 
 ENTRYPOINT ["/usr/local/bin/mika-os-init.sh"]
 
@@ -272,23 +272,23 @@ ENTRYPOINT ["/usr/local/bin/mika"]
 FROM mika-runtime-base AS mika-runtime-all
 
 COPY --from=mika-os /usr/local/bin/mika /usr/local/bin/mika
-COPY --from=mika-os /usr/local/bin/mika-server /usr/local/bin/mika-server
+COPY --from=mika-os /usr/local/bin/mika-spirit /usr/local/bin/mika-spirit
 COPY --from=mika-os /usr/local/bin/mika-gateway /usr/local/bin/mika-gateway
 COPY --from=mika-os /usr/local/bin/gh /usr/local/bin/gh
 COPY --from=mika-os /usr/local/bin/gws /usr/local/bin/gws
 COPY --from=mika-os /usr/local/bin/ollama /usr/local/bin/ollama
 
 # ── OpenRC service definitions ──
-COPY --from=mika-os /etc/init.d/mika-server /etc/init.d/mika-server
+COPY --from=mika-os /etc/init.d/mika-spirit /etc/init.d/mika-spirit
 COPY --from=mika-os /etc/init.d/mika-gateway /etc/init.d/mika-gateway
-COPY --from=mika-os /etc/conf.d/mika-server /etc/conf.d/mika-server
+COPY --from=mika-os /etc/conf.d/mika-spirit /etc/conf.d/mika-spirit
 COPY --from=mika-os /etc/conf.d/mika-gateway /etc/conf.d/mika-gateway
-RUN rc-update add mika-server default && \
+RUN rc-update add mika-spirit default && \
     rc-update add mika-gateway default
 
 EXPOSE 8080 3001
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-    CMD rc-service mika-server status
+    CMD rc-service mika-spirit status
 
 ENTRYPOINT ["/usr/local/bin/mika-os-init.sh"]

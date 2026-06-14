@@ -69,7 +69,7 @@ Content sections:
    - System: `heartbeat_sends`, `reflection_runs`, `customer_config`, `failed_sends`, `skill_overrides`
    - Views: `unified_timeline`
    - Notable indexes (unique partial indexes for dedup)
-3. **Log File Locations** — CLI (daily-rotating in `{agent_home}/logs/`), server (stdout + optional `MIKA_SERVER_LOG_FILE`), gateway (optional `MIKA_GATEWAY_LOG_FILE`), team mode (`{team_dir}/logs/`)
+3. **Log File Locations** — CLI (daily-rotating in `{agent_home}/logs/`), server (stdout + optional `MIKA_SPIRIT_LOG_FILE`), gateway (optional `MIKA_GATEWAY_LOG_FILE`), team mode (`{team_dir}/logs/`)
 4. **Cross-references** — Links to `configuration.md` (config formats, env vars, cascade), `skills.md` (skill.toml format)
 
 ### Phase 2: Integration (all files)

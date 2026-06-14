@@ -96,7 +96,7 @@ The dual-site emission is intentional defense-in-depth: Site A carries what was 
 ## Prevention
 
 - **Log level reflects consequence, not transience.** `NoChannel` is permanent message loss — `error!` is the correct level. `warn!` should be reserved for conditions the system can recover from automatically.
-- **Grep for `send_message_nochannel` after deploys** to validate the fix is working: `jq 'select(.fields.message | test("send_message_nochannel"))' < $MIKA_SERVER_LOG_FILE`
+- **Grep for `send_message_nochannel` after deploys** to validate the fix is working: `jq 'select(.fields.message | test("send_message_nochannel"))' < $MIKA_SPIRIT_LOG_FILE`
 - **Future Level 2/3 work is filed separately.** Level 2 (fallback channel routing) and Level 3 (rejecting the call) are out of scope for this fix — each has its own coupling analysis.
 
 ## Related Issues

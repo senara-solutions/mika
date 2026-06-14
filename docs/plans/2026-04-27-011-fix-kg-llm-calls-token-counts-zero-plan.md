@@ -147,7 +147,7 @@ assert_eq!(row.cache_read_input_tokens, Some(10));
 
 ### Real-system smoke
 1. Build with the fix.
-2. Restart `mika-server`.
+2. Restart `mika-spirit`.
 3. Trigger KG resolution work using `MIKA_KG_RESOLUTION_MODEL=anthropic/claude-sonnet-4-6` (or any Anthropic-routed call).
 4. Query:
    ```sql

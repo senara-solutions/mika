@@ -47,7 +47,7 @@ Alternatively, a simpler approach that achieves the same safety: parse the `.env
 **Call sites to update:**
 - `crates/mika-cli/src/main.rs:33` (global home)
 - `crates/mika-cli/src/main.rs:115` (agent-specific home)
-- `crates/mika-agent/src/bin/mika-server.rs:7`
+- `crates/mika-agent/src/bin/mika-spirit.rs:7`
 
 ### 2. Add `GH_TOKEN` to exec handler env scrubbing
 

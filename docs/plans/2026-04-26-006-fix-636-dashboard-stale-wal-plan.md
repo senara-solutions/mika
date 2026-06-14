@@ -15,7 +15,7 @@ origin: senara-solutions/mika#636
 
 ## Problem
 
-The dashboard API (`/api/v1/sessions`) returns stale data — new sessions created by other processes (e.g. `mika ask --agent mika-dev`) are invisible until mika-server is restarted. The DB has 5731 sessions; the API only sees 5705, with the newest visible session over an hour behind. Restarting mika-server makes the new sessions appear immediately.
+The dashboard API (`/api/v1/sessions`) returns stale data — new sessions created by other processes (e.g. `mika ask --agent mika-dev`) are invisible until mika-spirit is restarted. The DB has 5731 sessions; the API only sees 5705, with the newest visible session over an hour behind. Restarting mika-spirit makes the new sessions appear immediately.
 
 Root cause: the server's dashboard connection is pinned to a stale WAL snapshot. **Critical architectural fact** (verified during planning): `dashboard_db` is constructed via `default_agent.db.clone()` at `crates/mika-agent/src/server/mod.rs:727-731`, which means **dashboard_db and the default agent's `db` share the same underlying Connection (same OS thread, same `AsyncDatabaseInner` Arc)**. The comment at line 725-726 confirms: "Create an unscoped dashboard DB handle that shares the same DB thread as the default agent."
 
@@ -83,7 +83,7 @@ Ok(row_id)
 
 ### Fix B — Periodic WAL checkpoint (defense-in-depth)
 
-Add a tokio task to mika-server that runs `PRAGMA wal_checkpoint(PASSIVE)` on `dashboard_db` (which is default-agent-db's Connection) every 60 seconds. This forces the connection to advance past any held snapshot regardless of transaction-leak status.
+Add a tokio task to mika-spirit that runs `PRAGMA wal_checkpoint(PASSIVE)` on `dashboard_db` (which is default-agent-db's Connection) every 60 seconds. This forces the connection to advance past any held snapshot regardless of transaction-leak status.
 
 **Hard-coded 60s interval** (per Finding 5 — drop env-var configurability for v1; YAGNI). Comment in code references `MIKA_DASHBOARD_CHECKPOINT_INTERVAL_SECS` as a future tunable if operator demand surfaces.
 
@@ -132,11 +132,11 @@ End-to-end staleness regression test (per Finding 6):
 - [ ] `set_skill_enabled` (db.rs:3737) uses `Connection::transaction_with_behavior(Immediate)` + `tx.commit()` instead of raw `BEGIN IMMEDIATE`/`COMMIT`.
 - [ ] `delete_skill_llm_override` (db.rs:3777) uses `Connection::transaction_with_behavior(Immediate)` + `tx.commit()` instead of raw `BEGIN IMMEDIATE`/`COMMIT`.
 - [ ] All `BEGIN IMMEDIATE` + `execute_batch("COMMIT")` patterns in `db.rs` migration paths (lines 1800-3509) refactored to `Transaction` (A2 hygiene).
-- [ ] `dashboard_db` connection runs `PRAGMA wal_checkpoint(PASSIVE)` every 60 seconds while mika-server is running, with INFO-level structured-log entries per checkpoint (`checkpoint.start`, `checkpoint.complete`, `checkpoint.error`).
+- [ ] `dashboard_db` connection runs `PRAGMA wal_checkpoint(PASSIVE)` every 60 seconds while mika-spirit is running, with INFO-level structured-log entries per checkpoint (`checkpoint.start`, `checkpoint.complete`, `checkpoint.error`).
 - [ ] PASSIVE-limitation note in `checkpoint.rs` doc-comment: if WAL grows despite checkpoints, escalate to RESTART mode (operating-envelope trigger).
 - [ ] Tests 1, 2, 3, 4, 5, 6 above pass.
 - [ ] Test 6 (cross-connection staleness regression) uses `cache=private` mode to disable in-process shared cache — verified via test setup code review.
-- [ ] End-to-end manual verification: with mika-server running, create a session via `mika ask` from a separate process, wait 65 seconds, assert dashboard `/api/v1/sessions` includes the new session.
+- [ ] End-to-end manual verification: with mika-spirit running, create a session via `mika ask` from a separate process, wait 65 seconds, assert dashboard `/api/v1/sessions` includes the new session.
 - [ ] All existing tests pass (`cargo test -p mika-agent`).
 - [ ] `cargo clippy --all-targets` clean.
 - [ ] `cargo fmt --check` clean.

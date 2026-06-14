@@ -255,7 +255,7 @@ jobs:
 
 **File: `.github/workflows/release.yml`**
 
-Triggered by tag push (`v*`). Builds `mika` CLI binary for 4 targets. Server binaries (`mika-server`, `mika-gateway`) are Docker-only and excluded from binary releases.
+Triggered by tag push (`v*`). Builds `mika` CLI binary for 4 targets. Server binaries (`mika-spirit`, `mika-gateway`) are Docker-only and excluded from binary releases.
 
 ```yaml
 # .github/workflows/release.yml
@@ -326,7 +326,7 @@ jobs:
 | `aarch64-apple-darwin` | `macos-14` | Apple Silicon (M1) runner |
 
 **Why only `mika` CLI binary?**
-- `mika-server` and `mika-gateway` are deployed via Docker containers with their own Dockerfiles
+- `mika-spirit` and `mika-gateway` are deployed via Docker containers with their own Dockerfiles
 - Including them would increase build time and create confusion (users don't need server binaries)
 - Docker images can be automated separately in a future workflow
 

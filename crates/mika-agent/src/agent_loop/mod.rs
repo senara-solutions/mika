@@ -2038,7 +2038,7 @@ async fn run_loop(
                         // Future "do we need to debounce ready-label stalls?"
                         // can answer via:
                         //   jq 'select(.message == "ready_label_dispatch_stall_total")
-                        //       | .timestamp' < $MIKA_SERVER_LOG_FILE
+                        //       | .timestamp' < $MIKA_SPIRIT_LOG_FILE
                         error!(
                             trace_id = %tool_ctx.trace_id,
                             location = %location,

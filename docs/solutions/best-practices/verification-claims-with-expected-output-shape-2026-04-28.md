@@ -73,7 +73,7 @@ The expected output shape is the *assertion*. The command is the *experiment*. A
 
 **Bad** (post-deploy check, narrative):
 
-> After deploy: confirm mika-server picked up the change.
+> After deploy: confirm mika-spirit picked up the change.
 
 **Good** (post-deploy check, observable):
 

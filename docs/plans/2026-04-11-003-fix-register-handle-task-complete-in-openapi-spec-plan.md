@@ -7,7 +7,7 @@ date: 2026-04-11
 
 # fix: register handle_task_complete in OpenAPI spec paths
 
-`handle_task_complete` in `crates/mika-agent/src/server/handlers.rs` has a `#[utoipa::path]` annotation but is **not registered** in the `AgentApiDoc` `paths()` macro in `crates/mika-agent/src/server/openapi.rs`. This means `POST /tasks/{id}/complete` does not appear in `docs/openapi/mika-server.yaml` despite being fully annotated.
+`handle_task_complete` in `crates/mika-agent/src/server/handlers.rs` has a `#[utoipa::path]` annotation but is **not registered** in the `AgentApiDoc` `paths()` macro in `crates/mika-agent/src/server/openapi.rs`. This means `POST /tasks/{id}/complete` does not appear in `docs/openapi/mika-spirit.yaml` despite being fully annotated.
 
 The `self-knowledge` skill serves the OpenAPI spec via `get_documentation("api-spec")`. Agents and external consumers can't discover the task completion endpoint.
 

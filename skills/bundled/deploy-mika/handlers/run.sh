@@ -1,6 +1,6 @@
 #!/bin/sh
 # Deploy handler for the deploy-mika skill.
-# Deploys all 3 mika binaries (mika, mika-server, mika-gateway) and restarts
+# Deploys all 3 mika binaries (mika, mika-spirit, mika-gateway) and restarts
 # services via rc-service (OpenRC).
 #
 # Input: JSON on stdin with __mika_task_id, __mika_agent, and cwd
@@ -80,7 +80,7 @@ case "$CWD" in
 esac
 
 # --- All 3 binaries ---
-BINARIES="mika mika-server mika-gateway"
+BINARIES="mika mika-spirit mika-gateway"
 INSTALL_DIR="$HOME/.local/bin"
 DEPLOY_LOG=""
 FAILED=0
@@ -139,8 +139,8 @@ done
 # --- Restart services via rc-service (OpenRC) ---
 RESTART_LOG=""
 
-# Restart mika-server and mika-gateway via rc-service if the init scripts exist
-for svc in mika-server mika-gateway; do
+# Restart mika-spirit and mika-gateway via rc-service if the init scripts exist
+for svc in mika-spirit mika-gateway; do
     if [ -f "/etc/init.d/$svc" ]; then
         set +e
         sudo rc-service "$svc" restart 2>&1

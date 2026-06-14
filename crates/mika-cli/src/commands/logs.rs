@@ -11,15 +11,15 @@ use crate::init;
 /// Print the resolved log file paths for the given agent.
 ///
 /// Two sinks exist:
-/// - **Server log:** `MIKA_SERVER_LOG_FILE` (or `/var/log/mika/server.log` fallback) — contains
-///   all runtime events from the long-running mika-server daemon, filterable by `agent_id`.
+/// - **Server log:** `MIKA_SPIRIT_LOG_FILE` (or `/var/log/mika/server.log` fallback) — contains
+///   all runtime events from the long-running mika-spirit daemon, filterable by `agent_id`.
 /// - **Per-agent CLI log:** `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` — contains events
 ///   from discrete CLI invocations (`mika ask`, `mika chat`, etc.) for that agent only.
 pub fn run(agent_name: &str, agent_home: &Path, format: &OutputFormat) -> Result<()> {
     let today = Local::now().format("%Y-%m-%d").to_string();
 
     // Resolve server log path: env var > fallback
-    let server_log = std::env::var("MIKA_SERVER_LOG_FILE")
+    let server_log = std::env::var("MIKA_SPIRIT_LOG_FILE")
         .ok()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/log/mika/server.log"));
@@ -82,7 +82,7 @@ pub fn run(agent_name: &str, agent_home: &Path, format: &OutputFormat) -> Result
             println!();
             println!("  \u{2726} Log Sinks for agent: {agent_name}");
             println!();
-            println!("  Server log (mika-server runtime events):");
+            println!("  Server log (mika-spirit runtime events):");
             println!("    Path:   {}", server_log.display());
             println!(
                 "    Status: {}",

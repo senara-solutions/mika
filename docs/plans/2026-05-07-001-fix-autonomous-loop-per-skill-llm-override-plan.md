@@ -574,7 +574,7 @@ The agent's only required action on a deferred-dispatch turn is `run_claude_pilo
 
 - After merge, update memory `project_skill_override_scope_gap.md` to mark the gap closed and cite the merge commit.
 - Update memory `project_mika_dev_model_switch.md` to remove the ⚠ warnings about the override being inert.
-- Operator-side: no config changes required. The fix is automatic on next `make deploy` / `mika-server` restart.
+- Operator-side: no config changes required. The fix is automatic on next `make deploy` / `mika-spirit` restart.
 - Validation post-merge: re-trigger a ready-label webhook on a queued issue while another dispatch is in flight; confirm `llm_calls.model = sonnet` and confirm the deferred callback fires when the slot frees.
 
 ## Sources & References

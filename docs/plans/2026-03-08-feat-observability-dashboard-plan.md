@@ -10,7 +10,7 @@ origin: docs/brainstorms/2026-03-08-observability-dashboard-brainstorm.md
 
 ## Overview
 
-A web-based observability dashboard for Mika, providing visibility into agent runtime behavior — conversations, memory mutations, task scheduling, and cross-subsystem event correlation via the `unified_timeline` VIEW. Standalone React app at `dashboard/` communicating with `mika-server` via REST API.
+A web-based observability dashboard for Mika, providing visibility into agent runtime behavior — conversations, memory mutations, task scheduling, and cross-subsystem event correlation via the `unified_timeline` VIEW. Standalone React app at `dashboard/` communicating with `mika-spirit` via REST API.
 
 **MVP scope:** 3 views — Unified Timeline (home), Agents, Sessions.
 
@@ -28,9 +28,9 @@ The orthogonal observability work (PR #88) introduced `trace_id` correlation and
 
 Standalone Vite + React 19 + TypeScript + Tailwind CSS v4 app, matching the existing `site/` design system (see brainstorm: design system tokens). Uses React Router for navigation and TanStack Query for data fetching with 5s polling.
 
-### Backend: REST API on mika-server (`/api/v1/*`)
+### Backend: REST API on mika-spirit (`/api/v1/*`)
 
-~10 new read-only GET endpoints on `mika-server`, sharing the existing Bearer token auth (`MIKA_INTERNAL_TOKEN`). Requires:
+~10 new read-only GET endpoints on `mika-spirit`, sharing the existing Bearer token auth (`MIKA_INTERNAL_TOKEN`). Requires:
 - **Unscoped `AsyncDatabase` handle** — new constructor with no `agent_id` scoping for cross-agent queries
 - **CORS middleware** — `tower-http` CorsLayer with configurable origin
 - **New query methods** on `Database` for paginated, unscoped data access
@@ -157,7 +157,7 @@ tower-http = { version = "0.6", features = ["trace", "limit", "set-header", "cor
 
 ## Acceptance Criteria
 
-### Backend (mika-server)
+### Backend (mika-spirit)
 
 - [x] `GET /api/v1/timeline` returns paginated unified timeline, filterable by agent_id, event_type, trace_id, session_id, from/to date range
 - [x] `GET /api/v1/timeline/trace/:trace_id` returns all events for a trace_id across messages, audit_events, and tasks
@@ -186,7 +186,7 @@ tower-http = { version = "0.6", features = ["trace", "limit", "set-header", "cor
 
 ## Success Metrics
 
-- Dashboard loads and displays data from a running mika-server within 2 seconds
+- Dashboard loads and displays data from a running mika-spirit within 2 seconds
 - Timeline view correctly correlates events across all 3 subsystems by trace_id
 - All list views paginate correctly with accurate total counts
 - Smart auto-refresh does not disrupt user context (no scroll reset, no filter loss)

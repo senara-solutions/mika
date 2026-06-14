@@ -14,7 +14,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **Agent engine:** Explicit Rust loop (no framework) — retrieve context -> build prompt -> LLM API -> match stop_reason -> execute tools or respond
 - **LLM:** Multi-provider via `LlmProvider` trait (12 providers). See `crates/mika-common/CLAUDE.md` for provider details.
 - **Database:** SQLite via rusqlite (single DB per container at `~/.mika/data/mika.db`)
-- **HTTP server:** Axum 0.8 (mika-server binary). See `crates/mika-agent/CLAUDE.md` for endpoint details.
+- **HTTP server:** Axum 0.8 (mika-spirit binary). See `crates/mika-agent/CLAUDE.md` for endpoint details.
 - **HTTP client:** reqwest 0.12 with rustls-tls
 - **Async runtime:** tokio
 - **MCP client:** rmcp 0.17 (official Rust MCP SDK) — stdio and Streamable HTTP transports
@@ -27,7 +27,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - `crates/mika-common/` — Shared library: config, LLM providers, Claude API client, OAuth, GitHub App auth, telemetry. See `crates/mika-common/CLAUDE.md`.
 - `crates/mika-a2a/` — A2A (Agent-to-Agent) protocol v0.3: JSON-RPC types, task state machine, SSE streaming. See `crates/mika-a2a/CLAUDE.md`.
-- `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, skills, task engine, HTTP server (mika-server). See `crates/mika-agent/CLAUDE.md`.
+- `crates/mika-agent/` — Agent container: SQLite DB, agent loop, tools, prompt assembly, skills, task engine, HTTP server (mika-spirit). See `crates/mika-agent/CLAUDE.md`.
 - `crates/mika-gateway/` — Telegram and GitHub webhook router: Postgres customer registry, message routing, A2A proxy. See `crates/mika-gateway/CLAUDE.md`.
 - `crates/mika-cli/` — TUI CLI binary (`mika`): ratatui chat interface, clap subcommands. See `crates/mika-cli/CLAUDE.md`.
 - `packages/ui/` — `@senara-solutions/ui` shared React component library (Vite library mode, published to GitHub Packages). Components: StatusBadge (six-variant: success/warning/error/info/neutral/blocked), Pagination, EmptyState (with optional action affordance), LoadingState (list/detail skeleton variants with ARIA), ErrorState (retry + details affordances with ARIA), CopyButton, MarkdownContent, TaskStatusBadge (thin adapter delegating to StatusBadge), ListRow (three-variant: static/navigable/expandable — canonical row primitive for all list/table surfaces), SelectFilter (categorical one-of-N filter dropdown), AgentFilter (thin adapter delegating to SelectFilter with consumer-injected agents prop), TimeRangeFilter (presets + custom picker, ISO 8601 emission, server-side enforcement), TokenBudgetBar (three-tier color threshold progress bar with ARIA meter semantics), CostMeter (unbounded threshold-based cost display with ARIA status semantics — two variants: full/chip), LiveRefreshToggle (auto-refresh toggle switch + LIVE badge — canonical affordance for all dashboard live-refresh surfaces). **Hand-rolled implementations of these primitives are review fails — see `packages/ui/CLAUDE.md` for enforcement rules and escape-hatch criteria.** See `packages/ui/CLAUDE.md`.
@@ -36,7 +36,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `docs/adr/` — Architecture Decision Records (numbered)
 - `docs/architecture/` — Architecture references including `review-guide.md` (SOLID/DRY/YAGNI/KISS/Orthogonality with citations to mika code; primary consumer is `mika-arch`'s plan-review skills, but applies to any code authored or reviewed in this repo).
 - `docs/design/` — Design system: `north-star.md` (the WHY behind every visual decision across the Mika ecosystem) + `luminescent-core.md` (the rulebook) + `dashboard-stitch-map.md` (Dashboard ↔ Stitch reconciliation, milestone #13 sequence, workflow agreement). Single design system across Observability Dashboard, Cloud Console, and Landing Page; consumed via `packages/ui/` (`@senara-solutions/ui`). The rulebook is owned by Vincent and updated via direct commits, not PRs; implementation PRs apply it but do not relitigate it.
-- `docs/openapi/` — OpenAPI specs (mika-server.yaml, gateway.yaml)
+- `docs/openapi/` — OpenAPI specs (mika-spirit.yaml, gateway.yaml)
 - `docs/solutions/` — Documented solutions to past problems (bugs, best practices, workflow patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when debugging or implementing in documented areas.
 - `skills/bundled/` — Source tree for engine-coupled bundled skills discovered at build time via `crates/mika-agent/build.rs`. See `crates/mika-agent/CLAUDE.md` Skills System for details.
 - `scripts/` — Utility scripts (sync-agent-docs.sh for crates.io publish prep)
@@ -84,8 +84,8 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `MIKA_EVAL_REAL_PROVIDERS=anthropic,openai cargo test -p mika-agent --test eval -- --ignored` — Run real-provider eval matrix (requires API keys)
 - `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval` — Run KG provider comparison eval (requires API keys for all selected providers)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, `mika kg status`, etc.)
-- `cargo run --bin mika-server` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
-- `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@senara-solutions/ui` first, requires mika-server on :8080)
+- `cargo run --bin mika-spirit` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
+- `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@senara-solutions/ui` first, requires mika-spirit on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
 - `make deploy` — Full deploy: build dashboard + release binaries with telemetry, install to `~/.local/bin/`, restart services. Prints the built SHA and warns when local HEAD is behind `origin/main`.
 - `cargo clippy` — Lint
@@ -103,7 +103,7 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 - **Agent loop** — max 20 tool steps, 5-min timeout, 11 post-condition guards on EndTurn (includes intent-precondition registry, required-suffix-line guard, required-finding-list guard, milestone-close-claim guard, and assert-grounded guard). See `crates/mika-agent/CLAUDE.md`.
 - **Skills marketplace** — git-based distribution, per-provider/model prompt variants, dependency resolution. See `crates/mika-agent/CLAUDE.md`.
 - **Unified task engine** — SQLite-backed scheduler, callback/resume lifecycle, team suspend/resume. See `crates/mika-agent/CLAUDE.md`.
-- **HTTP server (mika-server)** — Axum, two auth layers, embedded dashboard. See `crates/mika-agent/CLAUDE.md`.
+- **HTTP server (mika-spirit)** — Axum, two auth layers, embedded dashboard. See `crates/mika-agent/CLAUDE.md`.
 - **Gateway** — Telegram + GitHub webhook routing, A2A proxy, Postgres. See `crates/mika-gateway/CLAUDE.md`.
 - **A2A protocol** — v0.3, JSON-RPC, task state machine. See `crates/mika-a2a/CLAUDE.md`.
 - **Knowledge Graph** — Three-layer KG (domain/lexical/subject) in SQLite. Domain graph builder (deterministic, startup) projects skills/tools/agents/problem_types/concepts into `kg_entities`/`kg_relationships`. Concept entities (#928) use hierarchical naming (`concept:cross-repo:*`, `concept:infra:*`) to cover cross-repo workflow and Helm/K8s infrastructure concepts for mika-platform and mika-cloud corpora. Lexical ingestor (#689) chunks `docs/solutions/**/*.md` per-agent into `kg_chunks` + FTS5/vec search. Subject extractor (#690) runs LLM-based NER to extract entities and fact triples from chunks into `kg_subject_entities`/`kg_subject_relationships` with provenance tracking. Extraction runs async at startup (background per-agent) and sync on compound hook. Entity resolver (#691) bridges subject graph to domain graph via two-stage pipeline (exact-match then LLM disambiguation) into `kg_subject_resolutions`/`kg_resolutions_log`. Resolution runs async at startup and as background spawn after compound extraction. Per-agent KG scoping via `identity.toml` `[kg]` section (#778) — `enabled` (default true) and `docs_root` (optional) control per-agent corpus isolation; agents with matching `docs_root` share extraction via `docs_root_hash` (v27). **KG topology (#800):** mika-arch is the sole KG consumer among well-known agents; mika-dev and mika-qa are provisioned with `[kg].enabled = false` (zero `query_knowledge_graph` usage — retrieval goes through `search_memory`). Re-enable per-agent with one identity.toml edit + restart if a dev/qa flow needs KG. See `crates/mika-agent/CLAUDE.md`.
@@ -131,7 +131,7 @@ Optional (Knowledge Graph LLM):
 - `MIKA_KG_RESOLUTION_MODEL` — Model for entity resolution disambiguation (#691). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Mid-tier model recommended for better judgment on ambiguous matches.
 - `MIKA_KG_BATCH_BUDGET` — Per-batch LLM call cap on KG startup extraction and resolution (#757). Default `500` per #757 burst-defense invariant ("no silent multi-thousand-call bursts"). Budget is distributed fairly across corpora for both extraction (#962) and resolution (#927) using two-pass allocation (`kg::budget::allocate_fair_budget`), so array order no longer starves secondary corpora. Worst-case per-startup cost is `2 × N_agents × budget` (extraction batch + resolution batch, one of each per agent). The 30-min periodic tick (#906, #1052) runs both extraction and resolution at the same budget, adding up to `2 × N_agents × budget` LLM calls per tick (48 ticks/day). Once extraction coverage reaches 100%, the tick's extraction phase is a no-op (zero pending = zero budget allocated). Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next tick. `0` disables the phase entirely. Extraction idempotency uses `ON CONFLICT(docs_root_hash, source_doc_path) DO UPDATE` upsert (#1052) — NULL-hash rows and content-changed docs are re-extracted; identical-content re-extractions are no-ops. See `docs/solutions/architecture-patterns/kg-extraction-trigger-semantics-2026-05-09.md` for the full trigger model.
 - `MIKA_KG_DOCS_ROOT` — Absolute path to the docs root the `LexicalIngestor` reads (#738). Defaults to `<CWD>/docs/solutions` when unset — works in containers where the Dockerfile copies `docs/` into the workdir. Needed on hosts where the service starts with CWD ≠ repo root (e.g., OpenRC `supervise-daemon` launches with CWD=`/`). Also settable as `kg_docs_root` in config.toml. If set to an empty string, lexical ingestion skips with a distinct warn.
-- `MIKA_KG_DOCS_ROOTS` — Optional colon-separated list of docs-root paths for multi-corpus agents (e.g., mika-arch reasoning across multiple repos). Global fallback; per-agent `[kg].docs_roots` in identity.toml takes precedence. Linux/macOS only. **Required for mika-arch in dev mode** — at provision time, `MIKA_ARCH_IDENTITY` is computed from this env so `[kg].docs_roots` always contains absolute paths (mika-server runs with CWD=`/` under OpenRC/systemd). When unset, mika-arch is skipped at provision with an explicit `error!` log; other well-known agents (mika-dev/qa/relay) come up normally.
+- `MIKA_KG_DOCS_ROOTS` — Optional colon-separated list of docs-root paths for multi-corpus agents (e.g., mika-arch reasoning across multiple repos). Global fallback; per-agent `[kg].docs_roots` in identity.toml takes precedence. Linux/macOS only. **Required for mika-arch in dev mode** — at provision time, `MIKA_ARCH_IDENTITY` is computed from this env so `[kg].docs_roots` always contains absolute paths (mika-spirit runs with CWD=`/` under OpenRC/systemd). When unset, mika-arch is skipped at provision with an explicit `error!` log; other well-known agents (mika-dev/qa/relay) come up normally.
 
 ### Post-restart safety check (#757)
 
@@ -191,14 +191,14 @@ Optional (telemetry — requires `--features telemetry` build):
 - `MIKA_OTLP_AUTH_HEADER` — OTLP auth header value (Base64-encoded credentials for Langfuse)
 
 Optional (CLI -> server communication):
-- `MIKA_SERVER_URL` — mika-server base URL for CLI dashboard commands (default: `http://localhost:8080`)
+- `MIKA_SPIRIT_URL` — mika-spirit base URL for CLI dashboard commands (default: `http://localhost:8080`)
 - `MIKA_GATEWAY_URL` — mika-gateway base URL for CLI webhook DLQ commands (default: `http://localhost:3001`)
 
 Optional (dashboard): See `dashboard/CLAUDE.md`.
 
 Optional (log format and files):
-- `MIKA_LOG_FORMAT` — Stdout log format for mika-server and mika-gateway: `json` (default) or `pretty` (human-readable, for local dev). CLI always uses pretty.
-- `MIKA_SERVER_LOG_FILE` — File path for mika-server log output (always JSON regardless of `MIKA_LOG_FORMAT`)
+- `MIKA_LOG_FORMAT` — Stdout log format for mika-spirit and mika-gateway: `json` (default) or `pretty` (human-readable, for local dev). CLI always uses pretty.
+- `MIKA_SPIRIT_LOG_FILE` — File path for mika-spirit log output (always JSON regardless of `MIKA_LOG_FORMAT`)
 
 Gateway mode: See `crates/mika-gateway/CLAUDE.md` for gateway-specific env vars.
 

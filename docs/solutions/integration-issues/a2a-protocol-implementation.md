@@ -47,7 +47,7 @@ mika-gateway  POST /a2a/{customer_id}/{agent_name}
     │ check key belongs to customer_id
     │ forward to container with MIKA_INTERNAL_TOKEN
     ▼
-mika-server   POST /a2a/{agent_name}   (internal token auth only)
+mika-spirit   POST /a2a/{agent_name}   (internal token auth only)
     │ parse JSON-RPC 2.0 envelope
     │ dispatch on method name
     │ acquire agent_lock (same mutex as Telegram messages)
@@ -215,4 +215,4 @@ The `a2a_call` tool rejects: non-http/https schemes, localhost/127.0.0.1/::1, RF
 17 findings in `todos/700-716`: 5 P1 (all resolved), 9 P2 (1 pending: #707 a2a_call not in system prompt), 3 P3 (2 pending: #713 SSE race, #716 API key in history).
 
 ### GitHub Issues
-- **#214** (OPEN) — Implement A2A protocol (v0.3) in mika-server and mika-gateway
+- **#214** (OPEN) — Implement A2A protocol (v0.3) in mika-spirit and mika-gateway

@@ -13,7 +13,7 @@ Gateway and server error/warn logs show status code and latency but not the HTTP
 
 - [x] Gateway `on_response` warn/error logs include `method` and `path` as explicit fields
 - [x] Gateway has custom `on_failure` callback with `method`, `path`, classification, and latency
-- [x] Agent server (`mika-server`) has custom `TraceLayer` matching the gateway pattern
+- [x] Agent server (`mika-spirit`) has custom `TraceLayer` matching the gateway pattern
 - [x] Agent server health probe (`/health`) logged at DEBUG level to reduce noise
 - [x] No `target: "mika::otel"` on infrastructure spans (OTel export constraint)
 - [x] Existing gateway tests pass; new test for agent server health probe classification

@@ -142,7 +142,7 @@ pub struct ToolsIdentityConfig {
 ///
 /// Use case: well-known agents (mika-arch) where a specific context block is
 /// a known leak source (mika#1009). Operator opts the agent out via
-/// `identity.toml`; production behavior changes on next mika-server restart.
+/// `identity.toml`; production behavior changes on next mika-spirit restart.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ContextIdentityConfig {
     #[serde(default)]
@@ -798,7 +798,7 @@ Core memory tracks key people briefly — the people table is the full record.\n
 /// Build a compact system prompt for `ProviderKind::MikaModel`.
 ///
 /// Emits ≤5 KB with at most 2 sections (Personality, Identity). The full
-/// mika-server prompt overwhelms the provider's small context window and
+/// mika-spirit prompt overwhelms the provider's small context window and
 /// causes OOD-prior-dominated completions (fictional status reports instead
 /// of agent-mode responses). A Tool Usage section is deliberately deferred:
 /// the MikaModel provider expects ≤5-10 tools max, so tool catalog injection

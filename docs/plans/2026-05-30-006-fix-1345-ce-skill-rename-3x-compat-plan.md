@@ -2,7 +2,7 @@
 
 ## Problem
 
-After today's 18:10Z `make deploy` (which restarted mika-server), every autonomous-loop IMPL dispatch dies in 7ms with `[error] pipeline_incomplete:` (no API call), while every GROOM dispatch succeeds in 21–23 turns. The pattern is reproducible:
+After today's 18:10Z `make deploy` (which restarted mika-spirit), every autonomous-loop IMPL dispatch dies in 7ms with `[error] pipeline_incomplete:` (no API call), while every GROOM dispatch succeeds in 21–23 turns. The pattern is reproducible:
 
 | session | prompt | turns | cost | result |
 |---|---|---|---|---|

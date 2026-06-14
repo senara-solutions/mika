@@ -481,7 +481,7 @@ Update CLAUDE.md:
 
 ## Documentation / Operational Notes
 
-- After deploying this PR, restart mika-server with `MIKA_DEV_MODE=true` to trigger mika-arch provisioning.
+- After deploying this PR, restart mika-spirit with `MIKA_DEV_MODE=true` to trigger mika-arch provisioning.
 - Verify: `mika agents list` shows `mika-arch`. `mika skills --agent mika-arch list` shows two enabled skills.
 - The four `[kg].docs_roots` paths must exist on the deployment host for KG ingestion to populate `agent_kg_corpora`.
 - Per-skill LLM overrides can be changed post-deploy via `mika skills llm mika-arch-groom-ticket set anthropic/claude-opus-4-7`.

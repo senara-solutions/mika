@@ -26,11 +26,11 @@ This is a **publish blocker**. `cargo install mika-ai` will produce a hard compi
    - github (likely more)
 
 2. `crates/mika-agent/src/skills/builtin_handlers.rs`:
-   - Line 13: `include_str!("../../../../docs/openapi/mika-server.yaml")`
+   - Line 13: `include_str!("../../../../docs/openapi/mika-spirit.yaml")`
    - Line 16: `include_str!("../../../../docs/architecture.md")`
 
 3. `crates/mika-agent/src/server/openapi.rs`:
-   - Line 80: `include_str!("../../../../docs/openapi/mika-server.yaml")`
+   - Line 80: `include_str!("../../../../docs/openapi/mika-spirit.yaml")`
 
 ## Proposed Solutions
 

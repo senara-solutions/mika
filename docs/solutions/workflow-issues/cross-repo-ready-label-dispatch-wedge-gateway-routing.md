@@ -27,11 +27,11 @@ When the loop is wedged with "**`ready` consumed but nothing dispatched**", chec
 order. The instinct to look at the agent-side marker/guard is **wrong** — those are repo-agnostic.
 
 1. **Did the agent even get the event?** Grep the server log for the agent turn:
-   `grep 'run_gh.*remove-label.*ready' $MIKA_SERVER_LOG_FILE` for the issue number. If the *agent*
+   `grep 'run_gh.*remove-label.*ready' $MIKA_SPIRIT_LOG_FILE` for the issue number. If the *agent*
    stripped the label, it received the marker; if not, the strip came from an ack path and the agent
    never saw it — a **routing-level miss**, not a dispatch-level miss.
 2. **Presence vs absence of a stall event is the discriminator.** `grep ready_label_dispatch_stalled
-   $MIKA_SERVER_LOG_FILE | jq .location` — every location being `senara-solutions/mika#...` (and
+   $MIKA_SPIRIT_LOG_FILE | jq .location` — every location being `senara-solutions/mika#...` (and
    never your repo) means non-mika events never reach the agent turn where the guard lives. Absence
    of the alarm is itself the signal.
 3. **The drop is in the gateway, at repo→container resolution.** `resolve_github_container_url`

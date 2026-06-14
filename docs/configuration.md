@@ -213,7 +213,7 @@ drift beyond ~1 minute warrants investigation.
 
 **Per-agent PAT:** To give a specific agent its own GitHub identity (e.g., mika-relay),
 create `~/.mika/agents/<name>/.env` and set `MIKA_GITHUB_TOKEN=<pat>`. Restart
-mika-server. `resolve_github_token` checks the PAT first; the GitHub App installation
+mika-spirit. `resolve_github_token` checks the PAT first; the GitHub App installation
 token is the fallback. Agents without a PAT rely entirely on the App path.
 
 ### GitHub token for `gh` CLI in Claude Code sessions
@@ -255,7 +255,7 @@ investigation panel uses only `MIKA_INVESTIGATE_GITHUB_TOKEN`. Steps:
    MIKA_INVESTIGATE_GITHUB_TOKEN=ghp_your_token_here
    MIKA_GITHUB_REPO=owner/repo
    ```
-3. Restart mika-server (tool registry is lazily initialized on first
+3. Restart mika-spirit (tool registry is lazily initialized on first
    investigation request)
 
 ### Example: Override model in home config
@@ -351,10 +351,10 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `llm_max_tokens` | `u32` | `4096` | `MIKA_LLM_MAX_TOKENS` | Maximum tokens for LLM responses. |
 | `db_path` | `PathBuf` | `~/.mika/data/mika.db` | `MIKA_DB_PATH` | Path to the SQLite database file. If not explicitly set, resolves to `{home_dir}/data/mika.db`. |
 | `log_level` | `String` | `info` | `MIKA_LOG_LEVEL` | Log level filter. Valid values: `trace`, `debug`, `info`, `warn`, `error`. |
-| `log_format` | `String` | `json` | `MIKA_LOG_FORMAT` | Stdout log format for mika-server and mika-gateway: `json` (default) or `pretty` (human-readable). CLI always uses pretty format regardless of this setting. File output always uses JSON. |
+| `log_format` | `String` | `json` | `MIKA_LOG_FORMAT` | Stdout log format for mika-spirit and mika-gateway: `json` (default) or `pretty` (human-readable). CLI always uses pretty format regardless of this setting. File output always uses JSON. |
 | `routing_url` | `Option<String>` | None | `MIKA_ROUTING_URL` | Gateway URL for outbound message delivery. Required in server mode. |
 | `customer_id` | `Option<String>` | None | `MIKA_CUSTOMER_ID` | Customer identifier. Set per container in hosted deployments. |
-| `server_port` | `u16` | `8080` | `MIKA_SERVER_PORT` | HTTP server listen port. Only used in server mode (`mika-server`). |
+| `server_port` | `u16` | `8080` | `MIKA_SPIRIT_PORT` | HTTP server listen port. Only used in server mode (`mika-spirit`). |
 | `openai_api_key` | `Option<String>` | None | `MIKA_OPENAI_API_KEY` | OpenAI API key for embedding generation. Enables vector similarity in Layer 3 hybrid search. |
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
@@ -370,7 +370,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `github_repo` | `Option<String>` | None | `MIKA_GITHUB_REPO` | Target GitHub repository in `owner/repo` format (e.g. `senara-solutions/mika`). Validated at registration time — must contain exactly one `/`. |
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
 | `dashboard_token` | `Option<SecretString>` | None | `MIKA_DASHBOARD_TOKEN` | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `internal_token` (backwards compatible). Only grants access to read-only routes — mutation endpoints (`/message`, `/tasks/{id}/complete`) still require `internal_token`. |
-| `server_log_file` | `Option<PathBuf>` | None | `MIKA_SERVER_LOG_FILE` | File path for mika-server log output. Logs go to stdout + file when set. |
+| `server_log_file` | `Option<PathBuf>` | None | `MIKA_SPIRIT_LOG_FILE` | File path for mika-spirit log output. Logs go to stdout + file when set. |
 | `dashboard_enabled` | `bool` | `false` | `MIKA_DASHBOARD_ENABLED` | Enable embedded dashboard SPA at `/dashboard/`. When enabled, the pre-built React dashboard is served from the binary via `rust-embed`. Requires `MIKA_DASHBOARD_TOKEN` for token injection. Build the dashboard before compiling: `npm run build --prefix dashboard` (`VITE_BASE_PATH` is set automatically). |
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `dev_mode` | `bool` | `false` | `MIKA_DEV_MODE` | Enable dev mode — auto-provisions well-known development agents (`mika-dev`, `mika-qa`) on startup with role-specific identity, soul, and skill assignments. Idempotent — existing agents are never overwritten. |
@@ -577,17 +577,17 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_DISABLE_AGENT_PROVISIONING` | No | Prevent dev_mode from overwriting agent files (default: false) |
 
 \* Set the API key for the active provider. E.g., `MIKA_ANTHROPIC_API_KEY` for Anthropic, `MIKA_GROQ_API_KEY` for Groq. Ollama does not require an API key.
-| `MIKA_SERVER_URL` | No | mika-server URL for dashboard CLI commands (default: `http://localhost:8080`) |
+| `MIKA_SPIRIT_URL` | No | mika-spirit URL for dashboard CLI commands (default: `http://localhost:8080`) |
 | `MIKA_GATEWAY_URL` | No | mika-gateway URL for webhook DLQ CLI commands (default: `http://localhost:3001`) |
 | `MIKA_REMOTE_AGENT_URL` | No | Cloud Mika gateway A2A endpoint for `mika ask` remote mode (e.g., `https://gw.example.com/a2a/{customer_id}/{agent}`). When set, `mika ask` bypasses the local agent loop and proxies to the cloud agent. `--remote <URL>` flag overrides. Auth via `MIKA_INTERNAL_TOKEN`. |
-| `MIKA_INTERNAL_TOKEN` | No | Bearer token for gateway internal-token auth. Used by `mika ask --remote` and by mika-server↔gateway communication. |
+| `MIKA_INTERNAL_TOKEN` | No | Bearer token for gateway internal-token auth. Used by `mika ask --remote` and by mika-spirit↔gateway communication. |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |
 | `MIKA_OTLP_ENDPOINT` | No | OTLP endpoint URL with `/v1/traces` path (required when telemetry enabled) |
 | `MIKA_OTLP_AUTH_HEADER` | No | OTLP auth header value (e.g. Base64-encoded Langfuse credentials) |
 
 ### Server mode
 
-For running `mika-server` (the HTTP server in hosted mode), additional variables
+For running `mika-spirit` (the HTTP server in hosted mode), additional variables
 are required for inter-service communication:
 
 | Variable | Required | Description |
@@ -596,7 +596,7 @@ are required for inter-service communication:
 | `MIKA_ROUTING_URL` | Yes | Gateway URL for outbound message delivery |
 | `MIKA_INTERNAL_TOKEN` | Yes | Shared bearer token (64 hex chars) for gateway auth |
 | `MIKA_CUSTOMER_ID` | Yes | Customer identifier for this container |
-| `MIKA_SERVER_PORT` | No | Listen port (default: `8080`) |
+| `MIKA_SPIRIT_PORT` | No | Listen port (default: `8080`) |
 | `MIKA_LLM_PROVIDER` | No | Active LLM provider (default: `anthropic`) |
 | `MIKA_LLM_MAX_TOKENS` | No | Override max tokens |
 | `MIKA_DB_PATH` | No | Override database path |

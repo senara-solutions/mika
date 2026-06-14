@@ -21,7 +21,7 @@ The failure signature pointed at the slash command, not the worktree or substrat
 - IMPL dispatches: `/ce:work docs/plans/<file>.md mika#N` → 7ms exit
 - GROOM dispatches: `/mika-groom-plan-only mika#N` → 21–23 turns success
 
-`/mika-groom-plan-only` resolves from the worktree's `.claude/commands/`; `/ce:work` resolves from the global compound-engineering plugin under `~/.claude/plugins/cache/every-marketplace/compound-engineering/`. The plugin was upgraded from 2.65.0 to 3.9.3 at 14:28Z UTC today (per `installed_plugins.json.lastUpdated`); the running mika-server kept stale plugin state until the 18:10Z restart loaded the new layout.
+`/mika-groom-plan-only` resolves from the worktree's `.claude/commands/`; `/ce:work` resolves from the global compound-engineering plugin under `~/.claude/plugins/cache/every-marketplace/compound-engineering/`. The plugin was upgraded from 2.65.0 to 3.9.3 at 14:28Z UTC today (per `installed_plugins.json.lastUpdated`); the running mika-spirit kept stale plugin state until the 18:10Z restart loaded the new layout.
 
 Comparison of frontmatter between versions in `skills/ce-work/SKILL.md`:
 
@@ -34,7 +34,7 @@ The plugin's own changelog records the rename at #503 — *"cli: rename all skil
 
 ## What didn't work
 
-- **Cold-start hypothesis (mika#1345 initial filing).** First N=1 instance landed at T+4min after mika-server restart, suggesting a relay-warmup race. Wrong: N=2 instance at T+36min showed the timing didn't matter — the slash command did.
+- **Cold-start hypothesis (mika#1345 initial filing).** First N=1 instance landed at T+4min after mika-spirit restart, suggesting a relay-warmup race. Wrong: N=2 instance at T+36min showed the timing didn't matter — the slash command did.
 - **Plugin install check.** `installed_plugins.json` showed compound-engineering 3.9.3 cleanly installed. The plugin was working; only the *command name* changed.
 - **`claude-pilot --no-relay` smoke test.** The permission classifier correctly forbids bypassing the relay safety surface for diagnostic purposes (per `feedback_never_suggest_dangerously_skip_permissions`). Diagnosis converged via static analysis of plugin SKILL.md frontmatter + CHANGELOG.
 

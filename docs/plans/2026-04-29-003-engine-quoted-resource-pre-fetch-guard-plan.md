@@ -242,7 +242,7 @@ cargo fmt --check
 
 mika#788's pre-fix trace is the fingerprint. After deploy:
 
-1. Restart mika-server.
+1. Restart mika-spirit.
 2. Send mika-arch a brief that quotes an issue body inline (any of the five detected shapes).
 3. Inspect the resulting session in `~/.mika/data/mika.db`:
    ```sql

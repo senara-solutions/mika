@@ -28,7 +28,7 @@ for doc in "${DOCS[@]}"; do
 done
 
 mkdir -p "$DST/openapi"
-cp "$SRC/openapi/mika-server.yaml" "$DST/openapi/mika-server.yaml"
-echo "  copied openapi/mika-server.yaml"
+cp "$SRC/openapi/mika-spirit.yaml" "$DST/openapi/mika-spirit.yaml"
+echo "  copied openapi/mika-spirit.yaml"
 
 echo "Done. Crate-local docs are in sync."

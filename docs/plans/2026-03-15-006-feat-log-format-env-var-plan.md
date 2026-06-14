@@ -9,7 +9,7 @@ date: 2026-03-15
 
 ## Overview
 
-mika-server and mika-gateway always output JSON logs via `logging::init()`. The CLI already has `init_pretty()` for human-readable output, but there's no way to get pretty logs from server/gateway — which is inconvenient during local development. This adds a `MIKA_LOG_FORMAT` env var to switch between `json` (default) and `pretty`.
+mika-spirit and mika-gateway always output JSON logs via `logging::init()`. The CLI already has `init_pretty()` for human-readable output, but there's no way to get pretty logs from server/gateway — which is inconvenient during local development. This adds a `MIKA_LOG_FORMAT` env var to switch between `json` (default) and `pretty`.
 
 ## Proposed Solution
 
@@ -28,7 +28,7 @@ Add a `LogFormat` enum to `logging.rs` and a `log_format` parameter to `init()`.
 - [x] `log_format` field on `GatewaySettings` (default `"json"`)
 - [x] Manual `Debug` impl updated for `GatewaySettings`
 - [x] Test struct literals updated for both settings structs
-- [x] mika-server passes `log_format` to `logging::init()`
+- [x] mika-spirit passes `log_format` to `logging::init()`
 - [x] mika-gateway passes `log_format` to `logging::init()`
 - [x] `.env.example` updated with `MIKA_LOG_FORMAT`
 - [x] `CLAUDE.md` Environment Variables section updated
@@ -62,7 +62,7 @@ pub fn init<OL>(default_level: &str, log_file: Option<&Path>, otel_layer: Option
 pub fn init<OL>(default_level: &str, log_file: Option<&Path>, log_format: LogFormat, otel_layer: Option<OL>)
 ```
 
-Two callers to update: `mika-server.rs:19`, `mika-gateway/main.rs:28`.
+Two callers to update: `mika-spirit.rs:19`, `mika-gateway/main.rs:28`.
 
 ### Case sensitivity
 
@@ -70,7 +70,7 @@ Accept lowercase only via the parse method. `MIKA_LOG_FORMAT=Pretty` → error w
 
 ### CLI scope
 
-The CLI ignores `MIKA_LOG_FORMAT`. It uses `init_pretty()` which is unchanged. The field exists on `Settings` but is only consumed by `mika-server`. ConfigKeyInfo description should clarify: "Controls stdout log format for mika-server and mika-gateway (json or pretty). CLI always uses pretty."
+The CLI ignores `MIKA_LOG_FORMAT`. It uses `init_pretty()` which is unchanged. The field exists on `Settings` but is only consumed by `mika-spirit`. ConfigKeyInfo description should clarify: "Controls stdout log format for mika-spirit and mika-gateway (json or pretty). CLI always uses pretty."
 
 ### Checklist from config-key-rename doc
 
@@ -84,7 +84,7 @@ Per `docs/solutions/architecture-patterns/config-key-rename-across-layers.md`, n
 6. Manual `Debug` impl for `GatewaySettings` — `crates/mika-gateway/src/settings.rs`
 7. Test struct literals — both settings files
 8. `LogFormat` enum + init() signature — `crates/mika-common/src/logging.rs`
-9. mika-server call site — `crates/mika-agent/src/bin/mika-server.rs`
+9. mika-spirit call site — `crates/mika-agent/src/bin/mika-spirit.rs`
 10. mika-gateway call site — `crates/mika-gateway/src/main.rs`
 11. `.env.example`
 12. `CLAUDE.md` Environment Variables section

@@ -11,7 +11,7 @@ issue: "#383"
 
 ## Problem
 
-The `GitHubApp` module uses an in-memory `tokio::sync::RwLock` cache for installation tokens. This works for long-running processes (mika-server, TUI) but is useless for short-lived CLI processes like `mika credential-helper`, which git spawns on every HTTPS push. Each invocation would make a full JWT + HTTP round-trip (~1-2 seconds) without cross-process caching.
+The `GitHubApp` module uses an in-memory `tokio::sync::RwLock` cache for installation tokens. This works for long-running processes (mika-spirit, TUI) but is useless for short-lived CLI processes like `mika credential-helper`, which git spawns on every HTTPS push. Each invocation would make a full JWT + HTTP round-trip (~1-2 seconds) without cross-process caching.
 
 Additionally, the credential helper runs as a child of git, which itself may be spawned by `run_git` with `scrub_mika_env_vars()` — meaning `MIKA_*` env vars are unavailable. The helper must read config from `~/.mika/.env` directly via `load_dotenv()`.
 

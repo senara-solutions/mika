@@ -79,7 +79,7 @@ Pre-merge:
 Post-deploy:
 1. Dispatch `mika ask --agent mika-dev "groom mika issue#<unreviewed>"` against a freshly-filed ticket
 2. Response should contain "Dispatched", a task ID, and NOT contain "Verdict: GROOMED"
-3. `grep dev_groom_fabrication_guard $MIKA_SERVER_LOG_FILE` — empty on healthy ticks
+3. `grep dev_groom_fabrication_guard $MIKA_SPIRIT_LOG_FILE` — empty on healthy ticks
 
 ## Lessons
 

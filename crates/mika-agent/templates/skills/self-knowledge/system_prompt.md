@@ -49,7 +49,7 @@ This applies even when `status: "ok"` — MCP-dynamic tools are expected to be a
 
 Available topics:
 - `architecture` — system design, memory model, agent loop, task engine, and more
-- `api-spec` — OpenAPI specification for the mika-server (agent) HTTP API
+- `api-spec` — OpenAPI specification for the mika-spirit (agent) HTTP API
 - `browser-control` — browser automation setup via Playwright MCP, usage patterns, and security
 - `cli-reference` — full CLI help text with all commands and options
 - `configuration` — config file options, environment variables, and setup

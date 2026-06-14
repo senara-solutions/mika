@@ -180,7 +180,7 @@ Directional only — not implementation specification. Field names and exact str
 - Mock server responds with a Task containing a file part (e.g., `{kind: "file", name: "foo.txt"}`); CLI renders `[file: foo.txt]` placeholder, exits 0.
 - `MIKA_INTERNAL_TOKEN` unset: A2aClient is constructed with `None` auth; the Authorization header is omitted. If the server requires it, the 401 path above fires.
 
-**Verification:** `cargo test -p mika-cli` passes new integration tests. Manual smoke: start a local `mika-server` instance, point `--remote http://localhost:8080/a2a/<cust>/<agent>` at it with `MIKA_INTERNAL_TOKEN` set, observe round-trip reply printed to stdout.
+**Verification:** `cargo test -p mika-cli` passes new integration tests. Manual smoke: start a local `mika-spirit` instance, point `--remote http://localhost:8080/a2a/<cust>/<agent>` at it with `MIKA_INTERNAL_TOKEN` set, observe round-trip reply printed to stdout.
 
 ### U3. Documentation + help-text polish
 

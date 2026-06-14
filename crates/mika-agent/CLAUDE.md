@@ -1,6 +1,6 @@
 # mika-agent — Agent Engine
 
-Agent container: SQLite DB, agent loop, tools, prompt assembly, A2A server endpoints, HTTP server binary (mika-server). This is the core crate where most development happens.
+Agent container: SQLite DB, agent loop, tools, prompt assembly, A2A server endpoints, HTTP server binary (mika-spirit). This is the core crate where most development happens.
 
 ## Agent Loop
 
@@ -516,7 +516,7 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 **Team task tree:** parent `invoke_orchestrator` task + child `resume_agent` tasks per delegation. Suspend/resume on pending grandchild callbacks. **Team-run user notification (#287):** fired once at terminal status from two symmetric callsites (`run_team` tool for sync completion, `dispatch_invoke_orchestrator` for async resume), both routing through `teams::notification::build_run_completion_message`. Per-child `resume_agent` callbacks have their user-facing `send_message` suppressed via `NoopSender`; the silent turn still runs (updates memory, records `llm_calls`) — only the user channel is gated. Deliverable text is UTF-8-safe truncated at 4000 chars (below Telegram's 4096 limit).
 
-## HTTP Server (mika-server)
+## HTTP Server (mika-spirit)
 
 Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN` only; read-only dashboard API accepts either `MIKA_DASHBOARD_TOKEN` or `MIKA_INTERNAL_TOKEN` (superuser).
 
@@ -584,14 +584,14 @@ Two distinct sinks exist for runtime log events. Both emit the same structured J
 
 | Sink | Initializer | Process | Path | Rotation |
 |------|-------------|---------|------|----------|
-| **Server log** | `mika_common::logging::init()` (`crates/mika-common/src/logging.rs:208`) | `mika-server` (long-running daemon) | `MIKA_SERVER_LOG_FILE` (e.g. `/var/log/mika/server.log`) | None — single file via `tracing_appender::rolling::never` |
+| **Server log** | `mika_common::logging::init()` (`crates/mika-common/src/logging.rs:208`) | `mika-spirit` (long-running daemon) | `MIKA_SPIRIT_LOG_FILE` (e.g. `/var/log/mika/server.log`) | None — single file via `tracing_appender::rolling::never` |
 | **Per-agent CLI log** | `mika_common::logging::init_pretty()` (`crates/mika-common/src/logging.rs:314`) | `mika-cli` (`mika ask`, `mika chat`, `mika team run`, etc.) | `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` (daily) | Daily via `tracing_appender::rolling::daily` |
 
-**Decision tree for operators:** If you want to read the running mika-server's runtime events (skill execution, task engine, callback lifecycle, autonomous-loop wedges), read `MIKA_SERVER_LOG_FILE` filtered by `agent_id`. If you want to read a specific `mika ask` or `mika chat` invocation's events, read `~/.mika/agents/<name>/logs/mika.log.<date>`. Both contain the same `agent_id` field on every entry, so cross-filtering by agent works in either sink.
+**Decision tree for operators:** If you want to read the running mika-spirit's runtime events (skill execution, task engine, callback lifecycle, autonomous-loop wedges), read `MIKA_SPIRIT_LOG_FILE` filtered by `agent_id`. If you want to read a specific `mika ask` or `mika chat` invocation's events, read `~/.mika/agents/<name>/logs/mika.log.<date>`. Both contain the same `agent_id` field on every entry, so cross-filtering by agent works in either sink.
 
-**Single-sink rationale:** mika-server uses one file with `agent_id`-filtered queries instead of per-agent file appenders because: (a) per-agent appenders would double the disk-write rate per event, (b) they create a sync gap risk if the per-agent appender worker can't keep up, and (c) they duplicate data already correctly addressable via the JSON `agent_id` field. The per-agent CLI sink is correct for its purpose (discrete CLI invocations) and is not a substitute for the server log.
+**Single-sink rationale:** mika-spirit uses one file with `agent_id`-filtered queries instead of per-agent file appenders because: (a) per-agent appenders would double the disk-write rate per event, (b) they create a sync gap risk if the per-agent appender worker can't keep up, and (c) they duplicate data already correctly addressable via the JSON `agent_id` field. The per-agent CLI sink is correct for its purpose (discrete CLI invocations) and is not a substitute for the server log.
 
-**Common mistake:** Audit tooling that reads `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` for server-mode events will find it nearly empty — only CLI invocations write there. Use `jq 'select(.agent_id == "<name>")' < $MIKA_SERVER_LOG_FILE` for server-mode queries. `mika logs --agent <name>` prints both resolved paths.
+**Common mistake:** Audit tooling that reads `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` for server-mode events will find it nearly empty — only CLI invocations write there. Use `jq 'select(.agent_id == "<name>")' < $MIKA_SPIRIT_LOG_FILE` for server-mode queries. `mika logs --agent <name>` prints both resolved paths.
 
 ## Audit Log
 

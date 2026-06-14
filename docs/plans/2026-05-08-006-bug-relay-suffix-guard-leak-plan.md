@@ -322,7 +322,7 @@ After landing:
 cargo build -p mika-agent
 cargo test -p mika-agent well_known_agents
 
-# Confirm post-deploy state on a host with mika-server running
+# Confirm post-deploy state on a host with mika-spirit running
 sqlite3 ~/.mika/data/mika.db \
   "SELECT skill_name, enabled FROM skill_overrides
    WHERE agent_id = 'mika-relay' AND skill_name IN

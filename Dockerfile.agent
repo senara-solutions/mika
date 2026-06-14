@@ -35,8 +35,8 @@ COPY --from=dashboard-builder /app/dashboard/dist dashboard/dist
 # Build with BuildKit cache mounts for incremental compilation
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --bin mika-server -p mika-agent \
-    && cp target/release/mika-server /usr/local/bin/mika-server
+    cargo build --release --bin mika-spirit -p mika-agent \
+    && cp target/release/mika-spirit /usr/local/bin/mika-spirit
 
 # === Runtime stage ===
 FROM debian:bookworm-slim
@@ -70,7 +70,7 @@ RUN ARCH_MAP="amd64:x86_64-unknown-linux-gnu arm64:aarch64-unknown-linux-gnu" &&
 RUN useradd -m -u 1000 -s /bin/false mika
 
 # Copy binary
-COPY --from=builder /usr/local/bin/mika-server /usr/local/bin/mika-server
+COPY --from=builder /usr/local/bin/mika-spirit /usr/local/bin/mika-spirit
 
 # Set up volume mount point (bootstrap creates data/ and logs/ subdirs on first run)
 ENV MIKA_HOME=/home/mika/.mika
@@ -83,4 +83,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["wget", "-q", "--spider", "http://localhost:8080/health"]
 
-CMD ["mika-server"]
+CMD ["mika-spirit"]

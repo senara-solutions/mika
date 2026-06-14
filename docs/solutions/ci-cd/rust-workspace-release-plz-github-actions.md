@@ -64,7 +64,7 @@ release-plz.yml [release job]
     |  (no crates.io publishing — all crates are publish = false)
     v
 release.yml (triggered by v* tag)
-    |  builds mika + mika-server binaries for 4 targets (with telemetry)
+    |  builds mika + mika-spirit binaries for 4 targets (with telemetry)
     |  uploads .tar.gz + .sha256 to GitHub Release
     v
 End user: curl install.sh | sh
@@ -93,7 +93,7 @@ Uses `taiki-e/setup-cross-toolchain-action` (conditional on `matrix.target == 'a
 
 **4. Build Matrix**
 
-Both `mika` CLI and `mika-server` HTTP server binaries are built for distribution (with `--features telemetry`). `mika-gateway` is Docker-only deployment. Release binaries use an empty `dashboard/dist/` placeholder — the embedded dashboard shows a "disabled" page; full dashboard embedding requires a Node.js build step (tracked as follow-up).
+Both `mika` CLI and `mika-spirit` HTTP server binaries are built for distribution (with `--features telemetry`). `mika-gateway` is Docker-only deployment. Release binaries use an empty `dashboard/dist/` placeholder — the embedded dashboard shows a "disabled" page; full dashboard embedding requires a Node.js build step (tracked as follow-up).
 
 | Target | Runner | Notes |
 |--------|--------|-------|

@@ -25,7 +25,7 @@ KG resolution is fully broken in production after the #757 deploy. `entity_resol
 
 ## Scope Boundaries
 
-- Global tracing-aware panic hook for mika-server — separate ticket
+- Global tracing-aware panic hook for mika-spirit — separate ticket
 - Semantic LLM prompt truncation (sentence/paragraph boundary, token-aware) — separate ticket
 - Schema-migration-as-integration-event retrospective — separate ticket
 

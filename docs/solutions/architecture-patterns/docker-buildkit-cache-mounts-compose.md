@@ -72,8 +72,8 @@ COPY crates/mika-agent/ crates/mika-agent/
 # Build with BuildKit cache mounts for incremental compilation
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --bin mika-server -p mika-agent \
-    && cp target/release/mika-server /usr/local/bin/mika-server
+    cargo build --release --bin mika-spirit -p mika-agent \
+    && cp target/release/mika-spirit /usr/local/bin/mika-spirit
 ```
 
 **Key details:**

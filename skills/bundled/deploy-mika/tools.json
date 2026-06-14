@@ -1,7 +1,7 @@
 [
   {
     "name": "deploy_mika",
-    "description": "Deploy all mika binaries (mika, mika-server, mika-gateway) from build artifacts. Per-binary health check, backup/rollback, rc-service restart.",
+    "description": "Deploy all mika binaries (mika, mika-spirit, mika-gateway) from build artifacts. Per-binary health check, backup/rollback, rc-service restart.",
     "input_schema": {
       "type": "object",
       "properties": {

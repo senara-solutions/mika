@@ -572,7 +572,7 @@ Operator: /mika-groom-milestone mika milestone#19
 
 - Post-merge: file the codification-prep ticket flagged in § Scope Boundaries (carve-out instance #2 follow-up).
 - Post-deploy: re-dispatch milestone#19 via the new command. This dogfoods the new skill against the original motivating milestone. If successful, milestone#19's sub-issues drain; if not, the dogfood result becomes the codification-prep evidence.
-- No deploy hook needed — new skill is auto-discovered by `build.rs` on next mika-server restart.
+- No deploy hook needed — new skill is auto-discovered by `build.rs` on next mika-spirit restart.
 
 ## Sources & References
 

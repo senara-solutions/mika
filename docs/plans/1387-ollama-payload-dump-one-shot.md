@@ -10,17 +10,17 @@ origin: senara-solutions/mika#1387
 
 ## Overview
 
-Add an env-gated, one-shot debug affordance to `OllamaProvider::send_once` that writes the exact JSON body sent to Ollama's `/api/chat` to a configured file path. Lets the operator (or follow-up diagnostic work) capture mika-server's actual runtime payload — system prompt + messages + tools + options — to diagnose the out-of-distribution behavior observed post-mika#1379 with `MIKA_LLM_PROVIDER=mikamodel mika ask "hello"`.
+Add an env-gated, one-shot debug affordance to `OllamaProvider::send_once` that writes the exact JSON body sent to Ollama's `/api/chat` to a configured file path. Lets the operator (or follow-up diagnostic work) capture mika-spirit's actual runtime payload — system prompt + messages + tools + options — to diagnose the out-of-distribution behavior observed post-mika#1379 with `MIKA_LLM_PROVIDER=mikamodel mika ask "hello"`.
 
 ## Problem Frame
 
-After mika#1379 shipped (PR #1380, commit `368d6b0`), local smoke testing surfaced that the MikaModel provider returns unrelated multi-section workplace-assistant boilerplate ("## Completed Tasks", "## Pending", etc.) rather than responding to the user input. Five direct curl probes against the same Ollama backend with various system-prompt shapes (training-shape, none, math-tutor role, explicit "use status report format" instruction, multi-section markdown) all returned sane conversational output. **The upstream model is healthy in isolation; something specific in mika-server's runtime `/api/chat` payload triggers the OOD behavior.**
+After mika#1379 shipped (PR #1380, commit `368d6b0`), local smoke testing surfaced that the MikaModel provider returns unrelated multi-section workplace-assistant boilerplate ("## Completed Tasks", "## Pending", etc.) rather than responding to the user input. Five direct curl probes against the same Ollama backend with various system-prompt shapes (training-shape, none, math-tutor role, explicit "use status report format" instruction, multi-section markdown) all returned sane conversational output. **The upstream model is healthy in isolation; something specific in mika-spirit's runtime `/api/chat` payload triggers the OOD behavior.**
 
 Three plausible triggers, in descending likelihood:
 
-1. **The `tools` array.** mika-server passes the full ~82-tool catalog on every request. The largest single structural delta vs the probes (which had no `tools` field set). Most plausible distribution-shift culprit.
+1. **The `tools` array.** mika-spirit passes the full ~82-tool catalog on every request. The largest single structural delta vs the probes (which had no `tools` field set). Most plausible distribution-shift culprit.
 2. **The full multi-section system prompt.** 14 `## Section` headers (Current Time, Communication Channel, Core Memory, Instructions, Tool Usage, Pending Commitments, Silent Mode, Today's Conversations, Recent Audit Events, File Tools, Task Health, Trigger, etc.), each with detailed rules and XML-tagged content.
-3. **Conversation history.** If the agent home dir has prior turns, mika-server appends them; a prior assistant message containing similar structural content could elicit continuation.
+3. **Conversation history.** If the agent home dir has prior turns, mika-spirit appends them; a prior assistant message containing similar structural content could elicit continuation.
 
 Without the actual payload, choosing a fix is guessing — a compact-prompt-builder branch for `ProviderKind::MikaModel` ships fast but is wrong if the trigger is the tools array, and vice versa. The smallest possible affordance to break the guessing cycle is a one-shot dump.
 

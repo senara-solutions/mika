@@ -102,7 +102,7 @@ This article exists in the requirements doc because the technical commitments be
 
 - Gateway endpoint additions land in the `mika-gateway` crate. Cross-repo coordination with `mika-cloud` chart updates if env vars or volume mounts are added.
 - The operator's GitHub App key (the existing one used for installation auth) is the bundle-signing key in the mission window. Key rotation procedures live outside this brainstorm.
-- mika-server's existing per-agent state structure (`~/.mika/agents/<name>/` + per-agent SQLite at `~/.mika/data/mika.db` locally, RDS-per-pod in cloud) is stable enough to round-trip through the bundle format.
+- mika-spirit's existing per-agent state structure (`~/.mika/agents/<name>/` + per-agent SQLite at `~/.mika/data/mika.db` locally, RDS-per-pod in cloud) is stable enough to round-trip through the bundle format.
 - The SQLite slice export/import preserves FTS5 + sqlite-vec indices, or rebuilds them on import. Planning-time decision.
 - Family Mika provisioning interacts with the existing `mika-cloud` Helm chart for `mika-agent` (template `mika-{customer_id}`). No new infra primitives required.
 - The chain-coupling principle is binding for Phase 2 even if the chain choice (Ethereum, Solana, NEAR, Polkadot, ...) is not yet made. The forward-compat bundle format is chain-agnostic.

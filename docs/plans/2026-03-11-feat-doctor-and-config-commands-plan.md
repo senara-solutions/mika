@@ -118,7 +118,7 @@ pub struct ConfigKeyInfo {
 | `claude_model` | File | `MIKA_CLAUDE_MODEL` | No | Claude model ID |
 | `claude_max_tokens` | File | `MIKA_CLAUDE_MAX_TOKENS` | No | Max response tokens |
 | `log_level` | File | `MIKA_LOG_LEVEL` | No | Log level (trace/debug/info/warn/error) |
-| `server_port` | File | `MIKA_SERVER_PORT` | No | HTTP server port |
+| `server_port` | File | `MIKA_SPIRIT_PORT` | No | HTTP server port |
 | `embedding_model` | File | `MIKA_EMBEDDING_MODEL` | No | OpenAI embedding model |
 | `embedding_dimensions` | File | `MIKA_EMBEDDING_DIMENSIONS` | No | Embedding vector dimensions |
 | `anthropic_api_key` | Env | `MIKA_ANTHROPIC_API_KEY` | Yes | Anthropic API key |

@@ -48,7 +48,7 @@ Citations:
 
 **Why a separate compound doc capturing the three-way filter.** The PR ships the immediate change (constant edit) AND the policy that motivated it (`core-memory-as-citation-not-accumulator-2026-04-28.md`). Two concerns in one PR is normally a smell, but here they're causally coupled — the constant edit is the *first application* of the policy; the policy explains *why* the constant edit is the right shape. Splitting them would land the constant edit without its rationale doc, which is exactly the no-plan failure mode this PR's process-note flags.
 
-**Why the live core-memory edits are post-deploy operator commands.** The `MIKA_ARCH_SOUL` constant edit only takes effect on next mika-server restart, after deploy. Live core-memory state in the DB is independent — `current_priorities` still has the inline list until an `update_core_memory` call replaces it. Running those `mika ask` invocations now (before deploy) would create a window where mika-arch has neither the inline refs nor the soul refs. Documented in the compound doc body as post-deploy commands rather than executed in this PR.
+**Why the live core-memory edits are post-deploy operator commands.** The `MIKA_ARCH_SOUL` constant edit only takes effect on next mika-spirit restart, after deploy. Live core-memory state in the DB is independent — `current_priorities` still has the inline list until an `update_core_memory` call replaces it. Running those `mika ask` invocations now (before deploy) would create a window where mika-arch has neither the inline refs nor the soul refs. Documented in the compound doc body as post-deploy commands rather than executed in this PR.
 
 ## Alternatives rejected
 
@@ -98,7 +98,7 @@ A6. PR description names the post-deploy operator commands and forward-points to
 ## Risk + rollback
 
 - **Risk: existing local mika-arch installs are not auto-overwritten.** The provisioning logic in `well_known_agents.rs` is idempotent and skips agents whose `soul.md` already exists. Operators with a custom mika-arch soul.md keep their custom content; only fresh provisions get the new template. Mitigation: documented in PR body. Operators who want the new section can either delete their local `~/.mika/agents/mika-arch/soul.md` and re-provision, or manually merge the new section.
-- **Risk: post-deploy `mika ask` invocations require the agent to be running on the new mika-server.** Mitigation: the compound doc body explicitly notes "after the next mika-server restart picks up the new MIKA_ARCH_SOUL." Operators reading the doc out-of-context get the timing right.
+- **Risk: post-deploy `mika ask` invocations require the agent to be running on the new mika-spirit.** Mitigation: the compound doc body explicitly notes "after the next mika-spirit restart picks up the new MIKA_ARCH_SOUL." Operators reading the doc out-of-context get the timing right.
 - **Rollback: revert the single commit.** No schema migration, no DB writes from this PR. Constant returns to prior shape; next provision regenerates the prior soul.md.
 
 ## Verification (end-to-end)
@@ -116,7 +116,7 @@ grep -nE "docs/solutions/best-practices/required-tools-gate-evasion|docs/solutio
 
 Post-merge + post-deploy:
 ```bash
-# Confirm soul.md was rewritten on next mika-server restart
+# Confirm soul.md was rewritten on next mika-spirit restart
 grep -A 10 "## Foundational references" ~/.mika/agents/mika-arch/soul.md
 # Run the post-deploy operator commands (from compound doc body) to apply live core-memory edits
 # (commands are inline in the compound doc; not duplicated here to avoid drift)

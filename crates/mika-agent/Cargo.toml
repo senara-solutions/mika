@@ -13,8 +13,8 @@ categories.workspace = true
 readme = "../../README.md"
 
 [[bin]]
-name = "mika-server"
-path = "src/bin/mika-server.rs"
+name = "mika-spirit"
+path = "src/bin/mika-spirit.rs"
 
 [[bin]]
 name = "calibrate"

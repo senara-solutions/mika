@@ -41,7 +41,7 @@ pub enum ProviderKind {
 
 ## Problem
 
-When the active provider is `ProviderKind::MikaModel`, the prompt-assembly path emits the full ~167KB system prompt with 63 sections (QA Review Skill ~49KB, Milestone Workflow ~21KB, Self-Dev Skill ~18KB, full tool catalog with 58 entries). The provider expects a minimal system prompt (~250 chars, single paragraph, ~5-10 tools max) and OOD-prior-dominates when given the full mika-server context — it completes the markdown structure instead of acting as an agent (emits fictional `## Summary / Completed Tasks / Pending` status reports unrelated to the user query).
+When the active provider is `ProviderKind::MikaModel`, the prompt-assembly path emits the full ~167KB system prompt with 63 sections (QA Review Skill ~49KB, Milestone Workflow ~21KB, Self-Dev Skill ~18KB, full tool catalog with 58 entries). The provider expects a minimal system prompt (~250 chars, single paragraph, ~5-10 tools max) and OOD-prior-dominates when given the full mika-spirit context — it completes the markdown structure instead of acting as an agent (emits fictional `## Summary / Completed Tasks / Pending` status reports unrelated to the user query).
 
 ## Why
 

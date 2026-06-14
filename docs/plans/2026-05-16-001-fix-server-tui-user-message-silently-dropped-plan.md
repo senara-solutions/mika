@@ -129,7 +129,7 @@ The `let _ =` discards `SendError` (only fires when the receiver is *dropped* �
                     .await;
 ```
 
-This is the only direct `run_agent` call site in `mika-cli` (excluding the callback variant at chat.rs:377). The TUI does not POST messages to mika-server.
+This is the only direct `run_agent` call site in `mika-cli` (excluding the callback variant at chat.rs:377). The TUI does not POST messages to mika-spirit.
 
 **P0 pin confirms** the plan's three pillars: (a) server has no session-listener registry; (b) TUI runs the agent locally with no supervision around the worker spawn; (c) message-arrival-via-restart hypothesis from the ticket has no underlying mechanism in this codebase.
 
@@ -238,7 +238,7 @@ ORDER BY created_at;
 
 ### S3.3 — Logs (correct sink)
 
-Per `crates/mika-agent/CLAUDE.md` § Log Sinks: CLI invocations write to `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`, NOT to `MIKA_SERVER_LOG_FILE`. The ticket's 2.5 GB `server.log` search was the wrong sink for a CLI-channel session.
+Per `crates/mika-agent/CLAUDE.md` § Log Sinks: CLI invocations write to `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`, NOT to `MIKA_SPIRIT_LOG_FILE`. The ticket's 2.5 GB `server.log` search was the wrong sink for a CLI-channel session.
 
 ```bash
 grep -F "d68e1285167a4fc0978bd655929e1cbe" \
@@ -313,7 +313,7 @@ Revision 1 of this plan had a "Branch B — Server-mode POST /message tokio-spaw
 
 ## Rejected directions (ticket suggestions; explicit rejection)
 
-1. **"TUI side: detect server restart, start a fresh session."** The TUI's local agent worker does not communicate with mika-server for `mika chat`. There is no server connection to detect a restart of. Suggestion does not apply to current architecture.
+1. **"TUI side: detect server restart, start a fresh session."** The TUI's local agent worker does not communicate with mika-spirit for `mika chat`. There is no server connection to detect a restart of. Suggestion does not apply to current architecture.
 2. **"Server side: subscribe by agent_id, not session_id."** Presupposes a per-session listener that does not exist (Phase 0 P0.3). Implementing it would be a net-new event-bus subsystem, not a fix. YAGNI + orthogonality reject this.
 3. **"Observability: 'message-persisted-but-no-loop-tick-within-Ns' metric."** Replaced by Step 5's tighter `agent_worker_silenced` event, fired from the supervision path. The polling/timer shape implied by the ticket's framing is replaced by an event-driven shape that uses the same mechanism as the fix.
 

@@ -6,7 +6,7 @@
 
 ## Root Cause Analysis
 
-The ticket asserts that the `calibrate` binary "doesn't share the OAuth path" that `mika-server` uses. This is **incorrect** — source-level verification confirms the binary goes through the full OAuth-aware chain:
+The ticket asserts that the `calibrate` binary "doesn't share the OAuth path" that `mika-spirit` uses. This is **incorrect** — source-level verification confirms the binary goes through the full OAuth-aware chain:
 
 ```
 create_provider_from_spec() → create_provider() → AnthropicProvider::new()
@@ -19,7 +19,7 @@ create_provider_from_spec() → create_provider() → AnthropicProvider::new()
 - `crates/mika-common/src/llm/anthropic.rs:29` — `AnthropicProvider::new()` calls `ClaudeClient::new(api_key, ...)`
 - `crates/mika-common/src/claude.rs:372` — `ClaudeClient::new()` checks `is_oauth_token(&credential)` and creates `AnthropicAuth::OAuthManaged` for `sk-ant-oat*` prefixes
 
-The issue body's curl probe (showing `x-api-key` rejection) likely reflects a direct API call outside the provider chain, or a version predating the OAuth detection. The calibrate binary's `create_provider_from_spec()` does NOT bypass the OAuth path — it uses the identical `create_provider()` factory that `mika-server` uses.
+The issue body's curl probe (showing `x-api-key` rejection) likely reflects a direct API call outside the provider chain, or a version predating the OAuth detection. The calibrate binary's `create_provider_from_spec()` does NOT bypass the OAuth path — it uses the identical `create_provider()` factory that `mika-spirit` uses.
 
 **Why 5/5 failures still occur:** The OAuth path IS invoked, but `OAuthTokenManager::get_valid_token()` fails silently when `~/.mika/oauth.json` is absent, expired, or has a hash mismatch from subscription token rotation. The error is then misclassified as `TransportError` (see Layer 1 below), hiding the real cause.
 
@@ -67,12 +67,12 @@ match provider.check_health().await {
         // Surface OAuth-specific guidance when the error chain mentions it
         if err_str.contains("OAuth") || err_str.contains("oauth") {
             eprintln!("Error: OAuth authentication failed for Anthropic provider.");
-            eprintln!("  The calibrate binary uses the same OAuth flow as mika-server.");
+            eprintln!("  The calibrate binary uses the same OAuth flow as mika-spirit.");
             eprintln!("  Ensure `mika setup --mode oauth` has been completed and");
             eprintln!("  that ~/.mika/oauth.json exists with valid, non-expired tokens.");
             eprintln!();
-            eprintln!("  To verify: check that mika-server can call Anthropic successfully.");
-            eprintln!("  If mika-server works but calibrate doesn't, the subscription token");
+            eprintln!("  To verify: check that mika-spirit can call Anthropic successfully.");
+            eprintln!("  If mika-spirit works but calibrate doesn't, the subscription token");
             eprintln!("  in MIKA_ANTHROPIC_API_KEY may have been rotated since the last");
             eprintln!("  `mika setup --mode oauth` run.");
         }

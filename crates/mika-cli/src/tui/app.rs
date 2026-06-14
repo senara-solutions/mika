@@ -994,7 +994,7 @@ impl<'a> App<'a> {
                                 Ok(resp) => {
                                     format!("Failed to {endpoint} dashboard: {}", resp.status())
                                 }
-                                Err(e) => format!("Failed to reach mika-server: {e}"),
+                                Err(e) => format!("Failed to reach mika-spirit: {e}"),
                             }
                         }
                     }

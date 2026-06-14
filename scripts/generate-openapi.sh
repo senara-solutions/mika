@@ -9,8 +9,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "Generating mika-server OpenAPI spec..."
+echo "Generating mika-spirit OpenAPI spec..."
 cargo test -p mika-agent write_agent_openapi_yaml -- --ignored
-echo "  → docs/openapi/mika-server.yaml"
+echo "  → docs/openapi/mika-spirit.yaml"
 
 echo "Done. Verify with: cargo build"

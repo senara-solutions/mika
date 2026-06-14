@@ -10,20 +10,20 @@ issue: "#372"
 
 ## Overview
 
-The GitHub Releases page is broken: all binary builds fail since v0.1.6, release names show internal crate names instead of the product name, `mika-server` is not published, and crates.io publishing is unnecessary. This plan fixes all four problems.
+The GitHub Releases page is broken: all binary builds fail since v0.1.6, release names show internal crate names instead of the product name, `mika-spirit` is not published, and crates.io publishing is unnecessary. This plan fixes all four problems.
 
 ## Problem Statement
 
 1. **Binary builds fail** — `release.yml` doesn't create `dashboard/dist/` placeholder, so `rust-embed` compilation fails (the `mika` CLI depends on `mika-agent` which uses `rust-embed` for `../../dashboard/dist/`)
 2. **Confusing release names** — release-plz names releases after `mika-common` (the only crate with `git_release_enable = true`), producing names like `mika-common-v0.3.1`
-3. **Missing `mika-server` binary** — only the `mika` CLI is uploaded to GitHub Releases
+3. **Missing `mika-spirit` binary** — only the `mika` CLI is uploaded to GitHub Releases
 4. **Unnecessary crates.io publishing** — distribution is via GitHub Releases only; no external consumers depend on these crates
 
 ## Proposed Solution
 
 Four targeted changes across CI/CD configuration files and Cargo manifests.
 
-### Change 1: `.github/workflows/release.yml` — fix build + add mika-server + telemetry
+### Change 1: `.github/workflows/release.yml` — fix build + add mika-spirit + telemetry
 
 **File:** `.github/workflows/release.yml`
 
@@ -48,21 +48,21 @@ Add `features: telemetry` to the existing mika upload step (matching `make deplo
           token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-Add a second upload step for `mika-server` (separate archive):
+Add a second upload step for `mika-spirit` (separate archive):
 
 ```yaml
-      - name: Build and upload mika-server
+      - name: Build and upload mika-spirit
         uses: taiki-e/upload-rust-binary-action@f391289bcff6a7f36b6301c0a74199657bbb4561  # v1
         with:
-          bin: mika-server
+          bin: mika-spirit
           features: telemetry
           target: ${{ matrix.target }}
-          archive: mika-server-$tag-$target
+          archive: mika-spirit-$tag-$target
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-**Note:** `mika-server` is a `[[bin]]` in `mika-agent` crate. The dashboard dist placeholder means zero assets are embedded (graceful degradation — the `/dashboard/` endpoint shows a "disabled" page). A full Node.js dashboard build in CI is a follow-up concern.
+**Note:** `mika-spirit` is a `[[bin]]` in `mika-agent` crate. The dashboard dist placeholder means zero assets are embedded (graceful degradation — the `/dashboard/` endpoint shows a "disabled" page). A full Node.js dashboard build in CI is a follow-up concern.
 
 **Note:** `mika-gateway` is intentionally excluded — it's deployed via Docker images to Kubernetes, not as a standalone binary. Add a comment in the workflow to document this decision.
 
@@ -141,7 +141,7 @@ Belt-and-suspenders with the release-plz config. Prevents accidental `cargo publ
 
 - [x] `release.yml` creates `dashboard/dist/` placeholder before Rust compilation
 - [x] `release.yml` builds and uploads `mika` binary with telemetry feature
-- [x] `release.yml` builds and uploads `mika-server` binary with telemetry feature (separate archive)
+- [x] `release.yml` builds and uploads `mika-spirit` binary with telemetry feature (separate archive)
 - [x] `release-plz.toml` has `publish = false` on all four crates (mika-common, mika-agent, mika-cli, mika-a2a)
 - [x] `release-plz.toml` has `git_release_name = "v{{ version }}"` for clean release naming
 - [x] `release-plz.yml` no longer references `CARGO_REGISTRY_TOKEN`
@@ -153,7 +153,7 @@ Belt-and-suspenders with the release-plz config. Prevents accidental `cargo publ
 ## Out of Scope (Follow-ups)
 
 - **Dashboard embedding in release binaries** — requires Node.js build step in `release.yml`; current PR uses empty placeholder (zero assets, graceful degradation)
-- **`install.sh` update for mika-server** — installer currently only handles `mika` CLI; track separately
+- **`install.sh` update for mika-spirit** — installer currently only handles `mika` CLI; track separately
 - **Yanking existing crates.io versions** — manual action after PR merges (`cargo yank` for mika-common 0.1.3/0.1.4, mika-agent, mika-cli, mika-a2a)
 - **Toolchain consistency in `release.yml`** — switching from `dtolnay/rust-toolchain` to `rustup show` (per `docs/solutions/ci-cd/ci-rust-toolchain-version-mismatch.md`); separate concern
 - **Delete `CARGO_REGISTRY_TOKEN` secret from GitHub repo settings** — manual action

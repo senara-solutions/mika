@@ -11,7 +11,7 @@
 # Environment:
 #   MIKA_PLATFORM_ROOT   — workspace root holding the four sub-repos
 #                          (default: /data/workspace/mika-platform)
-#   MIKA_SERVER_LOG_FILE — server log path (default: /var/log/mika/server.log)
+#   MIKA_SPIRIT_LOG_FILE — server log path (default: /var/log/mika/server.log)
 #   MIKA_DB              — SQLite DB path  (default: ~/.mika/data/mika.db)
 #
 # This script is read-only and idempotent — safe to re-run.
@@ -23,7 +23,7 @@ set -euo pipefail
 # --- Configuration (per architect NF3) ---
 PLATFORM_ROOT="${MIKA_PLATFORM_ROOT:-/data/workspace/mika-platform}"
 DB="${MIKA_DB:-$HOME/.mika/data/mika.db}"
-LOG_FILE="${MIKA_SERVER_LOG_FILE:-/var/log/mika/server.log}"
+LOG_FILE="${MIKA_SPIRIT_LOG_FILE:-/var/log/mika/server.log}"
 AGENT_ID="mika-arch"  # sole KG consumer per mika#800
 MIN_SCHEMA_VERSION=27
 TODAY=$(date -u +'%Y-%m-%d')

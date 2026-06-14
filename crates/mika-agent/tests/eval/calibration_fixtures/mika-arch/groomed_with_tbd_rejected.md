@@ -24,7 +24,7 @@ deliver messages to the agent.
 ### Port Configuration
 
 - The webhook listener port is TBD — pick a port number that doesn't conflict
-  with the existing mika-server (8080) or gateway (3001)
+  with the existing mika-spirit (8080) or gateway (3001)
 
 ### Error Handling
 

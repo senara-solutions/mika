@@ -49,14 +49,14 @@ SELECT customer_id, agent_mapping FROM github_repos WHERE repo_full_name = $1
   - **multi-tenant** (no `MIKA_AGENT_BASE_URL`) → **event dropped** (`warn!("GitHub repo not
     registered and no fallback configured")`).
   - **single-tenant** (`MIKA_AGENT_BASE_URL` set) → falls back to that base URL → reaches the one
-    mika-server, where `route_event` picks `mika-dev`.
+    mika-spirit, where `route_event` picks `mika-dev`.
 
 `github_repos` is populated by **customer provisioning** (gateway migration 004, `add-customer`).
 Internal repos (mika-cloud/skills/cpp) are never provisioned as customers → no row.
 
 ### Tenancy split (the crux — Open question O2)
 
-The autonomous loop's mika-dev runs on the **dev host** (OpenRC, one `mika-server` with all
+The autonomous loop's mika-dev runs on the **dev host** (OpenRC, one `mika-spirit` with all
 well-known agents). If that gateway has `MIKA_AGENT_BASE_URL` set (single-tenant), Layer-2 routing
 already works via fallback — meaning the *local* blocker is **Layer 1 (delivery)**, not the registry.
 In **multi-tenant prod** (K8s, no base-url fallback), the *same* missing-registry-row path **drops**
@@ -124,7 +124,7 @@ coordination-overhead call for Vincent — not a blocker. Default: keep as one t
   an `INTERNAL_REPOS` const or config); `crates/mika-gateway/CLAUDE.md` (document the allowlist).
 - **Approach:** Define the internal-repo set (`senara-solutions/mika`, `mika-cloud`, `mika-skills`,
   `claude-pilot-py`, and any others). When `repo_full_name` is in the set and not found in
-  `github_repos`, resolve to the same route the single-tenant fallback uses (the mika-server hosting
+  `github_repos`, resolve to the same route the single-tenant fallback uses (the mika-spirit hosting
   the well-known agents) rather than dropping. Keep `route_event` unchanged — it already yields
   mika-dev. **Allowlist is a compiled const** (architect Q2: security-adjacent, changes on release
   cadence not ops cadence; YAGNI on env-tunability — adding a repo is a code change + restart at a

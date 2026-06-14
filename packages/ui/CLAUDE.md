@@ -117,4 +117,4 @@ Every primitive in this library is CI-gated for accessibility via `jest-axe` (ax
 
 - `npm run build --prefix packages/ui` — Build the library
 - `npm test --prefix packages/ui` — Run tests (includes axe-core a11y assertions)
-- `npm run dev:dashboard` — Dev server (builds ui first, requires mika-server on :8080)
+- `npm run dev:dashboard` — Dev server (builds ui first, requires mika-spirit on :8080)

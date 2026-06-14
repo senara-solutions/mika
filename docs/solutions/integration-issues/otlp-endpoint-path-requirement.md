@@ -5,7 +5,7 @@ category: "integration-issues"
 tags: [opentelemetry, otlp, langfuse, jaeger, rust, tracing, configuration]
 severity: "medium"
 component: "mika-common/telemetry"
-affects: ["mika-cli", "mika-server", "mika-common"]
+affects: ["mika-cli", "mika-spirit", "mika-common"]
 status: "resolved"
 ---
 

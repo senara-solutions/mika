@@ -195,7 +195,7 @@ cargo fmt --check
 
 mika#788's pre-fix trace `03d3ec38-0839-47b6-9226-111b38d8b52b` is the fingerprint. After deploy:
 
-1. Restart mika-server.
+1. Restart mika-spirit.
 2. Run a mika-arch second-review CLI ask that historically triggered the verdict ghost (multi-section response with cognitive load on `current_priorities`).
 3. Inspect the resulting session in `~/.mika/data/mika.db`:
    ```sql

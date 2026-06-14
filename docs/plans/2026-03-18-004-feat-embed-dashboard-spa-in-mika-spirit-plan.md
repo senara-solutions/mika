@@ -1,22 +1,22 @@
 ---
-title: "feat: Embed dashboard SPA in mika-server binary"
+title: "feat: Embed dashboard SPA in mika-spirit binary"
 type: feat
 status: active
 date: 2026-03-18
 issue: https://github.com/senara-solutions/mika/issues/198
 ---
 
-# Embed Dashboard SPA in mika-server Binary
+# Embed Dashboard SPA in mika-spirit Binary
 
 ## Overview
 
-Serve the pre-built React dashboard SPA directly from the mika-server binary using `rust-embed`, eliminating the need for a separate web server or reverse proxy in production. The dashboard is embedded under `/dashboard/*` and controlled by `MIKA_DASHBOARD_ENABLED` env var (default `false`). When disabled, `/dashboard` returns a minimal branded HTML page explaining how to enable it.
+Serve the pre-built React dashboard SPA directly from the mika-spirit binary using `rust-embed`, eliminating the need for a separate web server or reverse proxy in production. The dashboard is embedded under `/dashboard/*` and controlled by `MIKA_DASHBOARD_ENABLED` env var (default `false`). When disabled, `/dashboard` returns a minimal branded HTML page explaining how to enable it.
 
 Additionally, provide CLI and TUI controls for starting, stopping, and checking the dashboard dev server — making the dashboard a first-class citizen of the Mika developer experience.
 
 ## Problem Statement / Motivation
 
-Currently the React observability dashboard runs as a separate Vite dev server (`:5173`) proxied to mika-server. This requires:
+Currently the React observability dashboard runs as a separate Vite dev server (`:5173`) proxied to mika-spirit. This requires:
 - A separate web server or reverse proxy in production
 - Manual process management for the dev server
 - No visibility into dashboard status from the TUI

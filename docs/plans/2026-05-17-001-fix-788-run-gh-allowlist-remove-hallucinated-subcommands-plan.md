@@ -215,7 +215,7 @@ Estimated diff: ~50 lines Rust (2 const edits + audit event + helper + 4 test bo
 
 **Behavioral verification (post-deploy on mika-dev's container):** Send `mika ask --agent mika-dev "run_gh api /repos/senara-solutions/mika --method GET"` → returns the repo JSON. Send `mika ask --agent mika-dev "run_gh milestone list --repo senara-solutions/mika"` → returns the "subcommand 'milestone' is not allowed" structured error. Both via the standard tool path, not via shell.
 
-**Audit-event verification (post-deploy):** After the GET call above, grep the server log for the new event: `grep gh_api_invocation $MIKA_SERVER_LOG_FILE | jq 'select(.method == "GET")'` should return one row with `path = "/repos/senara-solutions/mika"`.
+**Audit-event verification (post-deploy):** After the GET call above, grep the server log for the new event: `grep gh_api_invocation $MIKA_SPIRIT_LOG_FILE | jq 'select(.method == "GET")'` should return one row with `path = "/repos/senara-solutions/mika"`.
 
 **Smoke verification of mika#15 unblock (the original repro):** After deploy, dispatch a milestone-close work item to mika-dev (or run inline via `mika ask`): the agent should call `run_gh ["api", "/repos/senara-solutions/mika/milestones/15", "--method", "PATCH", "-f", "state=closed"]` and the milestone should transition to `closed` state. Verify via `gh issue list --milestone 15 --state closed --repo senara-solutions/mika` (operator-side, outside the agent).
 
