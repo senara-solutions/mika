@@ -226,6 +226,20 @@ This section codifies the recursive-self-review carve-out established in `docs/s
 
 ---
 
+## 8. GROOMED contract — what the verdict guarantees
+
+When mika-arch's second-pass returns `Verdict: GROOMED`, the plan is guaranteed:
+
+1. **Implementable as-written** — no TBDs, no "pick one" choices, no `<version>` or `<path>` placeholders. Every load-bearing design decision is committed in the plan text.
+2. **No load-bearing decisions deferred to the implementer** — the architect ruled on or escalated everything material. The implementer should never need to surface a clarifying question about a design choice.
+3. **Architecturally sound** per Single Responsibility / DRY / YAGNI / KISS / Orthogonality (§1–§5 of this guide).
+
+The implementer can `/ce:work` the plan headlessly without surfacing clarifying questions. If they discover an ambiguity at execution time that grooming couldn't have anticipated, that's an orthogonal operator-question-relay concern — not a grooming failure.
+
+**Enforcement:** The Unresolved-Decision Gate in `mika-arch-groom-ticket` (first pass) and `mika-arch-second-review` (second pass) system prompts explicitly reject plans with unresolved decisions. Calibration fixtures at `tests/eval/calibration_fixtures/mika-arch/groomed_with_tbd_rejected.md` and `groomed_with_placeholder_path_rejected.md` structurally bind this rule — CI fails if the architect produces READY/GROOMED on a TBD-containing plan.
+
+---
+
 ## Maintenance
 
 Updates land via normal PR. When a new principle is established (e.g., a compound doc codifies a recurring pattern), add it with a citation and a real-codebase example. When a section's example goes stale, update the citation rather than removing the section. `mika-arch`'s skill prompts reference this guide by path; do not move it without updating those prompts.
