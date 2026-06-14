@@ -587,12 +587,59 @@ fn update_autocomplete_for_input(app: &mut App<'_>) {
 
 /// Key handling when autocomplete is NOT visible (normal mode).
 fn handle_key_normal(app: &mut App<'_>, key: KeyEvent) {
-    // Ctrl+A: select all input text
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+    // Ctrl+A / Cmd+A: select all input text (mika#96 — SUPER peer for Mac Cmd)
+    if (key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER))
+        && key.code == KeyCode::Char('a')
+    {
         if !app.textarea.is_empty() {
             app.textarea.select_all();
             app.needs_redraw = true;
         }
+        return;
+    }
+
+    // Alt+Backspace / Ctrl+W: delete previous word (mika#96 — Mac + POSIX standards)
+    if (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Backspace)
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w'))
+    {
+        app.textarea.delete_word();
+        app.needs_redraw = true;
+        return;
+    }
+
+    // Alt+Left: jump cursor one word back (mika#96)
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Left {
+        app.textarea.move_cursor(CursorMove::WordBack);
+        app.needs_redraw = true;
+        return;
+    }
+
+    // Alt+Right: jump cursor one word forward (mika#96)
+    if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Right {
+        app.textarea.move_cursor(CursorMove::WordForward);
+        app.needs_redraw = true;
+        return;
+    }
+
+    // Cmd+Left: jump cursor to start of line (mika#96)
+    if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Left {
+        app.textarea.move_cursor(CursorMove::Head);
+        app.needs_redraw = true;
+        return;
+    }
+
+    // Cmd+Right: jump cursor to end of line (mika#96)
+    if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Right {
+        app.textarea.move_cursor(CursorMove::End);
+        app.needs_redraw = true;
+        return;
+    }
+
+    // Cmd+Backspace: delete from cursor to start of line (mika#96)
+    if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Backspace {
+        app.textarea.delete_line_by_head();
+        app.needs_redraw = true;
         return;
     }
 
@@ -1371,5 +1418,84 @@ mod tests {
         assert_eq!(find_current_arg_start("/model sonnet"), 7);
         assert_eq!(find_current_arg_start("/config set key"), 12);
         assert_eq!(find_current_arg_start("/model "), 7);
+    }
+
+    // Helper: synthesize a KeyEvent for mika#96 Mac shortcut tests.
+    fn mac_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alt_backspace_deletes_previous_word() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.textarea.insert_str("hello world");
+        handle_key_normal(&mut app, mac_key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.textarea.lines(), &["hello "]);
+    }
+
+    #[tokio::test]
+    async fn test_ctrl_w_deletes_previous_word() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.textarea.insert_str("hello world");
+        handle_key_normal(&mut app, mac_key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.textarea.lines(), &["hello "]);
+    }
+
+    #[tokio::test]
+    async fn test_alt_left_jumps_one_word_back() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.textarea.insert_str("foo bar baz");
+        // Cursor is at end (col 11). Alt+Left should jump to start of "baz" (col 8).
+        handle_key_normal(&mut app, mac_key(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(app.textarea.cursor(), (0, 8));
+    }
+
+    #[tokio::test]
+    async fn test_alt_right_jumps_one_word_forward() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.textarea.insert_str("foo bar baz");
+        app.textarea.move_cursor(CursorMove::Head);
+        // Cursor at start. Alt+Right should jump to start of "bar" (col 4).
+        handle_key_normal(&mut app, mac_key(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(app.textarea.cursor(), (0, 4));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_left_jumps_to_line_start() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.textarea.insert_str("hello world");
+        handle_key_normal(&mut app, mac_key(KeyCode::Left, KeyModifiers::SUPER));
+        assert_eq!(app.textarea.cursor(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_right_jumps_to_line_end() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.textarea.insert_str("hello world");
+        app.textarea.move_cursor(CursorMove::Head);
+        handle_key_normal(&mut app, mac_key(KeyCode::Right, KeyModifiers::SUPER));
+        assert_eq!(app.textarea.cursor(), (0, 11));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_backspace_deletes_to_line_start() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.textarea.insert_str("hello world");
+        handle_key_normal(&mut app, mac_key(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(app.textarea.lines(), &[""]);
+    }
+
+    #[tokio::test]
+    async fn test_cmd_a_selects_all() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.textarea.insert_str("hello world");
+        handle_key_normal(&mut app, mac_key(KeyCode::Char('a'), KeyModifiers::SUPER));
+        // tui_textarea's select_all stores selection_start at (0,0) and moves cursor to end.
+        assert!(app.textarea.selection_range().is_some());
     }
 }
