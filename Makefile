@@ -83,7 +83,7 @@ calibrate-mika-dev: ## Pre-swap calibration gate for mika-dev (MODEL=provider/mo
 	cargo run --bin calibrate --release -- --role mika-dev --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
 
 calibrate-mika-arch: ## Pre-swap calibration gate for mika-arch (MODEL=provider/model required)
-	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-arch MODEL=anthropic/claude-opus-4-6" >&2; exit 1; fi
+	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-arch MODEL=anthropic/claude-sonnet-4-6" >&2; exit 1; fi
 	cargo run --bin calibrate --release -- --role mika-arch --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
 
 test: ## Run all tests

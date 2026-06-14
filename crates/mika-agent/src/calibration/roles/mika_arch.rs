@@ -13,6 +13,7 @@ use mika_common::llm::LlmProvider;
 
 use crate::calibration::failure::FailureClass;
 use crate::calibration::role::{RoleScenario, RoleScenarioResult};
+use crate::calibration::roles::llm_error_result;
 
 /// Static scenario definitions for the mika-arch role.
 pub const SCENARIOS: &[RoleScenario] = &[
@@ -175,17 +176,7 @@ async fn run_groom_ticket_basic(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "groom_ticket_basic",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result("groom_ticket_basic", e, start.elapsed().as_millis() as u64),
     }
 }
 
@@ -250,17 +241,7 @@ async fn run_groom_milestone(provider: Arc<dyn LlmProvider>, start: Instant) -> 
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "groom_milestone",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result("groom_milestone", e, start.elapsed().as_millis() as u64),
     }
 }
 
@@ -333,17 +314,7 @@ async fn run_citation_discipline(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "citation_discipline",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result("citation_discipline", e, start.elapsed().as_millis() as u64),
     }
 }
 
@@ -414,17 +385,11 @@ async fn run_disposition_keyword(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "disposition_keyword_discipline",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result(
+            "disposition_keyword_discipline",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
     }
 }
 
@@ -501,17 +466,11 @@ async fn run_required_finding_list(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "required_finding_list",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result(
+            "required_finding_list",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
     }
 }
 
@@ -589,17 +548,11 @@ async fn run_groomed_no_tbds_passes(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "groomed_no_tbds_passes",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result(
+            "groomed_no_tbds_passes",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
     }
 }
 
@@ -709,17 +662,11 @@ async fn run_groomed_with_tbd_rejected(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "groomed_with_tbd_rejected",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result(
+            "groomed_with_tbd_rejected",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
     }
 }
 
@@ -830,17 +777,11 @@ async fn run_groomed_with_placeholder_path_rejected(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "groomed_with_placeholder_path_rejected",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result(
+            "groomed_with_placeholder_path_rejected",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
     }
 }
 

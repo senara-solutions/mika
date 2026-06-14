@@ -6,14 +6,22 @@
 
 ## Root Cause Analysis
 
-The ticket asserts that the `calibrate` binary "doesn't share the OAuth path" that `mika-server` uses. This is **partially incorrect** — the binary already goes through the full OAuth-aware chain:
+The ticket asserts that the `calibrate` binary "doesn't share the OAuth path" that `mika-server` uses. This is **incorrect** — source-level verification confirms the binary goes through the full OAuth-aware chain:
 
 ```
 create_provider_from_spec() → create_provider() → AnthropicProvider::new()
   → ClaudeClient::new() → is_oauth_token("sk-ant-oat...") → OAuthManaged(manager)
 ```
 
-`ClaudeClient::new()` at `crates/mika-common/src/claude.rs:372` correctly detects `sk-ant-oat*` prefixes and creates `AnthropicAuth::OAuthManaged(Arc<OAuthTokenManager>)`. The `send_once()` method at `claude.rs:679-685` then routes OAuth tokens to `Authorization: Bearer` (not `x-api-key`). **The provider construction chain IS shared.**
+**Source-level verification (addressing F1):**
+- `crates/mika-agent/src/calibration/providers.rs:115` — `create_provider_from_spec()` calls `create_provider(&spec, ...)` from `mika_common::llm`
+- `crates/mika-common/src/llm/mod.rs:400-409` — `create_provider()` matches `ProviderKind::Anthropic` and calls `AnthropicProvider::new(spec.api_key.clone(), ...)`
+- `crates/mika-common/src/llm/anthropic.rs:29` — `AnthropicProvider::new()` calls `ClaudeClient::new(api_key, ...)`
+- `crates/mika-common/src/claude.rs:372` — `ClaudeClient::new()` checks `is_oauth_token(&credential)` and creates `AnthropicAuth::OAuthManaged` for `sk-ant-oat*` prefixes
+
+The issue body's curl probe (showing `x-api-key` rejection) likely reflects a direct API call outside the provider chain, or a version predating the OAuth detection. The calibrate binary's `create_provider_from_spec()` does NOT bypass the OAuth path — it uses the identical `create_provider()` factory that `mika-server` uses.
+
+**Why 5/5 failures still occur:** The OAuth path IS invoked, but `OAuthTokenManager::get_valid_token()` fails silently when `~/.mika/oauth.json` is absent, expired, or has a hash mismatch from subscription token rotation. The error is then misclassified as `TransportError` (see Layer 1 below), hiding the real cause.
 
 The real failures are in **two layers**:
 
@@ -43,7 +51,9 @@ The `calibrate-mika-arch` target in the Makefile references `anthropic/claude-op
 
 **File:** `crates/mika-agent/src/bin/calibrate.rs`
 
-Before the scenario loop, add an explicit `provider.check_health().await` call. For Anthropic OAuth, this exercises the full `get_valid_token()` → `send_once()` path with a minimal request (`max_tokens: 1, "hi"`). On failure, emit a clear diagnostic:
+Before the scenario loop, add an explicit `provider.check_health().await` call. **`check_health()` is verified to exist on the `LlmProvider` trait** (`crates/mika-common/src/llm/mod.rs:192`) with implementations for Anthropic (`crates/mika-common/src/llm/anthropic.rs:93`), OpenAI (`crates/mika-common/src/llm/openai.rs:436`), Ollama (`crates/mika-common/src/llm/ollama.rs:683`), and Mock (`crates/mika-common/src/llm/mock.rs:184`). No new trait method is needed (addressing F2, per review-guide.md § KISS — use the simplest mechanism that exists).
+
+For Anthropic OAuth, the existing `check_health()` sends a minimal request (`max_tokens: 1, "hi"`) which exercises the full `get_valid_token()` → `send_once()` path. On failure, emit a clear diagnostic:
 
 ```rust
 // Pre-flight: verify provider can authenticate
@@ -164,10 +174,15 @@ fn test_classify_auth_failed() {
 
 **File:** `crates/mika-agent/src/calibration/providers.rs` (test module)
 
-Add a test verifying that `create_provider_from_spec("anthropic/claude-sonnet-4-6")` produces a provider that, when `MIKA_ANTHROPIC_API_KEY` is an `sk-ant-oat*` token, goes through the OAuth path. This is a structural test — it doesn't make API calls, just verifies the provider is constructed without error:
+Add a test verifying that `create_provider_from_spec("anthropic/claude-sonnet-4-6")` produces a provider that, when `MIKA_ANTHROPIC_API_KEY` is an `sk-ant-oat*` token, goes through the OAuth path. This is a structural test — it doesn't make API calls, just verifies the provider is constructed without error.
+
+**Thread-safety (addressing F3):** Use `#[serial]` from the `serial_test` crate (already a dev-dependency of `mika-agent`, per `Cargo.toml:73`) to prevent data races on `std::env::set_var`. This follows the existing codebase convention — `serial_test::serial` is already used in `crates/mika-common/src/config.rs`, `crates/mika-common/src/dotenv.rs`, `crates/mika-common/src/telemetry.rs`, `crates/mika-common/src/llm/ollama.rs`, and `crates/mika-agent/tests/kg_docs_root_resolution.rs` (per review-guide.md § DRY — follow existing codebase conventions for env-var tests):
 
 ```rust
+use serial_test::serial;
+
 #[test]
+#[serial]
 fn test_oauth_token_creates_provider() {
     // Set an OAuth-prefix key for this test only
     unsafe { std::env::set_var("MIKA_ANTHROPIC_API_KEY", "sk-ant-oat01-test-token-dummy") };
@@ -193,7 +208,7 @@ fn test_oauth_token_creates_provider() {
 
 - **AC1/AC2 (calibrate succeeds with OAuth):** The pre-flight check validates the OAuth flow upfront and gives actionable errors when it fails. The underlying `ClaudeClient::new()` OAuth detection already works — this fix ensures the operator knows when the OAuth state needs repair.
 - **AC3 (non-OAuth keys unaffected):** No changes to `ClaudeClient::new()` or `AnthropicProvider::new()`. Pre-flight `check_health()` exercises the same path for both auth types.
-- **AC4 (non-Anthropic providers unaffected):** Pre-flight `check_health()` is provider-generic (defined on `LlmProvider` trait). The OAuth-specific diagnostic is string-gated on error content.
+- **AC4 (non-Anthropic providers unaffected):** Pre-flight `check_health()` is provider-generic (defined on `LlmProvider` trait at `crates/mika-common/src/llm/mod.rs:192`, implemented by all 4 provider types). The OAuth-specific diagnostic is string-gated on error content.
 - **AC5 (Makefile model example):** Step 4 fixes the stale example.
 - **AC6 (regression test):** Steps 5 and 6 cover the `sk-ant-oat*` detection + `AuthenticationError` classification.
 
@@ -202,3 +217,7 @@ fn test_oauth_token_creates_provider() {
 - Changes to `ClaudeClient::new()`, `OAuthTokenManager`, or the OAuth PKCE flow (already working correctly)
 - Changes to `create_provider()` or `AnthropicProvider::new()` (already correctly routing OAuth tokens)
 - New providers, new calibration roles, or calibration CI (#742)
+
+## Revision history
+
+- rev 2 (2026-06-14): addressed F1 by adding source-level verification of the full provider chain (`providers.rs:115` → `mod.rs:400` → `anthropic.rs:29` → `claude.rs:372`) confirming the plan's root cause analysis is correct and the OAuth path IS shared — the issue body's curl evidence likely reflects a code path outside the provider chain or an older version, and the real bug is error misclassification + missing pre-flight validation; addressed F2 by verifying `check_health()` exists on the `LlmProvider` trait (`mod.rs:192`) with implementations for Anthropic (`anthropic.rs:93`), OpenAI, Ollama, and Mock — no new trait method or scope increase needed (per review-guide.md § KISS); addressed F3 by replacing bare `unsafe { std::env::set_var }` in Step 6 with `#[serial]` from `serial_test` crate (already a dev-dependency), following the existing codebase convention used in 5+ test modules (per review-guide.md § DRY).
