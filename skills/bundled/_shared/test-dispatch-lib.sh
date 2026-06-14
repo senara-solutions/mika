@@ -2042,6 +2042,96 @@ assert_contains "Doc comment cites sibling mika#1414" 'mika#1414' "$DOC_COMMENT"
 assert_contains "Doc comment cites sibling mika#1364" 'mika#1364' "$DOC_COMMENT"
 assert_contains "Doc comment mentions worktree_setup_failed:" 'worktree_setup_failed:' "$DOC_COMMENT"
 
+# --- Test: _label_to_type mapping (mika#1515) ---
+
+echo ""
+echo "Test: _label_to_type mapping (mika#1515)"
+echo "------------------------------------------"
+
+assert_eq "_label_to_type enhancement" "feat" "$(_label_to_type "enhancement")"
+assert_eq "_label_to_type feature" "feat" "$(_label_to_type "feature")"
+assert_eq "_label_to_type bug" "fix" "$(_label_to_type "bug")"
+assert_eq "_label_to_type infrastructure" "chore" "$(_label_to_type "infrastructure")"
+assert_eq "_label_to_type documentation" "docs" "$(_label_to_type "documentation")"
+assert_eq "_label_to_type refactor" "refactor" "$(_label_to_type "refactor")"
+assert_eq "_label_to_type test" "test" "$(_label_to_type "test")"
+assert_eq "_label_to_type unknown label defaults to chore" "chore" "$(_label_to_type "priority:high")"
+assert_eq "_label_to_type empty string defaults to chore" "chore" "$(_label_to_type "")"
+assert_eq "_label_to_type comma-separated with enhancement" "feat" "$(_label_to_type "priority:high,enhancement")"
+assert_eq "_label_to_type comma-separated with bug" "fix" "$(_label_to_type "component:agent,bug,ready")"
+
+# --- Test: _derive_recovery_pr_title (mika#1515) ---
+
+echo ""
+echo "Test: _derive_recovery_pr_title (mika#1515)"
+echo "----------------------------------------------"
+
+# Set up a temporary git repo for commit-pushed-no-pr tests
+_TEST_REPO_DIR=$(mktemp -d)
+git -C "$_TEST_REPO_DIR" init -q 2>/dev/null
+git -C "$_TEST_REPO_DIR" config user.email "test@test.com"
+git -C "$_TEST_REPO_DIR" config user.name "Test"
+echo "content" > "$_TEST_REPO_DIR/file.txt"
+git -C "$_TEST_REPO_DIR" add file.txt
+git -C "$_TEST_REPO_DIR" commit -q -m "feat(agent): add dispatch recovery (mika#1515)" 2>/dev/null
+
+# commit-pushed-no-pr: should return the commit subject
+assert_eq "commit-pushed-no-pr returns commit subject" \
+    "feat(agent): add dispatch recovery (mika#1515)" \
+    "$(_derive_recovery_pr_title "commit-pushed-no-pr" "$_TEST_REPO_DIR" "mika" "1515" "enhancement" "Some issue title")"
+
+# dirty-worktree with plan file that has H1
+mkdir -p "$_TEST_REPO_DIR/docs/plans"
+echo '# PR titles on recovery should carry the conventional-commit subject' > "$_TEST_REPO_DIR/docs/plans/2026-06-14-005-1515-dispatch-lib-pr-titles-on-recovery-plan.md"
+
+assert_eq "dirty-worktree with plan H1 constructs conventional title" \
+    "feat: PR titles on recovery should carry the conventional-commit subject (mika#1515)" \
+    "$(_derive_recovery_pr_title "dirty-worktree" "$_TEST_REPO_DIR" "mika" "1515" "enhancement" "Some issue title")"
+
+# dirty-worktree with plan H1 that already has conventional-commit format
+echo '# feat(dispatch-lib): PR titles on recovery' > "$_TEST_REPO_DIR/docs/plans/2026-06-14-005-1515-dispatch-lib-pr-titles-on-recovery-plan.md"
+
+assert_eq "dirty-worktree with conventional-commit H1 passes through" \
+    "feat(dispatch-lib): PR titles on recovery" \
+    "$(_derive_recovery_pr_title "dirty-worktree" "$_TEST_REPO_DIR" "mika" "1515" "enhancement" "Some issue title")"
+
+# dirty-worktree with no plan file → fallback to issue title
+rm -rf "$_TEST_REPO_DIR/docs/plans"
+
+assert_eq "dirty-worktree without plan falls back to issue title" \
+    "feat: Some issue title (mika#1515)" \
+    "$(_derive_recovery_pr_title "dirty-worktree" "$_TEST_REPO_DIR" "mika" "1515" "enhancement" "Some issue title")"
+
+# dirty-worktree with bug label → fix prefix
+assert_eq "dirty-worktree with bug label uses fix prefix" \
+    "fix: Fix broken dispatch (mika#42)" \
+    "$(_derive_recovery_pr_title "dirty-worktree" "$_TEST_REPO_DIR" "mika" "42" "bug" "Fix broken dispatch")"
+
+# issue title already has conventional-commit format → pass through
+assert_eq "issue title with conventional-commit passes through" \
+    "fix(cli): handle edge case" \
+    "$(_derive_recovery_pr_title "dirty-worktree" "$_TEST_REPO_DIR" "mika" "99" "bug" "fix(cli): handle edge case")"
+
+# Cleanup
+rm -rf "$_TEST_REPO_DIR"
+
+# --- Test: Recovery block uses _derive_recovery_pr_title (mika#1515, structural) ---
+
+echo ""
+echo "Test: Recovery block uses _derive_recovery_pr_title (mika#1515, structural)"
+echo "-----------------------------------------------------------------------------"
+
+RECOVERY_BLOCK=$(sed -n '/Recovery classes:/,/RESCUED_PR_URL/p' "$DISPATCH_LIB")
+
+assert_contains "dirty-worktree uses _derive_recovery_pr_title" \
+    '_derive_recovery_pr_title "dirty-worktree"' "$RECOVERY_BLOCK"
+assert_contains "commit-pushed-no-pr uses _derive_recovery_pr_title" \
+    '_derive_recovery_pr_title "commit-pushed-no-pr"' "$RECOVERY_BLOCK"
+assert_not_contains "No hardcoded wip() rescue title" \
+    'rescued impl (dispatch-lib recovery)' "$RECOVERY_BLOCK"
+assert_not_contains "No hardcoded pilot impl rescue title" \
+    'pilot impl (dispatch-lib PR-create recovery' "$RECOVERY_BLOCK"
+
 # --- Summary ---
 
 echo ""
