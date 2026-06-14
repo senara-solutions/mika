@@ -16,6 +16,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub session_id: Option<String>,
 
+    /// Continue the most recent session or team run
+    #[arg(short = 'c', long = "continue")]
+    pub continue_session: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -115,6 +119,35 @@ impl Commands {
         }
     }
 
+    /// Extract `-c`/`--continue` override (available on `chat` and `ask`).
+    pub fn continue_override(&self) -> bool {
+        match self {
+            Commands::Chat(args) => args.continue_session,
+            Commands::Ask(args) => args.continue_session,
+            // Listed explicitly for compile-time safety on new variants.
+            Commands::Setup { .. }
+            | Commands::Memory(_)
+            | Commands::Reminders(_)
+            | Commands::Status(_)
+            | Commands::Config(_)
+            | Commands::Skills(_)
+            | Commands::Mcp(_)
+            | Commands::Tasks(_)
+            | Commands::Agents(_)
+            | Commands::Doctor(_)
+            | Commands::Teams(_)
+            | Commands::Dashboard(_)
+            | Commands::Token(_)
+            | Commands::Provider(_)
+            | Commands::Model(_)
+            | Commands::Webhook(_)
+            | Commands::Kg(_)
+            | Commands::Logs(_)
+            | Commands::Notify(_)
+            | Commands::CredentialHelper(_) => false,
+        }
+    }
+
     /// Extract `--team` override (available on `chat` and `ask`).
     pub fn team_override(&self) -> Option<&str> {
         match self {
@@ -160,12 +193,16 @@ pub struct ChatArgs {
     pub team: Option<String>,
 
     /// Continue from a previous team run (requires --team)
-    #[arg(long, requires = "team", conflicts_with = "last_run")]
+    #[arg(long, requires = "team", conflicts_with_all = ["last_run", "continue_session"])]
     pub run_id: Option<String>,
 
-    /// Use the most recent finished team run as context (requires --team)
-    #[arg(long, requires = "team", conflicts_with = "run_id")]
+    /// Use the most recent finished team run as context (requires --team; deprecated, use -c instead)
+    #[arg(long, requires = "team", conflicts_with_all = ["run_id", "continue_session"])]
     pub last_run: bool,
+
+    /// Continue the most recent session or team run
+    #[arg(short = 'c', long = "continue", conflicts_with_all = ["run_id", "last_run"])]
+    pub continue_session: bool,
 
     /// Launch directly in audit mode (show internal messages, equivalent to typing `/inbox` after launch).
     /// Default off — chat opens in inbox mode (internal messages filtered).
@@ -205,12 +242,16 @@ pub struct AskArgs {
     #[arg(long, conflicts_with = "agent")]
     pub team: Option<String>,
     /// Continue from a previous team run (requires --team)
-    #[arg(long, requires = "team", conflicts_with = "last_run")]
+    #[arg(long, requires = "team", conflicts_with_all = ["last_run", "continue_session"])]
     pub run_id: Option<String>,
 
-    /// Use the most recent finished team run as context (requires --team)
-    #[arg(long, requires = "team", conflicts_with = "run_id")]
+    /// Use the most recent finished team run as context (requires --team; deprecated, use -c instead)
+    #[arg(long, requires = "team", conflicts_with_all = ["run_id", "continue_session"])]
     pub last_run: bool,
+
+    /// Continue the most recent session or team run
+    #[arg(short = 'c', long = "continue", conflicts_with_all = ["run_id", "last_run"])]
+    pub continue_session: bool,
 
     /// Force named skill(s) to be active for this invocation (repeatable).
     /// Mutually exclusive with --disable-skill per skill name.
@@ -1181,5 +1222,53 @@ mod tests {
             }
             _ => panic!("expected Chat command"),
         }
+    }
+
+    #[test]
+    fn chat_continue_short_flag_parses() {
+        let cli = parse_cli(&["mika", "chat", "-c"]);
+        match cli.command {
+            Some(Commands::Chat(args)) => assert!(args.continue_session),
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_continue_long_flag_parses() {
+        let cli = parse_cli(&["mika", "chat", "--continue"]);
+        match cli.command {
+            Some(Commands::Chat(args)) => assert!(args.continue_session),
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_continue_conflicts_with_run_id() {
+        let result =
+            Cli::try_parse_from(["mika", "chat", "-c", "--run-id", "abc", "--team", "dev"]);
+        assert!(result.is_err(), "-c and --run-id should conflict");
+    }
+
+    #[test]
+    fn ask_continue_parses() {
+        let cli = parse_cli(&["mika", "ask", "-c", "hello"]);
+        match cli.command {
+            Some(Commands::Ask(args)) => assert!(args.continue_session),
+            _ => panic!("expected Ask command"),
+        }
+    }
+
+    #[test]
+    fn ask_continue_conflicts_with_last_run() {
+        let result =
+            Cli::try_parse_from(["mika", "ask", "-c", "--last-run", "--team", "dev", "hello"]);
+        assert!(result.is_err(), "-c and --last-run should conflict");
+    }
+
+    #[test]
+    fn top_level_continue_parses() {
+        let cli = parse_cli(&["mika", "-c"]);
+        assert!(cli.continue_session);
+        assert!(cli.command.is_none());
     }
 }

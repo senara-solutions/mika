@@ -63,6 +63,10 @@ async fn main() -> Result<()> {
         .and_then(|c| c.team_override())
         .or(cli.team.as_deref());
 
+    // Merge top-level and subcommand-level -c/--continue flag.
+    let continue_session =
+        cli.continue_session || cli.command.as_ref().is_some_and(|c| c.continue_override());
+
     if let Some(team_name) = team_override {
         let team_name = team::normalize_team_name(team_name);
         team::validate_team_name(&team_name)?;
@@ -84,7 +88,11 @@ async fn main() -> Result<()> {
                     _ => (None, false, false),
                 };
 
-                let run_id = if last_run {
+                if last_run {
+                    eprintln!("Warning: --last-run is deprecated; use -c instead.");
+                }
+
+                let run_id = if last_run || continue_session {
                     Some(resolve_last_run(&global_home, &team_name)?)
                 } else {
                     explicit_run_id.map(String::from)
@@ -111,7 +119,11 @@ async fn main() -> Result<()> {
             }
             // `mika ask --team`
             Some(Commands::Ask(ref args)) => {
-                let run_id = if args.last_run {
+                if args.last_run {
+                    eprintln!("Warning: --last-run is deprecated; use -c instead.");
+                }
+
+                let run_id = if args.last_run || continue_session {
                     Some(resolve_last_run(&global_home, &team_name)?)
                 } else {
                     args.run_id.clone()
@@ -226,6 +238,33 @@ async fn main() -> Result<()> {
         log_llm_bodies,
     );
 
+    // Validate -c/--continue conflicts with --session-id (can't use clap conflicts_with
+    // across global and subcommand args).
+    if continue_session && cli.session_id.is_some() {
+        anyhow::bail!(
+            "The argument '-c' cannot be used with '--session-id'. \
+             Use -c to resume the last session, or --session-id to target a specific session."
+        );
+    }
+
+    // Resolve -c/--continue to a session ID for solo-mode (non-team) commands.
+    let continue_session_id = if continue_session && team_override.is_none() {
+        let home_dir = home::resolve_home_dir()?;
+        let db = commands::teams::open_container_db(&home_dir)?;
+        match db.get_last_cli_session_for_agent(&agent_name)? {
+            Some(session) => Some(session.id),
+            None => anyhow::bail!(
+                "No previous session found for agent '{agent_name}'. \
+                 Start a chat first before using -c."
+            ),
+        }
+    } else {
+        None
+    };
+
+    // Effective session ID: explicit --session-id > -c resolved > None
+    let effective_session_id = cli.session_id.as_deref().or(continue_session_id.as_deref());
+
     match cli.command {
         // Bare `mika` with no subcommand: auto-setup if needed, then chat
         None => {
@@ -233,12 +272,12 @@ async fn main() -> Result<()> {
             if !home::is_initialized(&home_dir) {
                 commands::setup::run(&agent_name, cli::SetupMode::Cli, None).await?;
             }
-            commands::chat::run(&agent_name, cli.session_id.as_deref(), None, false).await
+            commands::chat::run(&agent_name, effective_session_id, None, false).await
         }
         Some(Commands::Chat(ref args)) => {
             commands::chat::run(
                 &agent_name,
-                cli.session_id.as_deref(),
+                effective_session_id,
                 args.model.as_deref(),
                 args.inbox,
             )
@@ -286,7 +325,7 @@ async fn main() -> Result<()> {
                 &agent_name,
                 args.task_id.as_deref(),
                 args.task_complete,
-                cli.session_id.as_deref(),
+                effective_session_id,
                 args.parent_task_id.as_deref(),
                 &args.format,
                 args.model.as_deref(),

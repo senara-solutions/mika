@@ -1873,6 +1873,13 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_session(&sid)).await
     }
 
+    /// Get the most recent ended CLI session for an agent.
+    pub async fn get_last_cli_session_for_agent(&self, agent_id: &str) -> Result<Option<Session>> {
+        let aid = agent_id.to_owned();
+        self.with_db(move |db| db.get_last_cli_session_for_agent(&aid))
+            .await
+    }
+
     /// Get all sessions linked to a task tree (root task + direct children).
     pub async fn get_sessions_for_task_tree(
         &self,

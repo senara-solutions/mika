@@ -9301,6 +9301,43 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Get the most recent ended CLI session for an agent.
+    ///
+    /// Scoped to `channel_type = 'cli'`, excludes system sessions (`system-*`),
+    /// delegate sessions (`delegate-*`), child sessions (non-NULL `parent_session_id`),
+    /// and active sessions (`ended_at IS NULL`). Returns the most recently started
+    /// ended session, or `None` if no matching session exists.
+    pub fn get_last_cli_session_for_agent(&self, agent_id: &str) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                "SELECT id, agent_id, channel_type, started_at, ended_at, metadata, parent_session_id, task_id
+                 FROM sessions
+                 WHERE agent_id = ?1
+                   AND channel_type = 'cli'
+                   AND ended_at IS NOT NULL
+                   AND id NOT LIKE 'system-%'
+                   AND id NOT LIKE 'delegate-%'
+                   AND parent_session_id IS NULL
+                 ORDER BY started_at DESC
+                 LIMIT 1",
+                params![agent_id],
+                |r| {
+                    Ok(Session {
+                        id: r.get(0)?,
+                        agent_id: r.get(1)?,
+                        channel_type: r.get(2)?,
+                        started_at: r.get(3)?,
+                        ended_at: r.get(4)?,
+                        metadata: r.get(5)?,
+                        parent_session_id: r.get(6)?,
+                        task_id: r.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Load messages for a session with pagination.
     pub fn load_session_messages_paginated(
         &self,
@@ -18480,5 +18517,90 @@ mod tests {
         // Manual task is still pending.
         let mt = db.get_task(&manual_id, "agent-b").unwrap().unwrap();
         assert_eq!(mt.status, "pending");
+    }
+
+    #[test]
+    fn test_get_last_cli_session_returns_none_when_empty() {
+        let db = db();
+        let result = db.get_last_cli_session_for_agent("mika").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_last_cli_session_returns_most_recent_ended() {
+        let db = db();
+        // Create two ended CLI sessions with distinct started_at timestamps
+        db.create_session("s1", "mika", "cli").unwrap();
+        db.end_session("s1").unwrap();
+        // Manually set s1 to an earlier timestamp to ensure deterministic ordering
+        db.conn
+            .execute(
+                "UPDATE sessions SET started_at = '2026-01-01T00:00:00Z' WHERE id = 's1'",
+                [],
+            )
+            .unwrap();
+        db.create_session("s2", "mika", "cli").unwrap();
+        db.end_session("s2").unwrap();
+
+        let result = db.get_last_cli_session_for_agent("mika").unwrap().unwrap();
+        assert_eq!(result.id, "s2");
+    }
+
+    #[test]
+    fn test_get_last_cli_session_excludes_non_cli_channels() {
+        let db = db();
+        db.create_session("tg1", "mika", "telegram").unwrap();
+        db.end_session("tg1").unwrap();
+        db.create_session("wh1", "mika", "webhook").unwrap();
+        db.end_session("wh1").unwrap();
+
+        let result = db.get_last_cli_session_for_agent("mika").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_last_cli_session_excludes_system_sessions() {
+        let db = db();
+        db.create_session("system-mika", "mika", "cli").unwrap();
+        db.end_session("system-mika").unwrap();
+
+        let result = db.get_last_cli_session_for_agent("mika").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_last_cli_session_excludes_delegate_sessions() {
+        let db = db();
+        db.create_session("delegate-abc", "mika", "cli").unwrap();
+        db.end_session("delegate-abc").unwrap();
+
+        let result = db.get_last_cli_session_for_agent("mika").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_last_cli_session_excludes_child_sessions() {
+        let db = db();
+        // Parent session
+        db.create_session("parent", "mika", "cli").unwrap();
+        db.end_session("parent").unwrap();
+        // Child session with parent_session_id set
+        db.create_session_with_parent("child", "mika", "cli", None, Some("parent"), None)
+            .unwrap();
+        db.end_session("child").unwrap();
+
+        let result = db.get_last_cli_session_for_agent("mika").unwrap().unwrap();
+        // Only the parent (no parent_session_id) is returned
+        assert_eq!(result.id, "parent");
+    }
+
+    #[test]
+    fn test_get_last_cli_session_excludes_active_sessions() {
+        let db = db();
+        // Active session (ended_at IS NULL)
+        db.create_session("active", "mika", "cli").unwrap();
+
+        let result = db.get_last_cli_session_for_agent("mika").unwrap();
+        assert!(result.is_none());
     }
 }
