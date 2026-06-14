@@ -237,7 +237,7 @@ fn run_server_prompts(
     }
 
     // MIKA_SPIRIT_PORT (optional, default 8080) — non-secret, goes to config.toml
-    if !config_key_is_set(home_dir, "server_port") {
+    if !config_key_is_set(home_dir, "spirit_port") {
         let port: String = Input::new()
             .with_prompt("  Server port (default: 8080)")
             .default("8080".to_string())
@@ -249,7 +249,7 @@ fn run_server_prompts(
                 .map_err(|_| anyhow::anyhow!("Invalid port number: {port}"))?;
             set_config_toml_value(
                 home_dir,
-                "server_port",
+                "spirit_port",
                 toml::Value::Integer(i64::from(port_num)),
             )?;
             *config_written = true;

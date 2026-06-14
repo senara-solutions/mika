@@ -1275,7 +1275,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
     let app = build_router(state.clone());
 
-    let port = settings.server_port;
+    let port = settings.spirit_port;
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     info!(port, "mika-spirit listening");
 

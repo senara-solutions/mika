@@ -976,7 +976,7 @@ impl<'a> App<'a> {
                         Ok(token) => {
                             let url = format!(
                                 "{}/api/v1/dashboard/{endpoint}",
-                                crate::commands::dashboard::server_url()
+                                crate::commands::dashboard::spirit_url()
                             );
                             let client = reqwest::Client::new();
                             match client

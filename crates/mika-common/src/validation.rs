@@ -119,7 +119,7 @@ pub fn validate_file_key(key: &str, value: &str) -> Result<(), String> {
                 ));
             }
         }
-        "server_port" => {
+        "spirit_port" => {
             let n: u16 = value
                 .parse()
                 .map_err(|_| format!("Invalid {key}: must be an integer 1-65535"))?;
@@ -257,12 +257,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_file_key_server_port() {
-        assert!(validate_file_key("server_port", "8080").is_ok());
-        assert!(validate_file_key("server_port", "1").is_ok());
-        assert!(validate_file_key("server_port", "65535").is_ok());
-        assert!(validate_file_key("server_port", "0").is_err());
-        assert!(validate_file_key("server_port", "99999").is_err());
+    fn test_validate_file_key_spirit_port() {
+        assert!(validate_file_key("spirit_port", "8080").is_ok());
+        assert!(validate_file_key("spirit_port", "1").is_ok());
+        assert!(validate_file_key("spirit_port", "65535").is_ok());
+        assert!(validate_file_key("spirit_port", "0").is_err());
+        assert!(validate_file_key("spirit_port", "99999").is_err());
     }
 
     #[test]

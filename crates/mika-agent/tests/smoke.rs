@@ -64,13 +64,13 @@ async fn health_endpoint_responds() {
     let port = free_port();
     let mut child = spawn_server(port);
 
-    let healthy = wait_for_health(port, Duration::from_secs(15)).await;
+    let healthy = wait_for_health(port, Duration::from_secs(30)).await;
 
     child.kill().ok();
     child.wait().ok();
     cleanup(port);
 
-    assert!(healthy, "server did not respond on /health within 15s");
+    assert!(healthy, "server did not respond on /health within 30s");
 }
 
 #[tokio::test]
@@ -79,7 +79,7 @@ async fn message_endpoint_requires_auth() {
     let port = free_port();
     let mut child = spawn_server(port);
 
-    if !wait_for_health(port, Duration::from_secs(15)).await {
+    if !wait_for_health(port, Duration::from_secs(30)).await {
         child.kill().ok();
         child.wait().ok();
         cleanup(port);

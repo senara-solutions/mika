@@ -15,7 +15,7 @@ pub async fn run(command: DashboardCommand) -> Result<()> {
 }
 
 /// Resolve the mika-spirit base URL from env or default.
-pub fn server_url() -> String {
+pub fn spirit_url() -> String {
     if let Ok(url) = std::env::var("MIKA_SPIRIT_URL") {
         return url;
     }
@@ -44,7 +44,7 @@ pub fn auth_token() -> Result<String> {
 /// Query the dashboard status from mika-spirit.
 /// Returns `Some((enabled, has_assets, has_token))` if reachable, `None` otherwise.
 pub async fn query_dashboard_status() -> Option<(bool, bool, bool)> {
-    let url = format!("{}/api/v1/dashboard/status", server_url());
+    let url = format!("{}/api/v1/dashboard/status", spirit_url());
     let token = auth_token().ok()?;
     let client = reqwest::Client::new();
     let resp = client
@@ -71,7 +71,7 @@ pub async fn is_dashboard_running() -> bool {
 
 /// Open the dashboard URL in the default browser. Returns a status message.
 pub fn open_dashboard_in_browser() -> String {
-    let url = format!("{}/dashboard", server_url());
+    let url = format!("{}/dashboard", spirit_url());
 
     #[cfg(target_os = "linux")]
     let result = Command::new("xdg-open")
@@ -100,7 +100,7 @@ pub fn open_dashboard_in_browser() -> String {
 
 async fn start() -> Result<()> {
     let token = auth_token()?;
-    let url = format!("{}/api/v1/dashboard/enable", server_url());
+    let url = format!("{}/api/v1/dashboard/enable", spirit_url());
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -112,7 +112,7 @@ async fn start() -> Result<()> {
 
     if resp.status().is_success() {
         println!("Dashboard enabled.");
-        println!("  URL: {}/dashboard", server_url());
+        println!("  URL: {}/dashboard", spirit_url());
     } else {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -123,7 +123,7 @@ async fn start() -> Result<()> {
 
 async fn stop() -> Result<()> {
     let token = auth_token()?;
-    let url = format!("{}/api/v1/dashboard/disable", server_url());
+    let url = format!("{}/api/v1/dashboard/disable", spirit_url());
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -148,7 +148,7 @@ async fn status() -> Result<()> {
         Some((enabled, has_assets, has_token)) => {
             if enabled {
                 println!("Dashboard is enabled.");
-                println!("  URL: {}/dashboard", server_url());
+                println!("  URL: {}/dashboard", spirit_url());
                 if !has_assets {
                     println!("  Warning: No embedded assets found. Build the dashboard first.");
                 }
@@ -162,7 +162,7 @@ async fn status() -> Result<()> {
         }
         None => {
             println!("Could not reach mika-spirit.");
-            println!("  Is it running at {}?", server_url());
+            println!("  Is it running at {}?", spirit_url());
         }
     }
     Ok(())

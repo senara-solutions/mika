@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         .map_err(|e: String| anyhow::anyhow!(e))?;
     let _log_guard = mika_common::logging::init(
         &settings.log_level,
-        settings.server_log_file.as_deref(),
+        settings.spirit_log_file.as_deref(),
         log_format,
         otel_layer,
         settings.log_llm_bodies,
