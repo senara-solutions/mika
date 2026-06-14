@@ -2,7 +2,7 @@
 
 ## Summary
 
-Extend the existing `mika logs` command from a simple log-path printer into a subcommand-bearing command with an `activity` subcommand that queries messages, llm_calls, and tool_calls from SQLite, interleaves them chronologically, and renders them as a unified timeline. The existing path-printing behavior moves to `mika logs paths` (backward-compatible bare `mika logs` defaults to `paths`).
+Extend the existing `mika logs` command from a simple log-path printer into a subcommand-bearing command with an `activity` subcommand that queries messages, llm_calls, tool_calls, and tasks from SQLite, interleaves them chronologically, and renders them as a unified timeline. The existing path-printing behavior moves to `mika logs paths` (backward-compatible bare `mika logs` defaults to `paths`). An `--include` flag controls which surfaces are queried (default: `messages,llm_calls,tool_calls,tasks` — all four DB surfaces).
 
 ## Design decisions
 
@@ -15,9 +15,11 @@ The ticket proposes `mika logs [OPTIONS]` as a flat command. However, the existi
 
 This follows the pattern established by `mika tasks` (where bare `mika tasks` aliases `mika tasks list`).
 
-### D2 — DB-only by default, no server_log grep in v1
+### D2 — `--include` flag with 4 DB surfaces by default; `server_log` opt-in deferred
 
-The `--include server_log` option from the ticket sketch requires reading a potentially multi-GB log file. For v1, we scope to DB-only surfaces (messages, llm_calls, tool_calls). Server log integration can be a follow-up. The `--include` flag is not implemented in v1 — all three DB surfaces are always included.
+The groom comment resolves the default surface set as `messages,llm_calls,tool_calls,tasks` (4 DB surfaces). An `--include <surfaces>` flag (comma-separated) controls which surfaces are queried. Default value: `messages,llm_calls,tool_calls,tasks`.
+
+The `server_log` surface (groom comment U3) requires streaming grep of a potentially multi-GB log file. In v1, passing `--include server_log` produces a clear error: `"server_log surface is not yet implemented — see mika#851 U3"`. This preserves the flag contract from the groom comment while deferring the I/O-heavy implementation. The flag infrastructure is present so future work is additive (add a handler), not structural (add the flag).
 
 ### D3 — Duration parsing with a simple custom parser
 
@@ -27,13 +29,13 @@ No `humantime` dependency. Implement a minimal `parse_duration_to_iso` that hand
 
 The `--tail` flag requires either polling or inotify/kqueue. Out of scope for v1. The DB query is a point-in-time snapshot.
 
-### D5 — Chronological interleaving, not grouped
+### D5 — Chronological interleaving by default; `--group-by trace_id` deferred
 
-Events from all surfaces are merged into a single chronologically-sorted stream. No trace_id grouping in v1 — strictly chronological as the ticket suggests for default behavior.
+Events from all surfaces are merged into a single chronologically-sorted stream. Strictly chronological is the default, as both the issue body and groom comment specify. The groom comment also commits to `--group-by trace_id` for a grouped view. This is **deferred to a follow-up** — it requires a secondary sort key and visual grouping separators that are orthogonal to the v1 timeline. Listed in "Out of scope" with explicit deferral note.
 
-### D6 — Unified event enum for rendering
+### D6 — Unified event enum for rendering (4 variants)
 
-Define a `LogEvent` enum that wraps message/llm_call/tool_call rows with a common `timestamp()` method. Sort all events by timestamp, then render each via a formatter that produces the one-line format from the ticket.
+Define a `LogEvent` enum with four variants — `Message`, `LlmCall`, `ToolCall`, `Task` — matching the groom comment's 4 DB surfaces. Each variant has a common `timestamp()` method. Sort all events by timestamp, then render each via a formatter that produces the one-line format from the ticket. The `Task` variant carries fields matching the groom comment's spec: timestamp, session_id, trace_id, task_id, status, label, action_type — rendered as `task.<status>` event type.
 
 ## Implementation steps
 
@@ -106,6 +108,12 @@ pub struct LogsActivityArgs {
     #[arg(long)]
     pub until: Option<String>,
 
+    /// Surfaces to include (comma-separated). Valid: messages, llm_calls, tool_calls, tasks, server_log.
+    /// Default: "messages,llm_calls,tool_calls,tasks" (all DB surfaces).
+    /// server_log requires explicit opt-in via --include server_log.
+    #[arg(long, default_value = "messages,llm_calls,tool_calls,tasks")]
+    pub include: String,
+
     /// Filter content by regex pattern
     #[arg(long)]
     pub grep: Option<String>,
@@ -156,6 +164,15 @@ enum LogEvent {
         latency_ms: Option<i64>,
         error_message: Option<String>,
     },
+    Task {
+        timestamp: String,
+        session_id: Option<String>,
+        trace_id: Option<String>,
+        task_id: String,
+        status: String,       // renders as event type task.<status>
+        label: Option<String>,
+        action_type: Option<String>,
+    },
 }
 ```
 
@@ -165,13 +182,13 @@ Implement `LogEvent::timestamp() -> &str` for sorting.
 
 **File:** `crates/mika-cli/src/commands/logs.rs`
 
-Add `parse_since(input: &str) -> Result<String>` that:
+Add a single `parse_time_expr(input: &str) -> Result<String>` function (per review-guide.md § DRY — one function, not two) that:
 - Handles `Nm` (minutes), `Nh` (hours), `Nd` (days) by subtracting from `Utc::now()`
 - Handles `today` as midnight of the current day (UTC)
 - Passes through anything that looks like an ISO 8601 timestamp
-- Returns ISO 8601 string for use in SQL `>=` comparison
+- Returns ISO 8601 string for use in SQL `>=` / `<=` comparison
 
-Similarly `parse_until(input: &str) -> Result<String>` (same logic, defaults to now if None).
+Call sites: `--since` calls `parse_time_expr(&args.since)`. `--until` calls `args.until.as_deref().map(parse_time_expr).transpose()?.unwrap_or_else(|| Utc::now().to_rfc3339())`. The "default to now" behavior is at the call site, not inside the parser.
 
 ### Step 5: Implement the activity query logic
 
@@ -180,17 +197,19 @@ Similarly `parse_until(input: &str) -> Result<String>` (same logic, defaults to 
 Add `pub async fn run_activity(args: &LogsActivityArgs, agent_name: &str) -> Result<()>`:
 
 1. Call `init::init_db_only_for_agent(agent_name)` to get `DbContext`.
-2. Parse `--since` and `--until` into ISO 8601 bounds.
-3. Build filters and query all three surfaces in parallel (they're independent):
-   - `get_messages_since(agent_id, since)` — then apply `until`, `session`, `trace`, `grep` post-filters.
-   - `query_llm_calls(LlmCallFilters { agent_id, from, to, session_id, trace_id }, page=1, per_page=limit)`.
-   - `query_tool_calls(ToolCallFilters { agent_id, from, to, session_id, trace_id }, page=1, per_page=limit)`.
-4. If `--task` is provided: look up the task to find its session_id, then use that as the session filter.
-5. Convert all results to `Vec<LogEvent>`.
-6. If `--grep` is provided: filter events whose content/error_message matches the regex.
-7. Sort all events by timestamp.
-8. Truncate to `--limit`.
-9. Render based on `--format`.
+2. Parse `--include` into a set of surface names. Validate each against known surfaces: `messages`, `llm_calls`, `tool_calls`, `tasks`, `server_log`. Unknown surface → error. If `server_log` is in the set, return an error: `"server_log surface is not yet implemented — see mika#851 U3"`.
+3. Parse `--since` and `--until` into ISO 8601 bounds using `parse_time_expr`.
+4. If `--task` is provided: look up the task to find its session_id(s), then use those as the session filter for all surface queries. If no sessions found, print an error and exit.
+5. Build filters and query only the included surfaces (skip surfaces not in `--include`):
+   - `messages`: `get_messages_since(agent_id, since)` — then apply `until`, `session`, `trace`, `grep` post-filters.
+   - `llm_calls`: `query_llm_calls(LlmCallFilters { agent_id, from, to, session_id, trace_id }, page=1, per_page=limit)`.
+   - `tool_calls`: `query_tool_calls(ToolCallFilters { agent_id, from, to, session_id, trace_id }, page=1, per_page=limit)`.
+   - `tasks`: query `tasks` table for rows matching the agent_id and time window, converting status transitions to `LogEvent::Task` with `task.<status>` event type. Uses `updated_at` as the event timestamp (status change time). Fields: task_id (from `reference_url` or DB id), status, label (from `title`), action_type.
+6. Convert all results to `Vec<LogEvent>`.
+7. If `--grep` is provided: filter events whose content/error_message/label matches the pattern.
+8. Sort all events by timestamp.
+9. Truncate to `--limit`.
+10. Render based on `--format`.
 
 ### Step 6: Implement text formatter
 
@@ -199,9 +218,10 @@ Add `pub async fn run_activity(args: &LogsActivityArgs, agent_name: &str) -> Res
 For text mode, render each event as one line matching the ticket's proposed format:
 
 ```
-[HH:MM:SS] msg.<role>     session=<8-char-prefix> <content-preview>
-[HH:MM:SS] llm.call       session=<8-char-prefix> provider=<p> model=<m> status=<s>  in=<n> out=<n>
-[HH:MM:SS] tool.call      session=<8-char-prefix> tool=<name> status=<success|error>  <latency>ms
+[HH:MM:SS] msg.<role>        session=<8-char-prefix> <content-preview>
+[HH:MM:SS] llm.call          session=<8-char-prefix> provider=<p> model=<m> status=<s>  in=<n> out=<n>
+[HH:MM:SS] tool.call         session=<8-char-prefix> tool=<name> status=<success|error>  <latency>ms
+[HH:MM:SS] task.<status>     task=<id> <label> action=<action_type>
 ```
 
 Time is shown as local time (HH:MM:SS) extracted from the ISO 8601 timestamp. Session IDs are truncated to 8 chars for readability.
@@ -260,12 +280,29 @@ Pragmatic approach: if the prefix is >= 8 chars (UUID-like), do an exact match. 
 **File:** `crates/mika-cli/src/commands/logs.rs`
 
 Add `#[cfg(test)] mod tests`:
-- `test_parse_since_minutes` — "30m" produces a timestamp ~30 minutes ago.
-- `test_parse_since_hours` — "2h" produces a timestamp ~2 hours ago.
-- `test_parse_since_today` — "today" produces midnight UTC.
-- `test_parse_since_iso_passthrough` — ISO 8601 string passes through unchanged.
-- `test_log_event_sorting` — mixed events sort chronologically by timestamp.
-- `test_text_format_one_line` — a single LogEvent renders as one line in the expected format.
+
+**Duration parsing (Step 4):**
+- `test_parse_time_expr_minutes` — "30m" produces a timestamp ~30 minutes ago.
+- `test_parse_time_expr_hours` — "2h" produces a timestamp ~2 hours ago.
+- `test_parse_time_expr_today` — "today" produces midnight UTC.
+- `test_parse_time_expr_iso_passthrough` — ISO 8601 string passes through unchanged.
+
+**Sorting and formatting (Steps 6–7):**
+- `test_log_event_sorting` — mixed events (including Task variant) sort chronologically by timestamp.
+- `test_text_format_one_line` — each LogEvent variant renders as one line in the expected format, including `task.<status>`.
+
+**`--task` session resolution (Step 9) — per review-guide.md § Single Responsibility:**
+- `test_task_resolution_finds_sessions` — `--task <id>` resolves to session IDs via the `sessions.task_id` column and filters events to those sessions.
+- `test_task_resolution_no_sessions_errors` — `--task <id>` with no matching sessions produces a clear error (not an empty result).
+
+**`--session` prefix matching (Step 10) — per review-guide.md § Single Responsibility:**
+- `test_session_prefix_short` — a 4-char prefix matches multiple sessions and filters events across all matches.
+- `test_session_prefix_long` — an 8+ char prefix performs exact-match filtering.
+
+**`--include` surface selection (Step 5):**
+- `test_include_parse_valid` — comma-separated surfaces parsed correctly.
+- `test_include_server_log_errors` — `--include server_log` produces the "not yet implemented" error.
+- `test_include_unknown_surface_errors` — unknown surface name produces a validation error.
 
 ### Step 12: Update CLI CLAUDE.md
 
@@ -280,7 +317,7 @@ Update the "Logs CLI" section to document both subcommands:
 | File | Change |
 |------|--------|
 | `crates/mika-cli/src/cli.rs` | Add `LogsCommand` enum, `LogsActivityArgs` struct, update `LogsArgs` to subcommand-bearing, update `agent_override()` |
-| `crates/mika-cli/src/commands/logs.rs` | Add `LogEvent` enum, `parse_since`/`parse_until`, `run_activity()`, text/JSON formatters, tests |
+| `crates/mika-cli/src/commands/logs.rs` | Add `LogEvent` enum (4 variants), `parse_time_expr`, `run_activity()` with `--include` parsing, text/JSON formatters, tests |
 | `crates/mika-cli/src/main.rs` | Update `Commands::Logs` dispatch to route subcommands |
 | `crates/mika-cli/CLAUDE.md` | Document new `mika logs activity` subcommand |
 
@@ -302,8 +339,12 @@ No new crate dependencies. Uses existing:
 
 ## Out of scope (explicit)
 
-- `--tail` / live streaming (requires polling infra)
-- `--include server_log` (requires multi-GB file grep)
+- `--tail` / live streaming (groom comment U4 — requires polling infra; deferred to follow-up)
+- `--include server_log` handler implementation (groom comment U3 — flag is present and validates, but handler returns "not yet implemented" error in v1; streaming grep approach per U3 is the follow-up path)
 - `--include claude_pilot` (subprocess log correlation)
+- `--group-by trace_id` (groom comment resolved this as a committed flag for grouped view; deferred to follow-up — requires secondary sort key and visual grouping separators orthogonal to v1 timeline)
 - Aggregation / analytics (use dashboard)
-- Trace-grouped output mode (follow-up)
+
+## Revision history
+
+- rev 2 (2026-06-14): addressed F1 by adding `Task` variant to `LogEvent` (4 DB surfaces matching groom comment's default set: messages, llm_calls, tool_calls, tasks) with fields from groom comment spec (timestamp, session_id, trace_id, task_id, status, label, action_type) and `task.<status>` event type rendering; addressed F2 by implementing `--include <surfaces>` flag (default: all 4 DB surfaces), `server_log` validates but returns "not yet implemented" error in v1 (flag infrastructure present for additive follow-up per groom comment U3), and listing `--group-by trace_id` explicitly in Out of scope with deferral note acknowledging groom comment commitment; addressed F3 by consolidating `parse_since`/`parse_until` into single `parse_time_expr` function with default-to-now at call site (per review-guide.md § DRY); addressed F4 by adding test cases for `--task` session resolution (success + no-match-error) and `--session` prefix matching (short + long prefixes), plus `--include` validation tests (per review-guide.md § Single Responsibility).

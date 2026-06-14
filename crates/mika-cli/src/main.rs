@@ -314,7 +314,18 @@ async fn main() -> Result<()> {
         Some(Commands::Logs(ref args)) => {
             let ah = agent_home
                 .ok_or_else(|| anyhow::anyhow!("Could not resolve agent home directory"))?;
-            commands::logs::run(&agent_name, &ah, &args.format)
+            match &args.command {
+                Some(cli::LogsCommand::Activity(activity_args)) => {
+                    commands::logs::run_activity(activity_args, &agent_name).await
+                }
+                Some(cli::LogsCommand::Paths(paths_args)) => {
+                    commands::logs::run(&agent_name, &ah, &paths_args.format)
+                }
+                None => {
+                    // Bare `mika logs` defaults to paths (backward compat)
+                    commands::logs::run(&agent_name, &ah, &args.format)
+                }
+            }
         }
         Some(Commands::Notify(ref args)) => {
             commands::notify::run(&args.text, &args.channel, &args.severity).await

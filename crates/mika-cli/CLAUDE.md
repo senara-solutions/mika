@@ -98,9 +98,20 @@ See `crates/mika-agent/CLAUDE.md` for KG architecture and schema details.
 
 ## Logs CLI
 
-`mika logs` — Show resolved log file paths for an agent. Prints both the server log path (`MIKA_SERVER_LOG_FILE` or `/var/log/mika/server.log` fallback) and the per-agent CLI log path (`~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`). Includes file existence, size, and a ready-to-use `jq` filter command for querying the server log by agent_id.
+Two subcommands; bare `mika logs` defaults to `paths` for backward compatibility.
 
-Supports `--agent <name>` and `--format text|json`.
+`mika logs` / `mika logs paths` — Show resolved log file paths for an agent. Prints both the server log path (`MIKA_SERVER_LOG_FILE` or `/var/log/mika/server.log` fallback) and the per-agent CLI log path (`~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD`). Includes file existence, size, and a ready-to-use `jq` filter command for querying the server log by agent_id. Supports `--agent <name>` and `--format text|json`.
+
+`mika logs activity` — Query cross-surface activity from SQLite (messages, LLM calls, tool calls, tasks) and render as a chronologically-interleaved timeline. Supports:
+- `--since <expr>` — Time window start: `30m`, `2h`, `1d`, `today`, or ISO 8601. Default: `1h`.
+- `--until <expr>` — Time window end (same format). Default: now.
+- `--include <surfaces>` — Comma-separated surfaces to query. Default: `messages,llm_calls,tool_calls,tasks`. `server_log` validates but returns "not yet implemented" error.
+- `--session <prefix>` — Filter by session ID (prefix match).
+- `--task <id>` — Filter by task ID (resolves to sessions via `sessions.task_id`).
+- `--trace <id>` — Filter by trace ID.
+- `--grep <pattern>` — Filter events by substring match on content fields.
+- `-n / --limit <N>` — Max events to display. Default: 200.
+- `--agent <name>` and `--format text|json`.
 
 See `crates/mika-agent/CLAUDE.md` § Log Sinks for the architectural rationale behind the two-sink design.
 
