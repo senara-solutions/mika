@@ -1,6 +1,10 @@
 pub mod a2a_card;
 pub mod a2a_db;
-pub mod agent;
+pub mod agent_loop;
+/// Backward-compatibility re-export. New code should use `crate::agent_loop` directly.
+pub mod agent {
+    pub use crate::agent_loop::*;
+}
 pub mod async_db;
 pub mod auto_pull;
 pub mod bundled_skills;

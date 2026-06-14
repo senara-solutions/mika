@@ -1,3 +1,8 @@
+//! Agent loop — the iteration itself: retrieve-context → build-prompt → LLM →
+//! match stop_reason → execute tools. This module owns the three entry-point
+//! variants (conversation, silent, team) and the shared `run_loop` core that
+//! drives them all.
+
 use anyhow::Result;
 use mika_common::llm::{
     LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmProvider, LlmRequest, LlmResponseContent,
