@@ -20,7 +20,7 @@ This is the same bug class as the team engine fix (#285, see `docs/solutions/log
 
 Two compounding issues:
 
-1. **Server loads global-only Settings:** `mika-server.rs` calls `Settings::load(&home_dir)` which internally calls `Settings::load_for_agent(home_dir, home_dir)` — since `global_home == agent_home`, the per-agent config layer is never applied. The single `LlmProvider` built from this is shared across ALL agents.
+1. **Server loads global-only Settings:** `mika-spirit.rs` calls `Settings::load(&home_dir)` which internally calls `Settings::load_for_agent(home_dir, home_dir)` — since `global_home == agent_home`, the per-agent config layer is never applied. The single `LlmProvider` built from this is shared across ALL agents.
 
 2. **TaskDispatcher passes `settings: None`:** All four `SilentAgentParams` construction sites in `dispatcher.rs` set `settings: None`, blocking `resolve_skill_llm_override()` for per-skill `[llm]` overrides in silent mode.
 

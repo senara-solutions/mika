@@ -57,7 +57,7 @@ Plus compression within keep blocks (CALLBACK TYPE DETECTION, MILESTONE/PROJECT 
 - **AC2** — Every `llm_calls` row written after deploy has a non-null `system_prompt_bytes` value. Every turn emits exactly one `system_prompt_assembled` INFO event.
 - **AC3 / AC3b** — `mika ask --agent mika-dev "groom mika issue#<test>"` after deploy completes with `tool_calls > 0` on the dispatch turn; the claude-pilot completion callback turn also shows `tool_calls > 0` (inverting the zero-tool-call fabrication signature on the same surface as session `callback-54a6ef5b`).
 - **AC4** — `test_resolve_skill_llm_override_silent_callback_and_deferred_dispatch_carve_out` passes. The residual silent-path-invocation gap is documented in this doc and tracked as a follow-up.
-- **AC5** — `cargo run --bin mika-server` startup log no longer emits `required_tools references` Warn for `self-dev` (run_claude_pilot via dependency-prefix), `qa-review` (run_gh via BUILTIN_TOOL_NAMES), or `dev-handsoff` (write_agent_file via BUILTIN_TOOL_NAMES).
+- **AC5** — `cargo run --bin mika-spirit` startup log no longer emits `required_tools references` Warn for `self-dev` (run_claude_pilot via dependency-prefix), `qa-review` (run_gh via BUILTIN_TOOL_NAMES), or `dev-handsoff` (write_agent_file via BUILTIN_TOOL_NAMES).
 - **AC6** — This document.
 
 ## Lessons

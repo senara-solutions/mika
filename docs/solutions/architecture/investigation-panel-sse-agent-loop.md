@@ -48,7 +48,7 @@ powered by Claude with read-only access to the database.
 ### Architecture
 
 ```
-Dashboard (React)                    mika-server (Axum)
+Dashboard (React)                    mika-spirit (Axum)
 ┌──────────────────┐    POST SSE     ┌──────────────────────────┐
 │ SessionDetail    │───────────────→ │ handle_investigate       │
 │  └─ InvestPanel  │                 │  ├─ Validate request     │

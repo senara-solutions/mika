@@ -11,7 +11,7 @@ execution: code
 
 ## Problem frame
 
-`mika-server` builds `AppState.agents: Arc<HashMap<String, Arc<AgentState>>>` once at startup (`server/mod.rs:666` populates from `agent::list_agents()`). Agents born after boot — created on disk via `~/.mika/agents/<id>/` and exercised by `mika ask --agent <id>` — are invisible to the dashboard's agent-detail page (`dashboard.rs:152` `handle_agent_detail` → `state.resolve_agent` → `None` → 404).
+`mika-spirit` builds `AppState.agents: Arc<HashMap<String, Arc<AgentState>>>` once at startup (`server/mod.rs:666` populates from `agent::list_agents()`). Agents born after boot — created on disk via `~/.mika/agents/<id>/` and exercised by `mika ask --agent <id>` — are invisible to the dashboard's agent-detail page (`dashboard.rs:152` `handle_agent_detail` → `state.resolve_agent` → `None` → 404).
 
 The data is fully present: DB row, sessions, llm_calls, identity.toml, soul.md. Only the running server's in-memory view is stale. Workaround: restart. Bites Mika Prime and any claude-pilot-spawned agent.
 
@@ -118,7 +118,7 @@ pub async fn resolve_agent(&self, name: &str) -> Option<Arc<AgentState>> {
 - **Resolve agent with disk but no DB row:** returns `None`. (Agent exists in `~/.mika/agents/` but was never exercised; the dashboard 404 is correct in this case — same UX, no data to show.)
 - **Race on lazy-construct:** two concurrent `resolve_agent` calls for the same new agent. DashMap's atomic insert ensures one wins; the other reads the inserted value. Verify via concurrent-call test.
 
-**Verification:** unit tests + integration test against a live mika-server (spawn server, create agent via `mika ask`, hit dashboard agent-detail, expect 200).
+**Verification:** unit tests + integration test against a live mika-spirit (spawn server, create agent via `mika ask`, hit dashboard agent-detail, expect 200).
 
 ### U3 — Update `handle_agent_detail` + sibling handlers
 
@@ -161,7 +161,7 @@ The startup path calls it inside its for-loop; the lazy path calls it from `AppS
 **Goal:** Document the lazy-construction behavior; add an audit log line on successful lazy insert (so operators can see when this fires).
 
 **Files:**
-- Modify: `crates/mika-agent/CLAUDE.md` § HTTP Server (mika-server) — add a note on the lazy-resolution behavior
+- Modify: `crates/mika-agent/CLAUDE.md` § HTTP Server (mika-spirit) — add a note on the lazy-resolution behavior
 - Modify: `crates/mika-agent/src/server/state.rs` — `tracing::info!` on successful lazy insert (`agent_resolved_lazily` event with `agent_id` field)
 
 **Approach:** Short additions; helps debugging when the dashboard "magically" finds a new agent.
@@ -187,7 +187,7 @@ The startup path calls it inside its for-loop; the lazy path calls it from `AppS
 - `cargo clippy --workspace` clean (DashMap ref-guard held-across-await checks)
 - `cargo fmt --all -- --check` clean
 - Smoke test:
-  1. Start mika-server
+  1. Start mika-spirit
   2. Create new agent on disk + exercise via `mika ask --agent new-agent ...`
   3. Open `http://localhost:8081/dashboard/agents/new-agent` — page loads (was 404 pre-fix)
   4. `grep agent_resolved_lazily` in server log — sees the lazy-insert event

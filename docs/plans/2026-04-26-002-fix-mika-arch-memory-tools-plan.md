@@ -86,7 +86,7 @@ The denylist's design intent is the **read-only architect contract** from spec �
 **Operator manual step** (post-merge, post-`make deploy`):
 1. Edit `~/.mika/agents/mika-arch/identity.toml` directly.
 2. In the `[tools].disabled` array, remove the three lines: `"update_core_memory",`, `"store_fact",`, `"update_fact",`.
-3. Restart mika-server (`sudo rc-service mika-server restart`).
+3. Restart mika-spirit (`sudo rc-service mika-spirit restart`).
 4. Verify: `mika ask --agent mika-arch "<simple prompt>"` followed by SQL `SELECT * FROM core_memory WHERE agent_id='mika-arch' AND key='self_model'` — confirm mika-arch's memory writes propagate to the table.
 
 Auto-migration would close this gap but adds complexity for a one-time fix. Defer per "Out of scope."
@@ -223,7 +223,7 @@ The inverted assertion is the regression guard at the rendered-toml level. Unit 
 
 **Approach:** Add a paragraph to the PR description (and to `mika/CLAUDE.md` § "Local Dev Environment" if appropriate) explaining:
 
-> **Existing mika-arch deploy migration:** This change updates `MIKA_ARCH_DISABLED_TOOLS` but does not auto-migrate existing `~/.mika/agents/mika-arch/identity.toml` files (the provisioning path's `agent_exists` short-circuit prevents re-rendering). After deploy: edit `~/.mika/agents/mika-arch/identity.toml`, remove the lines `"update_core_memory",`, `"store_fact",`, `"update_fact",` from the `[tools].disabled` array, restart mika-server. Verify with: `mika ask --agent mika-arch "<test prompt>"` followed by `sqlite3 ~/.mika/data/mika.db "SELECT key, length(value) FROM core_memory WHERE agent_id='mika-arch'"`.
+> **Existing mika-arch deploy migration:** This change updates `MIKA_ARCH_DISABLED_TOOLS` but does not auto-migrate existing `~/.mika/agents/mika-arch/identity.toml` files (the provisioning path's `agent_exists` short-circuit prevents re-rendering). After deploy: edit `~/.mika/agents/mika-arch/identity.toml`, remove the lines `"update_core_memory",`, `"store_fact",`, `"update_fact",` from the `[tools].disabled` array, restart mika-spirit. Verify with: `mika ask --agent mika-arch "<test prompt>"` followed by `sqlite3 ~/.mika/data/mika.db "SELECT key, length(value) FROM core_memory WHERE agent_id='mika-arch'"`.
 
 No code change for Unit 4 — pure documentation.
 

@@ -34,7 +34,7 @@ No `choices[]` wrapper is needed since Mika always returns a single response.
 
 3. **Role is always `"assistant"`:** Validated by industry research — every major LLM API uses `role: "assistant"` for model responses. Including it (even though constant) enables direct array composition: `messages.push(mika_output)`.
 
-4. **CLI only:** No server-side changes. The mika-server `/message` endpoint remains async (202). A synchronous server endpoint may come later but is out of scope.
+4. **CLI only:** No server-side changes. The mika-spirit `/message` endpoint remains async (202). A synchronous server endpoint may come later but is out of scope.
 
 5. **Edge case — no text response:** Output `{"role": "assistant", "content": null}` when the agent produces no text (tool-only runs). In practice, the agent almost always produces a text summary, so this is a rare fallback.
 

@@ -83,7 +83,7 @@ pub fn redact_db_secrets(db_path: &Path, agent_id: &str) -> Result<()>;
 **Prune strategy:** `prune_snapshots(keep: usize)` deletes oldest-first by timestamp parsed from label, keeping the `keep` most recent. Default `--keep 50` (configurable). No time-based retention in v1 — count-based only.
 
 **Rollback mechanics:**
-1. Stop mika-server and mika-gateway services (if running)
+1. Stop mika-spirit and mika-gateway services (if running)
 2. Create a safety snapshot of current state (labeled `pre-rollback-{timestamp}`)
 3. `btrfs subvolume delete ~/.mika/logs/` and `~/.mika/data/_backups/` (nested subvols must die before parent)
 4. `btrfs subvolume delete ~/.mika/` (the main subvolume)

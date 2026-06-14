@@ -49,10 +49,10 @@ fn main() {
     }
 
     // Also copy openapi spec
-    let api_src = source.join("openapi/mika-server.yaml");
+    let api_src = source.join("openapi/mika-spirit.yaml");
     println!("cargo:rerun-if-changed={}", api_src.display());
     fs::create_dir_all(docs_out.join("openapi")).unwrap();
-    fs::copy(&api_src, docs_out.join("openapi/mika-server.yaml"))
+    fs::copy(&api_src, docs_out.join("openapi/mika-spirit.yaml"))
         .unwrap_or_else(|e| panic!("failed to copy {}: {e}", api_src.display()));
 
     // Copy dashboard assets into OUT_DIR so rust-embed can reference them via

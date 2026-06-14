@@ -6,7 +6,7 @@ The release workflow (`release.yml`) produces cross-platform binaries via `taiki
 
 - **Checksums:** Already present (`checksum: sha256` on both binary upload steps). ✅
 - **Signatures:** Not present. No cosign or GPG signing step.
-- **Archive naming:** Uses `mika-$tag-$target` / `mika-server-$tag-$target` — functional but the `$tag` includes the `v` prefix (e.g., `mika-v0.1.5-x86_64-unknown-linux-gnu`). This is fine for GitHub Releases but packaging scripts need a predictable, version-only naming convention.
+- **Archive naming:** Uses `mika-$tag-$target` / `mika-spirit-$tag-$target` — functional but the `$tag` includes the `v` prefix (e.g., `mika-v0.1.5-x86_64-unknown-linux-gnu`). This is fine for GitHub Releases but packaging scripts need a predictable, version-only naming convention.
 - **SBOM:** Not present.
 - **Verification script:** No `install.sh` or verification doc for self-hosters.
 

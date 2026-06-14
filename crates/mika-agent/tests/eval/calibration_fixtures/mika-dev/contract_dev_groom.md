@@ -4,7 +4,7 @@
 
 ### Description
 
-Add a new HTTP endpoint to mika-server that returns the current operational status
+Add a new HTTP endpoint to mika-spirit that returns the current operational status
 of a specific agent. This is needed by the dashboard's agent detail panel.
 
 ### Acceptance Criteria
@@ -25,4 +25,4 @@ This is a lightweight status-only endpoint for polling without full detail paylo
 
 - Use `AsyncDatabase::with_db` for the task count query
 - Status derivation logic should live in a helper, not inline in the handler
-- Consider adding to the OpenAPI spec at `docs/openapi/mika-server.yaml`
+- Consider adding to the OpenAPI spec at `docs/openapi/mika-spirit.yaml`

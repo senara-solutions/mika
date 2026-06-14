@@ -19,7 +19,7 @@ Three enhancements to the existing MCP (Model Context Protocol) system:
 
 **Headers:** The current `connect_http()` function uses `StreamableHttpClientTransport::from_uri(url)` with no headers. Many remote MCP servers require authentication (Bearer tokens, API keys). Users cannot connect to authenticated HTTP MCP servers at all.
 
-**CLI Integration:** MCP servers are only connected in server mode (`mika-server`). The CLI (`mika ask` and `mika chat`) passes `mcp_manager: None`, meaning CLI users get zero MCP tool access despite having configured servers in `mcp.json`. Team agents also pass `None`.
+**CLI Integration:** MCP servers are only connected in server mode (`mika-spirit`). The CLI (`mika ask` and `mika chat`) passes `mcp_manager: None`, meaning CLI users get zero MCP tool access despite having configured servers in `mcp.json`. Team agents also pass `None`.
 
 **Enable/Disable:** Users can set `"enabled": false` in `mcp.json` manually, but there are no CLI commands to toggle this. The existing `mika mcp add/remove/list` commands don't cover toggling.
 

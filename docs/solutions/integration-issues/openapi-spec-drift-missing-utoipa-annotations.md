@@ -14,7 +14,7 @@ modules: [mika-agent/server]
 
 Two variants of the same bug class:
 
-1. **#321 — Missing annotations:** After PR #319 regenerated `docs/openapi/mika-server.yaml`, 3 dashboard toggle endpoints (`/api/v1/dashboard/enable`, `/disable`, `/status`) disappeared from the spec. The endpoints were originally hand-added to the YAML but never backed by `#[utoipa::path]` annotations — any spec regeneration silently removed them.
+1. **#321 — Missing annotations:** After PR #319 regenerated `docs/openapi/mika-spirit.yaml`, 3 dashboard toggle endpoints (`/api/v1/dashboard/enable`, `/disable`, `/status`) disappeared from the spec. The endpoints were originally hand-added to the YAML but never backed by `#[utoipa::path]` annotations — any spec regeneration silently removed them.
 
 2. **#328 — Missing registration:** `handle_task_complete` in `handlers.rs` had a `#[utoipa::path]` annotation but was never added to the `paths(...)` list in `AgentApiDoc` in `openapi.rs`. The annotation existed but the endpoint was invisible to the generator because it wasn't registered.
 
@@ -65,7 +65,7 @@ paths(
 - **Full paths required:** utoipa doesn't know about Axum's `nest()` routing — use `/api/v1/dashboard/enable`, not `/dashboard/enable`.
 - **`json!` macro in attributes:** utoipa's proc macro resolves `json!(...)` internally — no `use serde_json::json` import needed in the handler file.
 - **`inline(serde_json::Value)`:** Use for ad-hoc JSON responses without a dedicated struct. Generates `schema: {}` in YAML but the `example` compensates.
-- **Two-copy sync:** Both `docs/openapi/mika-server.yaml` (canonical) and `crates/mika-agent/docs/openapi/mika-server.yaml` (crate-local for crates.io) must match. `scripts/sync-agent-docs.sh` handles the copy. The `test_committed_spec_is_current` test only validates the canonical copy.
+- **Two-copy sync:** Both `docs/openapi/mika-spirit.yaml` (canonical) and `crates/mika-agent/docs/openapi/mika-spirit.yaml` (crate-local for crates.io) must match. `scripts/sync-agent-docs.sh` handles the copy. The `test_committed_spec_is_current` test only validates the canonical copy.
 
 ## Prevention
 

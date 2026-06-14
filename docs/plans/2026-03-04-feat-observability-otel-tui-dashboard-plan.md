@@ -418,7 +418,7 @@ pub fn init(
 #### 3.5 Init Entry Points
 
 - **CLI** (`crates/mika-cli/src/main.rs`): Build OTel layer after settings load, pass to `init_pretty()`, store `TelemetryGuard` in main scope
-- **Server** (`crates/mika-agent/src/bin/mika-server.rs`): Build OTel layer, pass to `init()`, store guard. Flush on `shutdown_signal()`
+- **Server** (`crates/mika-agent/src/bin/mika-spirit.rs`): Build OTel layer, pass to `init()`, store guard. Flush on `shutdown_signal()`
 
 #### 3.6 Exporter Configuration (Bounded)
 

@@ -152,7 +152,7 @@ The fail-open semantics (warn and continue) match existing dispatch-readiness fa
 - **No-op on healthy startup:** all agents present → no orphans logged.
 - **Empty known set:** safety log fires; no DB mutation.
 
-**Verification:** integration smoke test in a test harness if available; manual smoke on a real mika-server.
+**Verification:** integration smoke test in a test harness if available; manual smoke on a real mika-spirit.
 
 ### U3 — Docs note
 
@@ -182,7 +182,7 @@ The fail-open semantics (warn and continue) match existing dispatch-readiness fa
 
 - `cargo test -p mika-agent db::tests` passes
 - `cargo clippy --workspace` clean
-- Manual smoke: delete an agent's dir, restart mika-server, confirm `list_scheduled_tasks` no longer shows orphan entries; log line visible
+- Manual smoke: delete an agent's dir, restart mika-spirit, confirm `list_scheduled_tasks` no longer shows orphan entries; log line visible
 
 ## Risk / known unknowns
 

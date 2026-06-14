@@ -163,9 +163,9 @@ If a future agent genuinely needs more identity surface than 500 tokens, that's 
 **Step 0 — Refresh the provisioned soul.md on existing hosts.** The `provision_well_known_agents()` path is idempotent and skips agents that already exist on disk (`crates/mika-agent/src/well_known_agents.rs:351-413`). Hosts that have ever booted with `MIKA_DEV_MODE=true` will keep their old `~/.mika/agents/mika-arch/soul.md` template *without* the new `## Foundational references` section unless explicitly refreshed. To pull in the new template:
 
 ```bash
-sudo rc-service mika-server stop
+sudo rc-service mika-spirit stop
 rm ~/.mika/agents/mika-arch/soul.md
-sudo rc-service mika-server start
+sudo rc-service mika-spirit start
 # Verify:
 grep -A 5 "## Foundational references" ~/.mika/agents/mika-arch/soul.md
 ```

@@ -1,7 +1,7 @@
 ---
 issue: 214
 type: feat
-title: Implement A2A Protocol (v0.3) in mika-server and mika-gateway
+title: Implement A2A Protocol (v0.3) in mika-spirit and mika-gateway
 created: 2026-03-19
 status: in-progress
 ---

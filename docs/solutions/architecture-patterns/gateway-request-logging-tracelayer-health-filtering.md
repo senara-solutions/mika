@@ -11,7 +11,7 @@ components: [mika-gateway, mika-agent]
 
 ## Problem
 
-The gateway (`mika-gateway`) had no request/response logging middleware, while `mika-server` already used `tower_http::trace::TraceLayer`. This created an observability gap — gateway requests were invisible in logs, making it difficult to debug routing issues, latency problems, or failed requests.
+The gateway (`mika-gateway`) had no request/response logging middleware, while `mika-spirit` already used `tower_http::trace::TraceLayer`. This created an observability gap — gateway requests were invisible in logs, making it difficult to debug routing issues, latency problems, or failed requests.
 
 ## Root Cause
 
@@ -71,7 +71,7 @@ fn is_health_probe(path: &str) -> bool {
 
 ### Key decisions
 
-1. **Custom `make_span_with` instead of defaults:** Both the gateway and mika-server use custom span factories to log health probes at DEBUG level (reducing noise from Kubernetes liveness/readiness checks that fire every few seconds). The gateway checks three paths (`/health`, `/readyz`, `/livez`); the server checks only `/health` (its sole health endpoint).
+1. **Custom `make_span_with` instead of defaults:** Both the gateway and mika-spirit use custom span factories to log health probes at DEBUG level (reducing noise from Kubernetes liveness/readiness checks that fire every few seconds). The gateway checks three paths (`/health`, `/readyz`, `/livez`); the server checks only `/health` (its sole health endpoint).
 
 2. **Span-level filtering:** Health probe spans use `debug_span!` while operational routes use `info_span!`. The `on_response` callback checks the span's metadata level to match: health probe responses use `debug!`, operational responses use `info!`, and 5xx responses always use `warn!`. This ensures health probe traffic is fully suppressed at INFO log level — both the span and the response event.
 

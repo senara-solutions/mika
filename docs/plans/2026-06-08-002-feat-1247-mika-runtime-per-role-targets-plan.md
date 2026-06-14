@@ -7,19 +7,19 @@
 - Stage 2: `mika-runtime` (line 184) — slim production runtime, COPYs ALL 3 binaries:
   ```dockerfile
   COPY --from=mika-os /usr/local/bin/mika /usr/local/bin/mika
-  COPY --from=mika-os /usr/local/bin/mika-server /usr/local/bin/mika-server
+  COPY --from=mika-os /usr/local/bin/mika-spirit /usr/local/bin/mika-spirit
   COPY --from=mika-os /usr/local/bin/mika-gateway /usr/local/bin/mika-gateway
   ```
-- Plus OpenRC init scripts (both `mika-server` and `mika-gateway`)
+- Plus OpenRC init scripts (both `mika-spirit` and `mika-gateway`)
 - Single ENTRYPOINT: `/usr/local/bin/mika-os-init.sh`
 
 **B. Three binaries from Cargo workspace:**
-- `mika-server` (from `crates/mika-agent/src/bin/mika-server.rs`)
+- `mika-spirit` (from `crates/mika-agent/src/bin/mika-spirit.rs`)
 - `mika-gateway` (from `crates/mika-gateway/src/main.rs`)
 - `mika` (from `crates/mika-cli/src/main.rs`)
 
 **C. OpenRC services at `mika/os/openrc/`:**
-- `init.d/mika-server` + `conf.d/mika-server`
+- `init.d/mika-spirit` + `conf.d/mika-spirit`
 - `init.d/mika-gateway` + `conf.d/mika-gateway`
 
 **D. Shared runtime dependencies** (all 3 binaries need):
@@ -31,8 +31,8 @@
 
 **E. `mika-os-init.sh` (F1 — pinned)** — read full at `mika/os/init/mika-os-init.sh`. Behavior summary:
 - Boots OpenRC via `rc default` (service-agnostic — boots whatever's in /etc/init.d/)
-- SIGTERM handler: `rc-service mika-gateway stop 2>/dev/null || true; rc-service mika-server stop 2>/dev/null || true` (BOTH calls fail-soft via `|| true` — graceful when the service isn't installed)
-- Tails BOTH log files: `tail -F "$LOG_DIR/mika-server.log" "$LOG_DIR/mika-gateway.log"`. Prior `touch` creates empty log files if missing.
+- SIGTERM handler: `rc-service mika-gateway stop 2>/dev/null || true; rc-service mika-spirit stop 2>/dev/null || true` (BOTH calls fail-soft via `|| true` — graceful when the service isn't installed)
+- Tails BOTH log files: `tail -F "$LOG_DIR/mika-spirit.log" "$LOG_DIR/mika-gateway.log"`. Prior `touch` creates empty log files if missing.
 - No hardcoded require-binary references. Compatible with all per-role targets (server-only, gateway-only, all).
 
 **Minor inefficiency on per-role targets**: tail-F always tails both log files even if one daemon isn't running. Empty-file tail is harmless (no data flow, no error). Acceptable for v1 — can be tightened in a follow-up if log noise becomes an issue.
@@ -42,8 +42,8 @@
 **F. Ticket ACs (verbatim from #1247):**
 - AC1: Dockerfile declares 5 named targets: `mika-os`, `mika-runtime-server`, `mika-runtime-gateway`, `mika-runtime-cli`, `mika-runtime-all`. Legacy `mika-runtime` removed or aliased.
 - AC2: each target builds clean via `docker build --target <target> -f mika/os/Dockerfile .`
-- AC3: each target's image contains ONLY appropriate binaries (server: only mika-server; gateway: only mika-gateway; cli: only mika; all: all three)
-- AC4: OpenRC init scripts per role (server: mika-server only; gateway: mika-gateway only; cli: none; all: both)
+- AC3: each target's image contains ONLY appropriate binaries (server: only mika-spirit; gateway: only mika-gateway; cli: only mika; all: all three)
+- AC4: OpenRC init scripts per role (server: mika-spirit only; gateway: mika-gateway only; cli: none; all: both)
 - AC5: `mika/os/README.md` updated with per-role table
 - AC6: plan addresses shared-base-stage trade-off (DRY vs clarity)
 
@@ -64,9 +64,9 @@ COPY --from=mika-os /usr/local/bin/mika-os-init.sh /usr/local/bin/mika-os-init.s
 
 # Stage 2b-server
 FROM mika-runtime-base AS mika-runtime-server
-COPY --from=mika-os /usr/local/bin/mika-server /usr/local/bin/mika-server
-COPY --from=mika-os /etc/init.d/mika-server /etc/init.d/mika-server
-COPY --from=mika-os /etc/conf.d/mika-server /etc/conf.d/mika-server
+COPY --from=mika-os /usr/local/bin/mika-spirit /usr/local/bin/mika-spirit
+COPY --from=mika-os /etc/init.d/mika-spirit /etc/init.d/mika-spirit
+COPY --from=mika-os /etc/conf.d/mika-spirit /etc/conf.d/mika-spirit
 ENTRYPOINT [...]
 
 # Similar for gateway, cli, all
@@ -98,7 +98,7 @@ Each `mika-runtime-*` stage independently `FROM gentoo/stage3:20250505 AS ...` a
 
 2. **`mika-runtime-base`** (NEW) — slim Gentoo runtime + shared system + /etc/mika/ + /app/docs/ + mika-os-init.sh. NO role-specific binaries. NO role-specific init scripts.
 
-3. **`mika-runtime-server`** (NEW, `FROM mika-runtime-base`) — adds `mika-server` binary + `init.d/mika-server` + `conf.d/mika-server`. ENTRYPOINT mika-os-init.sh.
+3. **`mika-runtime-server`** (NEW, `FROM mika-runtime-base`) — adds `mika-spirit` binary + `init.d/mika-spirit` + `conf.d/mika-spirit`. ENTRYPOINT mika-os-init.sh.
 
 4. **`mika-runtime-gateway`** (NEW, `FROM mika-runtime-base`) — adds `mika-gateway` binary + `init.d/mika-gateway` + `conf.d/mika-gateway`. ENTRYPOINT mika-os-init.sh.
 
@@ -113,9 +113,9 @@ Removed cleanly. The single existing consumer in mika-cloud Helm chart will be c
 ### Tooling binaries (gh, gws, ollama)
 
 Currently COPY'd into mika-runtime. Need to map per-role:
-- `gh` — needed by mika-server (for GitHub webhook gateway responses). Include in mika-runtime-server + mika-runtime-all. Not gateway, not cli.
+- `gh` — needed by mika-spirit (for GitHub webhook gateway responses). Include in mika-runtime-server + mika-runtime-all. Not gateway, not cli.
 - `gws` — niche tool; include in mika-runtime-all only. Not needed for server/gateway/cli alone.
-- `ollama` — needed by mika-server (LLM inference). Include in mika-runtime-server + mika-runtime-all. Not gateway, not cli.
+- `ollama` — needed by mika-spirit (LLM inference). Include in mika-runtime-server + mika-runtime-all. Not gateway, not cli.
 
 This is the right verification target for AC3 — image contents per role.
 
@@ -130,13 +130,13 @@ This is the right verification target for AC3 — image contents per role.
    - `docker build --target mika-runtime-all -f mika/os/Dockerfile .`
 
 3. **AC3:** Each image contains ONLY appropriate binaries (verified via `docker run --rm <image> ls -la /usr/local/bin/`):
-   - `mika-runtime-server`: mika-server + gh + ollama present; mika + mika-gateway + gws absent
-   - `mika-runtime-gateway`: mika-gateway present; mika + mika-server + gh + gws + ollama absent
-   - `mika-runtime-cli`: mika present; mika-server + mika-gateway + gh + gws + ollama absent
-   - `mika-runtime-all`: mika + mika-server + mika-gateway + gh + gws + ollama all present
+   - `mika-runtime-server`: mika-spirit + gh + ollama present; mika + mika-gateway + gws absent
+   - `mika-runtime-gateway`: mika-gateway present; mika + mika-spirit + gh + gws + ollama absent
+   - `mika-runtime-cli`: mika present; mika-spirit + mika-gateway + gh + gws + ollama absent
+   - `mika-runtime-all`: mika + mika-spirit + mika-gateway + gh + gws + ollama all present
 
 4. **AC4:** OpenRC init scripts present per role (verified via `docker run --rm <image> ls /etc/init.d/`):
-   - `mika-runtime-server`: only `mika-server`
+   - `mika-runtime-server`: only `mika-spirit`
    - `mika-runtime-gateway`: only `mika-gateway`
    - `mika-runtime-cli`: none
    - `mika-runtime-all`: both
@@ -147,7 +147,7 @@ This is the right verification target for AC3 — image contents per role.
    |--------|------------|----------|
    | mika-os | Full build env | Forkable reference, dev environment |
    | mika-runtime-base | Shared runtime base (no role-specific binaries) | Internal — not pushed standalone |
-   | mika-runtime-server | mika-server | mika-cloud per-customer agent container |
+   | mika-runtime-server | mika-spirit | mika-cloud per-customer agent container |
    | mika-runtime-gateway | mika-gateway | mika-cloud gateway deployment |
    | mika-runtime-cli | mika (TUI) | Operator desktop install via Docker |
    | mika-runtime-all | All three binaries | Single-box self-host |

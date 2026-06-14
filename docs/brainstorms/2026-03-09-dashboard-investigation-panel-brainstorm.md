@@ -49,7 +49,7 @@ Same agent loop, same DB, same server. No new architecture.
 
 ## Scope
 
-### Backend (mika-server)
+### Backend (mika-spirit)
 - New endpoint: `POST /api/v1/investigate` — accepts message_id or (message_id + tool_call_index), user question, optional conversation history for follow-ups
 - Runs the investigator agent with pre-assembled context (the target message, its tool calls, surrounding messages from the session)
 - Returns the investigator's response (synchronous — investigation should be fast with read-only tools)

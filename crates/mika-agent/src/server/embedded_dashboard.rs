@@ -35,7 +35,7 @@ pub async fn handle_root(State(state): State<AppState>) -> Response {
         Redirect::temporary("/dashboard").into_response()
     } else {
         Json(serde_json::json!({
-            "name": "mika-server",
+            "name": "mika-spirit",
             "version": env!("CARGO_PKG_VERSION"),
             "dashboard": "/dashboard (disabled)"
         }))
@@ -242,7 +242,7 @@ fn token_not_configured_page() -> String {
   <p>The dashboard is enabled but <code style="display:inline">MIKA_DASHBOARD_TOKEN</code> is not configured.
      Set a read-only dashboard token to use the embedded dashboard:</p>
   <code>MIKA_DASHBOARD_TOKEN=$(openssl rand -hex 32)</code>
-  <p style="margin-top: 1rem; font-size: 0.875rem;">Then restart mika-server.</p>
+  <p style="margin-top: 1rem; font-size: 0.875rem;">Then restart mika-spirit.</p>
 </div>
 </body>
 </html>"#
@@ -282,7 +282,7 @@ fn disabled_page() -> Html<&'static str> {
   <h1><span class="mika">✦</span> Mika Dashboard</h1>
   <p>The embedded dashboard is disabled. To enable it, set the environment variable:</p>
   <code>MIKA_DASHBOARD_ENABLED=true</code>
-  <p style="margin-top: 1.5rem; font-size: 0.875rem;">Then restart mika-server.</p>
+  <p style="margin-top: 1.5rem; font-size: 0.875rem;">Then restart mika-spirit.</p>
 </div>
 </body>
 </html>"#,

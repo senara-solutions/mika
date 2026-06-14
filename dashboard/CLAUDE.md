@@ -15,8 +15,8 @@ This Dashboard is currently undergoing the first of three ecosystem-wide design 
 
 ## Architecture
 
-- **Production:** Embedded into the mika-server binary via `rust-embed` and served at `/dashboard/*` (controlled by `MIKA_DASHBOARD_ENABLED`, default `false`)
-- **Development:** Runs as standalone Vite dev server on `:5173` proxied to mika-server API
+- **Production:** Embedded into the mika-spirit binary via `rust-embed` and served at `/dashboard/*` (controlled by `MIKA_DASHBOARD_ENABLED`, default `false`)
+- **Development:** Runs as standalone Vite dev server on `:5173` proxied to mika-spirit API
 - **Token injection:** `window.__MIKA_CONFIG__` in embedded mode; `VITE_MIKA_DASHBOARD_TOKEN` env var in dev mode
 - **Shared UI components:** `@senara-solutions/ui` extracted into `packages/ui/` (npm workspace)
 
@@ -42,11 +42,11 @@ Event Timeline (`/timeline`), Agents, Sessions, Traces, Tasks (+ detail), Team R
 
 ## Commands
 
-- `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@senara-solutions/ui` first, requires mika-server on :8080)
+- `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@senara-solutions/ui` first, requires mika-spirit on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
-- `mika dashboard start` — Enable the embedded dashboard on the running mika-server (via `POST /api/v1/dashboard/enable`)
-- `mika dashboard stop` — Disable the embedded dashboard on the running mika-server (via `POST /api/v1/dashboard/disable`)
-- `mika dashboard status` — Query embedded dashboard status from mika-server (via `GET /api/v1/dashboard/status`)
+- `mika dashboard start` — Enable the embedded dashboard on the running mika-spirit (via `POST /api/v1/dashboard/enable`)
+- `mika dashboard stop` — Disable the embedded dashboard on the running mika-spirit (via `POST /api/v1/dashboard/disable`)
+- `mika dashboard status` — Query embedded dashboard status from mika-spirit (via `GET /api/v1/dashboard/status`)
 - `mika dashboard open` — Open dashboard URL in browser
 
 ## Environment Variables
@@ -61,4 +61,4 @@ The dashboard is audited for WCAG 2.1 AA compliance. See `docs/audits/2026-05-06
 
 ## Embedded Dashboard (Server-side)
 
-Runtime-togglable via `AppState.dashboard_enabled: Arc<AtomicBool>` (initialized from `MIKA_DASHBOARD_ENABLED`, default `false`). Toggle endpoints: `POST /api/v1/dashboard/enable`, `POST /api/v1/dashboard/disable`, `GET /api/v1/dashboard/status` (returns `{enabled, has_assets, has_token}`) — all accept dashboard or internal token auth. When enabled, the pre-built React SPA is served at `/dashboard/*` via `rust-embed` (compiled into binary). SPA fallback to `index.html` for client-side routing. Token injected via `window.__MIKA_CONFIG__` using `serde_json` with HTML-safe escaping. Only `MIKA_DASHBOARD_TOKEN` is injected (never the internal superuser token). Security headers: `Cache-Control: no-store` on index.html, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`. When disabled, `/dashboard/` returns a branded HTML page. Build sequencing: `npm run build --prefix dashboard` before `cargo build` (`VITE_BASE_PATH=/dashboard/` is set automatically in the npm build script; no build.rs coupling). Dockerfile.agent has a Node.js builder stage for this. CLI `mika dashboard start/stop/status` communicates with these toggle endpoints (requires `MIKA_INTERNAL_TOKEN` or `MIKA_DASHBOARD_TOKEN`; server URL from `MIKA_SERVER_URL`, default `http://localhost:8080`).
+Runtime-togglable via `AppState.dashboard_enabled: Arc<AtomicBool>` (initialized from `MIKA_DASHBOARD_ENABLED`, default `false`). Toggle endpoints: `POST /api/v1/dashboard/enable`, `POST /api/v1/dashboard/disable`, `GET /api/v1/dashboard/status` (returns `{enabled, has_assets, has_token}`) — all accept dashboard or internal token auth. When enabled, the pre-built React SPA is served at `/dashboard/*` via `rust-embed` (compiled into binary). SPA fallback to `index.html` for client-side routing. Token injected via `window.__MIKA_CONFIG__` using `serde_json` with HTML-safe escaping. Only `MIKA_DASHBOARD_TOKEN` is injected (never the internal superuser token). Security headers: `Cache-Control: no-store` on index.html, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`. When disabled, `/dashboard/` returns a branded HTML page. Build sequencing: `npm run build --prefix dashboard` before `cargo build` (`VITE_BASE_PATH=/dashboard/` is set automatically in the npm build script; no build.rs coupling). Dockerfile.agent has a Node.js builder stage for this. CLI `mika dashboard start/stop/status` communicates with these toggle endpoints (requires `MIKA_INTERNAL_TOKEN` or `MIKA_DASHBOARD_TOKEN`; server URL from `MIKA_SPIRIT_URL`, default `http://localhost:8080`).

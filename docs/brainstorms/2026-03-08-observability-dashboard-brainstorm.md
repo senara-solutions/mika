@@ -12,7 +12,7 @@ A web-based observability and management dashboard for Mika. It provides visibil
 
 **Future views (Phase 2+):** Tasks, Teams, Memory, Skills.
 
-The dashboard is a standalone React app at `dashboard/` in the repo, communicating with `mika-server` via REST API endpoints.
+The dashboard is a standalone React app at `dashboard/` in the repo, communicating with `mika-spirit` via REST API endpoints.
 
 ## Why This Approach
 
@@ -29,7 +29,7 @@ The orthogonal observability work (trace_id correlation, unified_timeline VIEW) 
 - OpenAPI spec can be extended naturally
 
 ### Why polling over SSE/WebSocket
-- mika-server is a simple Axum app — adding SSE infrastructure is premature
+- mika-spirit is a simple Axum app — adding SSE infrastructure is premature
 - 5-second polling is fine for an ops dashboard (not a real-time chat UI)
 - Can upgrade to SSE later without changing the dashboard architecture
 
@@ -126,7 +126,7 @@ struct PaginatedResponse<T> {
 }
 ```
 
-**CORS:** Dashboard runs on a different port than mika-server. Need `tower-http` CORS middleware (already a dependency).
+**CORS:** Dashboard runs on a different port than mika-spirit. Need `tower-http` CORS middleware (already a dependency).
 
 **Query parameters:** Use `axum::extract::Query<T>` with `#[serde(default)]` for optional filters.
 

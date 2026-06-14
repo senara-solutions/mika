@@ -6,16 +6,16 @@ tags: [code-review, duplication, architecture]
 dependencies: []
 ---
 
-# Duplicated bootstrap ceremony across mika-server.rs and setup.rs
+# Duplicated bootstrap ceremony across mika-spirit.rs and setup.rs
 
 ## Problem Statement
 
-The 5-step bootstrap sequence (create agents/ dir, bootstrap_agent, write_active_agent, write_default_if_missing for config.toml) is copy-pasted between `mika-server.rs` (lines 12-21) and `setup.rs` (lines 16-25). If the bootstrap sequence changes, both must be updated.
+The 5-step bootstrap sequence (create agents/ dir, bootstrap_agent, write_active_agent, write_default_if_missing for config.toml) is copy-pasted between `mika-spirit.rs` (lines 12-21) and `setup.rs` (lines 16-25). If the bootstrap sequence changes, both must be updated.
 
 ## Findings
 
 - **Source:** Pattern Recognition Specialist
-- **Files:** `crates/mika-agent/src/bin/mika-server.rs:12-21`, `crates/mika-cli/src/commands/setup.rs:16-25`
+- **Files:** `crates/mika-agent/src/bin/mika-spirit.rs:12-21`, `crates/mika-cli/src/commands/setup.rs:16-25`
 
 ## Proposed Solutions
 
@@ -30,7 +30,7 @@ Create `pub fn bootstrap_fresh_install(home_dir: &Path) -> Result<()>` in `mika-
 ## Acceptance Criteria
 
 - [ ] Single bootstrap function in `home.rs`
-- [ ] Both `mika-server.rs` and `setup.rs` call the shared function
+- [ ] Both `mika-spirit.rs` and `setup.rs` call the shared function
 
 ## Work Log
 

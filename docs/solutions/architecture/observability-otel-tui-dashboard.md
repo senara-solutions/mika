@@ -140,7 +140,7 @@ where
 }
 ```
 
-**Server entry point** (`crates/mika-agent/src/bin/mika-server.rs`):
+**Server entry point** (`crates/mika-agent/src/bin/mika-spirit.rs`):
 ```rust
 #[cfg(feature = "telemetry")]
 let (otel_layer, _telemetry_guard) = match mika_common::telemetry::build_otel_layer(&settings) {
@@ -212,6 +212,6 @@ Build with: `cargo build --features telemetry`
 | `crates/mika-agent/src/teams/types.rs` | TeamPhase enum, new TeamEvent variants |
 | `crates/mika-cli/src/tui/app.rs` | TeamDashboardState, event handler |
 | `crates/mika-cli/src/tui/ui.rs` | Split-pane dashboard renderer |
-| `crates/mika-agent/src/bin/mika-server.rs` | Wired OTel into subscriber |
+| `crates/mika-agent/src/bin/mika-spirit.rs` | Wired OTel into subscriber |
 | `crates/mika-gateway/src/main.rs` | NoopLayer parameter |
 | `.env.example` | Telemetry env vars |

@@ -117,7 +117,7 @@ Server maintains `HashMap<docs_root_hash, ExtractorHandle>`. Per-agent `tokio::s
 
 ### Option C — single-consumer topology
 
-`[kg].enabled = false` in `~/.mika/agents/{mika,mika-dev,mika-qa}/identity.toml`. mika-arch keeps full KG. Restart mika-server.
+`[kg].enabled = false` in `~/.mika/agents/{mika,mika-dev,mika-qa}/identity.toml`. mika-arch keeps full KG. Restart mika-spirit.
 
 - **Blast radius:** three single-line edits in three identity files. Zero code, zero schema. One restart.
 - **Reversibility:** one config line per agent + one restart cycle. Shared-corpus markers stay alive while mika-arch holds them; re-enabling on a sibling rebuilds only that agent's resolution log, not the extraction layer.
@@ -190,10 +190,10 @@ mika kg purge --agent mika-qa --yes
 ### Server restart
 
 ```bash
-sudo rc-service mika-server restart
+sudo rc-service mika-spirit restart
 ```
 
-OpenRC `supervise-daemon` per `/etc/init.d/mika-server` (chdir `/data/workspace/mika-platform/mika`, user `samidarko`, log `/var/log/mika/server.log`).
+OpenRC `supervise-daemon` per `/etc/init.d/mika-spirit` (chdir `/data/workspace/mika-platform/mika`, user `samidarko`, log `/var/log/mika/server.log`).
 
 No `MIKA_KG_BATCH_BUDGET` adjustment needed — disabled agents skip extraction/resolution at startup; mika-arch's pending backlog is already 0.
 
@@ -277,7 +277,7 @@ mika kg purge --agent <agent> --yes
 sed -i 's/^enabled = false$/enabled = true/' ~/.mika/agents/<agent>/identity.toml
 
 # Step 3 — restart.
-sudo rc-service mika-server restart
+sudo rc-service mika-spirit restart
 ```
 
 Re-enabling against a purged log forces a fresh Stage-1 + Stage-2 resolution pass. The extraction layer was preserved by mika-arch's continued ownership of the corpus markers, so re-extraction does not re-run LLM calls — only the per-agent resolution log rebuilds, which is the cheap path. Doing this without the purge step risks inheriting stale resolution rows from any race-window writes (the failure class mika#802 documents).

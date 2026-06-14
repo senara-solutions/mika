@@ -14,9 +14,9 @@ use crate::bundled_skills::{is_trust_critical_skill, trust_critical_skill_names}
 use crate::skills::index::{resolve_canonical_provider_model, sanitize_model_dir_name};
 use crate::tools::{ToolContext, ToolOutput};
 
-/// Embedded OpenAPI spec for the agent (mika-server) HTTP API.
+/// Embedded OpenAPI spec for the agent (mika-spirit) HTTP API.
 static AGENT_API_SPEC: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/docs/openapi/mika-server.yaml"));
+    include_str!(concat!(env!("OUT_DIR"), "/docs/openapi/mika-spirit.yaml"));
 
 /// Embedded architecture overview document.
 static ARCHITECTURE_OVERVIEW: &str =
@@ -4172,7 +4172,7 @@ mod tests {
             "runtime-structure.md",
             "skills.md",
             "slash-commands.md",
-            "openapi/mika-server.yaml",
+            "openapi/mika-spirit.yaml",
         ];
 
         for file in &files {

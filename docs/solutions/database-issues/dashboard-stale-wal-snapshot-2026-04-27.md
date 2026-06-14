@@ -6,7 +6,7 @@ module: mika-agent/server
 problem_type: database_issue
 component: database
 symptoms:
-  - Dashboard API returns stale data — new sessions invisible until mika-server restart
+  - Dashboard API returns stale data — new sessions invisible until mika-spirit restart
   - DB has more sessions than dashboard shows (e.g. 5731 vs 5705)
   - Newest visible session is over an hour behind actual newest
   - WAL file grows to several MB without being checkpointed
@@ -27,13 +27,13 @@ tags:
 
 ## Problem
 
-The dashboard API (`/api/v1/sessions`) returns stale data. Sessions created by other processes (e.g. `mika ask --agent mika-dev`) are invisible in the dashboard until mika-server is restarted. The root cause is the server's `AsyncDatabase` connection getting pinned to a stale WAL snapshot.
+The dashboard API (`/api/v1/sessions`) returns stale data. Sessions created by other processes (e.g. `mika ask --agent mika-dev`) are invisible in the dashboard until mika-spirit is restarted. The root cause is the server's `AsyncDatabase` connection getting pinned to a stale WAL snapshot.
 
 ## Symptoms
 
 - `sqlite3 ~/.mika/data/mika.db "SELECT COUNT(*) FROM sessions"` returns 5731
 - Dashboard API `/api/v1/sessions?page=1&per_page=1` shows total 5705
-- After `rc-service mika-server restart`, dashboard immediately shows all sessions
+- After `rc-service mika-spirit restart`, dashboard immediately shows all sessions
 - WAL file at 3.9MB confirms un-checkpointed writes
 
 ## What Didn't Work

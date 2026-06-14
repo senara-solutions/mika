@@ -387,8 +387,8 @@ After the smoke test passes, revert the temporary refusal-directive change.
 Per AC4, confirm tool-name collision from #934 does NOT re-emerge.
 
 Concrete check:
-1. After `make deploy`, restart mika-server.
-2. `grep -i "duplicate.*tool\|tool.*conflict\|dedup" ~/.mika/logs/mika-server.log | head`.
+1. After `make deploy`, restart mika-spirit.
+2. `grep -i "duplicate.*tool\|tool.*conflict\|dedup" ~/.mika/logs/mika-spirit.log | head`.
 3. Expected: zero matches related to `run_claude_pilot*`. The two tool names are distinct (`run_claude_pilot` and `run_claude_pilot_groom`), so the dedup path cannot fire on them.
 4. Also verify mika-dev's tool registry includes both: a quick `mika --agent mika-dev ask "list your tools"` should mention both names. (Or query via `gh issue view` for the actual state.)
 

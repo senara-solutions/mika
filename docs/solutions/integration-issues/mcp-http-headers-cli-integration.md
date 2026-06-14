@@ -27,7 +27,7 @@ related_files:
 Three gaps in the MCP integration prevented full use of the MCP ecosystem:
 
 1. **No HTTP headers** -- Remote MCP servers requiring authentication (Bearer tokens, API keys) could not be connected to. The `connect_http()` function called `StreamableHttpClientTransport::from_uri(url)` with no header support.
-2. **CLI modes had no MCP** -- Both `mika ask` and `mika` (chat) passed `mcp_manager: None` to `AgentParams`. Only server mode (`mika-server`) connected to MCP servers.
+2. **CLI modes had no MCP** -- Both `mika ask` and `mika` (chat) passed `mcp_manager: None` to `AgentParams`. Only server mode (`mika-spirit`) connected to MCP servers.
 3. **No enable/disable commands** -- Users could set `"enabled": false` in `mcp.json` manually, but there were no CLI commands to toggle servers without editing JSON.
 
 ## Root Cause

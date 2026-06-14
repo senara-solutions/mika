@@ -277,8 +277,8 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
 **Approach:**
 - Build: `cargo build --release --features telemetry`
-- Deploy: `make deploy` (rebuilds + restarts mika-server)
-- Wait for mika-server restart and skill registry reload (look for `INFO Skills registered` in server.log)
+- Deploy: `make deploy` (rebuilds + restarts mika-spirit)
+- Wait for mika-spirit restart and skill registry reload (look for `INFO Skills registered` in server.log)
 - Open a throwaway test issue on `senara-solutions/mika`, e.g. `test: ready-label dispatch verification`. Apply `ready` label.
 - Watch `/var/log/mika/gateway.log` for `GitHub event forwarded to agent container target_agent=mika-dev`
 - Watch `/var/log/mika/server.log` for `INFO run_claude_pilot invocation` with non-empty `task_id`

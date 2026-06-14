@@ -3,7 +3,7 @@
 # Mika OS entrypoint — boots OpenRC and supervises services.
 #
 # Lifecycle contract (F2):
-#   1. Boot OpenRC via `rc default` (dependency graph: net -> mika-server -> mika-gateway)
+#   1. Boot OpenRC via `rc default` (dependency graph: net -> mika-spirit -> mika-gateway)
 #   2. SIGTERM trap: stop services in reverse dependency order, then exit
 #   3. Child-exit: supervise-daemon handles respawn (respawn_delay=5, respawn_max=10, respawn_period=60)
 #   4. Container stays alive via `tail -F` on log files (backgrounded, trap remains active)
@@ -17,7 +17,7 @@ set -e
 shutdown() {
     echo "[mika-os-init] SIGTERM received, stopping services..."
     rc-service mika-gateway stop 2>/dev/null || true
-    rc-service mika-server stop 2>/dev/null || true
+    rc-service mika-spirit stop 2>/dev/null || true
     echo "[mika-os-init] Services stopped, exiting."
     exit 0
 }
@@ -51,9 +51,9 @@ echo "[mika-os-init] OpenRC boot complete. Services running."
 # Create log files if they don't exist yet (first boot)
 LOG_DIR="${MIKA_HOME:-/home/mika/.mika}/logs"
 mkdir -p "$LOG_DIR"
-touch "$LOG_DIR/mika-server.log" "$LOG_DIR/mika-gateway.log"
+touch "$LOG_DIR/mika-spirit.log" "$LOG_DIR/mika-gateway.log"
 
-tail -F "$LOG_DIR/mika-server.log" "$LOG_DIR/mika-gateway.log" &
+tail -F "$LOG_DIR/mika-spirit.log" "$LOG_DIR/mika-gateway.log" &
 TAIL_PID=$!
 
 # Wait for the tail process — trap will interrupt this on SIGTERM

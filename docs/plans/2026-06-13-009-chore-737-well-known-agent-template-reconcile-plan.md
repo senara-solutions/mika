@@ -115,7 +115,7 @@ If a soul.md contains a triple-`#` sequence (rare but possible if it documents `
 - `cargo test -p mika-agent` passes (existing + 2 new tests for U1/U2/U3)
 - `cargo clippy --workspace` clean
 - `cargo fmt --all -- --check` clean
-- Manual smoke (documented in PR description): on a fresh `~/.mika/` directory with `MIKA_DEV_MODE=true`, start mika-server. Verify `~/.mika/agents/mika-dev/soul.md` matches the const (byte-for-byte) and `identity.toml` carries `name = "Mika Dev"` with `[reflection]` absent.
+- Manual smoke (documented in PR description): on a fresh `~/.mika/` directory with `MIKA_DEV_MODE=true`, start mika-spirit. Verify `~/.mika/agents/mika-dev/soul.md` matches the const (byte-for-byte) and `identity.toml` carries `name = "Mika Dev"` with `[reflection]` absent.
 
 ## Risk / known unknowns
 

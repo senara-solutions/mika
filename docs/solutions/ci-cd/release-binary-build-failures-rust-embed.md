@@ -24,7 +24,7 @@ resolution_time: "1 hour"
 
 All release binary builds failed since v0.1.6. The `release.yml` workflow did not create the `dashboard/dist/` directory that `rust-embed` requires at compile time. The `mika` CLI binary transitively depends on `mika-agent` (which uses `#[derive(Embed)] #[folder = "../../dashboard/dist/"]`), so even building just the CLI failed.
 
-Additionally, only the `mika` CLI was published to GitHub Releases — the `mika-server` HTTP server binary was missing. Release names showed internal crate names (e.g., `mika-common-v0.3.1`) instead of clean version names.
+Additionally, only the `mika` CLI was published to GitHub Releases — the `mika-spirit` HTTP server binary was missing. Release names showed internal crate names (e.g., `mika-common-v0.3.1`) instead of clean version names.
 
 ## Root Cause
 
@@ -32,7 +32,7 @@ Three independent issues in the release pipeline:
 
 1. **Missing directory:** `release.yml` lacked the `mkdir -p dashboard/dist && touch dashboard/dist/.gitkeep` step that `ci.yml` and `release-plz.yml` already had. The `rust-embed` derive macro fails at compile time if the referenced directory does not exist.
 
-2. **Missing binary:** `release.yml` only had one `taiki-e/upload-rust-binary-action` step for the `mika` binary. The `mika-server` binary (a `[[bin]]` in the `mika-agent` crate) was not uploaded.
+2. **Missing binary:** `release.yml` only had one `taiki-e/upload-rust-binary-action` step for the `mika` binary. The `mika-spirit` binary (a `[[bin]]` in the `mika-agent` crate) was not uploaded.
 
 3. **Confusing names:** `release-plz.toml` lacked `git_release_name`, so the GitHub Release was named after the crate (`mika-common-v0.3.1`) rather than a clean version (`v0.3.1`).
 
@@ -47,16 +47,16 @@ Three independent issues in the release pipeline:
 
 This must appear before any Rust compilation step. The placeholder means zero dashboard assets are embedded (graceful degradation — `/dashboard/` shows a "disabled" page).
 
-### 2. Add mika-server binary upload
+### 2. Add mika-spirit binary upload
 
 ```yaml
-- name: Build and upload mika-server
+- name: Build and upload mika-spirit
   uses: taiki-e/upload-rust-binary-action@<sha>  # v1
   with:
-    bin: mika-server
+    bin: mika-spirit
     features: telemetry
     target: ${{ matrix.target }}
-    archive: mika-server-$tag-$target
+    archive: mika-spirit-$tag-$target
     checksum: sha256
     token: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -81,7 +81,7 @@ Belt-and-suspenders: also add `publish = false` to each crate's `Cargo.toml` to 
 
 - **Transitive dependency:** Even if you only build the `mika` CLI, it depends on `mika-agent` which triggers the `rust-embed` derive macro. Any workflow that compiles any binary in this workspace needs the `dashboard/dist/` directory.
 - **Empty vs missing (legacy):** Before #374, `rust-embed` with an empty directory embedded zero files (graceful) but a missing directory failed compilation. After #374, `build.rs` copies `dashboard/dist/` into `OUT_DIR/dashboard_dist/` and `#[allow_missing = true]` ensures compilation succeeds even if the directory is missing. CI placeholders (`mkdir -p dashboard/dist`) are kept for clarity but are no longer strictly required.
-- **Two upload steps, not one:** `taiki-e/upload-rust-binary-action` with `bin: mika,mika-server` would create a single combined archive. Separate steps create separate archives, which is correct for independent binaries.
+- **Two upload steps, not one:** `taiki-e/upload-rust-binary-action` with `bin: mika,mika-spirit` would create a single combined archive. Separate steps create separate archives, which is correct for independent binaries.
 - **Features parameter:** `features: telemetry` in the upload action maps to `--features telemetry` in cargo. Both `mika-cli` and `mika-agent` declare this feature and propagate it to `mika-common`.
 
 ## Prevention

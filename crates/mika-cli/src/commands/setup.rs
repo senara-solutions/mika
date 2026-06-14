@@ -236,8 +236,8 @@ fn run_server_prompts(
         println!("\n  Generated dashboard token.");
     }
 
-    // MIKA_SERVER_PORT (optional, default 8080) — non-secret, goes to config.toml
-    if !config_key_is_set(home_dir, "server_port") {
+    // MIKA_SPIRIT_PORT (optional, default 8080) — non-secret, goes to config.toml
+    if !config_key_is_set(home_dir, "spirit_port") {
         let port: String = Input::new()
             .with_prompt("  Server port (default: 8080)")
             .default("8080".to_string())
@@ -249,7 +249,7 @@ fn run_server_prompts(
                 .map_err(|_| anyhow::anyhow!("Invalid port number: {port}"))?;
             set_config_toml_value(
                 home_dir,
-                "server_port",
+                "spirit_port",
                 toml::Value::Integer(i64::from(port_num)),
             )?;
             *config_written = true;
@@ -470,7 +470,7 @@ fn run_compose_generation() -> Result<()> {
     lines.push(String::new());
 
     // Agent / Server
-    lines.push("# ── Agent (mika-server) ──".to_string());
+    lines.push("# ── Agent (mika-spirit) ──".to_string());
     lines.push("MIKA_ROUTING_URL=http://gateway:8080".to_string());
     lines.push(format!("MIKA_DASHBOARD_TOKEN={dashboard_token}"));
     lines.push(String::new());

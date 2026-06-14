@@ -1,4 +1,4 @@
-# Plan: bug(gateway): webhook deliveries during mika-server restart get permanent-no-retry
+# Plan: bug(gateway): webhook deliveries during mika-spirit restart get permanent-no-retry
 
 **Ticket:** mika issue#1293
 **Type:** bug fix
@@ -6,7 +6,7 @@
 
 ## Problem
 
-When mika-server restarts (e.g., during `make deploy`), in-flight webhook deliveries from `mika-gateway` fail with a connection error. The error classification at line 953 of `github.rs` treats `e.is_connect()` as `ForwardResult::Permanent`, which:
+When mika-spirit restarts (e.g., during `make deploy`), in-flight webhook deliveries from `mika-gateway` fail with a connection error. The error classification at line 953 of `github.rs` treats `e.is_connect()` as `ForwardResult::Permanent`, which:
 
 1. Stops retries immediately (the retry loop only retries `Retryable` results)
 2. Returns without persisting to the DLQ (only `Retryable`-exhausted events reach DLQ insertion at line 1163)
@@ -70,7 +70,7 @@ Err(e) => {
 The net change is: `e.is_connect()` on localhost routes flips from `Permanent` to `Retryable`. Non-localhost connection errors and the `else` branch are unchanged. This means:
 
 - For localhost connection errors, the retry loop applies the existing `[2s, 5s, 15s, 60s, 300s]` schedule (6 attempts total, 382s worst-case)
-- If mika-server comes back within that window (typical restart is 30-60s), the event delivers on retry 2-4
+- If mika-spirit comes back within that window (typical restart is 30-60s), the event delivers on retry 2-4
 - If all retries fail, the event is persisted to the DLQ (line 1163) instead of being dropped
 - The DLQ background worker (30s tick, exponential backoff up to 1h, 10 max attempts) provides a safety net
 - Non-localhost connection errors remain `Permanent` — identical to current behavior
@@ -166,7 +166,7 @@ Both tests assert the `ForwardResult` variant directly via `matches!()`. The fir
 
 1. `cargo test -p mika-gateway` — all existing tests pass with updated assertions
 2. `cargo clippy -p mika-gateway` — no warnings
-3. Manual: trigger a webhook during `make deploy` — event should deliver after mika-server restart completes (currently fails with permanent-no-retry)
+3. Manual: trigger a webhook during `make deploy` — event should deliver after mika-spirit restart completes (currently fails with permanent-no-retry)
 
 ## Revision history
 

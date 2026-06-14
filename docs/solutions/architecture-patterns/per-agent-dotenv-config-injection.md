@@ -33,7 +33,7 @@ Two startup paths skipped per-agent `.env`:
 
 1. **CLI agent mode** (`main.rs`): Loaded global `.env` at line 152, then resolved
    `agent_home` later at line 158. Per-agent `.env` was never loaded.
-2. **Server mode** (`mika-server.rs`): Loaded global `.env` once at process start.
+2. **Server mode** (`mika-spirit.rs`): Loaded global `.env` once at process start.
    `init_agent()` called `Settings::load_for_agent()` which reads process env vars,
    but per-agent `.env` was never in the process environment.
 

@@ -315,7 +315,7 @@ fn build_mika_arch_identity(settings: &Settings) -> Result<String, String> {
         if !path.is_absolute() {
             return Err(format!(
                 "MIKA_KG_DOCS_ROOTS contains a relative path '{s}'; mika-arch \
-                 requires absolute paths because mika-server runs with CWD=/ \
+                 requires absolute paths because mika-spirit runs with CWD=/ \
                  in production"
             ));
         }

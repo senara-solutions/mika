@@ -151,7 +151,7 @@ cargo fmt --check
 
 The compound doc trace `03d3ec38-0839-47b6-9226-111b38d8b52b` is the pre-fix fingerprint. After deploy:
 
-1. Restart mika-server.
+1. Restart mika-spirit.
 2. Run a mika-arch CLI ask that historically triggered the fabrication (e.g., a complex multi-source brief with embedded GitHub references that should be cross-checked via `gh_read`).
 3. Inspect the resulting session in `~/.mika/data/mika.db`:
    ```sql

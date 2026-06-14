@@ -10,13 +10,13 @@ origin: senara-solutions/mika#1379
 
 ## Overview
 
-Add a new `ProviderKind::MikaModel` variant to the `LlmProvider` registry so mika-server can route LLM calls to a closed-source internal model. Phase 1: served by a local Ollama runtime, talked to via the existing `OllamaProvider` transport. Phase 2 (deferred): hosted endpoint behind the same wire protocol, swap via the `mikamodel_base_url` config key.
+Add a new `ProviderKind::MikaModel` variant to the `LlmProvider` registry so mika-spirit can route LLM calls to a closed-source internal model. Phase 1: served by a local Ollama runtime, talked to via the existing `OllamaProvider` transport. Phase 2 (deferred): hosted endpoint behind the same wire protocol, swap via the `mikamodel_base_url` config key.
 
 The integration must be **independent from the generic Ollama provider** so the operator can run general-purpose models (`ollama_*`) and the internal model (`mikamodel_*`) on the same agent without their config namespaces colliding. It must also **preserve the closed-source posture**: no public-source references to model lineage, training venue, or internal codenames.
 
 ## Problem Frame
 
-The closed-source model lives in `wizzard/` and is shipped via a GGUF artifact run by Ollama. Today nothing in mika-server knows it exists — there's no `ProviderKind` for it, so `MIKA_LLM_PROVIDER=...` cannot select it and no `mikamodel_*` config keys flow through. The model is built and locally serving (verified end-to-end via the wizzard#1 Modelfile-template fix: `curl /api/chat` returns a structured `tool_calls` array on tool-eliciting queries), but it is unreachable from the agent loop.
+The closed-source model lives in `wizzard/` and is shipped via a GGUF artifact run by Ollama. Today nothing in mika-spirit knows it exists — there's no `ProviderKind` for it, so `MIKA_LLM_PROVIDER=...` cannot select it and no `mikamodel_*` config keys flow through. The model is built and locally serving (verified end-to-end via the wizzard#1 Modelfile-template fix: `curl /api/chat` returns a structured `tool_calls` array on tool-eliciting queries), but it is unreachable from the agent loop.
 
 Constraints:
 

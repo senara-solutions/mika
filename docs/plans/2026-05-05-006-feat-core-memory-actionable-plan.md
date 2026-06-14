@@ -334,7 +334,7 @@ Agent Detail Page
 - **Error propagation:** New endpoints follow existing error handling (internal_error helper). Frontend uses `<ErrorState />`.
 - **State lifecycle risks:** None — read-only operations.
 - **API surface parity:** New `GET /agents/:id/facts` endpoint. Audit endpoint gains backward-compatible optional params.
-- **Integration coverage:** Frontend↔backend integration verified by dashboard build + manual testing with running mika-server.
+- **Integration coverage:** Frontend↔backend integration verified by dashboard build + manual testing with running mika-spirit.
 - **Unchanged invariants:** Core memory write path, agent loop, tool execution, audit logging — all unchanged. The dashboard is purely a read surface.
 
 ## Risks & Dependencies
@@ -347,7 +347,7 @@ Agent Detail Page
 
 ## Documentation / Operational Notes
 
-- `docs/openapi/mika-server.yaml` may need updating to include the new `/agents/:id/facts` endpoint — verify and update if the spec is actively maintained.
+- `docs/openapi/mika-spirit.yaml` may need updating to include the new `/agents/:id/facts` endpoint — verify and update if the spec is actively maintained.
 - No migration required — all schema tables already exist.
 - No new environment variables.
 

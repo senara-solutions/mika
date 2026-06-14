@@ -16,7 +16,7 @@ Per-agent `.env` files (`~/.mika/agents/<name>/.env`) are never loaded in CLI ag
 Two startup paths skip per-agent `.env`:
 
 1. **CLI agent mode** (`crates/mika-cli/src/main.rs:149-154`): Loads global `.env` at line 152, never loads per-agent `.env`. The `agent_home` is resolved later at line 158.
-2. **Server mode** (`crates/mika-agent/src/bin/mika-server.rs:6`): Loads global `.env` once. `init_agent()` in `server/mod.rs:288` calls `Settings::load_for_agent()` which reads process env vars — but per-agent `.env` was never loaded into them.
+2. **Server mode** (`crates/mika-agent/src/bin/mika-spirit.rs:6`): Loads global `.env` once. `init_agent()` in `server/mod.rs:288` calls `Settings::load_for_agent()` which reads process env vars — but per-agent `.env` was never loaded into them.
 
 ## Fix
 
@@ -162,7 +162,7 @@ async fn init_agent(
 ## Acceptance Criteria
 
 - [x] `mika chat` / `mika ask` loads per-agent `.env` before global `.env`
-- [x] `mika-server` agents each get their own `.env` values via Settings
+- [x] `mika-spirit` agents each get their own `.env` values via Settings
 - [x] Per-agent GitHub App credentials resolve correctly in server mode
 - [x] Shell env vars still override `.env` values
 - [x] `GH_TOKEN` scrubbing (`check_env_warnings`) still runs
@@ -180,6 +180,6 @@ async fn init_agent(
 - GH_TOKEN defense: `docs/solutions/security-issues/gh-token-identity-collision-dotenv-leak.md`
 - dotenv module: `crates/mika-common/src/dotenv.rs`
 - CLI entry: `crates/mika-cli/src/main.rs:149-154`
-- Server entry: `crates/mika-agent/src/bin/mika-server.rs:6`
+- Server entry: `crates/mika-agent/src/bin/mika-spirit.rs:6`
 - Agent init: `crates/mika-agent/src/server/mod.rs:288`
 - Settings loader: `crates/mika-common/src/config.rs:955`

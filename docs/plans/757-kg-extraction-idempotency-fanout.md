@@ -24,7 +24,7 @@ Explicit non-goal: per-chunk refactoring of the extractor. In scope: a schema v2
 
 ## Problem Frame
 
-**Incident (2026-04-23 09:08 UTC):** `sudo rc-service mika-server restart` triggered 30,400 LLM calls in 38 min (~800/min) across 11 agents on `claude-haiku-4-5`. 1,044 `credit balance too low` 400s logged. Default `mika` chat responses silently degraded for ~3h until Vincent noticed. Estimated cost: $40–60. KG resolution state left half-drained (50–92% pending per agent).
+**Incident (2026-04-23 09:08 UTC):** `sudo rc-service mika-spirit restart` triggered 30,400 LLM calls in 38 min (~800/min) across 11 agents on `claude-haiku-4-5`. 1,044 `credit balance too low` 400s logged. Default `mika` chat responses silently degraded for ~3h until Vincent noticed. Estimated cost: $40–60. KG resolution state left half-drained (50–92% pending per agent).
 
 **Structural issues:**
 
@@ -232,7 +232,7 @@ After make_kg_extraction_provider() returns Some(Ok(llm)):
 
 **Verification:**
 - `cargo test -p mika-common config::` passes.
-- Manual: starting mika-server with multiple agents configured + `MIKA_KG_INGESTION_MODEL=openrouter/...` emits exactly one `kg_shared_docs_root` INFO with the full agent list; no `kg_anthropic_provider` WARN.
+- Manual: starting mika-spirit with multiple agents configured + `MIKA_KG_INGESTION_MODEL=openrouter/...` emits exactly one `kg_shared_docs_root` INFO with the full agent list; no `kg_anthropic_provider` WARN.
 - Manual: swapping to `anthropic/*` emits one `kg_anthropic_provider` WARN per role (extraction + resolution).
 
 - [ ] **Unit 2: Schema v26 migration + budget-guarded `extract_pending` with doc-hash idempotency marker**

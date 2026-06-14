@@ -11,7 +11,7 @@ severity: high
 
 ## Problem
 
-After the per-provider LLM config was introduced (2026-03-22), `MIKA_LLM_API_KEY` became a dead env var — it had no corresponding field in the `Settings` struct, so config-rs never read it. However, `setup.rs`, `doctor.rs`, `claude.rs`, and `mika-server.rs` all still referenced it in user-facing code.
+After the per-provider LLM config was introduced (2026-03-22), `MIKA_LLM_API_KEY` became a dead env var — it had no corresponding field in the `Settings` struct, so config-rs never read it. However, `setup.rs`, `doctor.rs`, `claude.rs`, and `mika-spirit.rs` all still referenced it in user-facing code.
 
 This created a split-brain:
 - `mika setup` wrote `MIKA_LLM_API_KEY` to `~/.mika/.env`
@@ -30,7 +30,7 @@ The per-provider config migration (introducing `MIKA_ANTHROPIC_API_KEY`, `MIKA_O
    - `setup.rs` (interactive wizard, non-interactive `--api-key`, OAuth flow, docker-compose)
    - `doctor.rs` (health check env var and `.env` file scan)
    - `claude.rs` (error messages)
-   - `mika-server.rs` (startup error message)
+   - `mika-spirit.rs` (startup error message)
    - `smoke.rs` (test env var)
    - Comments in `executor.rs` and `mcp/mod.rs`
 

@@ -279,12 +279,12 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         backend: ConfigBackend::File,
         env_var: Some("MIKA_LOG_FORMAT"),
         secret: false,
-        description: "Stdout log format for mika-server and mika-gateway (json or pretty). CLI always uses pretty.",
+        description: "Stdout log format for mika-spirit and mika-gateway (json or pretty). CLI always uses pretty.",
     },
     ConfigKeyInfo {
-        key: "server_port",
+        key: "spirit_port",
         backend: ConfigBackend::File,
-        env_var: Some("MIKA_SERVER_PORT"),
+        env_var: Some("MIKA_SPIRIT_PORT"),
         secret: false,
         description: "HTTP server port",
     },
@@ -479,7 +479,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "llm_max_tokens" => Some(settings.llm_max_tokens.to_string()),
         "log_level" => Some(settings.log_level.clone()),
         "log_format" => Some(settings.log_format.clone()),
-        "server_port" => Some(settings.server_port.to_string()),
+        "spirit_port" => Some(settings.spirit_port.to_string()),
         "embedding_model" => Some(settings.embedding_model.clone()),
         "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
         "dashboard_enabled" => Some(settings.dashboard_enabled.to_string()),
@@ -703,8 +703,8 @@ pub struct Settings {
     pub customer_id: Option<String>,
 
     /// HTTP server port (default: 8080, only used in server mode)
-    #[serde(default = "default_server_port")]
-    pub server_port: u16,
+    #[serde(default = "default_spirit_port")]
+    pub spirit_port: u16,
 
     /// Internal bearer token for gateway ↔ container auth
     #[serde(default)]
@@ -731,9 +731,9 @@ pub struct Settings {
     #[serde(default)]
     pub brave_api_key: Option<SecretString>,
 
-    /// Optional log file path for mika-server (maps to MIKA_SERVER_LOG_FILE)
+    /// Optional log file path for mika-spirit (maps to MIKA_SPIRIT_LOG_FILE)
     #[serde(default)]
-    pub server_log_file: Option<PathBuf>,
+    pub spirit_log_file: Option<PathBuf>,
 
     /// GitHub Personal Access Token for agent operations (context injection, task enrichment, PR merge).
     /// No fallback — `investigate_github_token` is used only by the investigation panel.
@@ -972,7 +972,7 @@ fn default_log_format() -> String {
     "json".to_string()
 }
 
-fn default_server_port() -> u16 {
+fn default_spirit_port() -> u16 {
     8080
 }
 
@@ -1412,7 +1412,7 @@ impl Settings {
             log_format: "json".to_string(),
             routing_url: None,
             customer_id: None,
-            server_port: 8080,
+            spirit_port: 8080,
             internal_token: None,
             dashboard_token: None,
             openai_api_key: None,
@@ -1427,7 +1427,7 @@ impl Settings {
             github_app_installation_id: None,
             github_app_login: None,
             home_dir: PathBuf::from("/tmp"),
-            server_log_file: None,
+            spirit_log_file: None,
             dashboard_enabled: false,
             disable_bundled_skills: false,
             dev_mode: false,
@@ -1523,7 +1523,7 @@ impl std::fmt::Debug for Settings {
             .field("log_format", &self.log_format)
             .field("routing_url", &self.routing_url)
             .field("customer_id", &self.customer_id)
-            .field("server_port", &self.server_port)
+            .field("spirit_port", &self.spirit_port)
             .field(
                 "internal_token",
                 &self.internal_token.as_ref().map(|_| "[REDACTED]"),
@@ -1557,7 +1557,7 @@ impl std::fmt::Debug for Settings {
                 &self.github_app_installation_id,
             )
             .field("github_app_login", &self.github_app_login)
-            .field("server_log_file", &self.server_log_file)
+            .field("spirit_log_file", &self.spirit_log_file)
             .field("dashboard_enabled", &self.dashboard_enabled)
             .field("disable_bundled_skills", &self.disable_bundled_skills)
             .field("dev_mode", &self.dev_mode)

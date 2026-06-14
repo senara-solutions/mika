@@ -56,13 +56,13 @@ Three execution contexts (startup, compound-hook, tick) can overlap. `kg_resolut
 
 ## Pattern Reference
 
-Mirrors `server::checkpoint::spawn_dashboard_checkpoint_task()` — interval-based tokio task with fail-open error handling and runtime-drop lifecycle. This is the canonical pattern for periodic background tasks in mika-server.
+Mirrors `server::checkpoint::spawn_dashboard_checkpoint_task()` — interval-based tokio task with fail-open error handling and runtime-drop lifecycle. This is the canonical pattern for periodic background tasks in mika-spirit.
 
 ## Lessons
 
 1. **Cadence vs burst** — When a budget-bounded operation needs higher throughput, prefer increasing execution cadence over raising the per-execution budget. Cadence is self-limiting (bounded by interval); budget increases compound across agents.
 2. **Deferred runs need a mechanism** — mika#757's AC said "leave remaining work for subsequent deferred runs" but didn't build the deferred-run mechanism. Design documents that reference future deferred execution should either build the mechanism or explicitly log a follow-up ticket.
-3. **Pattern precedent** — The `checkpoint_task` pattern (interval + fail-open + runtime-drop lifecycle) is reusable for any periodic background work in mika-server. New periodic tasks should follow this pattern.
+3. **Pattern precedent** — The `checkpoint_task` pattern (interval + fail-open + runtime-drop lifecycle) is reusable for any periodic background work in mika-spirit. New periodic tasks should follow this pattern.
 
 ## Counter contract (added 2026-05-06)
 

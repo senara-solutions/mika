@@ -48,7 +48,7 @@ This follows the same sync-to-async bridging pattern as the existing `pending_co
 ### 3. Process in `tick()` (async context)
 
 The `tick()` method handles `pending_dashboard_action` right after `pending_command`:
-- Start/Stop: HTTP POST to mika-server toggle endpoints, update `dashboard_running` state
+- Start/Stop: HTTP POST to mika-spirit toggle endpoints, update `dashboard_running` state
 - Open: call `open_dashboard_in_browser()` (safe here because output goes to `ChatMessage`, not stdout)
 
 ### 4. Fix `open_dashboard_in_browser()` to return `String`

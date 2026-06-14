@@ -82,7 +82,7 @@ All per-agent and per-team SQLite files merge into `~/.mika/data/mika.db`. Agent
 │  │                  │   └──────────────┘                        │
 │  │  send_message    │                                            │
 │  │  resume_agent    │   ┌──────────────────────────────────┐    │
-│  │  inject_context  │   │  Axum server (mika-server)        │    │
+│  │  inject_context  │   │  Axum server (mika-spirit)        │    │
 │  │  run_skill       │   │                                   │    │
 │  │  invoke_orch.    │   │  POST /message                    │    │
 │  └──────────────────┘   │  POST /heartbeat  (→ task lookup) │    │
@@ -905,7 +905,7 @@ New tool: **`ask_user` tool** (builtin, not skill):
   - Agent container's `TaskEngine.complete_task()` fires → `dispatch_resume_agent()`
 - If no pending `user_reply` task (or expired): normal `POST /message` routing
 
-New endpoint on `mika-server`:
+New endpoint on `mika-spirit`:
 - `GET /tasks/pending_user_reply` → returns `{task_id, label, timeout_at}` if a user_reply task is pending, else 404
 - `POST /tasks/{id}/complete` → accepts `{"result": <json>}`, calls `engine.complete_task(id, result)`
 
@@ -1032,7 +1032,7 @@ if output.is_long_running_submitted() {
 - `crates/mika-agent/src/db.rs` — remove all `reminders`-related methods
 - `crates/mika-agent/src/async_db.rs` — remove reminder methods
 - `crates/mika-common/src/home.rs` — remove per-agent DB path helpers (or keep for filesystem structure)
-- `docs/openapi/mika-server.yaml` — update to add `/tasks/{id}/complete`, `GET /tasks/pending_user_reply`; update or remove `/heartbeat` if removed
+- `docs/openapi/mika-spirit.yaml` — update to add `/tasks/{id}/complete`, `GET /tasks/pending_user_reply`; update or remove `/heartbeat` if removed
 - `CLAUDE.md` — update schema version to 12, update Architecture section, update features table
 - `.env.example` — remove any calendar sidecar env vars if present
 
@@ -1133,7 +1133,7 @@ Don't convert team delegation to async tasks; keep `JoinSet` blocking.
 
 ### API Surface Parity
 
-**New endpoints on `mika-server`:**
+**New endpoints on `mika-spirit`:**
 - `GET /tasks/pending_user_reply?agent_id={id}` — gateway calls this before routing
 - `POST /tasks/{id}/complete` — background processes and gateway call this
 
@@ -1242,7 +1242,7 @@ Don't convert team delegation to async tasks; keep `JoinSet` blocking.
 ## Documentation Plan
 
 - `CLAUDE.md` — update schema version (11→12), Architecture section (DB topology, task engine, new capabilities), Environment Variables (remove calendar sidecar vars if any)
-- `docs/openapi/mika-server.yaml` — add `GET /tasks/pending_user_reply`, `POST /tasks/{id}/complete`; update or remove `/heartbeat`
+- `docs/openapi/mika-spirit.yaml` — add `GET /tasks/pending_user_reply`, `POST /tasks/{id}/complete`; update or remove `/heartbeat`
 - `docs/adr/` — new ADR for unified task engine decision
 - `docs/configuration.md` — update any references to per-agent DB paths
 - `docs/architecture.md` — update DB schema appendix

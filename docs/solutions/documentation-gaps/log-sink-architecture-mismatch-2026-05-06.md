@@ -4,10 +4,10 @@ date: "2026-05-06"
 problem_type: documentation_gap
 component: documentation
 severity: medium
-tags: [logging, tracing, mika-server, mika-cli, audit, observability]
+tags: [logging, tracing, mika-spirit, mika-cli, audit, observability]
 applies_when:
   - Audit tooling reads per-agent log files for server-mode events
-  - Operators expect mika-server runtime events in ~/.mika/agents/<name>/logs/
+  - Operators expect mika-spirit runtime events in ~/.mika/agents/<name>/logs/
   - Debugging autonomous-loop issues using per-agent CLI log paths
 ---
 
@@ -25,7 +25,7 @@ mika has **two distinct log sinks**, each written by a different process:
 
 | Sink | Process | Path | Contains |
 |------|---------|------|----------|
-| Server log | `mika-server` (long-running daemon) | `MIKA_SERVER_LOG_FILE` (default: `/var/log/mika/server.log`) | All runtime events: skill execution, task engine, callbacks, autonomous-loop lifecycle |
+| Server log | `mika-spirit` (long-running daemon) | `MIKA_SPIRIT_LOG_FILE` (default: `/var/log/mika/server.log`) | All runtime events: skill execution, task engine, callbacks, autonomous-loop lifecycle |
 | Per-agent CLI log | `mika` CLI (`mika ask`, `mika chat`) | `~/.mika/agents/<name>/logs/mika.log.YYYY-MM-DD` | Events from discrete CLI invocations only |
 
 **The key insight:** Both sinks write the same structured JSON with an `agent_id` field. The CLI log is per-agent by path; the server log is per-agent by filter. They are not duplicates — they capture events from different processes.
@@ -40,7 +40,7 @@ mika has **two distinct log sinks**, each written by a different process:
 
 Audit tooling that reads only the per-agent CLI log path will find it nearly empty for server-mode events. This creates false "sparse logging" reports and blocks debugging of autonomous-loop issues. The data exists — it's just in the server log, not where the audit recipe looked.
 
-The single-sink rationale for mika-server (no per-agent file appenders) is intentional:
+The single-sink rationale for mika-spirit (no per-agent file appenders) is intentional:
 1. Per-agent appenders would double disk-write rate per event
 2. Sync gaps risk if a per-agent appender worker can't keep up
 3. Duplicates data already addressable via `agent_id` JSON field

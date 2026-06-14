@@ -4,10 +4,10 @@ title: "Adding Log Format Selection to tracing_subscriber Init"
 date: 2026-03-15
 components:
   - crates/mika-common (logging.rs, config.rs)
-  - crates/mika-agent (mika-server binary)
+  - crates/mika-agent (mika-spirit binary)
   - crates/mika-gateway (settings.rs, main.rs)
 symptoms:
-  - mika-server and mika-gateway always output JSON logs
+  - mika-spirit and mika-gateway always output JSON logs
   - No way to get human-readable logs during local development
 root_cause: >
   logging::init() hardcoded .json().flatten_event(true) for the stdout layer.
@@ -22,7 +22,7 @@ keywords:
 
 ## Problem
 
-mika-server and mika-gateway always output JSON structured logs, which are
+mika-spirit and mika-gateway always output JSON structured logs, which are
 hard to read during local development. The CLI already had `init_pretty()`
 for human-readable output, but there was no way to switch server/gateway
 stdout between JSON and pretty format.

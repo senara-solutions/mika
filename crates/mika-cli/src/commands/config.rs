@@ -421,7 +421,7 @@ pub(crate) fn write_config_toml(path: &Path, key: &str, value: &str) -> Result<(
 
     // Set the value with appropriate type
     let toml_value = match key {
-        "llm_max_tokens" | "server_port" | "embedding_dimensions" => {
+        "llm_max_tokens" | "spirit_port" | "embedding_dimensions" => {
             let n: i64 = value
                 .parse()
                 .map_err(|_| anyhow::anyhow!("{key} must be an integer"))?;

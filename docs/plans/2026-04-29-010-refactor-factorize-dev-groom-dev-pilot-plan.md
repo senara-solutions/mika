@@ -108,7 +108,7 @@ dev-pilot's handler currently invokes `scripts/derive-branch-name` from the meta
 ```sh
 # Single entrypoint. Args: $1 = entry slash command (e.g., "/mika" or "/mika-groom-ticket")
 # Reads JSON from process stdin (fd 0) — inherited from the calling handler script,
-# which mika-server connects to the webhook payload per existing exec-handler protocol.
+# which mika-spirit connects to the webhook payload per existing exec-handler protocol.
 # Caller MUST NOT pipe explicitly into this function; stdin is process-inherited.
 # Sets up worktree, scrubs env, invokes relay, installs EXIT trap, exec's claude-pilot.
 # EXIT trap is installed by this function at call-time. Callers MUST NOT set their own
@@ -124,7 +124,7 @@ dispatch_claude_pilot() {
 
 That's the single API surface. Internal helpers (e.g., `_parse_input_json`, `_set_up_worktree`, `_scrub_env`, `_dispatch_lib_exit_trap`) are file-private (underscore-prefixed) and not part of the contract.
 
-**Stdin contract (per architect F8):** The function reads JSON from process-inherited stdin (fd 0). Callers do NOT pipe — the handler script is invoked by mika-server with stdin already connected to the webhook payload, and that fd 0 is inherited through the function call. Choosing this path (vs. a `caller pipes JSON via |`) keeps the wrapper symmetric with mika-server's existing exec-handler convention.
+**Stdin contract (per architect F8):** The function reads JSON from process-inherited stdin (fd 0). Callers do NOT pipe — the handler script is invoked by mika-spirit with stdin already connected to the webhook payload, and that fd 0 is inherited through the function call. Choosing this path (vs. a `caller pipes JSON via |`) keeps the wrapper symmetric with mika-spirit's existing exec-handler convention.
 
 **EXIT trap reentrancy (per architect F9):** The trap is installed inside `dispatch_claude_pilot()` at call time. This explicitly overwrites any prior trap (bash `trap` is process-scoped, not function-scoped). Callers MUST NOT install their own EXIT trap before calling this function — doing so would be silently overwritten. The thin wrapper above does not set a trap; the function does.
 

@@ -14,7 +14,7 @@ The `deploy_mika` tool is long-running:
 
 ### What it does
 
-Deploys all 3 mika binaries (`mika`, `mika-server`, `mika-gateway`):
+Deploys all 3 mika binaries (`mika`, `mika-spirit`, `mika-gateway`):
 
 1. Acquires a file lock (only one deploy at a time)
 2. Validates the path (security prefix check)
@@ -23,7 +23,7 @@ Deploys all 3 mika binaries (`mika`, `mika-server`, `mika-gateway`):
    - Backs up the current binary
    - Copies the new binary to `~/.local/bin/`
    - On copy failure: restores backup
-4. Restarts `mika-server` and `mika-gateway` via `rc-service` (OpenRC)
+4. Restarts `mika-spirit` and `mika-gateway` via `rc-service` (OpenRC)
 5. Reports per-binary and per-service status
 
 Binaries that don't exist in `target/release/` are skipped (not all builds produce all 3).

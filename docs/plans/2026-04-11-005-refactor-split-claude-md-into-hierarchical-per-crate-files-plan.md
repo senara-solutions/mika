@@ -25,7 +25,7 @@ Split into 7 files. Root becomes a compact index (~20k); crate-specific detail m
 | File | Target chars | Content scope |
 |------|-------------|---------------|
 | `CLAUDE.md` (root) | ~20k | Project overview, stack summary, directory index, cross-cutting conventions, env vars, commands, versioning, pending work, workspace context |
-| `crates/mika-agent/CLAUDE.md` | ~30k | Agent loop, skills system, task engine, tools, memory model, work items, management tools, observability, silent mode, compaction, rewind, schema version (condensed), mika-server HTTP endpoints, PR merge gate |
+| `crates/mika-agent/CLAUDE.md` | ~30k | Agent loop, skills system, task engine, tools, memory model, work items, management tools, observability, silent mode, compaction, rewind, schema version (condensed), mika-spirit HTTP endpoints, PR merge gate |
 | `crates/mika-gateway/CLAUDE.md` | ~5k | Webhook routing, GitHub App integration, A2A proxy, gateway-specific env vars, request logging, agent identification, reply routing, build.rs |
 | `crates/mika-cli/CLAUDE.md` | ~4k | TUI, clap subcommands, slash commands, tab completion, input modes, `mika ask` flags, team mode CLI, dashboard CLI |
 | `crates/mika-common/CLAUDE.md` | ~4k | Config system, LLM providers, Claude API client, prompt caching, OAuth, GitHub App auth, model list cache, MockLlmProvider, typed errors, internal tag stripping, XML tool call extraction |

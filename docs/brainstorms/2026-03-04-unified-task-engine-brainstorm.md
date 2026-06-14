@@ -545,7 +545,7 @@ Since there's no backward compatibility constraint (single user), the migration 
 
 1. **`event` trigger source format:** Calendar events come from an external skill. How does the skill communicate the event's `fire_at` to the task engine? The task needs `event_at` (when the event starts) and `event_offset_secs` (how early to fire). The calendar sync skill creates tasks; the engine fires them. The `event_source` column carries the calendar event ID for deduplication on re-sync.
 
-2. **Server mode: where does the `POST /tasks/{id}/complete` endpoint live?** On the `mika-server` binary. Background processes POST directly to `mika-server`'s local endpoint (within the container). The gateway is not involved — it's container-internal only.
+2. **Server mode: where does the `POST /tasks/{id}/complete` endpoint live?** On the `mika-spirit` binary. Background processes POST directly to `mika-spirit`'s local endpoint (within the container). The gateway is not involved — it's container-internal only.
 
 3. **Max concurrent pending tasks per agent:** Suggested cap: 100 pending tasks (check at create time). Seems large enough to never matter in practice. This is an implementation detail for the planning phase.
 

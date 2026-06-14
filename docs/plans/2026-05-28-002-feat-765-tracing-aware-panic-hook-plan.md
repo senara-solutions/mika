@@ -1,4 +1,4 @@
-# Plan: Tracing-Aware Panic Hook for mika-server
+# Plan: Tracing-Aware Panic Hook for mika-spirit
 
 **Ticket:** mika issue#765
 **Type:** feat
@@ -12,15 +12,15 @@ Per-site `handle.await` + `JoinError::is_panic()` patterns (already in place for
 
 ## Approach
 
-Install a `std::panic::set_hook` in the mika-server binary that emits a `tracing::error!` event with structured fields before chaining to the previous hook. The hook must be installed before any tokio work is spawned.
+Install a `std::panic::set_hook` in the mika-spirit binary that emits a `tracing::error!` event with structured fields before chaining to the previous hook. The hook must be installed before any tokio work is spawned.
 
 ### Key Design Decisions
 
 1. **Chain, don't replace.** Use `std::panic::take_hook()` to capture the previous hook and call it after logging. This preserves default backtrace output (`RUST_BACKTRACE`) and test framework hooks.
 
-2. **Install location: `main()` in `mika-server.rs`, after tracing init but before `run_server()`.** The `#[tokio::main]` macro creates the runtime before entering `main()`, but no work is spawned until `run_server()`. Tracing must be initialized first so the `tracing::error!` call inside the hook actually reaches the subscriber.
+2. **Install location: `main()` in `mika-spirit.rs`, after tracing init but before `run_server()`.** The `#[tokio::main]` macro creates the runtime before entering `main()`, but no work is spawned until `run_server()`. Tracing must be initialized first so the `tracing::error!` call inside the hook actually reaches the subscriber.
 
-3. **Scoped to mika-server only.** The CLI (`mika`) and gateway (`mika-gateway`) don't have the same long-running background-task problem. If they need it later, the helper can be extracted to `mika-common`.
+3. **Scoped to mika-spirit only.** The CLI (`mika`) and gateway (`mika-gateway`) don't have the same long-running background-task problem. If they need it later, the helper can be extracted to `mika-common`.
 
 4. **Helper function in a new module.** Create `crates/mika-agent/src/panic_hook.rs` with an `install_tracing_panic_hook()` function. This keeps the binary entry point clean and makes the hook testable.
 
@@ -73,12 +73,12 @@ pub fn install_tracing_panic_hook() {
 - Payload extraction mirrors the existing pattern in `server/mod.rs:1050-1056`
 - Thread name included for identifying which tokio worker thread panicked
 
-### Step 2: Register the module and wire into mika-server
+### Step 2: Register the module and wire into mika-spirit
 
 **File:** `crates/mika-agent/src/lib.rs`
 - Add `pub mod panic_hook;`
 
-**File:** `crates/mika-agent/src/bin/mika-server.rs`
+**File:** `crates/mika-agent/src/bin/mika-spirit.rs`
 - Add call to `mika_agent::panic_hook::install_tracing_panic_hook()` after the `_log_guard` initialization (line 30) and before `run_server()` (line 32).
 
 ```rust
@@ -131,7 +131,7 @@ This directly validates the motivating use case: a spawned task with a dropped h
 |------|--------|
 | `crates/mika-agent/src/panic_hook.rs` | **New** — panic hook module with `install_tracing_panic_hook()` + tests |
 | `crates/mika-agent/src/lib.rs` | Add `pub mod panic_hook;` |
-| `crates/mika-agent/src/bin/mika-server.rs` | Add hook installation call after tracing init |
+| `crates/mika-agent/src/bin/mika-spirit.rs` | Add hook installation call after tracing init |
 
 ## Out of Scope
 

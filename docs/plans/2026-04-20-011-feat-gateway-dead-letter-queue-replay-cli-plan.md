@@ -53,7 +53,7 @@ This feature adds persistence for failed deliveries, automatic background retry,
 - `crates/mika-gateway/migrations/` — 5 existing Postgres migrations
 - `crates/mika-cli/src/cli.rs` — `Commands` enum with clap subcommands
 - `crates/mika-cli/src/commands/mod.rs` — 18 existing command modules
-- CLI commands that talk to remote services use `MIKA_SERVER_URL` (dashboard) or direct HTTP calls
+- CLI commands that talk to remote services use `MIKA_SPIRIT_URL` (dashboard) or direct HTTP calls
 
 ### Institutional Learnings
 
@@ -63,7 +63,7 @@ This feature adds persistence for failed deliveries, automatic background retry,
 
 ## Key Technical Decisions
 
-- **CLI talks to gateway via HTTP, not direct Postgres access**: The CLI runs on user machines; the gateway runs in K8s. New gateway REST endpoints (`GET /webhook/dlq`, `POST /webhook/dlq/{id}/replay`, `POST /webhook/dlq/replay-all`) expose DLQ operations. CLI uses `MIKA_GATEWAY_URL` (new env var) to reach the gateway. This follows the same pattern as the dashboard CLI using `MIKA_SERVER_URL` for the agent server.
+- **CLI talks to gateway via HTTP, not direct Postgres access**: The CLI runs on user machines; the gateway runs in K8s. New gateway REST endpoints (`GET /webhook/dlq`, `POST /webhook/dlq/{id}/replay`, `POST /webhook/dlq/replay-all`) expose DLQ operations. CLI uses `MIKA_GATEWAY_URL` (new env var) to reach the gateway. This follows the same pattern as the dashboard CLI using `MIKA_SPIRIT_URL` for the agent server.
 - **Store formatted `text` + metadata, not raw GitHub body**: The DLQ stores the already-formatted message text, target agent, request ID, and repo name — the same values passed to `deliver_with_retry()`. This avoids re-parsing the raw GitHub webhook body on replay and keeps the storage compact. The raw body could be 256KB; the formatted text is typically <1KB.
 - **Replay re-resolves routes**: When replaying, the worker/CLI re-resolves the container URL via `resolve_github_container_url()` rather than caching the original URL. This handles the case where containers moved or were recreated.
 - **Background worker uses the same `forward_to_resolved_route()` path**: The worker calls the same forwarding function as the original retry loop, ensuring consistent behavior and semaphore respect.
@@ -293,7 +293,7 @@ This feature adds persistence for failed deliveries, automatic background retry,
 - Support `--format text|json` like other CLI commands
 
 **Patterns to follow:**
-- `crates/mika-cli/src/commands/dashboard.rs` — uses `MIKA_SERVER_URL` for remote API calls
+- `crates/mika-cli/src/commands/dashboard.rs` — uses `MIKA_SPIRIT_URL` for remote API calls
 - `crates/mika-cli/src/commands/tasks.rs` — table output formatting
 - Clap subcommand registration pattern in `cli.rs`
 

@@ -14,16 +14,16 @@ pub async fn run(command: DashboardCommand) -> Result<()> {
     }
 }
 
-/// Resolve the mika-server base URL from env or default.
-pub fn server_url() -> String {
-    if let Ok(url) = std::env::var("MIKA_SERVER_URL") {
+/// Resolve the mika-spirit base URL from env or default.
+pub fn spirit_url() -> String {
+    if let Ok(url) = std::env::var("MIKA_SPIRIT_URL") {
         return url;
     }
-    // Load dotenv so MIKA_SERVER_PORT from ~/.mika/.env is available
+    // Load dotenv so MIKA_SPIRIT_PORT from ~/.mika/.env is available
     if let Ok(home) = mika_common::home::resolve_home_dir() {
         mika_common::dotenv::load_dotenv(&home);
     }
-    let port = std::env::var("MIKA_SERVER_PORT").unwrap_or_else(|_| "8080".to_string());
+    let port = std::env::var("MIKA_SPIRIT_PORT").unwrap_or_else(|_| "8080".to_string());
     format!("http://localhost:{port}")
 }
 
@@ -37,14 +37,14 @@ pub fn auth_token() -> Result<String> {
     std::env::var("MIKA_INTERNAL_TOKEN")
         .or_else(|_| std::env::var("MIKA_DASHBOARD_TOKEN"))
         .context(
-            "MIKA_INTERNAL_TOKEN or MIKA_DASHBOARD_TOKEN is required to communicate with mika-server",
+            "MIKA_INTERNAL_TOKEN or MIKA_DASHBOARD_TOKEN is required to communicate with mika-spirit",
         )
 }
 
-/// Query the dashboard status from mika-server.
+/// Query the dashboard status from mika-spirit.
 /// Returns `Some((enabled, has_assets, has_token))` if reachable, `None` otherwise.
 pub async fn query_dashboard_status() -> Option<(bool, bool, bool)> {
-    let url = format!("{}/api/v1/dashboard/status", server_url());
+    let url = format!("{}/api/v1/dashboard/status", spirit_url());
     let token = auth_token().ok()?;
     let client = reqwest::Client::new();
     let resp = client
@@ -71,7 +71,7 @@ pub async fn is_dashboard_running() -> bool {
 
 /// Open the dashboard URL in the default browser. Returns a status message.
 pub fn open_dashboard_in_browser() -> String {
-    let url = format!("{}/dashboard", server_url());
+    let url = format!("{}/dashboard", spirit_url());
 
     #[cfg(target_os = "linux")]
     let result = Command::new("xdg-open")
@@ -100,7 +100,7 @@ pub fn open_dashboard_in_browser() -> String {
 
 async fn start() -> Result<()> {
     let token = auth_token()?;
-    let url = format!("{}/api/v1/dashboard/enable", server_url());
+    let url = format!("{}/api/v1/dashboard/enable", spirit_url());
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -108,11 +108,11 @@ async fn start() -> Result<()> {
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
-        .context("Failed to connect to mika-server. Is it running?")?;
+        .context("Failed to connect to mika-spirit. Is it running?")?;
 
     if resp.status().is_success() {
         println!("Dashboard enabled.");
-        println!("  URL: {}/dashboard", server_url());
+        println!("  URL: {}/dashboard", spirit_url());
     } else {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -123,7 +123,7 @@ async fn start() -> Result<()> {
 
 async fn stop() -> Result<()> {
     let token = auth_token()?;
-    let url = format!("{}/api/v1/dashboard/disable", server_url());
+    let url = format!("{}/api/v1/dashboard/disable", spirit_url());
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -131,7 +131,7 @@ async fn stop() -> Result<()> {
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
-        .context("Failed to connect to mika-server. Is it running?")?;
+        .context("Failed to connect to mika-spirit. Is it running?")?;
 
     if resp.status().is_success() {
         println!("Dashboard disabled.");
@@ -148,7 +148,7 @@ async fn status() -> Result<()> {
         Some((enabled, has_assets, has_token)) => {
             if enabled {
                 println!("Dashboard is enabled.");
-                println!("  URL: {}/dashboard", server_url());
+                println!("  URL: {}/dashboard", spirit_url());
                 if !has_assets {
                     println!("  Warning: No embedded assets found. Build the dashboard first.");
                 }
@@ -161,8 +161,8 @@ async fn status() -> Result<()> {
             }
         }
         None => {
-            println!("Could not reach mika-server.");
-            println!("  Is it running at {}?", server_url());
+            println!("Could not reach mika-spirit.");
+            println!("  Is it running at {}?", spirit_url());
         }
     }
     Ok(())

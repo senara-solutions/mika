@@ -88,7 +88,7 @@ On first run, Mika creates `~/.mika/` with default configuration, personality, a
 ```
 crates/
   mika-common/     Shared: config, LLM providers, OAuth, GitHub App auth, telemetry
-  mika-agent/      Agent: SQLite DB, agent loop, tools, skills, HTTP server (mika-server)
+  mika-agent/      Agent: SQLite DB, agent loop, tools, skills, HTTP server (mika-spirit)
   mika-a2a/        A2A (Agent-to-Agent) protocol v0.3: JSON-RPC types, task state machine, SSE streaming
   mika-gateway/    Telegram + GitHub webhook router: Postgres customer registry, message routing, A2A proxy
   mika-cli/        TUI CLI (mika): ratatui chat, clap subcommands, slash commands

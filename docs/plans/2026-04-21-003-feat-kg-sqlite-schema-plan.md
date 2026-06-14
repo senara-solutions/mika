@@ -714,7 +714,7 @@ Test expectation: none — this unit is documentation. ID format compliance is e
 
 - ID convention doc (`docs/architecture/kg-id-convention.md`) is load-bearing for #687, #690, #691. Land it with this ticket.
 - ADR-003 gets a short update noting KG composition (Unit 4).
-- No rollout considerations — schema changes are container-local, apply on next mika-server startup via the migration chain.
+- No rollout considerations — schema changes are container-local, apply on next mika-spirit startup via the migration chain.
 - Monitoring: `audit_events` already captures schema-version transitions; the v24 → v25 migration fires one event. No new metrics needed in this ticket.
 
 ## Sources & References

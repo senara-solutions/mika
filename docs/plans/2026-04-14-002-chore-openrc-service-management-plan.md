@@ -29,7 +29,7 @@ Replace all tmux-based service stop/restart logic in the Makefile with OpenRC `r
 - The bundled `tmux` skill (`crates/mika-agent/templates/skills/tmux/`) is **unrelated** — it lets the agent manage tmux sessions as a tool. Not in scope.
 - Historical tmux references in CHANGELOG.md, docs/plans/, docs/solutions/, todos/ are not modified
 - No OpenRC init scripts or supervise-daemon configs are created in-repo — those are managed outside the repo on the host
-- Sudoers entries already exist for the deploy user (`rc-service mika-server` and `rc-service mika-gateway`)
+- Sudoers entries already exist for the deploy user (`rc-service mika-spirit` and `rc-service mika-gateway`)
 - `CLAUDE.md` line describing `make deploy` is tmux-agnostic ("dashboard+build+stop+install") and needs no change
 
 ## Context & Research
@@ -39,7 +39,7 @@ Replace all tmux-based service stop/restart logic in the Makefile with OpenRC `r
 - `Makefile` lines 20-55: current `stop` and `restart` targets with tmux logic
 - `Makefile` line 69: `deploy` target chain — `build-dashboard build stop install restart check-ngrok`
 - `CLAUDE.md` line 39: describes Makefile targets — currently tmux-agnostic wording
-- The `BINARIES` variable (line 2) lists `mika mika-server mika-gateway`; stop/restart only operate on `mika-server mika-gateway`
+- The `BINARIES` variable (line 2) lists `mika mika-spirit mika-gateway`; stop/restart only operate on `mika-spirit mika-gateway`
 
 ### Institutional Learnings
 
@@ -49,7 +49,7 @@ Replace all tmux-based service stop/restart logic in the Makefile with OpenRC `r
 
 - **Use `rc-service` directly, no fallback to pkill**: The issue explicitly specifies OpenRC as the sole mechanism. The tmux+pkill dual-path complexity was the root cause of the bug (silent no-op). A single, reliable path is better.
 - **Use `stop` + `start` (not `restart`)**: The `stop` target runs before `install`, and `restart` runs after. This two-phase approach is correct — stop old binary, install new binary, start new binary. The Makefile `restart` target should use `rc-service start` (not `rc-service restart`) since the service was already stopped by the `stop` target. However, `rc-service restart` is idempotent and handles the already-stopped case, so either works. Use `restart` for robustness in case `stop` was skipped.
-- **Keep the loop over both services**: Both `mika-server` and `mika-gateway` need stop/restart, preserving current behavior.
+- **Keep the loop over both services**: Both `mika-spirit` and `mika-gateway` need stop/restart, preserving current behavior.
 
 ## Implementation Units
 
@@ -65,12 +65,12 @@ Replace all tmux-based service stop/restart logic in the Makefile with OpenRC `r
   - Modify: `Makefile`
 
   **Approach:**
-  - Replace lines 20-45 (the entire `stop` target body) with a simple loop: `sudo rc-service $$bin stop` for each of `mika-server mika-gateway`
+  - Replace lines 20-45 (the entire `stop` target body) with a simple loop: `sudo rc-service $$bin stop` for each of `mika-spirit mika-gateway`
   - Update the help comment from `(via tmux C-c)` to `(via OpenRC)`
   - Use `|| true` after each stop command so Make doesn't fail if the service is already stopped
 
   **Patterns to follow:**
-  - Keep the existing `@for bin in mika-server mika-gateway; do ... done` loop structure for consistency with the rest of the Makefile
+  - Keep the existing `@for bin in mika-spirit mika-gateway; do ... done` loop structure for consistency with the rest of the Makefile
 
   **Test expectation:** none — infrastructure target, no automated test. Verified manually via `make stop` on the host.
 
@@ -90,7 +90,7 @@ Replace all tmux-based service stop/restart logic in the Makefile with OpenRC `r
   - Modify: `Makefile`
 
   **Approach:**
-  - Replace lines 47-55 (the entire `restart` target body) with a simple loop: `sudo rc-service $$bin restart` for each of `mika-server mika-gateway`
+  - Replace lines 47-55 (the entire `restart` target body) with a simple loop: `sudo rc-service $$bin restart` for each of `mika-spirit mika-gateway`
   - Update the help comment from `in their tmux sessions` to `(via OpenRC)`
   - `rc-service restart` handles the already-stopped case (starts the service), so this works whether called after `stop` or independently
 

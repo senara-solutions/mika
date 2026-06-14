@@ -10,7 +10,7 @@ issues: [420, 419, 412, 354]
 
 ## Overview
 
-Group of three logging and observability fixes for mika-server and mika-gateway, shipped as one branch and one PR. Closes #420 (umbrella), #419, #412, #354.
+Group of three logging and observability fixes for mika-spirit and mika-gateway, shipped as one branch and one PR. Closes #420 (umbrella), #419, #412, #354.
 
 ## Problem Statement
 
@@ -29,7 +29,7 @@ Group of three logging and observability fixes for mika-server and mika-gateway,
    - Captures `request.method().to_string()` and `request.uri().path().to_owned()` before forwarding
    - After `next.run(request).await`, inserts `RequestMeta` into `response.extensions_mut()`
 3. In `on_response`, extract `RequestMeta` from `response.extensions()` and include `method` and `path` as explicit event fields alongside `status` and `latency`.
-4. Apply to both mika-server and mika-gateway.
+4. Apply to both mika-spirit and mika-gateway.
 
 **Layer ordering** (critical): The `from_fn` middleware must be **inner** to `TraceLayer` so that on the response path, `from_fn` inserts extensions *before* `TraceLayer::on_response` reads them:
 
@@ -81,7 +81,7 @@ Group of three logging and observability fixes for mika-server and mika-gateway,
 - [x] JSON log output for any request includes `method` and `path` as top-level keys (not only inside `spans`)
 - [x] WARN-level logs for 5xx responses include top-level `method` and `path`
 - [x] DEBUG-level logs for health probe endpoints include top-level `method` and `path`
-- [x] Both mika-server and mika-gateway `on_response` logs include top-level `method` and `path`
+- [x] Both mika-spirit and mika-gateway `on_response` logs include top-level `method` and `path`
 - [x] Pretty format output is not degraded (method/path still visible)
 - [x] `GET /version` on gateway returns `200` with `{"version":"<semver>","git_hash":"<7-char-hash>"}`
 - [x] `GET /version` requires no authentication
@@ -122,7 +122,7 @@ pub async fn inject_request_meta(request: Request, next: Next) -> Response {
 
 Export from `crates/mika-common/src/lib.rs` as `pub mod middleware`.
 
-### Step 2: Update mika-server TraceLayer
+### Step 2: Update mika-spirit TraceLayer
 
 **File: `crates/mika-agent/src/server/mod.rs` (lines 203-240)**
 

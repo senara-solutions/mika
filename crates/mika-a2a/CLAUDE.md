@@ -18,9 +18,9 @@ A2A tasks use `trigger_type='a2a'` in the `tasks` table with orthogonal persiste
 
 ## Server Integration
 
-- **mika-server** exposes `/a2a/{agent_name}` (JSON-RPC POST, 2MB limit) and `/a2a/{agent_name}/agent.json` (Agent Card GET), both internal-token auth. See `crates/mika-agent/CLAUDE.md` for server endpoint details.
+- **mika-spirit** exposes `/a2a/{agent_name}` (JSON-RPC POST, 2MB limit) and `/a2a/{agent_name}/agent.json` (Agent Card GET), both internal-token auth. See `crates/mika-agent/CLAUDE.md` for server endpoint details.
 - **mika-gateway** proxies at `/a2a/{customer_id}/{agent_name}` with API key auth (SHA-256 hashed keys in Postgres `a2a_api_keys` table, migration 003). See `crates/mika-gateway/CLAUDE.md` for gateway details.
 
 ## Convention
 
-The A2A Protocol convention documented in root CLAUDE.md: `mika-server` exposes endpoints, gateway proxies with API key auth. State machine validates transitions. SSE streaming for `message/send`.
+The A2A Protocol convention documented in root CLAUDE.md: `mika-spirit` exposes endpoints, gateway proxies with API key auth. State machine validates transitions. SSE streaming for `message/send`.

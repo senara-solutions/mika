@@ -46,7 +46,7 @@ The root cause chain:
 Replace the comment on line 22 and add the gitignore entry:
 
 ```gitignore
-# dashboard/dist/ is a build artifact — embedded into mika-server via rust-embed at compile time.
+# dashboard/dist/ is a build artifact — embedded into mika-spirit via rust-embed at compile time.
 # Run `make deploy` or `npm run build --prefix dashboard` to produce it.
 dashboard/dist/
 ```

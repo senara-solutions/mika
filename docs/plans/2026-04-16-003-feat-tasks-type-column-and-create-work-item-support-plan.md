@@ -218,7 +218,7 @@ None — straightforward SQLite ALTER TABLE + tool wiring.
 - Modify: `crates/mika-agent/src/server/dashboard.rs`
   - Add `pub r#type: String` (or `#[serde(rename = "type")] pub r#type: String`) to `TaskResponse` (line 471) and `TaskDetailResponse` (line 586). With raw identifiers, serde's default name is `"type"` — no rename needed; verify this in tests if uncertain.
   - Update the two `From<Task>` impls (line 496, 611) to copy `t.r#type`.
-- Modify: `docs/openapi/mika-server.yaml` (and the build-time crate copy via `scripts/sync-agent-docs.sh`) — regenerate or hand-update the `TaskResponse` / `TaskDetailResponse` schemas to add the `type` property.
+- Modify: `docs/openapi/mika-spirit.yaml` (and the build-time crate copy via `scripts/sync-agent-docs.sh`) — regenerate or hand-update the `TaskResponse` / `TaskDetailResponse` schemas to add the `type` property.
 - Test: covered by `cargo test -p mika-agent` build + serde derive — no separate test file, but verify a snapshot test exists for the API or add a smoke test that serializes a `TaskResponse` and asserts `"type"` appears in the JSON.
 
 **Approach:**

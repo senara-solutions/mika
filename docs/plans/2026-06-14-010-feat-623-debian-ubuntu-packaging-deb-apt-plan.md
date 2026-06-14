@@ -13,7 +13,7 @@ This ticket adds `.deb` package generation via `cargo-deb` to the release pipeli
 
 ### Current state
 
-- Release workflow (`.github/workflows/release.yml`) builds two binaries for four targets: `mika` (CLI) and `mika-server` (HTTP agent), using `taiki-e/upload-rust-binary-action`
+- Release workflow (`.github/workflows/release.yml`) builds two binaries for four targets: `mika` (CLI) and `mika-spirit` (HTTP agent), using `taiki-e/upload-rust-binary-action`
 - Linux targets: `x86_64-unknown-linux-gnu` (native Ubuntu 22.04), `aarch64-unknown-linux-gnu` (cross-compiled)
 - Release trigger: `v*` tag push (via release-please)
 - Existing artifacts: `.tar.gz` + SHA256 checksums + SBOM + cosign signatures + GitHub attestations
@@ -35,10 +35,10 @@ This ticket adds `.deb` package generation via `cargo-deb` to the release pipeli
 
 ### In scope
 
-1. `cargo-deb` metadata in `Cargo.toml` for `mika-cli` (produces `mika` binary) and `mika-agent` (produces `mika-server` binary)
-2. Two `.deb` packages: `mika` (CLI tool) and `mika-server` (HTTP agent daemon)
-3. `postinst`/`prerm` scripts for `mika-server` (systemd service lifecycle)
-4. systemd service unit file for `mika-server`
+1. `cargo-deb` metadata in `Cargo.toml` for `mika-cli` (produces `mika` binary) and `mika-agent` (produces `mika-spirit` binary)
+2. Two `.deb` packages: `mika` (CLI tool) and `mika-spirit` (HTTP agent daemon)
+3. `postinst`/`prerm` scripts for `mika-spirit` (systemd service lifecycle)
+4. systemd service unit file for `mika-spirit`
 5. New CI workflow job in `release.yml` that builds `.deb` packages and uploads to GitHub Release
 6. APT repository hosted on GitHub Pages via `reprepro` in a separate repo (`senara-solutions/apt`)
 7. CI job that publishes `.deb` packages to the APT repo after release
@@ -55,9 +55,9 @@ This ticket adds `.deb` package generation via `cargo-deb` to the release pipeli
 
 ## Implementation
 
-### Step 1: systemd service unit for mika-server
+### Step 1: systemd service unit for mika-spirit
 
-Create `packaging/systemd/mika-server.service`:
+Create `packaging/systemd/mika-spirit.service`:
 
 ```ini
 [Unit]
@@ -69,13 +69,13 @@ Wants=network-online.target
 Type=simple
 User=mika
 Group=mika
-ExecStart=/usr/bin/mika-server
+ExecStart=/usr/bin/mika-spirit
 Restart=on-failure
 RestartSec=5
 Environment=MIKA_HOME=/var/lib/mika
 Environment=MIKA_LOG_FORMAT=json
-Environment=MIKA_SERVER_LOG_FILE=/var/log/mika/server.log
-EnvironmentFile=-/etc/mika/mika-server.env
+Environment=MIKA_SPIRIT_LOG_FILE=/var/log/mika/server.log
+EnvironmentFile=-/etc/mika/mika-spirit.env
 WorkingDirectory=/var/lib/mika
 
 # Hardening
@@ -89,11 +89,11 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 ```
 
-**Files:** `packaging/systemd/mika-server.service` (new)
+**Files:** `packaging/systemd/mika-spirit.service` (new)
 
-### Step 2: Maintainer scripts for mika-server
+### Step 2: Maintainer scripts for mika-spirit
 
-Create `packaging/debian/mika-server.postinst`:
+Create `packaging/debian/mika-spirit.postinst`:
 
 ```bash
 #!/bin/sh
@@ -116,15 +116,15 @@ case "$1" in
 
     # Enable and restart service on upgrade
     systemctl daemon-reload
-    systemctl enable mika-server.service
-    if systemctl is-active --quiet mika-server.service; then
-      systemctl restart mika-server.service
+    systemctl enable mika-spirit.service
+    if systemctl is-active --quiet mika-spirit.service; then
+      systemctl restart mika-spirit.service
     fi
     ;;
 esac
 ```
 
-Create `packaging/debian/mika-server.prerm`:
+Create `packaging/debian/mika-spirit.prerm`:
 
 ```bash
 #!/bin/sh
@@ -132,13 +132,13 @@ set -e
 
 case "$1" in
   remove|purge)
-    systemctl stop mika-server.service || true
-    systemctl disable mika-server.service || true
+    systemctl stop mika-spirit.service || true
+    systemctl disable mika-spirit.service || true
     ;;
 esac
 ```
 
-**Files:** `packaging/debian/mika-server.postinst`, `packaging/debian/mika-server.prerm` (new)
+**Files:** `packaging/debian/mika-spirit.postinst`, `packaging/debian/mika-spirit.prerm` (new)
 
 ### Step 3: cargo-deb metadata in Cargo.toml
 
@@ -165,7 +165,7 @@ assets = [
 
 ```toml
 [package.metadata.deb]
-name = "mika-server"
+name = "mika-spirit"
 maintainer = "Senara Solutions <engineering@senara.solutions>"
 copyright = "2025-2026 Senara Solutions"
 depends = "$auto, jq"
@@ -175,11 +175,11 @@ extended-description = """Mika AI Agent HTTP Server.
 Per-customer container isolation with SQLite storage, Axum-based HTTP API,
 embedded dashboard, and A2A protocol support."""
 assets = [
-  ["target/release/mika-server", "usr/bin/mika-server", "755"],
+  ["target/release/mika-spirit", "usr/bin/mika-spirit", "755"],
 ]
-systemd-units = { unit-name = "mika-server", enable = false }
+systemd-units = { unit-name = "mika-spirit", enable = false }
 maintainer-scripts = "../../packaging/debian"
-conf-files = ["/etc/mika/mika-server.env"]
+conf-files = ["/etc/mika/mika-spirit.env"]
 ```
 
 Notes:
@@ -193,7 +193,7 @@ Notes:
 
 ### Step 4: Default environment file
 
-Create `packaging/debian/mika-server.env`:
+Create `packaging/debian/mika-spirit.env`:
 
 ```bash
 # Mika Server Configuration
@@ -210,9 +210,9 @@ Create `packaging/debian/mika-server.env`:
 # MIKA_TELEMETRY_ENABLED=false
 ```
 
-This file is installed to `/etc/mika/mika-server.env` as a conffile (preserved on upgrade).
+This file is installed to `/etc/mika/mika-spirit.env` as a conffile (preserved on upgrade).
 
-**Files:** `packaging/debian/mika-server.env` (new)
+**Files:** `packaging/debian/mika-spirit.env` (new)
 
 ### Step 5: CI workflow — build .deb packages
 
@@ -264,7 +264,7 @@ deb:
       env:
         CARGO_BUILD_TARGET: ${{ matrix.target }}
 
-    - name: Build mika-server .deb
+    - name: Build mika-spirit .deb
       run: cargo deb -p mika-agent --target ${{ matrix.target }} --no-build
       env:
         CARGO_BUILD_TARGET: ${{ matrix.target }}
@@ -287,7 +287,7 @@ Wait — `--no-build` requires binaries to already exist. Since the `build` job 
     - name: Build mika .deb
       run: cargo deb -p mika-cli --target ${{ matrix.target }} -- --features telemetry
 
-    - name: Build mika-server .deb
+    - name: Build mika-spirit .deb
       run: cargo deb -p mika-agent --target ${{ matrix.target }} -- --features telemetry
 ```
 
@@ -403,7 +403,7 @@ echo "deb [signed-by=/usr/share/keyrings/mika-archive-keyring.gpg] https://senar
 # Install
 sudo apt-get update
 sudo apt-get install mika          # CLI only
-sudo apt-get install mika-server   # HTTP agent server (includes systemd service)
+sudo apt-get install mika-spirit   # HTTP agent server (includes systemd service)
 ```
 
 **Files:** `docs/getting-started.md` (modify or create)
@@ -414,10 +414,10 @@ sudo apt-get install mika-server   # HTTP agent server (includes systemd service
 |------|--------|---------|
 | `crates/mika-cli/Cargo.toml` | Modify | Add `[package.metadata.deb]` section |
 | `crates/mika-agent/Cargo.toml` | Modify | Add `[package.metadata.deb]` section |
-| `packaging/systemd/mika-server.service` | Create | systemd unit file |
-| `packaging/debian/mika-server.postinst` | Create | Post-install script (user creation, service enable) |
-| `packaging/debian/mika-server.prerm` | Create | Pre-remove script (service stop) |
-| `packaging/debian/mika-server.env` | Create | Default env file template |
+| `packaging/systemd/mika-spirit.service` | Create | systemd unit file |
+| `packaging/debian/mika-spirit.postinst` | Create | Post-install script (user creation, service enable) |
+| `packaging/debian/mika-spirit.prerm` | Create | Pre-remove script (service stop) |
+| `packaging/debian/mika-spirit.env` | Create | Default env file template |
 | `.github/workflows/release.yml` | Modify | Add `deb` and `publish-apt` jobs, extend `sign` |
 | `docs/getting-started.md` | Modify/Create | Installation instructions |
 
@@ -435,9 +435,9 @@ sudo apt-get install mika-server   # HTTP agent server (includes systemd service
 
 - [ ] Build `.deb` locally with `cargo deb -p mika-cli` and `cargo deb -p mika-agent`
 - [ ] Install on a clean Debian/Ubuntu container: `dpkg -i mika_*.deb`
-- [ ] Verify binary paths: `/usr/bin/mika`, `/usr/bin/mika-server`
-- [ ] Verify systemd service: `systemctl status mika-server`
+- [ ] Verify binary paths: `/usr/bin/mika`, `/usr/bin/mika-spirit`
+- [ ] Verify systemd service: `systemctl status mika-spirit`
 - [ ] Verify postinst creates `mika` user and directories
 - [ ] Verify upgrade path: install v1, upgrade to v2, confirm service restarts
-- [ ] Verify removal: `apt-get remove mika-server` stops service cleanly
+- [ ] Verify removal: `apt-get remove mika-spirit` stops service cleanly
 - [ ] Test aarch64 .deb in an arm64 container

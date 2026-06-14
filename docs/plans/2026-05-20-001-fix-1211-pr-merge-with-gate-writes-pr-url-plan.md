@@ -419,7 +419,7 @@ fn shallow_merge_object(base: &mut Map<String, Value>, incoming: &Map<String, Va
 
 ### Observability
 
-- `info!` log entry `pr_merge_with_gate: wrote pr_url to supervisor metadata on auto_merge_enabled` visible in the server log (`$MIKA_SERVER_LOG_FILE`) on every `AutoMergeEnabled` path that has a callback context.
+- `info!` log entry `pr_merge_with_gate: wrote pr_url to supervisor metadata on auto_merge_enabled` visible in the server log (`$MIKA_SPIRIT_LOG_FILE`) on every `AutoMergeEnabled` path that has a callback context.
 - Existing audit events (`task_engine_parent_completer`) continue to fire on the eventual transition.
 
 ## Risks and mitigations

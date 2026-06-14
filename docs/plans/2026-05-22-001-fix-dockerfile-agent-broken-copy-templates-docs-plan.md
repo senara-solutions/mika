@@ -21,7 +21,7 @@ This blocks **first cloud deploy (Mika Prime)**: the `mika-agent` image is the p
 
 - **AC1:** `Dockerfile.agent` no longer contains the lines `COPY templates/ templates/` and `COPY docs/ docs/`.
 - **AC2:** `docker build -f Dockerfile.agent -t mika-agent:test .` succeeds on a clean checkout of `main` (with this fix applied).
-- **AC3:** The resulting image still embeds the templates and docs that `include_str!` references at compile time — i.e., `/usr/local/bin/mika-server --help` (or any path that touches the docs/templates handlers) works at runtime.
+- **AC3:** The resulting image still embeds the templates and docs that `include_str!` references at compile time — i.e., `/usr/local/bin/mika-spirit --help` (or any path that touches the docs/templates handlers) works at runtime.
 
 ## Design Decisions
 
@@ -34,7 +34,7 @@ The lines are dead code, not load-bearing. Three independent reasons:
    - `crates/mika-agent/src/skills/executor.rs:2550` — `include_str!("../../templates/skills/shell-exec/handlers/run.sh")` → same crate-local `templates/`.
    Both files are already pulled in by the earlier `COPY crates/mika-agent/ crates/mika-agent/` directive on Dockerfile.agent line 20.
 2. **`COPY docs/ docs/`** — the root-level `docs/` is listed in `.dockerignore` (top-level pattern `docs/`, anchored to context root per `.dockerignore`'s non-recursive matching for plain entries). Even if the line worked, it would copy nothing. The `include_str!` call sites that reference `docs/` either:
-   - Use a relative path that resolves inside the crate (`crates/mika-agent/src/server/openapi.rs:100` → `crates/mika-agent/docs/openapi/mika-server.yaml`, copied by the `COPY crates/mika-agent/` line), or
+   - Use a relative path that resolves inside the crate (`crates/mika-agent/src/server/openapi.rs:100` → `crates/mika-agent/docs/openapi/mika-spirit.yaml`, copied by the `COPY crates/mika-agent/` line), or
    - Use `concat!(env!("OUT_DIR"), "/docs/…")` (10 sites in `crates/mika-agent/src/skills/builtin_handlers.rs`). These come from `crates/mika-agent/build.rs`, which already has a two-tier source resolution:
      ```rust
      let source = if workspace_docs.join(DOCS[0]).exists() {
@@ -80,12 +80,12 @@ COPY --from=dashboard-builder /app/dashboard/dist dashboard/dist
 DOCKER_BUILDKIT=1 docker build --no-cache --progress=plain -f Dockerfile.agent -t mika-agent:test .
 ```
 
-Expected: build succeeds end-to-end. Cargo compiles `mika-server`, `crates/mika-agent/build.rs` falls back to crate-local docs, runtime image gets stamped.
+Expected: build succeeds end-to-end. Cargo compiles `mika-spirit`, `crates/mika-agent/build.rs` falls back to crate-local docs, runtime image gets stamped.
 
 **Step 3.** Smoke the binary inside the image:
 
 ```bash
-docker run --rm mika-agent:test mika-server --help
+docker run --rm mika-agent:test mika-spirit --help
 ```
 
 Expected: prints help output (exit 0). This indirectly confirms that the embedded docs/templates loaded successfully — any missing `include_str!` would have errored at compile time, not at this runtime invocation, so a clean build implies clean embedding.
@@ -113,5 +113,5 @@ Expected: prints help output (exit 0). This indirectly confirms that the embedde
 
 1. The two `COPY` lines are removed from `Dockerfile.agent`.
 2. `DOCKER_BUILDKIT=1 docker build --no-cache -f Dockerfile.agent -t mika-agent:test .` succeeds locally on this branch.
-3. `docker run --rm mika-agent:test mika-server --help` exits 0.
+3. `docker run --rm mika-agent:test mika-spirit --help` exits 0.
 4. PR open; CI green; merged; cloud-deploy readiness audit unblocked.

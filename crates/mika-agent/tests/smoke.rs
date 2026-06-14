@@ -1,8 +1,8 @@
-//! End-to-end smoke tests for the mika-server binary.
+//! End-to-end smoke tests for the mika-spirit binary.
 //!
 //! These tests spawn the actual server binary and verify it handles
 //! HTTP requests correctly. They require the binary to be built first
-//! (`cargo build --bin mika-server`).
+//! (`cargo build --bin mika-spirit`).
 //!
 //! Marked `#[ignore]` — run explicitly with:
 //! ```
@@ -12,20 +12,20 @@
 use std::process::{Child, Command};
 use std::time::Duration;
 
-/// Spawn the mika-server binary on the given port, returning the child process.
+/// Spawn the mika-spirit binary on the given port, returning the child process.
 fn spawn_server(port: u16) -> Child {
-    let binary = env!("CARGO_BIN_EXE_mika-server");
+    let binary = env!("CARGO_BIN_EXE_mika-spirit");
     Command::new(binary)
         .env("MIKA_ANTHROPIC_API_KEY", "sk-ant-test-dummy-key-for-smoke")
         .env("MIKA_INTERNAL_TOKEN", "aa".repeat(32)) // 64 hex chars
         .env("MIKA_ROUTING_URL", "http://localhost:19999")
-        .env("MIKA_SERVER_PORT", port.to_string())
+        .env("MIKA_SPIRIT_PORT", port.to_string())
         .env("MIKA_HOME", format!("/tmp/mika-smoke-test-{port}"))
         .env("MIKA_DISABLE_BUNDLED_SKILLS", "true")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("failed to spawn mika-server binary")
+        .expect("failed to spawn mika-spirit binary")
 }
 
 /// Wait for the server to respond on the health endpoint.
@@ -64,13 +64,13 @@ async fn health_endpoint_responds() {
     let port = free_port();
     let mut child = spawn_server(port);
 
-    let healthy = wait_for_health(port, Duration::from_secs(15)).await;
+    let healthy = wait_for_health(port, Duration::from_secs(30)).await;
 
     child.kill().ok();
     child.wait().ok();
     cleanup(port);
 
-    assert!(healthy, "server did not respond on /health within 15s");
+    assert!(healthy, "server did not respond on /health within 30s");
 }
 
 #[tokio::test]
@@ -79,7 +79,7 @@ async fn message_endpoint_requires_auth() {
     let port = free_port();
     let mut child = spawn_server(port);
 
-    if !wait_for_health(port, Duration::from_secs(15)).await {
+    if !wait_for_health(port, Duration::from_secs(30)).await {
         child.kill().ok();
         child.wait().ok();
         cleanup(port);

@@ -9,7 +9,7 @@ date: 2026-03-31
 
 ## Overview
 
-The gateway (`mika-gateway`) has no request/response logging middleware, while `mika-server` already uses `tower_http::trace::TraceLayer`. This creates an observability gap — gateway requests are invisible in logs. Adding `TraceLayer` with health-endpoint filtering brings the gateway to parity with mika-server.
+The gateway (`mika-gateway`) has no request/response logging middleware, while `mika-spirit` already uses `tower_http::trace::TraceLayer`. This creates an observability gap — gateway requests are invisible in logs. Adding `TraceLayer` with health-endpoint filtering brings the gateway to parity with mika-spirit.
 
 ## Problem Statement
 
@@ -21,7 +21,7 @@ Add `TraceLayer` to the gateway router in `routes.rs` with a custom `make_span_w
 
 ### Key Design Decisions
 
-1. **Custom `make_span_with` (not plain defaults):** mika-server uses `TraceLayer::new_for_http()` with defaults, but the issue explicitly requires health probes at DEBUG. The gateway needs a custom span factory to differentiate health paths from operational paths.
+1. **Custom `make_span_with` (not plain defaults):** mika-spirit uses `TraceLayer::new_for_http()` with defaults, but the issue explicitly requires health probes at DEBUG. The gateway needs a custom span factory to differentiate health paths from operational paths.
 
 2. **Span fields:** method, path — consistent with what `TraceLayer` defaults provide, but explicitly set in our custom span for control.
 
@@ -83,7 +83,7 @@ fn is_health_probe(path: &str) -> bool {
 }
 ```
 
-**Layer ordering:** `TraceLayer` goes AFTER `SetResponseHeaderLayer` (outermost layer = first to see request, last to see response). This matches mika-server's pattern where `TraceLayer` is the outermost `.layer()` call before `.with_state()`.
+**Layer ordering:** `TraceLayer` goes AFTER `SetResponseHeaderLayer` (outermost layer = first to see request, last to see response). This matches mika-spirit's pattern where `TraceLayer` is the outermost `.layer()` call before `.with_state()`.
 
 ## Technical Considerations
 
@@ -94,7 +94,7 @@ fn is_health_probe(path: &str) -> bool {
 
 ## Sources
 
-- mika-server implementation: `crates/mika-agent/src/server/mod.rs:204`
+- mika-spirit implementation: `crates/mika-agent/src/server/mod.rs:204`
 - Gateway router: `crates/mika-gateway/src/routes.rs:64-100`
 - Langfuse span filtering learning: `docs/solutions/integration-issues/langfuse-non-llm-span-filtering.md`
 - GitHub issue: #355

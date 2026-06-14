@@ -30,7 +30,7 @@ qa-review-build-callback:  18595B (limit 16384B)
 self-dev:                  49195B (limit 49152B)
 ```
 
-The skill loader at `crates/mika-agent/src/skills/index.rs:499-516` calls `load_snippet_with_limit()` and pushes oversized prompts onto `ScanResult.skipped`. The skill is **not** loaded. There is a startup WARN line per skipped skill, but mika-server keeps booting — the autonomous loop comes up missing core skills and silently misbehaves until the next deploy.
+The skill loader at `crates/mika-agent/src/skills/index.rs:499-516` calls `load_snippet_with_limit()` and pushes oversized prompts onto `ScanResult.skipped`. The skill is **not** loaded. There is a startup WARN line per skipped skill, but mika-spirit keeps booting — the autonomous loop comes up missing core skills and silently misbehaves until the next deploy.
 
 The immediate fix is small (three TOML edits). The durable question is broader: what other config defaults assume a smaller, cheaper model than Sonnet, and how do we stop discovering them piecemeal at deploy time?
 
@@ -137,7 +137,7 @@ The immediate fix is small (three TOML edits). The durable question is broader: 
 - *Test expectation: none — pure config, behavior verified by Unit 2's regression test and by Unit 3's startup-log check.*
 
 **Verification:**
-- A clean release build of mika-server starts with `loaded=N disabled=0 skipped=0` and no `oversized prompt` log lines for these three skills.
+- A clean release build of mika-spirit starts with `loaded=N disabled=0 skipped=0` and no `oversized prompt` log lines for these three skills.
 
 - [ ] **Unit 2: Add a startup regression test that fails CI when bundled skills exceed their declared limits**
 

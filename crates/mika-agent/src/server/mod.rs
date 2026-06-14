@@ -592,7 +592,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     let is_pretty = settings.log_format == "pretty";
 
     if is_pretty {
-        mika_common::logging::print_banner("mika-server", env!("CARGO_PKG_VERSION"));
+        mika_common::logging::print_banner("mika-spirit", env!("CARGO_PKG_VERSION"));
     }
 
     // Auto-migrate to multi-agent layout if needed
@@ -1275,9 +1275,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
     let app = build_router(state.clone());
 
-    let port = settings.server_port;
+    let port = settings.spirit_port;
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    info!(port, "mika-server listening");
+    info!(port, "mika-spirit listening");
 
     ready.store(true, Ordering::Release);
 

@@ -88,7 +88,7 @@ External A2A Client
        │
        ▼
 ┌─────────────────┐    JSON-RPC     ┌─────────────────────────────┐
-│  mika-gateway   │ ───────────────▶│  mika-server (per-customer) │
+│  mika-gateway   │ ───────────────▶│  mika-spirit (per-customer) │
 │                 │   (thin proxy)  │                             │
 │ - API key auth  │                 │ - A2A JSON-RPC handler      │
 │ - Customer      │                 │ - Agent Card endpoint       │

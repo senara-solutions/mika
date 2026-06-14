@@ -1,5 +1,5 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
-BINARIES := mika mika-server mika-gateway
+BINARIES := mika mika-spirit mika-gateway
 
 .PHONY: build build-dashboard deploy stop restart install test test-async-db-saturation lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch
 
@@ -17,14 +17,14 @@ build-dashboard: ## Build dashboard for production (installs deps + builds share
 	npm run build -w packages/ui
 	npm run build --prefix dashboard
 
-stop: ## Stop running mika-server and mika-gateway (via OpenRC)
-	@for bin in mika-server mika-gateway; do \
+stop: ## Stop running mika-spirit and mika-gateway (via OpenRC)
+	@for bin in mika-spirit mika-gateway; do \
 		echo "Stopping $$bin..."; \
 		sudo rc-service "$$bin" stop || true; \
 	done
 
-restart: ## Restart mika-server and mika-gateway (via OpenRC)
-	@for bin in mika-server mika-gateway; do \
+restart: ## Restart mika-spirit and mika-gateway (via OpenRC)
+	@for bin in mika-spirit mika-gateway; do \
 		echo "Restarting $$bin..."; \
 		sudo rc-service "$$bin" restart || true; \
 	done

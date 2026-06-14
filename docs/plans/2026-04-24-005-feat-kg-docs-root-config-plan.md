@@ -12,7 +12,7 @@ milestone: senara-solutions/mika#17
 
 ## Overview
 
-`LexicalIngestor` today resolves its docs root via `std::env::current_dir().join("docs/solutions")`. This works inside the container (the Dockerfile COPYs `docs/` into the workdir) but breaks on OpenRC hosts where `supervise-daemon` launches `mika-server` with CWD=`/` — the ingestor logs `docs/solutions not found — skipping lexical ingestion` and the entire lexical / subject / resolution KG pipeline never runs. This plan adds a `MIKA_KG_DOCS_ROOT` env var and `kg_docs_root` config field so operators can point the ingestor at the repo's docs tree regardless of the process CWD, without changing container behavior.
+`LexicalIngestor` today resolves its docs root via `std::env::current_dir().join("docs/solutions")`. This works inside the container (the Dockerfile COPYs `docs/` into the workdir) but breaks on OpenRC hosts where `supervise-daemon` launches `mika-spirit` with CWD=`/` — the ingestor logs `docs/solutions not found — skipping lexical ingestion` and the entire lexical / subject / resolution KG pipeline never runs. This plan adds a `MIKA_KG_DOCS_ROOT` env var and `kg_docs_root` config field so operators can point the ingestor at the repo's docs tree regardless of the process CWD, without changing container behavior.
 
 ## Problem Frame
 
@@ -267,7 +267,7 @@ Settings (from config-rs cascade) + process env
 
 **Verification:**
 - `cargo test -p mika-agent --test kg_docs_root_resolution` passes all scenarios above.
-- Manual verification (mika-dev-executable, post-merge, not in AC): `cargo build --release && cd /tmp && MIKA_KG_DOCS_ROOT=$REPO/docs/solutions ./target/release/mika-server --agent test` logs `lexical_ingest_complete`.
+- Manual verification (mika-dev-executable, post-merge, not in AC): `cargo build --release && cd /tmp && MIKA_KG_DOCS_ROOT=$REPO/docs/solutions ./target/release/mika-spirit --agent test` logs `lexical_ingest_complete`.
 
 ### Unit 4: Documentation — `.env.example`, CLAUDE.md, configuration.md
 
@@ -328,7 +328,7 @@ Settings (from config-rs cascade) + process env
 
 ## Documentation / Operational Notes
 
-- Operators on OpenRC hosts get a one-line fix: set `MIKA_KG_DOCS_ROOT=/path/to/mika-repo/docs/solutions` in `/etc/conf.d/mika-server` (or the per-agent `.env`), restart the service, observe `lexical_ingest_complete` in logs.
+- Operators on OpenRC hosts get a one-line fix: set `MIKA_KG_DOCS_ROOT=/path/to/mika-repo/docs/solutions` in `/etc/conf.d/mika-spirit` (or the per-agent `.env`), restart the service, observe `lexical_ingest_complete` in logs.
 - Existing OpenRC init scripts using `directory=/path/to/mika-repo` or `supervise_daemon_args="--chdir /path/to/mika-repo"` continue to work unchanged.
 - Container deploys: no action required. The `None` → CWD-based default still resolves to `<workdir>/docs/solutions` as today.
 - mika-cloud (Helm): operators who want to set this in K8s can add `MIKA_KG_DOCS_ROOT` to the chart's env block — this is a values.yaml change, not a chart-code change, so it stays out of the mika-cloud repo unless that repo's `values.yaml` defaults need the line for self-documentation (optional follow-up, not part of this plan).

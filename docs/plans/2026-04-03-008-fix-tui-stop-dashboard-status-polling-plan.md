@@ -57,7 +57,7 @@ The footer `[start]`/`[stop]` click handler (lines 858-907 in `app.rs`) already 
 Delete this block:
 
 ```rust
-// Dashboard status polling: query mika-server for embedded dashboard state.
+// Dashboard status polling: query mika-spirit for embedded dashboard state.
 if self.tick_count.is_multiple_of(POLL_INTERVAL_TICKS) {
     let running = crate::commands::dashboard::is_dashboard_running().await;
     if running != self.dashboard_running {

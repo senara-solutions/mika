@@ -235,8 +235,8 @@ Callback delivery: `idx_tasks_callback_delivery` (partial, for TUI polling).
 |--------|----------|--------|----------|
 | `mika` (CLI) | `{agent_home}/logs/mika.log` | JSON | Daily (tracing_appender) |
 | `mika` (team mode) | `{team_dir}/logs/mika.log` | JSON | Daily |
-| `mika-server` | stdout | JSON | None |
-| `mika-server` | `$MIKA_SERVER_LOG_FILE` (optional) | JSON | None |
+| `mika-spirit` | stdout | JSON | None |
+| `mika-spirit` | `$MIKA_SPIRIT_LOG_FILE` (optional) | JSON | None |
 | `mika-gateway` | stdout | JSON | None |
 | `mika-gateway` | `$MIKA_GATEWAY_LOG_FILE` (optional) | JSON | None |
 

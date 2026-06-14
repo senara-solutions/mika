@@ -239,7 +239,7 @@ Single PR, single commit conceptually. No upstream blockers. Can ship behind no 
 
 1. `cargo test -p mika-agent kg::domain_builder` — covers Step 5 unit tests.
 2. `cargo test -p mika-agent kg::entity_resolver` — sanity check existing pending-detection still passes.
-3. Operational smoke: deploy to local mika-server, observe `domain_rebuild_invalidated_resolutions` log on next restart, verify next resolver tick fires with `pending_before > 0` for concept type.
+3. Operational smoke: deploy to local mika-spirit, observe `domain_rebuild_invalidated_resolutions` log on next restart, verify next resolver tick fires with `pending_before > 0` for concept type.
 
 ## Estimated diff size
 

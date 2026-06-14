@@ -209,7 +209,7 @@ cargo fmt --check
 
 After merge:
 
-1. Start mika-server with the patched binary.
+1. Start mika-spirit with the patched binary.
 2. Create a synthetic parent self_dev task and a delivered callback subtask via direct DB inserts (or via a contrived dispatch that exits without a PR).
 3. Wait > 10 minutes (grace period). On the next tick (within 60s after grace expires), reaper fires.
 4. Verify in `~/.mika/data/mika.db`:

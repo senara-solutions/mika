@@ -51,7 +51,7 @@ Option 1 — make `anthropic_api_key` an `Option<String>` and validate at `Claud
 
 - [ ] `mika status` works without `MIKA_ANTHROPIC_API_KEY` set
 - [ ] `mika chat` still fails clearly if API key is missing
-- [ ] No regression in mika-server API key validation
+- [ ] No regression in mika-spirit API key validation
 
 ## Work Log
 

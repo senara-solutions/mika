@@ -126,7 +126,7 @@ Net cost of the hit: ~30 seconds. Net cost of the miss: 20+ minutes plus the ins
 **Symmetry counterexample — when the rule does not apply:**
 
 ```
-User: "Add a new health endpoint to mika-server."
+User: "Add a new health endpoint to mika-spirit."
 Agent: <does not run the pre-flight; this is net-new work in a documented area
         but not a recurrence>
 Agent: <reads existing endpoints, drafts plan, proceeds normally>

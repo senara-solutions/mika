@@ -104,7 +104,7 @@ The ticket lists "load-path serialization drops `required`" as the leading hypot
 
 Commit `06dc9e40` (2026-04-28) added `"skill"` to `required` in `skills/bundled/dev-pilot/tools.json`, changing it from `["prompt","task_id"]` to `["skill","prompt","task_id"]`. Bundled skills are re-seeded on startup by `seed_bundled_skills_if_needed()` in `crates/mika-agent/src/startup.rs:33`, which writes the embedded content over the agent's per-agent skill dir at `~/.mika/agents/<name>/skills/dev-pilot/tools.json`.
 
-`MIKA_DISABLE_BUNDLED_SKILLS=true` skips the re-sync entirely (documented escape hatch). If the running mika-server starts with that env var set — the operator hot-patches workflow per `project_skill_propagation_lock.md` notes — the on-disk `tools.json` is whatever was there at provisioning time. An agent provisioned before 2026-04-28 still has `required: ["prompt","task_id"]`, the dispatch supplies both, validation correctly passes, and the subprocess crashes downstream because `dispatch-lib.sh` post-#06dc9e40 does require `--skill`.
+`MIKA_DISABLE_BUNDLED_SKILLS=true` skips the re-sync entirely (documented escape hatch). If the running mika-spirit starts with that env var set — the operator hot-patches workflow per `project_skill_propagation_lock.md` notes — the on-disk `tools.json` is whatever was there at provisioning time. An agent provisioned before 2026-04-28 still has `required: ["prompt","task_id"]`, the dispatch supplies both, validation correctly passes, and the subprocess crashes downstream because `dispatch-lib.sh` post-#06dc9e40 does require `--skill`.
 
 This matches every piece of evidence in the ticket: binary is post-#969, on-disk source is post-#06dc9e40, but the *agent's* tools.json is pre-#06dc9e40. The ticket's "regression is in the load-path serialization" framing collapses into "the load path reads stale state on disk that the build-time embed doesn't get to overwrite."
 
@@ -147,7 +147,7 @@ The only place this chain *can* drop `required` between source and validation is
 
 Goal: distinguish H1 from H2/H3 *before* writing any test or fix.
 
-1. On the running mika-server's host, capture:
+1. On the running mika-spirit's host, capture:
    - `env | grep MIKA_DISABLE_BUNDLED_SKILLS` from the running process (`/proc/<pid>/environ | tr '\0' '\n' | grep BUNDLED`)
    - `cat ~/.mika/agents/mika/skills/dev-pilot/tools.json | jq '.[0].input_schema.required'`
    - `cat skills/bundled/dev-pilot/tools.json | jq '.[0].input_schema.required'` (in the deployed source tree)
@@ -169,7 +169,7 @@ The original Step 2A is preserved below for audit-trail clarity. Its operational
 The fix is operational *and* structural; both, not either. The validate-fields runtime check is correct as-shipped but is rendered useless by stale on-disk state. Three layered actions:
 
 1. **Operational unblock for `mika#666`** (no code):
-   - With mika-server stopped, `rm -rf ~/.mika/agents/mika/skills/dev-pilot` then restart with `MIKA_DISABLE_BUNDLED_SKILLS` *unset* so `seed_bundled_skills` repopulates from the post-#06dc9e40 embedded content.
+   - With mika-spirit stopped, `rm -rf ~/.mika/agents/mika/skills/dev-pilot` then restart with `MIKA_DISABLE_BUNDLED_SKILLS` *unset* so `seed_bundled_skills` repopulates from the post-#06dc9e40 embedded content.
    - Verify `cat ~/.mika/agents/mika/skills/dev-pilot/tools.json | jq '.[0].input_schema.required'` returns `["skill","prompt","task_id"]`.
    - Cancel the stuck `mika#666` callback child task via `mika tasks cancel <child-id>` so `validate_dispatch_readiness` releases the queue.
    - This unfreezes milestone#13 immediately. The runtime validation in #969 takes effect from the next dispatch.
@@ -237,7 +237,7 @@ Independent of H1/H2 outcome:
 
 ## Risk and reversibility
 
-- **Step 2A.1 (operational unblock)** is destructive — `rm -rf` of an agent skill dir. Mitigation: only the dev-pilot subdir, only after Step 1 has captured the existing content for the regression test, and only after stopping mika-server (so no in-flight dispatch loses its tool definition mid-turn).
+- **Step 2A.1 (operational unblock)** is destructive — `rm -rf` of an agent skill dir. Mitigation: only the dev-pilot subdir, only after Step 1 has captured the existing content for the regression test, and only after stopping mika-spirit (so no in-flight dispatch loses its tool definition mid-turn).
 - **Step 2A.2 (drift detection)** is non-destructive — log-only, opt-in via existing env var.
 - **Step 2A.3 / Step 4 / Step 3 (tests)** are pure additions. No production behavior change.
 - **Step 2B (debug log + trace)** is one-line debug log on a hot path; remove before merge.

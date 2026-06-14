@@ -64,7 +64,7 @@ pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
 
 Updated the doc comment to document memory writes as "Notably allowed" with citation to `docs/architecture/review-guide.md` § Orthogonality. Added regression test `test_mika_arch_disabled_tools_excludes_agent_self_state` and flipped existing test assertion.
 
-**Deploy note:** Existing `~/.mika/agents/mika-arch/identity.toml` files must be manually edited (the provisioning path's `agent_exists` short-circuit prevents re-rendering). Remove the three tool names from `[tools].disabled` and restart mika-server.
+**Deploy note:** Existing `~/.mika/agents/mika-arch/identity.toml` files must be manually edited (the provisioning path's `agent_exists` short-circuit prevents re-rendering). Remove the three tool names from `[tools].disabled` and restart mika-spirit.
 
 ## Why This Works
 

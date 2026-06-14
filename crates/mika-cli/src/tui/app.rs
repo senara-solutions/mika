@@ -976,7 +976,7 @@ impl<'a> App<'a> {
                         Ok(token) => {
                             let url = format!(
                                 "{}/api/v1/dashboard/{endpoint}",
-                                crate::commands::dashboard::server_url()
+                                crate::commands::dashboard::spirit_url()
                             );
                             let client = reqwest::Client::new();
                             match client
@@ -994,7 +994,7 @@ impl<'a> App<'a> {
                                 Ok(resp) => {
                                     format!("Failed to {endpoint} dashboard: {}", resp.status())
                                 }
-                                Err(e) => format!("Failed to reach mika-server: {e}"),
+                                Err(e) => format!("Failed to reach mika-spirit: {e}"),
                             }
                         }
                     }

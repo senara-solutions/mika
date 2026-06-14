@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: Mika Agent API (mika-server)
+  title: Mika Agent API (mika-spirit)
   description: Per-customer agent container HTTP API. Receives messages from the gateway, runs the agent loop, and delivers responses asynchronously.
   license:
     name: MIT

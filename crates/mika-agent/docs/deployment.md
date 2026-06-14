@@ -59,7 +59,7 @@ Build details:
 - **Dashboard builder:** `node:22-slim` — builds the React SPA (`npm ci && npm run build --prefix dashboard`). The built `dashboard/dist/` is copied into the Rust builder for embedding via `rust-embed`.
 - **Builder:** `rust:1.93-slim` with gcc, libc-dev, pkg-config (no OpenSSL — uses rustls)
 - **Runtime:** `debian:bookworm-slim` with ca-certificates, wget, file, jq, gh (GitHub CLI v2.65.0), and gws (Google Workspace CLI v0.13.3) — both with SHA256 checksum verification
-- **Binary:** `mika-server` (Axum HTTP server)
+- **Binary:** `mika-spirit` (Axum HTTP server)
 - **User:** `mika` (UID 1000), non-root
 - **Port:** 8080
 - **Healthcheck:** `wget -q --spider http://localhost:8080/health` (10s interval, 5s start period)
@@ -124,7 +124,7 @@ Runs on push to `main` (after CI passes):
 
 Triggered by `v*` tag push:
 - Builds cross-platform binaries with `--features telemetry`: x86_64-linux, aarch64-linux (cross-compiled), x86_64-macos, aarch64-macos
-- Uploads `mika` (CLI) and `mika-server` (HTTP server) to GitHub Releases with SHA256 checksums
+- Uploads `mika` (CLI) and `mika-spirit` (HTTP server) to GitHub Releases with SHA256 checksums
 - `mika-gateway` excluded — deployed via Docker to Kubernetes, not as a standalone binary
 - Dashboard assets are not embedded in release builds (empty placeholder); the `/dashboard/` endpoint shows a branded "disabled" page
 

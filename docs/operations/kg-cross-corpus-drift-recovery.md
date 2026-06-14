@@ -41,7 +41,7 @@ After purging all drifted agents:
 
 ```bash
 mika kg validate                # confirm 8/8 OK
-sudo rc-service mika-server restart
+sudo rc-service mika-spirit restart
 ```
 
 The next restart's `resolution_pending_start` event fires for each enabled agent. With zero `kg_resolutions_log` entries, the resolver re-resolves all `kg_subject_entities` under the agent's now-correct `docs_root_hash` from scratch.

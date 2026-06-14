@@ -15,7 +15,7 @@ The React observability dashboard ran as a separate Vite dev server on `:5173`, 
 
 ## Solution
 
-Use `rust-embed` to compile `dashboard/dist/` into the mika-server binary at build time. Serve the SPA at `/dashboard/*` with an Axum fallback handler that supports client-side routing.
+Use `rust-embed` to compile `dashboard/dist/` into the mika-spirit binary at build time. Serve the SPA at `/dashboard/*` with an Axum fallback handler that supports client-side routing.
 
 ### Key Components
 

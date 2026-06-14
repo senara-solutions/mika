@@ -96,7 +96,7 @@ Bash test script that:
 - Look in `mika/tests/` for existing shell-test conventions. If a runner exists (e.g., `bats`, plain bash with `set -e`), use it. Otherwise plain bash with explicit `if [ $? -ne 0 ] then fail` shape.
 - `scripts/mika-platform-deploy-preflight` test pattern if mika-platform has one — mirror the structural test approach.
 
-**Execution note:** Structural test (AST-shape, not real git ops on the actual repo). Test must NOT mutate the real working repo or live `~/.local/bin/mika-server`.
+**Execution note:** Structural test (AST-shape, not real git ops on the actual repo). Test must NOT mutate the real working repo or live `~/.local/bin/mika-spirit`.
 
 **Test scenarios:**
 - Off-main without FORCE: exit != 0, ABORT message present

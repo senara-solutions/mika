@@ -10,12 +10,12 @@ Six named multi-stage targets serve different audiences:
 
 | Target | Binary set | Tooling | OpenRC services | Audience |
 |--------|------------|---------|-----------------|----------|
-| `mika-os` | All three + full toolchain | gh, gws, ollama + portage tree | mika-server, mika-gateway | Forkable reference, dev environment |
+| `mika-os` | All three + full toolchain | gh, gws, ollama + portage tree | mika-spirit, mika-gateway | Forkable reference, dev environment |
 | `mika-runtime-base` | None (shared base) | None | None | Internal — not pushed standalone |
-| `mika-runtime-server` | mika-server | gh, ollama | mika-server | mika-cloud per-customer agent container |
+| `mika-runtime-server` | mika-spirit | gh, ollama | mika-spirit | mika-cloud per-customer agent container |
 | `mika-runtime-gateway` | mika-gateway | None | mika-gateway | mika-cloud gateway deployment |
 | `mika-runtime-cli` | mika (TUI) | None | None | Operator desktop install via Docker |
-| `mika-runtime-all` | All three binaries | gh, gws, ollama | mika-server, mika-gateway | Single-box self-host |
+| `mika-runtime-all` | All three binaries | gh, gws, ollama | mika-spirit, mika-gateway | Single-box self-host |
 
 ### Stage hierarchy
 
@@ -90,10 +90,10 @@ docker run -it --rm \
 
 ```bash
 # Check services are running (server or all targets)
-docker exec mika rc-service mika-server status
+docker exec mika rc-service mika-spirit status
 
 # Check version
-docker exec mika mika-server --version
+docker exec mika mika-spirit --version
 ```
 
 ## Configuration
@@ -134,13 +134,13 @@ Daemon targets run services under OpenRC supervision:
 
 | Service | Binary | Port | Config | Present in |
 |---------|--------|------|--------|------------|
-| `mika-server` | `/usr/local/bin/mika-server` | 8080 | `/etc/conf.d/mika-server` | server, all |
+| `mika-spirit` | `/usr/local/bin/mika-spirit` | 8080 | `/etc/conf.d/mika-spirit` | server, all |
 | `mika-gateway` | `/usr/local/bin/mika-gateway` | 3001 | `/etc/conf.d/mika-gateway` | gateway, all |
 
 Manage services inside the container:
 
 ```bash
-docker exec mika rc-service mika-server restart
+docker exec mika rc-service mika-spirit restart
 docker exec mika rc-service mika-gateway stop
 ```
 
@@ -156,13 +156,13 @@ docker exec mika ollama pull llama3
 
 - **Gentoo stage3** base (glibc, OpenRC) — handbook-style `emerge` for all portage-available packages
 - **mika** — TUI CLI (cli, all targets)
-- **mika-server** — HTTP agent server (Axum, with telemetry) (server, all targets)
+- **mika-spirit** — HTTP agent server (Axum, with telemetry) (server, all targets)
 - **mika-gateway** — Telegram + GitHub webhook router (gateway, all targets)
 - **ollama** — Local LLM inference (v0.6.0, sha256-verified, no models pre-loaded) (server, all targets)
 - **gh** CLI — GitHub operations (v2.65.0, sha256-verified) (server, all targets)
 - **gws** CLI — Google Workspace operations (v0.13.3, sha256-verified) (all target only)
 - **OpenRC** process supervision with automatic restart (`supervise-daemon`) (server, gateway, all targets)
-- **Dashboard** — Built-in React observability dashboard (embedded in mika-server)
+- **Dashboard** — Built-in React observability dashboard (embedded in mika-spirit)
 
 ## License
 

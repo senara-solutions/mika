@@ -232,7 +232,7 @@ as part of the implementation PR.
 Warning text "no trigger keywords + not always_on" does **not** appear verbatim in
 `crates/mika-agent/src/skills/index.rs` (the source of the other four). Either it is
 operator paraphrase of an existing diagnostic, or it surfaces from a different
-validator pass. Run `mika-server` startup with `RUST_LOG=debug` against a fresh
+validator pass. Run `mika-spirit` startup with `RUST_LOG=debug` against a fresh
 agent and grep `skill_skipped\|skill_warning\|skill-review` from the log. If the
 exact wording is paraphrase, leave warning #5 out of F4's scope.
 
@@ -459,7 +459,7 @@ keywords are intentional per `skills/bundled/skill-review/skill.toml` comment).
   gap for those variants.
 
 - **AC5.** Validator no longer emits Warn for builtin tool references in `required_tools`
-  for `self-dev`, `qa-review`, `dev-handsoff`. Manual verification: start `mika-server`
+  for `self-dev`, `qa-review`, `dev-handsoff`. Manual verification: start `mika-spirit`
   against a fresh dev-mode home, grep startup log for `required_tools references`. Match
   count drops from current N=3 to 0 for these three skills.
 

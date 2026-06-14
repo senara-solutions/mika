@@ -32,7 +32,7 @@ Add stubs for `mika-a2a` and `mika-cli` alongside the existing `mika-agent` stub
 # Dummy stubs for workspace members not being built
 # (cargo needs their Cargo.toml to resolve the workspace graph)
 COPY crates/mika-agent/Cargo.toml crates/mika-agent/Cargo.toml
-RUN mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agent/src/bin/mika-server.rs \
+RUN mkdir -p crates/mika-agent/src/bin && echo "fn main() {}" > crates/mika-agent/src/bin/mika-spirit.rs \
     && echo "" > crates/mika-agent/src/lib.rs \
     && mkdir -p crates/mika-agent/src && echo "fn main() {}" > crates/mika-agent/src/cli.rs
 

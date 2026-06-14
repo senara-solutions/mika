@@ -260,7 +260,7 @@ If `PilotConfig.from_file()` raises `FileNotFoundError` on missing file (rather 
 - Phase C's relay agent retirement (mika#1193).
 - Hot-reload of policy file mid-session.
 - Replacing the `[claude-pilot] ` payload prefix or other transport-layer contracts.
-- New HTTP endpoints on `mika-server` (option iii was rejected during milestone grooming).
+- New HTTP endpoints on `mika-spirit` (option iii was rejected during milestone grooming).
 
 ## Verification
 

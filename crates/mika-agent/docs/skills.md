@@ -614,7 +614,7 @@ At agent startup, Mika runs `validate_skill()` on every loaded skill **after** a
 |------|-------------------|
 | **TUI** (`mika`) | `ChatRole::System` message at startup listing up to 5 skills with warnings |
 | **`mika ask`** | Summary printed to stderr |
-| **Server** (`mika-server`) | `tracing::warn` log entries with structured fields (`skill`, `error_kind`, `message`) |
+| **Server** (`mika-spirit`) | `tracing::warn` log entries with structured fields (`skill`, `error_kind`, `message`) |
 
 For full diagnostic output, run `mika skills validate`.
 
@@ -854,7 +854,7 @@ Validate the skill structure before starting Mika:
 mika skills validate timezone
 ```
 
-A restart is required for Mika to discover new skill directories, because `skill.toml` manifests are scanned once at startup. After restarting Mika (or the mika-server process), send a message like:
+A restart is required for Mika to discover new skill directories, because `skill.toml` manifests are scanned once at startup. After restarting Mika (or the mika-spirit process), send a message like:
 
 ```
 What time is it in Tokyo when it's 3 PM in New York?

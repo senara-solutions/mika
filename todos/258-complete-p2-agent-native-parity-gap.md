@@ -58,7 +58,7 @@ impl Tool for RunTeamTool {
 - Team execution can be long-running (minutes), so the tool should work within the agent's 5-minute timeout or have special handling
 - The tool context (`ToolContext`) may need extension to include team-related configuration
 - Consider whether team runs should count against the agent's 10-tool-step limit or have their own budget
-- Server mode (mika-server) would also benefit from team access via the `/message` endpoint
+- Server mode (mika-spirit) would also benefit from team access via the `/message` endpoint
 
 ## Acceptance Criteria
 

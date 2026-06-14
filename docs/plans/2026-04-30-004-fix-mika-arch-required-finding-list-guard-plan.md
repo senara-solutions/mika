@@ -271,7 +271,7 @@ The earlier `1d5a420c` retroactive review (session `1e148899-d577-4cb7-be7d-4e25
 
   **Verification:**
   - `grep -n "required_finding_list_prefixes" skills/bundled/mika-arch-*/skill.toml` returns the new field in both target skills, NOT in groom-milestone.
-  - mika-server startup logs no skill-validation warnings about the new field beyond expected Warn-not-Fail patterns.
+  - mika-spirit startup logs no skill-validation warnings about the new field beyond expected Warn-not-Fail patterns.
 
 - [ ] **Unit 3: Skill prompt updates documenting the unconditional F-list contract**
 
