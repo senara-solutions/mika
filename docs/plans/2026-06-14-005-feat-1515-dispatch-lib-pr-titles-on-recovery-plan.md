@@ -31,7 +31,7 @@ This is the simplest case — the subject is already there.
 
 The pilot never committed. dispatch-lib created a `wip(...)` rescue commit. The rescue commit subject is not useful. Derivation fallback chain:
 
-1. **Plan file H1 title + issue labels → conventional-commit format.** The plan file (`docs/plans/*-<ISSUE_NUM>-*-plan.md`) is reliably present in the rescued tree (the pilot ran `/ce:plan` before writing code). Parse the H1 (`# <title>`), map the issue's primary type label (`enhancement` → `feat`, `bug` → `fix`, etc.) and scope from the plan filename or issue title, and construct `<type>(<scope>): <description> (mika#NNNN)`.
+1. **Plan file H1 title + issue labels → conventional-commit format.** The plan file (`docs/plans/*-<ISSUE_NUM>-*-plan.md`) is reliably present in the rescued tree (the pilot ran `/ce:plan` before writing code). Find the plan file by name (no size filter — the H1 extraction determines usability; review-guide.md § KISS/YAGNI). Parse the H1 (`# <title>`), map the issue's primary type label (`enhancement` → `feat`, `bug` → `fix`, etc.) and scope from the plan filename or issue title, and construct `<type>(<scope>): <description> (mika#NNNN)`. If the file exists but has no H1 within the first 5 lines, fall through to the issue-title fallback.
 
 2. **Issue title fallback.** If no plan file is found (edge case — pilot crashed before plan), use the issue title with label-derived type prefix: `<type>: <issue-title> (mika#NNNN)`.
 
@@ -56,6 +56,10 @@ Uses the `LABELS` variable already captured at line 456 (comma-separated label l
 ### Scope extraction
 
 Extract scope from the plan H1 or issue title by matching the conventional-commit pattern if already present (e.g., `feat(dispatch-lib): ...` → scope is `dispatch-lib`). If no scope is present in the title, omit it — `feat: description` is valid conventional-commit.
+
+### Conventional-commit prefix detection (F1 — review-guide.md § KISS)
+
+Detecting whether a title already carries a conventional-commit prefix uses a character-class anchor on the delimiter that follows the type keyword — either `(` (scoped) or `:` (unscoped). Pattern: `'^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]'`. This is POSIX ERE compliant (no `\b` word-boundary extension) and correctly rejects false positives like `fixture` starting with `fix` — the delimiter must immediately follow the type keyword.
 
 ### Recovery metadata preservation (AC3)
 
@@ -107,7 +111,8 @@ _derive_recovery_pr_title() {
 
     # Look for plan file
     local plan_file
-    plan_file=$(find "$wt_dir/docs/plans" -name "*-${issue_num}-*-plan.md" -size +500c 2>/dev/null | sort -r | head -1)
+    # No size filter — rely on H1 extraction to determine plan usability (F2, review-guide.md § KISS/YAGNI)
+    plan_file=$(find "$wt_dir/docs/plans" -name "*-${issue_num}-*-plan.md" 2>/dev/null | sort -r | head -1)
 
     if [ -n "$plan_file" ]; then
         # Extract H1 title from plan
@@ -115,7 +120,7 @@ _derive_recovery_pr_title() {
         plan_h1=$(head -5 "$plan_file" | grep -m1 '^# ' | sed 's/^# //')
         if [ -n "$plan_h1" ]; then
             # Check if H1 already has conventional-commit format
-            if echo "$plan_h1" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf|ci)\b'; then
+            if echo "$plan_h1" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]'; then
                 echo "$plan_h1"
                 return
             fi
@@ -127,7 +132,7 @@ _derive_recovery_pr_title() {
 
     # Final fallback: issue title
     # Check if issue title already has conventional-commit format
-    if echo "$issue_title" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf|ci)\b'; then
+    if echo "$issue_title" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]'; then
         echo "$issue_title"
         return
     fi
@@ -204,3 +209,7 @@ In the rescue commit messages (lines 792 and 826), the commit body already notes
 - Changing the rescue commit message subjects (`wip(...)` prefix) — these are internal-only markers.
 - Retroactively renaming existing recovery PRs — operator can batch-rename if desired.
 - Changing the `## Recovery metadata` PR body format — already correct per AC3.
+
+## Revision history
+
+- rev 2 (2026-06-14): addressed F1 by replacing `\b` word-boundary (GNU/PCRE extension, not POSIX ERE) with `[:(]` character-class anchor at both conventional-commit prefix detection points — matches the delimiter that always follows the type keyword in conventional-commit subjects (review-guide.md § KISS); addressed F2 by removing the `-size +500c` filter from plan-file lookup — usability is now determined solely by H1 extraction (`head -5 | grep -m1 '^# '`), eliminating the silent skip of small but valid plan files (review-guide.md § KISS, § YAGNI).

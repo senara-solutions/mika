@@ -1868,6 +1868,82 @@ _iterate_groom_loop() {
     esac
 }
 
+# _label_to_type — Map GitHub issue label to conventional-commit type prefix.
+# Uses the first matching label from a comma-separated list.
+_label_to_type() {
+    case "$1" in
+        *enhancement*|*feature*) echo "feat" ;;
+        *bug*)                   echo "fix" ;;
+        *infrastructure*)        echo "chore" ;;
+        *documentation*)         echo "docs" ;;
+        *refactor*)              echo "refactor" ;;
+        *test*)                  echo "test" ;;
+        *)                       echo "chore" ;;
+    esac
+}
+
+# _derive_recovery_pr_title — Compute a conventional-commit PR title for
+# recovery-class PRs. Called by the recovery block (mika#1282 + mika#1396).
+#
+# For commit-pushed-no-pr: reads the impl commit subject from branch tip.
+# For dirty-worktree: reads the plan file H1 or falls back to issue title.
+#
+# Args:
+#   $1 — recovery class ("dirty-worktree" or "commit-pushed-no-pr")
+#   $2 — worktree dir
+#   $3 — repo name
+#   $4 — issue number
+#   $5 — labels (comma-separated)
+#   $6 — issue title
+#
+# Outputs: PR title string to stdout
+_derive_recovery_pr_title() {
+    local recovery_class="$1"
+    local wt_dir="$2"
+    local repo="$3"
+    local issue_num="$4"
+    local labels="$5"
+    local issue_title="$6"
+
+    if [ "$recovery_class" = "commit-pushed-no-pr" ]; then
+        local impl_subject
+        impl_subject=$(git -C "$wt_dir" log -1 --format='%s' HEAD 2>/dev/null)
+        if [ -n "$impl_subject" ]; then
+            echo "$impl_subject"
+            return
+        fi
+    fi
+
+    # dirty-worktree or fallback: derive from plan H1 + labels
+    local type_prefix
+    type_prefix=$(_label_to_type "$labels")
+
+    # Look for plan file
+    local plan_file
+    plan_file=$(find "$wt_dir/docs/plans" -name "*-${issue_num}-*-plan.md" 2>/dev/null | sort -r | head -1)
+
+    if [ -n "$plan_file" ]; then
+        local plan_h1
+        plan_h1=$(head -5 "$plan_file" | grep -m1 '^# ' | sed 's/^# //')
+        if [ -n "$plan_h1" ]; then
+            # Check if H1 already has conventional-commit format
+            if echo "$plan_h1" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]'; then
+                echo "$plan_h1"
+                return
+            fi
+            echo "${type_prefix}: ${plan_h1} (${repo}#${issue_num})"
+            return
+        fi
+    fi
+
+    # Final fallback: issue title
+    if echo "$issue_title" | grep -qE '^(feat|fix|chore|docs|refactor|test|perf|ci)[:(]'; then
+        echo "$issue_title"
+        return
+    fi
+    echo "${type_prefix}: ${issue_title} (${repo}#${issue_num})"
+}
+
 _deliver_callback() {
     set +e
     if [ -n "$AGENT" ]; then
@@ -2118,12 +2194,12 @@ ${RESULT}"
         local _rescue_title
         local _rescue_body_note
         if [ "$RECOVERY_CLASS" = "dirty-worktree" ]; then
-            _rescue_title="wip(${REPO}#${ISSUE_NUM}): rescued impl (dispatch-lib recovery)"
+            _rescue_title=$(_derive_recovery_pr_title "dirty-worktree" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
             _rescue_body_note="The dev-pilot session wrote file changes but never completed the git workflow (no \`git commit\` or \`gh pr create\`). Per the mika#1271 content/workflow split contract, dispatch-lib took ownership of the git layer: staged, committed with \`wip()\` prefix, pushed, and opened this draft PR to preserve the content.
 
 **This is a draft PR requiring human review.** The content has NOT passed \`/ce:review\` and may contain partially-coherent multi-file changes."
         else
-            _rescue_title="${REPO}#${ISSUE_NUM}: pilot impl (dispatch-lib PR-create recovery, mika#1396)"
+            _rescue_title=$(_derive_recovery_pr_title "commit-pushed-no-pr" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
             _rescue_body_note="The dev-pilot session committed and pushed the implementation but \`gh pr create\` failed (typically a transient AxiosError 5000ms timeout from claude-cli's internal HTTP relay). Branch is on origin with the impl commit; only the final PR-creation step needed recovery.
 
 **This is a draft PR — operator should verify pilot's pipeline (/ce:work, /ce:review, /ce:compound) completed before marking ready.** The recovery path is uniform with mika#1282's draft-PR pattern for audit consistency."
