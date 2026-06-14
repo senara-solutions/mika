@@ -918,7 +918,38 @@ ${RESULT}"
                 CE_PLAN_INVOKED="unknown"
             fi
 
-            if [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
+            # Policy-deny pre-check (drift-misdiagnosis fix, docs/solutions/
+            # workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md).
+            # If the pilot was halted by claude-pilot's tier1/policy classifier
+            # on a research bash command, it is NOT LLM drift — the pilot
+            # tried to do its work and was prevented. Disambiguate by reading
+            # the persistent stderr for [policy:deny] before declaring drift.
+            # Fail-open: if stderr is unavailable, fall through to the
+            # existing drift messages.
+            POLICY_DENY=""
+            PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
+            if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
+                # Strip ANSI color codes, then extract the first [policy:deny] line.
+                # The line shape is `[policy:deny] <Tool>: <command>[ \[rule-id\]]`.
+                POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
+                    | grep -m1 '\[policy:deny\]' || true)
+            fi
+
+            if [ -n "$POLICY_DENY" ]; then
+                # Class C — policy-deny-induced early halt. The pilot made a
+                # legitimate research request that hit a tier1/policy allow-list
+                # gap. This is NOT LLM drift; the operator should investigate
+                # the deny rule, not the pilot's reasoning.
+                RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift.
+
+Halt event: ${POLICY_DENY}
+
+Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate research command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-grooming this ticket without addressing the substrate gap will hit the same wall.
+
+See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+
+${RESULT}"
+            elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
                 # Both checks failed: no plan file AND /ce:plan never called
                 RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no issue-scoped plan >500 bytes found via _find_issue_plan for $REPO#$ISSUE_NUM) and no /ce:plan invocation detected in session log. Session drifted into executor mode.
 

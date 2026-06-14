@@ -2132,6 +2132,102 @@ assert_not_contains "No hardcoded wip() rescue title" \
 assert_not_contains "No hardcoded pilot impl rescue title" \
     'pilot impl (dispatch-lib PR-create recovery' "$RECOVERY_BLOCK"
 
+# --- Test 13: policy-deny disambiguation (drift-misdiagnosis fix) ---
+# Mirrors investigation in docs/solutions/workflow-issues/
+# 2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md.
+# Verifies the new POLICY_DENY pre-check exists, precedes the existing
+# drift-detection chain, reads from the persistent stderr path, and emits
+# a distinct message that does NOT conflate the failure with LLM drift.
+
+echo ""
+echo "Test 13: Policy-deny disambiguation precedes drift detection (structural)"
+echo "-------------------------------------------------------------------------"
+
+DRIFT_BLOCK=$(sed -n '/Post-flight plan validation/,/Issue #138: Discover/p' "$DISPATCH_LIB")
+
+assert_contains "POLICY_DENY variable initialized" \
+    'POLICY_DENY=""' "$DRIFT_BLOCK"
+assert_contains "PERSISTENT_STDERR_PATH uses LOG_ID convention" \
+    'PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"' "$DRIFT_BLOCK"
+assert_contains "Reads from persistent stderr (mika#1097 channel)" \
+    '"$PERSISTENT_STDERR_PATH"' "$DRIFT_BLOCK"
+assert_contains "Strips ANSI before grep (UI ANSI shouldn't break match)" \
+    'sed' "$DRIFT_BLOCK"
+assert_contains "Searches for [policy:deny] marker" \
+    '[policy:deny]' "$DRIFT_BLOCK"
+assert_contains "Class C message identifies policy halt explicitly" \
+    'halted by claude-pilot policy deny' "$DRIFT_BLOCK"
+assert_contains "Class C message explicitly NOT drift" \
+    'not LLM drift' "$DRIFT_BLOCK"
+assert_contains "Class C message links to investigation doc" \
+    'drift-misdiagnosis-policy-deny-halt' "$DRIFT_BLOCK"
+
+# Branch ordering: the POLICY_DENY branch must be the FIRST elif/if, so it wins
+# over the drift messages when both conditions could fire.
+POLICY_DENY_LINE=$(echo "$DRIFT_BLOCK" | grep -n 'if \[ -n "\$POLICY_DENY" \]' | head -1 | cut -d: -f1)
+DRIFT_MSG_LINE=$(echo "$DRIFT_BLOCK" | grep -n 'Session drifted into executor mode' | head -1 | cut -d: -f1)
+if [ -n "$POLICY_DENY_LINE" ] && [ -n "$DRIFT_MSG_LINE" ] && [ "$POLICY_DENY_LINE" -lt "$DRIFT_MSG_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ POLICY_DENY branch precedes drift message in source"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ POLICY_DENY branch must precede drift message (POLICY_DENY_LINE=$POLICY_DENY_LINE, DRIFT_MSG_LINE=$DRIFT_MSG_LINE)"
+fi
+
+# Behavioral test — extract the policy-deny check logic into a function and
+# exercise it with synthetic stderr fixtures.
+echo ""
+echo "Test 13b: Policy-deny check (behavioral, synthetic stderr fixtures)"
+echo "-------------------------------------------------------------------"
+
+# Minimal reproduction of the policy-deny check from dispatch-lib.sh.
+# Kept in sync with the version in dispatch-lib.sh via the structural
+# assertions above (mirrors the mika#1364 self-test approach).
+_test_policy_deny_check() {
+    local stderr_path="$1"
+    local policy_deny=""
+    if [ -f "$stderr_path" ] && [ -r "$stderr_path" ]; then
+        policy_deny=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$stderr_path" 2>/dev/null \
+            | grep -m1 '\[policy:deny\]' || true)
+    fi
+    printf '%s' "$policy_deny"
+}
+
+POLICY_DENY_FIXTURE_DIR=$(mktemp -d)
+trap "rm -rf '$POLICY_DENY_FIXTURE_DIR'" EXIT
+
+# Fixture 1: stderr with a real ANSI-coded policy-deny line (today's mika#624 shape).
+printf '\x1b[31m[policy:deny]\x1b[0m \x1b[1mBash\x1b[0m: gh auth status 2>&1 | head -10\n' \
+    > "$POLICY_DENY_FIXTURE_DIR/with_deny.stderr"
+RESULT=$(_test_policy_deny_check "$POLICY_DENY_FIXTURE_DIR/with_deny.stderr")
+assert_contains "ANSI-stripped deny line extracted" \
+    '[policy:deny] Bash: gh auth status' "$RESULT"
+
+# Fixture 2: stderr without any policy-deny lines (healthy session).
+printf '[init] Session abc123\n[done] Success | 5 turns | $0.20\n' \
+    > "$POLICY_DENY_FIXTURE_DIR/clean.stderr"
+RESULT=$(_test_policy_deny_check "$POLICY_DENY_FIXTURE_DIR/clean.stderr")
+assert_eq "Clean stderr yields empty POLICY_DENY" "" "$RESULT"
+
+# Fixture 3: stderr missing entirely (fail-open, fall through to drift checks).
+RESULT=$(_test_policy_deny_check "$POLICY_DENY_FIXTURE_DIR/does_not_exist.stderr")
+assert_eq "Missing stderr yields empty POLICY_DENY (fail-open)" "" "$RESULT"
+
+# Fixture 4: deny line with rule-id suffix (today's mika#96 shape).
+printf '\x1b[31m[policy:deny]\x1b[0m \x1b[1mBash\x1b[0m: grep -r "x" /tmp/ [bash-grep]\n' \
+    > "$POLICY_DENY_FIXTURE_DIR/deny_with_rule.stderr"
+RESULT=$(_test_policy_deny_check "$POLICY_DENY_FIXTURE_DIR/deny_with_rule.stderr")
+assert_contains "Deny line with rule-id suffix extracted" \
+    '[bash-grep]' "$RESULT"
+
+# Fixture 5: multiple deny lines — only the first should be extracted (head -1
+# behavior). Operators get the actionable signal without spam.
+printf '[policy:deny] Bash: cmd1\n[policy:deny] Bash: cmd2\n[policy:deny] Bash: cmd3\n' \
+    > "$POLICY_DENY_FIXTURE_DIR/multi_deny.stderr"
+RESULT=$(_test_policy_deny_check "$POLICY_DENY_FIXTURE_DIR/multi_deny.stderr")
+assert_contains "First deny extracted" "cmd1" "$RESULT"
+assert_not_contains "Subsequent denies not included" "cmd2" "$RESULT"
+
 # --- Summary ---
 
 echo ""
