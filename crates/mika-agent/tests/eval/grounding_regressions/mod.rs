@@ -50,6 +50,7 @@ pub mod dev_groom_verdict_producer_exempt;
 pub mod engine_correction_rejection;
 pub mod fabricated_shell_errors;
 pub mod graphql_field_fabrication;
+pub mod guard_fabrication_telemetry;
 pub mod kg_result_ignored;
 pub mod merge_gate_blocked_no_fallback;
 pub mod merge_gate_errored_no_fallback;

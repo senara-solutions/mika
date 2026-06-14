@@ -636,7 +636,16 @@ fn strip_prior_images(messages: &mut [LlmMessage]) {
 /// `required_finding_list_prefixes` specifies finding-line prefixes (from matched skills'
 /// `[output]` sections) that must appear in the message body on terminal dispositions
 /// (ITERATE/ESCALATE). See #901.
-///
+// Cross-step correlation state for guard telemetry (#953). When any fabrication-class
+// guard fires (detection event at step N), this struct captures the correlation ID so
+// the subsequent successful EndTurn (step N+1) can emit a paired correction event with
+// corrected_content. Last-writer-wins when multiple guards fire across retries.
+struct GuardCorrelation {
+    correlation_id: String,
+    guard_label: &'static str,
+    step: usize,
+}
+
 /// `is_verdict_producer` is true when the agent has a known verdict-producer skill loaded
 /// (e.g. mika-arch-groom-ticket, mika-arch-second-review). When true, the dev-groom
 /// fabrication guard (position 5b) is exempted — verdict lines are legitimate output,
@@ -739,6 +748,10 @@ async fn run_loop(
     // Guards against thin-emission: skills declaring `[output] required_finding_list_prefixes`
     // must have at least one F-list line in the message body on terminal dispositions. See #901.
     let mut required_finding_list_retry_done = false;
+    // Guard telemetry correlation (#953). Set by any fabrication-class guard firing
+    // (last-writer-wins); consumed on the next successful EndTurn to emit a paired
+    // `guard.correction_accepted` event with `corrected_content`.
+    let mut guard_correlation: Option<GuardCorrelation> = None;
     // Intent-precondition registry retry tracking (#702). Each entry label
     // gets inserted on first fire; presence prevents re-fire. Replaces the
     // former `webhook_zero_tools_retry_done` boolean and generalizes to all
@@ -1333,10 +1346,23 @@ async fn run_loop(
 
                         if !has_verification {
                             callback_state_claim_retry_done = true;
+                            let corr_id =
+                                format!("{}:{}:callback_state_claim", tool_ctx.trace_id, step);
+                            guard_correlation = Some(GuardCorrelation {
+                                correlation_id: corr_id.clone(),
+                                guard_label: "callback_state_claim",
+                                step,
+                            });
                             warn!(
+                                target: "mika::otel",
+                                trace_id = %tool_ctx.trace_id,
+                                agent_id = %db.agent_id(),
+                                session_id,
                                 step,
                                 claim,
+                                guard_correlation_id = %corr_id,
                                 label = mode.label(),
+                                event = "guard.callback_state_claim",
                                 "Callback state claim detected without verification tool — re-prompting"
                             );
                             request.messages.push(LlmMessage {
@@ -1374,11 +1400,24 @@ async fn run_loop(
                         && let Some((verb, url)) = detect_fabricated_action_claim(&text)
                     {
                         fabricated_action_retry_done = true;
+                        let corr_id =
+                            format!("{}:{}:fabricated_action_claim", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "fabricated_action_claim",
+                            step,
+                        });
                         warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
                             step,
                             verb,
                             url,
+                            guard_correlation_id = %corr_id,
                             label = mode.label(),
+                            event = "guard.fabricated_action_claim",
                             "Fabricated action claim detected with zero tool calls — re-prompting"
                         );
                         request.messages.push(LlmMessage {
@@ -1438,9 +1477,22 @@ async fn run_loop(
                             .any(|s| s.name == "run_claude_pilot_groom" && s.success);
                         if claims_verdict && !dispatched {
                             dev_groom_fabrication_retry_done = true;
-                            warn!(
+                            let corr_id =
+                                format!("{}:{}:dev_groom_fabrication", tool_ctx.trace_id, step);
+                            guard_correlation = Some(GuardCorrelation {
+                                correlation_id: corr_id.clone(),
+                                guard_label: "dev_groom_fabrication",
                                 step,
+                            });
+                            warn!(
+                                target: "mika::otel",
+                                trace_id = %tool_ctx.trace_id,
+                                agent_id = %db.agent_id(),
+                                session_id,
+                                step,
+                                guard_correlation_id = %corr_id,
                                 label = mode.label(),
+                                event = "guard.dev_groom_fabrication",
                                 "dev-groom fabrication guard: response claims Verdict \
                                  without a successful run_claude_pilot_groom call — \
                                  re-prompting (#1133)"
@@ -1615,11 +1667,24 @@ async fn run_loop(
                         )
                     {
                         intent_guard_retries.insert(ASSERTED_UNAVAILABILITY_LABEL);
-                        warn!(
+                        let corr_id =
+                            format!("{}:{}:asserted_unavailability", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "asserted_unavailability",
                             step,
-                            label = mode.label(),
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
                             tool = %tool_name,
                             intent_guard = ASSERTED_UNAVAILABILITY_LABEL,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.asserted_unavailability",
                             "Asserted-unavailability guard fired — re-prompting"
                         );
                         request.messages.push(LlmMessage {
@@ -1659,13 +1724,25 @@ async fn run_loop(
                         && !assert_grounded_satisfied(&claim, &all_tool_summaries)
                     {
                         intent_guard_retries.insert(ASSERT_GROUNDED_LABEL);
-                        warn!(
+                        let corr_id = format!("{}:{}:assert_grounded", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "assert_grounded",
                             step,
-                            label = mode.label(),
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
                             resource_type = claim.resource_type,
                             resource_ref = %claim.resource_ref,
                             claim = %claim.claim_text,
                             intent_guard = ASSERT_GROUNDED_LABEL,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.assert_grounded",
                             "Assert-grounded guard fired — re-prompting"
                         );
                         request.messages.push(LlmMessage {
@@ -2000,6 +2077,53 @@ async fn run_loop(
                         )
                         .await?;
                     }
+                    // #953 — Guard correction telemetry. When a guard fired on a
+                    // previous step and the current EndTurn passes all guards, emit
+                    // a paired correction event with the accepted content.
+                    if let Some(corr) = guard_correlation.take() {
+                        let corrected = &text[..text.floor_char_boundary(2000)];
+                        info!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            guard_correlation_id = %corr.correlation_id,
+                            original_guard = corr.guard_label,
+                            original_step = corr.step,
+                            corrected_content = %corrected,
+                            event = "guard.correction_accepted",
+                            "Guard correction accepted — corrected content captured"
+                        );
+                    }
+
+                    // #953 — Architect anchoring self-report. When a verdict-producer
+                    // agent (mika-arch) correctly self-reports inability to anchor a
+                    // citation, record an audit event as a success signal.
+                    if is_verdict_producer {
+                        const ANCHORING_PHRASES: &[&str] = &[
+                            "unable to anchor",
+                            "flag the inability to anchor",
+                            "cannot be retrieved via a fresh tool call",
+                            "could not retrieve",
+                        ];
+                        let text_lower = text.to_lowercase();
+                        if ANCHORING_PHRASES.iter().any(|p| text_lower.contains(p)) {
+                            let after_val = &text[..text.floor_char_boundary(500)];
+                            let _ = db
+                                .log_audit_event(
+                                    session_id,
+                                    "fabrication_guard",
+                                    "arch_anchoring_self_report",
+                                    None,
+                                    Some(after_val),
+                                    Some("mika-arch correctly self-reported inability to anchor a citation (success signal per #952 skill prompts)"),
+                                    Some(tool_ctx.trace_id),
+                                )
+                                .await;
+                        }
+                    }
+
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
                         text: Some(text),

@@ -546,6 +546,38 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 
 **Session lifecycle:** Silent dispatcher variants call `end_session()` after completion. CLI commands call `end_session()` on all exit paths. `startup_recovery()` prunes old sessions via `prune_old_sessions()`.
 
+### Guard Fabrication Telemetry (#953)
+
+Structured telemetry for the five fabrication-class EndTurn guards. Each guard firing emits a `target: "mika::otel"` event (exported to Langfuse via OTLP when telemetry is enabled, always in log file). Two paired event types:
+
+**Detection events** — emitted when a guard fires (step N):
+
+| Event name | Guard position | Fires when |
+|---|---|---|
+| `guard.callback_state_claim` | 4c | Callback turn claims downstream state without `run_gh`/`check_task`/`gh_read` |
+| `guard.fabricated_action_claim` | 5 | Claims action with GitHub URL but zero tool calls |
+| `guard.dev_groom_fabrication` | 5b | Claims Verdict without `run_claude_pilot_groom` call |
+| `guard.asserted_unavailability` | 6c | Claims tool unavailable when it's in the enabled set |
+| `guard.assert_grounded` | 6d | Affirms resource state without grounding tool call |
+
+Fields: `trace_id`, `agent_id`, `session_id`, `step`, `guard_correlation_id` (`{trace_id}:{step}:{guard_label}`), `label` (mode), plus guard-specific detail fields.
+
+**Correction event** — emitted when the next EndTurn passes all guards (step N+1):
+
+| Event name | Fires when | Key fields |
+|---|---|---|
+| `guard.correction_accepted` | EndTurn accepted after a guard previously fired | `guard_correlation_id` (matches detection), `original_guard`, `original_step`, `corrected_content` (truncated to 2000 chars) |
+
+**Architect self-report** — complementary success signal (not fabrication detection):
+
+When a verdict-producer agent (mika-arch) self-reports inability to anchor a citation (the desired behavior per #952 skill prompts), an `audit_events` row is written with `tool_name='fabrication_guard'`, `target_key='arch_anchoring_self_report'`. Queryable via SQL: `SELECT * FROM audit_events WHERE target_key = 'arch_anchoring_self_report'`.
+
+**Query patterns:**
+- Detection events: `grep 'guard\.' server.log | jq 'select(.event | startswith("guard.") and . != "guard.correction_accepted")'`
+- Correction events: `grep guard.correction_accepted server.log | jq '{guard_correlation_id, corrected_content}'`
+- Cross-event join: match `guard_correlation_id` between detection and correction events
+- Self-report (SQL): `SELECT * FROM audit_events WHERE target_key = 'arch_anchoring_self_report'`
+
 ### Log Sinks
 
 Two distinct sinks exist for runtime log events. Both emit the same structured JSON with an `agent_id` field on every entry — the difference is the file target and the process that writes to it.
