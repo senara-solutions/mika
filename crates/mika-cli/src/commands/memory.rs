@@ -1,12 +1,14 @@
 use anyhow::Result;
 use mika_agent::db::{CORE_MEMORY_SECTIONS, core_memory_section_names, default_self_model};
 
-use crate::cli::{MemoryArgs, MemoryCommand};
+use crate::cli::{MemoryArgs, MemoryCommand, OutputFormat};
+use crate::commands::format_helper::print_structured;
 use crate::init;
 
 pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
     let ctx = init::init_db_only_for_agent(agent_name)?;
     let db = &ctx.async_db;
+    let format = &args.format;
 
     match args.command {
         None => {
@@ -14,7 +16,7 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
             let entries = db.get_all_core_memory().await?;
             if entries.is_empty() {
                 println!("\nNo core memory entries.\n");
-            } else {
+            } else if !print_structured(format, &entries)? {
                 println!("\n  Core Memory");
                 for entry in &entries {
                     println!("\n  [{}] (~{} tokens)", entry.key, entry.token_count);
@@ -25,7 +27,7 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
                 println!();
             }
         }
-        Some(MemoryCommand::Search { query, format }) => {
+        Some(MemoryCommand::Search { query }) => {
             let (people, commitments, preferences, events) = tokio::join!(
                 db.search_people(&query),
                 db.search_commitments(&query),
@@ -34,16 +36,16 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
             );
 
             match format {
-                crate::cli::OutputFormat::Json => {
+                OutputFormat::Json | OutputFormat::Yaml => {
                     let obj = serde_json::json!({
                         "people": people.unwrap_or_default(),
                         "commitments": commitments.unwrap_or_default(),
                         "preferences": preferences.unwrap_or_default(),
                         "events": events.unwrap_or_default(),
                     });
-                    println!("{}", serde_json::to_string_pretty(&obj)?);
+                    print_structured(format, &obj)?;
                 }
-                crate::cli::OutputFormat::Text => {
+                OutputFormat::Text => {
                     let mut found = false;
                     println!();
 
@@ -117,7 +119,7 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
             let items = db.list_people().await?;
             if items.is_empty() {
                 println!("\n  No tracked people.\n");
-            } else {
+            } else if !print_structured(format, &items)? {
                 println!("\n  People ({}):", items.len());
                 for p in &items {
                     println!(
@@ -136,7 +138,7 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
             let items = db.list_commitments(&status).await?;
             if items.is_empty() {
                 println!("\n  No {status} commitments.\n");
-            } else {
+            } else if !print_structured(format, &items)? {
                 println!("\n  Commitments — {status} ({}):", items.len());
                 for c in &items {
                     let due = c
@@ -153,7 +155,7 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
             let items = db.list_preferences().await?;
             if items.is_empty() {
                 println!("\n  No stored preferences.\n");
-            } else {
+            } else if !print_structured(format, &items)? {
                 println!("\n  Preferences ({}):", items.len());
                 for p in &items {
                     println!("    {}: {}", p.category, p.value);
@@ -165,7 +167,7 @@ pub async fn run(args: MemoryArgs, agent_name: &str) -> Result<()> {
             let items = db.list_events().await?;
             if items.is_empty() {
                 println!("\n  No stored events.\n");
-            } else {
+            } else if !print_structured(format, &items)? {
                 println!("\n  Events ({}):", items.len());
                 for e in &items {
                     let date = e

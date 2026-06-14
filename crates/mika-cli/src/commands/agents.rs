@@ -52,6 +52,18 @@ fn list(global_home: &std::path::Path, format: &OutputFormat) -> Result<()> {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&entries)?);
         }
+        OutputFormat::Yaml => {
+            let entries: Vec<serde_json::Value> = agents
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "name": name,
+                        "active": *name == active,
+                    })
+                })
+                .collect();
+            print!("{}", serde_yaml::to_string(&entries)?);
+        }
         OutputFormat::Text => {
             if agents.is_empty() {
                 println!("\n  No agents found. Run `mika agents create <name>` to create one.\n");
@@ -250,6 +262,10 @@ fn validate_agents(
             if !agent::agent_exists(global_home, n) {
                 match format {
                     OutputFormat::Json => println!("[]"),
+                    OutputFormat::Yaml => print!(
+                        "{}",
+                        serde_yaml::to_string(&Vec::<serde_json::Value>::new())?
+                    ),
                     OutputFormat::Text => println!("\n  Agent '{n}' not found.\n"),
                 }
                 return Ok(());
@@ -261,6 +277,10 @@ fn validate_agents(
             if found.is_empty() {
                 match format {
                     OutputFormat::Json => println!("[]"),
+                    OutputFormat::Yaml => print!(
+                        "{}",
+                        serde_yaml::to_string(&Vec::<serde_json::Value>::new())?
+                    ),
                     OutputFormat::Text => println!("\n  No agents found.\n"),
                 }
                 return Ok(());
@@ -290,7 +310,7 @@ fn validate_agents(
         }
 
         match format {
-            OutputFormat::Json => {
+            OutputFormat::Json | OutputFormat::Yaml => {
                 for diag in &diags {
                     all_diags.push(serde_json::json!({
                         "agent": agent_name,
@@ -311,6 +331,9 @@ fn validate_agents(
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&all_diags)?);
+        }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&all_diags)?);
         }
         OutputFormat::Text => {
             println!();

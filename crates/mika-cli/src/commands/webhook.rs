@@ -90,6 +90,9 @@ async fn list_dead(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&body)?);
+        }
         OutputFormat::Text => {
             let deliveries = body["deliveries"].as_array();
             let count = deliveries.map(|d| d.len()).unwrap_or(0);
@@ -166,6 +169,9 @@ async fn replay(delivery_id: &str, format: &OutputFormat) -> Result<()> {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&body)?);
+        }
         OutputFormat::Text => {
             let status = body["delivery"]["status"].as_str().unwrap_or("unknown");
             if status == "delivered" {
@@ -209,6 +215,9 @@ async fn replay_all(format: &OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&body)?);
         }
         OutputFormat::Text => {
             let succeeded = body["succeeded"].as_u64().unwrap_or(0);

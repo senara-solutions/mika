@@ -260,6 +260,8 @@ pub enum OutputFormat {
     Text,
     /// JSON: {"role": "assistant", "content": "..."}
     Json,
+    /// YAML
+    Yaml,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -591,6 +593,10 @@ pub struct MemoryArgs {
     #[command(flatten)]
     pub agent_flag: AgentFlag,
 
+    /// Output format: text (default), json, or yaml
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+
     #[command(subcommand)]
     pub command: Option<MemoryCommand>,
 }
@@ -598,12 +604,7 @@ pub struct MemoryArgs {
 #[derive(Subcommand)]
 pub enum MemoryCommand {
     /// Search across all memory types
-    Search {
-        query: String,
-        /// Output format: text (default) or json
-        #[arg(long, value_enum, default_value = "text")]
-        format: OutputFormat,
-    },
+    Search { query: String },
     /// List tracked people
     People,
     /// List commitments
@@ -955,7 +956,11 @@ pub struct CredentialHelperArgs {
 #[derive(Subcommand)]
 pub enum McpCommand {
     /// List configured MCP servers
-    List,
+    List {
+        /// Output format: text (default), json, or yaml
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Add a new MCP server
     Add {
         /// Server name (used as identifier)

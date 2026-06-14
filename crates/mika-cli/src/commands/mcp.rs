@@ -4,7 +4,8 @@ use anyhow::Result;
 use mika_agent::mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use mika_common::home;
 
-use crate::cli::{McpArgs, McpCommand};
+use crate::cli::{McpArgs, McpCommand, OutputFormat};
+use crate::commands::format_helper::print_structured;
 
 pub async fn run(args: McpArgs, agent_name: &str) -> Result<()> {
     let global_home = home::resolve_home_dir()?;
@@ -12,7 +13,8 @@ pub async fn run(args: McpArgs, agent_name: &str) -> Result<()> {
     let agent_home = home::resolve_agent_home(&global_home, agent_name);
 
     match args.command {
-        None | Some(McpCommand::List) => list_servers(&agent_home),
+        None => list_servers(&agent_home, &OutputFormat::Text),
+        Some(McpCommand::List { format }) => list_servers(&agent_home, &format),
         Some(McpCommand::Add {
             name,
             transport,
@@ -35,7 +37,7 @@ pub async fn run(args: McpArgs, agent_name: &str) -> Result<()> {
     }
 }
 
-fn list_servers(agent_home: &std::path::Path) -> Result<()> {
+fn list_servers(agent_home: &std::path::Path, format: &OutputFormat) -> Result<()> {
     let config = McpConfig::load(agent_home)?;
 
     if config.mcp_servers.is_empty() {
@@ -45,11 +47,38 @@ fn list_servers(agent_home: &std::path::Path) -> Result<()> {
         return Ok(());
     }
 
-    println!("\n  MCP Servers ({}):", config.mcp_servers.len());
+    // Build a display-safe representation (header values redacted)
+    let mut display_servers: Vec<serde_json::Value> = Vec::new();
     let mut names: Vec<_> = config.mcp_servers.keys().collect();
     names.sort();
-    for name in names {
-        let cfg = &config.mcp_servers[name];
+    for name in &names {
+        let cfg = &config.mcp_servers[*name];
+        let transport_str = match cfg.transport {
+            McpTransport::Stdio => "stdio",
+            McpTransport::Http => "http",
+        };
+        let header_keys: Option<Vec<String>> = cfg.headers.as_ref().map(|h| {
+            let mut keys: Vec<_> = h.keys().cloned().collect();
+            keys.sort();
+            keys
+        });
+        display_servers.push(serde_json::json!({
+            "name": name,
+            "transport": transport_str,
+            "command": cfg.command,
+            "url": cfg.url,
+            "enabled": cfg.enabled,
+            "header_keys": header_keys,
+        }));
+    }
+
+    if print_structured(format, &display_servers)? {
+        return Ok(());
+    }
+
+    println!("\n  MCP Servers ({}):", config.mcp_servers.len());
+    for name in &names {
+        let cfg = &config.mcp_servers[*name];
         let transport = match cfg.transport {
             McpTransport::Stdio => {
                 format!("stdio ({})", cfg.command.as_deref().unwrap_or("?"))
