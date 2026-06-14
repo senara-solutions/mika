@@ -60,6 +60,24 @@ pub fn run(agent_name: &str, agent_home: &Path, format: &OutputFormat) -> Result
             });
             println!("{}", serde_json::to_string_pretty(&obj)?);
         }
+        OutputFormat::Yaml => {
+            let obj = serde_json::json!({
+                "agent": agent_name,
+                "server_log": {
+                    "path": server_log.to_string_lossy(),
+                    "exists": server_log_exists,
+                    "size_bytes": server_log_size,
+                    "filter_command": format!("jq 'select(.agent_id == \"{agent_name}\")' {}", server_log.display()),
+                },
+                "cli_log": {
+                    "path": cli_log.to_string_lossy(),
+                    "exists": cli_log_exists,
+                    "size_bytes": cli_log_size,
+                    "date": today,
+                },
+            });
+            print!("{}", serde_yaml::to_string(&obj)?);
+        }
         OutputFormat::Text => {
             println!();
             println!("  \u{2726} Log Sinks for agent: {agent_name}");
@@ -480,6 +498,7 @@ pub async fn run_activity(args: &LogsActivityArgs, agent_name: &str) -> Result<(
     // Render
     match args.format {
         OutputFormat::Json => render_json(agent_name, &since, &until, &events)?,
+        OutputFormat::Yaml => render_yaml(agent_name, &since, &until, &events)?,
         OutputFormat::Text => render_text(agent_name, &since, &until, &events),
     }
 
@@ -495,6 +514,18 @@ fn render_json(agent: &str, since: &str, until: &str, events: &[LogEvent]) -> Re
         "events": events,
     });
     println!("{}", serde_json::to_string_pretty(&envelope)?);
+    Ok(())
+}
+
+fn render_yaml(agent: &str, since: &str, until: &str, events: &[LogEvent]) -> Result<()> {
+    let envelope = serde_json::json!({
+        "agent": agent,
+        "since": since,
+        "until": until,
+        "total": events.len(),
+        "events": events,
+    });
+    print!("{}", serde_yaml::to_string(&envelope)?);
     Ok(())
 }
 

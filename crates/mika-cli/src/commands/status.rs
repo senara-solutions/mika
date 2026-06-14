@@ -38,6 +38,22 @@ pub async fn run(agent_name: &str, format: &OutputFormat) -> Result<()> {
             });
             println!("{}", serde_json::to_string_pretty(&obj)?);
         }
+        OutputFormat::Yaml => {
+            let last_message = last_msg.ok().flatten();
+            let obj = serde_json::json!({
+                "agent": agent_name,
+                "version": version.unwrap_or(0),
+                "db_size_bytes": db_size,
+                "messages": msg_count.unwrap_or(0),
+                "people": people.map(|p| p.len()).unwrap_or(0),
+                "commitments_pending": commitments.map(|c| c.len()).unwrap_or(0),
+                "preferences": preferences.map(|p| p.len()).unwrap_or(0),
+                "events": events.map(|e| e.len()).unwrap_or(0),
+                "tokens_used": tokens.unwrap_or(0),
+                "last_message": last_message,
+            });
+            print!("{}", serde_yaml::to_string(&obj)?);
+        }
         OutputFormat::Text => {
             let size_str = if db_size > 1_000_000 {
                 format!("{:.1} MB", db_size as f64 / 1_000_000.0)

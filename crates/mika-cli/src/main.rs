@@ -263,6 +263,8 @@ async fn main() -> Result<()> {
                 let fmt = match args.format {
                     cli::OutputFormat::Text => mika_cli::remote_ask::OutputFormat::Text,
                     cli::OutputFormat::Json => mika_cli::remote_ask::OutputFormat::Json,
+                    // remote_ask has its own OutputFormat without Yaml; fall back to Json
+                    cli::OutputFormat::Yaml => mika_cli::remote_ask::OutputFormat::Json,
                 };
                 return match mika_cli::remote_ask::run_remote(
                     &args.message,

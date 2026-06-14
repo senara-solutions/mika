@@ -513,6 +513,16 @@ pub async fn run(
             };
             println!("{}", serde_json::to_string(&response)?);
         }
+        OutputFormat::Yaml => {
+            let response = AskJsonResponse {
+                role: "assistant",
+                content: output.text,
+                task_id: task_id.map(|s| s.to_string()),
+                pending_tasks: pending_callbacks,
+                metadata,
+            };
+            print!("{}", serde_yaml::to_string(&response)?);
+        }
     }
 
     // Gracefully shut down MCP server connections
@@ -678,6 +688,18 @@ pub async fn run_team_ask(
                 },
             };
             println!("{}", serde_json::to_string(&response)?);
+        }
+        OutputFormat::Yaml => {
+            let response = AskTeamJsonResponse {
+                role: "assistant",
+                content: run.deliverable.clone(),
+                team_run: TeamRunMeta {
+                    run_id: run.run_id.clone(),
+                    status: format!("{}", run.status),
+                    iterations: run.iteration,
+                },
+            };
+            print!("{}", serde_yaml::to_string(&response)?);
         }
     }
 

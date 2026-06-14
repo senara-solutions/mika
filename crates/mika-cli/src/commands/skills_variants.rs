@@ -63,6 +63,9 @@ fn run_list(skills_dir: &Path, name: &str, format: &OutputFormat) -> Result<()> 
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&all_variants)?);
         }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&all_variants)?);
+        }
         OutputFormat::Text => {
             if all_variants.is_empty() {
                 println!("\n  No variants found for skill '{name}'.\n");
@@ -104,6 +107,10 @@ fn run_status(skills_dir: &Path, format: &OutputFormat) -> Result<()> {
     if !skills_dir.is_dir() {
         match format {
             OutputFormat::Json => println!("[]"),
+            OutputFormat::Yaml => print!(
+                "{}",
+                serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+            ),
             OutputFormat::Text => {
                 println!("\n  No skills directory found.\n");
             }
@@ -130,6 +137,9 @@ fn run_status(skills_dir: &Path, format: &OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&summaries)?);
+        }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&summaries)?);
         }
         OutputFormat::Text => {
             if summaries.is_empty() {
@@ -240,6 +250,9 @@ fn run_diff(
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&report)?);
+        }
         OutputFormat::Text => {
             println!("\n  Diff: {name} {provider}/{model}");
             println!("  Classification: {}", report.classification);
@@ -272,6 +285,9 @@ fn run_reflect(skills_dir: &Path, name: &str, format: &OutputFormat) -> Result<(
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&report)?);
         }
         OutputFormat::Text => {
             println!("\n  Reflection report for '{name}':");
@@ -360,6 +376,12 @@ fn run_validate(skills_dir: &Path, name: Option<&str>, format: &OutputFormat) ->
                             "error": format!("{e}"),
                         }));
                     }
+                    OutputFormat::Yaml => {
+                        all_json.push(serde_json::json!({
+                            "skill": skill_name,
+                            "error": format!("{e}"),
+                        }));
+                    }
                 }
                 continue;
             }
@@ -416,6 +438,26 @@ fn run_validate(skills_dir: &Path, name: Option<&str>, format: &OutputFormat) ->
                         "results": rule_results,
                     }));
                 }
+                OutputFormat::Yaml => {
+                    let rule_results: Vec<serde_json::Value> = results
+                        .iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "rule": r.rule,
+                                "passed": r.passed,
+                                "message": r.message,
+                                "level": r.level,
+                            })
+                        })
+                        .collect();
+                    all_json.push(serde_json::json!({
+                        "skill": skill_name,
+                        "provider": v.provider,
+                        "model": v.model,
+                        "source": v.source,
+                        "results": rule_results,
+                    }));
+                }
             }
         }
     }
@@ -423,6 +465,9 @@ fn run_validate(skills_dir: &Path, name: Option<&str>, format: &OutputFormat) ->
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&all_json)?);
+        }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&all_json)?);
         }
         OutputFormat::Text => println!(),
     }
