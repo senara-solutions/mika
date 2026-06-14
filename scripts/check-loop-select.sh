@@ -3,7 +3,7 @@
 #
 # Background: mika#848 fixes a deadline-during-LLM-call bug by checking the
 # turn deadline at the top of each `run_loop` iteration in
-# `crates/mika-agent/src/agent.rs`. The guarantee that this check fires before
+# `crates/mika-agent/src/agent_loop/mod.rs`. The guarantee that this check fires before
 # any new step starts depends on the loop body NOT shadowing iteration semantics
 # with `tokio::select!`. A `select!` inside the loop could:
 #
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGENT_FILE="crates/mika-agent/src/agent.rs"
+AGENT_FILE="crates/mika-agent/src/agent_loop/mod.rs"
 
 if [ ! -f "$AGENT_FILE" ]; then
     echo "error: $AGENT_FILE not found (run from repo root)" >&2
