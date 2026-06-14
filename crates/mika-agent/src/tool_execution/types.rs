@@ -80,16 +80,19 @@ pub fn tool_calls_metadata_json(summaries: &[ToolCallSummary]) -> Option<String>
     }
 
     // Phase 2: Last resort — drop tail entries from the already-shrunk vector.
-    warn!(
-        total_entries = summaries.len(),
-        max = crate::planning::policy::TOOL_METADATA_MAX,
-        "tool_calls metadata exceeds cap after field truncation, dropping tail entries"
-    );
     for count in (1..shrunk.len()).rev() {
         let wrapper = serde_json::json!({ "tool_calls": &shrunk[..count] });
         if let Ok(json) = serde_json::to_string(&wrapper)
             && json.len() <= crate::planning::policy::TOOL_METADATA_MAX
         {
+            let dropped = summaries.len() - count;
+            warn!(
+                total_entries = summaries.len(),
+                kept_count = count,
+                dropped_count = dropped,
+                max = crate::planning::policy::TOOL_METADATA_MAX,
+                "tool_calls metadata exceeds cap after field truncation, dropped tail entries"
+            );
             return Some(json);
         }
     }
@@ -414,6 +417,53 @@ mod tests {
         for entry in entries {
             assert!(entry["name"].is_string(), "entries must have name");
             assert!(entry["step"].is_number(), "entries must have step");
+        }
+    }
+
+    /// Regression test for mika#151: verify that Phase 2 tail-drop preserves
+    /// head entries and drops tail entries, and that kept + dropped == total.
+    #[test]
+    fn test_phase2_tail_drop_preserves_head_entries() {
+        // Create 20 entries with long tool names that will exceed the cap
+        // even after Phase 1 field truncation
+        let summaries: Vec<ToolCallSummary> = (0..20)
+            .map(|i| ToolCallSummary {
+                step: i,
+                name: format!("mcp__long_server__very_long_tool_name_number_{i}"),
+                input_summary: "x".repeat(crate::planning::policy::INPUT_SUMMARY_MAX),
+                output_summary: "y".repeat(crate::planning::policy::OUTPUT_SUMMARY_MAX),
+                success: i % 3 != 0, // some failures for variety
+                non_zero_exit: i % 5 == 0,
+            })
+            .collect();
+
+        let json = tool_calls_metadata_json(&summaries).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries = parsed["tool_calls"].as_array().unwrap();
+
+        let kept = entries.len();
+        let dropped = summaries.len() - kept;
+
+        // Phase 2 must have fired (not all entries fit)
+        assert!(
+            kept < summaries.len(),
+            "expected tail-drop to fire, but all {} entries were kept",
+            summaries.len()
+        );
+        assert!(kept >= 1, "must retain at least one entry");
+        assert_eq!(
+            kept + dropped,
+            summaries.len(),
+            "kept + dropped must equal total input count"
+        );
+
+        // Verify that the KEPT entries are the first N (head preserved, tail dropped)
+        for (i, entry) in entries.iter().enumerate() {
+            let step = entry["step"].as_u64().unwrap() as u32;
+            assert_eq!(
+                step, i as u32,
+                "entry at position {i} should have step={i} (head-preserved order), got step={step}"
+            );
         }
     }
 

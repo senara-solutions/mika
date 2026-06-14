@@ -910,6 +910,59 @@ async fn run_loop(
 
         match response.stop_reason {
             LlmStopReason::EndTurn | LlmStopReason::MaxTokens | LlmStopReason::ContentFilter => {
+                // mika#151 — EndTurn-with-tool_use: when the LLM returns
+                // EndTurn but also contains tool_use content blocks, process
+                // those tool calls before extracting text. This ensures their
+                // ToolCallSummary entries are captured in all_tool_summaries
+                // and persisted in messages.metadata and the tool_calls table.
+                // The LLM signaled EndTurn so the turn still terminates after
+                // tool execution — we do NOT continue the loop.
+                if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                    && response.has_tool_calls()
+                {
+                    let tool_count = response
+                        .content
+                        .iter()
+                        .filter(|c| matches!(c, LlmResponseContent::ToolCall { .. }))
+                        .count();
+                    warn!(
+                        step,
+                        tool_count,
+                        label = mode.label(),
+                        "endturn_with_tool_use: LLM returned EndTurn with tool_use blocks — \
+                         processing tool calls before text extraction"
+                    );
+
+                    // Update tools_called for required_tools enforcement
+                    for block in &response.content {
+                        if let LlmResponseContent::ToolCall { name, .. } = block {
+                            tools_called.insert(name.clone());
+                        }
+                    }
+
+                    let step_summaries = process_tool_calls(
+                        response.content.clone(),
+                        tools,
+                        skill_tool_map,
+                        skill_timeout,
+                        tool_ctx,
+                        request,
+                        step as u32,
+                        mcp_manager,
+                        long_running_ctx,
+                        db,
+                        session_id,
+                        store_tool_calls,
+                        llm_call_id.as_deref(),
+                        &mut send_message_boundary_active,
+                        &mut suppressed_write_tools,
+                        &mut send_message_text_capture,
+                        mode.is_conversation(),
+                    )
+                    .await;
+                    all_tool_summaries.extend(step_summaries);
+                }
+
                 let text = mika_common::llm::strip_internal_tags(&response.text());
 
                 // mika#1168 — refusal-detection telemetry (Phase C Step 10).

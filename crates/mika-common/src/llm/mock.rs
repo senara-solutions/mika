@@ -346,6 +346,31 @@ pub fn content_filter_response() -> MockResponse {
     })
 }
 
+/// Create an EndTurn response that also contains tool_use blocks.
+///
+/// This simulates the anomalous provider behavior where the LLM returns
+/// `stop_reason: EndTurn` but includes structured `tool_use` content blocks
+/// alongside text. The agent engine should process these tool calls before
+/// extracting text and terminating the turn. See mika#151.
+pub fn endturn_with_tools_response(text: &str, calls: Vec<(&str, Value)>) -> MockResponse {
+    let mut content: Vec<LlmResponseContent> = calls
+        .into_iter()
+        .map(|(name, args)| LlmResponseContent::ToolCall {
+            id: format!("tc_{}", uuid::Uuid::new_v4().as_simple()),
+            name: name.to_string(),
+            arguments: args,
+        })
+        .collect();
+    content.push(LlmResponseContent::Text(text.to_string()));
+
+    MockResponse::Success(LlmResponse {
+        content,
+        reasoning: None,
+        stop_reason: LlmStopReason::EndTurn,
+        usage: LlmUsage::default(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
