@@ -55,6 +55,9 @@ fn list(global_home: &std::path::Path, format: &crate::cli::OutputFormat) -> Res
     if teams.is_empty() {
         match format {
             crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Yaml => {
+                print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+            }
             crate::cli::OutputFormat::Text => {
                 println!("\n  No teams found. Run `mika teams create <name>` to create one.\n");
             }
@@ -81,6 +84,25 @@ fn list(global_home: &std::path::Path, format: &crate::cli::OutputFormat) -> Res
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
+        crate::cli::OutputFormat::Yaml => {
+            let entries: Vec<serde_json::Value> = teams
+                .iter()
+                .map(|name| match team::load_team(global_home, name) {
+                    Ok(def) => serde_json::json!({
+                        "name": name,
+                        "orchestrator": def.team.orchestrator,
+                        "agents": def.agents.iter().map(|a| &a.name).collect::<Vec<_>>(),
+                        "agent_count": def.agents.len(),
+                        "max_iterations": def.flow.max_iterations,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "name": name,
+                        "error": e.to_string(),
+                    }),
+                })
+                .collect();
+            print!("{}", serde_yaml::to_string(&entries)?);
         }
         crate::cli::OutputFormat::Text => {
             println!("\n  Teams:");
@@ -198,6 +220,23 @@ fn status(
             }
             println!("{}", serde_json::to_string_pretty(&obj)?);
         }
+        crate::cli::OutputFormat::Yaml => {
+            let mut obj = serde_json::json!({
+                "team": def,
+                "latest_run": serde_json::Value::Null,
+            });
+            if let Some(run) = latest_run {
+                obj["latest_run"] = serde_json::json!({
+                    "id": run.id,
+                    "team_name": run.team_name,
+                    "goal": run.goal,
+                    "status": run.status,
+                    "started_at": run.started_at,
+                    "ended_at": run.ended_at,
+                });
+            }
+            print!("{}", serde_yaml::to_string(&obj)?);
+        }
         crate::cli::OutputFormat::Text => {
             println!("\n  Team: {}", def.team.name);
             println!("  Orchestrator: {}", def.team.orchestrator);
@@ -244,6 +283,9 @@ fn log(
         Err(_) => {
             match format {
                 crate::cli::OutputFormat::Json => println!("[]"),
+                crate::cli::OutputFormat::Yaml => {
+                    print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+                }
                 crate::cli::OutputFormat::Text => {
                     println!("\n  No runs found for team '{name}'.\n");
                 }
@@ -256,6 +298,9 @@ fn log(
     if runs.is_empty() {
         match format {
             crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Yaml => {
+                print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+            }
             crate::cli::OutputFormat::Text => {
                 println!("\n  No runs found for team '{name}'.\n");
             }
@@ -279,6 +324,22 @@ fn log(
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
+        crate::cli::OutputFormat::Yaml => {
+            let entries: Vec<serde_json::Value> = runs
+                .iter()
+                .map(|run| {
+                    serde_json::json!({
+                        "id": run.id,
+                        "team_name": run.team_name,
+                        "goal": run.goal,
+                        "status": run.status,
+                        "started_at": run.started_at,
+                        "ended_at": run.ended_at,
+                    })
+                })
+                .collect();
+            print!("{}", serde_yaml::to_string(&entries)?);
         }
         crate::cli::OutputFormat::Text => {
             println!("\n  Run history for team '{name}':");
@@ -337,6 +398,9 @@ fn validate_teams(
             if !team::team_exists(global_home, n) {
                 match format {
                     crate::cli::OutputFormat::Json => println!("[]"),
+                    crate::cli::OutputFormat::Yaml => {
+                        print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+                    }
                     crate::cli::OutputFormat::Text => println!("\n  Team '{n}' not found.\n"),
                 }
                 return Ok(());
@@ -348,6 +412,9 @@ fn validate_teams(
             if found.is_empty() {
                 match format {
                     crate::cli::OutputFormat::Json => println!("[]"),
+                    crate::cli::OutputFormat::Yaml => {
+                        print!("{}", serde_yaml::to_string(&serde_json::json!([]))?)
+                    }
                     crate::cli::OutputFormat::Text => println!("\n  No teams found.\n"),
                 }
                 return Ok(());
@@ -377,7 +444,7 @@ fn validate_teams(
         }
 
         match format {
-            crate::cli::OutputFormat::Json => {
+            crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Yaml => {
                 for diag in &diags {
                     all_diags.push(serde_json::json!({
                         "team": team_name,
@@ -398,6 +465,9 @@ fn validate_teams(
     match format {
         crate::cli::OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&all_diags)?);
+        }
+        crate::cli::OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&all_diags)?);
         }
         crate::cli::OutputFormat::Text => {
             println!();

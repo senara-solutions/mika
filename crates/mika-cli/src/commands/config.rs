@@ -257,6 +257,41 @@ async fn run_list(
                 .collect();
             println!("{}", serde_json::to_string_pretty(&entries)?);
         }
+        crate::cli::OutputFormat::Yaml => {
+            let entries: Vec<serde_json::Value> = CONFIG_KEYS
+                .iter()
+                .map(|info| {
+                    let value = if info.backend == ConfigBackend::Database {
+                        db_configs
+                            .iter()
+                            .find(|(k, _)| k == info.key)
+                            .map(|(_, v)| v.clone())
+                    } else {
+                        get_effective_value(info.key, &ctx.settings)
+                    };
+                    let display_value = if info.secret {
+                        value.as_ref().map(|v| {
+                            if v.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::String("[REDACTED]".to_string())
+                            }
+                        })
+                    } else {
+                        value.as_ref().map(|v| serde_json::Value::String(v.clone()))
+                    };
+                    serde_json::json!({
+                        "key": info.key,
+                        "value": display_value.unwrap_or(serde_json::Value::Null),
+                        "backend": format!("{:?}", info.backend).to_lowercase(),
+                        "env_var": info.env_var,
+                        "secret": info.secret,
+                        "description": info.description,
+                    })
+                })
+                .collect();
+            print!("{}", serde_yaml::to_string(&entries)?);
+        }
         crate::cli::OutputFormat::Text => {
             println!();
             println!("  Mika Configuration Keys");

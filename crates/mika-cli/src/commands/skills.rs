@@ -330,6 +330,14 @@ fn list_skills(
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             }
+            crate::cli::OutputFormat::Yaml => {
+                let output = serde_json::json!({
+                    "loaded": [],
+                    "disabled": [],
+                    "skipped": [],
+                });
+                print!("{}", serde_yaml::to_string(&output)?);
+            }
             crate::cli::OutputFormat::Text => {
                 println!("\n  No skills loaded.\n");
                 println!("  Create one with: mika skills create <name>");
@@ -392,6 +400,59 @@ fn list_skills(
                 "skipped": skipped_json,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        crate::cli::OutputFormat::Yaml => {
+            let loaded: Vec<serde_json::Value> = skills
+                .iter()
+                .map(|entry| {
+                    let name = &entry.manifest.skill.name;
+                    let origin = if bundled_skills::is_bundled_skill(name) {
+                        "built-in"
+                    } else if let Some(mp_entry) = lock.skills.get(name.as_str()) {
+                        if mp_entry.linked {
+                            "marketplace/linked"
+                        } else {
+                            "marketplace"
+                        }
+                    } else {
+                        "custom"
+                    };
+                    let llm_override = if !entry.manifest.llm.is_empty() {
+                        let provider = entry.manifest.llm.provider.as_deref().unwrap_or("*");
+                        let model = entry.manifest.llm.model.as_deref().unwrap_or("default");
+                        Some(format!("{provider}/{model}"))
+                    } else {
+                        None
+                    };
+                    serde_json::json!({
+                        "name": name,
+                        "description": entry.manifest.skill.description,
+                        "origin": origin,
+                        "enabled": entry.enabled,
+                        "always_on": entry.manifest.skill.always_on,
+                        "tools": entry.skill_tools.len(),
+                        "variants": entry.variant_count(),
+                        "generated_variants": entry.generated_model_prompts().len(),
+                        "llm_override": llm_override,
+                    })
+                })
+                .collect();
+            let disabled_json: Vec<serde_json::Value> = disabled
+                .iter()
+                .map(|d| serde_json::json!({"name": d.name, "status": "disabled"}))
+                .collect();
+            let skipped_json: Vec<serde_json::Value> = skipped
+                .iter()
+                .map(|s| {
+                    serde_json::json!({"name": s.name, "status": "skipped", "reason": s.reason})
+                })
+                .collect();
+            let output = serde_json::json!({
+                "loaded": loaded,
+                "disabled": disabled_json,
+                "skipped": skipped_json,
+            });
+            print!("{}", serde_yaml::to_string(&output)?);
         }
         crate::cli::OutputFormat::Text => {
             println!(
@@ -1425,6 +1486,10 @@ fn validate_skills(
     if !skills_dir.is_dir() {
         match format {
             crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Yaml => print!(
+                "{}",
+                serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+            ),
             crate::cli::OutputFormat::Text => {
                 println!(
                     "\n  No skills directory found at {}\n",
@@ -1440,6 +1505,10 @@ fn validate_skills(
             if let Err(e) = validate_skill_name(n) {
                 match format {
                     crate::cli::OutputFormat::Json => println!("[]"),
+                    crate::cli::OutputFormat::Yaml => print!(
+                        "{}",
+                        serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+                    ),
                     crate::cli::OutputFormat::Text => println!("\n  Invalid skill name: {e}\n"),
                 }
                 return Ok(());
@@ -1448,6 +1517,10 @@ fn validate_skills(
             if !skill_dir.is_dir() {
                 match format {
                     crate::cli::OutputFormat::Json => println!("[]"),
+                    crate::cli::OutputFormat::Yaml => print!(
+                        "{}",
+                        serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+                    ),
                     crate::cli::OutputFormat::Text => {
                         println!("\n  Skill '{n}' not found at {}\n", skill_dir.display());
                     }
@@ -1476,6 +1549,10 @@ fn validate_skills(
     if dirs.is_empty() {
         match format {
             crate::cli::OutputFormat::Json => println!("[]"),
+            crate::cli::OutputFormat::Yaml => print!(
+                "{}",
+                serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+            ),
             crate::cli::OutputFormat::Text => println!("\n  No skills found to validate.\n"),
         }
         return Ok(());
@@ -1511,6 +1588,15 @@ fn validate_skills(
                     }));
                 }
             }
+            crate::cli::OutputFormat::Yaml => {
+                for diag in &diags {
+                    all_diags.push(serde_json::json!({
+                        "skill": dir_name,
+                        "level": diag.level,
+                        "message": diag.message,
+                    }));
+                }
+            }
             crate::cli::OutputFormat::Text => {
                 println!("  {dir_name}/");
                 for diag in &diags {
@@ -1523,6 +1609,9 @@ fn validate_skills(
     match format {
         crate::cli::OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&all_diags)?);
+        }
+        crate::cli::OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&all_diags)?);
         }
         crate::cli::OutputFormat::Text => {
             println!();

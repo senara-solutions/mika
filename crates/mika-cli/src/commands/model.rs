@@ -212,6 +212,9 @@ pub async fn run(args: crate::cli::ModelArgs, agent_name: &str) -> Result<()> {
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 }
+                OutputFormat::Yaml => {
+                    print!("{}", serde_yaml::to_string(&result)?);
+                }
                 OutputFormat::Text => {
                     println!(
                         "Current model: {}\n\nAvailable models for {}:",
@@ -242,6 +245,9 @@ pub async fn run(args: crate::cli::ModelArgs, agent_name: &str) -> Result<()> {
             match args.format {
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                OutputFormat::Yaml => {
+                    print!("{}", serde_yaml::to_string(&result)?);
                 }
                 OutputFormat::Text => {
                     println!("Switched to {}.", display);

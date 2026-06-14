@@ -139,6 +139,18 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                 };
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
+            OutputFormat::Yaml => {
+                let report = KgStatusReport {
+                    summary: KgSummary {
+                        total_agents: 0,
+                        unique_corpora: 0,
+                        disabled_count: 0,
+                        corpora: vec![],
+                    },
+                    agents: vec![],
+                };
+                print!("{}", serde_yaml::to_string(&report)?);
+            }
             OutputFormat::Text => {
                 println!("\n  KG state summary (0 agents)\n");
             }
@@ -219,6 +231,13 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                 agents: agent_states,
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Yaml => {
+            let report = KgStatusReport {
+                summary,
+                agents: agent_states,
+            };
+            print!("{}", serde_yaml::to_string(&report)?);
         }
         OutputFormat::Text => {
             println!();
@@ -588,6 +607,9 @@ fn run_list_agents(global_home: &Path, db_path: &Path, args: &KgListAgentsArgs) 
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&listings)?);
         }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&listings)?);
+        }
         OutputFormat::Text => {
             if listings.is_empty() {
                 println!("\n  No agents found.\n");
@@ -785,6 +807,10 @@ fn run_validate(db_path: &Path, args: &KgValidateArgs) -> Result<()> {
             let report = KgValidateReport { checks, summary };
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        OutputFormat::Yaml => {
+            let report = KgValidateReport { checks, summary };
+            print!("{}", serde_yaml::to_string(&report)?);
+        }
         OutputFormat::Text => {
             println!();
             println!("  Mika KG Validate \u{2014} checking Knowledge Graph integrity...");
@@ -879,7 +905,7 @@ fn run_purge(global_home: &Path, db_path: &Path, args: &KgPurgeArgs) -> Result<(
     let force_delete_shared =
         args.include_orphaned_corpus && docs_root_hash.is_some() && shared_agents.is_empty();
 
-    // Print pre-confirmation summary (text only — JSON comes after purge)
+    // Print pre-confirmation summary (text only — JSON/YAML comes after purge)
     if matches!(args.format, OutputFormat::Text) {
         println!();
         println!("  About to purge KG state for agent '{agent_id}':");
@@ -1007,6 +1033,9 @@ fn run_purge(global_home: &Path, db_path: &Path, args: &KgPurgeArgs) -> Result<(
     match args.format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&counts)?);
+        }
+        OutputFormat::Yaml => {
+            print!("{}", serde_yaml::to_string(&counts)?);
         }
         OutputFormat::Text => {
             println!("  Purging... done.");
