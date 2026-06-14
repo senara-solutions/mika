@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    # Create mika user/group if not exists
+    if ! getent group mika >/dev/null 2>&1; then
+      groupadd --system mika
+    fi
+    if ! getent passwd mika >/dev/null 2>&1; then
+      useradd --system --gid mika --home-dir /var/lib/mika --shell /usr/sbin/nologin mika
+    fi
+
+    # Create runtime directories
+    install -d -m 0755 -o mika -g mika /var/lib/mika
+    install -d -m 0755 -o mika -g mika /var/log/mika
+    install -d -m 0750 -o mika -g mika /etc/mika
+
+    # Enable and restart service on upgrade
+    systemctl daemon-reload
+    systemctl enable mika-server.service
+    if systemctl is-active --quiet mika-server.service; then
+      systemctl restart mika-server.service
+    fi
+    ;;
+esac

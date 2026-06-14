@@ -1,0 +1,27 @@
+[Unit]
+Description=Mika AI Agent HTTP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mika
+Group=mika
+ExecStart=/usr/bin/mika-server
+Restart=on-failure
+RestartSec=5
+Environment=MIKA_HOME=/var/lib/mika
+Environment=MIKA_LOG_FORMAT=json
+Environment=MIKA_SERVER_LOG_FILE=/var/log/mika/server.log
+EnvironmentFile=-/etc/mika/mika-server.env
+WorkingDirectory=/var/lib/mika
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/mika /var/log/mika
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
