@@ -93,6 +93,32 @@ async fn main() {
     println!("╰─────────────────────────────────────────────────────╯");
     println!();
 
+    // Pre-flight: verify provider can authenticate
+    print!("  Verifying provider authentication... ");
+    match provider.check_health().await {
+        Ok(()) => println!("OK"),
+        Err(e) => {
+            let err_str = e.to_string();
+            eprintln!("FAIL");
+            eprintln!();
+            // Surface OAuth-specific guidance when the error chain mentions it
+            if err_str.to_lowercase().contains("oauth") {
+                eprintln!("Error: OAuth authentication failed for Anthropic provider.");
+                eprintln!("  The calibrate binary uses the same OAuth flow as mika-server.");
+                eprintln!("  Ensure `mika setup --mode oauth` has been completed and");
+                eprintln!("  that ~/.mika/oauth.json exists with valid, non-expired tokens.");
+                eprintln!();
+                eprintln!("  To verify: check that mika-server can call Anthropic successfully.");
+                eprintln!("  If mika-server works but calibrate doesn't, the subscription token");
+                eprintln!("  in MIKA_ANTHROPIC_API_KEY may have been rotated since the last");
+                eprintln!("  `mika setup --mode oauth` run.");
+            }
+            eprintln!("  Provider error: {}", err_str);
+            std::process::exit(2);
+        }
+    }
+    println!();
+
     // Run scenarios
     let mut results = Vec::new();
     for scenario in scenarios {

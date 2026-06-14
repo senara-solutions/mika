@@ -22,6 +22,8 @@ pub enum FailureClass {
     EmptyResponse,
     /// Exceeded per-scenario latency budget (default 60s)
     Timeout,
+    /// Authentication failure (OAuth, API key, etc.)
+    AuthenticationError,
     /// Provider returned non-200 / network error
     TransportError,
     /// Skill output contract failed (suffix line, finding list, disposition keyword, etc.)
@@ -37,6 +39,7 @@ impl std::fmt::Display for FailureClass {
             Self::Fabrication => write!(f, "Fabrication"),
             Self::EmptyResponse => write!(f, "EmptyResponse"),
             Self::Timeout => write!(f, "Timeout"),
+            Self::AuthenticationError => write!(f, "AuthenticationError"),
             Self::TransportError => write!(f, "TransportError"),
             Self::ContractViolation => write!(f, "ContractViolation"),
             Self::Other(detail) => write!(f, "Other({})", detail),
@@ -59,11 +62,19 @@ const REFUSAL_PATTERNS: &[&str] = &[
 
 /// Classify a failure from an error message and optional response text.
 pub fn classify_failure(error: Option<&str>, response_text: Option<&str>) -> FailureClass {
-    // Check for transport errors first (from error message)
+    // Check for transport/auth errors first (from error message)
     if let Some(err) = error {
         let lower = err.to_lowercase();
         if lower.contains("timeout") || lower.contains("timed out") {
             return FailureClass::Timeout;
+        }
+        // Authentication errors (OAuth, API key) before transport
+        if lower.contains("oauth")
+            || lower.contains("authentication failed")
+            || lower.contains("invalid x-api-key")
+            || lower.contains("invalid api key")
+        {
+            return FailureClass::AuthenticationError;
         }
         if lower.contains("connection")
             || lower.contains("network")
@@ -141,6 +152,34 @@ mod tests {
             FailureClass::EmptyResponse
         );
         assert_eq!(classify_failure(None, None), FailureClass::EmptyResponse);
+    }
+
+    #[test]
+    fn test_classify_oauth_error() {
+        assert_eq!(
+            classify_failure(Some("OAuth token resolution failed: ..."), None),
+            FailureClass::AuthenticationError
+        );
+    }
+
+    #[test]
+    fn test_classify_auth_failed() {
+        assert_eq!(
+            classify_failure(Some("Authentication failed. Check API key."), None),
+            FailureClass::AuthenticationError
+        );
+    }
+
+    #[test]
+    fn test_classify_invalid_api_key() {
+        assert_eq!(
+            classify_failure(Some("invalid x-api-key"), None),
+            FailureClass::AuthenticationError
+        );
+        assert_eq!(
+            classify_failure(Some("invalid api key provided"), None),
+            FailureClass::AuthenticationError
+        );
     }
 
     #[test]

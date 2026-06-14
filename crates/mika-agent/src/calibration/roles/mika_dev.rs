@@ -14,6 +14,7 @@ use mika_common::llm::LlmProvider;
 
 use crate::calibration::failure::FailureClass;
 use crate::calibration::role::{RoleScenario, RoleScenarioResult};
+use crate::calibration::roles::llm_error_result;
 
 /// Static scenario definitions for the mika-dev role.
 pub const SCENARIOS: &[RoleScenario] = &[
@@ -153,17 +154,7 @@ async fn run_refusal_regression(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "refusal_regression",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result("refusal_regression", e, start.elapsed().as_millis() as u64),
     }
 }
 
@@ -225,17 +216,7 @@ async fn run_contract_dev_groom(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "contract_dev_groom",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result("contract_dev_groom", e, start.elapsed().as_millis() as u64),
     }
 }
 
@@ -304,17 +285,11 @@ async fn run_golden_path_dispatch(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "golden_path_dispatch",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result(
+            "golden_path_dispatch",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
     }
 }
 
@@ -376,17 +351,7 @@ async fn run_required_tools_gate(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "required_tools_gate",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result("required_tools_gate", e, start.elapsed().as_millis() as u64),
     }
 }
 
@@ -453,16 +418,10 @@ async fn run_plan_callout_recognition(
                 latency,
             )
         }
-        Err(e) => {
-            let latency = start.elapsed().as_millis() as u64;
-            RoleScenarioResult::fail(
-                "plan_callout_recognition",
-                FailureClass::TransportError,
-                format!("{e}"),
-                None,
-                None,
-                latency,
-            )
-        }
+        Err(e) => llm_error_result(
+            "plan_callout_recognition",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
     }
 }

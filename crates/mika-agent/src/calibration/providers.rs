@@ -183,4 +183,17 @@ mod tests {
         // Groq key is likely not set in test environment
         assert!(create_real_provider(ProviderKind::Groq).is_none());
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_oauth_token_creates_provider() {
+        // Set an OAuth-prefix key for this test only
+        unsafe { std::env::set_var("MIKA_ANTHROPIC_API_KEY", "sk-ant-oat01-test-token-dummy") };
+        let provider = create_provider_from_spec("anthropic/claude-sonnet-4-6");
+        assert!(
+            provider.is_some(),
+            "OAuth token should create a valid provider"
+        );
+        unsafe { std::env::remove_var("MIKA_ANTHROPIC_API_KEY") };
+    }
 }
