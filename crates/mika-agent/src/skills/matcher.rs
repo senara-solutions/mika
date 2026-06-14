@@ -472,4 +472,63 @@ mod tests {
         assert_eq!(matched[1].entry.manifest.skill.name, "skill-review");
         assert_eq!(matched[1].reason, MatchReason::Dependency);
     }
+
+    // --- Google Workspace skill activation regression tests (mika#152) ---
+
+    #[test]
+    fn test_google_workspace_always_on_activates_on_natural_language() {
+        // mika#152: natural language prompts like "show my latest 5 emails" must
+        // activate the google-workspace skill via always_on, even without keywords.
+        let skills = vec![make_entry(
+            "google-workspace",
+            &[
+                "google",
+                "gmail",
+                "google calendar",
+                "google drive",
+                "gdrive",
+                "email",
+                "emails",
+                "inbox",
+                "send email",
+                "calendar",
+                "meeting",
+                "meetings",
+                "schedule",
+                "agenda",
+                "free",
+                "busy",
+                "drive",
+                "document",
+                "documents",
+                "spreadsheet",
+                "slides",
+                "triage",
+                "gws",
+                "workspace",
+            ],
+            true,
+        )];
+
+        // No keyword hit — matched via always_on
+        let matched = match_skills(&skills, "what's on my plate today");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].entry.manifest.skill.name, "google-workspace");
+        assert_eq!(matched[0].reason, MatchReason::AlwaysOn);
+
+        // Keyword hit on "meeting" — matched as Keyword (takes precedence)
+        let matched = match_skills(&skills, "what meetings do I have today");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].reason, MatchReason::Keyword);
+
+        // Keyword hit on "triage" + "inbox"
+        let matched = match_skills(&skills, "triage my inbox");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].reason, MatchReason::Keyword);
+
+        // Keyword hit on "drive"
+        let matched = match_skills(&skills, "search drive for quarterly report");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].reason, MatchReason::Keyword);
+    }
 }
