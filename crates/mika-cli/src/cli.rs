@@ -101,7 +101,7 @@ impl Commands {
             Commands::Provider(args) => args.agent_flag.agent.as_deref(),
             Commands::Model(args) => args.agent_flag.agent.as_deref(),
             Commands::Kg(args) => args.agent_override(),
-            Commands::Logs(args) => args.agent_flag.agent.as_deref(),
+            Commands::Logs(args) => args.agent_override(),
             // No agent override — listed explicitly so adding a new Commands variant
             // produces a compile error, forcing a conscious scoping decision.
             Commands::Setup { .. }
@@ -826,8 +826,85 @@ pub struct ModelArgs {
 
 #[derive(clap::Args)]
 pub struct LogsArgs {
+    #[command(subcommand)]
+    pub command: Option<LogsCommand>,
+
+    /// Agent to use (overrides active agent)
     #[command(flatten)]
     pub agent_flag: AgentFlag,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+}
+
+impl LogsArgs {
+    /// Extract `--agent` override from whichever Logs subcommand carries it.
+    pub fn agent_override(&self) -> Option<&str> {
+        match &self.command {
+            Some(LogsCommand::Paths(args)) => args.agent_flag.agent.as_deref(),
+            Some(LogsCommand::Activity(args)) => args.agent_flag.agent.as_deref(),
+            None => self.agent_flag.agent.as_deref(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum LogsCommand {
+    /// Show resolved log file paths
+    Paths(LogsPathsArgs),
+    /// Query cross-surface activity (messages, LLM calls, tool calls, tasks)
+    Activity(LogsActivityArgs),
+}
+
+#[derive(clap::Args)]
+pub struct LogsPathsArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// Output format: text (default) or json
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+}
+
+#[derive(clap::Args)]
+pub struct LogsActivityArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    /// Filter by session ID (prefix match supported)
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Filter by task ID
+    #[arg(long)]
+    pub task: Option<String>,
+
+    /// Filter by trace ID
+    #[arg(long)]
+    pub trace: Option<String>,
+
+    /// Time window start: "30m", "2h", "1d", "today", or ISO 8601 timestamp.
+    /// Default: "1h"
+    #[arg(long, default_value = "1h")]
+    pub since: String,
+
+    /// Time window end (same format as --since). Default: now.
+    #[arg(long)]
+    pub until: Option<String>,
+
+    /// Surfaces to include (comma-separated). Valid: messages, llm_calls, tool_calls, tasks, server_log.
+    /// Default: "messages,llm_calls,tool_calls,tasks" (all DB surfaces).
+    #[arg(long, default_value = "messages,llm_calls,tool_calls,tasks")]
+    pub include: String,
+
+    /// Filter content by substring pattern
+    #[arg(long)]
+    pub grep: Option<String>,
+
+    /// Maximum number of events to display
+    #[arg(long, short = 'n', default_value = "200")]
+    pub limit: usize,
 
     /// Output format: text (default) or json
     #[arg(long, value_enum, default_value = "text")]
