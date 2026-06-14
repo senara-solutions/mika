@@ -408,3 +408,145 @@ async fn test_send_message_no_channel_returns_success_with_redirect() {
     assert_tool_output_contains(&trace, "send_message", 0, "No reply channel");
     assert_tool_output_contains(&trace, "send_message", 0, "run_gh");
 }
+
+/// Regression test for mika#151: when the LLM returns `stop_reason: EndTurn`
+/// with tool_use content blocks, the tool calls must be processed and their
+/// summaries captured in the metadata. Previously these were silently dropped.
+#[tokio::test]
+async fn test_endturn_with_tool_use_blocks_processed() {
+    // Step 0: normal ToolUse response with 2 tool calls
+    // Step 1: EndTurn response that contains BOTH text AND tool_use blocks
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            multi_tool_response(vec![
+                ("search_memory", json!({"query": "tasks"})),
+                ("search_memory", json!({"query": "calendar"})),
+            ]),
+            endturn_with_tools_response(
+                "Here is a summary of your tasks and calendar.",
+                vec![(
+                    "store_fact",
+                    json!({"category": "event", "content": "User asked for summary"}),
+                )],
+            ),
+        ])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("What do I have going on?").await.unwrap();
+
+    // The text from the EndTurn response should be saved
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "summary");
+
+    // Tool calls from BOTH steps should be recorded
+    assert_tools_include(&trace, &["search_memory", "store_fact"]);
+
+    // Step 0: 2 search_memory calls, Step 1: 1 store_fact call = 3 total
+    assert_eq!(
+        trace.tool_calls.len(),
+        3,
+        "expected 3 tool calls (2 from ToolUse step + 1 from EndTurn-with-tool_use step), got {}",
+        trace.tool_calls.len()
+    );
+
+    // The store_fact call should come from step 1 (the EndTurn step)
+    let store_fact_calls = trace.calls_for_tool("store_fact");
+    assert_eq!(store_fact_calls.len(), 1, "expected 1 store_fact call");
+}
+
+/// Regression test for mika#151: EndTurn with tool_use blocks and empty text
+/// should still process the tool calls. In conversation mode, the agent loop
+/// follows up on empty text with a re-prompt, so we provide a third response.
+#[tokio::test]
+async fn test_endturn_with_tool_use_blocks_and_empty_text() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            tool_call_response("search_memory", json!({"query": "meetings"})),
+            endturn_with_tools_response(
+                "",
+                vec![(
+                    "store_fact",
+                    json!({"category": "event", "content": "checked meetings"}),
+                )],
+            ),
+            // The agent loop follows up on empty text in conversation mode
+            text_response("I've checked your meetings and noted the results."),
+        ])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("Check my meetings").await.unwrap();
+
+    // Both tool calls from the first two steps should be recorded
+    assert_tools_include(&trace, &["search_memory", "store_fact"]);
+    assert_eq!(
+        trace.tool_calls.len(),
+        2,
+        "expected 2 tool calls total, got {}",
+        trace.tool_calls.len()
+    );
+}
+
+/// Regression test for mika#151: EndTurn response with NO tool_use blocks
+/// should behave exactly as before (regression guard).
+#[tokio::test]
+async fn test_endturn_without_tool_use_blocks_unchanged() {
+    let harness = EvalHarness::builder()
+        .responses(vec![
+            tool_call_response("search_memory", json!({"query": "priorities"})),
+            text_response("Your top priority is the quarterly review."),
+        ])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("What should I focus on?").await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "quarterly review");
+    assert_tools_include(&trace, &["search_memory"]);
+    assert_exact_steps(&trace, 2);
+}
+
+/// Regression test for mika#151: multiple tool_use blocks in a single
+/// EndTurn response should all be processed.
+#[tokio::test]
+async fn test_endturn_with_multiple_tool_use_blocks() {
+    let harness = EvalHarness::builder()
+        .responses(vec![endturn_with_tools_response(
+            "I've noted all your preferences.",
+            vec![
+                (
+                    "store_fact",
+                    json!({"category": "preference", "content": "likes coffee"}),
+                ),
+                (
+                    "store_fact",
+                    json!({"category": "preference", "content": "prefers morning meetings"}),
+                ),
+                (
+                    "store_fact",
+                    json!({"category": "preference", "content": "uses dark mode"}),
+                ),
+            ],
+        )])
+        .build()
+        .await
+        .unwrap();
+
+    let trace = harness.run("Remember my preferences").await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "preferences");
+
+    let store_fact_calls = trace.calls_for_tool("store_fact");
+    assert_eq!(
+        store_fact_calls.len(),
+        3,
+        "expected all 3 store_fact calls from EndTurn-with-tool_use, got {}",
+        store_fact_calls.len()
+    );
+}
