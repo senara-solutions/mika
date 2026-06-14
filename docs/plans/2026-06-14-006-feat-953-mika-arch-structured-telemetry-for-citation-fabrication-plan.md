@@ -37,11 +37,11 @@ Rather than a single `arch_fabrication_detected` event that multiplexes all fabr
 | 6d — assert grounded (#1331) | plain warn | `guard.assert_grounded` |
 | 4c — callback state claim (#716) | plain warn | `guard.callback_state_claim` |
 
-**Event name (architect self-report):**
+**Event name (architect self-report — correct behavior signal, not fabrication):**
 
-| Source | Event name |
-|---|---|
-| audit_events row | `arch_citation_unanchored` |
+| Source | Event name | Semantic |
+|---|---|---|
+| audit_events row | `arch_anchoring_self_report` | mika-arch correctly reported inability to anchor a citation (success signal per #952 skill prompts) |
 
 ### D3: audit_events for SQL-queryable catalog, tracing for OTLP export
 
@@ -62,8 +62,14 @@ Each structured event carries:
 | `guard` | guard label constant | Event discriminator (e.g., `"asserted_unavailability"`) |
 | `step` | loop counter | Already in scope at every guard site |
 | `detail` | guard-specific | Tool name for 6c, verb+url for 5, claim text for 6d, etc. |
+| `guard_correlation_id` | computed | `{trace_id}:{step}:{guard_label}` — links detection to correction event |
 
-The `corrected_content` field from the ticket is not directly capturable — the guard re-prompts the LLM and the corrected response appears on the *next* turn. The guard event records what was *detected*, not what was corrected. This is the right shape: the detection event is the signal; the correction is the next turn's response, already persisted in `messages`.
+The `corrected_content` field from the ticket requires cross-step correlation: the guard fires at step N (detection), re-prompts, and the corrected response appears at step N+1 (correction). This plan captures both via a two-event correlation pattern:
+
+1. **Detection event** (step N): the `guard.*` structured event fires with all detection fields. Includes a `guard_correlation_id` (format: `{trace_id}:{step}:{guard_label}`) for cross-step linkage.
+2. **Correction event** (step N+1): when the next `EndTurn` is accepted (no guard fires), a `guard.correction_accepted` event fires with `guard_correlation_id` matching the detection event and `corrected_content` carrying the accepted response text (truncated to 2000 chars, consistent with `TOOL_METADATA_MAX` budget class).
+
+Implementation: a turn-scoped `Option<GuardCorrelation>` struct in `run_loop` stores `{ correlation_id, guard_label, step }` when any guard fires. On the next successful EndTurn, the struct is consumed to emit the correction event. If multiple guards fire across retries, only the last guard's correlation is tracked (the final correction is the one that passes all guards). The `corrected_content` field satisfies AC2's three-part conjunction: `session_id` + `guard` (instance type) + `corrected_content`.
 
 ### D5: No schema migration
 
@@ -85,6 +91,15 @@ The guard sites in `run_loop` have access to `trace_id` (from `AgentParams`) and
 - Add `session_id: &str` parameter to `run_loop()` signature (line ~640)
 - Pass `params.session_id` at the three `run_loop` call sites: `run_conversation_agent` (~line 2902), `run_silent_agent` (~line 3100), `run_team_agent` (~line 3300)
 - Verify `AgentParams.session_id` exists — it does (`session_id: String` field)
+- Add `guard_correlation: Option<GuardCorrelation>` local variable in `run_loop`, initialized to `None`. Struct definition:
+  ```rust
+  struct GuardCorrelation {
+      correlation_id: String,  // "{trace_id}:{step}:{guard_label}"
+      guard_label: &'static str,
+      step: usize,
+  }
+  ```
+  Set by any guard firing (last-writer-wins); consumed by the correction event on successful EndTurn.
 
 ### Unit 2: Upgrade guard `warn!` calls to structured events
 
@@ -98,6 +113,12 @@ For each of the five guard firing sites, replace the plain `warn!` with a struct
 warn!(step, verb, url, label = mode.label(), "Fabricated action ...");
 
 // After:
+let correlation_id = format!("{trace_id}:{step}:fabricated_action_claim");
+guard_correlation = Some(GuardCorrelation {
+    correlation_id: correlation_id.clone(),
+    guard_label: "fabricated_action_claim",
+    step,
+});
 warn!(
     target: "mika::otel",
     trace_id = %trace_id,
@@ -106,6 +127,7 @@ warn!(
     step,
     verb,
     url,
+    guard_correlation_id = %correlation_id,
     label = mode.label(),
     event = "guard.fabricated_action_claim",
     "Fabricated action claim with GitHub URL but zero tool calls"
@@ -175,19 +197,42 @@ warn!(
 );
 ```
 
-**Pattern note:** Use `target: "mika::otel"` so the OTLP exporter picks these up when telemetry is enabled. The `event = "guard.*"` field is the grep/jq discriminator. All existing log-file consumers continue to see the warn line.
+**Pattern note:** Use `target: "mika::otel"` so the OTLP exporter picks these up when telemetry is enabled. The `event = "guard.*"` field is the grep/jq discriminator. All existing log-file consumers continue to see the warn line. Each guard site sets `guard_correlation` before emitting the warn — subsequent guards overwrite (last-writer-wins, since only the final correction matters). The `guard_correlation_id` field format `{trace_id}:{step}:{guard_label}` is unique per guard firing and stable for cross-event joins.
 
-### Unit 3: Architect self-report via audit_events
+**Correction event (emitted once per successful EndTurn after a guard fired):**
+```rust
+// After all guards pass and EndTurn is accepted:
+if let Some(corr) = guard_correlation.take() {
+    let corrected = &text[..text.len().min(2000)];
+    warn!(
+        target: "mika::otel",
+        trace_id = %trace_id,
+        agent_id = %agent_id,
+        session_id = %session_id,
+        step,
+        guard_correlation_id = %corr.correlation_id,
+        original_guard = corr.guard_label,
+        original_step = corr.step,
+        corrected_content = %corrected,
+        event = "guard.correction_accepted",
+        "Guard correction accepted — corrected content captured"
+    );
+}
+```
+
+### Unit 3: Architect anchoring self-report via audit_events
 
 **File:** `crates/mika-agent/src/tools/send_message.rs` or a new lightweight helper
 
-When mika-arch emits a message containing the phrase "unable to anchor" or "cannot be retrieved via a fresh tool call" (the verbatim-quote anchoring failure language from the skill prompts), the engine writes an `audit_events` row:
+**Semantic clarification (per review-guide.md § Single Responsibility):** This event has one clear semantic: **"correct self-report observed"** — mika-arch correctly identified and reported that it cannot anchor a citation, which is the *desired* behavior per #952's skill prompts. This is a complementary signal to AC1 ("structured event fires on identified fabrication"), not AC1 itself. AC1 is satisfied by the engine-level guard events in Unit 2, which fire when fabrication slips *through* (the guard catches the LLM making a false claim). Unit 3 records when the LLM *correctly* self-reports its limitation — the opposite signal. Both are valuable for the fabrication catalog: guard events show detection-and-correction; self-report events show the prompt-level defenses working as intended.
+
+When mika-arch emits a message containing anchoring-failure language from the skill prompts, the engine writes an `audit_events` row:
 
 ```
 tool_name = "fabrication_guard"
-target_key = "arch_citation_unanchored"
+target_key = "arch_anchoring_self_report"
 after_value = <truncated assistant text, max 500 chars>
-reasoning = "mika-arch self-reported inability to anchor a citation"
+reasoning = "mika-arch correctly self-reported inability to anchor a citation (success signal per #952 skill prompts)"
 ```
 
 **Implementation approach:** Add a post-EndTurn check in the conversation-mode path of `agent.rs`, after the guard chain but before the response is persisted. The check:
@@ -230,19 +275,28 @@ Add a subsection under Observability documenting the new structured guard events
 Add Signal K to the post-restart safety check section:
 
 ```
-- **Signal K — guard fabrication telemetry (#953).** `grep 'guard\.' server.log | jq '.event'` — 
-  any hits indicate a fabrication-class guard fired during an agent turn. The `session_id` and 
-  `trace_id` fields enable drill-down to the specific turn. Sustained hits from the same agent 
-  indicate the prompt-level defenses (#952) need reinforcement for that agent's failure mode.
+- **Signal K — guard fabrication telemetry (#953).** Two paired events:
+  (a) `grep 'guard\.' server.log | jq 'select(.event | startswith("guard.") and . != "guard.correction_accepted")'` —
+  detection events. Any hits indicate a fabrication-class guard fired. The `guard_correlation_id` 
+  field links to the correction event.
+  (b) `grep guard.correction_accepted server.log | jq '{guard_correlation_id, corrected_content}'` —
+  correction events. The `corrected_content` field shows the accepted response after re-prompt. 
+  Join on `guard_correlation_id` for the full detection→correction trace.
+  (c) `grep arch_anchoring_self_report server.log` — architect correct-self-report events 
+  (success signal, not fabrication). Also queryable via SQL: 
+  `SELECT * FROM audit_events WHERE target_key = 'arch_anchoring_self_report'`.
+  Sustained guard detections from the same agent indicate #952 prompt defenses need reinforcement.
 ```
 
 ## Verification
 
 1. `cargo test -p mika-agent` — all existing tests pass (no guard behavior changed)
 2. `cargo clippy` — clean
-3. `grep "guard\." crates/mika-agent/src/agent.rs` — confirms structured event names present at all five guard sites
-4. New eval scenario passes with `MockLlmProvider`
-5. Manual: deploy, trigger a fabrication guard (e.g., send a message that triggers asserted-unavailability), verify `grep guard.asserted_unavailability server.log` returns a structured JSON event with all expected fields
+3. `grep "guard\." crates/mika-agent/src/agent.rs` — confirms structured event names present at all five guard sites plus the `guard.correction_accepted` emission site
+4. New eval scenario passes with `MockLlmProvider` — exercises guard firing (detection event with `guard_correlation_id`) followed by corrected response (correction event with `corrected_content`)
+5. Manual: deploy, trigger a fabrication guard (e.g., send a message that triggers asserted-unavailability), verify:
+   - `grep guard.asserted_unavailability server.log` returns a structured JSON event with all expected fields including `guard_correlation_id`
+   - `grep guard.correction_accepted server.log` returns a paired event with matching `guard_correlation_id` and non-empty `corrected_content`
 
 ## Out of Scope
 
@@ -251,3 +305,7 @@ Add Signal K to the post-restart safety check section:
 - Changes to mika-arch skill prompts (owned by mika#952)
 - Dashboard UI for the fabrication catalog (future enhancement)
 - Calibration scenario changes (`calibration/roles/mika_arch.rs`)
+
+## Revision history
+
+- rev 2 (2026-06-14): addressed F1 by adding a two-event correlation pattern — detection events carry `guard_correlation_id`, and a `guard.correction_accepted` event fires on the next successful EndTurn with `corrected_content` (truncated to 2000 chars), satisfying AC2's three-part conjunction (`session_id` + instance type + corrected content). `GuardCorrelation` struct added to Unit 1, correlation fields added to Unit 2 guard sites, correction event emission added after the guard chain. Addressed F2 by renaming `arch_citation_unanchored` to `arch_anchoring_self_report` and clarifying its semantic as "correct self-report observed" (success signal per #952 skill prompts), distinct from AC1's "fabrication detected" (which is satisfied by engine-level guard events). Unit 3 rewritten with explicit semantic clarification per review-guide.md § Single Responsibility — the event has one clear meaning: mika-arch correctly flagged its limitation, not that fabrication was detected. Citation: review-guide.md § Single Responsibility, workflows § issue-as-versioned-contract.
