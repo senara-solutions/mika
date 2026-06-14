@@ -105,6 +105,8 @@ IUSE="+telemetry"
 RDEPEND="
     acct-user/mika
     acct-group/mika
+"
+PDEPEND="
     app-misc/jq
 "
 BDEPEND="
@@ -113,13 +115,17 @@ BDEPEND="
 "
 # Note: No dev-db/sqlite needed — rusqlite bundles SQLite
 # Note: No dev-libs/openssl needed — all TLS via rustls
+# Note: jq is a PDEPEND (soft dependency) — required only by mika-server's
+# bundled shell skill handlers (dispatch-lib.sh), not by the mika or
+# mika-server binaries themselves. Mirrors Debian #623's Recommends decision.
+# Users running only the CLI are not forced to install jq.
 
 ECARGO_WORKSPACE=1
 ```
 
 **Build phase:**
 - `src_configure`: set cargo features based on USE flags (`telemetry` → `--features telemetry`)
-- `src_compile`: `cargo build --release --workspace` with appropriate features
+- `src_compile`: `cargo build --release -p mika-cli -p mika-agent` with appropriate features (targeted build — excludes `mika-gateway` and `calibrate` which are out of scope and may have undeclared system dependencies)
 - `src_install`:
   - Install `mika` and `mika-server` binaries to `/usr/bin/`
   - Install OpenRC init script to `/etc/init.d/mika-server`
@@ -127,7 +133,7 @@ ECARGO_WORKSPACE=1
   - `keepdir /var/lib/mika /var/log/mika /etc/mika`
   - `fowners mika:mika /var/lib/mika /var/log/mika`
   - `fperms 0750 /etc/mika`
-- `pkg_postinst`: print einfo about configuration, restart notice
+- `pkg_postinst`: print einfo about configuration, restart notice, and recommend installing `app-misc/jq` if not present (required by mika-server's bundled shell skill handlers)
 
 **Dashboard handling:** The dashboard requires Node.js to build. Two options:
 - **Option A (recommended):** Skip dashboard embedding in the ebuild. The CLI (`mika`) works without it; `mika-server` runs without the dashboard (API-only mode). Dashboard can be served separately or added later.
@@ -149,6 +155,17 @@ command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
 directory="/var/lib/mika"
 
+# Pass conf.d environment variables to the supervised process.
+# OpenRC sources /etc/conf.d/${RC_SVCNAME} into the init script shell,
+# but command_background=true uses start-stop-daemon which does NOT
+# automatically export those variables to the child process.
+# supervise_daemon_args passes them explicitly via --env flags.
+supervise_daemon_args="
+    --env MIKA_HOME=${MIKA_HOME:-/var/lib/mika}
+    --env MIKA_LOG_FORMAT=${MIKA_LOG_FORMAT:-json}
+    --env MIKA_SERVER_LOG_FILE=${MIKA_SERVER_LOG_FILE:-/var/log/mika/server.log}
+"
+
 depend() {
     need net
     after dns
@@ -160,6 +177,8 @@ start_pre() {
     checkpath -d -m 0750 -o mika:mika /etc/mika
 }
 ```
+
+> **Design note (F2):** `supervise_daemon_args` with `--env` is the canonical OpenRC pattern for passing conf.d variables to backgrounded processes. Each variable gets an explicit `--env` flag so the supervised `mika-server` process inherits them. The conf.d file remains the configuration surface; the init script is the delivery mechanism. Additional MIKA_* variables (e.g., API keys from a secrets file) can be added to `supervise_daemon_args` or loaded via an env file sourced in `start_pre`.
 
 `files/mika-server.confd`:
 ```bash
@@ -243,7 +262,7 @@ rc-update add mika-server default
 
 | Risk | Mitigation |
 |------|-----------|
-| Cargo ebuild eclass may not handle workspace builds | Test with `ECARGO_WORKSPACE=1`; fall back to manual `cargo build` in `src_compile` if needed |
+| Cargo ebuild eclass may not handle targeted `-p` builds | Test with `ECARGO_WORKSPACE=1` and targeted `-p mika-cli -p mika-agent`; fall back to manual `cargo build` in `src_compile` if needed |
 | Rust MSRV (1.91) newer than Gentoo stable toolchain | Use `~amd64` keywords (testing); Gentoo stable Rust updates quickly |
 | Dashboard not embedded | CLI and API work fully without it; document as known limitation |
 | Large compile time on first install | Expected for source-based distro; binary cache (BINHOST) is future scope |
@@ -260,3 +279,7 @@ rc-update add mika-server default
    - `emerge -av --update app-misc/mika` — verify upgrade path
 2. `pkgcheck scan` passes in CI
 3. `repoman manifest` generates valid Manifest
+
+## Revision history
+
+- rev 2 (2026-06-14): addressed F1 (BLOCKING) by moving `app-misc/jq` from `RDEPEND` to `PDEPEND` — mirrors sibling Debian plan #623's `Recommends` decision; jq is a skill-runtime dependency, not a binary dependency (review-guide.md § DRY, § YAGNI). Added `pkg_postinst` jq recommendation message. Addressed F2 by adding `supervise_daemon_args` with `--env` flags to the OpenRC init script — conf.d variables are now explicitly passed to the supervised `mika-server` process (review-guide.md § KISS). Addressed F3 by replacing `cargo build --release --workspace` with targeted `cargo build --release -p mika-cli -p mika-agent` — avoids compiling excluded `mika-gateway` and `calibrate` targets and their potentially undeclared dependencies (review-guide.md § YAGNI, § KISS).
