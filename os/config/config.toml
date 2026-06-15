@@ -13,7 +13,7 @@
 
 # ── Server ──
 # log_format = "json"
-# server_port = 8080
+# spirit_port = 8080
 
 # ── Knowledge Graph ──
 # KG docs root inside the container (docs/ is copied to /app/ at build time)

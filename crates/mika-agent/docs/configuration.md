@@ -354,7 +354,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `log_format` | `String` | `json` | `MIKA_LOG_FORMAT` | Stdout log format for mika-spirit and mika-gateway: `json` (default) or `pretty` (human-readable). CLI always uses pretty format regardless of this setting. File output always uses JSON. |
 | `routing_url` | `Option<String>` | None | `MIKA_ROUTING_URL` | Gateway URL for outbound message delivery. Required in server mode. |
 | `customer_id` | `Option<String>` | None | `MIKA_CUSTOMER_ID` | Customer identifier. Set per container in hosted deployments. |
-| `server_port` | `u16` | `8080` | `MIKA_SPIRIT_PORT` | HTTP server listen port. Only used in server mode (`mika-spirit`). |
+| `spirit_port` | `u16` | `8080` | `MIKA_SPIRIT_PORT` | HTTP server listen port. Only used in server mode (`mika-spirit`). |
 | `openai_api_key` | `Option<String>` | None | `MIKA_OPENAI_API_KEY` | OpenAI API key for embedding generation. Enables vector similarity in Layer 3 hybrid search. |
 | `embedding_model` | `String` | `text-embedding-3-small` | `MIKA_EMBEDDING_MODEL` | OpenAI embedding model ID. |
 | `embedding_dimensions` | `u32` | `512` | `MIKA_EMBEDDING_DIMENSIONS` | Embedding vector dimensions. |
@@ -370,7 +370,7 @@ Complete table of all `Settings` struct fields for the agent (CLI and server mod
 | `github_repo` | `Option<String>` | None | `MIKA_GITHUB_REPO` | Target GitHub repository in `owner/repo` format (e.g. `senara-solutions/mika`). Validated at registration time — must contain exactly one `/`. |
 | `internal_token` | `Option<SecretString>` | None | `MIKA_INTERNAL_TOKEN` | Shared bearer token for gateway-to-container auth. Must be exactly 64 hex characters (32 bytes hex-encoded). Required in server mode. Accepted on all routes (superuser). |
 | `dashboard_token` | `Option<SecretString>` | None | `MIKA_DASHBOARD_TOKEN` | Separate bearer token for read-only dashboard API routes (`/api/v1/*`). If unset, dashboard routes accept `internal_token` (backwards compatible). Only grants access to read-only routes — mutation endpoints (`/message`, `/tasks/{id}/complete`) still require `internal_token`. |
-| `server_log_file` | `Option<PathBuf>` | None | `MIKA_SPIRIT_LOG_FILE` | File path for mika-spirit log output. Logs go to stdout + file when set. |
+| `spirit_log_file` | `Option<PathBuf>` | None | `MIKA_SPIRIT_LOG_FILE` | File path for mika-spirit log output. Logs go to stdout + file when set. |
 | `dashboard_enabled` | `bool` | `false` | `MIKA_DASHBOARD_ENABLED` | Enable embedded dashboard SPA at `/dashboard/`. When enabled, the pre-built React dashboard is served from the binary via `rust-embed`. Requires `MIKA_DASHBOARD_TOKEN` for token injection. Build the dashboard before compiling: `npm run build --prefix dashboard` (`VITE_BASE_PATH` is set automatically). |
 | `disable_bundled_skills` | `bool` | `false` | `MIKA_DISABLE_BUNDLED_SKILLS` | Skip bundled skill re-sync on startup. Useful for debugging handler scripts. **Do not enable in production** — prevents security updates to handler scripts from propagating. |
 | `dev_mode` | `bool` | `false` | `MIKA_DEV_MODE` | Enable dev mode — auto-provisions well-known development agents (`mika-dev`, `mika-qa`) on startup with role-specific identity, soul, and skill assignments. Idempotent — existing agents are never overwritten. |
