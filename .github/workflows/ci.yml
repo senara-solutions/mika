@@ -21,6 +21,16 @@ jobs:
     name: Check
     runs-on: [self-hosted, Linux, X64, gentux]
     steps:
+      # mika#1542: gentux self-hosted runner's _diag/pages dir can retain
+      # stale .log files from cancelled / concurrent-cancelled prior jobs,
+      # which collide with the new job's diagnostic file at checkout time:
+      #   "The file '/var/lib/actions-runner/runner/_diag/pages/<uuid>_<uuid>_1.log' already exists."
+      # Best-effort cleanup BEFORE actions/checkout removes the stale files
+      # so the new job's logging handler can create its own. Silent fallback
+      # if dir is missing or permissions deny — the next step's checkout will
+      # then surface any real (non-stale) error.
+      - name: Clean stale runner diagnostic pages (mika#1542)
+        run: rm -f /var/lib/actions-runner/runner/_diag/pages/*.log 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       - name: Install rustup if missing (self-hosted runner)
         run: |
