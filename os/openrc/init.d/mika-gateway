@@ -16,7 +16,7 @@ output_log="/home/mika/.mika/logs/mika-gateway.log"
 error_log="/home/mika/.mika/logs/mika-gateway.log"
 
 depend() {
-    need net mika-server
+    need net mika-spirit
     after firewall
 }
 
