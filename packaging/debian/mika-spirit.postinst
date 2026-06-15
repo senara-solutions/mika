@@ -18,9 +18,9 @@ case "$1" in
 
     # Enable and restart service on upgrade
     systemctl daemon-reload
-    systemctl enable mika-server.service
-    if systemctl is-active --quiet mika-server.service; then
-      systemctl restart mika-server.service
+    systemctl enable mika-spirit.service
+    if systemctl is-active --quiet mika-spirit.service; then
+      systemctl restart mika-spirit.service
     fi
     ;;
 esac

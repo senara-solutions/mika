@@ -3,7 +3,7 @@ set -e
 
 case "$1" in
   remove|purge)
-    systemctl stop mika-server.service || true
-    systemctl disable mika-server.service || true
+    systemctl stop mika-spirit.service || true
+    systemctl disable mika-spirit.service || true
     ;;
 esac

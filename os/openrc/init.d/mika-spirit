@@ -1,10 +1,10 @@
 #!/sbin/openrc-run
 # SPDX-License-Identifier: Apache-2.0
-# OpenRC init script for mika-server (Mika AI agent HTTP server)
+# OpenRC init script for mika-spirit (Mika AI agent HTTP server)
 
 description="Mika AI agent HTTP server"
 
-command="/usr/local/bin/mika-server"
+command="/usr/local/bin/mika-spirit"
 command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"
 
@@ -12,8 +12,8 @@ command_user="mika:mika"
 
 supervise_daemon_args="--respawn-delay 5 --respawn-max 10 --respawn-period 60"
 
-output_log="/home/mika/.mika/logs/mika-server.log"
-error_log="/home/mika/.mika/logs/mika-server.log"
+output_log="/home/mika/.mika/logs/mika-spirit.log"
+error_log="/home/mika/.mika/logs/mika-spirit.log"
 
 depend() {
     need net
@@ -22,9 +22,9 @@ depend() {
 
 start_pre() {
     # Source environment configuration
-    if [ -f "/etc/conf.d/mika-server" ]; then
-        . "/etc/conf.d/mika-server"
-        export MIKA_HOME MIKA_LOG_FORMAT MIKA_SERVER_LOG_FILE
+    if [ -f "/etc/conf.d/mika-spirit" ]; then
+        . "/etc/conf.d/mika-spirit"
+        export MIKA_HOME MIKA_LOG_FORMAT MIKA_SPIRIT_LOG_FILE
         # Export optional vars only if set
         [ -n "$MIKA_ANTHROPIC_API_KEY" ] && export MIKA_ANTHROPIC_API_KEY
         [ -n "$MIKA_OPENAI_API_KEY" ] && export MIKA_OPENAI_API_KEY

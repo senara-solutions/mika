@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# Configuration for mika-server OpenRC service
-# Source: os/openrc/conf.d/mika-server
+# Configuration for mika-spirit OpenRC service
+# Source: os/openrc/conf.d/mika-spirit
 #
-# This file is sourced by the mika-server init script.
+# This file is sourced by the mika-spirit init script.
 # Edit to configure runtime environment for the Mika agent server.
 
 # ── Core paths ──
 MIKA_HOME="/home/mika/.mika"
 MIKA_LOG_FORMAT="json"
-MIKA_SERVER_LOG_FILE="/home/mika/.mika/logs/mika-server.log"
+MIKA_SPIRIT_LOG_FILE="/home/mika/.mika/logs/mika-spirit.log"
 
 # ── Server mode ──
 # Required for server mode (gateway <-> agent communication)

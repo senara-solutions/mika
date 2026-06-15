@@ -7,13 +7,13 @@ Wants=network-online.target
 Type=simple
 User=mika
 Group=mika
-ExecStart=/usr/bin/mika-server
+ExecStart=/usr/bin/mika-spirit
 Restart=on-failure
 RestartSec=5
 Environment=MIKA_HOME=/var/lib/mika
 Environment=MIKA_LOG_FORMAT=json
-Environment=MIKA_SERVER_LOG_FILE=/var/log/mika/server.log
-EnvironmentFile=-/etc/mika/mika-server.env
+Environment=MIKA_SPIRIT_LOG_FILE=/var/log/mika/server.log
+EnvironmentFile=-/etc/mika/mika-spirit.env
 WorkingDirectory=/var/lib/mika
 
 # Hardening

@@ -9,7 +9,7 @@
 # Postgres connection string for the gateway's customer registry
 # MIKA_DATABASE_URL="postgres://mika:password@localhost:5432/mika"
 
-# ── Internal auth (required, must match mika-server) ──
+# ── Internal auth (required, must match mika-spirit) ──
 # MIKA_INTERNAL_TOKEN="<shared-secret — openssl rand -hex 32>"
 
 # ── Telegram (optional) ──
