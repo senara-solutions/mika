@@ -31,6 +31,28 @@ jobs:
       # then surface any real (non-stale) error.
       - name: Clean stale runner diagnostic pages (mika#1542)
         run: rm -f /var/lib/actions-runner/runner/_diag/pages/*.log 2>/dev/null || true
+      # mika#1544: capture gentux runner state at job start for flake investigation.
+      # The actions/checkout step fails ~3s into the job with "Missing file at path:
+      # _runner_file_commands/set_output_<uuid>" on a corrupted-runner-state class.
+      # Per-job snapshot of _work/_temp/_runner_file_commands/, inode count, and
+      # runner process list narrows the hypothesis (state corruption vs cancel race
+      # vs inode pressure) without requiring host access. Best-effort; never fails.
+      - name: Capture gentux runner diagnostic snapshot (mika#1544)
+        run: |
+          {
+            echo "=== _work/_temp/_runner_file_commands/ contents ==="
+            ls -la /var/lib/actions-runner/runner/_work/_temp/_runner_file_commands/ 2>&1 | head -30 || true
+            echo ""
+            echo "=== _work/_temp/ top-level ==="
+            ls -la /var/lib/actions-runner/runner/_work/_temp/ 2>&1 | head -10 || true
+            echo ""
+            echo "=== inode usage on _work/ filesystem ==="
+            df -i /var/lib/actions-runner/runner/_work/ 2>&1 || true
+            echo ""
+            echo "=== runner processes (first 5) ==="
+            pgrep -af 'Runner\.|actions-runner' 2>&1 | head -5 || true
+          } 2>&1
+        continue-on-error: true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       - name: Install rustup if missing (self-hosted runner)
         run: |
