@@ -2228,6 +2228,47 @@ RESULT=$(_test_policy_deny_check "$POLICY_DENY_FIXTURE_DIR/multi_deny.stderr")
 assert_contains "First deny extracted" "cmd1" "$RESULT"
 assert_not_contains "Subsequent denies not included" "cmd2" "$RESULT"
 
+# --- Test 14: policy-deny disambiguation extended to dev-pilot ---
+# Companion to mika#1534 (dev-groom disambiguation). The Class C policy-deny
+# check now also fires on dev-pilot post-flight before the generic "Zero new
+# commits" / "HEAD unchanged" message. Validates the structural placement.
+
+echo ""
+echo "Test 14: Policy-deny disambiguation extended to dev-pilot (structural)"
+echo "----------------------------------------------------------------------"
+
+POSTFLIGHT_BLOCK=$(sed -n '/Post-flight diff check: detect zero-commit/,/Unit 1 (mika#1282)/p' "$DISPATCH_LIB")
+
+assert_contains "Class C check fires on HEAD-unchanged for ALL skills (not just dev-groom)" \
+    'Policy-deny pre-check (Class C disambiguation, extended to dev-pilot' "$POSTFLIGHT_BLOCK"
+assert_contains "POLICY_DENY variable set in HEAD-unchanged path" \
+    'POLICY_DENY=""' "$POSTFLIGHT_BLOCK"
+assert_contains "Reads persistent stderr at LOG_ID path" \
+    'PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"' "$POSTFLIGHT_BLOCK"
+assert_contains "Strips ANSI before grep" \
+    'sed' "$POSTFLIGHT_BLOCK"
+assert_contains "Searches for [policy:deny] marker" \
+    '[policy:deny]' "$POSTFLIGHT_BLOCK"
+assert_contains "Class C message — halted by policy deny, NOT generic exit" \
+    'halted by policy deny — not generic exit' "$POSTFLIGHT_BLOCK"
+assert_contains "Links to investigation doc" \
+    'drift-misdiagnosis-policy-deny-halt' "$POSTFLIGHT_BLOCK"
+
+# Branch ordering: POLICY_DENY must precede BOTH the dev-groom-re-dispatch
+# Note AND the generic "Zero new commits" message in source order.
+POLICY_LINE=$(echo "$POSTFLIGHT_BLOCK" | grep -n 'if \[ -n "\$POLICY_DENY" \]' | head -1 | cut -d: -f1)
+GROOM_LINE=$(echo "$POSTFLIGHT_BLOCK" | grep -n 'HEAD unchanged on dev-groom re-dispatch' | head -1 | cut -d: -f1)
+ZERO_COMMITS_LINE=$(echo "$POSTFLIGHT_BLOCK" | grep -n 'Zero new commits produced' | head -1 | cut -d: -f1)
+if [ -n "$POLICY_LINE" ] && [ -n "$GROOM_LINE" ] && [ -n "$ZERO_COMMITS_LINE" ] \
+    && [ "$POLICY_LINE" -lt "$GROOM_LINE" ] && [ "$POLICY_LINE" -lt "$ZERO_COMMITS_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ POLICY_DENY branch precedes both dev-groom-note and zero-commits messages"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ POLICY_DENY branch must precede both messages in HEAD-unchanged block"
+    echo "    (POLICY_LINE=$POLICY_LINE, GROOM_LINE=$GROOM_LINE, ZERO_COMMITS_LINE=$ZERO_COMMITS_LINE)"
+fi
+
 # --- Summary ---
 
 echo ""

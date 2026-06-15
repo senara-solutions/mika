@@ -705,11 +705,40 @@ Note: process exited with code ${PILOT_EXIT} after session completed — result 
         if [ -n "$PRE_RUN_HEAD" ] && [ -n "$REPO" ]; then
             POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
             if [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ]; then
+                # Policy-deny pre-check (Class C disambiguation, extended to dev-pilot
+                # from dev-groom — companion to mika#1534). If the pilot halted on a
+                # tier1/policy deny mid-flight, "Zero new commits" is the SYMPTOM, not
+                # the cause. Read persistent stderr for [policy:deny] before declaring
+                # the generic HEAD-unchanged failure. Fail-open: missing stderr → empty
+                # POLICY_DENY → fall through to existing messages.
+                #
+                # See: docs/solutions/workflow-issues/
+                #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+                POLICY_DENY=""
+                PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
+                if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
+                    POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
+                        | grep -m1 '\[policy:deny\]' || true)
+                fi
+
                 # mika#1333 Unit 2: For dev-groom re-dispatch, HEAD-unchanged is
                 # expected when the plan was already committed in a prior run.
                 # The architect pass (_iterate_groom_loop) is what matters — don't
                 # poison RESULT with PIPELINE FAILURE for the expected re-dispatch state.
-                if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && \
+                if [ -n "$POLICY_DENY" ]; then
+                    # Class C — policy-deny halt. The pilot tried to do legitimate
+                    # work and was prevented by a tier1/policy allow-list gap. NOT
+                    # to be confused with LLM drift or genuine dirty-worktree-rescue.
+                    RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit.
+
+Halt event: ${POLICY_DENY}
+
+Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-dispatching without addressing the substrate gap will hit the same wall.
+
+See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+
+${RESULT}"
+                elif [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && \
                    find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | grep -q .; then
                     RESULT="Note: HEAD unchanged on dev-groom re-dispatch — plan already committed from prior run. Architect pass will determine outcome.
 
