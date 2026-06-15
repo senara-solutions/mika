@@ -297,6 +297,37 @@ See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, 
 
 See `tests/eval/grounding_regressions/README.md` for the full vocabulary, capability matrix, and how to add scenarios.
 
+### Calibration CI Workflow (#742)
+
+`.github/workflows/eval-calibration.yml` — Weekly scheduled workflow that keeps the committed baseline (`tests/fixtures/eval-baseline.json`) trustworthy by detecting provider tolerance drift.
+
+**Schedule:** Mondays 08:00 UTC (cron) + `workflow_dispatch` for on-demand runs.
+
+**How it works:**
+1. Runs full calibration matrix (`MIKA_EVAL_REAL_PROVIDERS=all`, `MIKA_EVAL_CALIBRATE=1`)
+2. If no baseline exists → `eval-diff bootstrap` creates the initial file, opens PR with label `calibration-bootstrap`
+3. If baseline exists → `eval-diff diff` compares artifacts:
+   - Exit 0 (no drift): logs success, no PR
+   - Exit 1 (drift detected): updates baseline, opens PR with labels `eval-calibration` + `drift-detected`
+   - Exit 2 (error): workflow fails, no PR
+
+**Provider secrets:** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY` in repo Settings → Secrets. Missing keys are soft-skipped (logged as warnings, remaining providers still run).
+
+**`eval-diff` CLI** (`src/bin/eval-diff.rs`):
+- `eval-diff bootstrap <artifact> [<baseline>]` — Copy artifact as committed baseline (default: `tests/fixtures/eval-baseline.json`)
+- `eval-diff diff <baseline> <new>` — Semantic diff; exit 0 = no drift, 1 = drift, 2 = error
+- `eval-diff format-pr-body <baseline> <new>` — Generate Markdown title + body for drift PR
+
+**Manual trigger:** Go to Actions → "Eval Calibration" → "Run workflow" → select branch (usually `main`). Useful before model upgrades, after prompt changes, or to verify baseline freshness.
+
+**Expected PR cadence:** ~0-2 drift PRs per month under normal conditions. A burst of drift PRs suggests a provider changed models or a prompt change shifted outcomes — investigate before blindly merging.
+
+**Interpreting a drift PR:** The PR body contains a fenced JSON block listing each changed scenario with provider, model, previous/new outcome, and classification. Review the changes to confirm they reflect real provider behavior shifts, not workflow bugs.
+
+**Rolling back a merged baseline:** `git revert <merge-sha>` on the baseline-update PR. The next weekly run will re-detect the drift and open a fresh PR.
+
+**Cost:** ~$2.57/run (four providers × full scenario matrix). Annual: ~$150 (52 weekly + ~10 manual runs). Bounded by 30-minute workflow timeout.
+
 ## Knowledge Graph — Domain Graph Builder
 
 `src/kg/domain_builder.rs` — Deterministic startup-time builder that populates `kg_entities` and `kg_relationships` from five authoritative sources: `SkillRegistry`, `ToolRegistry`, `McpManager`, agent configs, and concept seeds (hardcoded). Runs once per server boot in `run_server()` after all agents are initialized. No LLM calls — pure code projection.
