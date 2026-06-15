@@ -31,13 +31,24 @@ The brainstorm specifically calls out R1 (CLI dual-mode) + R5 (gateway transfer 
 
 ### Deferred to Follow-Up Work
 
-- **R5 (gateway transfer endpoint)** — re-scoped to slice 2 alongside R2 (bundle producer). Producing the endpoint here would create a surface with no callers; the brainstorm-stated split was based on the assumption R5 could ship independently, which doesn't hold.
-- **R2 (signed-bundle export/import)** — slice 2.
-- **R3 (granular slice selection)**, **R4 (manifest schema with DID-shaped identity)** — slice 2 or 3 depending on R2 sequencing.
-- **R6 (chain-forward-compat shape)** — establishes manifest format; ships with R2/R4.
-- **R7 (per-instance key pair)**, **R8 (operator-issued credentials migration)** — Phase 2 (post-mission window).
-- **R9 (Halo2/PLONK ZK selective disclosure)** — Phase 2+.
-- **R10 (Gaia framing in identity manifests)** — poetic framing layer, lands with R4.
+> **Note (2026-06-15 — mika#1538 canvass reconciliation):** The R-number assignments below were drifted from the brainstorm canonical R1–R10 (the brainstorm at `docs/brainstorms/2026-06-09-mika-ascension-architecture-requirements.md` § Requirements is origin-of-truth). The drift invented R-numbers for items not in the brainstorm's R-list — the brainstorm has no Halo2/ZK requirement and no Gaia-framing R (Gaia frame appears as K6, a key decision, not as an R requirement). The section below is reconciled to canonical assignments. The original drifted assignments are preserved in the PR #1468 git history.
+
+Brainstorm canonical R-list (for downstream-plan citations):
+
+- **R1.** CLI dual-mode connection — shipped (this slice).
+- **R2.** Signed-bundle export/import — slice 2 (mika#1538).
+- **R3.** Granular slice selection — slice 2.
+- **R4.** Family-bootstrap as degenerate case — **deferred to slice 3** ("family identity" slice, per mika#1538 canvass 2026-06-15) alongside R7. R4-without-R7 ships a read-only clone rather than a family member; the two form a coherent identity slice.
+- **R5.** Gateway endpoint for bundle transfer — slice 2. Re-scoped here from this slice; producing the endpoint without R2 callers would be a surface with no clients (the brainstorm-stated R1+R5 first-slice split assumed R5 could ship independently, which doesn't hold).
+- **R6.** Chain-forward-compat shape — slice 2 (ships with R2; manifest format is the bundle).
+- **R7.** Per-instance key model — **deferred to slice 3** ("family identity" slice) alongside R4.
+- **R8.** Manifest legibility for humans and agents — slice 2 (ships with R2; same reason as R6).
+- **R9.** CLI granular operations (`mika bundle list/verify`, `mika agent slices`) — slice 2.
+- **R10.** Security baseline (TLS, signature verification, secret wrapping) — slice 2 (ships with R2; security is not optional in slice 2).
+
+Slice 2 signing-key locus (per mika#1538 canvass, ratified 2026-06-15): operator-bundle-shipped, encrypted with operator's existing GitHub App key (`Settings.github_app_private_key`). This is a slice-2-pattern, not load-bearing-forever — slice 3 (R7) introduces per-instance keys and narrows the operator-custody burden.
+
+Phase 2+ items (post-mission, not numbered as R-requirements in the brainstorm): real chain-resolution semantics; continuous bidirectional sync (Approach C); peer-to-peer family Mikas without gateway-as-intermediary; cross-customer knowledge commons; auto-conflict resolution; encrypted-at-rest SQLite; soul-version history. See brainstorm § Scope Boundaries.
 
 ### Outside this product's identity
 
