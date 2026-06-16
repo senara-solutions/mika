@@ -918,6 +918,97 @@ ${RESULT}"
                     fi
                 fi
             fi
+
+            # mika#1383: structural completion gate for HEAD-advanced-no-PR.
+            # The pilot session ran content and committed, but ended its turn
+            # before invoking `gh pr create` (Mode 1 = bare `/ce-work` launch
+            # never had commit→PR in scope; Mode 2 = full `/mika` launch hit
+            # prompt-enforcement fragility on the tail). dispatch-lib owns the
+            # git/PR tail per mika#1271 (content/workflow split). Honors
+            # Vincent's pre-reboot framing: "gate the loop until the tail's
+            # fixed". Companion to mika#1282 (handles HEAD-unchanged + dirty);
+            # this block handles HEAD-changed + missing PR.
+            #
+            # Decision matrix when this block fires (HEAD changed):
+            #   dirty worktree           → Phase A: rescue dirty into wip() commit
+            #   PR exists for branch     → Phase B no-op (existing path is success)
+            #   no PR exists for branch  → Phase B: gh pr create from existing commits
+            #
+            # Scoped to dev-pilot only — dev-groom produces plan-only commits
+            # and intentionally has no PR (plan goes on the branch, not in a PR).
+            if [ "$SKILL" = "dev-pilot" ] && \
+               [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && \
+               [ -n "$WORKTREE_DIR" ] && [ -n "$BRANCH" ]; then
+
+                # Phase A: rescue any trailing dirty content (pilot committed but
+                # left additional uncommitted changes). Same exclusion pattern as
+                # mika#1282 (scaffold paths must not be re-committed).
+                DIRTY_AFTER_COMMITS=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -5)
+                if [ -n "$DIRTY_AFTER_COMMITS" ]; then
+                    git -C "$WORKTREE_DIR" add -A -- \
+                        ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>&9 || true
+                    if ! git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
+                        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" 2>&9; then
+                            git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9 || true
+                            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+                            RESULT="${RESULT}
+
+dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit before PR check."
+                        fi
+                    fi
+                fi
+
+                # Phase B: PR existence check. Use `gh pr list` filtered by
+                # head branch — `gh pr view <branch>` requires the PR exist;
+                # listing is the discoverable read.
+                EXISTING_PR=""
+                if command -v gh &>/dev/null; then
+                    EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
+                fi
+
+                if [ -z "$EXISTING_PR" ]; then
+                    # No PR exists for this branch. Auto-create from existing commits.
+                    # Title: derive from latest commit subject (preserves pilot intent).
+                    # Body: link to dispatch-lib's structural completion gate doc.
+                    PR_TITLE=$(git -C "$WORKTREE_DIR" log -1 --format='%s' 2>/dev/null || echo "Auto-PR for ${REPO}#${ISSUE_NUM}")
+                    PR_BODY="$(cat <<PR_BODY_EOF
+Auto-created by dispatch-lib (mika#1383 structural completion gate).
+
+The pilot session completed work and committed but did not reach \`gh pr create\` before its turn ended. dispatch-lib takes ownership of the commit→PR tail per mika#1271 (content/workflow split). The pilot owned content; dispatch-lib owns git/PR.
+
+Pilot session: \`${LOG_ID}\`
+Branch: \`${BRANCH}\`
+
+Closes #${ISSUE_NUM}
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+PR_BODY_EOF
+)"
+
+                    if PR_CREATE_OUT=$(gh pr create \
+                            --repo "$REPO" \
+                            --base main \
+                            --head "$BRANCH" \
+                            --title "$PR_TITLE" \
+                            --body "$PR_BODY" 2>&1); then
+                        # Re-query the PR URL (gh pr create prints it but parsing is fragile).
+                        EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
+                        RESULT="${RESULT}
+
+dispatch-lib (mika#1383): auto-created PR ${EXISTING_PR} from pilot's commits — pilot reached end_turn without invoking gh pr create."
+                    else
+                        # PR creation failed — surface manual recovery.
+                        # Common causes: gh auth scope, branch already has closed PR, base branch mismatch.
+                        RESULT="PIPELINE FAILURE: pilot produced commits on ${BRANCH} but no PR exists, and dispatch-lib's auto-create attempt failed.
+gh pr create error: $(printf '%s' "$PR_CREATE_OUT" | head -5)
+
+Manual recovery:
+  gh pr create --repo ${REPO} --base main --head ${BRANCH} --title \"<title>\" --body \"<body>\"
+
+${RESULT}"
+                    fi
+                fi
+            fi
         fi
 
         # Post-flight plan validation (mika#1033, mika#1032, mika#1394): detect

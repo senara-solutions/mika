@@ -2269,6 +2269,61 @@ else
     echo "    (POLICY_LINE=$POLICY_LINE, GROOM_LINE=$GROOM_LINE, ZERO_COMMITS_LINE=$ZERO_COMMITS_LINE)"
 fi
 
+# --- Test 15: mika#1383 structural completion gate (HEAD-changed + missing PR) ---
+#
+# mika#1383: dispatch-lib now auto-creates a PR when the pilot committed but
+# didn't reach `gh pr create`. This is the structural completion gate for the
+# tail-loss failure modes (Mode 1: bare /ce-work, Mode 2: full /mika tail).
+# Tests validate the placement, scope (dev-pilot only), decision flow.
+
+echo ""
+echo "Test 15: mika#1383 structural completion gate (HEAD-changed + no PR)"
+echo "--------------------------------------------------------------------"
+
+# Block extraction: from the gate's marker comment to the next major section.
+GATE_BLOCK=$(sed -n '/mika#1383: structural completion gate/,/Post-flight plan validation/p' "$DISPATCH_LIB")
+
+assert_contains "Gate references mika#1271 (content/workflow split)" \
+    'mika#1271' "$GATE_BLOCK"
+assert_contains "Gate references mika#1282 (companion handler for HEAD-unchanged + dirty)" \
+    'mika#1282' "$GATE_BLOCK"
+assert_contains "Gate scoped to dev-pilot only (groom intentionally has no PR)" \
+    'SKILL" = "dev-pilot"' "$GATE_BLOCK"
+assert_contains "Gate fires only when HEAD has advanced (PRE != POST)" \
+    'PRE_RUN_HEAD" != "$POST_RUN_HEAD"' "$GATE_BLOCK"
+assert_contains "Gate uses gh pr list --head <branch> for PR existence check" \
+    'gh pr list --repo "$REPO" --head "$BRANCH"' "$GATE_BLOCK"
+assert_contains "Phase A: trailing dirty rescue with wip() prefix" \
+    'wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)' "$GATE_BLOCK"
+assert_contains "Phase A: same scaffold-path exclusion as mika#1282 (.claude/commands, claude-pilot.json)" \
+    ":!.claude/commands/" "$GATE_BLOCK"
+assert_contains "Phase B: gh pr create with --base main --head BRANCH" \
+    'gh pr create' "$GATE_BLOCK"
+assert_contains "Phase B: PR title derived from latest commit subject" \
+    'git -C "$WORKTREE_DIR" log -1 --format=' "$GATE_BLOCK"
+assert_contains "Phase B: Closes #ISSUE_NUM in body" \
+    'Closes #${ISSUE_NUM}' "$GATE_BLOCK"
+assert_contains "PR-create failure surfaces structured manual recovery command" \
+    'PIPELINE FAILURE: pilot produced commits on' "$GATE_BLOCK"
+assert_contains "Manual recovery names the gh pr create command verbatim" \
+    'Manual recovery:' "$GATE_BLOCK"
+
+# Structural placement: the gate must fire AFTER the mika#1282 dirty-rescue
+# (which only handles HEAD-unchanged) and BEFORE the dev-groom-specific
+# post-flight plan validation. Both bounds verified by source order.
+GATE_LINE=$(grep -n 'mika#1383: structural completion gate' "$DISPATCH_LIB" | head -1 | cut -d: -f1)
+M1282_LINE=$(grep -n 'Unit 1 (mika#1282): detect dirty worktree' "$DISPATCH_LIB" | head -1 | cut -d: -f1)
+GROOM_PLAN_LINE=$(grep -n 'Post-flight plan validation (mika#1033' "$DISPATCH_LIB" | head -1 | cut -d: -f1)
+if [ -n "$GATE_LINE" ] && [ -n "$M1282_LINE" ] && [ -n "$GROOM_PLAN_LINE" ] \
+    && [ "$M1282_LINE" -lt "$GATE_LINE" ] && [ "$GATE_LINE" -lt "$GROOM_PLAN_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Gate placement: after mika#1282 dirty-rescue, before dev-groom plan validation"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Gate placement violated source-order invariant"
+    echo "    (GATE_LINE=$GATE_LINE, M1282_LINE=$M1282_LINE, GROOM_PLAN_LINE=$GROOM_PLAN_LINE)"
+fi
+
 # --- Summary ---
 
 echo ""
