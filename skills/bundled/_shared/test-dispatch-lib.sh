@@ -960,6 +960,70 @@ else
     echo "  ✗ Empty-index guard with both scaffolds: $RESULT_D"
 fi
 
+# Test E (mika#1552): settings.local.json + .claude/*.local.* exclusion —
+# permission allowlist file written by claude-pilot (or worktree setup) MUST NOT
+# ship as pilot-authored content. cm#5 dispatch (2026-06-16) produced PR #16
+# whose ONLY changed file was a 143-line .claude/settings.local.json leak,
+# zero adapter implementation — the founding incident.
+test_auto_rescue_excludes_settings_local_json() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    git -C "$test_dir" init -q
+    git -C "$test_dir" commit --allow-empty -m "initial" -q
+
+    # 1. settings.local.json — must NOT be staged (mika#1552 explicit case).
+    mkdir -p "$test_dir/.claude"
+    echo '{"permissions": ["Bash(ls)"]}' > "$test_dir/.claude/settings.local.json"
+
+    # 2. hooks.local.json — must NOT be staged (mika#1552 wildcard case via .local.*).
+    echo '{"PreToolUse": []}' > "$test_dir/.claude/hooks.local.json"
+
+    # 3. Pilot-authored new file — must be staged.
+    mkdir -p "$test_dir/src"
+    echo "fn main() {}" > "$test_dir/src/new_feature.rs"
+
+    # Exercise: the mika#1552 extended pathspec exclusion.
+    git -C "$test_dir" add -A -- \
+        ':!.claude/commands/' \
+        ':!.claude/claude-pilot.json' \
+        ':!.claude/settings.local.json' \
+        ':!.claude/*.local.*' 2>/dev/null
+
+    local staged
+    staged=$(git -C "$test_dir" diff --cached --name-only)
+
+    # settings.local.json must NOT appear (mika#1552 explicit exclusion).
+    if echo "$staged" | grep -q '.claude/settings.local.json'; then
+        echo "FAIL: .claude/settings.local.json was staged (mika#1552 leak)"
+        return 1
+    fi
+
+    # hooks.local.json must NOT appear (mika#1552 wildcard exclusion).
+    if echo "$staged" | grep -q '.claude/hooks.local.json'; then
+        echo "FAIL: .claude/hooks.local.json was staged (mika#1552 wildcard gap)"
+        return 1
+    fi
+
+    # Pilot-authored file MUST be staged.
+    if ! echo "$staged" | grep -q 'src/new_feature.rs'; then
+        echo "FAIL: pilot-authored file was not staged"
+        return 1
+    fi
+
+    echo "PASS"
+}
+
+RESULT_E=$(test_auto_rescue_excludes_settings_local_json 2>/dev/null)
+if [ "$RESULT_E" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ settings.local.json + *.local.* excluded (mika#1552 founding case)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ settings.local.json exclusion: $RESULT_E"
+fi
+
 RESULT_B=$(test_auto_rescue_empty_index_guard 2>/dev/null)
 if [ "$RESULT_B" = "PASS" ]; then
     PASS=$((PASS + 1))

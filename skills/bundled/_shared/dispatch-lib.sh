@@ -759,14 +759,19 @@ ${RESULT}"
                 DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
                 if [ -n "$DIRTY_FILES" ]; then
                     # Stage all dirty files EXCEPT worktree-scaffold paths copied by
-                    # _set_up_worktree (mika#1288, mika#1419):
+                    # _set_up_worktree (mika#1288, mika#1419, mika#1552):
                     #   - .claude/commands/         slash-command snapshots from mika-platform
                     #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
-                    # Neither is pilot-authored content. Without the second exclusion, the
-                    # rescue commit re-introduces .claude/claude-pilot.json whose intentional
-                    # deletion shipped in PR #1348 (mika#1193 Phase C) — the founding incident
-                    # for mika#1419 (ping-pong on the file's git log).
-                    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>&9
+                    #   - .claude/settings.local.json  permission allowlist cp'd at :490 (mika#1552)
+                    #   - .claude/*.local.*          general guard for any future Claude-local
+                    #                                files (.env-class — operator-machine-specific)
+                    # None is pilot-authored content. Without the second exclusion, the rescue
+                    # commit re-introduces .claude/claude-pilot.json whose intentional deletion
+                    # shipped in PR #1348 (mika#1193 Phase C) — the founding incident for
+                    # mika#1419. The third + fourth catch the .claude/settings.local.json class
+                    # — cm#5 dispatch (2026-06-16) produced PR #16 whose only "rescued" content
+                    # was a 143-line operator allowlist leak (mika#1552 founding incident).
+                    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
 
                     # Guard: if pathspec exclusion left nothing staged, skip the rescue
                     # commit. Handles the edge case where the pilot wrote ONLY to scaffold
@@ -794,7 +799,7 @@ ${RESULT}"
                             # Same exclusion pathspec as the initial `git add -A` above
                             # (mika#1288, mika#1419) — keeps scaffold paths out of the
                             # post-fmt re-add.
-                            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>&9
+                            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
                         fi
 
                         # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
@@ -849,7 +854,7 @@ ${RESULT}"
                             # Same exclusion pathspec as the initial `git add -A` above
                             # (mika#1288, mika#1419) — scaffold paths stay excluded on the
                             # post-fmt retry path too.
-                            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>&9
+                            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
 
                             # mika#1310: capture both stdout+stderr (see above).
                             if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
@@ -946,7 +951,7 @@ ${RESULT}"
                 DIRTY_AFTER_COMMITS=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -5)
                 if [ -n "$DIRTY_AFTER_COMMITS" ]; then
                     git -C "$WORKTREE_DIR" add -A -- \
-                        ':!.claude/commands/' ':!.claude/claude-pilot.json' 2>&9 || true
+                        ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9 || true
                     if ! git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
                         if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" 2>&9; then
                             git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9 || true
