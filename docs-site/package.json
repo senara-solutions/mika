@@ -13,6 +13,7 @@
     "@astrojs/starlight": "^0.37.0",
     "astro": "^5.18.0",
     "sharp": "^0.33.0",
+    "starlight-openapi": "^0.22.1",
     "zod": "3.25.76"
   }
 }
