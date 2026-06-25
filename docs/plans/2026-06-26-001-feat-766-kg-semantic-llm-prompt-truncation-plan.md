@@ -221,11 +221,33 @@ Test `build_disambiguation_prompt` with a chunk_context that would produce a mid
 
 3. **No measurable quality difference** — the ticket explicitly accounts for this outcome. If Step 1 shows no delta, the ticket closes with a documented decision and the `truncate_at_semantic_boundary` function stays in the codebase (zero cost, useful for future callers).
 
-## Acceptance Criteria (from ticket)
+## Acceptance criteria
+
+### Semantic truncation behavior
+
+- [ ] `truncate_at_semantic_boundary(s, max_bytes)` truncates at the last sentence-ending punctuation (`.` `!` `?`) within the byte budget
+- [ ] Newlines (`\n`) are NOT treated as sentence boundaries — strings with only newline boundaries fall back to `safe_truncate`
+- [ ] When no sentence boundary exists within the budget, the function falls back to `safe_truncate` (char-boundary truncation)
+- [ ] Strings shorter than or equal to `max_bytes` are returned unchanged (no-op)
+- [ ] Multi-byte UTF-8 characters near the boundary do not cause panics or invalid slicing
+- [ ] Empty strings and zero budgets are handled without panic
+
+### Token budget enforcement
+
+- [ ] A 50% minimum-utilization floor is enforced: if the best sentence boundary yields fewer than `max_bytes / 2` bytes, the function falls back to `safe_truncate` to avoid discarding too much context
+- [ ] Sentence boundaries at ≥50% of the budget truncate at the boundary (utilization floor passes)
+
+### LLM prompt size limits
+
+- [ ] All three LLM-prompt-bound `safe_truncate` call sites (R1: resolver disambiguation at 2000 bytes, R2: resolver retry at 500 bytes, R3: extractor retry at 500 bytes) are replaced with `truncate_at_semantic_boundary`
+- [ ] Error-log-bound truncation sites (L1, L2) remain on `safe_truncate` — no change
+- [ ] The full-document extraction path (E1) remains unchanged — no truncation applied
+
+### Eval and decision gate
 
 - [ ] Step 1 produces a written quality comparison artifact (compound doc under `docs/solutions/kg/`)
 - [ ] Step 2 decision documented with the comparison evidence
-- [ ] If implementing: `truncate_at_semantic_boundary` helper + tests + applied to LLM-prompt-bound sites
+- [ ] If implementing: `truncate_at_semantic_boundary` helper + unit tests + applied to LLM-prompt-bound sites
 - [ ] If not implementing: ticket closed with a "won't do, measured" note and a link to the comparison doc
 
 ## Out of Scope
