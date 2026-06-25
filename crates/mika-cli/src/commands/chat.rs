@@ -178,13 +178,21 @@ async fn spawn_agent_worker(
     )));
 
     // Register recurring built-in tasks and run startup recovery
-    task_engine::ensure_recurring_task(
-        &ctx.async_db,
-        "heartbeat",
-        "0 0 * * * *",
-        r#"{"trigger":"heartbeat"}"#,
-    )
-    .await;
+    if task_engine::heartbeat_enabled_for_agent(&ctx.home_dir).await {
+        task_engine::ensure_recurring_task(
+            &ctx.async_db,
+            "heartbeat",
+            "0 0 * * * *",
+            r#"{"trigger":"heartbeat"}"#,
+        )
+        .await;
+    } else if let Err(e) = ctx
+        .async_db
+        .cancel_recurring_task_by_label("heartbeat")
+        .await
+    {
+        tracing::warn!(error = %e, "failed to cancel stale heartbeat task");
+    }
     if let Some(cron) = task_engine::reflection_cron_for_agent(&ctx.home_dir, &ctx.async_db).await {
         task_engine::ensure_recurring_task(
             &ctx.async_db,

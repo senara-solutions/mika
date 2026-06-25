@@ -1327,13 +1327,17 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         let agent_name = name.clone();
 
         // Register recurring built-in tasks
-        task_engine::ensure_recurring_task(
-            &db,
-            "heartbeat",
-            HEARTBEAT_CRON,
-            r#"{"trigger":"heartbeat"}"#,
-        )
-        .await;
+        if task_engine::heartbeat_enabled_for_agent(&agent_state.home_dir).await {
+            task_engine::ensure_recurring_task(
+                &db,
+                "heartbeat",
+                HEARTBEAT_CRON,
+                r#"{"trigger":"heartbeat"}"#,
+            )
+            .await;
+        } else if let Err(e) = db.cancel_recurring_task_by_label("heartbeat").await {
+            warn!(agent = %agent_name, error = %e, "failed to cancel stale heartbeat task");
+        }
         if let Some(cron) = task_engine::reflection_cron_for_agent(&agent_state.home_dir, &db).await
         {
             task_engine::ensure_recurring_task(

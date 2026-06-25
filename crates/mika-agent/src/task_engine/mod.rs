@@ -98,6 +98,17 @@ pub async fn ensure_recurring_task(
     }
 }
 
+/// Check if heartbeat is enabled for the agent from identity.toml config.
+/// Returns `true` (default) unless `[heartbeat] enabled = false`.
+pub async fn heartbeat_enabled_for_agent(home_dir: &Path) -> bool {
+    let identity = crate::prompt::load_identity_async(home_dir).await;
+    identity
+        .heartbeat
+        .as_ref()
+        .map(|c| c.enabled)
+        .unwrap_or(true)
+}
+
 /// Build a UTC cron expression for reflection from identity.toml config + customer timezone.
 /// Returns `None` if reflection is disabled or not configured.
 pub async fn reflection_cron_for_agent(home_dir: &Path, db: &AsyncDatabase) -> Option<String> {

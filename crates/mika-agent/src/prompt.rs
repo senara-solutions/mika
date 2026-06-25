@@ -52,6 +52,17 @@ impl ReflectionConfig {
     }
 }
 
+/// Configuration for periodic heartbeat task.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HeartbeatConfig {
+    #[serde(default = "default_heartbeat_enabled")]
+    pub enabled: bool,
+}
+
+fn default_heartbeat_enabled() -> bool {
+    true // Back-compat: heartbeat is enabled by default
+}
+
 /// Per-agent Knowledge Graph configuration from `[kg]` section of `identity.toml`.
 ///
 /// Controls whether the KG subsystem runs for this agent and which docs root
@@ -233,6 +244,8 @@ pub struct Identity {
     #[serde(default)]
     pub reflection: Option<ReflectionConfig>,
     #[serde(default)]
+    pub heartbeat: Option<HeartbeatConfig>,
+    #[serde(default)]
     pub kg: KgIdentityConfig,
     #[serde(default)]
     pub skills: SkillsIdentityConfig,
@@ -256,6 +269,7 @@ impl Default for Identity {
             name: default_name(),
             emoji: default_emoji(),
             reflection: None,
+            heartbeat: None,
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
@@ -344,6 +358,7 @@ fn fail_closed_identity() -> Identity {
         name: default_name(),
         emoji: default_emoji(),
         reflection: None,
+        heartbeat: None,
         kg: KgIdentityConfig::default(),
         skills: SkillsIdentityConfig {
             allowlist: Some(vec!["__fail_closed_no_skills__".to_string()]),
@@ -1037,6 +1052,7 @@ mod tests {
             name: "Mika".to_string(),
             emoji: "✦".to_string(),
             reflection: None,
+            heartbeat: None,
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
@@ -1118,6 +1134,7 @@ mod tests {
             name: "TestBot".to_string(),
             emoji: "🤖".to_string(),
             reflection: None,
+            heartbeat: None,
             kg: KgIdentityConfig::default(),
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
@@ -1916,6 +1933,67 @@ notify = true
 
         let identity = load_identity(tmp.path());
         assert!(identity.reflection.is_none());
+    }
+
+    #[test]
+    fn heartbeat_config_defaults_to_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )
+        .unwrap();
+
+        let identity = load_identity(tmp.path());
+        assert!(identity.heartbeat.is_none());
+        // unwrap_or(true) yields true — backward-compatible default
+        assert!(
+            identity
+                .heartbeat
+                .as_ref()
+                .map(|c| c.enabled)
+                .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn heartbeat_config_explicit_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("identity.toml"),
+            r#"
+name = "Mika"
+emoji = "✦"
+
+[heartbeat]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        let identity = load_identity(tmp.path());
+        let hb = identity.heartbeat.unwrap();
+        assert!(!hb.enabled);
+    }
+
+    #[test]
+    fn heartbeat_config_explicit_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("identity.toml"),
+            r#"
+name = "Mika"
+emoji = "✦"
+
+[heartbeat]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let identity = load_identity(tmp.path());
+        let hb = identity.heartbeat.unwrap();
+        assert!(hb.enabled);
     }
 
     #[test]
