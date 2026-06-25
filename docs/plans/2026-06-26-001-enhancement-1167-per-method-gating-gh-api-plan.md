@@ -40,6 +40,13 @@ Replace the two-list pattern (`GH_API_READ_ALLOWED_PATTERNS` + `GH_API_WRITE_ALL
 
 The initial matrix carries exactly the same 5 entries (4 GET + 1 PATCH) as the current two lists, so runtime accept/reject decisions are identical at ship time. The only behavioral changes are: (1) rule-name propagation to the audit event, and (2) the error message format.
 
+## Acceptance criteria
+
+1. **Rule-name propagation on allowed calls.** `validate_gh_api_scope()` returns `Ok(Some(&'static str))` with the matched rule name (e.g., `"read:branch"`, `"write:milestone-update"`) for every API call that passes the matrix. Non-API subcommands (e.g., `gh pr`) return `Ok(None)`.
+2. **Audit event enrichment.** The `gh_api_invocation` audit event carries an `allowed_by_rule` field set to the matched rule name on every permitted `gh api` call.
+3. **Deny-by-default error format.** Rejected calls return an error containing `"not in the allowed method+path matrix"` with a listing of allowed combinations. This is a unified format replacing the previous method-branched messages (`"not in the read-only allowlist"`, `"not in the write allowlist"`, `"is not allowed"`).
+4. **All module tests pass.** The full `validate_gh_api_scope` test suite (existing updated tests + new tests `test_gh_api_matrix_denies_unmatched_method_on_allowed_path` and `test_gh_api_matrix_all_entries_compile`) passes with `cargo test`.
+
 ## Implementation
 
 ### Step 1 — Define the unified method+path matrix
