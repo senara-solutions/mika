@@ -101,7 +101,7 @@ if task_engine::heartbeat_enabled_for_agent(&agent_state.home_dir).await {
 }
 ```
 
-## Testing
+## Acceptance criteria
 
 ### Unit tests
 
