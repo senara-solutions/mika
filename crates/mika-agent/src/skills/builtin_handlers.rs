@@ -1632,48 +1632,68 @@ const QA_REVIEW_GH_ALLOWED: &[(&str, &str)] = &[
     ("issue", "view"),
 ];
 
-/// Allowed read-only `gh api` endpoint patterns (mika#805).
+/// Per-method gating entry for `gh api` (mika#1167, evolved from #805 + #1153).
 ///
-/// Only GET requests matching one of these patterns are permitted.
-/// Patterns use regex; leading `/` is optional (gh CLI accepts both forms).
-/// Compiled once via `LazyLock` — malformed patterns surface immediately on
-/// first use rather than silently denying all requests.
-const GH_API_READ_ALLOWED_PATTERNS: &[&str] = &[
-    r"^/?repos/[^/]+/[^/]+/branches/[^/]+$",
-    r"^/?repos/[^/]+/[^/]+/branches$",
-    r"^/?repos/[^/]+/[^/]+/commits/[a-fA-F0-9]+$",
-    // Milestone read: GET /repos/{owner}/{repo}/milestones/{number} (mika#1153 R4)
-    r"^/?repos/[^/]+/[^/]+/milestones/\d+$",
+/// Each entry defines an allowed method+path combination. The matrix is
+/// deny-by-default: any `gh api` call whose method+path does not match
+/// at least one entry is rejected by `validate_gh_api_scope()`.
+struct GhApiAllowEntry {
+    /// HTTP method (case-insensitive match). `"*"` matches any method.
+    method: &'static str,
+    /// Regex pattern for the API path (leading `/` optional, same as `gh` CLI).
+    path_pattern: &'static str,
+    /// Human-readable rule name for audit events and error messages.
+    rule: &'static str,
+}
+
+const GH_API_ALLOW_MATRIX: &[GhApiAllowEntry] = &[
+    // -- Read-only (carried forward from #805 + #1153) --
+    GhApiAllowEntry {
+        method: "GET",
+        path_pattern: r"^/?repos/[^/]+/[^/]+/branches/[^/]+$",
+        rule: "read:branch",
+    },
+    GhApiAllowEntry {
+        method: "GET",
+        path_pattern: r"^/?repos/[^/]+/[^/]+/branches$",
+        rule: "read:branches-list",
+    },
+    GhApiAllowEntry {
+        method: "GET",
+        path_pattern: r"^/?repos/[^/]+/[^/]+/commits/[a-fA-F0-9]+$",
+        rule: "read:commit",
+    },
+    GhApiAllowEntry {
+        method: "GET",
+        path_pattern: r"^/?repos/[^/]+/[^/]+/milestones/\d+$",
+        rule: "read:milestone",
+    },
+    // -- Mutations (from #1153) --
+    GhApiAllowEntry {
+        method: "PATCH",
+        path_pattern: r"^/?repos/[^/]+/[^/]+/milestones/\d+$",
+        rule: "write:milestone-update",
+    },
 ];
 
-static GH_API_READ_COMPILED: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
-    GH_API_READ_ALLOWED_PATTERNS
-        .iter()
-        .map(|p| {
-            regex::Regex::new(p).unwrap_or_else(|e| {
-                panic!("BUG: malformed GH_API_READ_ALLOWED_PATTERNS regex '{p}': {e}")
-            })
-        })
-        .collect()
-});
+struct CompiledGhApiAllowEntry {
+    method: &'static str,
+    pattern: regex::Regex,
+    rule: &'static str,
+}
 
-/// Allowed write `gh api` endpoint patterns (mika#1153 R4).
-///
-/// Only PATCH method on matching paths is permitted. This is scoped narrowly
-/// to milestone lifecycle operations (close + readback). POST/PUT/DELETE are
-/// never allowed through this path.
-const GH_API_WRITE_ALLOWED_PATTERNS: &[&str] = &[
-    // Milestone close: PATCH /repos/{owner}/{repo}/milestones/{number}
-    r"^/?repos/[^/]+/[^/]+/milestones/\d+$",
-];
-
-static GH_API_WRITE_COMPILED: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
-    GH_API_WRITE_ALLOWED_PATTERNS
+static GH_API_ALLOW_COMPILED: LazyLock<Vec<CompiledGhApiAllowEntry>> = LazyLock::new(|| {
+    GH_API_ALLOW_MATRIX
         .iter()
-        .map(|p| {
-            regex::Regex::new(p).unwrap_or_else(|e| {
-                panic!("BUG: malformed GH_API_WRITE_ALLOWED_PATTERNS regex '{p}': {e}")
-            })
+        .map(|e| CompiledGhApiAllowEntry {
+            method: e.method,
+            pattern: regex::Regex::new(e.path_pattern).unwrap_or_else(|err| {
+                panic!(
+                    "BUG: malformed GH_API_ALLOW_MATRIX regex '{}': {err}",
+                    e.path_pattern
+                )
+            }),
+            rule: e.rule,
         })
         .collect()
 });
@@ -1905,52 +1925,34 @@ fn validate_qa_review_gh_scope(args: &[String], ctx: &ToolContext<'_>) -> Result
     )))
 }
 
-/// Validate `gh api` invocations: method + path allowlist (mika#805, mika#1153).
+/// Validate `gh api` invocations: per-method gating via allow matrix (mika#1167).
 ///
-/// Extracts the HTTP method (default GET) and the API path from argv.
-/// GET requests are checked against `GH_API_READ_COMPILED`. PATCH requests
-/// are checked against `GH_API_WRITE_COMPILED` (milestone lifecycle only).
-/// All other methods (POST, PUT, DELETE) are unconditionally rejected.
-fn validate_gh_api_scope(args: &[String]) -> Result<(), ToolOutput> {
+/// Returns `Ok(Some(rule))` when a matrix entry matches (rule name for audit),
+/// `Ok(None)` when the command is not a `gh api` call, or `Err` on rejection.
+fn validate_gh_api_scope(args: &[String]) -> Result<Option<&'static str>, ToolOutput> {
     if args.first().map(String::as_str) != Some("api") {
-        return Ok(());
+        return Ok(None);
     }
 
     let method = extract_api_method(args);
-
-    // Extract the API path: first positional arg after "api" that doesn't start with "-"
-    // and is not the value of a flag (e.g., `-X PATCH` or `--method PATCH`).
     let path = extract_api_path(args);
 
-    if method.eq_ignore_ascii_case("GET") {
-        let matched = GH_API_READ_COMPILED.iter().any(|re| re.is_match(path));
-        if !matched {
-            return Err(ToolOutput::error(format!(
-                "gh api path '{path}' is not in the read-only allowlist. \
-                 Allowed: repos/{{owner}}/{{repo}}/branches[/{{branch}}], \
-                 repos/{{owner}}/{{repo}}/commits/{{sha}}, \
-                 repos/{{owner}}/{{repo}}/milestones/{{number}}."
-            )));
+    for entry in GH_API_ALLOW_COMPILED.iter() {
+        let method_matches = entry.method == "*" || entry.method.eq_ignore_ascii_case(method);
+        if method_matches && entry.pattern.is_match(path) {
+            return Ok(Some(entry.rule));
         }
-        return Ok(());
     }
 
-    if method.eq_ignore_ascii_case("PATCH") {
-        let matched = GH_API_WRITE_COMPILED.iter().any(|re| re.is_match(path));
-        if !matched {
-            return Err(ToolOutput::error(format!(
-                "gh api PATCH path '{path}' is not in the write allowlist. \
-                 Only PATCH on repos/{{owner}}/{{repo}}/milestones/{{number}} is permitted."
-            )));
-        }
-        return Ok(());
-    }
-
-    // All other methods (POST, PUT, DELETE) are unconditionally rejected.
     Err(ToolOutput::error(format!(
-        "gh api method '{method}' is not allowed. Only GET and PATCH (on milestone \
-         endpoints) are permitted through run_gh. Use the appropriate gh subcommand \
-         (e.g., gh issue, gh pr) for other write operations."
+        "gh api {method} '{path}' is not in the allowed method+path matrix. \
+         Allowed combinations: {rules}. \
+         Use the appropriate gh subcommand (e.g., gh issue, gh pr) for other operations.",
+        rules = GH_API_ALLOW_COMPILED
+            .iter()
+            .map(|e| format!("{} {}", e.method, e.rule))
+            .collect::<Vec<_>>()
+            .join(", ")
     )))
 }
 
@@ -2032,11 +2034,12 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         return err;
     }
 
-    // gh api read-only scope check (mika#805): restrict api subcommand to
-    // GET-only against allowed endpoint patterns.
-    if let Err(err) = validate_gh_api_scope(&gh_args.args) {
-        return err;
-    }
+    // gh api per-method gating (mika#1167): restrict api subcommand via
+    // method+path allow matrix. Returns the matched rule name for audit.
+    let matched_rule = match validate_gh_api_scope(&gh_args.args) {
+        Ok(rule) => rule,
+        Err(err) => return err,
+    };
 
     // Compute PR dedup key for `pr review` commands.
     let pr_dedup_key = if is_pr_review_command(&gh_args.args) {
@@ -2111,19 +2114,19 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     }
 
     // Audit event for `gh api` invocations — structural observability for the
-    // expanded security surface (mika#788, engine-guards-vs-prompt-rules principle).
+    // expanded security surface (mika#788, mika#1167 allowed_by_rule enrichment).
     if gh_args.args.first().map(|s| s.as_str()) == Some("api") {
         let method = extract_api_method(&gh_args.args);
-        let path = gh_args
-            .args
-            .get(1)
-            .map(|s| s.as_str())
-            .unwrap_or("<missing>");
+        let path = extract_api_path(&gh_args.args);
+        // matched_rule is always Some here: validate_gh_api_scope returns Ok(None)
+        // only for non-API calls, and we already checked args.first() == "api".
+        let rule = matched_rule.unwrap_or("unknown");
         tracing::info!(
             event = "gh_api_invocation",
             session_id = %ctx.session_id,
             method = %method,
             path = %path,
+            allowed_by_rule = %rule,
             "gh api invocation"
         );
     }
@@ -3030,25 +3033,28 @@ mod tests {
     #[test]
     fn test_gh_api_get_branches_allowed() {
         let args = str_args(&["api", "repos/senara-solutions/mika/branches/main"]);
-        assert!(validate_gh_api_scope(&args).is_ok());
+        assert_eq!(validate_gh_api_scope(&args).unwrap(), Some("read:branch"));
     }
 
     #[test]
     fn test_gh_api_get_branches_list_allowed() {
         let args = str_args(&["api", "repos/senara-solutions/mika/branches"]);
-        assert!(validate_gh_api_scope(&args).is_ok());
+        assert_eq!(
+            validate_gh_api_scope(&args).unwrap(),
+            Some("read:branches-list")
+        );
     }
 
     #[test]
     fn test_gh_api_get_commit_allowed() {
         let args = str_args(&["api", "repos/senara-solutions/mika/commits/abc123def"]);
-        assert!(validate_gh_api_scope(&args).is_ok());
+        assert_eq!(validate_gh_api_scope(&args).unwrap(), Some("read:commit"));
     }
 
     #[test]
     fn test_gh_api_leading_slash_allowed() {
         let args = str_args(&["api", "/repos/senara-solutions/mika/branches/main"]);
-        assert!(validate_gh_api_scope(&args).is_ok());
+        assert_eq!(validate_gh_api_scope(&args).unwrap(), Some("read:branch"));
     }
 
     #[test]
@@ -3067,7 +3073,7 @@ mod tests {
             result
                 .unwrap_err()
                 .content
-                .contains("not in the write allowlist")
+                .contains("not in the allowed method+path matrix")
         );
     }
 
@@ -3076,7 +3082,12 @@ mod tests {
         let args = str_args(&["api", "repos/o/r/issues", "-X", "POST"]);
         let result = validate_gh_api_scope(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().content.contains("is not allowed"));
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the allowed method+path matrix")
+        );
     }
 
     #[test]
@@ -3084,7 +3095,12 @@ mod tests {
         let args = str_args(&["api", "repos/o/r/branches/main", "--method", "DELETE"]);
         let result = validate_gh_api_scope(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().content.contains("is not allowed"));
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the allowed method+path matrix")
+        );
     }
 
     #[test]
@@ -3097,7 +3113,7 @@ mod tests {
             result
                 .unwrap_err()
                 .content
-                .contains("not in the read-only allowlist")
+                .contains("not in the allowed method+path matrix")
         );
     }
 
@@ -3105,13 +3121,19 @@ mod tests {
     fn test_gh_api_milestone_get_allowed() {
         // GET readback for milestone close verification (mika#1153 R4)
         let args = str_args(&["api", "repos/o/r/milestones/14"]);
-        assert!(validate_gh_api_scope(&args).is_ok());
+        assert_eq!(
+            validate_gh_api_scope(&args).unwrap(),
+            Some("read:milestone")
+        );
     }
 
     #[test]
     fn test_gh_api_milestone_get_leading_slash_allowed() {
         let args = str_args(&["api", "/repos/o/r/milestones/14"]);
-        assert!(validate_gh_api_scope(&args).is_ok());
+        assert_eq!(
+            validate_gh_api_scope(&args).unwrap(),
+            Some("read:milestone")
+        );
     }
 
     #[test]
@@ -3125,7 +3147,10 @@ mod tests {
             "-f",
             "state=closed",
         ]);
-        assert!(validate_gh_api_scope(&args).is_ok());
+        assert_eq!(
+            validate_gh_api_scope(&args).unwrap(),
+            Some("write:milestone-update")
+        );
     }
 
     #[test]
@@ -3141,7 +3166,12 @@ mod tests {
         ]);
         let result = validate_gh_api_scope(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().content.contains("is not allowed"));
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the allowed method+path matrix")
+        );
     }
 
     #[test]
@@ -3149,7 +3179,12 @@ mod tests {
         let args = str_args(&["api", "-X", "DELETE", "/repos/o/r/milestones/14"]);
         let result = validate_gh_api_scope(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().content.contains("is not allowed"));
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the allowed method+path matrix")
+        );
     }
 
     #[test]
@@ -3162,7 +3197,7 @@ mod tests {
             result
                 .unwrap_err()
                 .content
-                .contains("not in the write allowlist")
+                .contains("not in the allowed method+path matrix")
         );
     }
 
@@ -3176,7 +3211,7 @@ mod tests {
             result
                 .unwrap_err()
                 .content
-                .contains("not in the write allowlist")
+                .contains("not in the allowed method+path matrix")
         );
     }
 
@@ -3197,7 +3232,34 @@ mod tests {
     #[test]
     fn test_gh_api_non_api_subcommand_skipped() {
         let args = str_args(&["pr", "list"]);
-        assert!(validate_gh_api_scope(&args).is_ok());
+        assert_eq!(validate_gh_api_scope(&args).unwrap(), None);
+    }
+
+    #[test]
+    fn test_gh_api_matrix_denies_unmatched_method_on_allowed_path() {
+        // POST on a path that is allowed for GET — should be rejected
+        let args = str_args(&["api", "-X", "POST", "repos/o/r/branches/main"]);
+        let result = validate_gh_api_scope(&args);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .content
+                .contains("not in the allowed method+path matrix")
+        );
+    }
+
+    #[test]
+    fn test_gh_api_matrix_all_entries_compile() {
+        // Guard against copy-paste regex errors — verify every entry compiles.
+        for entry in GH_API_ALLOW_MATRIX {
+            regex::Regex::new(entry.path_pattern).unwrap_or_else(|err| {
+                panic!(
+                    "GH_API_ALLOW_MATRIX entry '{}' has invalid regex '{}': {err}",
+                    entry.rule, entry.path_pattern
+                )
+            });
+        }
     }
 
     #[test]
