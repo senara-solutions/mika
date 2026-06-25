@@ -1,0 +1,189 @@
+# KG Truncation Eval — Extended-Context Resolution Cases (#766)
+# Date: 2026-06-26
+# Purpose: Resolution cases with long chunk_context for testing byte vs semantic truncation.
+#
+# Each case has chunk_context > 500 bytes to ensure truncation triggers at the
+# eval's lowered budget (500 bytes). These contexts are drawn from realistic
+# docs/solutions/ prose patterns (multi-sentence paragraphs with technical detail).
+#
+# The eval runs disambiguation twice per case:
+#   Variant A: safe_truncate(chunk_context, budget)
+#   Variant B: truncate_at_semantic_boundary(chunk_context, budget)
+# and compares accuracy against ground truth.
+
+[[cases]]
+entity_key = "problem_type:state_drift"
+entity_confidence = 0.88
+chunk_context = """The CI failure was caused by state drift between the local worktree and the remote branch. When the developer ran make deploy, the preflight gate detected that the local checkout was behind origin/main by three commits. The guard aborted the deploy before any build step executed, preventing a stale binary from overwriting the production version. This is the expected behavior of the two-layer contract described in mika-platform's CLAUDE.md — the meta-repo gate enforces branch freshness as a workspace-level invariant. The sub-repo guard is intentionally narrower, only blocking off-main checkouts without checking behind-origin status. Together they cover two distinct failure classes: deploying from the wrong branch (sub-repo guard) and deploying stale code from the right branch (meta-repo gate). The incident was resolved by running git pull --ff-only before retrying the deploy. No code changes were needed."""
+expected_match = "problem_type:state_drift"
+case_category = "clear_match"
+disputable = false
+rationale = "Direct description of state drift between local and remote — clear match to the state_drift problem type seed"
+[[cases.candidates]]
+entity_key = "problem_type:state_drift"
+description = "Mismatch between expected and actual system state"
+[[cases.candidates]]
+entity_key = "problem_type:ci_failure"
+description = "CI pipeline failure"
+[[cases.candidates]]
+entity_key = "problem_type:stale_uuid"
+description = "Stale or invalid UUID reference"
+
+[[cases]]
+entity_key = "skill:self_dev"
+entity_confidence = 0.85
+chunk_context = """The self-dev skill is the orchestration layer for the autonomous development workflow. It receives a task dispatch from mika-dev, launches a claude-pilot session in a fresh git worktree, and manages the lifecycle of the implementation run. The skill creates a callback task to track the subprocess, injects environment variables for the target issue and branch, and monitors the session until completion or timeout. When claude-pilot finishes, the callback handler parses the result for structured metadata including PR URL, session duration, and cost. This metadata is persisted to the parent task for observability. The self-dev skill also handles the retry loop — when qa-review returns a VERDICT: block[ac] or block[ci], self-dev dispatches a new claude-pilot session with the fix prompt, up to three retries before escalating to the operator. The skill's system prompt instructs the LLM to use the run_claude_pilot tool, which is the only tool that launches the headless session."""
+expected_match = "skill:self-dev"
+case_category = "clear_match"
+disputable = false
+rationale = "Detailed description of the self-dev skill workflow — underscore variant matches the hyphenated canonical name"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+[[cases.candidates]]
+entity_key = "skill:self-dev-iterate"
+description = "PR iteration handler for self-dev"
+[[cases.candidates]]
+entity_key = "skill:dev-pilot"
+description = "Claude Code implementation dispatch skill"
+
+[[cases]]
+entity_key = "tool:pr_merge_with_gate"
+entity_confidence = 0.91
+chunk_context = """The PR merge gate is a structural backstop against merging pull requests with failing required CI checks. It is registered in default_tools for all agents, including delegates. The tool returns a tagged-union MergeGateResult via serde tag action — the LLM branches on the action field to decide next steps. There are five result variants: merged (immediate success), auto_merge_enabled (CI pending, auto-merge armed), blocked (with a BlockReason sub-enum listing the specific failure), already_merged (no-op), and gate_errored (infrastructure failure). Before attempting the merge, the preflight step runs gh pr view to detect CONFLICTING, CLOSED, or DRAFT states. The decision matrix maps check states to actions: conflicting or dirty triggers blocked with merge_conflict reason; fail or cancel triggers blocked with required_check_failed; pending triggers auto-merge; all pass triggers immediate merge. The tool has a 60-second timeout and requires ctx.github_token to be set."""
+expected_match = "tool:pr_merge_with_gate"
+case_category = "clear_match"
+disputable = false
+rationale = "Detailed functional description of the pr_merge_with_gate tool — exact match"
+[[cases.candidates]]
+entity_key = "tool:pr_merge_with_gate"
+description = "Merge PR with CI check gate"
+[[cases.candidates]]
+entity_key = "tool:run_gh"
+description = "General-purpose GitHub CLI handler"
+[[cases.candidates]]
+entity_key = "tool:check_task"
+description = "Check task status with optional GitHub enrichment"
+
+[[cases]]
+entity_key = "pattern:two_layer_deploy_guard"
+entity_confidence = 0.78
+chunk_context = """The two-layer deploy guard is the defensive pattern that prevents deploying from stale or incorrect branches. The meta-repo layer runs scripts/mika-platform-deploy-preflight, which checks that every sub-repo checkout is on main and not behind origin/main. It reports and aborts — it never pulls. The sub-repo layer runs inside each repo's own make deploy target and enforces a narrower check: only blocking off-main checkouts, without checking behind-origin status. This asymmetry is intentional — the sub-repo guard targets the specific bypass class where a developer runs cd mika && make deploy from muscle memory while on a feature branch. The FORCE_DEPLOY_FROM_BRANCH=1 environment variable disables both layers. The founding incident that motivated this layering is documented in mika-platform issue 163, where a developer deployed from a feature branch and the stale binary caused a production routing failure that took 45 minutes to diagnose."""
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "pattern:two_layer_deploy_guard is a discovered pattern type — no domain counterpart exists in the domain graph candidates"
+[[cases.candidates]]
+entity_key = "concept:infra:deploy_guard"
+description = "Infrastructure concept for deployment safety gates"
+[[cases.candidates]]
+entity_key = "problem_type:state_drift"
+description = "Mismatch between expected and actual system state"
+
+[[cases]]
+entity_key = "agent:mika_arch"
+entity_confidence = 0.92
+chunk_context = """The mika-arch agent is the read-only architect reviewer that performs two-pass plan review for grooming tickets. It operates with a Kimi base model and Sonnet 4.6 skill overrides for the review skills. Unlike mika-dev and mika-qa, mika-arch is the sole KG consumer among well-known agents — it indexes all six platform repos' docs/solutions directories for cross-repo reasoning during plan review. The agent's identity template disables platform-mutational tools via the tools.disabled section in identity.toml, keeping only read-only GitHub operations (gh_read), memory writes (update_core_memory, store_fact, update_fact), and send_message. The skill allowlist restricts it to three skills: mika-arch-groom-ticket (first-pass, produces READY/ITERATE/ESCALATE), mika-arch-groom-milestone (milestone-level review), and mika-arch-second-review (second-pass, produces GROOMED/ESCALATE). Context summary injection is disabled via context.summary.inject = false to prevent context-channel leaks documented in issue 1009."""
+expected_match = "agent:mika-arch"
+case_category = "clear_match"
+disputable = false
+rationale = "Detailed description of the mika-arch agent — underscore variant matches hyphenated canonical name"
+[[cases.candidates]]
+entity_key = "agent:mika-arch"
+description = "Read-only architect reviewer agent"
+[[cases.candidates]]
+entity_key = "agent:mika-dev"
+description = "Development agent for autonomous implementation"
+[[cases.candidates]]
+entity_key = "agent:mika-qa"
+description = "Quality assurance review agent"
+
+[[cases]]
+entity_key = "problem_type:fabrication"
+entity_confidence = 0.90
+chunk_context = """The fabrication guard chain is the EndTurn post-condition system that detects when an agent claims to have performed actions it did not actually perform. Five guards target different fabrication classes: guard 5 detects fabricated action claims where the agent references a GitHub resource URL but made zero tool calls in the turn; guard 5b detects dev-groom fabrication where the agent claims a Verdict without running the dispatch tool; guard 6c detects asserted unavailability where the agent claims a tool is not callable when it is actually in the enabled set; guard 6d detects assert-grounded failures where the agent affirms resource state without a grounding tool call. Each guard fires once and allows a retry — the corrective re-prompt instructs the model to either call the appropriate tool or retract the claim. Guard fabrication telemetry emits paired events: a detection event when the guard fires, and a correction_accepted event when the retry passes. The guard_correlation_id field links the two events for cross-event analysis in Langfuse."""
+expected_match = "problem_type:fabrication"
+case_category = "clear_match"
+disputable = false
+rationale = "Detailed description of the fabrication detection system — directly references the fabrication problem type"
+[[cases.candidates]]
+entity_key = "problem_type:fabrication"
+description = "Agent fabricates state claims without evidence"
+[[cases.candidates]]
+entity_key = "problem_type:ci_failure"
+description = "CI pipeline failure"
+[[cases.candidates]]
+entity_key = "concept:cross-repo:guard_chain"
+description = "Cross-repo pattern for EndTurn guard chains"
+
+[[cases]]
+entity_key = "concept:dispatch_slot"
+entity_confidence = 0.82
+chunk_context = """The dispatch slot mechanism enforces that only one implementation dispatch and one grooming dispatch can run concurrently per agent. Before spawning a claude-pilot subprocess, validate_dispatch_readiness performs seven checks. Check 3 is the per-class slot guard: it queries for any active callback child task of the same dispatch class (implement or groom) and rejects with global_dispatch_active if one exists. The dispatch_class column was added in schema v34 and uses a CHECK constraint limiting values to implement and groom. Pre-v34 NULL rows are treated as implement via SQL COALESCE. The slot predicates must exclude deferred wrappers — tasks with labels ending in :deferred — to prevent the multi-wrapper deadlock documented in issue 1163 where wrapper tasks saw each other as slot-occupied and kept creating more wrappers without ever spawning a real dispatch. The DeferredDispatch mechanism handles the case where a dispatch is rejected because the slot is busy: instead of failing, it registers a pending callback task that fires when the blocking dispatch completes."""
+expected_match = "null"
+case_category = "no_match"
+disputable = true
+rationale = "concept:dispatch_slot is a domain concept but not in the candidate list as an exact match — closest is concept:infra:dispatch which is a different granularity"
+[[cases.candidates]]
+entity_key = "concept:infra:deploy_guard"
+description = "Infrastructure concept for deployment safety gates"
+[[cases.candidates]]
+entity_key = "concept:cross-repo:autonomous_loop"
+description = "Cross-repo pattern for the autonomous development loop"
+[[cases.candidates]]
+entity_key = "tool:run_gh"
+description = "General-purpose GitHub CLI handler"
+
+[[cases]]
+entity_key = "skill:qa_review"
+entity_confidence = 0.86
+chunk_context = """The qa-review skill handles automated PR review in the autonomous development loop. When a PR is opened by claude-pilot, mika-qa is dispatched to review the changes. The skill uses the run_gh tool with scope restrictions — validate_qa_review_gh_scope ensures that only PR-related gh commands are allowed during review context. The review produces a VERDICT line in the review body that is intercepted by the structural verdict handler before reaching the LLM. Five verdict classes exist: pass (approved, triggers merge), block[ac] (acceptance criteria violation, triggers retry), block[ci] (CI failure, triggers retry), block[security] (security concern, blocks and notifies operator), and hold[review] (needs human review). The retry loop is bounded at 3 attempts per block class before escalating. The qa-review skill also has a build callback handler that monitors the CI status of reviewed PRs and triggers re-evaluation when builds complete."""
+expected_match = "skill:qa-review"
+case_category = "clear_match"
+disputable = false
+rationale = "Detailed description of the qa-review skill workflow — underscore variant matches hyphenated canonical name"
+[[cases.candidates]]
+entity_key = "skill:qa-review"
+description = "PR review skill for quality assurance"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+[[cases.candidates]]
+entity_key = "skill:skill-review"
+description = "Skill review handler"
+
+[[cases]]
+entity_key = "failure_mode:context_leak"
+entity_confidence = 0.79
+chunk_context = """The context-channel leak is a failure mode where the conversational summary injected into the system prompt contains information from a previous session that biases the current session's reasoning. The canonical incident is documented in issue 1009, where mika-arch's summary contained task-specific details from a prior grooming session that leaked into a subsequent independent review, causing the architect to reference issues and decisions it had not been presented with in the current turn. The fix has four axes: Axis 1 is the structural gate (context.summary.inject = false in identity.toml), Axis 2 is the content reform (summarizer output contract changed from conversational to factual-assertion shape), Axis 3 is the budget cap (context.summary.max_tokens for mode-conditional truncation), and Axis 4 is the load-prevention (when inject = false, the summary is not loaded from DB at all, not just not injected). mika-arch is provisioned with Axis 1 and Axis 4 active by default."""
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "failure_mode:context_leak is a discovered type — no domain counterpart in the candidate set"
+[[cases.candidates]]
+entity_key = "problem_type:fabrication"
+description = "Agent fabricates state claims without evidence"
+[[cases.candidates]]
+entity_key = "concept:cross-repo:guard_chain"
+description = "Cross-repo pattern for EndTurn guard chains"
+[[cases.candidates]]
+entity_key = "agent:mika-arch"
+description = "Read-only architect reviewer agent"
+
+[[cases]]
+entity_key = "tool:resolve_issue_order"
+entity_confidence = 0.89
+chunk_context = """The resolve_issue_order tool is a builtin that determines dependency-aware execution order for a set of GitHub issues. It accepts a repo in owner/repo format and an array of issue numbers, then queries the GitHub GraphQL API for blockedBy relationships between the issues. The tool builds a directed acyclic graph from the dependency edges and runs Kahn's algorithm with an issue-number-ascending tiebreaker to produce a topological sort. If the dependency graph contains a cycle, the sorted array is cleared and the cycle members are listed separately. External blockers — issues outside the input set that block issues within it — are tracked but do not affect the sort order. The tool fails open when no GitHub token is configured, returning the input order with a warning. It has a 60-second timeout. The primary consumer is the self-dev milestone workflow at step M2b, which uses the sorted order to dispatch issues sequentially so that dependencies are satisfied before dependents begin."""
+expected_match = "tool:resolve_issue_order"
+case_category = "clear_match"
+disputable = false
+rationale = "Detailed functional description of the resolve_issue_order tool — exact match"
+[[cases.candidates]]
+entity_key = "tool:resolve_issue_order"
+description = "Resolve dependency-aware execution order for GitHub issues"
+[[cases.candidates]]
+entity_key = "tool:run_gh"
+description = "General-purpose GitHub CLI handler"
+[[cases.candidates]]
+entity_key = "tool:check_task"
+description = "Check task status with optional GitHub enrichment"

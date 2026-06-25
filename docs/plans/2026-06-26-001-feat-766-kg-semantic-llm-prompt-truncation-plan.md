@@ -58,8 +58,19 @@ Six `safe_truncate` call sites exist in the KG subsystem. Three are LLM-prompt-b
 
 ```rust
 /// Truncate prose to at most `max_bytes`, preferring to end at the last
-/// sentence boundary (`.` `!` `?` or `\n`) within the budget.
-/// Falls back to `safe_truncate` (char-boundary) if no sentence boundary exists.
+/// sentence boundary (`.` `!` `?`) within the budget. Falls back to
+/// `safe_truncate` (char-boundary) if no sentence boundary exists or if
+/// the best boundary would utilize less than 50% of the byte budget.
+///
+/// The 50% minimum-utilization floor prevents pathological cases where the
+/// only sentence boundary is near the start of the string — returning 50
+/// bytes of a 2000-byte budget silently discards context, which is worse
+/// for LLM quality than a mid-sentence cut (review-guide.md § KISS).
+///
+/// `\n` is intentionally excluded from the sentence-boundary set. Markdown
+/// documents use hard-wrapped lines within sentences; a trailing `\n` from
+/// line wrapping is not a reliable sentence boundary and would defeat the
+/// purpose of semantic truncation (review-guide.md § KISS).
 ///
 /// Use for LLM-prompt-bound truncation where mid-sentence cuts degrade
 /// prompt quality. For log lines and error previews, use `safe_truncate`.
@@ -68,15 +79,17 @@ pub fn truncate_at_semantic_boundary(s: &str, max_bytes: usize) -> &str {
         return s;
     }
     let limit = s.floor_char_boundary(s.len().min(max_bytes));
-    // Scan backwards for sentence-ending punctuation
+    let min_utilization = max_bytes / 2; // 50% floor
+    // Scan backwards for sentence-ending punctuation only (no \n)
     if let Some(end) = s[..limit]
-        .rfind(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+        .rfind(|c: char| matches!(c, '.' | '!' | '?'))
     {
         // Include the sentence-ending character
         let boundary = end + s[end..].chars().next().map_or(0, |c| c.len_utf8());
-        if boundary > 0 {
+        if boundary >= min_utilization {
             return &s[..boundary];
         }
+        // Boundary exists but would waste >50% of budget — fall through
     }
     // Fallback: char boundary (same as safe_truncate)
     safe_truncate(s, max_bytes)
@@ -89,7 +102,10 @@ pub fn truncate_at_semantic_boundary(s: &str, max_bytes: usize) -> &str {
 - String shorter than limit (no-op)
 - String longer with sentence boundary within budget → truncates at boundary
 - String longer with no sentence boundary → falls back to `safe_truncate`
-- Sentence boundary at various positions (period, newline, exclamation)
+- Sentence boundary at various positions (period, exclamation, question mark)
+- **Newline NOT treated as sentence boundary** — string with only `\n` boundaries falls back to `safe_truncate`
+- **Minimum-utilization floor** — sentence boundary at <50% of budget falls back to `safe_truncate`
+- **Minimum-utilization pass** — sentence boundary at ≥50% of budget truncates at boundary
 - Multi-byte characters near boundary
 - Empty string, zero budget
 
@@ -104,6 +120,8 @@ Create `truncation_eval.rs` as a new eval module alongside `extraction_eval.rs` 
 3. Calls the LLM with the same disambiguation prompt structure as `build_disambiguation_prompt`
 4. Compares accuracy against ground truth for both variants
 5. Reports per-case delta: matched-correct, confidence delta, and any flipped outcomes (A wrong → B right, or vice versa)
+
+**Eval scope: resolution only.** The eval targets resolution (disambiguation) quality, not extraction. Rationale: E1 is the full-document extraction path with no truncation applied today — there is nothing to compare. R3 is a retry prompt where truncation quality is less sensitive (the LLM only needs enough of its prior mistake to correct it). The quality-critical truncation site is R1 (disambiguation context), so the eval targets resolution. This aligns with the ticket's intent even though it mentions "run extraction twice" — that instruction applies to the extraction *call*, not to truncation comparison on the extraction path (review-guide.md § Single Responsibility).
 
 **Gate:** Use `MIKA_EVAL_KG_PROVIDERS` gating (existing). Add a `truncation_eval` test function alongside the existing `kg_provider_eval` function.
 
@@ -197,9 +215,9 @@ Test `build_disambiguation_prompt` with a chunk_context that would produce a mid
 
 ## Risks and Mitigations
 
-1. **Semantic boundary too aggressive** — if the last sentence boundary is at byte 50 of a 2000-byte budget, we lose 97.5% of available context. Mitigation: fall back to `safe_truncate` when the sentence boundary is too far from the budget (e.g., < 50% of budget utilized). This is a tuning knob, not a blocker.
+1. **Semantic boundary too aggressive** — if the last sentence boundary is at byte 50 of a 2000-byte budget, we lose 97.5% of available context. **Addressed in Step 1.1:** the function enforces a 50% minimum-utilization floor — if the best sentence boundary yields less than `max_bytes / 2` bytes, it falls back to `safe_truncate`. 50% is the committed threshold: it guarantees at least half the budget is utilized while still allowing meaningful sentence-boundary preference in the upper half. A tighter floor (e.g., 80%) would rarely trigger; a looser floor (e.g., 25%) still risks substantial context loss (review-guide.md § KISS).
 
-2. **Newline as sentence boundary** — markdown docs use newlines within sentences (line wrapping). A newline-terminated truncation might still be mid-sentence in the prose sense. Mitigation: prefer `.`/`!`/`?` over `\n` when both are available within the last ~200 bytes of the budget. Implementation: scan for punctuation first; only use newline if no punctuation found.
+2. **Newline as sentence boundary** — markdown docs use newlines within sentences (line wrapping). A newline-terminated truncation might still be mid-sentence in the prose sense. **Addressed in Step 1.1:** `\n` is excluded from the sentence-boundary character set entirely (option a from the risk analysis). The function scans for `.`/`!`/`?` only. This is the simplest correct shape — a two-pass scan with newline fallback adds complexity for marginal benefit when the 50% floor already provides a `safe_truncate` fallback (review-guide.md § KISS).
 
 3. **No measurable quality difference** — the ticket explicitly accounts for this outcome. If Step 1 shows no delta, the ticket closes with a documented decision and the `truncate_at_semantic_boundary` function stays in the codebase (zero cost, useful for future callers).
 
@@ -216,3 +234,7 @@ Test `build_disambiguation_prompt` with a chunk_context that would produce a mid
 - Truncation of already-tokenized inputs
 - Error log truncations (stay on `safe_truncate`)
 - Changes to the full-document extraction path (E1 — no truncation applied today)
+
+## Revision history
+
+- rev 2 (2026-06-26): addressed F1 by adding a committed 50% minimum-utilization floor to `truncate_at_semantic_boundary` in Step 1.1 — function falls back to `safe_truncate` when the best sentence boundary yields < `max_bytes / 2` bytes (review-guide.md § KISS); addressed F2 by removing `\n` from the sentence-boundary character set in Step 1.1 — function scans `.`/`!`/`?` only, no newline (review-guide.md § KISS, option a); addressed F3 by adding explicit eval-scope note to Step 1.2 explaining why the eval targets resolution quality only and extraction comparison is excluded (review-guide.md § Single Responsibility); addressed F4 jointly with F1 — threshold committed at 50% with justification (Unresolved-Decision Gate, mika#1244). Updated Risk #1 and Risk #2 descriptions to reference the committed implementations. Added test cases for newline exclusion and minimum-utilization floor behavior.

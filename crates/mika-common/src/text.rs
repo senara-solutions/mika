@@ -10,6 +10,40 @@ pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Truncate prose to at most `max_bytes`, preferring to end at the last
+/// sentence boundary (`.` `!` `?`) within the budget. Falls back to
+/// `safe_truncate` (char-boundary) if no sentence boundary exists or if
+/// the best boundary would utilize less than 50% of the byte budget.
+///
+/// The 50% minimum-utilization floor prevents pathological cases where the
+/// only sentence boundary is near the start of the string — returning 50
+/// bytes of a 2000-byte budget silently discards context, which is worse
+/// for LLM quality than a mid-sentence cut.
+///
+/// `\n` is intentionally excluded from the sentence-boundary set. Markdown
+/// documents use hard-wrapped lines within sentences; a trailing `\n` from
+/// line wrapping is not a reliable sentence boundary.
+///
+/// Use for LLM-prompt-bound truncation where mid-sentence cuts degrade
+/// prompt quality. For log lines and error previews, use `safe_truncate`.
+pub fn truncate_at_semantic_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let limit = s.floor_char_boundary(s.len().min(max_bytes));
+    let min_utilization = max_bytes / 2;
+    // Scan backwards for sentence-ending punctuation only (no \n)
+    if let Some(end) = s[..limit].rfind(['.', '!', '?']) {
+        // Include the sentence-ending character
+        let boundary = end + s[end..].chars().next().map_or(0, |c| c.len_utf8());
+        if boundary >= min_utilization {
+            return &s[..boundary];
+        }
+    }
+    // Fallback: char boundary (same as safe_truncate)
+    safe_truncate(s, max_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +131,88 @@ mod tests {
         assert_eq!(safe_truncate(s, 6), "ab\u{1F600}");
         // Full string
         assert_eq!(safe_truncate(s, 8), s);
+    }
+
+    // -----------------------------------------------------------------------
+    // truncate_at_semantic_boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn semantic_shorter_than_limit() {
+        assert_eq!(truncate_at_semantic_boundary("hello.", 100), "hello.");
+    }
+
+    #[test]
+    fn semantic_truncates_at_period() {
+        let s = "First sentence. Second sentence that is longer.";
+        // Budget 20: "First sentence. Sec" (19 bytes) — period at byte 15
+        // 15 >= 20/2=10, so sentence boundary wins
+        assert_eq!(truncate_at_semantic_boundary(s, 20), "First sentence.");
+    }
+
+    #[test]
+    fn semantic_truncates_at_exclamation() {
+        let s = "Watch out! This is a much longer continuation of the text.";
+        // Budget 15: "Watch out! This" — exclamation at byte 10
+        // 10 >= 15/2=7, so boundary wins
+        assert_eq!(truncate_at_semantic_boundary(s, 15), "Watch out!");
+    }
+
+    #[test]
+    fn semantic_truncates_at_question_mark() {
+        let s = "Is this working? Let me check the rest of the output.";
+        // Budget 20: "Is this working? Let" — question at byte 16
+        // 16 >= 20/2=10, so boundary wins
+        assert_eq!(truncate_at_semantic_boundary(s, 20), "Is this working?");
+    }
+
+    #[test]
+    fn semantic_no_sentence_boundary_falls_back() {
+        let s = "No sentence boundary here, just a long clause that keeps going";
+        assert_eq!(truncate_at_semantic_boundary(s, 20), safe_truncate(s, 20));
+    }
+
+    #[test]
+    fn semantic_newline_not_treated_as_boundary() {
+        // Only \n boundaries — should fall back to safe_truncate
+        let s = "Line one\nLine two\nLine three\nLine four continues here";
+        assert_eq!(truncate_at_semantic_boundary(s, 25), safe_truncate(s, 25));
+    }
+
+    #[test]
+    fn semantic_min_utilization_floor_rejects() {
+        // Sentence boundary at byte 5 ("Done."), budget 100 → 5 < 100/2=50 → fallback
+        let s = "Done. Then a very long continuation without any more sentence endings that goes on and on and on and on";
+        assert_eq!(truncate_at_semantic_boundary(s, 100), safe_truncate(s, 100));
+    }
+
+    #[test]
+    fn semantic_min_utilization_floor_accepts() {
+        // Sentence boundary at ~55 bytes, budget 100 → 55 >= 50 → boundary wins
+        let s = "This is a sentence that ends right around the middle here. Then more text follows after that point and keeps going";
+        let result = truncate_at_semantic_boundary(s, 100);
+        assert!(result.ends_with('.'));
+        assert!(result.len() >= 50);
+        assert!(result.len() <= 100);
+    }
+
+    #[test]
+    fn semantic_multibyte_near_boundary() {
+        // "Caf\u{00e9}." is 6 bytes (3 + 2 + 1), then " More text follows here"
+        let s = "Caf\u{00e9}. More text follows here and continues on";
+        // Budget 10: floor_char_boundary(10) = 10
+        // rfind('.') at byte 5, boundary = 6
+        // 6 >= 10/2=5, so sentence boundary wins
+        assert_eq!(truncate_at_semantic_boundary(s, 10), "Caf\u{00e9}.");
+    }
+
+    #[test]
+    fn semantic_empty_string() {
+        assert_eq!(truncate_at_semantic_boundary("", 100), "");
+    }
+
+    #[test]
+    fn semantic_zero_budget() {
+        assert_eq!(truncate_at_semantic_boundary("hello.", 0), "");
     }
 }

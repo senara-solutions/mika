@@ -20,6 +20,7 @@ pub mod extraction_eval;
 pub mod prompts;
 pub mod report;
 pub mod resolution_eval;
+pub mod truncation_eval;
 
 use std::sync::Arc;
 
@@ -323,6 +324,39 @@ async fn kg_provider_eval_resolution_only() {
 
     let outcomes = resolution_eval::run_resolution_eval(&active_providers).await;
     report::print_resolution_summary(&outcomes);
+}
+
+#[tokio::test]
+#[ignore]
+async fn truncation_eval() {
+    let providers = parse_kg_providers();
+    if providers.is_empty() {
+        eprintln!(
+            "[truncation_eval] MIKA_EVAL_KG_PROVIDERS not set — skipping. \
+             Set to 'default' or 'anthropic/claude-haiku-4-5-20251001,openrouter/deepseek/deepseek-v3'"
+        );
+        return;
+    }
+
+    let mut active_providers = Vec::new();
+    for spec in &providers {
+        if let Some(provider) = create_kg_provider(spec) {
+            active_providers.push((spec.clone(), provider));
+        }
+    }
+
+    if active_providers.is_empty() {
+        eprintln!("[truncation_eval] no providers have API keys configured — skipping");
+        return;
+    }
+
+    println!(
+        "\n=== Truncation Comparison Eval: {} providers ===\n",
+        active_providers.len()
+    );
+
+    let outcomes = truncation_eval::run_truncation_eval(&active_providers).await;
+    truncation_eval::print_truncation_summary(&outcomes);
 }
 
 #[cfg(test)]
