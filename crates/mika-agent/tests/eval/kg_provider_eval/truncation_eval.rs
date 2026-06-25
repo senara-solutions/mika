@@ -213,8 +213,8 @@ pub fn print_truncation_summary(outcomes: &[TruncationComparisonOutcome]) {
             "{:<35} {:<12} {:<12} {:<8} {:+.3}",
             format!(
                 "{} ({})",
-                &o.entity_key[..o.entity_key.len().min(20)],
-                &o.provider[..o.provider.len().min(10)]
+                safe_truncate(&o.entity_key, 20),
+                safe_truncate(&o.provider, 10)
             ),
             format!("{} ({:.2})", byte_mark, o.byte_confidence),
             format!("{} ({:.2})", semantic_mark, o.semantic_confidence),
