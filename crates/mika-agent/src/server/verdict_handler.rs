@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::LazyLock;
 use tracing::{info, warn};
@@ -28,7 +29,7 @@ use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
-    CheckClassification, classify_checks, run_gh_checks, run_gh_merge,
+    CheckClassification, classify_checks, run_gh_checks, run_gh_merge, run_gh_subprocess,
 };
 
 use super::verdict::{
@@ -44,6 +45,18 @@ const BLOCK_CI_MAX_RETRIES: u32 = 3;
 
 /// Maximum body excerpt length for fallback AC extraction and metadata.
 const BODY_EXCERPT_MAX: usize = 2000;
+
+/// Identical-diff circuit breaker threshold: halt after this many rejections
+/// with the same PR head commit SHA (mika#1563).
+const IDENTICAL_DIFF_THRESHOLD: u32 = 3;
+
+/// A recorded diff fingerprint entry stored in task metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiffFingerprint {
+    sha: String,
+    verdict: String,
+    at: String,
+}
 
 /// Result of the structural verdict handler.
 #[derive(Debug)]
@@ -106,8 +119,28 @@ pub async fn try_handle_pr_review_verdict(
             .await
         }
         Verdict::Block(reason) => match reason.to_lowercase().as_str() {
-            "ac" => handle_block_ac(&event, db, message_sender, session_id, trace_id).await,
-            "ci" => handle_block_ci(&event, db, message_sender, session_id, trace_id).await,
+            "ac" => {
+                handle_block_ac(
+                    &event,
+                    db,
+                    github_token,
+                    message_sender,
+                    session_id,
+                    trace_id,
+                )
+                .await
+            }
+            "ci" => {
+                handle_block_ci(
+                    &event,
+                    db,
+                    github_token,
+                    message_sender,
+                    session_id,
+                    trace_id,
+                )
+                .await
+            }
             "security" | "pipeline" => {
                 handle_escalate(&event, db, &reason, message_sender, session_id, trace_id).await
             }
@@ -122,7 +155,17 @@ pub async fn try_handle_pr_review_verdict(
             }
         },
         Verdict::Hold(reason) => match reason.to_lowercase().as_str() {
-            "review" => handle_hold_review(&event, db, message_sender, session_id, trace_id).await,
+            "review" => {
+                handle_hold_review(
+                    &event,
+                    db,
+                    github_token,
+                    message_sender,
+                    session_id,
+                    trace_id,
+                )
+                .await
+            }
             _ => {
                 warn!(
                     reason = %reason,
@@ -391,10 +434,11 @@ async fn handle_pass_verdict(
 // ---------------------------------------------------------------------------
 
 /// Handle a VERDICT: block[ac] — dispatch claude-pilot with AC-fix prompt,
-/// bounded by retry counter.
+/// bounded by retry counter and identical-diff circuit breaker (#1563).
 async fn handle_block_ac(
     event: &PrReviewEvent,
     db: &AsyncDatabase,
+    github_token: Option<&str>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -435,6 +479,24 @@ async fn handle_block_ac(
                 event.state, event.repo, event.pr_number, event.reviewer
             ),
         };
+    }
+
+    // Identical-diff circuit breaker (mika#1563) — runs BEFORE generic retry counter
+    if let Some(action) = check_identical_diff_circuit_breaker(
+        event,
+        db,
+        github_token,
+        &task_id,
+        &task.metadata,
+        &pr_url,
+        "block[ac]",
+        message_sender,
+        session_id,
+        trace_id,
+    )
+    .await
+    {
+        return action;
     }
 
     // Read retry counter
@@ -589,10 +651,12 @@ async fn handle_block_ac(
 // ---------------------------------------------------------------------------
 
 /// Handle a VERDICT: block[ci] — dispatch claude-pilot with CI-fix prompt,
-/// bounded by retry counter. Same structure as block[ac].
+/// bounded by retry counter and identical-diff circuit breaker (#1563).
+/// Same structure as block[ac].
 async fn handle_block_ci(
     event: &PrReviewEvent,
     db: &AsyncDatabase,
+    github_token: Option<&str>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -631,6 +695,24 @@ async fn handle_block_ci(
                 event.state, event.repo, event.pr_number, event.reviewer
             ),
         };
+    }
+
+    // Identical-diff circuit breaker (mika#1563) — runs BEFORE generic retry counter
+    if let Some(action) = check_identical_diff_circuit_breaker(
+        event,
+        db,
+        github_token,
+        &task_id,
+        &task.metadata,
+        &pr_url,
+        "block[ci]",
+        message_sender,
+        session_id,
+        trace_id,
+    )
+    .await
+    {
+        return action;
     }
 
     let count = read_verdict_retry_count(&task.metadata, "verdict_block_ci");
@@ -859,9 +941,11 @@ async fn handle_escalate(
 // ---------------------------------------------------------------------------
 
 /// Handle VERDICT: hold[review] — notify operator, leave task in_progress.
+/// Enriches the pre-digest with diff fingerprint data (#1563).
 async fn handle_hold_review(
     event: &PrReviewEvent,
     db: &AsyncDatabase,
+    github_token: Option<&str>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -882,6 +966,36 @@ async fn handle_hold_review(
     };
 
     let task_id = task.id.clone();
+
+    // Fetch diff fingerprint for enrichment (fail-open — omit on error)
+    let fingerprint_enrichment = if let Some(token) = github_token {
+        match fetch_pr_head_sha(event.pr_number, &event.repo, token).await {
+            Ok(sha) => {
+                let history = read_diff_fingerprints(&task.metadata);
+                let identical_count = history.iter().filter(|fp| fp.sha == sha).count() as u32;
+
+                // Append to metadata
+                if let Err(e) =
+                    append_diff_fingerprint(db, &task_id, &task.metadata, &sha, "hold[review]")
+                        .await
+                {
+                    warn!(error = %e, task_id = %task_id, "Failed to append hold[review] diff fingerprint");
+                }
+
+                Some((sha, identical_count))
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    pr_number = event.pr_number,
+                    "Failed to fetch PR head SHA for hold[review] enrichment — omitting fingerprint data"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Update metadata
     if let Err(e) = update_hold_metadata(
@@ -933,7 +1047,7 @@ async fn handle_hold_review(
     );
 
     VerdictAction::Handled {
-        pre_digest: format_hold_review_pre_digest(event, &task_id),
+        pre_digest: format_hold_review_pre_digest(event, &task_id, fingerprint_enrichment.as_ref()),
     }
 }
 
@@ -1099,6 +1213,230 @@ fn read_verdict_retry_count(metadata: &Option<String>, key: &str) -> u32 {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.get(key)?.get("count")?.as_u64())
         .unwrap_or(0) as u32
+}
+
+// ---------------------------------------------------------------------------
+// Identical-diff circuit breaker helpers (mika#1563)
+// ---------------------------------------------------------------------------
+
+/// Fetch the current head commit SHA for a PR via `gh pr view`.
+async fn fetch_pr_head_sha(pr_number: u64, repo: &str, token: &str) -> Result<String, String> {
+    let pr_str = pr_number.to_string();
+    let args = vec![
+        "pr",
+        "view",
+        &pr_str,
+        "--repo",
+        repo,
+        "--json",
+        "headRefOid",
+        "--jq",
+        ".headRefOid",
+    ];
+
+    let future = run_gh_subprocess(&args, token);
+    match tokio::time::timeout(std::time::Duration::from_secs(15), future).await {
+        Ok(Ok(output)) => {
+            let sha = output.trim().to_string();
+            if sha.is_empty() {
+                Err("gh pr view returned empty headRefOid".to_string())
+            } else {
+                Ok(sha)
+            }
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("gh pr view timed out after 15s".to_string()),
+    }
+}
+
+/// Read the diff fingerprint history from task metadata JSON.
+fn read_diff_fingerprints(metadata: &Option<String>) -> Vec<DiffFingerprint> {
+    metadata
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.get("verdict_diff_fingerprints").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<DiffFingerprint>>(v).ok())
+        .unwrap_or_default()
+}
+
+/// Append a diff fingerprint entry to task metadata.
+async fn append_diff_fingerprint(
+    db: &AsyncDatabase,
+    task_id: &str,
+    existing_metadata: &Option<String>,
+    sha: &str,
+    verdict_class: &str,
+) -> Result<()> {
+    let mut base = existing_metadata
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .unwrap_or_else(|| json!({}));
+
+    let new_entry = json!({
+        "sha": sha,
+        "verdict": verdict_class,
+        "at": crate::timestamp::now(),
+    });
+
+    // Append to existing array or create new one
+    let arr = base
+        .as_object_mut()
+        .unwrap()
+        .entry("verdict_diff_fingerprints")
+        .or_insert_with(|| json!([]));
+
+    if let Some(arr) = arr.as_array_mut() {
+        arr.push(new_entry);
+    }
+
+    let merged_str = serde_json::to_string(&base)?;
+    db.update_task_metadata(task_id, &merged_str).await?;
+    Ok(())
+}
+
+/// Check the identical-diff circuit breaker. Returns `Some(VerdictAction)` when
+/// the circuit breaker fires (same SHA rejected ≥ IDENTICAL_DIFF_THRESHOLD times),
+/// or `None` to fall through to the generic retry counter.
+#[allow(clippy::too_many_arguments)]
+async fn check_identical_diff_circuit_breaker(
+    event: &PrReviewEvent,
+    db: &AsyncDatabase,
+    github_token: Option<&str>,
+    task_id: &str,
+    task_metadata: &Option<String>,
+    pr_url: &str,
+    verdict_class: &str,
+    message_sender: Option<&Arc<dyn MessageSender>>,
+    session_id: &str,
+    trace_id: &str,
+) -> Option<VerdictAction> {
+    // Require GitHub token — fail-open on None
+    let token = match github_token {
+        Some(t) => t,
+        None => {
+            warn!(
+                pr_number = event.pr_number,
+                repo = %event.repo,
+                "identical-diff circuit breaker skipped — no GitHub token available"
+            );
+            return None;
+        }
+    };
+
+    // Fetch current PR head SHA
+    let sha = match fetch_pr_head_sha(event.pr_number, &event.repo, token).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                pr_number = event.pr_number,
+                repo = %event.repo,
+                "identical-diff circuit breaker skipped — failed to fetch head SHA"
+            );
+            return None;
+        }
+    };
+
+    // Read existing fingerprint history
+    let history = read_diff_fingerprints(task_metadata);
+    let identical_count = history.iter().filter(|fp| fp.sha == sha).count() as u32;
+
+    if identical_count >= IDENTICAL_DIFF_THRESHOLD {
+        // Circuit breaker fires
+        info!(
+            event = "identical_diff_circuit_breaker",
+            pr_number = event.pr_number,
+            repo = %event.repo,
+            task_id = %task_id,
+            head_sha = %sha,
+            identical_count = identical_count,
+            verdict_class = %verdict_class,
+            trace_id = %trace_id,
+            "Identical-diff circuit breaker fired — same SHA rejected {}x",
+            identical_count
+        );
+
+        // Mark task blocked
+        if let Err(e) = db.update_task_status(task_id, "blocked").await {
+            warn!(error = %e, task_id = %task_id, "Failed to mark task blocked after identical-diff circuit breaker");
+        }
+
+        // Write circuit breaker metadata
+        let cb_metadata = json!({
+            "identical_diff_circuit_breaker": {
+                "head_sha": sha,
+                "identical_count": identical_count,
+                "verdict_class": verdict_class,
+                "fired_at": crate::timestamp::now(),
+            }
+        });
+        let mut base = task_metadata
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .unwrap_or_else(|| json!({}));
+        merge_metadata(&mut base, &cb_metadata);
+        if let Ok(merged_str) = serde_json::to_string(&base)
+            && let Err(e) = db.update_task_metadata(task_id, &merged_str).await
+        {
+            warn!(error = %e, task_id = %task_id, "Failed to update circuit breaker metadata");
+        }
+
+        // Audit event
+        let matching_fingerprints: Vec<&DiffFingerprint> =
+            history.iter().filter(|fp| fp.sha == sha).collect();
+        let verdict_history_json =
+            serde_json::to_string(&matching_fingerprints).unwrap_or_default();
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "verdict_handler",
+                "identical_diff_circuit_breaker",
+                Some("in_progress"),
+                Some("blocked"),
+                Some(&format!(
+                    "pr_url={pr_url} head_sha={sha} identical_count={identical_count} \
+                     verdict_history={verdict_history_json}"
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, "Failed to log identical_diff_circuit_breaker audit event");
+        }
+
+        // Notify operator
+        if let Some(sender) = message_sender {
+            send_notification(
+                sender,
+                &format!(
+                    "PR #{} on {} — identical-diff circuit breaker fired ({verdict_class}). \
+                     Same diff (SHA: {}) rejected {identical_count}x. \
+                     Task {task_id} marked blocked. Operator review required.",
+                    event.pr_number,
+                    event.repo,
+                    &sha[..8.min(sha.len())]
+                ),
+            )
+            .await;
+        }
+
+        return Some(VerdictAction::Handled {
+            pre_digest: format_identical_diff_pre_digest(
+                event,
+                task_id,
+                &sha,
+                identical_count,
+                verdict_class,
+            ),
+        });
+    }
+
+    // Below threshold — append fingerprint and fall through
+    if let Err(e) = append_diff_fingerprint(db, task_id, task_metadata, &sha, verdict_class).await {
+        warn!(error = %e, task_id = %task_id, "Failed to append diff fingerprint");
+    }
+
+    None
 }
 
 /// Truncate body to BODY_EXCERPT_MAX chars, appending [truncated] if needed.
@@ -1485,16 +1823,63 @@ fn format_escalate_pre_digest(event: &PrReviewEvent, reason: &str, task_id: &str
     )
 }
 
-/// Format pre-digest for hold[review].
-fn format_hold_review_pre_digest(event: &PrReviewEvent, task_id: &str) -> String {
+/// Format pre-digest for hold[review], with optional diff fingerprint enrichment (#1563).
+fn format_hold_review_pre_digest(
+    event: &PrReviewEvent,
+    task_id: &str,
+    fingerprint: Option<&(String, u32)>,
+) -> String {
+    let fingerprint_section = match fingerprint {
+        Some((sha, count)) if *count >= IDENTICAL_DIFF_THRESHOLD => {
+            format!(
+                "\nDiff fingerprint: {sha}\n\
+                 Identical-diff rejection count: {count}/{IDENTICAL_DIFF_THRESHOLD}\n\
+                 IDENTICAL DIFF CIRCUIT BREAKER: same diff rejected {count}x — \
+                 DO NOT dispatch run_claude_pilot.\n"
+            )
+        }
+        Some((sha, count)) => {
+            format!(
+                "\nDiff fingerprint: {sha}\n\
+                 Identical-diff rejection count: {count}/{IDENTICAL_DIFF_THRESHOLD}\n"
+            )
+        }
+        None => String::new(),
+    };
+
     format!(
         "<verdict_handler>\n\
          [GitHub] PR review ({}) on {}#{} by @{}\n\
          VERDICT: hold[review] — operator notified; task remains in_progress.\n\n\
          Task: {task_id}\n\
-         Review: {}\n\n\
+         Review: {}{fingerprint_section}\n\
          Do NOT dispatch run_claude_pilot or take autonomous action.\n\
          The operator will decide the next move. Acknowledge the hold verdict.\n\
+         </verdict_handler>",
+        event.state, event.repo, event.pr_number, event.reviewer, event.review_url
+    )
+}
+
+/// Format pre-digest for identical-diff circuit breaker firing (#1563).
+fn format_identical_diff_pre_digest(
+    event: &PrReviewEvent,
+    task_id: &str,
+    head_sha: &str,
+    identical_count: u32,
+    verdict_class: &str,
+) -> String {
+    format!(
+        "<verdict_handler>\n\
+         [GitHub] PR review ({}) on {}#{} by @{}\n\
+         VERDICT: {verdict_class} — identical diff circuit breaker fired.\n\n\
+         The same PR diff (head SHA: {head_sha}) has been rejected {identical_count} times \
+         across QA review cycles. The fix attempts are not producing new code changes.\n\n\
+         Task: {task_id} (now blocked)\n\
+         Review: {}\n\n\
+         Do NOT dispatch run_claude_pilot — the identical-diff circuit breaker has halted \
+         re-dispatch. The fix loop is stuck producing the same code.\n\
+         Notify the user about the convergence failure and ask for manual intervention \
+         (amend the plan, rewrite the QA criteria, or close the PR).\n\
          </verdict_handler>",
         event.state, event.repo, event.pr_number, event.reviewer, event.review_url
     )
@@ -1750,7 +2135,7 @@ mod tests {
     fn hold_review_pre_digest_avoids_completion_claim_words() {
         let mut event = sample_event_commented();
         event.body = "VERDICT: hold[review]\nREASON: Needs design input.".to_string();
-        let text = format_hold_review_pre_digest(&event, "task-hold");
+        let text = format_hold_review_pre_digest(&event, "task-hold", None);
         assert!(
             !COMPLETION_CLAIM_RE.is_match(&text),
             "hold[review] pre-digest contains completion-claim trigger word: {text}"
@@ -1760,7 +2145,7 @@ mod tests {
     #[test]
     fn hold_review_pre_digest_contains_no_action_instruction() {
         let event = sample_event_commented();
-        let text = format_hold_review_pre_digest(&event, "task-hold");
+        let text = format_hold_review_pre_digest(&event, "task-hold", None);
         assert!(text.contains("Do NOT dispatch run_claude_pilot"));
         assert!(text.contains("remains in_progress"));
     }
@@ -1960,7 +2345,7 @@ mod tests {
             format_block_ci_pre_digest(&event_c, "CI context", "t1", 1),
             format_block_ci_limit_pre_digest(&event_c, "t1"),
             format_escalate_pre_digest(&event_c, "security", "t1"),
-            format_hold_review_pre_digest(&event_c, "t1"),
+            format_hold_review_pre_digest(&event_c, "t1", None),
             format_verdict_classification_failed_pre_digest(&event_c),
         ];
 
@@ -2007,7 +2392,10 @@ mod tests {
                 "escalate_pipeline",
                 format_escalate_pre_digest(&event_c, "pipeline", "t1"),
             ),
-            ("hold_review", format_hold_review_pre_digest(&event_c, "t1")),
+            (
+                "hold_review",
+                format_hold_review_pre_digest(&event_c, "t1", None),
+            ),
             (
                 "classification_failed",
                 format_verdict_classification_failed_pre_digest(&event_c),
@@ -2018,6 +2406,161 @@ mod tests {
             assert!(
                 !COMPLETION_CLAIM_RE.is_match(text),
                 "{name} pre-digest contains completion-claim trigger word: {text}"
+            );
+        }
+    }
+
+    // ---- Diff fingerprint metadata helpers tests (mika#1563) ----
+
+    #[test]
+    fn read_diff_fingerprints_none_metadata() {
+        let result = read_diff_fingerprints(&None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn read_diff_fingerprints_missing_key() {
+        let meta = Some(r#"{"other": "value"}"#.to_string());
+        let result = read_diff_fingerprints(&meta);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn read_diff_fingerprints_populated_array() {
+        let meta = Some(
+            r#"{"verdict_diff_fingerprints": [
+                {"sha": "abc123", "verdict": "block[ac]", "at": "2026-06-26T01:00:00Z"},
+                {"sha": "def456", "verdict": "block[ci]", "at": "2026-06-26T01:30:00Z"}
+            ]}"#
+            .to_string(),
+        );
+        let result = read_diff_fingerprints(&meta);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].sha, "abc123");
+        assert_eq!(result[0].verdict, "block[ac]");
+        assert_eq!(result[1].sha, "def456");
+        assert_eq!(result[1].verdict, "block[ci]");
+    }
+
+    #[test]
+    fn read_diff_fingerprints_malformed_json() {
+        let meta = Some("not json".to_string());
+        let result = read_diff_fingerprints(&meta);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn read_diff_fingerprints_malformed_array_entries() {
+        let meta = Some(r#"{"verdict_diff_fingerprints": [{"wrong_field": true}]}"#.to_string());
+        // serde_json::from_value will fail on missing required fields, returning empty
+        let result = read_diff_fingerprints(&meta);
+        assert!(result.is_empty());
+    }
+
+    // ---- Identical-diff circuit breaker pre-digest tests ----
+
+    #[test]
+    fn identical_diff_pre_digest_avoids_completion_claim_words() {
+        let event = sample_event_commented();
+        let text =
+            format_identical_diff_pre_digest(&event, "task-123", "abc123def", 3, "block[ac]");
+        assert!(
+            !COMPLETION_CLAIM_RE.is_match(&text),
+            "identical_diff pre-digest contains completion-claim trigger word: {text}"
+        );
+    }
+
+    #[test]
+    fn identical_diff_pre_digest_has_xml_tags() {
+        let event = sample_event_commented();
+        let text =
+            format_identical_diff_pre_digest(&event, "task-123", "abc123def", 3, "block[ac]");
+        assert!(text.contains("<verdict_handler>"));
+        assert!(text.contains("</verdict_handler>"));
+    }
+
+    #[test]
+    fn identical_diff_pre_digest_contains_key_fields() {
+        let event = sample_event_commented();
+        let text =
+            format_identical_diff_pre_digest(&event, "task-123", "abc123def456", 4, "block[ci]");
+        assert!(text.contains("identical diff"));
+        assert!(text.contains("circuit breaker"));
+        assert!(text.contains("abc123def456"));
+        assert!(text.contains("4 times"));
+        assert!(text.contains("task-123"));
+        assert!(text.contains("block[ci]"));
+        assert!(text.contains("Do NOT dispatch run_claude_pilot"));
+    }
+
+    #[test]
+    fn identical_diff_pre_digest_no_dispatch_instruction() {
+        let event = sample_event_commented();
+        let text = format_identical_diff_pre_digest(&event, "task-123", "abc123", 3, "block[ac]");
+        assert!(text.contains("Do NOT dispatch run_claude_pilot"));
+        assert!(text.contains("circuit breaker has halted"));
+    }
+
+    // ---- Hold[review] with fingerprint enrichment tests ----
+
+    #[test]
+    fn hold_review_pre_digest_with_fingerprint_below_threshold() {
+        let event = sample_event_commented();
+        let fp = ("abc123def".to_string(), 1u32);
+        let text = format_hold_review_pre_digest(&event, "task-hold", Some(&fp));
+        assert!(text.contains("Diff fingerprint: abc123def"));
+        assert!(text.contains("Identical-diff rejection count: 1/3"));
+        assert!(!text.contains("CIRCUIT BREAKER"));
+    }
+
+    #[test]
+    fn hold_review_pre_digest_with_fingerprint_at_threshold() {
+        let event = sample_event_commented();
+        let fp = ("abc123def".to_string(), 3u32);
+        let text = format_hold_review_pre_digest(&event, "task-hold", Some(&fp));
+        assert!(text.contains("IDENTICAL DIFF CIRCUIT BREAKER"));
+        assert!(text.contains("DO NOT dispatch run_claude_pilot"));
+    }
+
+    #[test]
+    fn hold_review_pre_digest_without_fingerprint() {
+        let event = sample_event_commented();
+        let text = format_hold_review_pre_digest(&event, "task-hold", None);
+        assert!(!text.contains("Diff fingerprint"));
+        assert!(!text.contains("CIRCUIT BREAKER"));
+    }
+
+    #[test]
+    fn hold_review_pre_digest_with_fingerprint_avoids_completion_claim_words() {
+        let event = sample_event_commented();
+        let fp = ("abc123".to_string(), 3u32);
+        let text = format_hold_review_pre_digest(&event, "task-hold", Some(&fp));
+        assert!(
+            !COMPLETION_CLAIM_RE.is_match(&text),
+            "hold[review] pre-digest with fingerprint contains completion-claim trigger word: {text}"
+        );
+    }
+
+    // ---- All pre-digests XML tags (including new ones) ----
+
+    #[test]
+    fn new_pre_digests_have_xml_tags() {
+        let event_c = sample_event_commented();
+
+        let pre_digests = [
+            format_identical_diff_pre_digest(&event_c, "t1", "sha123", 3, "block[ac]"),
+            format_hold_review_pre_digest(&event_c, "t1", Some(&("sha123".to_string(), 2))),
+            format_hold_review_pre_digest(&event_c, "t1", Some(&("sha123".to_string(), 3))),
+        ];
+
+        for (i, text) in pre_digests.iter().enumerate() {
+            assert!(
+                text.contains("<verdict_handler>"),
+                "New pre-digest #{i} missing opening XML tag: {text}"
+            );
+            assert!(
+                text.contains("</verdict_handler>"),
+                "New pre-digest #{i} missing closing XML tag: {text}"
             );
         }
     }
