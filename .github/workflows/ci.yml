@@ -179,28 +179,35 @@ jobs:
     runs-on: ubuntu-22.04
     if: github.event_name == 'pull_request'
     outputs:
-      docker-relevant: ${{ steps.filter.outputs.docker-relevant }}
+      # mika#1484: two independent filters. `images-relevant` gates the fast
+      # agent/gateway Rust-image builds (genuinely affected by code changes).
+      # `os-relevant` gates the 5 slow os/Dockerfile Gentoo stage3 builds, which
+      # must only run when os/** or a Dockerfile actually changes — a crates/**
+      # change previously tripped hours of Gentoo builds with no merge-gate value.
+      images-relevant: ${{ steps.filter.outputs.images-relevant }}
+      os-relevant: ${{ steps.filter.outputs.os-relevant }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
-            docker-relevant:
+            images-relevant:
               - 'Dockerfile.agent'
               - 'Dockerfile.gateway'
-              - 'os/Dockerfile'
-              - 'os/Dockerfile.dockerignore'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'crates/**'
               - '.github/workflows/ci.yml'
+            os-relevant:
+              - 'os/**'
+              - '**/Dockerfile*'
 
   docker-build:
     name: Docker Build
     runs-on: ubuntu-22.04
     needs: docker-build-filter
-    if: github.event_name == 'pull_request' && needs.docker-build-filter.outputs.docker-relevant == 'true'
+    if: github.event_name == 'pull_request' && needs.docker-build-filter.outputs.images-relevant == 'true'
     strategy:
       matrix:
         include:
@@ -208,6 +215,34 @@ jobs:
             tag: mika-agent
           - dockerfile: Dockerfile.gateway
             tag: mika-gateway
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+      - name: Build ${{ matrix.tag }}
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target || '' }}
+          tags: ${{ matrix.tag }}:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=${{ matrix.tag }}
+          cache-to: type=gha,scope=${{ matrix.tag }},mode=max
+          platforms: linux/amd64
+
+  # mika#1484: os/Dockerfile Gentoo stage3 builds (hours each) — gated on
+  # os-relevant so they run ONLY on PRs touching os/** or any Dockerfile,
+  # never on routine crates/** changes.
+  docker-build-os:
+    name: Docker Build OS
+    runs-on: ubuntu-22.04
+    needs: docker-build-filter
+    if: github.event_name == 'pull_request' && needs.docker-build-filter.outputs.os-relevant == 'true'
+    strategy:
+      matrix:
+        include:
           - dockerfile: os/Dockerfile
             target: mika-os
             tag: mika-os
