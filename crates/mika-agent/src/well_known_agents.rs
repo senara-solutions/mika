@@ -291,6 +291,16 @@ pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
     "remove_team_member",
 ];
 
+/// mika-arch's static skill allowlist. Held as a `pub const` (rather than only
+/// inline in `build_mika_arch_identity`) so the `verify-bundled-skills` gate
+/// (mika#1575) can read it without constructing a full `Settings` — mika-arch's
+/// identity is `Computed`, but its allowlist does not depend on `Settings`.
+pub const MIKA_ARCH_SKILL_ALLOWLIST: &[&str] = &[
+    "mika-arch-groom-ticket",
+    "mika-arch-groom-milestone",
+    "mika-arch-second-review",
+];
+
 /// Build mika-arch's identity.toml with absolute `[kg].docs_roots` paths
 /// derived from `Settings.kg_docs_roots`.
 ///
@@ -328,6 +338,12 @@ fn build_mika_arch_identity(settings: &Settings) -> Result<String, String> {
     }
     tools_block.push(']');
 
+    let allowlist_block = MIKA_ARCH_SKILL_ALLOWLIST
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     Ok(format!(
         r#"name = "Architect"
 emoji = "🏛"
@@ -341,7 +357,7 @@ docs_roots = [
 inject = false
 
 [skills]
-allowlist = ["mika-arch-groom-ticket", "mika-arch-groom-milestone", "mika-arch-second-review"]
+allowlist = [{allowlist_block}]
 
 [tools]
 {tools_block}
@@ -351,6 +367,56 @@ allowlist = ["mika-arch-groom-ticket", "mika-arch-groom-milestone", "mika-arch-s
 
 /// All well-known agents.
 pub static WELL_KNOWN_AGENTS: &[&WellKnownAgent] = &[&MIKA_DEV, &MIKA_TEST, &MIKA_QA, &MIKA_ARCH];
+
+/// Returns `(agent_name, skill_allowlist)` for every well-known agent that
+/// declares a `[skills].allowlist`, for the `verify-bundled-skills` gate
+/// (mika#1575, Check 5 — identity allowlist coherence).
+///
+/// Resolution rules:
+/// - `IdentitySource::Static(s)` — parse `[skills].allowlist` from the identity TOML.
+/// - `IdentitySource::Computed` — only mika-arch is computed; its allowlist is
+///   static and read from [`MIKA_ARCH_SKILL_ALLOWLIST`] (no `Settings` needed).
+/// - Sentinel tokens (`__mika_test_no_skills__`, `__fail_closed_no_skills__`, or
+///   any `__…__` form) are filtered out — they intentionally match no real skill.
+/// - Agents with no `[skills].allowlist` (or an allowlist that is only sentinels)
+///   are omitted entirely.
+pub fn well_known_skill_allowlists() -> Vec<(&'static str, Vec<String>)> {
+    fn is_sentinel(name: &str) -> bool {
+        name.starts_with("__") && name.ends_with("__")
+    }
+
+    let mut out = Vec::new();
+    for spec in WELL_KNOWN_AGENTS {
+        let names: Vec<String> = match spec.identity_source {
+            Some(IdentitySource::Static(s)) => toml::from_str::<toml::Value>(s)
+                .ok()
+                .and_then(|v| {
+                    v.get("skills")
+                        .and_then(|sk| sk.get("allowlist"))
+                        .and_then(|al| al.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|e| e.as_str().map(str::to_string))
+                                .collect()
+                        })
+                })
+                .unwrap_or_default(),
+            Some(IdentitySource::Computed(_)) if spec.name == "mika-arch" => {
+                MIKA_ARCH_SKILL_ALLOWLIST
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        let filtered: Vec<String> = names.into_iter().filter(|n| !is_sentinel(n)).collect();
+        if !filtered.is_empty() {
+            out.push((spec.name, filtered));
+        }
+    }
+    out
+}
 
 /// Identity-toml section paths that the reconciler owns from the static spec.
 ///

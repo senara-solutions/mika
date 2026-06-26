@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install test test-async-db-saturation lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch
+.PHONY: build build-dashboard deploy stop restart install test test-async-db-saturation test-dispatch-symmetry verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -96,6 +96,9 @@ test-async-db-saturation: ## Run async DB channel saturation regression test (mi
 
 test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structurally symmetric (mika#893 R5)
 	@bash scripts/test-dispatch-symmetry.sh
+
+verify-bundled-skills: ## Verify structural invariants on bundled skills — pre-merge counterpart to AC2 (mika#1575)
+	cargo run -q --bin verify-bundled-skills
 
 lint: ## Run clippy
 	cargo clippy
