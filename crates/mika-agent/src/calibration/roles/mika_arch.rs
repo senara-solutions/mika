@@ -858,6 +858,10 @@ mod tests {
             prompt.contains("TBD"),
             "gate must enumerate TBD as an unresolved-decision pattern"
         );
+        assert!(
+            prompt.contains("Acceptance-Criteria Gate (mika#1559)"),
+            "groom-ticket system prompt must contain the Acceptance-Criteria Gate section (mika#1559)"
+        );
     }
 
     #[test]
@@ -867,6 +871,10 @@ mod tests {
         assert!(
             prompt.contains("Unresolved-Decision Gate"),
             "second-review system prompt must contain the Unresolved-Decision Gate section"
+        );
+        assert!(
+            prompt.contains("Acceptance-Criteria Gate (mika#1559)"),
+            "second-review system prompt must contain the Acceptance-Criteria Gate section (mika#1559)"
         );
     }
 
