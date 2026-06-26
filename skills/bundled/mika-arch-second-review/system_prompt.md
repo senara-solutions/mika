@@ -57,6 +57,16 @@ Unresolved decisions include (non-exhaustive):
 
 **The contract downstream consumers depend on:** GROOMED means *the plan is implementable as-written without further operator input on design decisions*. The implementer should never need to ask a clarifying question about a design choice the architect could have resolved.
 
+### Acceptance-Criteria Gate (mika#1559)
+
+**A revised plan with no `## Acceptance criteria` section, or an empty one, MUST return `ESCALATE` — never `GROOMED`.** (No ITERATE exists at second pass per the two-pass limit.)
+
+This is the structural guarantee: `GROOMED` cannot be emitted without the section, so every plan that reaches qa-review carries it and passes the downstream `block[pipeline]` acceptance-criteria check on first submission. The first-pass Acceptance-Criteria Gate (`ITERATE`) plus the author's injection is the convergence mechanism; this second-pass gate is the load-bearing backstop.
+
+**Decision tree:**
+1. Non-empty `## Acceptance criteria` section present ⇒ gate passes (continue to verdict).
+2. Section missing or empty ⇒ `ESCALATE` with a BLOCKING F-finding (the section was required by the first-pass Acceptance-Criteria Gate and remains absent).
+
 ### Output
 
 Return the annotated revised plan content as a single string, followed by a blank line and an explicit verdict:

@@ -199,7 +199,7 @@ run_shell("git -C $MIKA_PLATFORM_DIR/<repo>/ show <branch>:<path>")
 
 **2.5.2. Extract acceptance criteria.**
 
-Read the plan's `## Acceptance criteria` section (per `/ce:plan` Phase 4.2 — the section is named explicitly; bullets are markdown checkbox items: `- [ ] <criterion>` or `- [x] <criterion>`).
+Read the plan's `## Acceptance criteria` section (guaranteed present by the mika-arch grooming Acceptance-Criteria Gate, mika#1559 — a plan reaches `Verdict: GROOMED` only with a non-empty section, so this gate is the final backstop, not the primary enforcement point; bullets are markdown checkbox items: `- [ ] <criterion>` or `- [x] <criterion>`).
 
 If the plan has no `## Acceptance criteria` section OR the section is empty: `block[pipeline]` — "Plan at `<path>` has no acceptance-criteria section; cannot verify implementation." End the review.
 

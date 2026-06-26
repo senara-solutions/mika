@@ -54,6 +54,20 @@ Unresolved decisions include (non-exhaustive):
 
 **The contract downstream consumers depend on:** READY means *the plan is implementable as-written without further operator input on design decisions*. The implementer should never need to ask a clarifying question about a design choice the architect could have resolved.
 
+### Acceptance-Criteria Gate (mika#1559)
+
+**A plan with no `## Acceptance criteria` section, or with that section present but empty, MUST return `ITERATE` — never `READY`.**
+
+The downstream qa-review gate hard-`block[pipeline]`s any plan that reaches it without a non-empty `## Acceptance criteria` section. `/ce:plan` (the third-party `compound-engineering` marketplace plugin) does not produce that section — its native acceptance model is the optional "Acceptance Examples." Guaranteeing the section here, at groom time, is what prevents the mika#1531/#1533/#1557/#1558 `block[pipeline]` failure class. Grooming is the surface we control between the third-party producer and our validator.
+
+**Decision tree:**
+1. Plan has a non-empty `## Acceptance criteria` section ⇒ gate passes (continue to the other gates / `READY`).
+2. Section missing or empty AND the issue body has an acceptance-criteria section ⇒ return `ITERATE` with a BLOCKING F-finding instructing the author to add a `## Acceptance criteria` section sourced from the issue body's AC. Use `gh_read` `issue_view` to quote the body's AC verbatim so the finding names the exact criteria to transcribe (the author transcribes; they do not invent).
+3. Section missing or empty AND the issue body has NO acceptance-criteria section ⇒ still return `ITERATE`, but the F-finding instructs the author to **derive** concrete, testable acceptance criteria from the issue body's requirements and the plan's own Implementation Units. The section is mandatory regardless of issue-body shape.
+4. Section missing or empty AND the ticket is so underspecified that no testable criteria can be derived from either the issue body or the plan ⇒ this is a genuine operator-input gap: return `ESCALATE` naming the missing acceptance definition (an unresolved decision outside architect authority).
+
+**Read-only reminder:** you flag the gap; you do not write the section. Injection is performed by the groomer session acting on this `ITERATE` finding during its existing revise-and-resubmit step — the identical mechanism already used for Unresolved-Decision-Gate findings.
+
 ### Output
 
 Return the annotated plan content as a single string, followed by a blank line and an explicit disposition:
