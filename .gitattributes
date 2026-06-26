@@ -1,0 +1,5 @@
+# Append-only trail logs use the union merge driver — two branches each
+# appending different entries to the file must NOT produce a conflict, since
+# both halves are valid history. Without this, the autonomous loop's
+# parallel grooming dispatches conflict on every base update.
+.claude/groom-verdict-trail.log merge=union
