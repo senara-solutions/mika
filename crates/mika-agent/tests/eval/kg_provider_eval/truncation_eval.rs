@@ -261,13 +261,149 @@ pub fn print_truncation_summary(outcomes: &[TruncationComparisonOutcome]) {
         total_confidence_delta / n as f64
     );
 
-    // Decision gate
-    println!("\n--- Decision Gate ---");
-    if total_flipped_semantic_wins > 0 || (total_confidence_delta / n as f64) > 0.05 {
-        println!("RESULT: Measurable improvement detected → proceed to implementation (Step 3)");
-    } else {
-        println!("RESULT: Indistinguishable quality → close as measured");
+    // Single-run summary — d-statistic is per-run; §1's mechanical disposition
+    // requires the two-run comparison printed by `print_two_run_comparison`.
+    let d_value = total_semantic_correct - total_byte_correct;
+    println!(
+        "d (this run): {} (= total_semantic_correct - total_byte_correct)",
+        d_value
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Two-run comparison (§1 — mika#766)
+// ---------------------------------------------------------------------------
+
+/// Per-case agreement between two runs (mika#766 §1 two-run protocol).
+#[derive(Debug, Clone)]
+pub struct CaseAgreement {
+    pub provider: String,
+    pub entity_key: String,
+    /// (byte_correct, semantic_correct) tuple from run 1.
+    pub run1_outcome: (bool, bool),
+    /// (byte_correct, semantic_correct) tuple from run 2.
+    pub run2_outcome: (bool, bool),
+    pub agreed: bool,
+}
+
+/// Compute per-case agreement between two runs.
+///
+/// Aligns outcomes by `(provider, entity_key)`. An outcome present in run 1
+/// but missing from run 2 is dropped (treated as missing data, not disagreement)
+/// — this is conservative and surfaces in the count.
+pub fn compute_per_case_agreement(
+    run1: &[TruncationComparisonOutcome],
+    run2: &[TruncationComparisonOutcome],
+) -> Vec<CaseAgreement> {
+    let mut agreements = Vec::new();
+    for o1 in run1 {
+        let o2 = match run2
+            .iter()
+            .find(|o| o.provider == o1.provider && o.entity_key == o1.entity_key)
+        {
+            Some(o) => o,
+            None => continue,
+        };
+        let run1_outcome = (o1.byte_correct, o1.semantic_correct);
+        let run2_outcome = (o2.byte_correct, o2.semantic_correct);
+        agreements.push(CaseAgreement {
+            provider: o1.provider.clone(),
+            entity_key: o1.entity_key.clone(),
+            run1_outcome,
+            run2_outcome,
+            agreed: run1_outcome == run2_outcome,
+        });
     }
+    agreements
+}
+
+/// Compute d-statistic for a single run: `total_semantic_correct - total_byte_correct`.
+fn compute_d(outcomes: &[TruncationComparisonOutcome]) -> i32 {
+    outcomes
+        .iter()
+        .map(|o| (o.semantic_correct as i32) - (o.byte_correct as i32))
+        .sum()
+}
+
+/// Print the two-run comparison + §1 mechanical disposition (mika#766).
+///
+/// §1's disposition rule (all gates shown, regardless of which fires):
+///   - agreement≥8 ✗ → Revert (inability-to-measure)
+///   - d≥3 on both runs ✓ → Stay
+///   - d≥3 ✗ on either run → Revert
+pub fn print_two_run_comparison(
+    run1: &[TruncationComparisonOutcome],
+    run2: &[TruncationComparisonOutcome],
+) {
+    println!("\n{:=^80}", " Two-Run Per-Case Agreement (mika#766 §1) ");
+
+    let agreements = compute_per_case_agreement(run1, run2);
+    let total = agreements.len();
+    let agreed_count = agreements.iter().filter(|a| a.agreed).count();
+
+    // Per-case table
+    println!(
+        "\n{:<35} {:<14} {:<14} {:<8}",
+        "Case", "Run 1 (B,S)", "Run 2 (B,S)", "Agreed"
+    );
+    println!("{:-<80}", "");
+    for a in &agreements {
+        let r1 = format!(
+            "({},{})",
+            if a.run1_outcome.0 { "T" } else { "F" },
+            if a.run1_outcome.1 { "T" } else { "F" }
+        );
+        let r2 = format!(
+            "({},{})",
+            if a.run2_outcome.0 { "T" } else { "F" },
+            if a.run2_outcome.1 { "T" } else { "F" }
+        );
+        let mark = if a.agreed { "yes" } else { "no" };
+        println!(
+            "{:<35} {:<14} {:<14} {:<8}",
+            format!(
+                "{} ({})",
+                safe_truncate(&a.entity_key, 20),
+                safe_truncate(&a.provider, 10)
+            ),
+            r1,
+            r2,
+            mark,
+        );
+    }
+
+    let d_run1 = compute_d(run1);
+    let d_run2 = compute_d(run2);
+
+    println!("\n{:-<80}", "");
+    println!("Per-case agreement: {}/{}", agreed_count, total);
+    println!("d (run 1): {}", d_run1);
+    println!("d (run 2): {}", d_run2);
+
+    // §1 mechanical disposition — all gates visible, short-circuit explicit
+    println!("\n--- §1 Mechanical Disposition (mika#766) ---");
+    let agreement_ok = agreed_count >= 8;
+    let d_ok_both = d_run1 >= 3 && d_run2 >= 3;
+    let agreement_mark = if agreement_ok { "✓" } else { "✗" };
+    let d_mark = if d_ok_both { "✓" } else { "✗" };
+
+    let disposition_line = if !agreement_ok {
+        format!(
+            "d_run1={}, d_run2={}, agreement={}/{} → agreement≥8 {} → Revert (inability-to-measure)",
+            d_run1, d_run2, agreed_count, total, agreement_mark
+        )
+    } else if d_ok_both {
+        format!(
+            "d_run1={}, d_run2={}, agreement={}/{} → d≥3 on both runs {} AND agreement≥8 {} → Stay",
+            d_run1, d_run2, agreed_count, total, d_mark, agreement_mark
+        )
+    } else {
+        format!(
+            "d_run1={}, d_run2={}, agreement={}/{} → agreement≥8 {} AND d≥3 on both runs {} → Revert",
+            d_run1, d_run2, agreed_count, total, agreement_mark, d_mark
+        )
+    };
+    println!("{}", disposition_line);
 }
 
 // ---------------------------------------------------------------------------

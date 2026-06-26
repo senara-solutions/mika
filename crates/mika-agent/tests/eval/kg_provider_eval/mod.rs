@@ -351,12 +351,19 @@ async fn truncation_eval() {
     }
 
     println!(
-        "\n=== Truncation Comparison Eval: {} providers ===\n",
+        "\n=== Truncation Comparison Eval (two-run protocol, mika#766 §1): {} providers ===\n",
         active_providers.len()
     );
 
-    let outcomes = truncation_eval::run_truncation_eval(&active_providers).await;
-    truncation_eval::print_truncation_summary(&outcomes);
+    println!("--- Run 1 ---");
+    let outcomes_run1 = truncation_eval::run_truncation_eval(&active_providers).await;
+    truncation_eval::print_truncation_summary(&outcomes_run1);
+
+    println!("\n--- Run 2 (confirmatory) ---");
+    let outcomes_run2 = truncation_eval::run_truncation_eval(&active_providers).await;
+    truncation_eval::print_truncation_summary(&outcomes_run2);
+
+    truncation_eval::print_two_run_comparison(&outcomes_run1, &outcomes_run2);
 }
 
 #[cfg(test)]
