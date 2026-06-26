@@ -145,6 +145,36 @@ impl Tool for PrMergeWithGateTool {
             return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
         }
 
+        // -- Step 1b: Behind-main assertion (#1577) --
+        // Block merge if PR base is behind the current main HEAD.
+        // Fail-open: API errors log a warning and proceed.
+        match is_behind_main(&preflight.base_ref_oid, repo, token).await {
+            Ok(Some(info)) => {
+                let detail = format!(
+                    "PR is behind main — rebase needed. \
+                     PR base: {}, main HEAD: {}",
+                    info.pr_base_sha, info.current_main_sha
+                );
+                let result = MergeGateResult::Blocked {
+                    reason: BlockReason::BehindMain {
+                        pr_base_sha: info.pr_base_sha,
+                        current_main_sha: info.current_main_sha,
+                    },
+                    failing_checks: vec![],
+                    detail,
+                };
+                return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+            }
+            Ok(None) => {} // Up-to-date — proceed
+            Err(e) => {
+                warn!(
+                    pr_number,
+                    error = %e,
+                    "Failed to check behind-main status — proceeding with merge (fail-open)"
+                );
+            }
+        }
+
         // -- Step 2: Fetch required check statuses --
         let checks_result = run_gh_checks(pr_number, repo, token).await;
         let checks = match checks_result {
@@ -330,6 +360,12 @@ pub(crate) enum BlockReason {
     /// PR is a draft.
     #[serde(rename = "draft")]
     Draft,
+    /// PR base is behind the current main HEAD — rebase needed before merge.
+    #[serde(rename = "behind_main")]
+    BehindMain {
+        pr_base_sha: String,
+        current_main_sha: String,
+    },
 }
 
 /// Why the gate tool itself failed (infrastructure, not PR state).
@@ -390,6 +426,10 @@ pub(crate) struct PrPreflight {
     #[serde(default)]
     pub(crate) is_draft: bool,
     pub(crate) state: String,
+    /// The SHA of the base branch commit this PR was created against.
+    /// Used by the behind-main assertion (#1577) to detect stale PRs.
+    #[serde(default)]
+    pub(crate) base_ref_oid: String,
 }
 
 /// Error from `run_gh_pr_view` with optional exit code.
@@ -514,7 +554,7 @@ pub(crate) async fn run_gh_pr_view(
         "--repo",
         repo,
         "--json",
-        "mergeable,mergeStateStatus,isDraft,state",
+        "mergeable,mergeStateStatus,isDraft,state,baseRefOid",
     ];
 
     let output = run_gh_subprocess(&args, token).await.map_err(|e| {
@@ -560,6 +600,54 @@ pub(crate) async fn run_gh_checks(
 
     serde_json::from_str::<Vec<GhCheck>>(trimmed)
         .map_err(|e| format!("Failed to parse gh pr checks output: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Behind-main detection (#1577)
+// ---------------------------------------------------------------------------
+
+/// Info returned when a PR is behind main.
+#[derive(Debug, Clone)]
+pub(crate) struct BehindMainInfo {
+    pub(crate) pr_base_sha: String,
+    pub(crate) current_main_sha: String,
+}
+
+/// Fetch the current HEAD SHA of the default branch (`main`) via the GitHub API.
+///
+/// Uses `gh api repos/{repo}/git/ref/heads/main --jq .object.sha`.
+pub(crate) async fn fetch_main_head_sha(repo: &str, token: &str) -> Result<String, String> {
+    let endpoint = format!("repos/{repo}/git/ref/heads/main");
+    let args = vec!["api", &endpoint, "--jq", ".object.sha"];
+
+    let output = run_gh_subprocess(&args, token).await?;
+    let sha = output.trim().to_string();
+    if sha.is_empty() {
+        return Err("Empty SHA returned from GitHub API for main HEAD".to_string());
+    }
+    Ok(sha)
+}
+
+/// Check whether a PR is behind `main` by comparing its `baseRefOid` against
+/// the current main HEAD SHA.
+///
+/// Returns `Ok(Some(info))` when behind, `Ok(None)` when up-to-date,
+/// `Err` on API failure.
+pub(crate) async fn is_behind_main(
+    base_ref_oid: &str,
+    repo: &str,
+    token: &str,
+) -> Result<Option<BehindMainInfo>, String> {
+    let current_main_sha = fetch_main_head_sha(repo, token).await?;
+
+    if base_ref_oid != current_main_sha {
+        Ok(Some(BehindMainInfo {
+            pr_base_sha: base_ref_oid.to_string(),
+            current_main_sha,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Run `gh pr merge <number> --repo <repo> --<method> [--delete-branch] [--auto]`
@@ -1156,6 +1244,7 @@ mod tests {
             merge_state_status: "DIRTY".to_string(),
             is_draft: false,
             state: "OPEN".to_string(),
+            base_ref_oid: String::new(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -1175,6 +1264,7 @@ mod tests {
             merge_state_status: "DIRTY".to_string(),
             is_draft: false,
             state: "OPEN".to_string(),
+            base_ref_oid: String::new(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -1194,6 +1284,7 @@ mod tests {
             merge_state_status: "CLEAN".to_string(),
             is_draft: false,
             state: "OPEN".to_string(),
+            base_ref_oid: String::new(),
         };
         assert_eq!(classify_preflight(&preflight), None);
     }
@@ -1205,6 +1296,7 @@ mod tests {
             merge_state_status: "CLEAN".to_string(),
             is_draft: false,
             state: "CLOSED".to_string(),
+            base_ref_oid: String::new(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -1224,6 +1316,7 @@ mod tests {
             merge_state_status: "CLEAN".to_string(),
             is_draft: false,
             state: "MERGED".to_string(),
+            base_ref_oid: String::new(),
         };
         assert_eq!(
             classify_preflight(&preflight),
@@ -1238,6 +1331,7 @@ mod tests {
             merge_state_status: "CLEAN".to_string(),
             is_draft: true,
             state: "OPEN".to_string(),
+            base_ref_oid: String::new(),
         };
         let result = classify_preflight(&preflight);
         assert_eq!(
@@ -1263,6 +1357,7 @@ mod tests {
             merge_state_status: "DIRTY".to_string(),
             is_draft: false,
             state: "OPEN".to_string(),
+            base_ref_oid: String::new(),
         };
 
         let result = classify_preflight(&preflight);
@@ -1761,5 +1856,50 @@ mod tests {
             "https://github.com/senara-solutions/mika/pull/9",
         )
         .await;
+    }
+
+    // -- Behind-main assertion tests (#1577) --
+
+    #[test]
+    fn behind_main_block_reason_serializes_correctly() {
+        let result = MergeGateResult::Blocked {
+            reason: BlockReason::BehindMain {
+                pr_base_sha: "abc123".to_string(),
+                current_main_sha: "def456".to_string(),
+            },
+            failing_checks: vec![],
+            detail: "PR is behind main".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "blocked");
+        assert_eq!(json["reason"]["reason"], "behind_main");
+        assert_eq!(json["reason"]["pr_base_sha"], "abc123");
+        assert_eq!(json["reason"]["current_main_sha"], "def456");
+    }
+
+    #[test]
+    fn preflight_deserializes_base_ref_oid() {
+        let json = r#"{
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "isDraft": false,
+            "state": "OPEN",
+            "baseRefOid": "abc123def456"
+        }"#;
+        let preflight: PrPreflight = serde_json::from_str(json).unwrap();
+        assert_eq!(preflight.base_ref_oid, "abc123def456");
+    }
+
+    #[test]
+    fn preflight_base_ref_oid_defaults_to_empty() {
+        // Pre-existing gh output without baseRefOid should still deserialize
+        let json = r#"{
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "isDraft": false,
+            "state": "OPEN"
+        }"#;
+        let preflight: PrPreflight = serde_json::from_str(json).unwrap();
+        assert_eq!(preflight.base_ref_oid, "");
     }
 }
