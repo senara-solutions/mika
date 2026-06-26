@@ -22,8 +22,7 @@ Three defense-in-depth layers are needed: prompt-level prohibition in the dev-gr
 The dev-groom pilot operates inside a worktree with full bash access. The pilot's authorized scope is content-only: read the ticket, generate a plan, commit it. Git push is explicitly dispatch-lib's responsibility (`_push_branch`). However, the dev-groom skill prompt (`system_prompt.md`) contained no explicit force-push prohibition, and the pilot reasoned its way to `git push --force-with-lease` when it observed local/remote divergence.
 
 **Existing defenses (already shipped):**
-- `claude-pilot-py/src/claude_pilot/tier1.py:112-113` — TIER3 patterns hard-deny `git push --force` and `git push -f`
-- `claude-pilot-py/src/claude_pilot/tier1.py:375` — `_FORCE_FLAG_RE` blocks force flags in `is_safe_git_command()`
+- `claude-pilot-py/src/claude_pilot/tier1.py` — TIER3 patterns hard-deny `git push --force` and `git push -f` (grep `TIER3_DENIED`); `_FORCE_FLAG_RE` blocks force flags in `is_safe_git_command()` (grep `_FORCE_FLAG_RE`). Line numbers subject to drift.
 - `/mika-groom-plan-only` command prompt (mika-platform PR #134) — explicit force-push prohibition text
 - `dispatch-lib.sh::_push_branch` — sole git-push site for dev-groom dispatches
 
@@ -61,13 +60,33 @@ The dev-groom pilot operates inside a worktree with full bash access. The pilot'
 
 **Rationale:** Dev-groom pilots should never push at all — push is dispatch-lib's job. Dev-pilot pilots may push as part of the `/mika` pipeline (PR creation). The asymmetry in authority is the design: dev-groom is content-only, dev-pilot is content+workflow. Extending the guard to dev-pilot would require distinguishing "pilot pushed via gh pr create" (legitimate) from "pilot force-pushed arbitrarily" (violation) — a harder discrimination that isn't needed given dev-pilot's broader authority.
 
-### KTD-3: Detection via reflog `(forced update)` marker
+### KTD-3: Detection via remote-ref comparison (not reflog)
 
-**Decision:** Scan `git reflog show origin/<branch>` for entries containing `(forced update)` that occurred between `PRE_RUN_HEAD` capture and the post-flight check.
+**Decision:** Compare the remote branch state before and after the pilot session using `git ls-remote`. Before launching `_run_claude_pilot`, capture `PRE_RUN_REMOTE_HEAD=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)` (empty string if branch doesn't exist on remote yet). After the pilot exits (but before `_push_branch`), re-query: `POST_RUN_REMOTE_HEAD=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)`. If the two differ, the pilot pushed to the remote — a scope-of-authority violation for dev-groom (regardless of whether it was a force-push or a normal push, since the pilot should never push at all).
 
-**Rationale:** Git's reflog records push operations on remote-tracking refs. A force-push produces an entry with the `(forced update)` suffix. By checking whether any such entries exist for `origin/$BRANCH` in the worktree's reflog, we can detect pilot force-pushes without parsing SDK transcripts. The reflog is local to the worktree and survives until worktree cleanup.
+**Rationale:** The original plan proposed `git reflog show refs/remotes/origin/$BRANCH` scanning for `(forced update)` markers. However, the `(forced update)` marker is reliably observed in `git push` stderr output (as shown in the mika#1318 incident transcript), but its presence in `git reflog show` output for remote-tracking refs is not empirically verified in our environment. The reflog on remote-tracking refs is a local cache that may behave differently across git versions and worktree configurations. The `git ls-remote` approach queries the actual remote state — it is authoritative, version-independent, and trivially verifiable. It also catches *any* pilot push (not just force-pushes), which is the correct detection surface for dev-groom: the pilot should never push at all.
 
-**Limitation:** The reflog on the remote-tracking ref is only updated if `git push` actually ran from this worktree. If the pilot somehow pushed from a different path (extremely unlikely in the worktree-isolated architecture), it wouldn't appear here. This is an acceptable gap — the worktree is the pilot's only working directory.
+**Trade-off:** `git ls-remote` requires network access to the remote. This is acceptable because `_push_branch` (which runs immediately after this check) also requires network access — if the remote is unreachable, the entire post-flight phase fails anyway. The additional round-trip adds ~1s latency.
+
+**Limitation:** If the remote branch was updated by an unrelated actor (another developer, CI) between `PRE_RUN_REMOTE_HEAD` capture and the post-flight check, a false positive occurs. This is extremely unlikely for dev-groom branches (which are worktree-isolated, short-lived, and named after the issue number) and would only result in a conservative PIPELINE_INCOMPLETE — not data loss. The operator can inspect the RESULT envelope's evidence field and dismiss the false positive.
+
+### Recovery posture (what happens after the guard fires)
+
+When the force-push guard detects a pilot push and fires:
+
+**Remote state:** The pilot's destructive push remains on the remote branch. dispatch-lib does NOT push over it (the guard fires *before* `_push_branch`), and does NOT attempt to restore `PRE_RUN_REMOTE_HEAD`. Automatic remote recovery is deliberately out of scope — a `git push --force` to restore prior state carries its own blast radius and should be an operator decision.
+
+**Local state:** The worktree retains the pilot's commits. `POST_RUN_HEAD` reflects the pilot's final local state. The worktree is not cleaned up early — it remains available for operator forensics until the normal cleanup path runs.
+
+**Callback state:** The RESULT envelope delivered to mika-dev contains `STRUCTURAL VIOLATION: pilot push detected (mika#1318)` with evidence (both `PRE_RUN_REMOTE_HEAD` and `POST_RUN_REMOTE_HEAD` SHAs). Outcome is `PIPELINE_INCOMPLETE — push violation`. mika-dev surfaces this to the operator.
+
+**Operator recovery steps:**
+1. Inspect the RESULT envelope to confirm the violation (false positive check).
+2. If genuine: `git push --force origin <PRE_RUN_REMOTE_HEAD>:refs/heads/<branch>` to restore the remote branch to its pre-pilot state.
+3. If the pre-pilot state was the correct plan commit from a prior groom pass: re-dispatch the groom or manually fix and push.
+4. If the branch had unrelated work (the mika#1318 incident pattern): recover from the other contributor's local state or reflog.
+
+The guard is forensic, not restorative. It converts a silent failure into a loud, actionable one. (Citation: review-guide.md § Single Responsibility — the guard's single responsibility is detection + reporting, not recovery.)
 
 ---
 
@@ -128,9 +147,13 @@ This mirrors the existing prohibition in `/mika-groom-plan-only` (mika-platform 
 
 1. Guards on `$SKILL = "dev-groom"` — returns 0 (no violation) for all other skills (R5).
 2. Guards on `$WORKTREE_DIR` being set and existing.
-3. Checks `git -C "$WORKTREE_DIR" reflog show "refs/remotes/origin/$BRANCH" 2>/dev/null` for lines containing `(forced update)`.
-4. If found, sets `FORCE_PUSH_DETECTED=1` and captures the reflog line(s) into `FORCE_PUSH_EVIDENCE`.
+3. Compares `PRE_RUN_REMOTE_HEAD` (captured before pilot launch via `git ls-remote origin "refs/heads/$BRANCH" | cut -f1`) with `POST_RUN_REMOTE_HEAD` (queried after pilot exit via the same command). If they differ, the pilot pushed to the remote — a scope-of-authority violation.
+4. If detected, sets `PUSH_VIOLATION_DETECTED=1` and captures both SHAs into `PUSH_VIOLATION_EVIDENCE`.
 5. Returns 1 (violation detected).
+
+**Callsite convention (per review-guide.md § KISS):** `dispatch_claude_pilot()` calls `_check_pilot_force_push` **unconditionally** — the function handles skill-scoping internally via the `$SKILL = "dev-groom"` early-return guard. This avoids duplicating the skill-check logic at the callsite and keeps the dispatch function's flow linear.
+
+**Pre-capture site:** `PRE_RUN_REMOTE_HEAD` must be captured in `dispatch_claude_pilot()` *before* `_run_claude_pilot` is invoked. Add it adjacent to the existing `PRE_RUN_HEAD` capture (local HEAD), so both pre-run anchors are co-located.
 
 Call `_check_pilot_force_push` in `dispatch_claude_pilot()` after `_run_claude_pilot` returns and after the post-flight diff check block, but before the `_iterate_groom_loop` call. If violation detected:
 - Prepend a `STRUCTURAL VIOLATION: pilot force-push detected (mika#1318)` block to RESULT with the reflog evidence.
@@ -146,20 +169,20 @@ The guard placement (after post-flight diff check, before iterate loop) ensures:
 **Patterns to follow:** The existing post-flight diff check (`PRE_RUN_HEAD = POST_RUN_HEAD`) and policy-deny pre-check (Class C disambiguation) at dispatch-lib.sh:704-750 are the structural pattern — a guard that reads evidence from the worktree/stderr and annotates RESULT before the next dispatch phase.
 
 **Test scenarios:**
-- Happy path: dev-groom dispatch with no force-push — guard returns 0, dispatch proceeds normally to iterate loop.
-- Force-push detected: reflog contains `(forced update)` for `origin/$BRANCH` — guard returns 1, RESULT contains `STRUCTURAL VIOLATION`, Outcome is `PIPELINE_INCOMPLETE`, `_iterate_groom_loop` is skipped.
-- Dev-pilot dispatch: `$SKILL = "dev-pilot"` — guard returns 0 regardless of reflog state (R5).
+- Happy path: dev-groom dispatch with no pilot push — `PRE_RUN_REMOTE_HEAD == POST_RUN_REMOTE_HEAD`, guard returns 0, dispatch proceeds normally to iterate loop.
+- Pilot push detected: `PRE_RUN_REMOTE_HEAD != POST_RUN_REMOTE_HEAD` for a dev-groom dispatch — guard returns 1, RESULT contains `STRUCTURAL VIOLATION`, Outcome is `PIPELINE_INCOMPLETE`, `_iterate_groom_loop` is skipped.
+- Dev-pilot dispatch: `$SKILL = "dev-pilot"` — guard returns 0 regardless of remote state (R5, early-return on skill check).
 - No worktree: `$WORKTREE_DIR` is empty — guard returns 0 (free-text mode, no worktree to scan).
-- Empty reflog: `origin/$BRANCH` has no reflog entries (first push hasn't happened yet) — guard returns 0.
-- Reflog command fails: git reflog exits non-zero (corrupt worktree) — guard returns 0 (fail-open, not fail-closed — a reflog failure shouldn't block a legitimate dispatch).
+- Branch not on remote: `PRE_RUN_REMOTE_HEAD` is empty (branch doesn't exist on remote yet), `POST_RUN_REMOTE_HEAD` is also empty — guard returns 0 (no push occurred). If `POST_RUN_REMOTE_HEAD` is non-empty, pilot created the remote branch — violation detected.
+- Network failure: `git ls-remote` exits non-zero — guard returns 0 (fail-open, not fail-closed — a network failure shouldn't block a legitimate dispatch; `_push_branch` will fail independently if the remote is truly unreachable).
 
-**Verification:** Run `test_force_push_guard.sh` — all scenarios pass. Deploy and verify Signal M (see U3) appears in server logs on the first dev-groom dispatch.
+**Verification:** Run `test_force_push_guard.sh` — all scenarios pass. Deploy and verify the pilot push guard Signal (see U3) appears in server logs on the first dev-groom dispatch.
 
 ---
 
 ### U3. Signal documentation for post-deploy verification
 
-**Goal:** Add a Signal M entry to `CLAUDE.md` so operators can verify force-push detection is active after deploy.
+**Goal:** Add a new Signal entry to `CLAUDE.md` so operators can verify force-push detection is active after deploy.
 
 **Requirements:** R6
 
@@ -168,15 +191,15 @@ The guard placement (after post-flight diff check, before iterate loop) ensures:
 **Files:**
 - `CLAUDE.md`
 
-**Approach:** Add `Signal M — pilot force-push guard` to the existing Signal list in the `### Post-restart safety check (#757)` section. The signal is:
+**Approach:** Add the next available Signal letter (verify against `CLAUDE.md` at implementation time — currently Signal L is the last entry, so the next is Signal M; if another PR ships a Signal M before this one, use Signal N) as `Signal <letter> — pilot push guard` to the existing Signal list in the `### Post-restart safety check (#757)` section. The signal is:
 
 ```
-grep force_push_guard server.log
+grep pilot_push_guard server.log
 ```
 
 Two sub-events:
-- `force_push_guard.clean` — guard ran, no violation detected (expected on every dev-groom dispatch).
-- `force_push_guard.violation` — guard ran, force-push detected (should never appear; investigate immediately if it does).
+- `pilot_push_guard.clean` — guard ran, no violation detected (expected on every dev-groom dispatch).
+- `pilot_push_guard.violation` — guard ran, pilot push detected (should never appear; investigate immediately if it does).
 
 Since dispatch-lib writes to stderr (not structured JSON logs), the signal is emitted via `echo` to stderr with a structured prefix that the operator can grep. This follows the existing dispatch-lib diagnostic pattern (e.g., `push_branch:` at line 1267).
 
@@ -185,7 +208,7 @@ Since dispatch-lib writes to stderr (not structured JSON logs), the signal is em
 **Test scenarios:**
 - Test expectation: none — documentation-only change.
 
-**Verification:** Read `CLAUDE.md` and confirm Signal M is present with both sub-event descriptions.
+**Verification:** Read `CLAUDE.md` and confirm the pilot push guard Signal is present with both sub-event descriptions, using the correct next-available letter.
 
 ---
 
@@ -199,8 +222,11 @@ None — all design decisions are resolved. The tier1/TIER3 layer is the primary
 
 - mika#1318 issue body — incident transcript, evidence, latent risk framing
 - mika#1318 comment (PR #134 draft) — prompt-layer half already shipped on mika-platform
-- `claude-pilot-py/src/claude_pilot/tier1.py:110-133` — existing TIER3 deny patterns (confirmed `git push --force` and `git push -f` are hard-denied)
-- `claude-pilot-py/src/claude_pilot/tier1.py:366-382` — `is_safe_git_command()` blocks force flags from auto-approval
-- `skills/bundled/_shared/dispatch-lib.sh:1185-1280` — `_push_branch` (sole push site, legitimate force-with-lease for rebased branches)
-- `skills/bundled/_shared/dispatch-lib.sh:704-750` — post-flight diff check pattern (structural model for U2)
-- `skills/bundled/_shared/dispatch-lib.sh:1883-2000` — `_iterate_groom_loop` (must be skipped on force-push violation)
+- `claude-pilot-py/src/claude_pilot/tier1.py` — existing TIER3 deny patterns (confirmed `git push --force` and `git push -f` are hard-denied) and `is_safe_git_command()` force-flag blocking. Line numbers approximate as of plan date (2026-06-26); grep for `TIER3_DENIED` and `_FORCE_FLAG_RE` for current locations.
+- `skills/bundled/_shared/dispatch-lib.sh` — `_push_branch` (sole push site, legitimate force-with-lease for rebased branches), post-flight diff check pattern (structural model for U2), `_iterate_groom_loop` (must be skipped on push violation). Line numbers approximate; grep for function names for current locations.
+
+---
+
+## Revision history
+
+- rev 2 (2026-06-26): addressed F1 by replacing unverified reflog `(forced update)` detection with authoritative `git ls-remote` remote-ref comparison (pre/post pilot session); addressed F2 by adding "Recovery posture" section documenting remote state, local state, callback state, and operator recovery steps after the guard fires (citation: review-guide.md § Single Responsibility); addressed F3 by stating explicitly that `dispatch_claude_pilot()` calls `_check_pilot_force_push` unconditionally with internal skill-scoping (citation: review-guide.md § KISS); addressed F4 by replacing hardcoded "Signal M" with "next available letter" + verification instruction to check CLAUDE.md at implementation time; addressed F5 by replacing brittle line-number references with grep-for-symbol instructions and noting references are approximate as of plan date.
