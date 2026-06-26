@@ -26,6 +26,18 @@ The autonomous loop has retry counters per verdict class but no **diff-equivalen
 
 ---
 
+## Acceptance criteria
+
+- **AC1 (R1):** On each `block[ac]` or `block[ci]` verdict that triggers a re-dispatch, the verdict handler fetches the PR's head commit SHA (`headRefOid`) before dispatching. If the fetch fails, the circuit breaker is skipped (fail-open) and the existing retry-count path runs.
+- **AC2 (R2):** The diff fingerprint history is persisted in the task's metadata JSON under a `verdict_diff_fingerprints` array. Each entry contains `sha`, `verdict` class, and `at` (ISO 8601 UTC timestamp).
+- **AC3 (R3):** When the same `headRefOid` has appeared in ≥3 entries in `verdict_diff_fingerprints` (across any verdict class), the verdict handler halts re-dispatch, marks the task `blocked`, and sends an operator notification.
+- **AC4 (R4):** When the circuit breaker fires, a structured log event named `identical_diff_circuit_breaker` is emitted with fields `pr_number`, `repo`, `task_id`, `head_sha`, `identical_count`, `verdict_class`, and `trace_id`. An audit event is written with `target_key = "identical_diff_circuit_breaker"`.
+- **AC5 (R5):** The `hold[review]` pre-digest includes the current diff fingerprint and the identical-diff rejection count. When the count ≥ threshold, the pre-digest includes an explicit circuit-breaker warning line.
+- **AC6 (R6):** When the PR's `headRefOid` changes between rejections (indicating forward progress), the circuit breaker does not fire — only consecutive identical SHAs are counted.
+- **AC7 (R7):** The identical-diff circuit breaker check executes before the generic `read_verdict_retry_count()` check. When both conditions would trigger simultaneously, the identical-diff halt takes precedence.
+
+---
+
 ## Key Technical Decisions
 
 **KTD-1: Diff fingerprint = `headRefOid` (PR head commit SHA).**
