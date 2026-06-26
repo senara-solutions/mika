@@ -1354,7 +1354,7 @@ Rules:
             "Your previous response was not valid JSON. The output was:\n{}\n\n\
              Please return ONLY a valid JSON object with \"entities\" and \"relationships\" arrays. \
              No markdown fencing, no explanation, no text outside the JSON.",
-            mika_common::text::truncate_at_semantic_boundary(bad_output, 500)
+            mika_common::text::safe_truncate(bad_output, 500)
         );
 
         let mut retry_request = original_request.clone();

@@ -297,18 +297,106 @@ if any of these change materially:
 A re-run produces a new dated decision doc; this one stays in history as
 the record of the original answer.
 
-## §2 — Measurement (filled in Commit B; do not edit §1 in the same commit)
+## §2 — Measurement (Commit B)
 
-*Pending — will be filled after running:*
+Eval invocation:
 
 ```bash
+git rev-parse HEAD   # 967f165d05a76ce65b5b4f17c204ce8bea8463ed (Commit A-prime, SHA-pinned by §1)
+date -Iseconds       # 2026-06-26T13:47:49+02:00 (Run 1 start)
 MIKA_EVAL_KG_PROVIDERS=openrouter/google/gemini-2.5-flash-lite \
   cargo test -p mika-agent --test eval truncation_eval -- --ignored --nocapture
 ```
 
-Sibling raw-output doc:
-`docs/solutions/kg/truncation-quality-comparison-2026-06-26.md`
+Sibling raw-output doc with full per-case detail:
+[`truncation-quality-comparison-2026-06-26.md`](truncation-quality-comparison-2026-06-26.md).
 
-## §3 — Disposition (filled in Commit B; do not edit §1 in the same commit)
+### Run 1 — per-case outcomes
 
-*Pending — will be derived from §2 against the decision rule in §1.*
+| Case | Byte correct | Semantic correct |
+|---|---|---|
+| `problem_type:state_drift` | ✓ | ✓ |
+| `skill:self_dev` | ✓ | ✓ |
+| `tool:pr_merge_with_gate` | ✓ | ✓ |
+| `pattern:two_layer_deploy_guard` | ✗ | ✗ |
+| `agent:mika_arch` | ✓ | ✓ |
+| `problem_type:fabrication` | ✓ | ✓ |
+| `concept:dispatch_slot` | ✓ | ✓ |
+| `skill:qa_review` | ✓ | ✓ |
+| `failure_mode:context_leak` | ✓ | ✓ |
+| `tool:resolve_issue_order` | ✓ | ✓ |
+
+Totals: byte 9/10, semantic 9/10. `d_run1 = 0`.
+
+### Run 2 — per-case outcomes
+
+| Case | Byte correct | Semantic correct |
+|---|---|---|
+| `problem_type:state_drift` | ✓ | ✓ |
+| `skill:self_dev` | ✓ | ✓ |
+| `tool:pr_merge_with_gate` | ✓ | ✓ |
+| `pattern:two_layer_deploy_guard` | ✗ | ✗ |
+| `agent:mika_arch` | ✓ | ✓ |
+| `problem_type:fabrication` | ✓ | ✓ |
+| `concept:dispatch_slot` | ✓ | ✓ |
+| `skill:qa_review` | ✓ | ✓ |
+| `failure_mode:context_leak` | ✓ | ✓ |
+| `tool:resolve_issue_order` | ✓ | ✓ |
+
+Totals: byte 9/10, semantic 9/10. `d_run2 = 0`.
+
+### Per-case agreement
+
+All 10 cases produced identical `(byte_correct, semantic_correct)`
+tuples between Run 1 and Run 2. **Agreement = 10/10.**
+
+### Mechanical disposition line (verbatim from harness)
+
+```
+d_run1=0, d_run2=0, agreement=10/10 → agreement≥8 ✓ AND d≥3 on both runs ✗ → Revert
+```
+
+### Run timestamps (model-revision drift visibility per honesty clause)
+
+- Run 1 start: 2026-06-26T13:47:49+02:00
+- Run 2 start: immediately after Run 1 (~20s total wall clock for both)
+- Eval host: gentux (operator desktop)
+- Provider name+model at run time: `openrouter/google/gemini-2.5-flash-lite`
+
+## §3 — Disposition (Commit B)
+
+**Disposition: Revert.**
+
+Applied per §1's revert clause as Commit B (this commit):
+
+- Reverted `crates/mika-common/src/text.rs` to `main` —
+  `truncate_at_semantic_boundary` and its 11 unit tests removed from
+  production code.
+- Reverted `crates/mika-agent/src/kg/entity_resolver.rs` to `main` —
+  two call sites in `disambiguation_prompt` and the LLM-retry path
+  restored to `safe_truncate`; the
+  `disambiguation_prompt_uses_semantic_truncation` integration test
+  removed (no longer load-bearing).
+- Reverted `crates/mika-agent/src/kg/subject_extractor.rs` to `main` —
+  retry-prompt call site restored to `safe_truncate`.
+
+**One interpretive call documented here** (§1's revert clause has an
+internal tension worth naming): §1's "Revert" set names
+`truncate_at_semantic_boundary` AND §1's "Keep" set requires the eval
+harness, which references that function. Strict deletion would break
+the harness. Resolved by relocating the function from
+`mika_common::text` into the test harness
+(`crates/mika-agent/tests/eval/kg_provider_eval/truncation_eval.rs`) as
+a private helper. Production code does not have the function; the eval
+keeps a self-contained reference implementation for any future re-run
+of the question (bigger fixture, different model). This honors §1's
+intent (production goes back to byte-truncation; eval infrastructure
+survives for re-litigation) rather than the literal letter (which is
+self-contradictory).
+
+mika#766 closes as won't-do (empirical: not measurably better at the
+current fixture+budget+production model). The eval harness, fixtures,
+and these two decision docs are retained as reusable infrastructure.
+If the question reopens against a different model or a larger fixture,
+the next iteration produces a new dated decision doc; this one stays
+in history as the record of the original answer.

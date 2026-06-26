@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use mika_common::llm::LlmProvider;
 use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
-use mika_common::text::{safe_truncate, truncate_at_semantic_boundary};
+use mika_common::text::safe_truncate;
 use serde::{Deserialize, Serialize};
 
 use super::KgProviderSpec;
@@ -92,6 +92,31 @@ pub struct TruncationComparisonOutcome {
 
 /// Lowered budget to ensure truncation triggers on most cases.
 const TRUNCATION_BUDGET: usize = 500;
+
+/// Truncate prose at the last sentence-ending punctuation (`. ! ?`) within
+/// the budget, falling back to `safe_truncate` if no boundary exists or
+/// the boundary would use less than 50% of the budget.
+///
+/// Eval-local helper for the truncation comparison harness. Lives here
+/// (not in `mika_common::text`) because the empirical decision in
+/// mika#766 (2026-06-26) reverted the production usage of semantic
+/// truncation — the function survives only as eval infrastructure for
+/// any future re-run of the question (e.g., bigger fixture, different
+/// model). Mirrors the implementation that was tested.
+fn truncate_at_semantic_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let limit = s.floor_char_boundary(s.len().min(max_bytes));
+    let min_utilization = max_bytes / 2;
+    if let Some(end) = s[..limit].rfind(['.', '!', '?']) {
+        let boundary = end + s[end..].chars().next().map_or(0, |c| c.len_utf8());
+        if boundary >= min_utilization {
+            return &s[..boundary];
+        }
+    }
+    safe_truncate(s, max_bytes)
+}
 
 // ---------------------------------------------------------------------------
 // Runner

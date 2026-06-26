@@ -1585,7 +1585,7 @@ impl SubjectEntityResolver {
             "Your previous response was not valid JSON. The output was:\n{}\n\n\
              Please return ONLY a valid JSON object: {{\"match\": \"<entity_key>\" | null, \"confidence\": 0.0-1.0}}\n\
              No markdown fencing, no explanation, no text outside the JSON.",
-            mika_common::text::truncate_at_semantic_boundary(bad_output, 500)
+            mika_common::text::safe_truncate(bad_output, 500)
         );
 
         let mut retry_request = original_request.clone();
@@ -1791,7 +1791,7 @@ Rules:
     if !chunk_context.is_empty() {
         user.push_str(&format!(
             "\nSource prose:\n{}\n",
-            mika_common::text::truncate_at_semantic_boundary(chunk_context, 2000)
+            mika_common::text::safe_truncate(chunk_context, 2000)
         ));
     }
 
@@ -2639,65 +2639,6 @@ mod tests {
         assert!(
             resolution.is_none(),
             "no resolution row should be written for empty type bucket"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Semantic truncation integration test (#766)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn disambiguation_prompt_uses_semantic_truncation() {
-        // A chunk_context that would produce a mid-sentence cut at byte 2000
-        // but has a sentence boundary within the budget.
-        let mut context = String::new();
-        // Build ~1960 bytes of complete sentences (49 * 40 = 1960)
-        for _ in 0..49 {
-            context.push_str("The CI pipeline completed successfully. ");
-        }
-        // Add a final sentence that pushes past 2000 bytes and would be cut
-        // mid-way if using byte-level truncation only
-        context.push_str(
-            "This is a longer sentence that extends past the two thousand byte mark \
-             and would be truncated in the middle if we used byte-level truncation only",
-        );
-        assert!(context.len() > 2000);
-
-        let entity = PendingEntity {
-            id: 1,
-            entity_key: "problem_type:ci_failure".to_string(),
-            entity_type: "problem_type".to_string(),
-            name: "ci_failure".to_string(),
-            confidence: 0.85,
-            docs_root_hash: "0000000000000000".to_string(),
-            was_invalidated: false,
-            discovered: false,
-        };
-
-        let candidates = vec![DomainCandidate {
-            id: 10,
-            entity_key: "problem_type:ci_failure".to_string(),
-            properties_json: Some(r#"{"description":"CI pipeline failure"}"#.to_string()),
-        }];
-
-        let (_system, user) = build_disambiguation_prompt(&entity, &candidates, &context);
-
-        // The "Source prose:" section should end at a sentence boundary
-        let prose_start = user.find("Source prose:\n").unwrap() + "Source prose:\n".len();
-        let prose_end = user.find("\nCandidates:").unwrap();
-        let prose_section = user[prose_start..prose_end].trim();
-
-        // Should end at a period (sentence boundary), not mid-word
-        assert!(
-            prose_section.ends_with('.'),
-            "disambiguation prompt should truncate at sentence boundary, \
-             but got trailing: ...'{}'",
-            &prose_section[prose_section.len().saturating_sub(40)..],
-        );
-        // Should be shorter than original (truncation happened)
-        assert!(
-            prose_section.len() < context.len(),
-            "context should have been truncated"
         );
     }
 }
