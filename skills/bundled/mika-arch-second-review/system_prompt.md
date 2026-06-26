@@ -67,6 +67,8 @@ This is the structural guarantee: `GROOMED` cannot be emitted without the sectio
 1. Non-empty `## Acceptance criteria` section present ⇒ gate passes (continue to verdict).
 2. Section missing or empty ⇒ `ESCALATE` with a BLOCKING F-finding (the section was required by the first-pass Acceptance-Criteria Gate and remains absent).
 
+**Gate precedence:** any `ESCALATE` from this gate or the Unresolved-Decision Gate wins over `GROOMED` — emit the union of all F-findings under the `ESCALATE` verdict.
+
 ### Output
 
 Return the annotated revised plan content as a single string, followed by a blank line and an explicit verdict:
