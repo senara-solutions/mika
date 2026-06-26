@@ -170,6 +170,15 @@ The `mika-platform-dev` actor has `bypass_mode: always` on the senara-solutions/
 
 ---
 
+## Acceptance criteria
+
+1. New `BlockReason::BehindMain { pr_base_sha, current_main_sha }` variant on `MergeGateResult`.
+2. The four merge sites listed above all check up-to-date-ness before calling `run_gh_merge` (immediate-merge case) or enabling auto-merge. If behind, no merge attempt; structured block returned.
+3. Unit tests for the `BehindMain` block path in each of the four sites.
+4. `BlockReason::BehindMain` carries `pr_base_sha` and `current_main_sha` so the recovery digest can reference them.
+
+---
+
 ## Scope Boundaries
 
 ### In scope
