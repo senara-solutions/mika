@@ -1543,6 +1543,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bundled_skills_no_cross_skill_tool_name_collision() {
+        // AC2: No two bundled skills may declare the same tool name.
+        // This catches collisions at compile-test time, before they reach
+        // production as silent last-write-wins shadows (mika#1326).
+        //
+        // Intentionally stricter than AC2's "different handler types"
+        // criterion: we flag ALL same-name declarations regardless of
+        // handler type. Rationale: even same-handler-type collisions
+        // indicate a manifest hygiene issue (redundant declarations),
+        // and the cost of flagging them is zero (fix is to remove the
+        // duplicate).
+
+        use std::collections::HashMap;
+
+        let all_skills = all_bundled_skills();
+        let mut tool_owners: HashMap<String, Vec<String>> = HashMap::new();
+
+        for skill in &all_skills {
+            let tools_json = skill.files.iter().find(|f| f.path == "tools.json");
+            let Some(tools_json) = tools_json else {
+                continue;
+            };
+
+            let tool_defs: Vec<serde_json::Value> = match serde_json::from_str(tools_json.content) {
+                Ok(t) => t,
+                Err(_) => continue, // Malformed tools.json caught by other tests
+            };
+
+            for tool_def in &tool_defs {
+                if let Some(name) = tool_def.get("name").and_then(|n| n.as_str()) {
+                    tool_owners
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(skill.name.to_string());
+                }
+            }
+        }
+
+        let collisions: Vec<(&String, &Vec<String>)> = tool_owners
+            .iter()
+            .filter(|(_, owners)| owners.len() > 1)
+            .collect();
+
+        assert!(
+            collisions.is_empty(),
+            "Bundled skill tool name collisions detected (mika#1326):\n{}",
+            collisions
+                .iter()
+                .map(|(tool, owners)| format!(
+                    "  tool '{}' declared by: {}",
+                    tool,
+                    owners.join(", ")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     // Shared fixtures for merge-semantics tests — call `merge_skill_lists`
     // directly so the production merge function is the unit under test.
     // Previously the test re-implemented the merge algorithm locally, which

@@ -74,28 +74,45 @@ Add a new test `test_bundled_skills_no_cross_skill_tool_name_collision`:
 ```rust
 #[test]
 fn test_bundled_skills_no_cross_skill_tool_name_collision() {
-    // AC2: No two bundled skills may declare the same tool name.
-    // This catches collisions at compile-test time, before they
-    // reach production as silent last-write-wins shadows (mika#1326).
+    // AC2: No two bundled skills may declare the same tool name
+    // with different handler types. This catches collisions at
+    // compile-test time, before they reach production as silent
+    // last-write-wins shadows (mika#1326).
+    //
+    // Intentionally stricter than AC2's "different handler types"
+    // criterion: we flag ALL same-name declarations regardless of
+    // handler type. Rationale: even same-handler-type collisions
+    // indicate a manifest hygiene issue (redundant declarations),
+    // and the cost of flagging them is zero (fix is to remove the
+    // duplicate). The ticket's handler-type filter was scoped to
+    // the concrete incident; the invariant is stronger.
 
     let all_skills = all_bundled_skills();
     let mut tool_owners: HashMap<String, Vec<String>> = HashMap::new();
 
     for skill in &all_skills {
-        // Find tools.json in embedded files
+        // Find tools.json in embedded files — same pattern as
+        // test_engine_referenced_tool_names_are_loader_reachable
         let tools_json = skill.files.iter().find(|f| f.path == "tools.json");
         let Some(tools_json) = tools_json else { continue };
 
-        let tools: Vec<SkillToolDef> = match serde_json::from_str(tools_json.content) {
+        // Parse as Vec<serde_json::Value> — matches the adjacent test's
+        // deserialization pattern (verified against
+        // test_engine_referenced_tool_names_are_loader_reachable at
+        // bundled_skills.rs:1464). SkillToolDef requires handler
+        // deserialization which is unnecessary for name-only extraction.
+        let tool_defs: Vec<serde_json::Value> = match serde_json::from_str(tools_json.content) {
             Ok(t) => t,
             Err(_) => continue, // Malformed tools.json caught by other tests
         };
 
-        for tool in &tools {
-            tool_owners
-                .entry(tool.definition.name.clone())
-                .or_default()
-                .push(skill.name.to_string());
+        for tool_def in &tool_defs {
+            if let Some(name) = tool_def.get("name").and_then(|n| n.as_str()) {
+                tool_owners
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(skill.name.to_string());
+            }
         }
     }
 
@@ -118,7 +135,11 @@ fn test_bundled_skills_no_cross_skill_tool_name_collision() {
 
 **What this catches:** Any new bundled skill added to `skills/bundled/` that reuses a tool name already claimed by another skill will fail `cargo test` before merge. This is the same `all_bundled_skills()` function used at runtime, so the test is authoritative.
 
-**Imports needed:** `SkillToolDef` from `crate::skills::manifest` (check if already in scope from adjacent tests; if not, add a `use` import).
+**Verified API shape:** `all_bundled_skills()` returns `Vec<&'static BundledSkill>` (`bundled_skills.rs:216`). `BundledSkill` has `name: &'static str` and `files: &'static [SkillFile]`. `SkillFile` has `path: &'static str` and `content: &'static str` (`bundled_skills.rs:35–40`). The iteration pattern `skill.files.iter().find(|f| f.path == "tools.json")` followed by `tools_json.content` matches the adjacent test at line 1464.
+
+**Deserialization type:** Uses `Vec<serde_json::Value>` with `tool_def.get("name")` — the same pattern as the adjacent `test_engine_referenced_tool_names_are_loader_reachable` test (line 1465). This avoids importing `SkillToolDef` from `crate::skills::manifest` and sidesteps handler-deserialization complexity that is unnecessary for name extraction. No new imports needed beyond `serde_json` (already in scope from the adjacent test).
+
+**AC2 spec divergence (acknowledged):** The ticket's AC2 specifies "same tool name with different handler types." This test intentionally applies a stricter criterion — flagging any same-name collision regardless of handler type. Rationale: same-handler-type collisions indicate a manifest hygiene issue (redundant declarations), and the false-positive cost is zero (fix is to remove the duplicate). The stricter criterion is a superset of the ticket's criterion, so no AC2 coverage gap exists.
 
 ### IU3: Update Existing Collision Test (AC1 companion)
 
@@ -184,3 +205,6 @@ fn test_build_skill_tool_map_collision_logs_both_skills() {
 - mika#1326 dispatch scope comment (2026-06-26) — the authority for this subset
 - mika#1220, mika#1224, mika#1196 — all CLOSED; reload-surface design deferred
 - `docs/solutions/logic-errors/builtin-skill-tool-name-shadowing.md` — related but distinct (dispatcher precedence vs HashMap construction)
+
+## Revision history
+- rev 2 (2026-06-26): addressed F1 by switching IU2's deserialization from `SkillToolDef` (unverified assumption — `SkillToolDef` has `name` directly, not `definition.name`, and requires handler deserialization unnecessary for name extraction) to `Vec<serde_json::Value>` with `tool_def.get("name")`, matching the adjacent `test_engine_referenced_tool_names_are_loader_reachable` pattern verified at `bundled_skills.rs:1464`; addressed F2 by documenting the verified API shape of `all_bundled_skills() -> Vec<&'static BundledSkill>`, `BundledSkill.{name, files}`, and `SkillFile.{path, content}` with line-number citations confirming the iteration pattern compiles; addressed F3 by acknowledging the AC2 spec divergence (plan flags all same-name collisions, ticket specifies different-handler-type only) with explicit rationale for the stricter criterion (zero false-positive cost, superset coverage).
