@@ -26,7 +26,16 @@ imports, making extraction impossible without restructuring.
 ## Solution
 
 Extracted shared components into `@senara-solutions/ui` — a Vite library-mode npm package
-published to GitHub Packages via npm workspaces.
+published via npm workspaces.
+
+> **Update 2026-06-26 (mika#1386):** the publish registry migrated from **GitHub Packages**
+> (`npm.pkg.github.com`) to **npmjs.org** as a public package. GitHub Packages' npm registry
+> has no anonymous read path (401 on every unauthenticated read, even for public packages),
+> which made the "public" lib un-installable without a `read:packages` token — friction for
+> every open-core consumer. The package is now published with `access: public` and installs
+> token-free. The GitHub-Packages-specific notes below (registry URLs, `GITHUB_TOKEN` auth,
+> `read:packages` PAT requirement) are retained as historical context; the current registry is
+> `https://registry.npmjs.org/`.
 
 ### 1. Workspace Setup
 
@@ -148,7 +157,7 @@ package during development; published version from GitHub Packages in production
 |----------|-----------|
 | Peer deps for React/Tailwind | Avoids duplication in consumer bundles |
 | Direct deps for react-markdown | Only MarkdownContent needs it; avoids consumer burden |
-| GitHub Packages over npm.org | Internal distribution; scoped package |
+| npmjs.org public package (was GitHub Packages until mika#1386) | Token-free anonymous install for open-core; GitHub Packages npm has no anonymous read path |
 | ES-only output | Modern tooling; smaller bundle; tree-shakeable |
 | Separate theme.css export | Consumers can use components without theme |
 | Wildcard version in dashboard | Workspace resolution handles local dev seamlessly |
