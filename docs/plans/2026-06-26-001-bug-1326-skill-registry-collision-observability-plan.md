@@ -23,6 +23,15 @@ This plan covers **AC1 + AC2 only** — the freeze-safe subset identified in the
 - mika#1224 (qa-review loaded despite allowlist): **CLOSED** — no change to boundary
 - mika#1196 (validate_qa_review_gh_scope): **CLOSED** — no change to boundary
 
+## Acceptance criteria
+
+| ID | Criterion | Verified by |
+|----|-----------|-------------|
+| AC1 | `build_skill_tool_map()` emits a structured `WARN` log with `tool`, `winner_skill`, `winner_handler`, `loser_skill`, and `loser_handler` fields when two skills declare the same tool name | `cargo test -p mika-agent -- test_build_skill_tool_map` (IU1 + IU3) |
+| AC2 | A compile-time test in `bundled_skills.rs` fails if any two bundled skills declare the same tool name | `cargo test -p mika-agent -- test_bundled_skills_no_cross_skill_tool_name_collision` (IU2) |
+| AC3 | No behavioral change to `build_skill_tool_map` return value or dispatch semantics — last-write-wins is preserved | Code review: function signature and return type unchanged; existing `test_build_skill_tool_map_last_skill_wins_on_collision` still passes |
+| AC4 | `cargo clippy` and full `cargo test` pass with no new warnings or regressions | CI green |
+
 ## Problem Statement
 
 `build_skill_tool_map()` at `crates/mika-agent/src/agent_loop/mod.rs:4395` uses `HashMap::collect()` which is silent last-write-wins on name collision. When two `SkillEntry` objects declare `skill_tools` with the same tool name, the iteration order determines which wins — with no warning and no diagnostic. The concrete incident: mika-qa's `run_gh` (Builtin from `github` skill) was silently overwritten by a stale Exec entry from `qa-review` for ~3 hours.
