@@ -617,9 +617,13 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
 
         # Save pre-run HEAD SHA for post-flight diff check
         PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+        # Save pre-run remote HEAD for pilot push guard (mika#1318).
+        # Empty if branch doesn't exist on remote yet.
+        PRE_RUN_REMOTE_HEAD=$(git -C "$WORKTREE_DIR" ls-remote origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1 || true)
     else
         # --- Free-text mode: pass prompt as-is, no worktree ---
         PRE_RUN_HEAD=""
+        PRE_RUN_REMOTE_HEAD=""
         LOG_ID="$TASK_ID"
         CWD_ARGS="--cwd $PLATFORM_DIR"
 
@@ -1180,6 +1184,44 @@ ${STDERR_TAIL}"
 
     # Truncate to ~90KB to stay within the 100KB callback limit
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
+}
+
+_check_pilot_force_push() {
+    # Post-flight pilot push guard (mika#1318). Detects whether the pilot
+    # pushed to the remote during its session — a scope-of-authority violation
+    # for dev-groom (content-only; push is dispatch-lib's job). Returns 0 if
+    # no violation, 1 if violation detected. Called unconditionally from
+    # dispatch_claude_pilot(); skill-scoping is internal (early-return for
+    # non-dev-groom skills).
+
+    # Skill scope: dev-groom only (R5). Dev-pilot's push is legitimate.
+    [ "$SKILL" = "dev-groom" ] || return 0
+
+    # Guard: repo#number mode only (worktree must exist).
+    [ -n "$WORKTREE_DIR" ] && [ -n "$BRANCH" ] || return 0
+
+    # Query current remote HEAD. Fail-open on network error — a network
+    # failure shouldn't block a legitimate dispatch; _push_branch will fail
+    # independently if the remote is truly unreachable.
+    local ls_remote_out post_remote_head
+    if ! ls_remote_out=$(git -C "$WORKTREE_DIR" ls-remote origin "refs/heads/$BRANCH" 2>/dev/null); then
+        echo "pilot_push_guard.clean: ls-remote failed (network?) — fail-open (branch=$BRANCH)" >&2
+        return 0
+    fi
+    post_remote_head=$(printf '%s' "$ls_remote_out" | cut -f1)
+
+    # Compare: if remote state changed between pre-run and post-run, the
+    # pilot pushed (any push, not just force-push, is a violation for dev-groom).
+    if [ "${PRE_RUN_REMOTE_HEAD:-}" = "${post_remote_head:-}" ]; then
+        echo "pilot_push_guard.clean: no remote-ref change during pilot session (branch=$BRANCH)" >&2
+        return 0
+    fi
+
+    # Violation detected.
+    PUSH_VIOLATION_DETECTED=1
+    PUSH_VIOLATION_EVIDENCE="pre_remote=${PRE_RUN_REMOTE_HEAD:-<none>} post_remote=${post_remote_head:-<none>}"
+    echo "pilot_push_guard.violation: pilot pushed to remote during session (branch=$BRANCH, $PUSH_VIOLATION_EVIDENCE)" >&2
+    return 1
 }
 
 _push_branch() {
@@ -2276,6 +2318,22 @@ EOF
     _detect_plan_on_branch
     _handle_dry_run
     _run_claude_pilot "$ENTRY_COMMAND"
+
+    # mika#1318 — pilot push guard (defense-in-depth). Called unconditionally;
+    # skill-scoping is internal (early-return for non-dev-groom). If violation
+    # detected, poison RESULT and skip iterate loop + push — deliver callback
+    # immediately so mika-dev receives the violation.
+    if ! _check_pilot_force_push; then
+        RESULT="STRUCTURAL VIOLATION: pilot push detected (mika#1318). The dev-groom pilot pushed to the remote during its session — this is a scope-of-authority violation. Push is dispatch-lib's responsibility, not the pilot's.
+
+Evidence: ${PUSH_VIOLATION_EVIDENCE}
+
+Outcome: PIPELINE_INCOMPLETE — push violation
+
+${RESULT}"
+        _deliver_callback
+        return
+    fi
 
     # mika#1271 — iterate-loop state machine (always-on for dev-groom).
     # Invokes mika-arch first-pass on the plan-on-branch, then second-pass on READY

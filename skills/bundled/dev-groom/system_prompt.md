@@ -12,6 +12,16 @@ Use `run_claude_pilot_groom` to dispatch a headless Claude Code grooming session
 4. During the run, claude-pilot will separately call back to mika-dev for permission decisions — handle those as they arrive
 5. When claude-pilot finishes, you receive a callback with the architect verdict (`Verdict: GROOMED` or `Verdict: ESCALATE`)
 
+### Authority bounds
+
+The dev-groom pilot's scope is **content-only**: read the ticket, generate a plan, commit it. All git push operations are dispatch-lib's responsibility (`_push_branch`). The pilot MUST NOT execute any of:
+
+- `git push --force`, `git push --force-with-lease`, `git push -f`
+- `git push` (plain — push of any kind is out of scope)
+- Any other destructive remote operation
+
+If local/remote divergence is observed, the pilot does NOT resolve it — dispatch-lib's `_set_up_worktree` handles branch reconciliation. The pilot's responsibility ends at the commit. (mika#1318 founding incident: a dev-groom pilot ran `git push --force-with-lease` from inside its worktree, destroying substrate-fix work on the remote.)
+
 ### Important
 - **Always pass `skill: "dev-groom"`** — required by the schema for engine dispatch-class derivation
 - **Always pass the task UUID as `task_id`** (36-char format) when a task exists. Do NOT pass issue references — pass the UUID returned by `create_task`. This ensures logs land at `/var/log/claude-pilot/{uuid}.log`
