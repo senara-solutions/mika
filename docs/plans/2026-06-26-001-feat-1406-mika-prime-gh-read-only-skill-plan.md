@@ -155,6 +155,15 @@ There is no third path. "Document the dependency and ship without the swap" is e
 | `skills/bundled/gh-read-only/system_prompt.md` | Create | Minimal read-only GitHub usage instructions |
 | `skills/bundled/bearing/skill.toml` | Modify (if exists) or ESCALATE | Swap `run_gh` → `gh_read` in `required_tools`. If file does not exist, ESCALATE to operator — do not ship without the coupling. |
 
+## Acceptance criteria
+
+- [ ] AC1: New bundled skill `gh-read-only` is loaded into the engine with read-only `gh_read` as its sole tool (verified via `cargo test` covering bundled-skill discovery + tool enumeration).
+- [ ] AC2: Mika Prime's deployed `identity.toml` allowlist removes `github` and adds `gh-read-only`. Documented as an operator post-deploy step in the PR description (identity.toml is not version-controlled per mika#1244).
+- [ ] AC3 (Critical, land-coupling): The bearing skill (`bearing/skill.toml`) `required_tools` is swapped from `run_gh` to `gh_read` IN THIS SAME PR. If `bearing/skill.toml` does not exist on disk at implementation time, ESCALATE to operator rather than ship — no "document and skip" fallback (mika#1405 vacuous-pass risk).
+- [ ] AC4: `gh-read-only` keyword set is keyword-matched to GitHub-read intents (`gh`, `issue`, `pr`, `repo`) — pattern mirrors `mika-arch-groom-ticket`. Validated via `validate_skill()` at load.
+- [ ] AC5: All existing `mika-arch-*` skills continue to declare `required_tools = ["gh_read"]` — no regression on the architect agents.
+
+
 ## Out of scope
 
 - Making mika-prime a well-known agent in `well_known_agents.rs` — she is operator-provisioned.
