@@ -85,7 +85,7 @@ The `hold[review]` path currently passes through to the LLM (no structural dispa
 - Diff-content hashing (SHA of `gh pr diff` output) for semantic equivalence — upgrade path if `headRefOid` false-negative rate is meaningful
 - Auto-recovery from convergence failure (re-grooming, architect escalation) — v1 halts + notifies only
 - Cross-PR pattern detection ("5 PRs hit the same plan-AC mismatch") — separate alarm concern
-- Convergence with mika#1384 Option A (structural dispatch) — both would benefit from a unified dispatcher-side gate; defer to that ticket
+- Convergence with mika#1384 Option A (structural dispatch) — both would benefit from a unified dispatcher-side gate; defer to that ticket. **Forward-compatibility posture:** This circuit breaker is additive and composable with a future unified dispatcher gate. It runs inside `handle_block_ac`/`handle_block_ci` (per-verdict-handler), while #1384's unified gate would run at the dispatcher level (before verdict routing). If #1384 lands, the per-handler circuit breaker becomes defense-in-depth behind the dispatcher gate — no refactoring required, only a decision on whether to keep both layers or collapse into the dispatcher gate (per review-guide.md § Orthogonality — changes should propagate minimally)
 
 ---
 
@@ -104,7 +104,9 @@ The `hold[review]` path currently passes through to the LLM (no structural dispa
 
 **Approach:** Add an async function `fetch_pr_head_sha(pr_number: u64, repo: &str, token: &str) -> Result<String, String>` that calls `gh pr view <number> --repo <repo> --json headRefOid --jq '.headRefOid'` via the existing `spawn_and_collect` helper used by `run_gh_checks` and `run_gh_merge`. Return the SHA string on success, error string on failure. Wrap in a 15-second timeout (shorter than the 60s merge timeout — this is a single-field JSON query).
 
-**Patterns to follow:** `run_gh_checks()` and `run_gh_merge()` in the same file for subprocess spawning pattern and timeout wrapping.
+**Parameter sourcing:** `repo` is sourced from `event.repo` (the `PrReviewEvent` field, available in all verdict handler functions). `token` is sourced from the `github_token: Option<&str>` parameter threaded through `dispatch_verdict()` → individual handlers — the same parameter used by `run_gh_checks(event.pr_number, &event.repo, token)` at verdict_handler.rs:216 and `run_gh_merge()`. `fetch_pr_head_sha` requires a valid token (fail-open on `None` — skip the circuit breaker, log a warning, fall through to existing retry counters).
+
+**Patterns to follow:** `run_gh_checks()` and `run_gh_merge()` in the same file for subprocess spawning pattern and timeout wrapping. `run_gh_checks(event.pr_number, &event.repo, token)` at line 216 is the exact calling-convention model.
 
 **Test scenarios:**
 - Test that `fetch_pr_head_sha` constructs the correct `gh` command arguments
@@ -128,7 +130,7 @@ The `hold[review]` path currently passes through to the LLM (no structural dispa
 - `read_diff_fingerprints(metadata: &Option<String>) -> Vec<DiffFingerprint>` — deserialize `verdict_diff_fingerprints` array from metadata JSON. Return empty vec if absent or malformed.
 - `append_diff_fingerprint(db, task_id, metadata, sha, verdict_class, timestamp) -> Result<()>` — append a new entry to the `verdict_diff_fingerprints` array using the existing `task_metadata::merge_metadata` two-level shallow merge.
 
-Define a small `DiffFingerprint` struct: `{ sha: String, verdict: String, at: String }`.
+Define a small `DiffFingerprint` struct: `{ sha: String, verdict: String, at: String }`. The `at` field uses ISO 8601 UTC format (`"2026-06-26T01:00:00Z"`) — the same format used by all timestamp columns in the schema (see `crate::timestamp::now()`) and consistent with KTD-4's example JSON.
 
 **Patterns to follow:** `read_verdict_retry_count()` for metadata deserialization pattern. `update_verdict_block_metadata()` for the metadata-write pattern with `merge_metadata`.
 
@@ -144,7 +146,7 @@ Define a small `DiffFingerprint` struct: `{ sha: String, verdict: String, at: St
 
 **Goal:** Add the identical-diff check to both block verdict handlers, gating re-dispatch when the same SHA has been rejected ≥3 times.
 
-**Requirements:** R1, R3, R5, R6, R7
+**Requirements:** R1, R3, R6, R7
 
 **Dependencies:** U1, U2
 
@@ -243,7 +245,7 @@ When the circuit breaker fires (U3 step 4):
    - `target_key`: `"identical_diff_circuit_breaker"`
    - Fields: `pr_url`, `head_sha`, `identical_count`, `verdict_history` (JSON array of the matching fingerprints)
 
-Add a **Signal** entry to CLAUDE.md § Post-restart safety check documentation:
+Add a **Signal** entry to CLAUDE.md § "Post-restart safety check (#757)". The existing signal inventory runs A through K (verified: Signal A extraction, Signal B budget, Signal C resolver, Signal D cost, Signal E tick drain, Signal F per-corpus fairness, Signal G extraction fairness, Signal H extraction tick drain, Signal I search index backfill, Signal J no-op wrapper detection, Signal K guard fabrication telemetry). The next available identifier is **L**:
 - **Signal L — identical-diff circuit breaker.** `grep identical_diff_circuit_breaker server.log` — any hits indicate the circuit breaker fired. The `head_sha` and `identical_count` fields show the convergence failure details. Investigate the PR and plan for the root cause of the stuck fix loop.
 
 **Patterns to follow:** Existing audit event writes in `handle_block_ac()` for the audit event shape. `domain_rebuild_invalidated_resolutions` for the structured log event naming convention.
@@ -276,3 +278,9 @@ None — the approach is straightforward and follows established patterns. The `
 - `crates/mika-agent/src/server/verdict_handler.rs` — existing structural verdict handler with `BLOCK_AC_MAX_RETRIES = 3` and `BLOCK_CI_MAX_RETRIES = 3`
 - `crates/mika-agent/src/auto_pull.rs` — circuit breaker precedent with `CIRCUIT_BREAKER_THRESHOLD = 3`
 - `feedback_prompt_enforcement_fragile` — doctrine requiring structural gates over prompt rules at the loop substrate
+
+---
+
+## Revision history
+
+- rev 2 (2026-06-26): addressed F1 by specifying `repo` and `token` parameter sourcing in U1 — `repo` from `event.repo`, `token` from the `github_token: Option<&str>` parameter threaded through `dispatch_verdict()`, matching the `run_gh_checks()` calling convention at verdict_handler.rs:216 (Unresolved-Decision Gate, mika#1244); addressed F2 by removing R5 from U3's requirements list — R5 (`hold[review]` enrichment) is implemented by U4, not U3 (review-guide.md § Single Responsibility); addressed F3 by verifying the existing signal inventory (A–K) in CLAUDE.md and confirming "Signal L" is the next available identifier (review-guide.md § DRY); addressed F4 by specifying `DiffFingerprint.at` as ISO 8601 UTC format consistent with `crate::timestamp::now()` and KTD-4's example JSON (review-guide.md § KISS); addressed F5 by adding a forward-compatibility note stating the per-handler circuit breaker is additive to and composable with #1384's unified dispatcher gate — no refactoring required on convergence (review-guide.md § Orthogonality).
