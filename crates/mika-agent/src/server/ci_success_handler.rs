@@ -256,11 +256,9 @@ pub async fn try_handle_ci_success(
                         "CI success handler: PR is behind main — skipping merge"
                     );
                     return VerdictAction::Passthrough {
-                        enrichment: Some(format!(
-                            "[ci_success_handler] All CI checks passed and VERDICT: pass exists, \
-                             but the PR is behind main (base: {}, main HEAD: {}). \
-                             Rebase the PR onto main before merging.\n\n",
-                            info.pr_base_sha, info.current_main_sha
+                        enrichment: Some(format_behind_main_enrichment(
+                            &info.pr_base_sha,
+                            &info.current_main_sha,
                         )),
                     };
                 }
@@ -630,6 +628,15 @@ fn format_error_pre_digest(event: &CheckSuiteEvent, pr_number: u64, error: &str)
     )
 }
 
+/// Format the enrichment message for a behind-main block.
+fn format_behind_main_enrichment(pr_base_sha: &str, current_main_sha: &str) -> String {
+    format!(
+        "[ci_success_handler] All CI checks passed and VERDICT: pass exists, \
+         but the PR is behind main (base: {pr_base_sha}, main HEAD: {current_main_sha}). \
+         Rebase the PR onto main before merging.\n\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,5 +743,40 @@ mod tests {
         // This tests the parse path; the full handler test would need mocked subprocesses
         let text = "[GitHub] PR review (approved) on org/repo#42 by @reviewer";
         assert!(parse_check_suite_success(text).is_none());
+    }
+
+    // ---- Behind-main enrichment tests (#1577) ----
+
+    #[test]
+    fn behind_main_enrichment_contains_both_shas() {
+        let pr_base = "abc1234deadbeef";
+        let main_head = "def5678cafebabe";
+        let text = format_behind_main_enrichment(pr_base, main_head);
+        assert!(
+            text.contains(pr_base),
+            "Enrichment missing pr_base_sha: {text}"
+        );
+        assert!(
+            text.contains(main_head),
+            "Enrichment missing current_main_sha: {text}"
+        );
+    }
+
+    #[test]
+    fn behind_main_enrichment_avoids_completion_claim_words() {
+        let text = format_behind_main_enrichment("aaa", "bbb");
+        assert!(
+            !COMPLETION_CLAIM_RE.is_match(&text),
+            "Behind-main enrichment contains completion-claim trigger word: {text}"
+        );
+    }
+
+    #[test]
+    fn behind_main_enrichment_mentions_rebase() {
+        let text = format_behind_main_enrichment("aaa", "bbb");
+        assert!(
+            text.contains("Rebase"),
+            "Behind-main enrichment should instruct rebase: {text}"
+        );
     }
 }
