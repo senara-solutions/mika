@@ -131,20 +131,34 @@ pub async fn try_handle_pr_review_verdict(
     //
     // The task-keyed retry counter in handle_block_{ac,ci} fails to bind when
     // `find_active_task_by_pr_url` returns None — exactly what happened on
-    // PR #1556 (7 syncs, 0 escalations). This breaker counts observation
-    // events per PR URL, independent of task lookup. After
-    // PR_CIRCUIT_BREAKER_THRESHOLD observations of any blocking verdict for
-    // the same PR within PR_CIRCUIT_BREAKER_WINDOW_SECS, the handler refuses
-    // to passthrough and escalates.
+    // PR #1556 (7 syncs, 0 escalations because the lookup kept returning None).
+    // This breaker counts observation events per PR URL and trips ONLY when
+    // task lookup cannot bind the per-task counter. When a task IS found
+    // in_progress, the per-task counter (BLOCK_AC_MAX_RETRIES, etc.) owns the
+    // gate and the breaker stands down — we still record the observation for
+    // diagnostic counts but don't preempt the existing dispatch path.
     //
     // Pass verdicts and hold[review] are excluded — they're either terminal
     // success or operator-only paths and shouldn't trip the breaker.
-    let is_blocking_verdict = matches!(verdict, Verdict::Block(_) | Verdict::Missing { .. },);
-    if is_blocking_verdict
-        && let Some(action) =
-            pr_circuit_breaker_check(&event, db, message_sender, session_id, trace_id).await
-    {
-        return action;
+    let is_blocking_verdict = matches!(verdict, Verdict::Block(_) | Verdict::Missing { .. });
+    if is_blocking_verdict {
+        let per_task_counter_will_bind = match db.find_active_task_by_pr_url(&event.pr_url()).await
+        {
+            Ok(Some(task)) => task.status == "in_progress",
+            _ => false,
+        };
+        if let Some(action) = pr_circuit_breaker_check(
+            &event,
+            db,
+            message_sender,
+            session_id,
+            trace_id,
+            per_task_counter_will_bind,
+        )
+        .await
+        {
+            return action;
+        }
     }
 
     match verdict {
@@ -1232,6 +1246,12 @@ async fn pr_circuit_breaker_check(
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
+    // When true, a task with status=in_progress exists for this PR URL and
+    // the per-task retry counter will fire correctly. The breaker records
+    // the observation but does NOT trip — the per-task gate owns the dispatch
+    // halt and the existing block[ac]/block[ci] pre-digests preserve the
+    // contract that callers (and tests) depend on.
+    per_task_counter_will_bind: bool,
 ) -> Option<VerdictAction> {
     let pr_url = event.pr_url();
     let since =
@@ -1289,6 +1309,20 @@ async fn pr_circuit_breaker_check(
     // threshold. The +1 accounts for the just-recorded observation.
     let total = prior_count + 1;
     if total < PR_CIRCUIT_BREAKER_THRESHOLD {
+        return None;
+    }
+
+    // The per-task counter is the authoritative gate when task lookup binds.
+    // We've recorded the observation for forensic counts; the per-task
+    // counter will fire on the same verdict and emit its own escalation
+    // pre-digest. Stand down here.
+    if per_task_counter_will_bind {
+        info!(
+            event = "pr_circuit_breaker_yielded_to_per_task_gate",
+            pr_url = %pr_url,
+            observation_count = total,
+            "PR-keyed breaker threshold reached but task lookup binds the per-task counter — yielding"
+        );
         return None;
     }
 
@@ -2819,7 +2853,8 @@ mod tests {
         // First and second observations should not trip — count is 1, then 2.
         for _ in 0..(PR_CIRCUIT_BREAKER_THRESHOLD - 1) {
             let action =
-                pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-1").await;
+                pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-1", false)
+                    .await;
             assert!(
                 action.is_none(),
                 "below threshold should return None, got Some"
@@ -2835,13 +2870,14 @@ mod tests {
         // Run up to (threshold - 1) observations — all should pass.
         for _ in 0..(PR_CIRCUIT_BREAKER_THRESHOLD - 1) {
             let action =
-                pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-2").await;
+                pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-2", false)
+                    .await;
             assert!(action.is_none());
         }
 
         // The THRESHOLD-th observation must trip.
         let tripped =
-            pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-2").await;
+            pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-2", false).await;
         assert!(
             matches!(tripped, Some(VerdictAction::Handled { .. })),
             "threshold observation must trip the breaker"
@@ -2872,12 +2908,14 @@ mod tests {
         // Saturate PR A to the threshold — last observation should trip.
         for _ in 0..PR_CIRCUIT_BREAKER_THRESHOLD {
             let _ =
-                pr_circuit_breaker_check(&event_a, &db, None, "cb-test-session", "trace-3").await;
+                pr_circuit_breaker_check(&event_a, &db, None, "cb-test-session", "trace-3", false)
+                    .await;
         }
 
         // PR B's first observation must NOT trip.
         let action_b =
-            pr_circuit_breaker_check(&event_b, &db, None, "cb-test-session", "trace-3").await;
+            pr_circuit_breaker_check(&event_b, &db, None, "cb-test-session", "trace-3", false)
+                .await;
         assert!(
             action_b.is_none(),
             "PR B's first observation must not trip (saw {action_b:?})"
@@ -2913,7 +2951,7 @@ mod tests {
 
         // First in-window observation must not trip — only its own row is recent.
         let action =
-            pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-4").await;
+            pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-4", false).await;
         assert!(
             action.is_none(),
             "old events outside the window should not count (saw {action:?})"
