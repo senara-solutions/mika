@@ -1,6 +1,6 @@
 # @senara-solutions/ui — Shared Component Library
 
-Vite library mode, published to GitHub Packages. Peer deps: React 19, Tailwind CSS v4, lucide-react.
+Vite library mode, published to npmjs.org as a public package (`access: public`, token-free anonymous install — mika#1386). Peer deps: React 19, Tailwind CSS v4, lucide-react.
 
 ## Design System
 
