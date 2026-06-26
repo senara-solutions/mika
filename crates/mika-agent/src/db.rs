@@ -5137,6 +5137,33 @@ impl Database {
         Ok(rows)
     }
 
+    /// Count audit_events matching (agent_id, tool_name, target_key) with `created_at > since`.
+    ///
+    /// Used by the verdict-handler's PR-keyed circuit breaker (mika#1563):
+    /// counts prior `verdict_observed` events for a given PR URL in a sliding
+    /// window. The check runs BEFORE task lookup, so it fires even when the
+    /// task is missing or no longer in_progress — which is the convergence-loop
+    /// failure mode that #1556 hit.
+    ///
+    /// `since` must be an ISO 8601 UTC timestamp (`%Y-%m-%dT%H:%M:%SZ`). String
+    /// comparison is correct because the column format is fixed-width UTC.
+    pub fn count_recent_audit_events_for_target(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        target_key: &str,
+        since: &str,
+    ) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2 AND target_key = ?3
+               AND created_at > ?4",
+            params![agent_id, tool_name, target_key, since],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Count **active** agent-created tasks in a session (for per-session cap enforcement).
     /// Only pending/in_progress/blocked items count — completed/cancelled/failed/delivered
     /// items are terminal and should not block new task creation (sprint mode).

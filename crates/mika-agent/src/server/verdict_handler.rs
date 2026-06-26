@@ -43,6 +43,31 @@ const BLOCK_AC_MAX_RETRIES: u32 = 3;
 /// Maximum block[ci] retries before escalation.
 const BLOCK_CI_MAX_RETRIES: u32 = 3;
 
+/// PR-keyed circuit breaker threshold (mika#1563).
+///
+/// When this many `verdict_observed` audit_events accumulate for the same
+/// PR URL within `PR_CIRCUIT_BREAKER_WINDOW_SECS`, the handler short-circuits
+/// — refusing to passthrough to the LLM — and escalates to operator.
+///
+/// Sized to match `BLOCK_AC_MAX_RETRIES` / `BLOCK_CI_MAX_RETRIES`: when the
+/// task-keyed retry counter fires correctly, this never triggers. It binds
+/// only when task lookup fails (the #1556 convergence case), where the
+/// per-task gate cannot bind because `find_active_task_by_pr_url` returns
+/// None and `handle_block_ac` early-exits via `Passthrough`.
+const PR_CIRCUIT_BREAKER_THRESHOLD: i64 = 3;
+
+/// Sliding window for the PR-keyed circuit breaker (mika#1563).
+///
+/// 30 minutes covers the typical mika-qa sync cadence (#1556 saw 7 cycles
+/// across ~3 hours = ~25 min/cycle) while expiring fast enough that a
+/// reasonable manual fix-and-resubmit can re-engage the loop.
+const PR_CIRCUIT_BREAKER_WINDOW_SECS: i64 = 30 * 60;
+
+/// `audit_events.tool_name` used by the circuit breaker. Distinct from
+/// `verdict_handled` (per-block-class success log) and `verdict_escalated`
+/// (task-keyed retry-limit exceeded) so the count is unambiguously PR-keyed.
+const VERDICT_OBSERVED_TOOL: &str = "verdict_observed";
+
 /// Maximum body excerpt length for fallback AC extraction and metadata.
 const BODY_EXCERPT_MAX: usize = 2000;
 
@@ -101,6 +126,40 @@ pub async fn try_handle_pr_review_verdict(
         review_depth = ?review_depth,
         "parsed review depth from verdict body"
     );
+
+    // 2c. PR-keyed circuit breaker (mika#1563).
+    //
+    // The task-keyed retry counter in handle_block_{ac,ci} fails to bind when
+    // `find_active_task_by_pr_url` returns None — exactly what happened on
+    // PR #1556 (7 syncs, 0 escalations because the lookup kept returning None).
+    // This breaker counts observation events per PR URL and trips ONLY when
+    // task lookup cannot bind the per-task counter. When a task IS found
+    // in_progress, the per-task counter (BLOCK_AC_MAX_RETRIES, etc.) owns the
+    // gate and the breaker stands down — we still record the observation for
+    // diagnostic counts but don't preempt the existing dispatch path.
+    //
+    // Pass verdicts and hold[review] are excluded — they're either terminal
+    // success or operator-only paths and shouldn't trip the breaker.
+    let is_blocking_verdict = matches!(verdict, Verdict::Block(_) | Verdict::Missing { .. });
+    if is_blocking_verdict {
+        let per_task_counter_will_bind = match db.find_active_task_by_pr_url(&event.pr_url()).await
+        {
+            Ok(Some(task)) => task.status == "in_progress",
+            _ => false,
+        };
+        if let Some(action) = pr_circuit_breaker_check(
+            &event,
+            db,
+            message_sender,
+            session_id,
+            trace_id,
+            per_task_counter_will_bind,
+        )
+        .await
+        {
+            return action;
+        }
+    }
 
     match verdict {
         Verdict::Pass => {
@@ -1161,6 +1220,187 @@ async fn handle_missing_verdict(
     VerdictAction::Handled {
         pre_digest: format_verdict_classification_failed_pre_digest(event),
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR-keyed circuit breaker (mika#1563)
+// ---------------------------------------------------------------------------
+
+/// PR-keyed circuit breaker — fires regardless of task lookup outcome.
+///
+/// Returns `Some(VerdictAction::Handled)` when the breaker trips; `None` when
+/// the verdict should continue through normal dispatch. Logs a
+/// `verdict_observed` audit event on every invocation so the count survives
+/// across syncs.
+///
+/// The breaker uses two timestamp anchors:
+/// - `now` for the new audit row's `created_at` (handled by SQLite default)
+/// - `since = now - PR_CIRCUIT_BREAKER_WINDOW_SECS` for the count query's lower bound
+///
+/// Counting strictly-prior events (before this invocation's audit insert)
+/// keeps the threshold check inclusive: the 3rd observation in the window
+/// trips on its own audit row's count, not on a future event.
+async fn pr_circuit_breaker_check(
+    event: &PrReviewEvent,
+    db: &AsyncDatabase,
+    message_sender: Option<&Arc<dyn MessageSender>>,
+    session_id: &str,
+    trace_id: &str,
+    // When true, a task with status=in_progress exists for this PR URL and
+    // the per-task retry counter will fire correctly. The breaker records
+    // the observation but does NOT trip — the per-task gate owns the dispatch
+    // halt and the existing block[ac]/block[ci] pre-digests preserve the
+    // contract that callers (and tests) depend on.
+    per_task_counter_will_bind: bool,
+) -> Option<VerdictAction> {
+    let pr_url = event.pr_url();
+    let since =
+        crate::timestamp::now_minus(chrono::Duration::seconds(PR_CIRCUIT_BREAKER_WINDOW_SECS));
+
+    // Count prior observations BEFORE writing this one. The current invocation
+    // is the (count+1)th observation; trip when count >= threshold means
+    // strictly more than threshold observations have accumulated counting
+    // this one.
+    let prior_count = match db
+        .count_recent_audit_events_for_target(VERDICT_OBSERVED_TOOL, &pr_url, &since)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            // Fail-open: DB errors here must NOT block the verdict pipeline.
+            // The per-task gate is the primary defense; this is a structural
+            // backstop for the lookup-failure case. A breaker that becomes
+            // its own outage surface is worse than no breaker.
+            warn!(
+                error = %e,
+                pr_url = %pr_url,
+                "pr_circuit_breaker: count query failed — failing open"
+            );
+            0
+        }
+    };
+
+    // Record this observation. Fire-and-forget per the C2.3 log-and-skip
+    // convention — failure to record a single observation must not break
+    // the verdict pipeline.
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            VERDICT_OBSERVED_TOOL,
+            &pr_url,
+            None,
+            None,
+            Some(&format!(
+                "pr_number={} repo={} reviewer={}",
+                event.pr_number, event.repo, event.reviewer,
+            )),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            pr_url = %pr_url,
+            "pr_circuit_breaker: failed to log verdict_observed audit event"
+        );
+    }
+
+    // Trip when the count of prior observations plus this one reaches the
+    // threshold. The +1 accounts for the just-recorded observation.
+    let total = prior_count + 1;
+    if total < PR_CIRCUIT_BREAKER_THRESHOLD {
+        return None;
+    }
+
+    // The per-task counter is the authoritative gate when task lookup binds.
+    // We've recorded the observation for forensic counts; the per-task
+    // counter will fire on the same verdict and emit its own escalation
+    // pre-digest. Stand down here.
+    if per_task_counter_will_bind {
+        info!(
+            event = "pr_circuit_breaker_yielded_to_per_task_gate",
+            pr_url = %pr_url,
+            observation_count = total,
+            "PR-keyed breaker threshold reached but task lookup binds the per-task counter — yielding"
+        );
+        return None;
+    }
+
+    info!(
+        event = "pr_circuit_breaker_tripped",
+        pr_number = event.pr_number,
+        repo = %event.repo,
+        pr_url = %pr_url,
+        observation_count = total,
+        threshold = PR_CIRCUIT_BREAKER_THRESHOLD,
+        window_secs = PR_CIRCUIT_BREAKER_WINDOW_SECS,
+        "PR-keyed circuit breaker tripped — refusing dispatch + notifying operator"
+    );
+
+    // Loud audit event so operator surfaces (dashboard, mika-platform monitor)
+    // can detect the trip without grepping logs.
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "verdict_circuit_breaker_tripped",
+            &pr_url,
+            None,
+            None,
+            Some(&format!(
+                "observation_count={total} threshold={PR_CIRCUIT_BREAKER_THRESHOLD} \
+                 window_secs={PR_CIRCUIT_BREAKER_WINDOW_SECS}"
+            )),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, "pr_circuit_breaker: failed to log trip audit event");
+    }
+
+    if let Some(sender) = message_sender {
+        send_notification(
+            sender,
+            &format!(
+                "PR #{} on {} — circuit breaker tripped after {} blocking-verdict observations \
+                 in {} min. Latest from @{}. Autonomous dispatch halted — operator triage required.",
+                event.pr_number,
+                event.repo,
+                total,
+                PR_CIRCUIT_BREAKER_WINDOW_SECS / 60,
+                event.reviewer,
+            ),
+        )
+        .await;
+    }
+
+    Some(VerdictAction::Handled {
+        pre_digest: format_circuit_breaker_pre_digest(event, total),
+    })
+}
+
+/// Pre-digest emitted when the circuit breaker trips. Replaces the original
+/// verdict text so the LLM sees a halt signal instead of a fresh block[*]
+/// instruction. Avoids completion-claim trigger words.
+fn format_circuit_breaker_pre_digest(event: &PrReviewEvent, count: i64) -> String {
+    format!(
+        "<verdict_handler>\n\
+         [GitHub] PR review ({}) on {}#{} by @{}\n\
+         \n\
+         CIRCUIT BREAKER TRIPPED: {} blocking-verdict observations on this PR within \
+         {} minutes. Per mika#1563, autonomous dispatch on this PR is now halted to \
+         prevent token-burn loops.\n\
+         \n\
+         Operator has been notified. Do NOT dispatch run_claude_pilot for this PR. \
+         Acknowledge the halt and surface the PR URL ({}) for operator triage.\n\
+         </verdict_handler>",
+        event.state,
+        event.repo,
+        event.pr_number,
+        event.reviewer,
+        count,
+        PR_CIRCUIT_BREAKER_WINDOW_SECS / 60,
+        event.pr_url(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2563,5 +2803,158 @@ mod tests {
                 "New pre-digest #{i} missing closing XML tag: {text}"
             );
         }
+    }
+    // ---- PR-keyed circuit breaker tests (mika#1563) ----
+
+    /// Construct an in-memory AsyncDatabase with an `agent_id` set, ready for
+    /// audit_event writes. Mirrors the helper shape from `async_db::tests` but
+    /// adds an explicit agent_id since `log_audit_event` requires it.
+    async fn cb_test_db() -> AsyncDatabase {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = AsyncDatabase::new(db);
+        // The agent_id is set by `AsyncDatabase::new` to "mika" by default;
+        // we ensure the agent row exists for FK satisfaction on audit_events.
+        async_db
+            .with_db(|d| {
+                d.conn.execute(
+                    "INSERT OR IGNORE INTO agents (id, name) VALUES ('mika', 'mika')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        async_db
+            .create_session("cb-test-session", "mika", "cli")
+            .await
+            .unwrap();
+        async_db
+    }
+
+    fn cb_blocking_event(pr_number: u64) -> PrReviewEvent {
+        PrReviewEvent {
+            state: "commented".to_string(),
+            repo: "senara-solutions/mika".to_string(),
+            pr_number,
+            title: "test plan".to_string(),
+            reviewer: "mika-qa".to_string(),
+            review_url: format!(
+                "https://github.com/senara-solutions/mika/pull/{pr_number}#pullrequestreview-1"
+            ),
+            body: "VERDICT: block[ac]\nREASON: test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_passes_below_threshold() {
+        let db = cb_test_db().await;
+        let event = cb_blocking_event(1100);
+
+        // First and second observations should not trip — count is 1, then 2.
+        for _ in 0..(PR_CIRCUIT_BREAKER_THRESHOLD - 1) {
+            let action =
+                pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-1", false)
+                    .await;
+            assert!(
+                action.is_none(),
+                "below threshold should return None, got Some"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_trips_at_threshold() {
+        let db = cb_test_db().await;
+        let event = cb_blocking_event(1101);
+
+        // Run up to (threshold - 1) observations — all should pass.
+        for _ in 0..(PR_CIRCUIT_BREAKER_THRESHOLD - 1) {
+            let action =
+                pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-2", false)
+                    .await;
+            assert!(action.is_none());
+        }
+
+        // The THRESHOLD-th observation must trip.
+        let tripped =
+            pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-2", false).await;
+        assert!(
+            matches!(tripped, Some(VerdictAction::Handled { .. })),
+            "threshold observation must trip the breaker"
+        );
+
+        // The trip audit row was written.
+        let trip_count = db
+            .count_recent_audit_events_for_target(
+                "verdict_circuit_breaker_tripped",
+                &event.pr_url(),
+                "1970-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trip_count, 1,
+            "expected one trip audit row, got {trip_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_isolates_pr_url() {
+        // Observations on PR #A must not influence PR #B.
+        let db = cb_test_db().await;
+        let event_a = cb_blocking_event(1102);
+        let event_b = cb_blocking_event(1103);
+
+        // Saturate PR A to the threshold — last observation should trip.
+        for _ in 0..PR_CIRCUIT_BREAKER_THRESHOLD {
+            let _ =
+                pr_circuit_breaker_check(&event_a, &db, None, "cb-test-session", "trace-3", false)
+                    .await;
+        }
+
+        // PR B's first observation must NOT trip.
+        let action_b =
+            pr_circuit_breaker_check(&event_b, &db, None, "cb-test-session", "trace-3", false)
+                .await;
+        assert!(
+            action_b.is_none(),
+            "PR B's first observation must not trip (saw {action_b:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_window_excludes_old_events() {
+        // Observations older than the window should not count toward the trip.
+        let db = cb_test_db().await;
+        let event = cb_blocking_event(1104);
+        let pr_url = event.pr_url();
+
+        // Backdate threshold-worth of audit rows OUTSIDE the window.
+        let outside_window = "2020-01-01T00:00:00Z";
+        for _ in 0..(PR_CIRCUIT_BREAKER_THRESHOLD + 5) {
+            db.with_db({
+                let pr_url = pr_url.clone();
+                let outside = outside_window.to_string();
+                move |d| {
+                    d.conn.execute(
+                        "INSERT INTO audit_events
+                         (agent_id, session_id, tool_name, target_key, created_at)
+                         VALUES ('mika', 'cb-test-session', ?1, ?2, ?3)",
+                        rusqlite::params![VERDICT_OBSERVED_TOOL, pr_url, outside],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        // First in-window observation must not trip — only its own row is recent.
+        let action =
+            pr_circuit_breaker_check(&event, &db, None, "cb-test-session", "trace-4", false).await;
+        assert!(
+            action.is_none(),
+            "old events outside the window should not count (saw {action:?})"
+        );
     }
 }

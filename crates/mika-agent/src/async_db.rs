@@ -367,6 +367,22 @@ impl AsyncDatabase {
         self.with_db(move |db| db.count_session_tasks(&a, &s)).await
     }
 
+    /// Count audit_events for (tool_name, target_key) with created_at > since (ISO 8601 UTC).
+    /// Used by the PR-keyed circuit breaker in `verdict_handler` (mika#1563).
+    pub async fn count_recent_audit_events_for_target(
+        &self,
+        tool_name: &str,
+        target_key: &str,
+        since: &str,
+    ) -> Result<i64> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let tk = target_key.to_owned();
+        let sn = since.to_owned();
+        self.with_db(move |db| db.count_recent_audit_events_for_target(&a, &tn, &tk, &sn))
+            .await
+    }
+
     pub async fn find_active_task_by_ref_url(&self, reference_url: &str) -> Result<Option<Task>> {
         let a = self.agent_id.clone();
         let url = reference_url.to_owned();
