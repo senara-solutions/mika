@@ -227,6 +227,18 @@ None — all design decisions are resolved. The tier1/TIER3 layer is the primary
 
 ---
 
+## Acceptance criteria
+
+- AC1 (structural): `system_prompt.md` contains `### Authority bounds` subsection explicitly prohibiting all `git push` variants
+- AC2 (structural): `_check_pilot_force_push` present in `dispatch-lib.sh`; guards on `$SKILL = "dev-groom"` early-return; compares `PRE_RUN_REMOTE_HEAD` vs post-run `git ls-remote` result
+- AC3 (structural): on violation, RESULT prefixed `STRUCTURAL VIOLATION:`; `_iterate_groom_loop` and `_push_branch` skipped; `_deliver_callback` called
+- AC4 (structural): `$SKILL = "dev-pilot"` early-return — dev-pilot unaffected
+- AC5 (structural/doc): Signal M `pilot_push_guard` in `CLAUDE.md` with `.clean` / `.violation` sub-events
+- AC6 (structural): `skill.toml` version bumped to 0.3.0
+- AC7 (CI-deferred): `test_force_push_guard.sh` all 7 scenarios pass
+
+---
+
 ## Revision history
 
 - rev 2 (2026-06-26): addressed F1 by replacing unverified reflog `(forced update)` detection with authoritative `git ls-remote` remote-ref comparison (pre/post pilot session); addressed F2 by adding "Recovery posture" section documenting remote state, local state, callback state, and operator recovery steps after the guard fires (citation: review-guide.md § Single Responsibility); addressed F3 by stating explicitly that `dispatch_claude_pilot()` calls `_check_pilot_force_push` unconditionally with internal skill-scoping (citation: review-guide.md § KISS); addressed F4 by replacing hardcoded "Signal M" with "next available letter" + verification instruction to check CLAUDE.md at implementation time; addressed F5 by replacing brittle line-number references with grep-for-symbol instructions and noting references are approximate as of plan date.
