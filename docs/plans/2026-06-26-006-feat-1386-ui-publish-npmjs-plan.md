@@ -114,7 +114,7 @@ Governing acceptance criteria from the issue body (architect resolution F2):
 
 ---
 
-## Acceptance / Verification at Release Time
+## Acceptance criteria
 
 The functional ACs (AC5 anonymous install; AC3 post-publish view) can only be fully proven by the **first real publish** from the updated workflow, which is gated on the operator pre-conditions. At PR-review time, verification is structural:
 
