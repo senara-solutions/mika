@@ -1,0 +1,17 @@
+[skill]
+name = "gh-read-only"
+description = "Read-only GitHub access — view issues, PRs, diffs, and issue lists without write capability."
+version = "0.1.0"
+always_on = false
+timeout_secs = 60
+
+[triggers]
+keywords = [
+    "issue", "issues", "pr", "pull request", "pull requests",
+    "github", "gh", "repo", "repository",
+    "view issue", "view pr", "check issue", "check pr",
+    "list issues", "pr diff", "issue list",
+]
+
+[constraints]
+required_tools = ["gh_read"]

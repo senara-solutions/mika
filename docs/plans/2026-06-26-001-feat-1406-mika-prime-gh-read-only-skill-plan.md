@@ -44,10 +44,15 @@ required_tools = ["gh_read"]
 - `always_on = false` — matches the architect skills' pattern. Read-only GitHub access is only needed when the turn involves GitHub-related intents.
 - `required_tools = ["gh_read"]` — structural enforcement that the tool is called when the skill keyword-matches, same pattern as the architect skills.
 - Keywords cover the bearing-keeper's primary GitHub read scenarios: viewing issues/PRs for operational state assessment.
+- `timeout_secs = 60` — **timeout model clarification:** Skill timeouts are per-skill-match, not per-tool-call. When the bearing skill (#1405, `timeout_secs = 30`) keyword-matches and its `required_tools` includes `gh_read`, the bearing skill's 30s timeout governs that turn — not this skill's 60s. The `gh-read-only` skill's 60s timeout only applies when `gh-read-only` itself keyword-matches directly (i.e., a turn where the user's intent triggers the `gh-read-only` keywords). 60s is appropriate for direct keyword-match scenarios where the agent may issue multiple sequential `gh_read` calls (e.g., listing issues then viewing several). *Citation: review-guide.md § KISS — commit to the timeout model.*
 
 ### Step 2 — Create `skills/bundled/gh-read-only/tools.json`
 
-Copy the `gh_read` tool definition from `skills/bundled/mika-arch-groom-ticket/tools.json` verbatim. This is the same builtin handler — the skill just provides a different keyword-trigger surface.
+Copy the `gh_read` tool definition from `skills/bundled/mika-arch-groom-ticket/tools.json`. **Implementation-time instruction:** Before copying, verify the current content of `skills/bundled/mika-arch-groom-ticket/tools.json` matches the snapshot below. If the source has changed since this plan was written, use the **current** version from the source file — it is the canonical `gh_read` definition.
+
+*Citation: review-guide.md § DRY — avoid divergent copies of the same definition.*
+
+The snapshot at plan-write time (verified 2026-06-26):
 
 ```json
 [
@@ -113,32 +118,33 @@ cargo build  # Verifies build.rs discovers the new skill
 cargo test -p mika-agent  # Run tests to check no regressions
 ```
 
-### Step 6 — Mika Prime identity allowlist swap (runtime, documented)
+### Step 6 — Mika Prime identity allowlist swap (operator post-deploy step)
 
-Mika Prime is operator-provisioned (not in `well_known_agents.rs`). The allowlist change is a manual runtime operation:
+Mika Prime is operator-provisioned (not in `well_known_agents.rs`). Her `~/.mika/agents/mika-prime/identity.toml` is not version-controlled — it lives only on the runtime host. Therefore, the PR **cannot contain the actual file change**. The allowlist swap is an **operator post-deploy step**, documented in the PR description as a required manual action after merge + deploy.
 
-**In `~/.mika/agents/mika-prime/identity.toml`:**
-```diff
- [skills]
- allowlist = [
--    "github",
-+    "gh-read-only",
-     # ... other skills unchanged
- ]
-```
+**PR description must include this operator instruction:**
 
-This step is documented in the PR description. The operator applies it after merge + deploy. The bundled skill becomes available via `seed_bundled_skills()` on next `make deploy`; the allowlist swap activates it for Prime.
+> **Required post-deploy action:** In `~/.mika/agents/mika-prime/identity.toml`, swap `github` → `gh-read-only` in the `[skills].allowlist` array. The new bundled skill is available after `make deploy` runs `seed_bundled_skills()`. Until this swap is applied, Prime retains full `run_gh` write access.
 
-### Step 7 — Critical AC: bearing skill `required_tools` coupling
+This is the only viable delivery mechanism — there is no seed/template file for Prime's identity in the repo. The PR satisfies the ticket's AC (a) by shipping the new `gh-read-only` skill itself; the allowlist swap is the operator's responsibility, explicitly called out rather than silently assumed.
+
+*Citation: Unresolved-Decision Gate (mika#1244) — mechanism resolved: operator post-deploy step, not a repo-tracked file change.*
+
+### Step 7 — Critical AC: bearing skill `required_tools` coupling (mandatory land-coupling)
 
 Sibling mika issue#1405 introduces `skills/bundled/bearing/skill.toml` with `required_tools = ["run_gh", "search_memory", "query_knowledge_graph"]`. When this PR removes `github` from Prime's allowlist, `run_gh` ceases to be in her resolved tool surface. The #516 availability filter then silently drops `run_gh` from the required-tools enforcement — the gate passes vacuously.
 
-**Sequencing:**
-- **If #1405 lands first:** This PR modifies `skills/bundled/bearing/skill.toml` to swap `required_tools` from `["run_gh", ...]` to `["gh_read", ...]`.
-- **If this PR lands first:** The bearing skill doesn't exist yet. Document in the PR description that #1405 MUST use `gh_read` (not `run_gh`) in its `required_tools`, since `github` is no longer in Prime's allowlist. Add a code comment or PR cross-reference.
-- **Same-PR (preferred):** Both changes land together. This is the ticket's stated preference ("Land-coupling is mandatory").
+**The ticket's Critical AC is absolute:** *"The PR is rejected if it does not contain both: (a) the new `gh-read-only` skill + allowlist swap, AND (b) the `required_tools` swap on the bearing skill. Land-coupling is mandatory."*
 
-**Implementation:** Check at implementation time whether `skills/bundled/bearing/` exists. If it does, modify it. If not, note the dependency in the PR description.
+**Implementation decision (two branches, no fallback):**
+
+1. **If `skills/bundled/bearing/skill.toml` exists at implementation time:** Modify it in this PR — swap `run_gh` → `gh_read` in `required_tools`. This satisfies the land-coupling mandate directly.
+
+2. **If `skills/bundled/bearing/skill.toml` does not exist at implementation time:** **ESCALATE to the operator.** The implementer cannot satisfy AC (b) without the file that #1405 creates. The PR must not ship without the coupling — documentation of a dependency is not enforcement, and the ticket explicitly rejects that path. The escalation surfaces the sequencing conflict for operator resolution (e.g., land #1405 first, or combine both tickets into one PR).
+
+There is no third path. "Document the dependency and ship without the swap" is explicitly removed — the ticket says "mandatory," not "preferred."
+
+*Citation: review-guide.md § YAGNI — the ticket is the spec; the plan cannot unilaterally weaken a stated AC.*
 
 ## Files changed
 
@@ -147,7 +153,7 @@ Sibling mika issue#1405 introduces `skills/bundled/bearing/skill.toml` with `req
 | `skills/bundled/gh-read-only/skill.toml` | Create | Skill manifest with keyword triggers and `required_tools = ["gh_read"]` |
 | `skills/bundled/gh-read-only/tools.json` | Create | `gh_read` tool definition (same as architect skills) |
 | `skills/bundled/gh-read-only/system_prompt.md` | Create | Minimal read-only GitHub usage instructions |
-| `skills/bundled/bearing/skill.toml` | Modify (conditional) | Swap `run_gh` → `gh_read` in `required_tools` (only if #1405 has landed) |
+| `skills/bundled/bearing/skill.toml` | Modify (if exists) or ESCALATE | Swap `run_gh` → `gh_read` in `required_tools`. If file does not exist, ESCALATE to operator — do not ship without the coupling. |
 
 ## Out of scope
 
@@ -159,6 +165,10 @@ Sibling mika issue#1405 introduces `skills/bundled/bearing/skill.toml` with `req
 
 ## Risks
 
-- **Vacuous-pass on bearing skill (Critical AC):** If the bearing skill ships with `run_gh` in `required_tools` and `github` is removed from the allowlist, the grounding gate passes vacuously. Mitigated by same-PR coupling or mandatory sequencing documentation.
+- **Vacuous-pass on bearing skill (Critical AC):** If the bearing skill ships with `run_gh` in `required_tools` and `github` is removed from the allowlist, the grounding gate passes vacuously. Mitigated by mandatory land-coupling: if `bearing/skill.toml` exists, this PR modifies it; if it does not exist, implementation ESCALATES to operator rather than shipping without the coupling.
 - **Keyword overlap:** `gh-read-only` keywords overlap with the `github` template skill's triggers. No conflict — they won't both be in Prime's allowlist. Other agents using `github` are unaffected (different allowlists).
 - **Missing `file_view` op:** Deliberately excluded. If Prime needs it later, extend the tools.json enum — additive, no breaking change.
+
+## Revision history
+
+- rev 2 (2026-06-26): addressed F1 by removing the three-way conditional sequencing in Step 7 and committing to a two-branch decision: modify `bearing/skill.toml` if it exists, or ESCALATE to operator if it does not — no "document and ship" fallback (review-guide.md § YAGNI); addressed F2 by explicitly resolving the `identity.toml` delivery mechanism — the file is not version-controlled, so the PR cannot contain the actual change; the allowlist swap is an operator post-deploy step, documented in the PR description (Unresolved-Decision Gate mika#1244); addressed F3 by adding an implementation-time verification instruction to Step 2 requiring the implementer to check the current `mika-arch-groom-ticket/tools.json` content before copying, using the current version if it has drifted (review-guide.md § DRY); addressed F4 by documenting the timeout model in Step 1's design decisions — skill timeouts are per-skill-match, so the bearing skill's 30s governs when bearing keyword-matches, and `gh-read-only`'s 60s governs only direct keyword-matches (review-guide.md § KISS).
