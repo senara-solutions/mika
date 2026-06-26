@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use mika_common::llm::{LlmMessage, LlmProvider, LlmRequest, LlmRole, LlmUsage};
+use mika_common::llm::{LlmMessage, LlmProvider, LlmRequest, LlmRole, LlmStopReason, LlmUsage};
 
 use crate::async_db::AsyncDatabase;
 
@@ -1249,7 +1249,24 @@ Rules:
             Ok(response) => {
                 let first_latency = start.elapsed().as_millis() as u64;
                 let first_usage = response.usage.clone();
+                let first_stop_reason = response.stop_reason;
                 let text = response.text_content();
+
+                // MaxTokens detection (#1091): a truncated response is guaranteed
+                // incomplete JSON. Skip the parse and the semantic retry entirely —
+                // the retry re-sends the truncated output plus reinforcement, which
+                // only tightens the already-insufficient budget and truncates again.
+                // Distinct event makes the previously-silent failure observable.
+                if first_stop_reason == LlmStopReason::MaxTokens {
+                    warn!(
+                        trace_id = %self.trace_id,
+                        event = "extraction_max_tokens_truncated",
+                        output_len = text.len(),
+                        "LLM hit MaxTokens — response truncated, skipping parse and retry (log-and-skip per C2.3)"
+                    );
+                    return Ok(None);
+                }
+
                 match self.parse_extraction_json(&text) {
                     Ok(output) => Ok(Some(ExtractionResult {
                         output,
@@ -1272,8 +1289,13 @@ Rules:
                             latency_ms: first_latency,
                             kg_phase: "kg_extraction",
                         };
-                        self.retry_with_reinforcement(&request, &text, first_record)
-                            .await
+                        self.retry_with_reinforcement(
+                            &request,
+                            &text,
+                            first_record,
+                            first_stop_reason,
+                        )
+                        .await
                     }
                 }
             }
@@ -1287,7 +1309,22 @@ Rules:
                         Ok(response) => {
                             let latency = retry_start.elapsed().as_millis() as u64;
                             let usage = response.usage.clone();
+                            let stop_reason = response.stop_reason;
                             let text = response.text_content();
+
+                            // MaxTokens detection (#1091) — same as the attempt-1
+                            // branch: a truncated response can't be parsed and the
+                            // semantic retry would only truncate again.
+                            if stop_reason == LlmStopReason::MaxTokens {
+                                warn!(
+                                    trace_id = %self.trace_id,
+                                    event = "extraction_max_tokens_truncated",
+                                    output_len = text.len(),
+                                    "LLM hit MaxTokens — response truncated, skipping parse and retry (log-and-skip per C2.3)"
+                                );
+                                return Ok(None);
+                            }
+
                             return match self.parse_extraction_json(&text) {
                                 Ok(output) => Ok(Some(ExtractionResult {
                                     output,
@@ -1303,8 +1340,13 @@ Rules:
                                         latency_ms: latency,
                                         kg_phase: "kg_extraction",
                                     };
-                                    self.retry_with_reinforcement(&request, &text, first_record)
-                                        .await
+                                    self.retry_with_reinforcement(
+                                        &request,
+                                        &text,
+                                        first_record,
+                                        stop_reason,
+                                    )
+                                    .await
                                 }
                             };
                         }
@@ -1349,6 +1391,7 @@ Rules:
         original_request: &LlmRequest,
         bad_output: &str,
         first_record: LlmCallRecord,
+        first_attempt_stop_reason: LlmStopReason,
     ) -> Result<Option<ExtractionResult>> {
         let reinforcement = format!(
             "Your previous response was not valid JSON. The output was:\n{}\n\n\
@@ -1390,6 +1433,7 @@ Rules:
                             trace_id = %self.trace_id,
                             error = %e,
                             event = "extraction_semantic_exhausted",
+                            first_stop_reason = ?first_attempt_stop_reason,
                             "semantic retry also failed — log-and-skip per C2.3"
                         );
                         Ok(None)
@@ -2609,5 +2653,82 @@ mod tests {
         let roster = test_roster();
         let result = validate_extraction_output(&output, 5, &roster, "test-agent", "test.md");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // MaxTokens log-and-skip (#1091)
+    // -----------------------------------------------------------------------
+
+    /// Build a `SubjectExtractor` over an in-memory DB and the given mock
+    /// provider. Only the LLM + trace_id are exercised by `call_llm_with_retry`,
+    /// but a real `AsyncDatabase` is required to construct the extractor.
+    fn extractor_with_mock(mock: Arc<mika_common::llm::mock::MockLlmProvider>) -> SubjectExtractor {
+        use crate::db::Database;
+        let db = AsyncDatabase::new(Database::open_in_memory().unwrap());
+        SubjectExtractor::new(db, mock, PathBuf::from("/tmp/docs"), Some("test-maxtokens"))
+    }
+
+    /// A MaxTokens (truncated) first response must log-and-skip immediately:
+    /// `Ok(None)` with exactly ONE LLM call — the doomed semantic retry is NOT
+    /// consumed. Pre-fix, this path made a second (also-truncating) call before
+    /// ending in `extraction_semantic_exhausted`.
+    #[tokio::test]
+    async fn call_llm_max_tokens_logs_and_skips_without_retry() {
+        use mika_common::llm::mock::{MockLlmProvider, max_tokens_response};
+
+        // Truncated, unparseable JSON body + MaxTokens stop reason.
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .response(max_tokens_response(
+                    r#"{"entities": [{"type": "skill", "na"#,
+                ))
+                .build(),
+        );
+        let extractor = extractor_with_mock(mock.clone());
+
+        let prompt = ("system".to_string(), "user".to_string());
+        let result = extractor.call_llm_with_retry(&prompt).await.unwrap();
+
+        assert!(
+            result.is_none(),
+            "MaxTokens truncation must log-and-skip (Ok(None))"
+        );
+        assert_eq!(
+            mock.calls_made(),
+            1,
+            "MaxTokens must NOT consume the semantic retry — exactly one LLM call"
+        );
+    }
+
+    /// Regression guard: a NON-truncated malformed first response still enters
+    /// the semantic retry (two calls) and recovers when the retry returns valid
+    /// JSON. Confirms the MaxTokens early-return is gated strictly on the stop
+    /// reason and does not short-circuit legitimate semantic recovery.
+    #[tokio::test]
+    async fn call_llm_non_truncated_malformed_still_retries() {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                // First: EndTurn (not truncated) but unparseable.
+                .response(text_response("not json at all"))
+                // Second (semantic retry): valid empty extraction.
+                .response(text_response(r#"{"entities": [], "relationships": []}"#))
+                .build(),
+        );
+        let extractor = extractor_with_mock(mock.clone());
+
+        let prompt = ("system".to_string(), "user".to_string());
+        let result = extractor.call_llm_with_retry(&prompt).await.unwrap();
+
+        assert!(
+            result.is_some(),
+            "non-truncated malformed JSON should recover via semantic retry"
+        );
+        assert_eq!(
+            mock.calls_made(),
+            2,
+            "semantic retry path must still make two calls when not truncated"
+        );
     }
 }
