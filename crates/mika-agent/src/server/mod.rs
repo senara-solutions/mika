@@ -11,6 +11,7 @@ pub mod investigate;
 pub mod json_extractor;
 mod milestone_context_handler;
 pub mod openapi;
+pub mod ready_label_handler;
 pub mod rewind;
 pub mod state;
 pub mod types;
