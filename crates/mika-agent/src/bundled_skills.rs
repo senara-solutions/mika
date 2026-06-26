@@ -1561,14 +1561,17 @@ mod tests {
     /// Adding a `mod-scope` re-export would breach the additions-only
     /// scope reservation that mika#1326's freeze-safe subset honors.
     const KNOWN_PRE_EXISTING_COLLISIONS: &[(&str, &str, &str)] = &[
-        // Three architect skills legitimately declare gh_read with identical
-        // Builtin handlers — same skill-scoped tool surface model used by
-        // each architect skill independently. Not a true collision (same
-        // name + same handler = no last-write-wins risk), but the strict
-        // test flags it. See mika#1573 for the test-relaxation decision.
+        // Four skills legitimately declare gh_read with identical Builtin
+        // handlers — same skill-scoped tool surface model used by each skill
+        // independently. Three are the architect skills (mika-arch-groom-
+        // milestone/groom-ticket/second-review); the fourth is gh-read-only
+        // (mika#1406, Mika Prime's read-only GitHub access). Not a true
+        // collision (same name + same handler = no last-write-wins risk),
+        // but the strict test flags it. See mika#1573 for the test-relaxation
+        // decision.
         (
             "gh_read",
-            "mika-arch-groom-milestone,mika-arch-groom-ticket,mika-arch-second-review",
+            "gh-read-only,mika-arch-groom-milestone,mika-arch-groom-ticket,mika-arch-second-review",
             "mika#1573",
         ),
     ];
