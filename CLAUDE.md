@@ -280,11 +280,13 @@ Skills are loaded at runtime from this generated constant — no filesystem acce
 ### Adding a New Bundled Skill
 
 1. Create `skills/bundled/<skill-name>/` directory
-2. Add `skill.toml` with required fields:
+2. Add `skill.toml` with required fields. Keywords live under `[triggers]` (required unless `always_on = true`):
    ```toml
    [skill]
    name = "<skill-name>"
    version = "0.1.0"
+
+   [triggers]
    keywords = ["trigger", "words"]
    ```
 3. Add `system_prompt.md` with the skill's system prompt
@@ -294,3 +296,4 @@ Skills are loaded at runtime from this generated constant — no filesystem acce
    - `MIKA_RELAY_IDENTITY` (1 skill) — only `permission-policy`; rarely needs new skills
    - `MIKA_ARCH` uses a computed identity via `build_mika_arch_identity()` (3 skills) — read-only review skills only
 5. Build — the skill is automatically discovered and available
+6. **Verify structure** — run `make verify-bundled-skills` (mika#1575). This pre-merge gate (the structural counterpart to mika#1326 AC2) asserts the new bundle is complete: required files present, manifest parses, handlers resolve, `required_tools` tokens consistent, and identity allowlists coherent. CI runs it on every PR. See `docs/architecture/bundled-skill-verification.md`.

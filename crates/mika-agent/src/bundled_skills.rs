@@ -242,6 +242,52 @@ pub fn all_bundled_skill_names() -> Vec<&'static str> {
     all_bundled_skills().iter().map(|s| s.name).collect()
 }
 
+/// Returns the set of every tool `name` declared in any bundled skill's
+/// `tools.json` — across BOTH the legacy hardcoded community skills and the
+/// directory-sourced engine-coupled skills.
+///
+/// This is the canonical "any bundled skill's tools.json" universe for the
+/// `verify-bundled-skills` gate (mika#1575, Check 4 option (c) — allowlist-unaware
+/// token resolution). It must consult the same dual source as [`all_bundled_skills`]
+/// so a `required_tools` token provided by a community skill (e.g. `run_shell` from
+/// `shell-exec`) resolves correctly and does not false-fail the gate.
+///
+/// Malformed `tools.json` content is skipped silently here — manifest validity is
+/// the responsibility of other checks, not this accessor.
+pub fn all_bundled_tool_names() -> std::collections::HashSet<String> {
+    bundled_skill_tool_map().into_values().flatten().collect()
+}
+
+/// Returns `skill_name -> [tool names it declares in its tools.json]` across BOTH
+/// the legacy hardcoded community skills and the directory-sourced engine-coupled
+/// skills.
+///
+/// Used by the `verify-bundled-skills` gate (mika#1575, Check 5 — identity allowlist
+/// coherence) to compute an agent's *allowlist-scoped* reachable tool set: a token is
+/// reachable through an allowlist only if a builtin provides it OR a skill IN THAT
+/// ALLOWLIST declares it. Per-skill attribution (not just the flat
+/// [`all_bundled_tool_names`] set) is required to distinguish "exists somewhere in the
+/// bundled surface" (Check 4) from "reachable through this specific allowlist" (Check 5).
+///
+/// Skills with no `tools.json` or unparseable content map to an empty list.
+pub fn bundled_skill_tool_map() -> std::collections::HashMap<String, Vec<String>> {
+    let mut map = std::collections::HashMap::new();
+    for skill in all_bundled_skills() {
+        let mut names = Vec::new();
+        if let Some(tools_file) = skill.files.iter().find(|f| f.path == "tools.json")
+            && let Ok(tools) = serde_json::from_str::<Vec<serde_json::Value>>(tools_file.content)
+        {
+            for tool in &tools {
+                if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        map.insert(skill.name.to_string(), names);
+    }
+    map
+}
+
 /// Trust-critical bundled skills whose prompts must NOT be reviewed or adapted.
 ///
 /// These skills govern the agent's self-awareness, security posture, or ability

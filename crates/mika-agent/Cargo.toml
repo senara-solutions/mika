@@ -24,6 +24,10 @@ path = "src/bin/calibrate.rs"
 name = "eval-diff"
 path = "src/bin/eval-diff.rs"
 
+[[bin]]
+name = "verify-bundled-skills"
+path = "src/bin/verify_bundled_skills.rs"
+
 [features]
 telemetry = ["mika-common/telemetry"]
 

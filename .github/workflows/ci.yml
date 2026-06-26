@@ -78,6 +78,9 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Verify bundled skills structural invariants (mika#1575)
+        run: make verify-bundled-skills
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
