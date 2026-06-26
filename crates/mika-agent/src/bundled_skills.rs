@@ -1543,6 +1543,144 @@ mod tests {
         );
     }
 
+    /// Allowlist of known cross-skill tool name declarations that are
+    /// benign (same name, same handler — skill-scoped tool surface model).
+    ///
+    /// Each entry: `(tool_name, sorted_skill_names_csv, follow_up_ticket)`.
+    /// The sorted-CSV form means `(skill_a, skill_b)` and `(skill_b, skill_a)`
+    /// produce the same key; we sort owners before comparison.
+    ///
+    /// **Self-cleaning contract:** the test below asserts each allowlist
+    /// entry STILL collides at the named owner set. When the follow-up
+    /// ticket's resolution removes the collision, this test fails with
+    /// "stale allowlist entry, remove it" — preventing the bounded hole
+    /// from rotting into permanence.
+    ///
+    /// **Scope discipline:** entries live inside `#[cfg(test)] mod tests`
+    /// so the production skill loader cannot consult them at runtime.
+    /// Adding a `mod-scope` re-export would breach the additions-only
+    /// scope reservation that mika#1326's freeze-safe subset honors.
+    const KNOWN_PRE_EXISTING_COLLISIONS: &[(&str, &str, &str)] = &[
+        // Three architect skills legitimately declare gh_read with identical
+        // Builtin handlers — same skill-scoped tool surface model used by
+        // each architect skill independently. Not a true collision (same
+        // name + same handler = no last-write-wins risk), but the strict
+        // test flags it. See mika#1573 for the test-relaxation decision.
+        (
+            "gh_read",
+            "mika-arch-groom-milestone,mika-arch-groom-ticket,mika-arch-second-review",
+            "mika#1573",
+        ),
+    ];
+
+    #[test]
+    fn test_bundled_skills_no_cross_skill_tool_name_collision() {
+        // AC2: No two bundled skills may declare the same tool name.
+        // This catches collisions at compile-test time, before they reach
+        // production as silent last-write-wins shadows (mika#1326).
+        //
+        // Intentionally stricter than AC2's "different handler types"
+        // criterion: we flag ALL same-name declarations regardless of
+        // handler type. Rationale: even same-handler-type collisions
+        // indicate a manifest hygiene issue (redundant declarations),
+        // and the cost of flagging them is zero (fix is to remove the
+        // duplicate).
+        //
+        // **Known pre-existing exceptions** are allowlisted via
+        // `KNOWN_PRE_EXISTING_COLLISIONS`. Each entry names the colliding
+        // tool, the exact (sorted) skill-name set, and a follow-up ticket
+        // for resolution. The test asserts each allowlist entry STILL
+        // collides at the named owner set — so when the follow-up ticket
+        // lands and the collision is resolved, this test fails with
+        // "stale allowlist entry, remove it." Self-cleaning, not silent.
+
+        use std::collections::HashMap;
+
+        let all_skills = all_bundled_skills();
+        let mut tool_owners: HashMap<String, Vec<String>> = HashMap::new();
+
+        for skill in &all_skills {
+            let tools_json = skill.files.iter().find(|f| f.path == "tools.json");
+            let Some(tools_json) = tools_json else {
+                continue;
+            };
+
+            let tool_defs: Vec<serde_json::Value> = match serde_json::from_str(tools_json.content) {
+                Ok(t) => t,
+                Err(_) => continue, // Malformed tools.json caught by other tests
+            };
+
+            for tool_def in &tool_defs {
+                if let Some(name) = tool_def.get("name").and_then(|n| n.as_str()) {
+                    tool_owners
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(skill.name.to_string());
+                }
+            }
+        }
+
+        // Build the actual-collision set: (tool_name, sorted owners csv).
+        let mut actual_collisions: HashMap<String, String> = HashMap::new();
+        for (tool, owners) in tool_owners.iter() {
+            if owners.len() > 1 {
+                let mut sorted_owners = owners.clone();
+                sorted_owners.sort();
+                actual_collisions.insert(tool.clone(), sorted_owners.join(","));
+            }
+        }
+
+        // Self-cleaning assertion: each allowlist entry must STILL collide
+        // at the exact owner set named. If the follow-up ticket lands and
+        // resolves the collision, this fires — telling the next engineer
+        // to remove the now-stale allowlist entry.
+        for (tool, expected_owners_csv, follow_up) in KNOWN_PRE_EXISTING_COLLISIONS {
+            match actual_collisions.get(*tool) {
+                Some(actual_owners_csv) if actual_owners_csv == expected_owners_csv => {
+                    // Allowlist entry is still valid — collision still exists.
+                }
+                Some(actual_owners_csv) => {
+                    panic!(
+                        "STALE allowlist entry for tool '{tool}' (mika#1326 / {follow_up}): \
+                         expected collision owners '{expected_owners_csv}' but found \
+                         '{actual_owners_csv}'. The follow-up resolved part of the collision \
+                         — update or remove the allowlist entry to match the new state."
+                    );
+                }
+                None => {
+                    panic!(
+                        "STALE allowlist entry for tool '{tool}' (mika#1326 / {follow_up}): \
+                         no collision found at all. The follow-up resolved the collision — \
+                         remove this allowlist entry."
+                    );
+                }
+            }
+        }
+
+        // Now report any UNALLOWLISTED collisions.
+        let unallowlisted: Vec<(String, String)> = actual_collisions
+            .iter()
+            .filter(|(tool, owners_csv)| {
+                !KNOWN_PRE_EXISTING_COLLISIONS
+                    .iter()
+                    .any(|(allowed_tool, allowed_owners, _)| {
+                        allowed_tool == tool && allowed_owners == &owners_csv.as_str()
+                    })
+            })
+            .map(|(t, o)| (t.clone(), o.clone()))
+            .collect();
+
+        assert!(
+            unallowlisted.is_empty(),
+            "Bundled skill tool name collisions detected (mika#1326):\n{}",
+            unallowlisted
+                .iter()
+                .map(|(tool, owners_csv)| format!("  tool '{tool}' declared by: {owners_csv}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     // Shared fixtures for merge-semantics tests — call `merge_skill_lists`
     // directly so the production merge function is the unit under test.
     // Previously the test re-implemented the merge algorithm locally, which

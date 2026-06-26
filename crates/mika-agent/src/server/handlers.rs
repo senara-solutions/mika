@@ -839,6 +839,34 @@ async fn run_agent_for_message(
             VerdictAction::Passthrough { enrichment: None } => {}
         }
 
+        // Structural ready-label dispatch handler (mika#1384): intercepts
+        // `[GitHub] Issue labeled ready on …` webhooks and pre-resolves every
+        // decision the LLM has historically failed to make (the
+        // `run_claude_pilot_groom`/`run_claude_pilot` no-call class). Returns
+        // a prescriptive pre-digest with the resolved task_id / skill / args.
+        // Composes with the existing `webhook_ready_label_dispatch` INTENT_GUARDS
+        // entry: this handler runs before the LLM turn; the guard runs after.
+        let ready_label_action = super::ready_label_handler::try_handle_ready_label_dispatch(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            Some(&sender_arc),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match ready_label_action {
+            VerdictAction::Handled { pre_digest } => {
+                req.text = pre_digest;
+            }
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+        }
+
         // Milestone-context marker injector (mika#1218): for `pull_request.closed`
         // webhooks whose correlated task has a milestone/project parent, prepend
         // a `[milestone-parent: <id>]` marker so the inline webhook_milestone_advance
