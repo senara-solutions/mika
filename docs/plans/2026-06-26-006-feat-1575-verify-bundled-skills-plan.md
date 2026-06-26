@@ -38,7 +38,7 @@ is precisely why AC2 is a test and not a code-review guideline."* The durable an
 
 ---
 
-## Requirements traceability
+## Acceptance criteria
 
 | AC | Requirement | Unit |
 |----|-------------|------|
