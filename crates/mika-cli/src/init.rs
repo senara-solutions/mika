@@ -6,7 +6,7 @@ use mika_agent::startup;
 use mika_common::config::Settings;
 use mika_common::github_app::GitHubApp;
 use mika_common::home;
-use mika_common::llm::LlmProvider;
+use mika_common::llm::{LlmProvider, ProviderKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -76,35 +76,71 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
 
 impl AppContext {
     /// Apply a one-shot model override (not persisted to config).
-    /// Resolves aliases (e.g., "sonnet" → "anthropic/claude-sonnet-4-6") and rebuilds the LLM provider.
     ///
-    /// Accepts plain model names (overrides the active provider's model)
-    /// or `provider/model` format (switches provider and sets model).
+    /// The `--model` flag is a **model-id-only** override: the provider is always
+    /// inherited from the agent's configured `llm_provider`. The model id is never
+    /// used to re-dispatch to a different (native) provider based on its name prefix
+    /// (mika#1591) — that prefix-routing produced spurious HTTP 401 "no API key"
+    /// failures when the inferred native provider had no key. A `prefix/` is stripped
+    /// only when it names the configured provider itself (e.g. `qwen/qwen3.7-max`
+    /// under `llm_provider = "qwen"`); under any other provider (e.g. OpenRouter,
+    /// whose ids are vendor-prefixed) the full id is preserved.
+    ///
+    /// Aliases (e.g. "sonnet") are resolved before routing.
     pub fn override_model(&mut self, model: &str) -> Result<()> {
-        let resolved = crate::cli::resolve_model_alias(model);
+        let configured = self.db_ctx.settings.llm_provider;
+        let (provider, model_id) = parse_model_override(model, configured);
 
-        // Check for provider/model format
-        if let Some(slash_pos) = resolved.find('/') {
-            let prefix = &resolved[..slash_pos];
-            if let Ok(provider) = prefix.parse::<mika_common::llm::ProviderKind>() {
-                let model_name = resolved[slash_pos + 1..].to_string();
-                self.db_ctx.settings.llm_provider = provider;
-                self.db_ctx
-                    .settings
-                    .set_provider_model(provider, Some(model_name));
-                self.llm = self.db_ctx.settings.make_llm_provider()?;
-                return Ok(());
-            }
-        }
+        // AC2 (mika#1591): surface a named error instead of a bare downstream
+        // 401 "no API key" when the inherited provider needs a key but none is
+        // configured. Local providers (Ollama, MikaModel) are exempt.
+        let (_, api_key, _) = self.db_ctx.settings.provider_fields(provider);
+        check_provider_key(provider, api_key, &model_id)?;
 
-        // Plain model name — override the active provider's model
-        let provider = self.db_ctx.settings.llm_provider;
         self.db_ctx
             .settings
-            .set_provider_model(provider, Some(resolved));
+            .set_provider_model(provider, Some(model_id));
         self.llm = self.db_ctx.settings.make_llm_provider()?;
         Ok(())
     }
+}
+
+/// Resolve a `--model` override into `(provider, model_id)` for the agent's
+/// configured provider.
+///
+/// The returned provider is **always** `configured` — the model name's prefix
+/// never re-dispatches to a different provider (mika#1591). Aliases are resolved
+/// first. A `prefix/rest` model id has its prefix stripped only when `prefix`
+/// parses to the configured provider itself; otherwise the full id is preserved
+/// (OpenRouter and other vendor-prefixed providers need the full id).
+fn parse_model_override(model: &str, configured: ProviderKind) -> (ProviderKind, String) {
+    let resolved = crate::cli::resolve_model_alias(model);
+    if let Some((prefix, rest)) = resolved.split_once('/')
+        && let Ok(parsed) = prefix.parse::<ProviderKind>()
+        && parsed == configured
+    {
+        return (configured, rest.to_string());
+    }
+    (configured, resolved)
+}
+
+/// Whether a provider needs an API key to authenticate. Local providers
+/// (Ollama, MikaModel — localhost endpoints) do not.
+fn provider_requires_api_key(provider: ProviderKind) -> bool {
+    !matches!(provider, ProviderKind::Ollama | ProviderKind::MikaModel)
+}
+
+/// Validate that a key-requiring provider has an API key configured before a
+/// `--model` override routes a request to it. Returns a named error (provider +
+/// model id) instead of letting the request fail with a bare downstream 401
+/// "no API key" (mika#1591 AC2).
+fn check_provider_key(provider: ProviderKind, api_key: Option<&str>, model_id: &str) -> Result<()> {
+    if provider_requires_api_key(provider) && api_key.is_none_or(|k| k.trim().is_empty()) {
+        anyhow::bail!(
+            "Provider '{provider}' has no API key configured. Cannot route model '{model_id}'."
+        );
+    }
+    Ok(())
 }
 
 /// Initialize full context for a named agent (for chat).
@@ -234,4 +270,113 @@ pub fn make_message_sender(
         None,
     );
     Some(Arc::new(sender))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // U1 / AC1: a vendor-prefixed id whose prefix does NOT name the configured
+    // provider keeps the full id and inherits the configured provider (no
+    // prefix re-dispatch). OpenRouter ids are vendor-prefixed.
+    #[test]
+    fn parse_keeps_full_id_for_openrouter() {
+        let (provider, model) = parse_model_override("qwen/qwen3.7-max", ProviderKind::OpenRouter);
+        assert_eq!(provider, ProviderKind::OpenRouter);
+        assert_eq!(model, "qwen/qwen3.7-max");
+    }
+
+    // U1 / AC3: a vendor prefix that matches the configured provider is stripped.
+    #[test]
+    fn parse_strips_matching_prefix_for_native_qwen() {
+        let (provider, model) = parse_model_override("qwen/qwen3.7-max", ProviderKind::Qwen);
+        assert_eq!(provider, ProviderKind::Qwen);
+        assert_eq!(model, "qwen3.7-max");
+    }
+
+    // U1 / AC4: a non-prefixed id is passed through unchanged under its provider.
+    #[test]
+    fn parse_passes_through_unprefixed_id() {
+        let (provider, model) =
+            parse_model_override("claude-sonnet-4-6-20250514", ProviderKind::Anthropic);
+        assert_eq!(provider, ProviderKind::Anthropic);
+        assert_eq!(model, "claude-sonnet-4-6-20250514");
+    }
+
+    // U1: aliases resolve before routing and still inherit the configured provider.
+    // Under the alias's own native provider the resolved prefix is stripped; under
+    // any other provider the full vendor-prefixed id is preserved.
+    #[test]
+    fn parse_resolves_alias_and_inherits_provider() {
+        // "sonnet" resolves to "anthropic/claude-sonnet-4-6"; under Anthropic the
+        // matching prefix is stripped to the native id.
+        let (provider, model) = parse_model_override("sonnet", ProviderKind::Anthropic);
+        assert_eq!(provider, ProviderKind::Anthropic);
+        assert_eq!(model, "claude-sonnet-4-6");
+        // Under a non-matching provider the resolved full id is kept (OpenRouter ids
+        // are vendor-prefixed) and the provider is still inherited.
+        let (provider, model) = parse_model_override("sonnet", ProviderKind::OpenRouter);
+        assert_eq!(provider, ProviderKind::OpenRouter);
+        assert_eq!(model, "anthropic/claude-sonnet-4-6");
+    }
+
+    // U1: a non-matching native prefix under a third provider never re-dispatches
+    // — guards against regression of the old prefix-routing behavior.
+    #[test]
+    fn parse_never_redispatches_to_named_native_provider() {
+        let (provider, model) = parse_model_override("qwen/qwen3.7-max", ProviderKind::DeepSeek);
+        assert_eq!(provider, ProviderKind::DeepSeek);
+        assert_eq!(model, "qwen/qwen3.7-max");
+    }
+
+    // U1: degenerate model strings never panic and inherit the configured provider.
+    // A bare prefix or trailing/leading slash whose prefix is not a provider keeps
+    // the full string; an empty string passes through unchanged.
+    #[test]
+    fn parse_handles_degenerate_strings() {
+        assert_eq!(
+            parse_model_override("", ProviderKind::Anthropic),
+            (ProviderKind::Anthropic, String::new())
+        );
+        // "foo/" — prefix "foo" is not a provider → full string kept.
+        assert_eq!(
+            parse_model_override("foo/", ProviderKind::OpenRouter),
+            (ProviderKind::OpenRouter, "foo/".to_string())
+        );
+        // "/bar" — empty prefix is not a provider → full string kept.
+        assert_eq!(
+            parse_model_override("/bar", ProviderKind::OpenRouter),
+            (ProviderKind::OpenRouter, "/bar".to_string())
+        );
+    }
+
+    // U2 / AC2: a key-requiring provider with no key yields a named error that
+    // includes both the provider and the model id.
+    #[test]
+    fn check_key_errors_name_provider_and_model() {
+        let err = check_provider_key(ProviderKind::OpenRouter, None, "qwen/qwen3.7-max")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("openrouter"), "error names provider: {err}");
+        assert!(err.contains("qwen/qwen3.7-max"), "error names model: {err}");
+    }
+
+    // U2 / AC2: an empty/whitespace key is treated as absent.
+    #[test]
+    fn check_key_treats_blank_key_as_absent() {
+        assert!(check_provider_key(ProviderKind::OpenRouter, Some("   "), "m").is_err());
+    }
+
+    // U2: a configured key passes the check.
+    #[test]
+    fn check_key_passes_with_configured_key() {
+        assert!(check_provider_key(ProviderKind::OpenRouter, Some("sk-or-xxx"), "m").is_ok());
+    }
+
+    // U2: local providers (Ollama, MikaModel) are exempt from the key check.
+    #[test]
+    fn check_key_exempts_local_providers() {
+        assert!(check_provider_key(ProviderKind::Ollama, None, "llama3").is_ok());
+        assert!(check_provider_key(ProviderKind::MikaModel, None, "mika").is_ok());
+    }
 }
