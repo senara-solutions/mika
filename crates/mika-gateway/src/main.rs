@@ -84,35 +84,40 @@ async fn main() -> Result<()> {
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()?;
 
-    // Create Telegram client (only in single-bot mode)
+    // Build global Telegram client whenever a bot token is configured (outbound delivery).
+    // The MIKA_TELEGRAM_SINGLE_BOT_MODE flag gates only inbound webhook registration,
+    // not client construction — operator agents need the global client for /send even
+    // in per-customer mode (mika#1590).
     let single_bot_mode =
         settings::telegram_single_bot_mode_is_enabled(settings.telegram_single_bot_mode.as_deref());
-    let telegram = if single_bot_mode {
-        let bot_token = settings
-            .telegram_bot_token
-            .clone()
-            .expect("validated in GatewaySettings::load");
+    let telegram = if let Some(bot_token) = settings.telegram_bot_token.clone() {
         let tg = TelegramClient::new(http_client.clone(), bot_token);
 
-        // Register webhook with Telegram (idempotent)
-        let webhook_url = settings
-            .telegram_webhook_url
-            .as_ref()
-            .expect("validated in GatewaySettings::load");
-        tg.set_webhook(
-            webhook_url,
-            settings
-                .telegram_webhook_secret
+        if single_bot_mode {
+            // Register inbound webhook with Telegram (idempotent)
+            let webhook_url = settings
+                .telegram_webhook_url
                 .as_ref()
-                .expect("validated in GatewaySettings::load")
-                .expose_secret(),
-        )
-        .await?;
-        info!(url = %webhook_url, "telegram webhook registered (single-bot mode)");
+                .expect("validated in GatewaySettings::load");
+            tg.set_webhook(
+                webhook_url,
+                settings
+                    .telegram_webhook_secret
+                    .as_ref()
+                    .expect("validated in GatewaySettings::load")
+                    .expose_secret(),
+            )
+            .await?;
+            info!(url = %webhook_url, "telegram webhook registered (single-bot mode)");
+        } else {
+            info!(
+                "global Telegram client built for outbound delivery — inbound webhook registration skipped (per-customer mode)"
+            );
+        }
 
         Some(tg)
     } else {
-        info!("per-customer Telegram bot mode — global webhook registration skipped");
+        info!("no MIKA_TELEGRAM_BOT_TOKEN configured — global Telegram client not built");
         None
     };
 

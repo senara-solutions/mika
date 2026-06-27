@@ -80,10 +80,10 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 ## Gateway Environment Variables
 
 - `MIKA_DATABASE_URL` — Postgres connection string
-- `MIKA_TELEGRAM_BOT_TOKEN` — Telegram Bot API token. Required only in single-bot mode.
-- `MIKA_TELEGRAM_WEBHOOK_SECRET` — 64-char hex secret for webhook validation. Required only in single-bot mode.
-- `MIKA_TELEGRAM_WEBHOOK_URL` — Public HTTPS URL for Telegram webhook delivery. Required only in single-bot mode.
-- `MIKA_TELEGRAM_SINGLE_BOT_MODE` — When `1` or `true`, the gateway uses the global `MIKA_TELEGRAM_BOT_TOKEN` for all customers (legacy single-bot behavior). Requires `MIKA_TELEGRAM_BOT_TOKEN`, `MIKA_TELEGRAM_WEBHOOK_SECRET`, and `MIKA_TELEGRAM_WEBHOOK_URL` to be set. Default: off (per-customer bot mode).
+- `MIKA_TELEGRAM_BOT_TOKEN` — Telegram Bot API token. When configured, the gateway builds the global `TelegramClient` for outbound delivery via `/send` (operator agents without `customer_id`), independent of `MIKA_TELEGRAM_SINGLE_BOT_MODE`. Required in single-bot mode; optional but enables outbound-only delivery in per-customer mode (mika#1590).
+- `MIKA_TELEGRAM_WEBHOOK_SECRET` — 64-char hex secret for inbound webhook validation. Required only in single-bot mode (inbound registration).
+- `MIKA_TELEGRAM_WEBHOOK_URL` — Public HTTPS URL for inbound Telegram webhook delivery. Required only in single-bot mode (inbound registration).
+- `MIKA_TELEGRAM_SINGLE_BOT_MODE` — Exclusively controls **inbound global webhook registration**. When `1` or `true`, the gateway registers the global webhook with Telegram for inbound messages (requires all three: `MIKA_TELEGRAM_BOT_TOKEN`, `MIKA_TELEGRAM_WEBHOOK_SECRET`, `MIKA_TELEGRAM_WEBHOOK_URL`). Default: off (per-customer inbound mode). **Semantic narrowing (mika#1590):** pre-fix, this flag gated both inbound webhook registration and outbound client construction; post-fix, it gates inbound registration only — the global outbound client is built whenever `MIKA_TELEGRAM_BOT_TOKEN` is configured.
 - `MIKA_INTERNAL_TOKEN` — Shared 64-char hex bearer token
 - `MIKA_AGENTS_NAMESPACE` — K8s namespace where agent pods run (default: `mika-agents`). Used for FQDN construction in cross-namespace DNS resolution (`http://mika-{id}.{ns}.svc.cluster.local:8080`). Override for environment-scoped namespaces (e.g. `mika-agents-prd`).
 - `MIKA_GITHUB_WEBHOOK_SECRET` — Secret for validating inbound GitHub App webhooks via HMAC-SHA256. Arbitrary string (not hex-constrained like Telegram). When absent, `POST /webhook/github` returns 404.
