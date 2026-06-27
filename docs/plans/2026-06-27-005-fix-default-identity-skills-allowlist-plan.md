@@ -294,6 +294,14 @@ triggers).
 
 ---
 
+## Acceptance criteria
+
+- [ ] **AC1** — fresh `bootstrap_fresh_install` agent does not load verdict-carrying engineering skills (the allowlist evicts them at agent load).
+- [ ] **AC2** — operator-essential skills (calendar, google-workspace, browser-control, desktop, file-reader, web-search, mcp) preserved.
+- [ ] **AC3** — well-known dev agents (`mika-dev/qa/arch/relay`) unchanged — they use separate identities in `well_known_agents.rs` (verified by their existing allowlist-count tests still passing).
+- [ ] **AC4** — integration test asserts the written allowlist excludes `dev-pilot`/`dev-groom`/`mika-arch-*`/`qa-review`/`self-dev*`.
+- [ ] **AC5** — docs updated.
+
 ## Definition of Done
 
 - `DEFAULT_IDENTITY` carries the active narrow `[skills].allowlist` (U1).
