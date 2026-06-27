@@ -44,11 +44,14 @@ mod discover;
 
 /// A known, deliberately-allowed pre-existing check failure.
 ///
-/// Mirrors `KNOWN_PRE_EXISTING_COLLISIONS` in `bundled_skills.rs` (mika#1326 AC2):
-/// each entry names the check, the skill, a substring the failure reason must
-/// contain, and the follow-up ticket that will resolve it. **Self-cleaning**: the
-/// binary (and a test) fail when an entry no longer matches a real failure, forcing
-/// removal of stale exceptions.
+/// Uses the same self-cleaning-exception discipline the mika#1326 AC2 collision
+/// test (`test_bundled_skills_no_cross_skill_tool_name_collision`) once applied
+/// via its own allowlist: each entry names the check, the skill, a substring the
+/// failure reason must contain, and the follow-up ticket that will resolve it.
+/// **Self-cleaning**: the binary (and a test) fail when an entry no longer
+/// matches a real failure, forcing removal of stale exceptions. (That AC2 test
+/// has since been relaxed to flag only divergent handler types and no longer
+/// needs an allowlist — mika#1573; this gate's pattern is unchanged.)
 ///
 /// Per mika#1575 F2 this ships **EMPTY**. A non-empty entry MUST be enumerated in
 /// the PR description with its resolution ticket.
