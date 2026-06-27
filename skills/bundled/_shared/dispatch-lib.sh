@@ -1437,11 +1437,19 @@ _find_issue_plan() {
         return 0
     fi
 
-    # Fallback: content references the issue. Pattern handles three
-    # shapes the pilot has been observed to produce in plan headers:
+    # Fallback: content references the issue. Pattern handles four
+    # header shapes the pilot has been observed to produce in plan headers:
     #   **Ticket:** mika issue#N    (current `/mika-groom-plan-only` shape)
     #   **Ticket:** mika#N          (older convention)
+    #   **Issue:** mika#N           ("Issue" synonym, matches GitHub's UI; mika#1602)
     #   ticket: mika#N              (YAML frontmatter)
+    #   issue: mika#N               (YAML frontmatter, "Issue" synonym; mika#1602)
+    #
+    # mika#1602 (n=3) widened the union to add the `**Issue:**` / `issue:`
+    # branches after mika#1600's dev-groom dispatch wrote `**Issue:** mika#1600`
+    # and BOTH passes missed (filename had no `-1600-` token AND the header was
+    # not `**Ticket:**`). Founding cases for the content-fallback itself were
+    # mika#1421 (n=2: mika#1381 + mika#771, both filename-shape gaps).
     #
     # Header-zone scope: the grep is restricted to the first 20 lines of
     # each plan file. The canonical ticket reference always sits in YAML
@@ -1454,7 +1462,7 @@ _find_issue_plan() {
     while IFS= read -r candidate; do
         [ -r "$candidate" ] || continue
         if head -n 20 "$candidate" 2>/dev/null \
-            | grep -qE "^(\*\*Ticket:\*\*|ticket:)\s+mika[[:space:]]?(issue)?#${ISSUE_NUM}\b"; then
+            | grep -qE "^(\*\*Ticket:\*\*|\*\*Issue:\*\*|ticket:|issue:)\s+mika[[:space:]]?(issue)?#${ISSUE_NUM}\b"; then
             printf '%s' "$candidate"
             return 0
         fi
