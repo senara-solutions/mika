@@ -2229,7 +2229,7 @@ assert_contains "Class C message links to investigation doc" \
 # Branch ordering: the POLICY_DENY branch must be the FIRST elif/if, so it wins
 # over the drift messages when both conditions could fire.
 POLICY_DENY_LINE=$(echo "$DRIFT_BLOCK" | grep -n 'if \[ -n "\$POLICY_DENY" \]' | head -1 | cut -d: -f1)
-DRIFT_MSG_LINE=$(echo "$DRIFT_BLOCK" | grep -n 'Session drifted into executor mode' | head -1 | cut -d: -f1)
+DRIFT_MSG_LINE=$(echo "$DRIFT_BLOCK" | grep -n 'pilot drifted into executor mode' | head -1 | cut -d: -f1)
 if [ -n "$POLICY_DENY_LINE" ] && [ -n "$DRIFT_MSG_LINE" ] && [ "$POLICY_DENY_LINE" -lt "$DRIFT_MSG_LINE" ]; then
     PASS=$((PASS + 1))
     echo "  ✓ POLICY_DENY branch precedes drift message in source"
