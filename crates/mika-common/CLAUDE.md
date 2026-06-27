@@ -13,7 +13,7 @@ Shared library used by all Mika crates: config, LLM providers, Claude API client
 - **Logging:** tracing + tracing-subscriber setup
 - **Telemetry:** Feature-gated OTel export. See `crates/mika-agent/CLAUDE.md` for observability architecture.
 - **Text:** `text.rs` — `safe_truncate(s, max_bytes)` for UTF-8-safe byte-budget truncation using `floor_char_boundary`. Returns `&str`, never panics on multi-byte characters. Use for log line widths, prompt size budgets, and error message previews. Distinct from `db::truncate_chars` (char-count-based, appends "...", returns `String`).
-- **Home directory:** Resolution utilities
+- **Home directory:** Resolution utilities. `bootstrap_fresh_install` writes the default agent's `identity.toml` from `DEFAULT_IDENTITY`, which ships a narrow `[skills].allowlist` (`DEFAULT_AGENT_SKILL_ALLOWLIST`). A missing/empty allowlist is default-permissive and leaks internal `Disposition:` contracts from engineering skills into user-facing replies (mika#1596); keep the constant and the `DEFAULT_IDENTITY` TOML array in sync (asserted by `home.rs` tests).
 - **Model list cache:** `llm/models.rs` — `get_models()` fetches from provider `/models` API with 24h TTL file cache at `{agent_home}/cache/models/{provider}.json`, hardcoded lists for Anthropic/Google, `ModelCache`/`ModelInfo` types
 
 ## LLM Providers
