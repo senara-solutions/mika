@@ -282,7 +282,7 @@ resolvable(token) ⟺ token ∈ BUILTIN_TOOL_NAMES
 
 ---
 
-## Definition of Done
+## Acceptance criteria
 
 - All of R1–R8 satisfied.
 - `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
