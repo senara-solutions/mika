@@ -179,6 +179,19 @@ Out of scope (from issue body):
   `Ollama`/`MikaModel` exemption).
 - Whether any existing `--help` snapshot/golden test exists that must be updated for U3.
 
+## Acceptance criteria
+
+Transcribed from mika#1591 (the issue's `## Acceptance criteria`). These are the criteria
+qa-review verifies the implementation against.
+
+- [x] AC1. `mika ask --model qwen/qwen3.7-max` against an agent with `llm_provider = "openrouter"` routes through OpenRouter and succeeds (returns a model response, not a 401).
+- [x] AC2. When the agent's configured provider has no API key, the error message names the provider and model id: e.g. `"Provider 'openrouter' has no API key configured. Cannot route model 'qwen/qwen3.7-max'."` — not a bare `"no API key"`.
+- [x] AC3. `mika ask --model qwen/qwen3.7-max` against an agent with `llm_provider = "qwen"` (native Qwen key configured) routes through the native Qwen provider and succeeds. The flag strips the `qwen/` prefix when it matches the configured provider name.
+- [x] AC4. `mika ask --model claude-sonnet-4-6-20250514` against an agent with `llm_provider = "anthropic"` routes through Anthropic (no prefix in model id — current behavior preserved for non-prefixed model ids).
+- [x] AC5. Docs: `--model` flag behavior documented in `mika ask --help` output: routes through the agent's configured `llm_provider`, does not re-dispatch based on model name prefix.
+- [x] AC6. Docs: `crates/mika-cli/CLAUDE.md` notes `--model` is a model-id-only override; provider is always inherited from agent config.
+- [x] AC7. Test: unit test asserting `parse_model_override("qwen/qwen3.7-max", configured_provider="openrouter")` returns `(provider: "openrouter", model_id: "qwen/qwen3.7-max")` — no prefix re-dispatch (plus the AC3/AC4, alias, named-error, and degenerate-input cases).
+
 ## Verification Contract
 
 - `cargo test -p mika-cli` green, including the new `parse_model_override` and AC2 cases.
