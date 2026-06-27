@@ -328,6 +328,9 @@ pub async fn run(
         }
     }
     skill_registry.apply_load_safety_check();
+    // Runtime allowlist↔required_tools coherence guard (mika#1576). Runs after
+    // safety check so the effective surface reflects only surviving skills.
+    skill_registry.apply_required_tools_coherence_check(agent_name);
     skill_registry.log_summary();
 
     // Surface validation warnings on stderr (Unit 4: #530)

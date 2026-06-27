@@ -75,6 +75,10 @@ Two predicates encoding "does this task have an active callback child?":
 
 These two perimeters answer overlapping questions and have evolved independently across multiple tickets (mika#525, mika#549, mika#1058). They have not yet drifted into a bug, but the structural shape is the same as #910 and #1163 — two perimeters, separate predicates, no shared function or parity test. Worth tracking as a pre-incident risk.
 
+### 4. mika#1576 — required_tools coherence across N layers (generalization to >2 perimeters)
+
+The same concept ("does this `required_tools` token resolve to a real tool?") is enforced at four layers: build-time `verify_bundled_skills` checks 4/5, the per-turn `#516` gate, and the new load-time `apply_required_tools_coherence_check`. The first review pass copied the surface-builder and the `mcp__` exemption predicate verbatim into both the runtime check and the `mika skills validate` CLI — the same drift seed, caught before merge. Fix: extract `effective_tool_surface` + `required_tool_resolves` (one home for the predicate); reuse the parity-guarded `BUILTIN_TOOL_NAMES` constant. This instance generalizes the two-perimeter pattern to N layers and adds three sub-rules (vantage-dependent severity, fixpoint eviction, coherence-scope ≠ enforcement-scope) — see `docs/solutions/architecture-patterns/multi-layer-structural-invariant-shared-primitive-2026-06-27.md`.
+
 ## The pattern
 
 ```

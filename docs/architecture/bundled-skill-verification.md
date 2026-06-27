@@ -92,9 +92,67 @@ exit blocks merge. The real-tree invariant is *also* enforced by the
 `real_bundled_tree_passes_green` test inside `cargo test`, so the gate has two independent
 CI entry points.
 
+## Runtime sibling: the load-time coherence guard (mika#1576)
+
+The build-time gate above proves the *source tree* is coherent. It cannot prove a *running
+agent* is coherent, because the effective skill set is computed at startup from the agent's
+`identity.toml [skills].allowlist` plus DB and transient overrides — state the build-time
+gate never sees. `SkillRegistry::apply_required_tools_coherence_check(agent_id)` closes that
+gap.
+
+**The invariant:** an agent must not hold a loaded skill that requires a tool it can't call.
+
+**Why a separate layer is needed.** The per-turn `required_tools` gate (mika#516) is
+keyword-scoped — it only fires when a skill keyword-matches *and* the LLM is asked to use the
+tool. A structurally-broken allowlist↔`required_tools` pairing (e.g. a skill requiring a tool
+provided by a skill the allowlist swap removed — the mika#1406 `github`→`gh-read-only`
+scenario) passes every existing check *vacuously* and surfaces only mid-work, when the agent
+reaches for a tool that isn't there. Counter: `invariant-enforced-at-dispatch-layer-not-load-layer`.
+
+**Where it runs.** Immediately after `apply_load_safety_check()` at every registry-finalize
+site (`crates/mika-cli/src/commands/{ask,chat}.rs`, `crates/mika-agent/src/server/mod.rs`,
+and the `list_skills` tool). This is the one point in the load chain where both operands —
+the allowlist (already applied) and each surviving skill's `required_tools` — are
+simultaneously visible.
+
+**The rule.** For each loaded skill, every `[constraints].required_tools` token must resolve to:
+
+- a builtin tool name — the **full** `tools::BUILTIN_TOOL_NAMES` (which subsumes
+  `builtin_handlers::KNOWN_BUILTINS` via the mika#1217 parity test); **the same builtin set
+  Check 4 / Check 5 use**, so the load-time and build-time checks never disagree about what
+  counts as a builtin; or
+- a tool declared in the `tools.json` of some **loaded** skill (allowlist-aware — only
+  surviving skills contribute). This makes it the runtime sibling of **Check 5**, not Check 4:
+  Check 4 is allowlist-unaware ("exists somewhere"); Check 5 and this guard are allowlist-aware
+  ("reachable here").
+
+`mcp__{server}__{tool}` tokens are exempt — they resolve through the MCP client at startup,
+not the builtin/skill surface, so firing on them would wrongly skip a skill that can in fact
+call the tool (mirrors `validate_skill` step 5b's leniency).
+
+**Fire disposition.** On a fire, the offending skill is **skipped** (evicted, recorded in
+`SkillRegistry::skipped()`) and an error-level `required_tool_unresolvable` structured event
+is emitted with fields `agent_id`, `skill`, `unresolvable_token`, `available_tool_count`. The
+agent starts **degraded** — the broken skill is unavailable until the operator fixes the
+coherence violation (adds the providing skill to the allowlist, or drops the dangling token)
+and restarts. This is the established `apply_load_safety_check` "load with warning + skip the
+broken skill" pattern, **not** refuse-to-start.
+
+**First-deploy expectation (mika#1576 F2).** All existing well-known agent configurations pass
+clean. The regression test `well_known_agents::tests::test_well_known_agents_pass_required_tools_coherence`
+seeds the full bundled library, applies each well-known allowlist, and asserts zero coherence
+fires — the runtime sibling of Check 5's build-time guarantee.
+
+**CLI surface.** `mika skills validate` reports a `[WARN]` coherence diagnostic for any
+`required_tools` token that resolves to nothing in the installed-skill surface. The CLI view is
+allowlist-*unaware* (disk-surface, like Check 4), so it emits **Warn, not Fail** — a token may
+be provided by a dependency that isn't installed in a standalone validate tree (e.g. community-
+skill CI) yet resolves fine at runtime; hard-failing there would break that CI. This matches
+the Warn severity of `validate_skill` step 5b and Check 4 for the same allowlist-unaware class.
+The per-agent runtime guard above is the allowlist-aware authority that hard-skips.
+
 ## Out of scope
 
-Runtime invariants (`apply_load_safety_check`, mika#1576), marketplace skill verification
-(bundled only), `tools.json` schema validation against the canonical tool schema, and the
-optional checks 6–8 (prompt-size limits, keyword-overlap detection, schema validation) are
-deferred follow-ups.
+Marketplace skill verification (bundled only), `tools.json` schema validation against the
+canonical tool schema, and the optional checks 6–8 (prompt-size limits, keyword-overlap
+detection, schema validation) are deferred follow-ups.
