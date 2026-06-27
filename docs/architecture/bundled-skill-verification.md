@@ -143,10 +143,13 @@ clean. The regression test `well_known_agents::tests::test_well_known_agents_pas
 seeds the full bundled library, applies each well-known allowlist, and asserts zero coherence
 fires — the runtime sibling of Check 5's build-time guarantee.
 
-**CLI surface.** `mika skills validate` reports a `[FAIL]` coherence diagnostic for any
-`required_tools` token that resolves to nothing on disk. The CLI view is allowlist-*unaware*
-(disk-surface, like Check 4) since it has no specific agent's allowlist; the per-agent runtime
-guard above is the allowlist-aware authority.
+**CLI surface.** `mika skills validate` reports a `[WARN]` coherence diagnostic for any
+`required_tools` token that resolves to nothing in the installed-skill surface. The CLI view is
+allowlist-*unaware* (disk-surface, like Check 4), so it emits **Warn, not Fail** — a token may
+be provided by a dependency that isn't installed in a standalone validate tree (e.g. community-
+skill CI) yet resolves fine at runtime; hard-failing there would break that CI. This matches
+the Warn severity of `validate_skill` step 5b and Check 4 for the same allowlist-unaware class.
+The per-agent runtime guard above is the allowlist-aware authority that hard-skips.
 
 ## Out of scope
 

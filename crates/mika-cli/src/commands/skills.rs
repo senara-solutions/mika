@@ -7,7 +7,9 @@ use mika_agent::skills::index::{
 };
 use mika_agent::skills::install;
 use mika_agent::skills::marketplace;
-use mika_agent::skills::{SkillListFilter, SkillRegistry, SkillSource};
+use mika_agent::skills::{
+    SkillListFilter, SkillRegistry, SkillSource, effective_tool_surface, required_tool_resolves,
+};
 use mika_agent::tools::create_skill::validate_skill_name;
 use mika_common::home;
 use std::io::IsTerminal;
@@ -1572,16 +1574,7 @@ fn validate_skills(
     // (`SkillRegistry::apply_required_tools_coherence_check`) is the allowlist-aware
     // authority that catches tokens unresolvable under a specific agent's allowlist.
     let coherence_registry = SkillRegistry::from_dir(skills_dir);
-    let mut coherence_surface: std::collections::HashSet<String> =
-        mika_agent::tools::BUILTIN_TOOL_NAMES
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-    for entry in coherence_registry.skills() {
-        for tool in &entry.skill_tools {
-            coherence_surface.insert(tool.definition.name.clone());
-        }
-    }
+    let coherence_surface = effective_tool_surface(coherence_registry.skills());
     let coherence_required: std::collections::HashMap<String, Vec<String>> = coherence_registry
         .skills()
         .iter()
@@ -1603,16 +1596,21 @@ fn validate_skills(
     for (dir_name, dir_path) in &dirs {
         let mut diags = validate_skill(dir_path);
         // mika#1576 coherence diagnostics: flag required_tools tokens that don't
-        // resolve to a builtin or any installed skill's declared tool.
+        // resolve to a builtin or any installed skill's declared tool. Emitted as
+        // **Warn**, not Fail — this is the allowlist-unaware disk-surface view (a
+        // dependency may be installed at runtime but absent in a standalone validate
+        // tree), so it must not break `mika skills validate`'s exit code. Matches the
+        // Warn severity of validate_skill step 5b and verify_bundled_skills check 4
+        // for the same allowlist-unaware class; the allowlist-aware runtime guard
+        // (apply_required_tools_coherence_check) is the authority that hard-skips.
         if let Some(required) = coherence_required.get(dir_name) {
             for token in required {
-                // MCP tools (`mcp__{server}__{tool}`) resolve via the MCP client at
-                // startup, not the disk surface — exempt them (mirrors validate_skill 5b).
-                if !token.starts_with("mcp__") && !coherence_surface.contains(token) {
-                    diags.push(SkillDiagnostic::fail(format!(
-                        "required_tool '{token}' is unresolvable — not a builtin and not declared \
-                         by any installed skill's tools.json (allowlist-unaware disk view; \
-                         per-agent coherence is enforced at load time, mika#1576)"
+                if !required_tool_resolves(token, &coherence_surface) {
+                    diags.push(SkillDiagnostic::warn(format!(
+                        "required_tool '{token}' is unresolvable in the installed-skill surface — \
+                         not a builtin and not declared by any installed skill's tools.json. OK if \
+                         provided by a not-yet-installed dependency or an MCP server; the per-agent \
+                         load-time coherence guard is the authority (mika#1576)"
                     )));
                 }
             }
@@ -1709,14 +1707,17 @@ mod coherence_tests {
     }
 
     #[test]
-    fn test_validate_flags_unresolvable_required_tool() {
+    fn test_validate_warns_not_hardfails_on_unresolvable_required_tool() {
         let tmp = tempfile::tempdir().unwrap();
         write_skill(tmp.path(), "coh-broken", &["totally_unresolvable_xyz"]);
-        // A truly-unresolvable token is a Fail → validate_skills bails.
-        let err = validate_skills(tmp.path(), None, &crate::cli::OutputFormat::Json).unwrap_err();
+        // The coherence diagnostic is a Warn (allowlist-unaware disk view), NOT a
+        // Fail — so `mika skills validate` must NOT exit non-zero on it (adversarial
+        // P2-B regression: a dependency-provided tool absent from a standalone tree
+        // must not break community-skill CI). It returns Ok with a warning emitted.
+        let res = validate_skills(tmp.path(), None, &crate::cli::OutputFormat::Json);
         assert!(
-            err.to_string().contains("validation failed"),
-            "expected validation failure, got: {err}"
+            res.is_ok(),
+            "unresolvable required_tool must warn, not hard-fail validate: {res:?}"
         );
     }
 
