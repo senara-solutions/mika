@@ -91,7 +91,7 @@ This is a **test-only** change in `crates/mika-agent/` — no production behavio
 - `grep -rn KNOWN_PRE_EXISTING_COLLISIONS crates/` — zero matches (R1 + R4 complete).
 - `make verify-bundled-skills` — green (unaffected; confirms no collateral).
 
-## Definition of Done
+## Acceptance criteria
 
 All three issue ACs satisfied: allowlist removed (AC1/R1), test flags only divergent handler types (AC2/R2), fixture regression test guards the `run_gh` Builtin-vs-Exec class (AC3/R3); no dangling symbol reference (R4); crate builds + lints clean; PR opened with `Closes #1573`.
 
