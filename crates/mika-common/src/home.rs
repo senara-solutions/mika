@@ -271,8 +271,61 @@ log_level = "info"
 # mikamodel_model = "mika"
 "#;
 
+/// Narrow operator-assistant skill allowlist for the default (personal/customer) agent.
+///
+/// A missing or empty `[skills].allowlist` is treated as *default-permissive* — every
+/// bundled skill loads, including the engineering skills (`dev-pilot`, `dev-groom`,
+/// `mika-arch-*`, `qa-review*`, `self-dev*`) whose prompts carry the internal
+/// `Disposition: READY|ITERATE|ESCALATE` contract. The model then mimics that contract and
+/// appends `Disposition:` lines to user-facing replies (mika#1596). Shipping this narrow list
+/// in `DEFAULT_IDENTITY` closes that gap; an explicit `[skills]` block in a provisioned
+/// `identity.toml` still overrides it (`bootstrap`/`write_default_if_missing` never overwrite
+/// an existing file).
+///
+/// Maintenance: this is the personal/customer-agent counterpart to the well-known-agent
+/// allowlists in `crates/mika-agent/src/well_known_agents.rs`. New user-facing skills a
+/// personal agent should reach must be added here too. The allowlist↔required_tools coherence
+/// guard (mika#1595) runs at agent-load on the resolved surface, so keep this list to skills
+/// with self-contained or operator-granted tools. The TOML array in `DEFAULT_IDENTITY` below
+/// MUST stay in sync with this constant — `home.rs` tests assert they match.
+pub const DEFAULT_AGENT_SKILL_ALLOWLIST: &[&str] = &[
+    "calendar",
+    "google-workspace",
+    "browser-control",
+    "desktop",
+    "file-reader",
+    "mcp",
+    "web-search",
+    "self-knowledge",
+    "shell-exec",
+    "tmux",
+    "git-ops",
+    "gh-read-only",
+];
+
 pub const DEFAULT_IDENTITY: &str = r#"name = "Mika"
 emoji = "✦"
+
+[skills]
+# Narrow operator-assistant allowlist. A missing/empty allowlist is default-permissive
+# (loads every bundled engineering skill) and leaks internal "Disposition:" contracts into
+# user-facing replies — see mika#1596. Provisioning an explicit identity.toml overrides this.
+# Keep in sync with DEFAULT_AGENT_SKILL_ALLOWLIST in crates/mika-common/src/home.rs and the
+# well-known-agent allowlists in crates/mika-agent/src/well_known_agents.rs.
+allowlist = [
+    "calendar",
+    "google-workspace",
+    "browser-control",
+    "desktop",
+    "file-reader",
+    "mcp",
+    "web-search",
+    "self-knowledge",
+    "shell-exec",
+    "tmux",
+    "git-ops",
+    "gh-read-only",
+]
 
 # [kg]
 # enabled = true                    # default: true — set false to skip KG for this agent
@@ -622,5 +675,76 @@ mod tests {
         // Root-level global config written
         let root_config = fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(root_config.contains("global"));
+    }
+
+    /// AC4 (mika#1596): the default identity written by `bootstrap_fresh_install` carries a
+    /// narrow `[skills].allowlist` that excludes engineering/verdict-carrying skills and
+    /// includes the operator-essential ones — so a fresh personal/customer agent does not
+    /// load the architect/dev skills that leak `Disposition:` lines into user-facing replies.
+    #[test]
+    fn test_bootstrap_fresh_install_writes_narrow_skill_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        bootstrap_fresh_install(home).unwrap();
+
+        let identity_path = home.join("agents").join("mika").join("identity.toml");
+        let raw = fs::read_to_string(&identity_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+
+        let allowlist: Vec<String> = parsed
+            .get("skills")
+            .and_then(|s| s.get("allowlist"))
+            .and_then(|a| a.as_array())
+            .expect("default identity must have an active [skills].allowlist")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        // Non-empty — proves the `apply_identity_allowlist` no-op-on-empty path can't trigger.
+        assert!(!allowlist.is_empty());
+
+        // Single source of truth: the written allowlist matches the constant.
+        assert_eq!(allowlist, DEFAULT_AGENT_SKILL_ALLOWLIST);
+
+        // AC4 exclusions: no engineering / verdict-carrying skills.
+        let excluded = [
+            "dev-pilot",
+            "dev-groom",
+            "mika-arch-groom-ticket",
+            "mika-arch-groom-milestone",
+            "mika-arch-second-review",
+            "qa-review",
+            "qa-review-build-callback",
+        ];
+        for name in excluded {
+            assert!(
+                !allowlist.iter().any(|s| s == name),
+                "default allowlist must exclude engineering skill `{name}`"
+            );
+        }
+        // Prefix guard: nothing self-dev* or mika-arch*.
+        for s in &allowlist {
+            assert!(
+                !s.starts_with("self-dev") && !s.starts_with("mika-arch"),
+                "default allowlist must not contain engineering skill `{s}`"
+            );
+        }
+
+        // AC2 inclusions: operator-essential skills present.
+        for name in [
+            "calendar",
+            "google-workspace",
+            "browser-control",
+            "desktop",
+            "file-reader",
+            "web-search",
+            "mcp",
+        ] {
+            assert!(
+                allowlist.iter().any(|s| s == name),
+                "default allowlist must include operator-essential skill `{name}`"
+            );
+        }
     }
 }
