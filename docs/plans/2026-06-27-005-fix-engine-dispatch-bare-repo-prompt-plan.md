@@ -107,6 +107,27 @@ Traceability to the ticket's acceptance criteria:
 
 ---
 
+## Acceptance criteria
+
+- [ ] **AC1** — Bare `repo#number` is emitted from both dispatch-prompt sites so dispatch-lib
+  creates the worktree; no `policy:deny` on `derive-branch-name`. (R1, R5)
+- [ ] **AC2** — Branch-name centralization (mika-platform#58) preserved: dispatch-lib's
+  `derive-branch-name` stays the sole brancher; no LLM-improvised branch names. (R2)
+- [ ] **AC3** — Pilot-no-push boundary (mika#1318) untouched: no change to push behavior,
+  `pilot_push_guard`, or iterate/push sequencing. (R3)
+- [ ] **AC4** — **Operator-gated runtime test**: after `make deploy` + restart, label a fresh
+  ungroomed ticket `ready`; observe (a) dispatch-lib creates the worktree (no free-text
+  fall-through), (b) inner pilot does **not** call `scripts/derive-branch-name`, (c) no
+  `policy:deny`, (d) `Verdict: GROOMED` or `ESCALATE` + callback to implement. (R4)
+
+### Gate assertions
+
+- `cargo test -p mika-agent ready_label` → all pass (includes `repo_name` and bare-prompt tests)
+- `bash skills/bundled/_shared/test-dispatch-lib.sh` → all pass (includes owner-prefix normalization)
+- `make verify-bundled-skills` → pass
+
+---
+
 ## Key Technical Decisions
 
 ### KTD1 — Fix the producer (emit bare `repo#number`), and harden the consumer (parser)
