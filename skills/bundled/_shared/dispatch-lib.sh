@@ -398,11 +398,17 @@ _seed_worktree_slash_commands() {
 # setup clobbers .claude/commands).
 _set_up_worktree() {
     # --- Parse repo#number format ---
-    # Matches: mika#214, mika-skills#8, mika-cloud#50
+    # Matches: mika#214, mika-skills#8, mika-cloud#50, and an optional owner/
+    # prefix (senara-solutions/mika#214). The owner prefix is stripped so REPO
+    # is always the bare basename — dispatch-lib hardcodes the senara-solutions
+    # owner for the gh call below. Normalizing here means an owner-qualified ref
+    # is routed into worktree mode instead of silently falling through to
+    # free-text mode (mika#1593). The match stays fully anchored, so genuine
+    # free-text prompts with an embedded '#' still fall through as before.
     REPO=""
     ISSUE_NUM=""
-    if printf '%s' "$PROMPT" | grep -qE '^[a-zA-Z0-9_-]+#[0-9]+$'; then
-        REPO=$(printf '%s' "$PROMPT" | sed 's/#.*//')
+    if printf '%s' "$PROMPT" | grep -qE '^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$'; then
+        REPO=$(printf '%s' "$PROMPT" | sed 's/#.*//' | sed 's#.*/##')
         ISSUE_NUM=$(printf '%s' "$PROMPT" | sed 's/.*#//')
     fi
 

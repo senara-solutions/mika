@@ -2388,6 +2388,39 @@ else
     echo "    (GATE_LINE=$GATE_LINE, M1282_LINE=$M1282_LINE, GROOM_PLAN_LINE=$GROOM_PLAN_LINE)"
 fi
 
+# --- Test: repo#number parse normalizes an optional owner/ prefix (mika#1593) ---
+echo ""
+echo "Test: _set_up_worktree prompt parse — owner-prefix normalization (mika#1593)"
+
+# (a) Static: the live parser carries the broadened regex + owner-strip, so the
+#     behavioral replica below cannot silently drift from the real code.
+PARSE_REGION=$(sed -n '/--- Parse repo#number format ---/,/^    if \[ -n "\$REPO" \]/p' "$DISPATCH_LIB")
+assert_contains "Parser regex accepts an optional owner/ segment" \
+    '^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$' "$PARSE_REGION"
+assert_contains "Parser strips the owner/ prefix to the bare basename" \
+    "sed 's#.*/##'" "$PARSE_REGION"
+
+# (b) Behavioral: replicate the exact two-line parse and assert normalization.
+#     Mirrors the harness convention of testing extracted logic in isolation
+#     (the full dispatch_claude_pilot needs git/gh/claude-pilot).
+_parse_prompt() {
+    local PROMPT="$1" REPO="" ISSUE_NUM=""
+    if printf '%s' "$PROMPT" | grep -qE '^([a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+#[0-9]+$'; then
+        REPO=$(printf '%s' "$PROMPT" | sed 's/#.*//' | sed 's#.*/##')
+        ISSUE_NUM=$(printf '%s' "$PROMPT" | sed 's/.*#//')
+    fi
+    printf '%s|%s' "$REPO" "$ISSUE_NUM"
+}
+assert_eq "Bare repo#number parses unchanged" "mika|214" "$(_parse_prompt 'mika#214')"
+assert_eq "Owner-qualified ref normalizes to bare basename" \
+    "mika|1576" "$(_parse_prompt 'senara-solutions/mika#1576')"
+assert_eq "Hyphenated repo basename is preserved" \
+    "mika-cloud|50" "$(_parse_prompt 'senara-solutions/mika-cloud#50')"
+assert_eq "Bare hyphenated repo parses unchanged" \
+    "mika-skills|8" "$(_parse_prompt 'mika-skills#8')"
+assert_eq "Free-text prompt with embedded # stays free-text (empty REPO)" \
+    "|" "$(_parse_prompt 'fix the foo#bar thing and more')"
+
 # --- Summary ---
 
 echo ""
