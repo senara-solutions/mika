@@ -85,8 +85,9 @@ pub(crate) async fn handle_version() -> Json<VersionInfo> {
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
-    /// Global Telegram client — populated only in single-bot mode
-    /// (`MIKA_TELEGRAM_SINGLE_BOT_MODE=1`). `None` in per-customer mode.
+    /// Global Telegram client — populated when `MIKA_TELEGRAM_BOT_TOKEN` is configured.
+    /// Used for outbound delivery via `/send` (operator agents without `customer_id`).
+    /// `None` only when no bot token is set.
     pub telegram: Option<TelegramClient>,
     pub http_client: reqwest::Client,
     pub internal_token: SecretString,
@@ -1098,6 +1099,12 @@ pub(crate) async fn handle_send(
                 CustomerTelegramClient::new(state.http_client.clone(), global_tg.bot_token_cloned())
             }
             None => {
+                warn!(
+                    agent_name = ?payload.agent_name,
+                    chat_id = payload.chat_id,
+                    request_id = ?payload.request_id,
+                    "send failed: no customer_id provided and no global Telegram client configured"
+                );
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"error": "no customer_id provided and gateway is not in single-bot mode"})),

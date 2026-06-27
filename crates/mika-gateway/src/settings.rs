@@ -8,7 +8,8 @@ pub struct GatewaySettings {
     /// Postgres connection string
     pub database_url: SecretString,
 
-    /// Telegram Bot API token (required only in single-bot mode)
+    /// Telegram Bot API token. When set, the global outbound client is built
+    /// regardless of single-bot mode (mika#1590).
     #[serde(default)]
     pub telegram_bot_token: Option<SecretString>,
 
@@ -118,45 +119,53 @@ impl GatewaySettings {
                 )
             })?;
 
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    /// Validate settings constraints. Extracted from `load()` for testability.
+    fn validate(&self) -> anyhow::Result<()> {
         // Validate internal token
-        validate_hex_token(&settings.internal_token, "MIKA_INTERNAL_TOKEN")?;
+        validate_hex_token(&self.internal_token, "MIKA_INTERNAL_TOKEN")?;
 
         // Single-bot mode requires bot token, webhook secret, and webhook URL
-        if telegram_single_bot_mode_is_enabled(settings.telegram_single_bot_mode.as_deref()) {
-            if settings.telegram_bot_token.is_none() {
+        // for inbound webhook registration. When single-bot mode is off,
+        // bot_token alone is sufficient for outbound delivery (mika#1590).
+        if telegram_single_bot_mode_is_enabled(self.telegram_single_bot_mode.as_deref()) {
+            if self.telegram_bot_token.is_none() {
                 anyhow::bail!(
                     "MIKA_TELEGRAM_SINGLE_BOT_MODE is enabled but MIKA_TELEGRAM_BOT_TOKEN is not set"
                 );
             }
-            if settings.telegram_webhook_secret.is_none() {
+            if self.telegram_webhook_secret.is_none() {
                 anyhow::bail!(
                     "MIKA_TELEGRAM_SINGLE_BOT_MODE is enabled but MIKA_TELEGRAM_WEBHOOK_SECRET is not set"
                 );
             }
-            if settings.telegram_webhook_url.is_none() {
+            if self.telegram_webhook_url.is_none() {
                 anyhow::bail!(
                     "MIKA_TELEGRAM_SINGLE_BOT_MODE is enabled but MIKA_TELEGRAM_WEBHOOK_URL is not set"
                 );
             }
 
             // Validate webhook URL is well-formed
-            reqwest::Url::parse(settings.telegram_webhook_url.as_ref().unwrap()).map_err(|e| {
+            reqwest::Url::parse(self.telegram_webhook_url.as_ref().unwrap()).map_err(|e| {
                 anyhow::anyhow!("MIKA_TELEGRAM_WEBHOOK_URL is not a valid URL: {e}")
             })?;
 
             // Validate webhook secret format
             validate_hex_token(
-                settings.telegram_webhook_secret.as_ref().unwrap(),
+                self.telegram_webhook_secret.as_ref().unwrap(),
                 "MIKA_TELEGRAM_WEBHOOK_SECRET",
             )?;
         }
 
         // Validate agent_base_url scheme when set (dev-only override)
-        if let Some(ref url_str) = settings.agent_base_url {
+        if let Some(ref url_str) = self.agent_base_url {
             validate_agent_base_url(url_str)?;
         }
 
-        Ok(settings)
+        Ok(())
     }
 }
 
@@ -407,5 +416,69 @@ mod tests {
     fn test_single_bot_mode_handles_whitespace() {
         assert!(telegram_single_bot_mode_is_enabled(Some(" 1 ")));
         assert!(telegram_single_bot_mode_is_enabled(Some("\ttrue\n")));
+    }
+
+    // -- validation contract tests (mika#1590) --
+
+    /// Helper to build a GatewaySettings with sensible defaults for validation tests.
+    fn test_settings() -> GatewaySettings {
+        GatewaySettings {
+            database_url: SecretString::from("postgres://localhost/test"),
+            telegram_bot_token: None,
+            telegram_webhook_secret: None,
+            telegram_webhook_url: None,
+            telegram_single_bot_mode: None,
+            internal_token: SecretString::from("a".repeat(64)),
+            gateway_port: 8080,
+            log_level: "info".to_string(),
+            log_format: "json".to_string(),
+            agent_base_url: None,
+            gateway_log_file: None,
+            agents_namespace: "mika-agents".to_string(),
+            github_webhook_secret: None,
+            github_app_id: None,
+            github_app_private_key: None,
+            github_app_installation_id: None,
+            orchestrator_inbox_enabled: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_token_only_mode_off_succeeds() {
+        // AC7: bot token alone is sufficient when single-bot mode is off
+        let mut s = test_settings();
+        s.telegram_bot_token = Some(SecretString::from("123:ABC"));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_token_only_mode_on_fails() {
+        // AC7: token-only with single-bot mode on → validation error
+        let mut s = test_settings();
+        s.telegram_bot_token = Some(SecretString::from("123:ABC"));
+        s.telegram_single_bot_mode = Some("1".to_string());
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("MIKA_TELEGRAM_WEBHOOK_SECRET"),
+            "expected error about missing webhook secret, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_all_three_mode_on_succeeds() {
+        // AC7: all three vars + mode on → success
+        let mut s = test_settings();
+        s.telegram_bot_token = Some(SecretString::from("123:ABC"));
+        s.telegram_webhook_secret = Some(SecretString::from("b".repeat(64)));
+        s.telegram_webhook_url = Some("https://example.com/webhook".to_string());
+        s.telegram_single_bot_mode = Some("1".to_string());
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_token_no_mode_succeeds() {
+        // No Telegram config at all — valid (Telegram features simply disabled)
+        let s = test_settings();
+        assert!(s.validate().is_ok());
     }
 }
