@@ -1086,12 +1086,12 @@ See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-poli
 ${RESULT}"
             elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
                 # Both checks failed: no plan file AND /ce:plan never called
-                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no issue-scoped plan >500 bytes found via _find_issue_plan for $REPO#$ISSUE_NUM) and no /ce:plan invocation detected in session log. Session drifted into executor mode.
+                RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md and no header-line match in first 20 lines for known prefixes) and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's regex didn't match the header shape — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1602 class).
 
 ${RESULT}"
             elif [ -z "$VALID_PLAN" ]; then
                 # Plan file missing but /ce:plan was called (or log unavailable)
-                RESULT="PIPELINE FAILURE: dev-groom produced no valid plan file (no issue-scoped plan >500 bytes found via _find_issue_plan for $REPO#$ISSUE_NUM). Session likely drifted into executor mode.
+                RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md and no header-line match in first 20 lines for known prefixes). Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1602 class); if no plan exists, the pilot drifted into executor mode.
 
 ${RESULT}"
             elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
