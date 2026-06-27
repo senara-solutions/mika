@@ -1589,144 +1589,172 @@ mod tests {
         );
     }
 
-    /// Allowlist of known cross-skill tool name declarations that are
-    /// benign (same name, same handler — skill-scoped tool surface model).
+    /// Detect cross-skill tool-name collisions where the same tool name is
+    /// declared with **different handler types** across bundled skills
+    /// (mika#1326 AC2, relaxed to spec per mika#1573).
     ///
-    /// Each entry: `(tool_name, sorted_skill_names_csv, follow_up_ticket)`.
-    /// The sorted-CSV form means `(skill_a, skill_b)` and `(skill_b, skill_a)`
-    /// produce the same key; we sort owners before comparison.
+    /// Returns one formatted line per divergent collision. Same-name +
+    /// **same**-handler-type declarations are intentionally NOT reported: that
+    /// is the skill-scoped tool surface model working as designed (every value
+    /// identical → no HashMap last-write-wins risk, e.g. the architect skills +
+    /// gh-read-only each declaring `gh_read` with an identical Builtin handler).
+    /// Only handler-type *divergence* — the class behind the 2026-05-28
+    /// `run_gh` Builtin-vs-Exec incident — is flagged.
     ///
-    /// **Self-cleaning contract:** the test below asserts each allowlist
-    /// entry STILL collides at the named owner set. When the follow-up
-    /// ticket's resolution removes the collision, this test fails with
-    /// "stale allowlist entry, remove it" — preventing the bounded hole
-    /// from rotting into permanence.
-    ///
-    /// **Scope discipline:** entries live inside `#[cfg(test)] mod tests`
-    /// so the production skill loader cannot consult them at runtime.
-    /// Adding a `mod-scope` re-export would breach the additions-only
-    /// scope reservation that mika#1326's freeze-safe subset honors.
-    const KNOWN_PRE_EXISTING_COLLISIONS: &[(&str, &str, &str)] = &[
-        // Four skills legitimately declare gh_read with identical Builtin
-        // handlers — same skill-scoped tool surface model used by each skill
-        // independently. Three are the architect skills (mika-arch-groom-
-        // milestone/groom-ticket/second-review); the fourth is gh-read-only
-        // (mika#1406, Mika Prime's read-only GitHub access). Not a true
-        // collision (same name + same handler = no last-write-wins risk),
-        // but the strict test flags it. See mika#1573 for the test-relaxation
-        // decision.
-        (
-            "gh_read",
-            "gh-read-only,mika-arch-groom-milestone,mika-arch-groom-ticket,mika-arch-second-review",
-            "mika#1573",
-        ),
-    ];
+    /// Factored out so the invariant test and the mika#1573 AC3 regression
+    /// fixture exercise the same detection path. Lives in `#[cfg(test)]` so the
+    /// production skill loader cannot consult it at runtime (preserving
+    /// mika#1326's additions-only scope reservation).
+    fn detect_divergent_handler_collisions(skills: &[&BundledSkill]) -> Vec<String> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // tool_name -> handler_type -> sorted set of declaring skills. A
+        // missing/unparseable handler.type maps to a stable sentinel so two
+        // handler-less declarations are treated as same (not a divergence),
+        // while a missing-vs-present pairing is flagged conservatively.
+        let mut by_tool: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+
+        for skill in skills {
+            let Some(tools_json) = skill.files.iter().find(|f| f.path == "tools.json") else {
+                continue;
+            };
+            let tool_defs: Vec<serde_json::Value> = match serde_json::from_str(tools_json.content) {
+                Ok(t) => t,
+                Err(_) => continue, // malformed tools.json caught by other tests
+            };
+            for tool_def in &tool_defs {
+                let Some(name) = tool_def.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let handler_type = tool_def
+                    .get("handler")
+                    .and_then(|h| h.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("(no handler.type)");
+                by_tool
+                    .entry(name.to_string())
+                    .or_default()
+                    .entry(handler_type.to_string())
+                    .or_default()
+                    .insert(skill.name.to_string());
+            }
+        }
+
+        by_tool
+            .into_iter()
+            .filter(|(_, by_handler)| by_handler.len() > 1)
+            .map(|(tool, by_handler)| {
+                let detail = by_handler
+                    .iter()
+                    .map(|(ht, owners)| {
+                        format!(
+                            "{ht} [{}]",
+                            owners.iter().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" vs ");
+                format!("  tool '{tool}' declared with divergent handler types: {detail}")
+            })
+            .collect()
+    }
 
     #[test]
     fn test_bundled_skills_no_cross_skill_tool_name_collision() {
-        // AC2: No two bundled skills may declare the same tool name.
-        // This catches collisions at compile-test time, before they reach
-        // production as silent last-write-wins shadows (mika#1326).
+        // AC2 (mika#1326), relaxed to spec per mika#1573: no two bundled skills
+        // may declare the same tool name with DIFFERENT handler types. This
+        // catches the production-risk class — divergent handlers silently
+        // shadowing each other via HashMap last-write-wins (the 2026-05-28
+        // run_gh Builtin-vs-Exec incident) — at compile-test time.
         //
-        // Intentionally stricter than AC2's "different handler types"
-        // criterion: we flag ALL same-name declarations regardless of
-        // handler type. Rationale: even same-handler-type collisions
-        // indicate a manifest hygiene issue (redundant declarations),
-        // and the cost of flagging them is zero (fix is to remove the
-        // duplicate).
-        //
-        // **Known pre-existing exceptions** are allowlisted via
-        // `KNOWN_PRE_EXISTING_COLLISIONS`. Each entry names the colliding
-        // tool, the exact (sorted) skill-name set, and a follow-up ticket
-        // for resolution. The test asserts each allowlist entry STILL
-        // collides at the named owner set — so when the follow-up ticket
-        // lands and the collision is resolved, this test fails with
-        // "stale allowlist entry, remove it." Self-cleaning, not silent.
-
-        use std::collections::HashMap;
+        // Same-name + same-handler-type declarations are NOT flagged: that is
+        // the skill-scoped tool surface model working as designed (e.g. the
+        // architect skills + gh-read-only each declaring `gh_read` with an
+        // identical Builtin handler — every value identical, no last-write-wins
+        // risk). The original AC2 impl was stricter (flagged ALL same-name
+        // declarations) and false-positived on that benign case; mika#1573
+        // relaxed it to the handler-type-divergence spec AC2 actually named.
 
         let all_skills = all_bundled_skills();
-        let mut tool_owners: HashMap<String, Vec<String>> = HashMap::new();
-
-        for skill in &all_skills {
-            let tools_json = skill.files.iter().find(|f| f.path == "tools.json");
-            let Some(tools_json) = tools_json else {
-                continue;
-            };
-
-            let tool_defs: Vec<serde_json::Value> = match serde_json::from_str(tools_json.content) {
-                Ok(t) => t,
-                Err(_) => continue, // Malformed tools.json caught by other tests
-            };
-
-            for tool_def in &tool_defs {
-                if let Some(name) = tool_def.get("name").and_then(|n| n.as_str()) {
-                    tool_owners
-                        .entry(name.to_string())
-                        .or_default()
-                        .push(skill.name.to_string());
-                }
-            }
-        }
-
-        // Build the actual-collision set: (tool_name, sorted owners csv).
-        let mut actual_collisions: HashMap<String, String> = HashMap::new();
-        for (tool, owners) in tool_owners.iter() {
-            if owners.len() > 1 {
-                let mut sorted_owners = owners.clone();
-                sorted_owners.sort();
-                actual_collisions.insert(tool.clone(), sorted_owners.join(","));
-            }
-        }
-
-        // Self-cleaning assertion: each allowlist entry must STILL collide
-        // at the exact owner set named. If the follow-up ticket lands and
-        // resolves the collision, this fires — telling the next engineer
-        // to remove the now-stale allowlist entry.
-        for (tool, expected_owners_csv, follow_up) in KNOWN_PRE_EXISTING_COLLISIONS {
-            match actual_collisions.get(*tool) {
-                Some(actual_owners_csv) if actual_owners_csv == expected_owners_csv => {
-                    // Allowlist entry is still valid — collision still exists.
-                }
-                Some(actual_owners_csv) => {
-                    panic!(
-                        "STALE allowlist entry for tool '{tool}' (mika#1326 / {follow_up}): \
-                         expected collision owners '{expected_owners_csv}' but found \
-                         '{actual_owners_csv}'. The follow-up resolved part of the collision \
-                         — update or remove the allowlist entry to match the new state."
-                    );
-                }
-                None => {
-                    panic!(
-                        "STALE allowlist entry for tool '{tool}' (mika#1326 / {follow_up}): \
-                         no collision found at all. The follow-up resolved the collision — \
-                         remove this allowlist entry."
-                    );
-                }
-            }
-        }
-
-        // Now report any UNALLOWLISTED collisions.
-        let unallowlisted: Vec<(String, String)> = actual_collisions
-            .iter()
-            .filter(|(tool, owners_csv)| {
-                !KNOWN_PRE_EXISTING_COLLISIONS
-                    .iter()
-                    .any(|(allowed_tool, allowed_owners, _)| {
-                        allowed_tool == tool && allowed_owners == &owners_csv.as_str()
-                    })
-            })
-            .map(|(t, o)| (t.clone(), o.clone()))
-            .collect();
+        let collisions = detect_divergent_handler_collisions(&all_skills);
 
         assert!(
-            unallowlisted.is_empty(),
-            "Bundled skill tool name collisions detected (mika#1326):\n{}",
-            unallowlisted
-                .iter()
-                .map(|(tool, owners_csv)| format!("  tool '{tool}' declared by: {owners_csv}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            collisions.is_empty(),
+            "Bundled skill tool-name collisions with DIVERGENT handler types \
+             detected (mika#1326 / mika#1573):\n{}\n\n\
+             The same tool name declared with different handler types risks \
+             silent last-write-wins shadowing in the skill loader. Consolidate \
+             to a single handler type.",
+            collisions.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_collision_detector_catches_divergent_run_gh_handlers() {
+        // mika#1573 AC3 regression guard: the relaxed AC2 detector MUST still
+        // catch the original mika#1326 incident class — two skills declaring
+        // the same tool name with DIFFERENT handler types (Builtin vs Exec).
+        // This reproduces the 2026-05-28 run_gh Builtin-vs-Exec production bug
+        // as a fixture so the mika#1573 relaxation can't silently drop coverage
+        // of the class it was scoped to keep.
+        static RUN_GH_BUILTIN_FILES: &[SkillFile] = &[SkillFile {
+            path: "tools.json",
+            content: r#"[{"name": "run_gh", "handler": {"type": "builtin", "function": "run_gh"}}]"#,
+            executable: false,
+        }];
+        static RUN_GH_EXEC_FILES: &[SkillFile] = &[SkillFile {
+            path: "tools.json",
+            content: r#"[{"name": "run_gh", "handler": {"type": "exec", "command": "handlers/run.sh"}}]"#,
+            executable: false,
+        }];
+        static RUN_GH_BUILTIN_SKILL: BundledSkill = BundledSkill {
+            name: "skill-run-gh-builtin",
+            files: RUN_GH_BUILTIN_FILES,
+            content_hash: "",
+        };
+        static RUN_GH_EXEC_SKILL: BundledSkill = BundledSkill {
+            name: "skill-run-gh-exec",
+            files: RUN_GH_EXEC_FILES,
+            content_hash: "",
+        };
+
+        let divergent: &[&BundledSkill] = &[&RUN_GH_BUILTIN_SKILL, &RUN_GH_EXEC_SKILL];
+        let collisions = detect_divergent_handler_collisions(divergent);
+        assert_eq!(
+            collisions.len(),
+            1,
+            "run_gh Builtin-vs-Exec divergence must be flagged, got: {collisions:?}"
+        );
+        assert!(
+            collisions[0].contains("run_gh"),
+            "collision report must name the run_gh tool: {collisions:?}"
+        );
+
+        // Negative companion: same name + SAME handler type is the benign
+        // skill-scoped tool surface model (the gh_read false-positive that
+        // motivated mika#1573) and must NOT be flagged.
+        static GH_READ_BUILTIN_FILES: &[SkillFile] = &[SkillFile {
+            path: "tools.json",
+            content: r#"[{"name": "gh_read", "handler": {"type": "builtin", "function": "gh_read"}}]"#,
+            executable: false,
+        }];
+        static GH_READ_SKILL_A: BundledSkill = BundledSkill {
+            name: "skill-gh-read-a",
+            files: GH_READ_BUILTIN_FILES,
+            content_hash: "",
+        };
+        static GH_READ_SKILL_B: BundledSkill = BundledSkill {
+            name: "skill-gh-read-b",
+            files: GH_READ_BUILTIN_FILES,
+            content_hash: "",
+        };
+
+        let benign: &[&BundledSkill] = &[&GH_READ_SKILL_A, &GH_READ_SKILL_B];
+        let benign_collisions = detect_divergent_handler_collisions(benign);
+        assert!(
+            benign_collisions.is_empty(),
+            "same-handler-type gh_read declarations must NOT be flagged \
+             (skill-scoped tool surface model): {benign_collisions:?}"
         );
     }
 
