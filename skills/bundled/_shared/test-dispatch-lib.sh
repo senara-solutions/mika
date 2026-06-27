@@ -2421,6 +2421,92 @@ assert_eq "Bare hyphenated repo parses unchanged" \
 assert_eq "Free-text prompt with embedded # stays free-text (empty REPO)" \
     "|" "$(_parse_prompt 'fix the foo#bar thing and more')"
 
+# --- Test 16: _find_issue_plan header-shape discovery (mika#1602, n=3) ---
+#
+# Behavioral test: source dispatch-lib.sh (verified side-effect-free — function
+# definitions only, no top-level execution) and call the real _find_issue_plan
+# against temp `docs/plans/` fixtures. Proves AC1–AC4:
+#   AC1 — `**Issue:** mika#N` (and `issue: mika#N`) headers are discoverable.
+#   AC2 — the legacy `**Ticket:** mika#N` and `ticket: mika#N` shapes still match.
+#   AC3 — the primary filename pass (`*-N-*-plan.md`) still matches.
+#   AC4 — the `**Issue:**` case FAILS on the pre-fix regex and PASSES after.
+#
+# Each fixture is padded > 500 bytes to satisfy the mika#1033 size filter.
+
+echo ""
+echo "Test 16: _find_issue_plan header-shape discovery (mika#1602)"
+echo "------------------------------------------------------------"
+
+# _fip_probe <issue_num> <header_line> <filename_slug> [header_offset_lines]
+# Builds a one-off plan fixture and returns _find_issue_plan's verdict as
+# "FOUND <basename>" (exit 0) or "NOTFOUND" (exit non-zero). Sourcing happens
+# in this same subshell so $WORKTREE_DIR / $ISSUE_NUM scope to the call only.
+_fip_probe() {
+    local issue_num="$1" header_line="$2" slug="$3" offset="${4:-2}"
+    local tmp result rc i
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/docs/plans"
+    local plan="$tmp/docs/plans/$slug"
+    {
+        echo "# Plan: synthetic fixture"
+        # Pad with $offset blank/filler lines BEFORE the header so callers can
+        # push the header above or below the 20-line header-zone boundary.
+        for ((i = 1; i < offset; i++)); do echo ""; done
+        echo "$header_line"
+        echo ""
+        # >500 bytes of body so the size filter does not reject the fixture.
+        for i in $(seq 1 12); do
+            echo "Body line $i — padding padding padding padding padding padding."
+        done
+    } > "$plan"
+    result=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB"
+        WORKTREE_DIR="$tmp" ISSUE_NUM="$issue_num" _find_issue_plan
+    ) && rc=0 || rc=$?
+    rm -rf "$tmp"
+    if [ "$rc" -eq 0 ] && [ -n "$result" ]; then
+        printf 'FOUND %s' "$(basename "$result")"
+    else
+        printf 'NOTFOUND'
+    fi
+}
+
+# AC1 — the n=3 case: **Issue:** header, filename has NO -1602- token.
+assert_eq "AC1: **Issue:** mika#1602 header found despite unrelated filename" \
+    "FOUND 2026-06-27-006-fix-unrelated-slug-plan.md" \
+    "$(_fip_probe 1602 '**Issue:** mika#1602' '2026-06-27-006-fix-unrelated-slug-plan.md')"
+
+# AC1 variant — `issue:` YAML frontmatter shape.
+assert_eq "AC1: issue: mika#1602 YAML header found" \
+    "FOUND 2026-06-27-007-yaml-issue-shape-plan.md" \
+    "$(_fip_probe 1602 'issue: mika#1602' '2026-06-27-007-yaml-issue-shape-plan.md')"
+
+# AC2 regression — legacy **Ticket:** shape still matches.
+assert_eq "AC2: **Ticket:** mika#771 header still found (no regression)" \
+    "FOUND 2026-06-06-003-feat-some-other-slug-plan.md" \
+    "$(_fip_probe 771 '**Ticket:** mika#771' '2026-06-06-003-feat-some-other-slug-plan.md')"
+
+# AC2 regression — legacy ticket: YAML shape still matches.
+assert_eq "AC2: ticket: mika#771 YAML header still found (no regression)" \
+    "FOUND 2026-06-06-004-feat-yaml-ticket-plan.md" \
+    "$(_fip_probe 771 'ticket: mika#771' '2026-06-06-004-feat-yaml-ticket-plan.md')"
+
+# AC3 regression — primary filename pass (issue number in filename, no content header).
+assert_eq "AC3: filename-embedded issue number found via primary pass" \
+    "FOUND 2026-06-06-003-fix-1407-pilot-push-plan.md" \
+    "$(_fip_probe 1407 '## No matching header here' '2026-06-06-003-fix-1407-pilot-push-plan.md')"
+
+# Negative — wrong issue number must NOT match (guards against over-broad union).
+assert_eq "Negative: **Issue:** mika#9999 not matched for ISSUE_NUM=1602" \
+    "NOTFOUND" \
+    "$(_fip_probe 1602 '**Issue:** mika#9999' '2026-06-27-008-wrong-number-plan.md')"
+
+# Negative — header below the first-20-lines zone must NOT match (header-zone scope intact).
+assert_eq "Negative: **Issue:** mika#1602 on line 30 not matched (header-zone scope)" \
+    "NOTFOUND" \
+    "$(_fip_probe 1602 '**Issue:** mika#1602' '2026-06-27-009-deep-header-plan.md' 30)"
+
 # --- Summary ---
 
 echo ""
