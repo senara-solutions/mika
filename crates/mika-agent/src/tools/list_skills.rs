@@ -57,6 +57,9 @@ impl Tool for ListSkillsTool {
         // Run load-time crash-protection to promote broken-handler/tools.json skills to skipped,
         // matching the startup paths (chat.rs, ask.rs, server/mod.rs).
         registry.apply_load_safety_check();
+        // Runtime allowlist↔required_tools coherence guard (mika#1576) — keep the
+        // listing in parity with the startup paths (chat.rs, ask.rs, server/mod.rs).
+        registry.apply_required_tools_coherence_check(ctx.db.agent_id());
         registry.log_summary();
 
         let entries = registry.skills();

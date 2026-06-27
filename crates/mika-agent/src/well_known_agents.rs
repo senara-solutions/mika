@@ -1322,6 +1322,48 @@ mod tests {
         assert_eq!(find_well_known_agent("mika-qa").unwrap().name, "mika-qa");
     }
 
+    /// mika#1576 F2 verification gate: every well-known agent's identity allowlist
+    /// must pass the runtime `required_tools` coherence check with zero fires.
+    ///
+    /// A fire here means a pre-existing allowlist↔required_tools incoherence — the
+    /// detector did its job, and the violation must be fixed in the same PR (either
+    /// add the providing skill to the allowlist, or drop the dangling token). This
+    /// mirrors mika#1575's fire-disposition contract and is the runtime sibling of
+    /// `verify_bundled_skills`'s build-time check 5 (identity coherence).
+    #[test]
+    fn test_well_known_agents_pass_required_tools_coherence() {
+        use crate::bundled_skills::seed_bundled_skills;
+        use crate::skills::SkillRegistry;
+
+        // Seed the full bundled skill library (community + engine-coupled) into a
+        // temp dir so the effective tool surface matches the real per-agent startup
+        // set — required_tools tokens like `run_shell` are provided by community
+        // skills (shell-exec), not just engine-coupled ones.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_bundled_skills(tmp.path());
+
+        for (agent, allowlist) in well_known_skill_allowlists() {
+            let mut registry = SkillRegistry::from_dir(tmp.path());
+            registry.apply_identity_allowlist(&allowlist);
+            registry.apply_load_safety_check();
+            registry.apply_required_tools_coherence_check(agent);
+
+            let coherence_fires: Vec<&str> = registry
+                .skipped()
+                .iter()
+                .filter(|s| s.reason.starts_with("coherence:"))
+                .map(|s| s.name.as_str())
+                .collect();
+
+            assert!(
+                coherence_fires.is_empty(),
+                "well-known agent '{agent}' has required_tools coherence fires: \
+                 {coherence_fires:?} — fix the allowlist↔required_tools incoherence in \
+                 this PR (mika#1576 F2 gate)"
+            );
+        }
+    }
+
     #[test]
     fn test_find_well_known_agent_not_found() {
         assert!(find_well_known_agent("mika").is_none());

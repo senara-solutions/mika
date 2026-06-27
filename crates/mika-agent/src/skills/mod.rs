@@ -416,6 +416,98 @@ impl SkillRegistry {
         self.validated_warnings = to_warn;
     }
 
+    /// Runtime coherence check: every loaded skill's `[constraints] required_tools`
+    /// token must resolve to a tool in the agent's effective tool surface (mika#1576).
+    ///
+    /// Closes the silent vacuous-pass risk: the per-turn required_tools gate (#516)
+    /// only fires for keyword-matched skills when the LLM is actually asked to call
+    /// the tool, so a structurally-broken allowlist↔required_tools pairing surfaces
+    /// only mid-work — when the agent reaches for a tool that isn't there. This
+    /// load-time check runs after `apply_identity_allowlist` + `apply_overrides` +
+    /// transient overrides, the one point where both the allowlist and each skill's
+    /// `required_tools` are simultaneously visible, and catches the incoherence at
+    /// startup instead.
+    ///
+    /// Effective surface = engine builtins (`tools::BUILTIN_TOOL_NAMES`, which
+    /// subsumes `builtin_handlers::KNOWN_BUILTINS` via the mika#1217 parity test)
+    /// ∪ the tool names declared by the agent's *loaded* skills' tools.json. The
+    /// builtin half is the same set mika#1575's build-time check consumes, so the
+    /// load-time and build-time checks never disagree about what counts as a
+    /// builtin. The **full** `BUILTIN_TOOL_NAMES` — including the conditionally
+    /// injected management tools — is treated as builtin, mirroring mika#1575 and
+    /// avoiding false-positive fires for agents where those tools are present.
+    ///
+    /// Unlike mika#1575's allowlist-unaware build-time check 4, this surface is
+    /// allowlist-aware (only loaded skills contribute), making it the runtime
+    /// sibling of mika#1575's check 5 (identity coherence).
+    ///
+    /// On fire: the offending skill is skipped (evicted into `self.skipped`) and an
+    /// error-level `required_tool_unresolvable` event is emitted. The agent starts
+    /// degraded — the broken skill stays unavailable until the operator fixes the
+    /// coherence violation (adds the providing skill to the allowlist, or removes
+    /// the dangling token) and restarts. This is the established
+    /// `apply_load_safety_check` "load with warning + skip the broken skill"
+    /// pattern, not refuse-to-start.
+    ///
+    /// Must run **after** `apply_load_safety_check()` so the effective surface
+    /// reflects only skills that survived structural validation.
+    pub fn apply_required_tools_coherence_check(&mut self, agent_id: &str) {
+        // Effective tool surface: engine builtins ∪ tools declared by loaded skills.
+        let mut effective: std::collections::HashSet<String> = crate::tools::BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for entry in &self.skills {
+            for tool in &entry.skill_tools {
+                effective.insert(tool.definition.name.clone());
+            }
+        }
+
+        // Phase 1: collect coherence violations without mutating self.skills.
+        let mut to_skip: Vec<SkippedSkill> = Vec::new();
+        let mut skip_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for entry in &self.skills {
+            let skill_name = &entry.manifest.skill.name;
+            // First unresolvable token is enough to skip the skill. MCP tools
+            // (`mcp__{server}__{tool}`) are exempt — they resolve through the MCP
+            // client at startup, not the builtin/skill surface, so firing on them
+            // would wrongly skip a skill that can in fact call the tool. Mirrors
+            // the same leniency in `validate_skill`'s step 5b (mika#1217 F4).
+            if let Some(token) = entry
+                .manifest
+                .constraints
+                .required_tools
+                .iter()
+                .find(|t| !t.starts_with("mcp__") && !effective.contains(t.as_str()))
+            {
+                tracing::error!(
+                    agent_id = %agent_id,
+                    skill = %skill_name,
+                    unresolvable_token = %token,
+                    available_tool_count = effective.len(),
+                    event = "required_tool_unresolvable",
+                    "skill required_tools references a tool absent from the agent's effective \
+                     surface — skipping skill; run `mika skills validate` for diagnostics",
+                );
+                skip_names.insert(skill_name.clone());
+                to_skip.push(SkippedSkill {
+                    name: skill_name.clone(),
+                    reason: format!(
+                        "coherence: required_tool '{token}' unresolvable in effective surface"
+                    ),
+                });
+            }
+        }
+
+        // Phase 2: evict violating skills.
+        if !to_skip.is_empty() {
+            self.skills
+                .retain(|e| !skip_names.contains(&e.manifest.skill.name));
+            self.skipped.extend(to_skip);
+        }
+    }
+
     /// Match skills against a user message.
     /// Only returns enabled skills, annotated with match reason.
     pub fn match_message(&self, user_message: &str) -> Vec<matcher::MatchedSkill<'_>> {
@@ -1132,6 +1224,137 @@ mod tests {
     fn test_safe_always_on_skills_empty() {
         let registry = SkillRegistry::empty();
         assert!(registry.safe_always_on_skills().is_empty());
+    }
+
+    // ── apply_required_tools_coherence_check tests (mika#1576) ──
+
+    fn entry_with_required_tools(name: &str, required: &[&str]) -> SkillEntry {
+        let mut e = make_entry(name, false, true);
+        e.manifest.constraints.required_tools = required.iter().map(|s| s.to_string()).collect();
+        e
+    }
+
+    /// A skill that both requires `required` and provides `provides` via its own tools.json.
+    fn entry_requiring_and_providing(
+        name: &str,
+        required: &[&str],
+        provides: &[&str],
+    ) -> SkillEntry {
+        use crate::skills::index::ResolvedSkillTool;
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        let mut e = entry_with_required_tools(name, required);
+        e.skill_tools = provides
+            .iter()
+            .map(|tool_name| ResolvedSkillTool {
+                definition: ToolDefinition {
+                    name: tool_name.to_string(),
+                    description: "tool".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                handler: ToolHandler::Builtin {
+                    function: tool_name.to_string(),
+                },
+                skill_dir: PathBuf::from(format!("/skills/{name}")),
+            })
+            .collect();
+        e
+    }
+
+    fn registry_of(skills: Vec<SkillEntry>) -> SkillRegistry {
+        SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills,
+        }
+    }
+
+    #[test]
+    fn test_coherence_pass_builtin_and_cross_skill() {
+        // "search_memory" is a builtin (BUILTIN_TOOL_NAMES); "tool_from_b" is
+        // provided by a co-loaded skill. Both resolve → no fire.
+        let mut registry = registry_of(vec![
+            entry_with_required_tools("skill-a", &["search_memory", "tool_from_b"]),
+            entry_requiring_and_providing("skill-b", &[], &["tool_from_b"]),
+        ]);
+        registry.apply_required_tools_coherence_check("test-agent");
+        assert_eq!(registry.skills.len(), 2);
+        assert!(registry.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_coherence_fail_synthetic_unresolvable_token() {
+        // A token that exists nowhere → the skill is evicted.
+        let mut registry = registry_of(vec![entry_with_required_tools(
+            "broken",
+            &["totally_unresolvable_tool"],
+        )]);
+        registry.apply_required_tools_coherence_check("test-agent");
+        assert!(registry.skills.is_empty());
+        assert_eq!(registry.skipped.len(), 1);
+        assert_eq!(registry.skipped[0].name, "broken");
+        assert!(
+            registry.skipped[0]
+                .reason
+                .contains("totally_unresolvable_tool")
+        );
+    }
+
+    #[test]
+    fn test_coherence_fail_realistic_allowlist_exclusion() {
+        // skill-a requires a tool only skill-b provides, but skill-b is NOT loaded
+        // (simulating allowlist exclusion — the mika#1406 motivating scenario).
+        let mut registry =
+            registry_of(vec![entry_with_required_tools("skill-a", &["tool_from_b"])]);
+        registry.apply_required_tools_coherence_check("test-agent");
+        assert!(registry.skills.is_empty(), "skill-a should be evicted");
+        assert_eq!(registry.skipped.len(), 1);
+        assert_eq!(registry.skipped[0].name, "skill-a");
+
+        // With skill-b loaded, the same required_tool resolves → no fire.
+        let mut registry = registry_of(vec![
+            entry_with_required_tools("skill-a", &["tool_from_b"]),
+            entry_requiring_and_providing("skill-b", &[], &["tool_from_b"]),
+        ]);
+        registry.apply_required_tools_coherence_check("test-agent");
+        assert_eq!(registry.skills.len(), 2);
+        assert!(registry.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_coherence_edge_builtin_always_resolves() {
+        // "run_gh" ∈ KNOWN_BUILTINS ⊂ BUILTIN_TOOL_NAMES, so it resolves as a
+        // builtin even when no loaded skill declares it. (This is why mika#1576's
+        // AC3 literal `run_gh` FAIL example was inconsistent with F1 — run_gh can
+        // never fire; see plan KTD-4.)
+        let mut registry = registry_of(vec![entry_with_required_tools("uses-gh", &["run_gh"])]);
+        registry.apply_required_tools_coherence_check("test-agent");
+        assert_eq!(registry.skills.len(), 1);
+        assert!(registry.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_coherence_edge_empty_required_tools() {
+        let mut registry = registry_of(vec![make_entry("no-constraints", false, true)]);
+        registry.apply_required_tools_coherence_check("test-agent");
+        assert_eq!(registry.skills.len(), 1);
+        assert!(registry.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_coherence_skips_only_offending_skill() {
+        // One broken skill is evicted; a coherent sibling survives.
+        let mut registry = registry_of(vec![
+            entry_with_required_tools("good", &["search_memory"]),
+            entry_with_required_tools("bad", &["totally_unresolvable_tool"]),
+        ]);
+        registry.apply_required_tools_coherence_check("test-agent");
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "good");
+        assert_eq!(registry.skipped.len(), 1);
+        assert_eq!(registry.skipped[0].name, "bad");
     }
 
     #[test]

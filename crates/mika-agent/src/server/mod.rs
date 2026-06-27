@@ -419,6 +419,10 @@ async fn init_agent(
         skill_registry.apply_overrides(&overrides);
     }
     skill_registry.apply_load_safety_check();
+    // Runtime allowlist↔required_tools coherence guard (mika#1576). Runs after
+    // identity allowlist + DB overrides + safety check — the one point where both
+    // the allowlist and each skill's required_tools are simultaneously visible.
+    skill_registry.apply_required_tools_coherence_check(agent_name);
     skill_registry.log_summary();
     let skill_registry = Arc::new(skill_registry);
 

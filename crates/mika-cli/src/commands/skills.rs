@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use mika_agent::bundled_skills;
 use mika_agent::skills::executor;
 use mika_agent::skills::git;
-use mika_agent::skills::index::{DiagnosticLevel, scan_skills_dir, validate_skill};
+use mika_agent::skills::index::{
+    DiagnosticLevel, SkillDiagnostic, scan_skills_dir, validate_skill,
+};
 use mika_agent::skills::install;
 use mika_agent::skills::marketplace;
 use mika_agent::skills::{SkillListFilter, SkillRegistry, SkillSource};
@@ -1562,12 +1564,59 @@ fn validate_skills(
     let mut total_errors = 0;
     let mut total_warnings = 0;
 
+    // mika#1576: build the cross-skill effective tool surface (engine builtins ∪
+    // tools declared by all installed skills) once, so `validate` can flag
+    // `required_tools` tokens that resolve to nothing on disk. This is the
+    // allowlist-UNAWARE disk-surface view — it catches the structural class
+    // (a token resolving to nothing anywhere). The per-agent runtime check
+    // (`SkillRegistry::apply_required_tools_coherence_check`) is the allowlist-aware
+    // authority that catches tokens unresolvable under a specific agent's allowlist.
+    let coherence_registry = SkillRegistry::from_dir(skills_dir);
+    let mut coherence_surface: std::collections::HashSet<String> =
+        mika_agent::tools::BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    for entry in coherence_registry.skills() {
+        for tool in &entry.skill_tools {
+            coherence_surface.insert(tool.definition.name.clone());
+        }
+    }
+    let coherence_required: std::collections::HashMap<String, Vec<String>> = coherence_registry
+        .skills()
+        .iter()
+        .map(|e| {
+            let key = e
+                .dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(e.manifest.skill.name.as_str())
+                .to_string();
+            (key, e.manifest.constraints.required_tools.clone())
+        })
+        .collect();
+
     if matches!(format, crate::cli::OutputFormat::Text) {
         println!();
     }
 
     for (dir_name, dir_path) in &dirs {
-        let diags = validate_skill(dir_path);
+        let mut diags = validate_skill(dir_path);
+        // mika#1576 coherence diagnostics: flag required_tools tokens that don't
+        // resolve to a builtin or any installed skill's declared tool.
+        if let Some(required) = coherence_required.get(dir_name) {
+            for token in required {
+                // MCP tools (`mcp__{server}__{tool}`) resolve via the MCP client at
+                // startup, not the disk surface — exempt them (mirrors validate_skill 5b).
+                if !token.starts_with("mcp__") && !coherence_surface.contains(token) {
+                    diags.push(SkillDiagnostic::fail(format!(
+                        "required_tool '{token}' is unresolvable — not a builtin and not declared \
+                         by any installed skill's tools.json (allowlist-unaware disk view; \
+                         per-agent coherence is enforced at load time, mika#1576)"
+                    )));
+                }
+            }
+        }
         let has_errors = diags.iter().any(|d| d.level == DiagnosticLevel::Fail);
         let has_warnings = diags.iter().any(|d| d.level == DiagnosticLevel::Warn);
 
@@ -1633,4 +1682,78 @@ fn validate_skills(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod coherence_tests {
+    //! mika#1576: `mika skills validate` cross-skill required_tools coherence.
+    use super::*;
+    use std::fs;
+
+    /// Write a minimal valid skill into `skills_dir/<name>/` with the given
+    /// `required_tools`. tools.json is empty (skill declares no tools of its own).
+    fn write_skill(skills_dir: &std::path::Path, name: &str, required_tools: &[&str]) {
+        let dir = skills_dir.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let required = required_tools
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml = format!(
+            "[skill]\nname = \"{name}\"\ndescription = \"coherence test skill\"\nversion = \"0.1.0\"\n\n[triggers]\nkeywords = [\"cohtest\"]\n\n[constraints]\nrequired_tools = [{required}]\n"
+        );
+        fs::write(dir.join("skill.toml"), toml).unwrap();
+        fs::write(dir.join("system_prompt.md"), "test prompt").unwrap();
+        fs::write(dir.join("tools.json"), "[]").unwrap();
+    }
+
+    #[test]
+    fn test_validate_flags_unresolvable_required_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "coh-broken", &["totally_unresolvable_xyz"]);
+        // A truly-unresolvable token is a Fail → validate_skills bails.
+        let err = validate_skills(tmp.path(), None, &crate::cli::OutputFormat::Json).unwrap_err();
+        assert!(
+            err.to_string().contains("validation failed"),
+            "expected validation failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_passes_builtin_required_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `search_memory` is an engine builtin (BUILTIN_TOOL_NAMES) → resolves, no fire.
+        write_skill(tmp.path(), "coh-ok", &["search_memory"]);
+        let res = validate_skills(tmp.path(), None, &crate::cli::OutputFormat::Json);
+        assert!(
+            res.is_ok(),
+            "builtin required_tool should not fail validation: {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_resolves_cross_skill_provided_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        // skill-a requires a tool provided by skill-b's tools.json → resolves cross-skill.
+        write_skill(tmp.path(), "coh-consumer", &["tool_from_provider"]);
+        let provider = tmp.path().join("coh-provider");
+        fs::create_dir_all(&provider).unwrap();
+        fs::write(
+            provider.join("skill.toml"),
+            "[skill]\nname = \"coh-provider\"\ndescription = \"provider\"\nversion = \"0.1.0\"\n\n[triggers]\nkeywords = [\"prov\"]\n",
+        )
+        .unwrap();
+        fs::write(provider.join("system_prompt.md"), "p").unwrap();
+        fs::write(
+            provider.join("tools.json"),
+            "[{\"name\": \"tool_from_provider\", \"description\": \"d\", \"input_schema\": {\"type\": \"object\"}, \"handler\": {\"type\": \"builtin\", \"function\": \"run_gh\"}}]",
+        )
+        .unwrap();
+        let res = validate_skills(tmp.path(), None, &crate::cli::OutputFormat::Json);
+        assert!(
+            res.is_ok(),
+            "cross-skill-provided required_tool should resolve: {res:?}"
+        );
+    }
 }

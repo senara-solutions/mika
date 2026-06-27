@@ -126,6 +126,8 @@ async fn spawn_agent_worker(
         skill_registry.apply_overrides(&overrides);
     }
     skill_registry.apply_load_safety_check();
+    // Runtime allowlist↔required_tools coherence guard (mika#1576).
+    skill_registry.apply_required_tools_coherence_check(ctx.async_db.agent_id());
     skill_registry.log_summary();
     let skill_registry = Arc::new(skill_registry);
     let skills_dirty = Arc::new(AtomicBool::new(false));
