@@ -304,10 +304,20 @@ mod tests {
     }
 
     // U1: aliases resolve before routing and still inherit the configured provider.
+    // Under the alias's own native provider the resolved prefix is stripped; under
+    // any other provider the full vendor-prefixed id is preserved.
     #[test]
     fn parse_resolves_alias_and_inherits_provider() {
-        let (provider, _model) = parse_model_override("sonnet", ProviderKind::OpenRouter);
+        // "sonnet" resolves to "anthropic/claude-sonnet-4-6"; under Anthropic the
+        // matching prefix is stripped to the native id.
+        let (provider, model) = parse_model_override("sonnet", ProviderKind::Anthropic);
+        assert_eq!(provider, ProviderKind::Anthropic);
+        assert_eq!(model, "claude-sonnet-4-6");
+        // Under a non-matching provider the resolved full id is kept (OpenRouter ids
+        // are vendor-prefixed) and the provider is still inherited.
+        let (provider, model) = parse_model_override("sonnet", ProviderKind::OpenRouter);
         assert_eq!(provider, ProviderKind::OpenRouter);
+        assert_eq!(model, "anthropic/claude-sonnet-4-6");
     }
 
     // U1: a non-matching native prefix under a third provider never re-dispatches
@@ -317,6 +327,27 @@ mod tests {
         let (provider, model) = parse_model_override("qwen/qwen3.7-max", ProviderKind::DeepSeek);
         assert_eq!(provider, ProviderKind::DeepSeek);
         assert_eq!(model, "qwen/qwen3.7-max");
+    }
+
+    // U1: degenerate model strings never panic and inherit the configured provider.
+    // A bare prefix or trailing/leading slash whose prefix is not a provider keeps
+    // the full string; an empty string passes through unchanged.
+    #[test]
+    fn parse_handles_degenerate_strings() {
+        assert_eq!(
+            parse_model_override("", ProviderKind::Anthropic),
+            (ProviderKind::Anthropic, String::new())
+        );
+        // "foo/" — prefix "foo" is not a provider → full string kept.
+        assert_eq!(
+            parse_model_override("foo/", ProviderKind::OpenRouter),
+            (ProviderKind::OpenRouter, "foo/".to_string())
+        );
+        // "/bar" — empty prefix is not a provider → full string kept.
+        assert_eq!(
+            parse_model_override("/bar", ProviderKind::OpenRouter),
+            (ProviderKind::OpenRouter, "/bar".to_string())
+        );
     }
 
     // U2 / AC2: a key-requiring provider with no key yields a named error that
