@@ -284,13 +284,14 @@ resolvable(token) ⟺ token ∈ BUILTIN_TOOL_NAMES
 
 ## Acceptance criteria
 
-- All of R1–R8 satisfied.
-- `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt --check` clean.
-- `cargo run --bin verify-bundled-skills` still passes (this ticket adds a runtime check; it must not break the build-time one).
-- U4 gate green: all four well-known agents pass the coherence check with zero fires (or any surfaced fire is fixed in this PR and documented).
-- Every `apply_load_safety_check` call site has an adjacent coherence-check call (U2 grep).
-- Documentation merged (and doc-synced if applicable).
-- PR body documents the F1 carried correction (KTD-1) and the AC3 token correction (KTD-4), and `Closes #1576`.
+- [ ] **AC1** — `SkillRegistry::apply_load_safety_check` (or a dedicated sibling method) includes the allowlist↔required_tools coherence rule, running after identity allowlist + DB/transient overrides have been applied. (R1)
+- [ ] **AC2** — On fire: emit an error-level structured log event `required_tool_unresolvable` (fields: `agent_id`, `skill`, `unresolvable_token`, `available_tool_count`) and skip the offending skill (evict from loaded set, agent starts degraded — load-with-warning, **not** refuse-to-start). (R2, R3)
+- [ ] **AC3** — Tests covering: PASS (all tokens resolve), FAIL (genuinely-unresolvable token → skill skipped + event), edge (builtin tokens always resolve with no skill declaration needed). (R4)
+- [ ] **AC4** — `mika skills validate` reports the coherence diagnostic when it would fire. (R5)
+- [ ] **AC5** — Documentation describing the coherence invariant and how it composes with mika#516 / #1326 / #1575. (R6)
+- [ ] **AC6** — "Builtin tool name" = `BUILTIN_TOOL_NAMES ∪ KNOWN_BUILTINS` — the same set mika#1575's check uses. (R7 / F1)
+- [ ] **AC7** — F2 verification gate: before opening the PR, run the coherence check against all well-known agent identity templates (mika-dev, mika-qa, mika-relay, mika-arch) and confirm zero fires. Any fire is fixed in this PR, not deferred. (R8)
+- [ ] **AC8** — `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt --check` clean; `cargo run --bin verify-bundled-skills` still passes; every `apply_load_safety_check` call site has an adjacent coherence-check call; PR body documents the F1 carried correction (KTD-1) and the AC3 token correction (KTD-4), and `Closes #1576`.
 
 ---
 
