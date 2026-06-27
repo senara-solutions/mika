@@ -246,13 +246,17 @@ pub async fn try_handle_ready_label_dispatch(
         }
     };
 
-    // 9b. Resolve the long-running exec command from the tool handler.
-    let command = match &skill_tool.handler {
+    // 9b. Resolve the long-running exec command + estimated duration from the
+    //     tool handler. The estimate drives the callback timeout below; binding
+    //     it (rather than hardcoding the 3600s default) keeps the callback's
+    //     `timeout_at` identical to the LLM tool-call path for these tools
+    //     (dev-pilot/dev-groom declare estimated_duration_secs=7200).
+    let (command, estimated_duration_secs) = match &skill_tool.handler {
         ToolHandler::Exec {
             command,
             long_running: true,
-            ..
-        } => command.clone(),
+            estimated_duration_secs,
+        } => (command.clone(), *estimated_duration_secs),
         _ => {
             warn!(
                 event = "ready_label_tool_not_long_running",
@@ -298,9 +302,10 @@ pub async fn try_handle_ready_label_dispatch(
     }
 
     // 9e. Create the callback child task (same shape as the LLM tool-call path
-    //     via the shared `build_callback_task` helper). Timeout mirrors
-    //     `execute_long_running`'s default (estimated 3600s × 3, clamped).
-    let timeout_secs = (3600u64 * 3).clamp(600, 7_776_000);
+    //     via the shared `build_callback_task` helper). Timeout matches
+    //     `execute_long_running` exactly: estimated_duration_secs (default 3600)
+    //     × 3, clamped to 10min..90days (executor.rs).
+    let timeout_secs = (estimated_duration_secs.unwrap_or(3600) * 3).clamp(600, 7_776_000);
     let callback_task = crate::skills::executor::build_callback_task(
         db.agent_id().to_string(),
         Some(task_id.clone()),
@@ -513,6 +518,15 @@ fn format_ready_label_pre_digest(
 /// returns false on the replaced `req.text`. The `webhook_ready_label_dispatch`
 /// INTENT_GUARD therefore does not fire — the guard composes by construction with
 /// no flag threading (plan addendum C4/C5).
+///
+/// The wording is also kept guard-safe against the *assistant-text* guards that
+/// scan the LLM's reply (not the user message): the header avoids the
+/// completion-claim keywords (#483 — `complete`/`merged`/`deployed`/`shipped`),
+/// and the optional-ack guidance steers the model toward a grounded action
+/// statement ("a dispatch subprocess was launched") rather than an affirmative
+/// issue-state claim ("issue #N is ready/groomed", which `assert_grounded` #1331
+/// would flag and try to "fix" with a `run_gh` call the digest forbids). This
+/// avoids a wasted self-healing retry turn after every engine dispatch.
 fn format_engine_dispatch_pre_digest(
     loc: &ReadyLabelLocation,
     is_groomed: bool,
@@ -529,16 +543,19 @@ fn format_engine_dispatch_pre_digest(
     };
     format!(
         "<ready_label_handler>\n\
-         [GitHub] Issue labeled ready on {}#{} — ENGINE-SIDE DISPATCH COMPLETE.\n\n\
+         [GitHub] Issue labeled ready on {}#{} — ENGINE-SIDE DISPATCH FIRED.\n\n\
          {}\n\
          The engine has ALREADY spawned `{}` with skill=`{}`, task_id=`{}`.\n\
-         The claude-pilot subprocess is running in the background.\n\n\
+         The claude-pilot subprocess is now running in the background; the work is \
+         NOT finished.\n\n\
          There is NO dispatch decision left for you to make. You MUST NOT:\n\
          - call `{}` (the dispatch already fired; a second call would double-dispatch)\n\
-         - call `create_task` or `run_gh` (the engine already pre-flighted everything)\n\n\
-         You MAY optionally call `send_message` to acknowledge to the operator that \
-         the dispatch is running, then EndTurn. If there is no reply channel, just \
-         EndTurn.\n\
+         - call `create_task` or `run_gh` (the engine already pre-flighted everything)\n\
+         - claim the issue is complete, merged, groomed, done, or otherwise assert its\n\
+           state — the run is still in progress and you have verified no outcome\n\n\
+         You MAY optionally call `send_message` to tell the operator that a dispatch \
+         subprocess was launched for this ticket, then EndTurn. If there is no reply \
+         channel, just EndTurn.\n\
          </ready_label_handler>",
         owner_repo, loc.number, groomed_line, target_tool, target_skill, task_id, target_tool,
     )
@@ -706,7 +723,24 @@ mod tests {
             "task-abc",
         );
         // AC2: post-dispatch shape — "already fired", not "make the call".
-        assert!(groomed.contains("ENGINE-SIDE DISPATCH COMPLETE"));
+        assert!(groomed.contains("ENGINE-SIDE DISPATCH FIRED"));
+        // Guard-safe wording (mika#1572 review): the header must not carry a
+        // completion-claim keyword (#483 detect_completion_claim scans
+        // `\b(merged|deployed|completed?|shipped)\b`), and the digest must forbid
+        // asserting issue state (assert_grounded #1331) — both prevent a wasted
+        // self-healing retry on the LLM's acknowledgment turn.
+        let header = groomed.lines().nth(1).unwrap_or("").to_lowercase();
+        assert!(
+            !header.contains("complete")
+                && !header.contains("merged")
+                && !header.contains("deployed")
+                && !header.contains("shipped"),
+            "digest header must not prime a completion-claim keyword: {header}"
+        );
+        assert!(
+            groomed.contains("you have verified no outcome"),
+            "digest must forbid asserting issue state (assert_grounded safety)"
+        );
         assert!(
             groomed.contains("task-abc"),
             "names the pre-created task_id"
