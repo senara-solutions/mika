@@ -93,7 +93,12 @@ This is a **test-only** change in `crates/mika-agent/` — no production behavio
 
 ## Acceptance criteria
 
-All three issue ACs satisfied: allowlist removed (AC1/R1), test flags only divergent handler types (AC2/R2), fixture regression test guards the `run_gh` Builtin-vs-Exec class (AC3/R3); no dangling symbol reference (R4); crate builds + lints clean; PR opened with `Closes #1573`.
+- [ ] **AC1 (R1):** `KNOWN_PRE_EXISTING_COLLISIONS` allowlist and its self-cleaning + unallowlisted-filter logic are deleted. The four `gh_read` Builtin declarations are no longer flagged.
+- [ ] **AC2 (R2):** `test_bundled_skills_no_cross_skill_tool_name_collision` flags only same-name declarations with **different** `handler.type` values. Same-name + same-handler-type is not reported.
+- [ ] **AC3 (R3):** A fixture-based regression test asserts the relaxed detector catches the `mika#1326` incident class (two skills declaring `run_gh` with Builtin vs Exec handlers trips the detector).
+- [ ] **AC4 (R4):** No dangling reference to `KNOWN_PRE_EXISTING_COLLISIONS` remains in the codebase.
+- [ ] **Verify:** `grep -rn KNOWN_PRE_EXISTING_COLLISIONS crates/` → zero matches.
+- [ ] **Verify:** `cargo test -p mika-agent bundled_skills` passes.
 
 ## Scope Boundaries
 
