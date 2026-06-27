@@ -93,6 +93,15 @@ pub enum VerdictAction {
     /// The handler did not act — pass through to the LLM.
     /// Optional enrichment text to prepend to the original message.
     Passthrough { enrichment: Option<String> },
+    /// The handler spawned a dispatch subprocess directly, engine-side, before
+    /// the LLM turn (mika#1572 — ready-label engine dispatch). The `pre_digest`
+    /// informs the LLM the dispatch already fired (post-dispatch shape), and
+    /// `task_id` is the pre-created parent task for observability. Like
+    /// `Handled`, the pre-digest replaces the original message; it intentionally
+    /// starts with `<ready_label_handler>` so it does not match the
+    /// `webhook_ready_label_dispatch` INTENT_GUARD trigger — the guard composes
+    /// by construction with no flag threading (see plan addendum C4/C5).
+    Dispatched { pre_digest: String, task_id: String },
 }
 
 /// Attempt to handle a PR review verdict structurally before the LLM turn.

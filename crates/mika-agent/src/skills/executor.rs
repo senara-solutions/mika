@@ -840,7 +840,7 @@ async fn record_dispatch_rejection(db: &AsyncDatabase, task_id: &str, reason_jso
 /// Returns `Err(json_error_string)` on rejection, `Ok(status)` with the task's
 /// current status if dispatch may proceed. Each rejection site also writes the
 /// structured reason to `tasks.result` (#1108) for operator visibility.
-async fn validate_dispatch_readiness(
+pub(crate) async fn validate_dispatch_readiness(
     db: &AsyncDatabase,
     task_id: &str,
     github_token: Option<&str>,
@@ -1774,6 +1774,64 @@ fn extract_pr_url(metadata: &Option<String>) -> Option<String> {
 
 /// Execute a long-running exec handler by creating a callback task and spawning
 /// the subprocess in the background. Returns immediately with the task ID.
+/// Build the callback `NewTask` for a long-running dispatch.
+///
+/// Shared by `execute_long_running` (the LLM tool-call path) and the engine-side
+/// ready-label dispatch (mika#1572) so both paths create structurally identical
+/// callback children. The callback/resume contract depends on this exact shape:
+/// `trigger_type=callback`, `action_type=resume_agent`, the `action_config.input`
+/// mirror of dispatch fields (#958), and the per-class `dispatch_class`. Drift
+/// between the two construction sites would re-introduce the callback-shape bug
+/// class this consolidation prevents (plan Risk 1).
+pub(crate) fn build_callback_task(
+    agent_id: String,
+    parent_task_id: Option<String>,
+    tool_name: &str,
+    input: &serde_json::Value,
+    timeout_secs: u64,
+    session_id: &str,
+    trace_id: &str,
+) -> NewTask {
+    NewTask {
+        agent_id,
+        team_run_id: None,
+        parent_task_id,
+        depth: 0,
+        label: format!("long_running:{tool_name}"),
+        trigger_type: trigger_type::CALLBACK.to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: Some(crate::timestamp::now_plus(chrono::Duration::seconds(
+            timeout_secs as i64,
+        ))),
+        action_type: action_type::RESUME_AGENT.to_string(),
+        action_config: {
+            // Populate action_config.input with dispatch fields so child tasks
+            // are self-describing without a parent join (#958).
+            let mut ac_input = serde_json::Map::new();
+            for key in &["prompt", "skill", "task_id", "branch"] {
+                if let Some(val) = input.get(*key).filter(|v| !v.is_null()) {
+                    ac_input.insert((*key).to_string(), val.clone());
+                }
+            }
+            serde_json::json!({ "input": ac_input }).to_string()
+        },
+        input_context: Some(serde_json::to_string(input).unwrap_or_default()),
+        created_by_session: Some(session_id.to_string()),
+        created_trace_id: Some(trace_id.to_string()),
+        reference_url: None,
+        source: None,
+        metadata: None,
+        r#type: None,
+        dispatch_class: Some(
+            derive_dispatch_class(input.get("skill").and_then(|v| v.as_str())).to_string(),
+        ),
+    }
+}
+
 async fn execute_long_running(
     skill_tool: &ResolvedSkillTool,
     command: &str,
@@ -1920,66 +1978,35 @@ async fn execute_long_running(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    let task = NewTask {
-        agent_id: ctx.db.agent_id.clone(),
-        team_run_id: None,
-        parent_task_id,
-        depth: 0,
-        label: format!("long_running:{}", skill_tool.definition.name),
-        trigger_type: trigger_type::CALLBACK.to_string(),
-        cron_expr: None,
-        event_source: None,
-        event_offset_secs: None,
-        condition_expr: None,
-        next_fire_at: None,
-        timeout_at: Some(crate::timestamp::now_plus(chrono::Duration::seconds(
-            timeout_secs as i64,
-        ))),
-        action_type: action_type::RESUME_AGENT.to_string(),
-        action_config: {
-            // Populate action_config.input with dispatch fields so child tasks
-            // are self-describing without a parent join (#958).
-            let mut ac_input = serde_json::Map::new();
-            for key in &["prompt", "skill", "task_id", "branch"] {
-                if let Some(val) = input.get(*key).filter(|v| !v.is_null()) {
-                    ac_input.insert((*key).to_string(), val.clone());
-                }
-            }
-            serde_json::json!({ "input": ac_input }).to_string()
+    // Belt-and-suspenders (#955): validate_required_fields is the runtime guard,
+    // but assert that required fields survived into the dispatch input as a
+    // development-time safety net before the shared builder serializes it.
+    debug_assert!(
+        {
+            let required: Vec<&str> = skill_tool
+                .definition
+                .input_schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            required
+                .iter()
+                .all(|f| input.get(f).is_some_and(|v| !v.is_null()))
         },
-        input_context: Some({
-            let serialized = serde_json::to_string(&input).unwrap_or_default();
-            // Belt-and-suspenders (#955): validate_required_fields is the runtime
-            // guard, but assert that required fields survived serialization as a
-            // development-time safety net.
-            debug_assert!(
-                {
-                    let required: Vec<&str> = skill_tool
-                        .definition
-                        .input_schema
-                        .get("required")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
-                        .unwrap_or_default();
-                    required
-                        .iter()
-                        .all(|f| input.get(f).is_some_and(|v| !v.is_null()))
-                },
-                "dispatch record serialized without required fields — \
-                 validate_required_fields should have caught this"
-            );
-            serialized
-        }),
-        created_by_session: Some(ctx.session_id.clone()),
-        created_trace_id: Some(ctx.trace_id.clone()),
-        reference_url: None,
-        source: None,
-        metadata: None,
-        r#type: None,
-        dispatch_class: Some(
-            derive_dispatch_class(input.get("skill").and_then(|v| v.as_str())).to_string(),
-        ),
-    };
+        "dispatch record serialized without required fields — \
+         validate_required_fields should have caught this"
+    );
+
+    let task = build_callback_task(
+        ctx.db.agent_id.clone(),
+        parent_task_id,
+        &skill_tool.definition.name,
+        &input,
+        timeout_secs,
+        &ctx.session_id,
+        &ctx.trace_id,
+    );
 
     let task_id = match ctx.db.create_task(task).await {
         Ok(id) => id,
@@ -2043,7 +2070,7 @@ async fn execute_long_running(
 /// The subprocess runs with `kill_on_drop(false)` so it survives if the
 /// parent agent task ends. A monitor task records the PID and handles
 /// failure (non-zero exit → task marked failed).
-fn spawn_long_running_exec(
+pub(crate) fn spawn_long_running_exec(
     cmd_path: PathBuf,
     skill_dir: PathBuf,
     input: serde_json::Value,

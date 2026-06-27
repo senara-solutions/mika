@@ -25,6 +25,8 @@ use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use crate::skills::SkillRegistry;
+use crate::skills::manifest::ToolHandler;
 use crate::task_state::tasks::NewTask;
 use crate::tools::pr_merge_with_gate::run_gh_subprocess;
 use crate::webhook_dispatch::READY_LABEL_DISPATCH_MARKER;
@@ -56,14 +58,14 @@ impl ReadyLabelLocation {
 /// Attempt to handle a `[GitHub] Issue labeled ready on …` webhook structurally
 /// before the LLM turn.
 ///
-/// Returns `VerdictAction::Handled` when the handler pre-flighted the dispatch
-/// and returns a prescriptive pre-digest. Returns `VerdictAction::Passthrough`
-/// when the event is not a ready-label marker, when parsing fails, or when a
-/// required precondition (github token, issue body fetch) cannot be satisfied.
-///
-/// **Reused `VerdictAction` enum** — the action surface is identical
-/// (`Handled { pre_digest }` / `Passthrough { enrichment }`), so adding a new
-/// enum just for naming would create drift between sibling handlers.
+/// Returns `VerdictAction::Dispatched` when the engine spawned the dispatch
+/// subprocess directly (mika#1572 — the LLM has no decision left to make).
+/// Returns `VerdictAction::Handled` (the #1571 prescriptive pre-digest) when
+/// engine-side dispatch is attempted but fails any precondition (tool not in the
+/// registry, dispatch-readiness rejection, handler missing) — Resolution F3's
+/// degraded path. Returns `VerdictAction::Passthrough` when the event is not a
+/// ready-label marker, when parsing fails, or when a required precondition
+/// (github token, issue body fetch, task pre-create) cannot be satisfied.
 pub async fn try_handle_ready_label_dispatch(
     text: &str,
     db: &AsyncDatabase,
@@ -71,6 +73,7 @@ pub async fn try_handle_ready_label_dispatch(
     _message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
+    skills: &SkillRegistry,
 ) -> VerdictAction {
     // 1. Early-return for non-ready-label messages. Cheapest predicate.
     if !text.starts_with(READY_LABEL_DISPATCH_MARKER) {
@@ -213,19 +216,12 @@ pub async fn try_handle_ready_label_dispatch(
         );
     }
 
-    info!(
-        event = "ready_label_handler_prepared_dispatch",
-        repo = %location.owner_repo(),
-        number = location.number,
-        target_tool,
-        target_skill,
-        dispatch_class,
-        groomed = is_groomed,
-        task_id = %task_id,
-        "ready_label_handler: pre-flight complete; returning prescriptive pre-digest"
-    );
-
-    VerdictAction::Handled {
+    // 9. Engine-side dispatch (mika#1572, full Option Α). Spawn the dispatch
+    //    subprocess directly instead of asking the LLM to call the tool. On ANY
+    //    precondition failure, fall back to the #1571 prescriptive pre-digest
+    //    (`VerdictAction::Handled`) per Resolution F3 — the engine dispatch is an
+    //    upgrade over the prescriptive path, not a replacement of its fallback.
+    let fallback = || VerdictAction::Handled {
         pre_digest: format_ready_label_pre_digest(
             &location,
             is_groomed,
@@ -233,6 +229,180 @@ pub async fn try_handle_ready_label_dispatch(
             target_skill,
             &task_id,
         ),
+    };
+
+    // 9a. Resolve the dispatch tool from the agent's loaded SkillRegistry (KTD-1).
+    let skill_tool = match skills.resolve_tool_by_name(target_tool) {
+        Some(t) => t,
+        None => {
+            warn!(
+                event = "ready_label_tool_not_found",
+                target_tool,
+                task_id = %task_id,
+                "ready_label_handler: dispatch tool not in SkillRegistry — \
+                 fallback to #1571 prescriptive pre-digest"
+            );
+            return fallback();
+        }
+    };
+
+    // 9b. Resolve the long-running exec command from the tool handler.
+    let command = match &skill_tool.handler {
+        ToolHandler::Exec {
+            command,
+            long_running: true,
+            ..
+        } => command.clone(),
+        _ => {
+            warn!(
+                event = "ready_label_tool_not_long_running",
+                target_tool,
+                task_id = %task_id,
+                "ready_label_handler: dispatch tool is not a long-running exec handler — \
+                 fallback to #1571 prescriptive pre-digest"
+            );
+            return fallback();
+        }
+    };
+
+    // 9c. The dispatch input the LLM would have provided. `prompt` is the
+    //     `<owner/repo>#<num>` reference; `task_id` is the pre-created parent.
+    let dispatch_input = serde_json::json!({
+        "skill": target_skill,
+        "prompt": format!("{}#{}", location.owner_repo(), location.number),
+        "task_id": task_id,
+    });
+
+    // 9d. Re-use the existing dispatch-readiness gate (slot availability,
+    //     grooming markers, blockedBy). `originating_message = text` (the raw
+    //     ready-label marker) keeps guard (0) authorized — it is not a webhook
+    //     fallthrough event. On rejection, fall back (Resolution F3).
+    if let Err(rejection) = crate::skills::executor::validate_dispatch_readiness(
+        db,
+        &task_id,
+        github_token,
+        Some(&dispatch_input),
+        Some(text),
+    )
+    .await
+    {
+        warn!(
+            event = "ready_label_dispatch_readiness_failed",
+            task_id = %task_id,
+            target_skill,
+            rejection = %rejection,
+            "ready_label_handler: dispatch readiness check failed — \
+             fallback to #1571 prescriptive pre-digest"
+        );
+        return fallback();
+    }
+
+    // 9e. Create the callback child task (same shape as the LLM tool-call path
+    //     via the shared `build_callback_task` helper). Timeout mirrors
+    //     `execute_long_running`'s default (estimated 3600s × 3, clamped).
+    let timeout_secs = (3600u64 * 3).clamp(600, 7_776_000);
+    let callback_task = crate::skills::executor::build_callback_task(
+        db.agent_id().to_string(),
+        Some(task_id.clone()),
+        target_tool,
+        &dispatch_input,
+        timeout_secs,
+        session_id,
+        trace_id,
+    );
+    let callback_task_id = match db.create_task(callback_task).await {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                event = "ready_label_callback_create_failed",
+                task_id = %task_id,
+                error = %e,
+                "ready_label_handler: failed to create callback child — \
+                 fallback to #1571 prescriptive pre-digest"
+            );
+            return fallback();
+        }
+    };
+
+    // 9f. Resolve and verify the handler script exists before committing to the
+    //     spawn. If missing, mark the callback child failed so it does not dangle.
+    let cmd_path = skill_tool.skill_dir.join(&command);
+    if !cmd_path.exists() {
+        warn!(
+            event = "ready_label_handler_not_found",
+            task_id = %task_id,
+            callback_task_id = %callback_task_id,
+            cmd_path = %cmd_path.display(),
+            "ready_label_handler: dispatch handler script not found — \
+             fallback to #1571 prescriptive pre-digest"
+        );
+        let _ = db
+            .update_task_failed(
+                &callback_task_id,
+                &format!("handler not found: {}", cmd_path.display()),
+            )
+            .await;
+        return fallback();
+    }
+
+    // 9g. Auto-transition the pre-created parent task to in_progress (mirrors
+    //     execute_long_running's #525 transition). Non-fatal on error.
+    if let Err(e) = db.update_manual_task_status(&task_id, "in_progress").await {
+        warn!(
+            task_id = %task_id,
+            error = %e,
+            "ready_label_handler: failed to auto-transition parent task to in_progress"
+        );
+    }
+
+    // 9h. Inject subprocess task metadata, mirroring execute_long_running:
+    //     `__mika_task_id` is the callback child (delivery target), `__mika_agent`
+    //     is this agent.
+    let mut enriched_input = dispatch_input.clone();
+    if let serde_json::Value::Object(ref mut map) = enriched_input {
+        map.insert(
+            "__mika_task_id".to_string(),
+            serde_json::Value::String(callback_task_id.clone()),
+        );
+        map.insert(
+            "__mika_agent".to_string(),
+            serde_json::Value::String(db.agent_id().to_string()),
+        );
+    }
+
+    // 9i. Spawn the detached subprocess. The LLM turn that follows only
+    //     acknowledges — it has no dispatch decision left to make.
+    crate::skills::executor::spawn_long_running_exec(
+        cmd_path,
+        skill_tool.skill_dir.clone(),
+        enriched_input,
+        callback_task_id.clone(),
+        db.clone(),
+        github_token.map(|s| s.to_string()),
+    );
+
+    info!(
+        event = "ready_label_engine_dispatched",
+        repo = %location.owner_repo(),
+        number = location.number,
+        target_tool,
+        target_skill,
+        dispatch_class,
+        groomed = is_groomed,
+        task_id = %task_id,
+        callback_task_id = %callback_task_id,
+        "ready_label_handler: engine-side dispatch spawned; LLM turn acknowledges only"
+    );
+
+    VerdictAction::Dispatched {
+        pre_digest: format_engine_dispatch_pre_digest(
+            &location,
+            is_groomed,
+            target_tool,
+            target_skill,
+            &task_id,
+        ),
+        task_id,
     }
 }
 
@@ -329,6 +499,48 @@ fn format_ready_label_pre_digest(
         owner_repo,
         loc.number,
         task_id,
+    )
+}
+
+/// Build the post-dispatch pre-digest delivered to the LLM after the engine has
+/// already spawned the dispatch subprocess (mika#1572 AC2 semantics shift).
+///
+/// Unlike `format_ready_label_pre_digest` (which instructs the LLM to MAKE the
+/// dispatch call), this tells the LLM the dispatch has ALREADY fired — there is
+/// no decision left. It intentionally starts with `<ready_label_handler>` (NOT
+/// the `[GitHub] Issue labeled ready on` marker) so that
+/// `webhook_dispatch::is_ready_label_dispatch_marker` (a `starts_with` predicate)
+/// returns false on the replaced `req.text`. The `webhook_ready_label_dispatch`
+/// INTENT_GUARD therefore does not fire — the guard composes by construction with
+/// no flag threading (plan addendum C4/C5).
+fn format_engine_dispatch_pre_digest(
+    loc: &ReadyLabelLocation,
+    is_groomed: bool,
+    target_tool: &str,
+    target_skill: &str,
+    task_id: &str,
+) -> String {
+    let owner_repo = loc.owner_repo();
+    let groomed_line = if is_groomed {
+        "Groomed-state: GROOMED — dev-pilot dispatched to implement."
+    } else {
+        "Groomed-state: UNGROOMED — dev-groom dispatched to groom first; \
+         implementation follows via callback."
+    };
+    format!(
+        "<ready_label_handler>\n\
+         [GitHub] Issue labeled ready on {}#{} — ENGINE-SIDE DISPATCH COMPLETE.\n\n\
+         {}\n\
+         The engine has ALREADY spawned `{}` with skill=`{}`, task_id=`{}`.\n\
+         The claude-pilot subprocess is running in the background.\n\n\
+         There is NO dispatch decision left for you to make. You MUST NOT:\n\
+         - call `{}` (the dispatch already fired; a second call would double-dispatch)\n\
+         - call `create_task` or `run_gh` (the engine already pre-flighted everything)\n\n\
+         You MAY optionally call `send_message` to acknowledge to the operator that \
+         the dispatch is running, then EndTurn. If there is no reply channel, just \
+         EndTurn.\n\
+         </ready_label_handler>",
+        owner_repo, loc.number, groomed_line, target_tool, target_skill, task_id, target_tool,
     )
 }
 
@@ -443,5 +655,104 @@ mod tests {
         assert!(ungroomed_digest.contains("run_claude_pilot_groom"));
         assert!(ungroomed_digest.contains("dev-groom"));
         assert!(ungroomed_digest.contains("groom"));
+    }
+
+    #[test]
+    fn engine_dispatch_pre_digest_does_not_trigger_intent_guard() {
+        // AC3 / plan addendum C4-C5: the post-dispatch pre-digest must NOT match
+        // the ready-label or unauthorized-webhook trigger predicates, so the
+        // `webhook_ready_label_dispatch` INTENT_GUARD does not fire after an
+        // engine-side dispatch. The guarantee is structural — the digest starts
+        // with `<ready_label_handler>`, not the `[GitHub] Issue labeled ready on`
+        // marker that `is_ready_label_dispatch_marker` (a `starts_with` predicate)
+        // keys on. No `engine_dispatched` flag threading is required.
+        let loc = ReadyLabelLocation {
+            repo_ref: "senara-solutions/mika".to_string(),
+            number: 1572,
+        };
+        let digest = format_engine_dispatch_pre_digest(
+            &loc,
+            true,
+            "run_claude_pilot",
+            "dev-pilot",
+            "tid-1572",
+        );
+
+        assert!(
+            digest.starts_with("<ready_label_handler>"),
+            "engine-dispatch digest must start with the handler tag, not the marker"
+        );
+        assert!(
+            !crate::webhook_dispatch::is_ready_label_dispatch_marker(&digest),
+            "engine-dispatch digest must NOT match the ready-label dispatch trigger"
+        );
+        assert!(
+            !crate::webhook_dispatch::is_unauthorized_webhook_dispatch(&digest),
+            "engine-dispatch digest must NOT match the unauthorized-webhook trigger"
+        );
+    }
+
+    #[test]
+    fn engine_dispatch_pre_digest_names_task_and_state() {
+        let loc = ReadyLabelLocation {
+            repo_ref: "mika".to_string(),
+            number: 999,
+        };
+        let groomed = format_engine_dispatch_pre_digest(
+            &loc,
+            true,
+            "run_claude_pilot",
+            "dev-pilot",
+            "task-abc",
+        );
+        // AC2: post-dispatch shape — "already fired", not "make the call".
+        assert!(groomed.contains("ENGINE-SIDE DISPATCH COMPLETE"));
+        assert!(
+            groomed.contains("task-abc"),
+            "names the pre-created task_id"
+        );
+        assert!(
+            groomed.contains("run_claude_pilot"),
+            "names the spawned tool"
+        );
+        assert!(
+            groomed.contains("MUST NOT"),
+            "instructs the LLM not to re-dispatch"
+        );
+        assert!(groomed.contains("GROOMED"));
+
+        let ungroomed = format_engine_dispatch_pre_digest(
+            &loc,
+            false,
+            "run_claude_pilot_groom",
+            "dev-groom",
+            "task-xyz",
+        );
+        assert!(ungroomed.contains("UNGROOMED"));
+        assert!(ungroomed.contains("run_claude_pilot_groom"));
+        assert!(ungroomed.contains("task-xyz"));
+    }
+
+    #[test]
+    fn handled_and_dispatched_pre_digests_share_guard_safe_prefix() {
+        // Both the #1571 prescriptive (Handled) and the #1572 engine-dispatch
+        // (Dispatched) pre-digests must share the same guard-safe prefix so
+        // neither trips the post-LLM-turn INTENT_GUARD.
+        let loc = ReadyLabelLocation {
+            repo_ref: "mika".to_string(),
+            number: 1,
+        };
+        let handled =
+            format_ready_label_pre_digest(&loc, true, "run_claude_pilot", "dev-pilot", "t");
+        let dispatched =
+            format_engine_dispatch_pre_digest(&loc, true, "run_claude_pilot", "dev-pilot", "t");
+        assert!(handled.starts_with("<ready_label_handler>"));
+        assert!(dispatched.starts_with("<ready_label_handler>"));
+        assert!(!crate::webhook_dispatch::is_ready_label_dispatch_marker(
+            &handled
+        ));
+        assert!(!crate::webhook_dispatch::is_ready_label_dispatch_marker(
+            &dispatched
+        ));
     }
 }
