@@ -199,7 +199,7 @@ Also update the `AppState` doc comment reference if the CLAUDE.md mentions it.
 
 ---
 
-## Definition of Done
+## Acceptance criteria
 
 - [ ] Global `TelegramClient` is built on token presence, not mode flag
 - [ ] `MIKA_TELEGRAM_SINGLE_BOT_MODE` only gates inbound webhook registration
