@@ -53,6 +53,22 @@ impl ReadyLabelLocation {
             format!("senara-solutions/{}", self.repo_ref)
         }
     }
+
+    /// Returns the bare repo basename (e.g. `mika`), stripping any `owner/`
+    /// prefix from `repo_ref`.
+    ///
+    /// This is the form the dispatch tool schemas document and dispatch-lib's
+    /// worktree-setup parser requires for the dispatch `prompt` argument —
+    /// distinct from [`owner_repo`](Self::owner_repo), which is for `gh` calls,
+    /// task labels, and display. Emitting the owner-qualified form as a dispatch
+    /// prompt fails dispatch-lib's `^[a-zA-Z0-9_-]+#[0-9]+$` parse, silently
+    /// routing the dispatch into no-worktree free-text mode (mika#1593).
+    pub fn repo_name(&self) -> String {
+        match self.repo_ref.rsplit_once('/') {
+            Some((_, name)) => name.to_string(),
+            None => self.repo_ref.clone(),
+        }
+    }
 }
 
 /// Attempt to handle a `[GitHub] Issue labeled ready on …` webhook structurally
@@ -269,11 +285,15 @@ pub async fn try_handle_ready_label_dispatch(
         }
     };
 
-    // 9c. The dispatch input the LLM would have provided. `prompt` is the
-    //     `<owner/repo>#<num>` reference; `task_id` is the pre-created parent.
+    // 9c. The dispatch input the LLM would have provided. `prompt` is the bare
+    //     `<repo>#<num>` reference (NOT owner-qualified) — dispatch-lib's
+    //     worktree-setup parser only accepts the bare form the tool schemas
+    //     document; an owner-qualified prompt silently routes the dispatch into
+    //     no-worktree free-text mode (mika#1593). `task_id` is the pre-created
+    //     parent.
     let dispatch_input = serde_json::json!({
         "skill": target_skill,
-        "prompt": format!("{}#{}", location.owner_repo(), location.number),
+        "prompt": format!("{}#{}", location.repo_name(), location.number),
         "task_id": task_id,
     });
 
@@ -467,6 +487,10 @@ fn format_ready_label_pre_digest(
     task_id: &str,
 ) -> String {
     let owner_repo = loc.owner_repo();
+    // Bare `repo#number` for the dispatch `prompt` arg (mika#1593) — the
+    // cosmetic marker line below stays owner-qualified to mirror the webhook
+    // marker, but the dispatch prompt MUST be the bare form dispatch-lib parses.
+    let repo_name = loc.repo_name();
     let groomed_line = if is_groomed {
         "Groomed-state: GROOMED (Plan callout + Branch callout + second-pass marker all present)"
     } else {
@@ -501,7 +525,7 @@ fn format_ready_label_pre_digest(
         if is_groomed { "implement" } else { "groom" },
         target_tool,
         target_skill,
-        owner_repo,
+        repo_name,
         loc.number,
         task_id,
     )
@@ -596,6 +620,50 @@ mod tests {
     }
 
     #[test]
+    fn repo_name_strips_owner_prefix() {
+        // mika#1593: the dispatch `prompt` must be the bare repo basename, not
+        // the owner-qualified form, regardless of the marker's repo_ref shape.
+        let owner_qualified = ReadyLabelLocation {
+            repo_ref: "senara-solutions/mika".to_string(),
+            number: 1,
+        };
+        assert_eq!(owner_qualified.repo_name(), "mika");
+
+        let bare = ReadyLabelLocation {
+            repo_ref: "mika".to_string(),
+            number: 1,
+        };
+        assert_eq!(bare.repo_name(), "mika");
+
+        let cloud = ReadyLabelLocation {
+            repo_ref: "senara-solutions/mika-cloud".to_string(),
+            number: 1,
+        };
+        assert_eq!(cloud.repo_name(), "mika-cloud");
+    }
+
+    #[test]
+    fn pre_digest_prompt_is_bare_for_mika_cloud() {
+        // mika#1593: an owner-qualified mika-cloud marker must still emit a bare
+        // `mika-cloud#<n>` dispatch prompt.
+        let loc = ReadyLabelLocation {
+            repo_ref: "senara-solutions/mika-cloud".to_string(),
+            number: 50,
+        };
+        let digest = format_ready_label_pre_digest(
+            &loc,
+            false,
+            "run_claude_pilot_groom",
+            "dev-groom",
+            "tid",
+        );
+        assert!(
+            digest.contains("\"prompt\": \"mika-cloud#50\""),
+            "dispatch prompt must be bare repo#number for owner-qualified mika-cloud ref"
+        );
+    }
+
+    #[test]
     fn rejects_non_marker_text() {
         assert!(parse_ready_label_location("hello world").is_none());
         assert!(parse_ready_label_location("[GitHub] PR closed: foo").is_none());
@@ -630,8 +698,14 @@ mod tests {
             "names skill arg"
         );
         assert!(
-            digest.contains("\"prompt\": \"senara-solutions/mika#1384\""),
-            "names prompt arg"
+            digest.contains("\"prompt\": \"mika#1384\""),
+            "names prompt arg as bare repo#number (dispatch-lib contract, mika#1593)"
+        );
+        // The cosmetic marker line still shows the owner-qualified form — only
+        // the dispatch `prompt` argument is normalized to bare.
+        assert!(
+            digest.contains("[GitHub] Issue labeled ready on senara-solutions/mika#1384"),
+            "marker line stays owner-qualified"
         );
         assert!(
             digest.contains("\"task_id\": \"task-uuid-abc\""),
