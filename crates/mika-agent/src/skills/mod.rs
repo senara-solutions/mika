@@ -432,6 +432,22 @@ impl SkillRegistry {
         &self.skills
     }
 
+    /// Resolve a skill tool by its Claude-facing tool name (e.g.
+    /// `"run_claude_pilot"`), returning the first match across all loaded
+    /// skills' `skill_tools`.
+    ///
+    /// Used by the engine-side ready-label dispatch path (mika#1572) to obtain
+    /// the `ResolvedSkillTool` for direct `spawn_long_running_exec` invocation,
+    /// the same surface the agent loop would have resolved for the LLM's tool
+    /// call. Scoped to this dispatch use — not a general-purpose tool registry.
+    pub fn resolve_tool_by_name(&self, name: &str) -> Option<self::index::ResolvedSkillTool> {
+        self.skills
+            .iter()
+            .flat_map(|e| &e.skill_tools)
+            .find(|t| t.definition.name == name)
+            .cloned()
+    }
+
     /// Return all always-on skills (no keyword matching needed).
     /// Only returns enabled skills.
     ///

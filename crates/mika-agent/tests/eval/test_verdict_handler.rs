@@ -106,6 +106,9 @@ async fn verdict_block_ci_no_task_passes_through_with_enrichment() -> Result<()>
 
     // With no matching task, block[ci] passes through with enrichment
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             let e = enrichment.expect("block[ci] with no task should enrich");
             assert!(
@@ -144,6 +147,9 @@ async fn verdict_block_ci_with_task_is_handled() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(
                 pre_digest.contains("block[ci]"),
@@ -193,6 +199,9 @@ async fn verdict_block_ac_with_task_is_handled() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(
                 pre_digest.contains("block[ac]"),
@@ -250,6 +259,9 @@ async fn verdict_block_ac_retry_limit_escalates() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(
                 pre_digest.contains("retry limit"),
@@ -306,6 +318,9 @@ async fn verdict_block_security_escalates() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(
                 pre_digest.contains("block[security]"),
@@ -362,6 +377,9 @@ async fn verdict_block_pipeline_escalates() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(pre_digest.contains("block[pipeline]"));
             assert!(pre_digest.contains("Do NOT dispatch"));
@@ -409,6 +427,9 @@ async fn verdict_block_ci_retry_limit_escalates() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(
                 pre_digest.contains("retry limit"),
@@ -465,6 +486,9 @@ async fn verdict_hold_review_with_task_is_handled() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(
                 pre_digest.contains("hold[review]"),
@@ -519,6 +543,9 @@ async fn verdict_hold_review_no_task_passes_through() -> Result<()> {
 
     // With no task, hold[review] passes through with enrichment
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             let e = enrichment.expect("hold[review] with no task should enrich");
             assert!(e.contains("hold[review]"));
@@ -550,6 +577,9 @@ async fn verdict_missing_is_handled_structurally() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(
                 pre_digest.contains("verdict_classification_failed"),
@@ -634,6 +664,9 @@ async fn verdict_changes_requested_block_ac_single_dispatch() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Handled { pre_digest } => {
             assert!(pre_digest.contains("block[ac]"));
             assert!(pre_digest.contains("dispatch run_claude_pilot"));
@@ -677,6 +710,9 @@ async fn verdict_pass_approved_with_task_no_token_passthrough() -> Result<()> {
     .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             let e = enrichment.expect("no-token pass should enrich");
             assert!(e.contains("no GitHub token"));
@@ -824,6 +860,9 @@ async fn non_pr_review_event_passes_through() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
                 enrichment.is_none(),
@@ -857,6 +896,9 @@ async fn verdict_pass_no_task_passes_through() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
                 enrichment.is_none(),
@@ -898,6 +940,9 @@ async fn verdict_pass_completed_task_passes_through() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
                 enrichment.is_none(),
@@ -970,6 +1015,9 @@ async fn verdict_pass_pending_task_passes_through() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
                 enrichment.is_none(),
@@ -1008,6 +1056,9 @@ async fn verdict_pass_no_github_token_passes_through() -> Result<()> {
     .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             let e = enrichment.expect("no-token should enrich");
             assert!(e.contains("no GitHub token"));
@@ -1039,6 +1090,9 @@ async fn non_approved_review_passes_through() -> Result<()> {
             .await;
 
     match action {
+        VerdictAction::Dispatched { .. } => {
+            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+        }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
                 enrichment.is_none(),

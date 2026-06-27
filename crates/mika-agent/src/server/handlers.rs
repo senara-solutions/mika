@@ -789,6 +789,8 @@ async fn run_agent_for_message(
                 req.text = format!("{e}{}", req.text);
             }
             VerdictAction::Passthrough { enrichment: None } => {}
+            // Only the ready-label handler returns Dispatched (mika#1572).
+            VerdictAction::Dispatched { .. } => {}
         }
 
         // Structural CI success handler: intercept check_suite.completed(success)
@@ -813,6 +815,8 @@ async fn run_agent_for_message(
                 req.text = format!("{e}{}", req.text);
             }
             VerdictAction::Passthrough { enrichment: None } => {}
+            // Only the ready-label handler returns Dispatched (mika#1572).
+            VerdictAction::Dispatched { .. } => {}
         }
 
         // Structural CI failure handler: intercept check_suite.completed(failure|timed_out)
@@ -837,6 +841,8 @@ async fn run_agent_for_message(
                 req.text = format!("{e}{}", req.text);
             }
             VerdictAction::Passthrough { enrichment: None } => {}
+            // Only the ready-label handler returns Dispatched (mika#1572).
+            VerdictAction::Dispatched { .. } => {}
         }
 
         // Structural ready-label dispatch handler (mika#1384): intercepts
@@ -853,9 +859,17 @@ async fn run_agent_for_message(
             Some(&sender_arc),
             &session_id,
             &req.request_id,
+            &skills,
         )
         .await;
         match ready_label_action {
+            // Engine-side dispatch already fired (mika#1572): replace the message
+            // with the post-dispatch pre-digest. It starts with
+            // `<ready_label_handler>`, so the `webhook_ready_label_dispatch`
+            // INTENT_GUARD does not fire (the LLM has no dispatch left to make).
+            VerdictAction::Dispatched { pre_digest, .. } => {
+                req.text = pre_digest;
+            }
             VerdictAction::Handled { pre_digest } => {
                 req.text = pre_digest;
             }
@@ -889,6 +903,9 @@ async fn run_agent_for_message(
             VerdictAction::Passthrough { enrichment: None } => {}
             VerdictAction::Handled { .. } => {
                 unreachable!("milestone_context handler never handles");
+            }
+            VerdictAction::Dispatched { .. } => {
+                unreachable!("milestone_context handler never dispatches");
             }
         }
     }
