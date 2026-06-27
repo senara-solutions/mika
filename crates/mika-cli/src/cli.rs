@@ -183,8 +183,9 @@ pub struct ChatArgs {
     #[command(flatten)]
     pub agent_flag: AgentFlag,
 
-    /// LLM model override for this session (e.g., sonnet, opus, haiku, openai/gpt-4o).
-    /// One-shot override, not persisted to config.
+    /// Model-id override for this session (e.g., sonnet, opus, claude-sonnet-4-6).
+    /// One-shot, not persisted. Routes through the agent's configured llm_provider —
+    /// does NOT re-dispatch based on the model-name prefix.
     #[arg(long, conflicts_with = "team")]
     pub model: Option<String>,
 
@@ -215,8 +216,9 @@ pub struct AskArgs {
     #[command(flatten)]
     pub agent_flag: AgentFlag,
 
-    /// LLM model override for this invocation (e.g., sonnet, opus, haiku, openai/gpt-4o).
-    /// One-shot override, not persisted to config.
+    /// Model-id override for this invocation (e.g., sonnet, opus, claude-sonnet-4-6).
+    /// One-shot, not persisted. Routes through the agent's configured llm_provider —
+    /// does NOT re-dispatch based on the model-name prefix.
     #[arg(long, conflicts_with = "team")]
     pub model: Option<String>,
 
