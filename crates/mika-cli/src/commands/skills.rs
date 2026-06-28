@@ -75,6 +75,12 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         Some(SkillsCommand::Disable { name }) => {
             toggle_skill(&global_home, &skills_dir, agent_name, &name, false)?;
         }
+        Some(SkillsCommand::Promote { name }) => {
+            set_lifecycle_state(&global_home, agent_name, &name, "active")?;
+        }
+        Some(SkillsCommand::Archive { name }) => {
+            set_lifecycle_state(&global_home, agent_name, &name, "archived")?;
+        }
         Some(SkillsCommand::Install {
             source,
             name,
@@ -901,6 +907,53 @@ fn toggle_skill(
     db.set_skill_enabled(agent_id, name, enable)?;
     let action = if enable { "Enabled" } else { "Disabled" };
     println!("\n  {action} skill '{name}'.\n");
+    Ok(())
+}
+
+/// Set the lifecycle state of an agent-authored skill (mika#1582).
+///
+/// Used by `mika skills promote <name>` and `mika skills archive <name>`.
+fn set_lifecycle_state(
+    global_home: &Path,
+    agent_id: &str,
+    name: &str,
+    target_state: &str,
+) -> Result<()> {
+    let db_path = mika_common::home::container_db_path(global_home);
+    if !db_path.exists() {
+        bail!(
+            "Mika database not found at {}. Run `mika status` to initialize the agent.",
+            db_path.display()
+        );
+    }
+    let mut db = mika_agent::db::Database::open(&db_path)
+        .with_context(|| format!("failed to open database at {}", db_path.display()))?;
+
+    // Check current lifecycle state
+    let current = db.get_skill_lifecycle_state(agent_id, name)?;
+    match current {
+        None => {
+            bail!(
+                "Skill '{name}' has no lifecycle_state — it is a bundled or marketplace skill \
+                 and cannot be promoted/archived via this command."
+            );
+        }
+        Some(ref s) if s == target_state => {
+            println!("\n  Skill '{name}' is already in '{target_state}' state.\n");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    db.set_skill_lifecycle_state(agent_id, name, target_state)?;
+
+    let action_word = match target_state {
+        "active" => "Promoted",
+        "archived" => "Archived",
+        "staged" => "Staged",
+        _ => "Updated",
+    };
+    println!("\n  {action_word} skill '{name}' → {target_state}.\n");
     Ok(())
 }
 

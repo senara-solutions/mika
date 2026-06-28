@@ -179,6 +179,27 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn set_skill_lifecycle_state(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+        state: &str,
+    ) -> Result<()> {
+        let (a, s, st) = (agent_id.to_owned(), skill_name.to_owned(), state.to_owned());
+        self.with_db(move |db| db.set_skill_lifecycle_state(&a, &s, &st))
+            .await
+    }
+
+    pub async fn get_skill_lifecycle_state(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+    ) -> Result<Option<String>> {
+        let (a, s) = (agent_id.to_owned(), skill_name.to_owned());
+        self.with_db(move |db| db.get_skill_lifecycle_state(&a, &s))
+            .await
+    }
+
     pub async fn delete_skill_override(&self, agent_id: &str, skill_name: &str) -> Result<()> {
         let (a, s) = (agent_id.to_owned(), skill_name.to_owned());
         self.with_db(move |db| db.delete_skill_override(&a, &s))

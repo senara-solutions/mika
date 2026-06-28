@@ -43,6 +43,7 @@ mod search_memory;
 mod search_tool_history;
 mod send_message;
 mod set_config;
+mod skill_manage;
 mod store_fact;
 mod toggle_skill;
 mod update_core_memory;
@@ -732,6 +733,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "list_skills",
     "toggle_skill",
     "update_skill",
+    "skill_manage",
     "get_config",
     "set_config",
     "write_agent_file",
@@ -796,6 +798,7 @@ pub fn default_tools() -> ToolRegistry {
     registry.register(Box::new(list_skills::ListSkillsTool));
     registry.register(Box::new(toggle_skill::ToggleSkillTool));
     registry.register(Box::new(update_skill::UpdateSkillTool));
+    registry.register(Box::new(skill_manage::SkillManageTool));
     registry.register(Box::new(get_config::GetConfigTool));
     registry.register(Box::new(set_config::SetConfigTool));
     registry.register(Box::new(write_agent_file::WriteAgentFileTool));

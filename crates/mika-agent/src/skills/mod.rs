@@ -643,8 +643,8 @@ impl SkillRegistry {
     /// doesn't match an installed skill name. Does not fail — only emits
     /// `tracing::warn` for each unresolvable dependency.
     pub fn apply_overrides(&mut self, overrides: &[SkillOverride]) {
-        // Phase 0: Evict disabled skills.
-        // Collect disabled skill names first, then evict using retain() + staging vec.
+        // Phase 0: Evict disabled skills AND lifecycle-gated skills (staged/archived).
+        // Collect names to evict first, then evict using retain() + staging vec.
         // Can't borrow `self.disabled` while `self.skills` is mutably borrowed by retain().
         let disabled_names: Vec<String> = overrides
             .iter()
@@ -652,22 +652,41 @@ impl SkillRegistry {
             .map(|ov| ov.skill_name.clone())
             .collect();
 
-        if !disabled_names.is_empty() {
+        // Lifecycle-gated eviction (mika#1582): skills with lifecycle_state
+        // `staged` or `archived` are not yet promoted / have been retired.
+        let lifecycle_evict_names: Vec<String> = overrides
+            .iter()
+            .filter(|ov| {
+                matches!(
+                    ov.lifecycle_state.as_deref(),
+                    Some("staged") | Some("archived")
+                )
+            })
+            .map(|ov| ov.skill_name.clone())
+            .collect();
+
+        if !disabled_names.is_empty() || !lifecycle_evict_names.is_empty() {
             let mut evicted = Vec::new();
             self.skills.retain(|entry| {
-                let is_disabled = disabled_names
+                let name = &entry.manifest.skill.name;
+                let is_disabled = disabled_names.iter().any(|n| name.eq_ignore_ascii_case(n));
+                let is_lifecycle_gated = lifecycle_evict_names
                     .iter()
-                    .any(|n| entry.manifest.skill.name.eq_ignore_ascii_case(n));
+                    .any(|n| name.eq_ignore_ascii_case(n));
                 if is_disabled {
                     tracing::info!(
-                        skill = %entry.manifest.skill.name,
+                        skill = %name,
                         "skill disabled via DB override — evicted from registry"
                     );
-                    evicted.push(DisabledSkill {
-                        name: entry.manifest.skill.name.clone(),
-                    });
+                    evicted.push(DisabledSkill { name: name.clone() });
+                } else if is_lifecycle_gated {
+                    tracing::info!(
+                        skill = %name,
+                        "skill lifecycle-gated (staged/archived) — evicted from registry"
+                    );
+                    evicted.push(DisabledSkill { name: name.clone() });
                 }
-                !is_disabled
+                !is_disabled && !is_lifecycle_gated
             });
             self.disabled.extend(evicted);
         }
