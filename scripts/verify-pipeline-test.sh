@@ -170,7 +170,13 @@ echo "=== Case B: documentation label + mixed diff → PASS ==="
 setup_test_repo
 git checkout -b feat/test -q
 mkdir -p docs/plans src
-echo "plan" > docs/plans/test-plan.md
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## Acceptance criteria
+
+- [ ] AC1. Test criterion
+PLANEOF
 echo "code" > src/main.rs
 git add docs/plans/test-plan.md src/main.rs
 git commit -q -m "feat: add plan and code"
@@ -365,6 +371,82 @@ write_mock_gh "documentation"
 output="" ; exit_code=0
 output=$(run_verify "Resolves #77") || exit_code=$?
 assert_pass "Resolves keyword parsed → label exemption (#77)" "$exit_code" "$output" "[pipeline-exempt: issue-label] docs-only PR allowed by linked-issue documentation label (#77)"
+cleanup_test_repo
+
+# =========================================================================
+# Acceptance criteria section tests (mika#1600)
+# =========================================================================
+
+echo ""
+echo "=== AC check: plan with AC section present → PASS ==="
+setup_test_repo
+git checkout -b feat/test -q
+mkdir -p docs/plans src
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## Definition of Done
+
+- [ ] Something done
+
+## Acceptance criteria
+
+- [ ] AC1. First criterion
+- [ ] AC2. Second criterion
+PLANEOF
+echo "code" > src/main.rs
+git add docs/plans/test-plan.md src/main.rs
+git commit -q -m "feat: plan with AC section"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_pass "AC check: plan with AC section present → PASS" "$exit_code" "$output" "Pipeline verification passed"
+cleanup_test_repo
+
+echo ""
+echo "=== AC check: plan missing AC section → FAIL ==="
+setup_test_repo
+git checkout -b feat/test -q
+mkdir -p docs/plans src
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## Definition of Done
+
+- [ ] Something done
+PLANEOF
+echo "code" > src/main.rs
+git add docs/plans/test-plan.md src/main.rs
+git commit -q -m "feat: plan without AC section"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_fail "AC check: plan missing AC section → FAIL" "$exit_code" "$output" "missing '## Acceptance criteria' section"
+cleanup_test_repo
+
+echo ""
+echo "=== AC check: plan with empty AC section → FAIL ==="
+setup_test_repo
+git checkout -b feat/test -q
+mkdir -p docs/plans src
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## Definition of Done
+
+- [ ] Something done
+
+## Acceptance criteria
+
+## Next section
+PLANEOF
+echo "code" > src/main.rs
+git add docs/plans/test-plan.md src/main.rs
+git commit -q -m "feat: plan with empty AC section"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_fail "AC check: plan with empty AC section → FAIL" "$exit_code" "$output" "empty '## Acceptance criteria' section"
 cleanup_test_repo
 
 # =========================================================================
