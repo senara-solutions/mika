@@ -1,5 +1,7 @@
 # Plan: Fix per-customer outbound delivery (mika#1607)
 
+**Issue:** mika#1607
+
 ## Problem
 
 Per-customer agents cannot deliver outbound Telegram replies in multi-bot gateway mode. The agent's `GatewayMessageSender` builds the `/send` payload without `customer_id`, so the gateway cannot resolve the per-customer bot token and returns 400.
