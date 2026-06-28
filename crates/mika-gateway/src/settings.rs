@@ -82,6 +82,13 @@ pub struct GatewaySettings {
     /// (gateway-only cutover) is reserved for a future ticket.
     #[serde(default)]
     pub orchestrator_inbox_enabled: Option<String>,
+
+    /// Public HTTPS base URL of the gateway (e.g., `https://gateway.mika.example.com`).
+    /// Required for per-customer webhook registration — the endpoint constructs
+    /// `{gateway_external_url}/webhook/telegram/{customer_id}` as the Telegram webhook URL.
+    /// Maps to `MIKA_GATEWAY_EXTERNAL_URL`.
+    #[serde(default)]
+    pub gateway_external_url: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -241,6 +248,7 @@ impl std::fmt::Debug for GatewaySettings {
                 "orchestrator_inbox_enabled",
                 &self.orchestrator_inbox_enabled,
             )
+            .field("gateway_external_url", &self.gateway_external_url)
             .finish()
     }
 }
@@ -338,6 +346,7 @@ mod tests {
                 github_app_private_key: Some(SecretString::from("super-secret-pem")),
                 github_app_installation_id: Some(67890),
                 orchestrator_inbox_enabled: None,
+                gateway_external_url: Some("https://gateway.test.example.com".to_string()),
             }
         );
         assert!(!debug.contains("pass"));
@@ -440,6 +449,7 @@ mod tests {
             github_app_private_key: None,
             github_app_installation_id: None,
             orchestrator_inbox_enabled: None,
+            gateway_external_url: None,
         }
     }
 

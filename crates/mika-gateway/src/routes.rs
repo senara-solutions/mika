@@ -121,6 +121,9 @@ pub struct AppState {
     /// subscribers can cascade into webhook failures. Default 10 permits
     /// (see `orchestrator_inbox::ORCHESTRATOR_INBOX_DEFAULT_SUBSCRIBER_CAP`).
     pub inbox_subscriber_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Public HTTPS base URL of the gateway. Required for per-customer webhook
+    /// registration (`POST /admin/customers`). `None` when not configured.
+    pub gateway_external_url: Option<String>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -220,6 +223,16 @@ pub fn build_router(state: AppState) -> Router {
                 state.clone(),
                 require_bearer_token,
             )),
+        )
+        // Admin: customer registration (mika#1609)
+        .route(
+            "/admin/customers",
+            post(handle_register_customer)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(16 * 1024)),
         )
         // Health probes and version (no auth)
         .route("/health", get(handle_readiness))
@@ -873,6 +886,242 @@ async fn handle_photo_message(
     handle_forward_result(state, tg, result, chat_id, row.id, update_id, "photo").await;
 }
 
+// -- Admin: customer registration (mika#1609) --
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisterCustomerPayload {
+    customer_id: Uuid,
+    name: String,
+    bot_token: SecretString,
+    bot_username: String,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    pairing_token_ttl_hours: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RegisterCustomerResponse {
+    customer_id: Uuid,
+    bot_username: String,
+    pairing_token: String,
+    pairing_url: String,
+    webhook_registered: bool,
+}
+
+/// Validate bot_username: alphanumeric + underscores, 1-32 chars, no leading `@`.
+fn is_valid_bot_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.len() <= 32
+        && !username.starts_with('@')
+        && username
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// POST /admin/customers — register or re-register a per-customer Telegram bot.
+///
+/// Creates a `customers` row with `status='provisioned'`, stores bot credentials,
+/// generates pairing token and webhook secret, registers the webhook with Telegram,
+/// and returns the pairing URL.
+///
+/// Idempotent on `customer_id`: re-registering updates bot credentials and
+/// re-registers the webhook. Pairing token is only regenerated if the customer
+/// is still in `provisioned` status.
+async fn handle_register_customer(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterCustomerPayload>,
+) -> impl IntoResponse {
+    // Validate gateway_external_url is configured
+    let gateway_url = match &state.gateway_external_url {
+        Some(url) => url.clone(),
+        None => {
+            error!("POST /admin/customers called but gateway_external_url not configured");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "gateway_external_url not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate plan
+    let plan = payload.plan.as_deref().unwrap_or("standard");
+    if plan != "standard" && plan != "premium" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid plan: must be 'standard' or 'premium'"})),
+        )
+            .into_response();
+    }
+
+    // Validate bot_username
+    if !is_valid_bot_username(&payload.bot_username) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid bot_username: must be 1-32 alphanumeric/underscore characters, no leading @"})),
+        )
+            .into_response();
+    }
+
+    // Validate bot token via getMe and check username match
+    let customer_tg = CustomerTelegramClient::new(
+        state.http_client.clone(),
+        SecretString::from(payload.bot_token.expose_secret().to_string()),
+    );
+    match customer_tg.get_me().await {
+        Ok(actual_username) => {
+            if actual_username != payload.bot_username {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "bot_username mismatch: provided '{}' but Telegram returned '{}'",
+                            payload.bot_username, actual_username
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        Err(TelegramApiError::Unauthorized) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid bot_token: Telegram returned 401 Unauthorized"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("bot token validation failed: {e}")})),
+            )
+                .into_response();
+        }
+    }
+
+    // Generate secrets
+    let webhook_secret = generate_webhook_secret();
+    let pairing_token = generate_pairing_token();
+    let ttl_hours = payload.pairing_token_ttl_hours.unwrap_or(48);
+    let timezone = payload.timezone.as_deref().unwrap_or("UTC");
+
+    // Upsert customer row
+    let upsert_result = sqlx::query_as::<_, UpsertCustomerRow>(
+        r#"INSERT INTO customers (id, name, plan, timezone, status, bot_token, bot_username, webhook_secret, pairing_token, pairing_expires_at)
+           VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, now() + make_interval(hours => $9))
+           ON CONFLICT (id) DO UPDATE SET
+               name = EXCLUDED.name,
+               bot_token = EXCLUDED.bot_token,
+               bot_username = EXCLUDED.bot_username,
+               webhook_secret = EXCLUDED.webhook_secret,
+               pairing_token = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_token ELSE customers.pairing_token END,
+               pairing_expires_at = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_expires_at ELSE customers.pairing_expires_at END
+           RETURNING status, pairing_token, (xmax = 0) AS was_inserted"#,
+    )
+    .bind(payload.customer_id)
+    .bind(&payload.name)
+    .bind(plan)
+    .bind(timezone)
+    .bind(payload.bot_token.expose_secret())
+    .bind(&payload.bot_username)
+    .bind(&webhook_secret)
+    .bind(&pairing_token)
+    .bind(ttl_hours as f64)
+    .fetch_one(&state.pool)
+    .await;
+
+    let row = match upsert_result {
+        Ok(row) => row,
+        Err(e) => {
+            error!(error = %e, customer_id = %payload.customer_id, "failed to upsert customer");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Register webhook with Telegram (fail-open)
+    let webhook_url = format!(
+        "{}/webhook/telegram/{}",
+        gateway_url.trim_end_matches('/'),
+        payload.customer_id
+    );
+    let webhook_registered = match customer_tg.set_webhook(&webhook_url, &webhook_secret).await {
+        Ok(()) => {
+            info!(
+                customer_id = %payload.customer_id,
+                bot_username = %payload.bot_username,
+                webhook_url = %webhook_url,
+                "per-customer telegram webhook registered"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                customer_id = %payload.customer_id,
+                bot_username = %payload.bot_username,
+                "per-customer telegram webhook registration failed (fail-open)"
+            );
+            false
+        }
+    };
+
+    // Use the effective pairing_token from the DB (may be the old one for active customers)
+    let effective_token = row.pairing_token.unwrap_or_else(|| pairing_token.clone());
+    let pairing_url = format!(
+        "https://t.me/{}?start={}",
+        payload.bot_username, effective_token
+    );
+
+    let status_code = if row.was_inserted {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+
+    (
+        status_code,
+        Json(RegisterCustomerResponse {
+            customer_id: payload.customer_id,
+            bot_username: payload.bot_username,
+            pairing_token: effective_token,
+            pairing_url,
+            webhook_registered,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct UpsertCustomerRow {
+    #[allow(dead_code)]
+    status: String,
+    pairing_token: Option<String>,
+    was_inserted: bool,
+}
+
+// -- Token generation --
+
+/// Generate a cryptographic pairing token (32 random bytes, hex-encoded → 64 chars).
+fn generate_pairing_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::fill(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Generate a webhook secret (32 random bytes, hex-encoded → 64 chars).
+fn generate_webhook_secret() -> String {
+    let mut bytes = [0u8; 32];
+    rand::fill(&mut bytes);
+    hex::encode(bytes)
+}
+
 // -- Pairing --
 
 /// Validate pairing token format: must be 64-char hex (32 bytes hex-encoded).
@@ -1390,13 +1639,6 @@ struct PairingResultRow {
 mod tests {
     use super::*;
 
-    /// Generate a cryptographic pairing token (32 random bytes, hex-encoded).
-    fn generate_pairing_token() -> String {
-        let mut bytes = [0u8; 32];
-        rand::fill(&mut bytes);
-        hex::encode(bytes)
-    }
-
     #[test]
     fn test_is_health_probe() {
         assert!(is_health_probe("/health"));
@@ -1416,25 +1658,6 @@ mod tests {
         assert!(!constant_time_eq("secret", "wrong"));
         assert!(!constant_time_eq("short", "longer_string"));
         assert!(constant_time_eq("", ""));
-    }
-
-    #[test]
-    fn test_generate_pairing_token_length() {
-        let token = generate_pairing_token();
-        assert_eq!(token.len(), 64);
-    }
-
-    #[test]
-    fn test_generate_pairing_token_unique() {
-        let t1 = generate_pairing_token();
-        let t2 = generate_pairing_token();
-        assert_ne!(t1, t2);
-    }
-
-    #[test]
-    fn test_generate_pairing_token_is_hex() {
-        let token = generate_pairing_token();
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -1642,5 +1865,84 @@ mod tests {
             !msg.contains("offline"),
             "non-connect errors should not mention offline"
         );
+    }
+
+    // -- generate_pairing_token / generate_webhook_secret tests --
+
+    #[test]
+    fn test_generate_pairing_token_length() {
+        let token = generate_pairing_token();
+        assert_eq!(token.len(), 64);
+    }
+
+    #[test]
+    fn test_generate_pairing_token_unique() {
+        let t1 = generate_pairing_token();
+        let t2 = generate_pairing_token();
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn test_generate_pairing_token_is_hex() {
+        let token = generate_pairing_token();
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_generate_webhook_secret_length() {
+        let secret = generate_webhook_secret();
+        assert_eq!(secret.len(), 64);
+    }
+
+    #[test]
+    fn test_generate_webhook_secret_unique() {
+        let s1 = generate_webhook_secret();
+        let s2 = generate_webhook_secret();
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn test_generate_webhook_secret_is_hex() {
+        let secret = generate_webhook_secret();
+        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // -- is_valid_bot_username tests --
+
+    #[test]
+    fn test_valid_bot_username() {
+        assert!(is_valid_bot_username("MyTestBot"));
+        assert!(is_valid_bot_username("test_bot_123"));
+        assert!(is_valid_bot_username("a"));
+        assert!(is_valid_bot_username("A_B_c_1"));
+    }
+
+    #[test]
+    fn test_invalid_bot_username_empty() {
+        assert!(!is_valid_bot_username(""));
+    }
+
+    #[test]
+    fn test_invalid_bot_username_leading_at() {
+        assert!(!is_valid_bot_username("@MyBot"));
+    }
+
+    #[test]
+    fn test_invalid_bot_username_too_long() {
+        let name = "a".repeat(33);
+        assert!(!is_valid_bot_username(&name));
+    }
+
+    #[test]
+    fn test_invalid_bot_username_special_chars() {
+        assert!(!is_valid_bot_username("my-bot"));
+        assert!(!is_valid_bot_username("my.bot"));
+        assert!(!is_valid_bot_username("my bot"));
+    }
+
+    #[test]
+    fn test_valid_bot_username_max_length() {
+        let name = "a".repeat(32);
+        assert!(is_valid_bot_username(&name));
     }
 }

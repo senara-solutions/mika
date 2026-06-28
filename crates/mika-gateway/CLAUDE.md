@@ -19,6 +19,7 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 | `/a2a/{customer_id}/{agent_name}/agent.json` | GET | None | Agent Card proxy |
 | `/orchestrator/inbox/{orchestrator_id}/message` | POST | Internal token | Persist spawn→orchestrator message (256KB limit, mika#1189) |
 | `/orchestrator/inbox/{orchestrator_id}/stream` | GET | Internal token | SSE stream of inbox messages with cursor replay (mika#1189) |
+| `/admin/customers` | POST | Internal token | Register/re-register a per-customer Telegram bot (mika#1609) |
 
 ## GitHub Webhook Integration
 
@@ -90,6 +91,7 @@ API keys are SHA-256 hashed and stored in Postgres `a2a_api_keys` table (migrati
 - `MIKA_GITHUB_APP_ID` — GitHub App ID (u64). Required for the synchronize no-diff guard (#886).
 - `MIKA_GITHUB_APP_PRIVATE_KEY` — GitHub App private key (base64-encoded PEM). Required for the synchronize no-diff guard (#886). Encode with: `base64 -w0 < your-app.pem`.
 - `MIKA_GITHUB_APP_INSTALLATION_ID` — GitHub App installation ID (u64). Required for the synchronize no-diff guard (#886). All 3 GitHub App vars must be set; when incomplete, the no-diff guard is disabled (fail-open).
+- `MIKA_GATEWAY_EXTERNAL_URL` — Public HTTPS base URL of the gateway (e.g., `https://gateway.mika.example.com`). Required for per-customer webhook registration via `POST /admin/customers`. The endpoint constructs `{gateway_external_url}/webhook/telegram/{customer_id}` as the Telegram webhook URL.
 - `MIKA_ORCHESTRATOR_INBOX_ENABLED` — Orchestrator inbox feature flag (mika#1189). Default off — `/orchestrator/inbox/*` endpoints return 404. Set `1` (or `true`, case-insensitive) to enable dual-write with the mika-platform#100 filesystem inbox. `2` (gateway-only cutover) is reserved for a future ticket and currently treated as disabled. Note: bearer auth gates the endpoints by token; orchestrator/spawn distinction is carried by path (`orchestrator_id`) and `spawn_id` field, not by separate tokens — multi-operator deployments will need per-operator scoping before exposure beyond a solo operator.
 
 ## Orchestrator Inbox (mika#1189)

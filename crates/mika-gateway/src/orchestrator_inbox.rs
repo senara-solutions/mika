@@ -548,6 +548,7 @@ mod tests {
             github_api_base_url: None,
             orchestrator_inbox_enabled,
             inbox_subscriber_semaphore: Arc::new(Semaphore::new(subscriber_cap)),
+            gateway_external_url: None,
         }
     }
 

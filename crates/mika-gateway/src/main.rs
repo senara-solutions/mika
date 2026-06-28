@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
         github_api_base_url: None,
         orchestrator_inbox_enabled,
         inbox_subscriber_semaphore: orchestrator_inbox::default_inbox_subscriber_semaphore(),
+        gateway_external_url: settings.gateway_external_url.clone(),
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)
