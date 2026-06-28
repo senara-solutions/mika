@@ -517,6 +517,63 @@ async fn download_image_impl(
     })
 }
 
+/// Response from Telegram `getMe` API.
+#[derive(Debug, Deserialize)]
+struct GetMeResponse {
+    ok: bool,
+    result: Option<GetMeResult>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetMeResult {
+    username: Option<String>,
+}
+
+/// Validate a bot token by calling Telegram's `getMe` endpoint.
+/// Returns the bot's username on success.
+pub(crate) async fn get_me(client: &Client, bot_token: &str) -> Result<String, TelegramApiError> {
+    let resp = client.get(api_url(bot_token, "getMe")).send().await?;
+
+    let status = resp.status().as_u16();
+    if status != 200 {
+        let body: TelegramResponse = resp.json().await.unwrap_or(TelegramResponse {
+            ok: false,
+            description: None,
+            parameters: None,
+        });
+        return match status {
+            401 => Err(TelegramApiError::Unauthorized),
+            _ => Err(TelegramApiError::Other {
+                status,
+                body: body.description.unwrap_or_default(),
+            }),
+        };
+    }
+
+    let me_resp: GetMeResponse = resp.json().await.map_err(|e| TelegramApiError::Other {
+        status: 200,
+        body: format!("failed to parse getMe response: {e}"),
+    })?;
+
+    if !me_resp.ok {
+        return Err(TelegramApiError::Other {
+            status: 200,
+            body: me_resp
+                .description
+                .unwrap_or_else(|| "getMe returned ok=false".to_string()),
+        });
+    }
+
+    me_resp
+        .result
+        .and_then(|r| r.username)
+        .ok_or(TelegramApiError::Other {
+            status: 200,
+            body: "getMe returned no username".to_string(),
+        })
+}
+
 /// Register the webhook URL with Telegram. Verifies `ok: true` response.
 async fn set_webhook_impl(
     client: &Client,
@@ -621,6 +678,23 @@ impl CustomerTelegramClient {
     /// Download an image by file_id: resolves path, downloads bytes, validates magic bytes, enforces size limit.
     pub async fn download_image(&self, file_id: &str) -> Result<DownloadedImage, TelegramApiError> {
         download_image_impl(&self.client, self.bot_token.expose_secret(), file_id).await
+    }
+
+    /// Register the webhook URL with Telegram for this customer's bot.
+    pub async fn set_webhook(&self, webhook_url: &str, webhook_secret: &str) -> anyhow::Result<()> {
+        set_webhook_impl(
+            &self.client,
+            self.bot_token.expose_secret(),
+            webhook_url,
+            webhook_secret,
+        )
+        .await
+    }
+
+    /// Validate the bot token by calling Telegram's `getMe` endpoint.
+    /// Returns the bot's username on success.
+    pub async fn get_me(&self) -> Result<String, TelegramApiError> {
+        get_me(&self.client, self.bot_token.expose_secret()).await
     }
 }
 
