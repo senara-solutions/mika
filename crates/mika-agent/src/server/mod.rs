@@ -434,6 +434,7 @@ async fn init_agent(
         None,
         Some(agent_name.to_string()),
         None,
+        agent_settings.customer_id.clone(),
     );
     let engine_sender: Arc<dyn MessageSender> = Arc::new(engine_sender);
 

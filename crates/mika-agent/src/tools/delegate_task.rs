@@ -225,6 +225,7 @@ impl Tool for DelegateTaskTool {
                     None,
                     Some(agent_name.to_string()),
                     chat_id,
+                    self.settings.customer_id.clone(),
                 )))
             } else {
                 tracing::warn!(
