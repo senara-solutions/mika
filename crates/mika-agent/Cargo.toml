@@ -68,6 +68,8 @@ regex.workspace = true
 sha2.workspace = true
 clap.workspace = true
 serde_yaml.workspace = true
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

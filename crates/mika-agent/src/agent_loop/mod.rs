@@ -3054,6 +3054,16 @@ async fn run_agent_inner(
     )
     .await?;
 
+    // Track skill usage at turn-end (one increment per turn, not per step).
+    let injected_skill_names: Vec<String> = per_skill_bytes.keys().cloned().collect();
+    if !injected_skill_names.is_empty()
+        && let Err(e) = db
+            .increment_skill_usage(&db.agent_id, &injected_skill_names)
+            .await
+    {
+        tracing::warn!(error = %e, "failed to increment skill usage");
+    }
+
     match result {
         LoopResult::Done {
             text,
@@ -3248,6 +3258,10 @@ pub enum SilentTrigger {
         /// The outcome of the last child: "completed", "failed", "blocked", "cancelled"
         last_child_outcome: String,
     },
+    /// A periodic curator review to surface archival candidates for idle skills (mika#1584).
+    /// The dispatcher short-circuits before calling `run_silent_agent` — the curator
+    /// runs as a deterministic query+notification task, not an LLM turn.
+    CuratorReview,
     /// mika#1011 — Engine-side deferred-dispatch retry. Fired by the dispatcher
     /// after a blocking `run_claude_pilot` callback completes and a pending
     /// deferred-dispatch callback is promoted. The agent's only required action
@@ -3277,7 +3291,7 @@ impl SilentTrigger {
             | Self::Reminder { .. }
             | Self::PostCallbackAdvance { .. }
             | Self::DeferredDispatch { .. } => crate::planning::policy::MAX_CALLBACK_TOOL_STEPS,
-            Self::Heartbeat | Self::Reflection | Self::SkillRun { .. } => {
+            Self::Heartbeat | Self::Reflection | Self::SkillRun { .. } | Self::CuratorReview => {
                 crate::planning::policy::MAX_TOOL_STEPS
             }
         }
@@ -3323,6 +3337,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<()> {
         SilentTrigger::Reminder { .. } => "reminder",
         SilentTrigger::PostCallbackAdvance { .. } => "post_callback_advance",
         SilentTrigger::DeferredDispatch { .. } => "deferred_dispatch",
+        SilentTrigger::CuratorReview => "curator_review",
     };
 
     let silent_span = info_span!(
@@ -3516,6 +3531,10 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
                  send_message, or any other tool first."
             )
         }
+        SilentTrigger::CuratorReview => "This is a scheduled CURATOR REVIEW background task. \
+             Review the agent's skills and identify any that need attention. \
+             Do not contact the user unless there is a critical issue requiring immediate action."
+            .to_string(),
     };
 
     let (task_health, stored_preferences) = if matches!(
@@ -3525,6 +3544,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
             | SilentTrigger::Reminder { .. }
             | SilentTrigger::PostCallbackAdvance { .. }
             | SilentTrigger::DeferredDispatch { .. }
+            | SilentTrigger::CuratorReview
     ) {
         (
             db.get_task_health_summary().await.ok(),
@@ -3583,7 +3603,8 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         SilentTrigger::Heartbeat
         | SilentTrigger::Reflection
         | SilentTrigger::Reminder { .. }
-        | SilentTrigger::SkillRun { .. } => params.skills.safe_always_on_skills(),
+        | SilentTrigger::SkillRun { .. }
+        | SilentTrigger::CuratorReview => params.skills.safe_always_on_skills(),
     };
 
     let provider = llm.provider_name();
@@ -3650,6 +3671,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         SilentTrigger::DeferredDispatch { parent_task_id, .. } => {
             format!("[callback:deferred-dispatch] [parent: {parent_task_id}]")
         }
+        SilentTrigger::CuratorReview => "[curator_review trigger]".to_string(),
     };
 
     let messages = vec![LlmMessage {
@@ -3670,6 +3692,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         SilentTrigger::Reminder { .. } => "reminder",
         SilentTrigger::PostCallbackAdvance { .. } => "post_callback_advance",
         SilentTrigger::DeferredDispatch { .. } => "deferred_dispatch",
+        SilentTrigger::CuratorReview => "curator_review",
     };
     let _ = emit_system_prompt_assembled(
         &system,
@@ -3809,6 +3832,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         SilentTrigger::Reminder { .. } => "reminder",
         SilentTrigger::PostCallbackAdvance { .. } => "post_callback_advance",
         SilentTrigger::DeferredDispatch { .. } => "deferred_dispatch",
+        SilentTrigger::CuratorReview => "curator_review",
     };
 
     // Prelude deadline check (mika#848 F3b) — see run_agent_inner for rationale.
@@ -3872,6 +3896,16 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         scope_task_id.as_deref(),
     )
     .await?;
+
+    // Track skill usage at turn-end (one increment per turn, not per step).
+    let injected_skill_names: Vec<String> = per_skill_bytes.keys().cloned().collect();
+    if !injected_skill_names.is_empty()
+        && let Err(e) = db
+            .increment_skill_usage(&db.agent_id, &injected_skill_names)
+            .await
+    {
+        tracing::warn!(error = %e, "failed to increment skill usage");
+    }
 
     // Match all three LoopResult variants. Compiler enforces exhaustiveness — see
     // mika#848 F4 / `LoopResult`'s exhaustiveness contract.
@@ -4293,6 +4327,17 @@ async fn run_team_agent_inner_impl(
         None, // team mode: no task context for parallel narrative
     )
     .await?;
+
+    // Track skill usage at turn-end (one increment per turn, not per step).
+    let injected_skill_names: Vec<String> = per_skill_bytes.keys().cloned().collect();
+    if !injected_skill_names.is_empty()
+        && let Err(e) = params
+            .db
+            .increment_skill_usage(&params.db.agent_id, &injected_skill_names)
+            .await
+    {
+        tracing::warn!(error = %e, "failed to increment skill usage");
+    }
 
     match result {
         LoopResult::Done { text, .. } => {

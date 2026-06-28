@@ -416,6 +416,21 @@ tar = "0.4"
 
 2. **Curator proposal emission** — first-tick after deployment fires on every agent-authored `active` skill. Since only operator-promoted skills have `lifecycle_state = 'active'`, the candidate set is bounded by deliberate operator action. Proposals are structured JSON queryable via CLI, not free-text notifications.
 
+## Acceptance criteria
+
+1. **AC1 — Schema migration:** Migration adds `use_count INTEGER NOT NULL DEFAULT 0` and `last_used_at TEXT` columns to `skill_overrides`. Existing rows get safe defaults (0 / NULL). (Steps 1, 10)
+2. **AC2 — Usage tracking:** Skill-prompt injection emits usage events; turn-end batch increments `use_count` and sets `last_used_at` for all injected skills. (Steps 2, 10)
+3. **AC3 — Curator recurring task:** `SilentTrigger::CuratorReview` is registered via `ensure_recurring_task` with a configurable interval (default daily at 03:00 UTC, overridable via `[curator].interval_hours` in identity.toml). (Step 3)
+4. **AC4 — Candidate query:** Curator candidate query selects skills with `lifecycle_state = 'active'` that are idle beyond the threshold. Bundled/marketplace skills (`lifecycle_state IS NULL`) and staged skills are excluded by construction. (Step 4)
+5. **AC5 — Structured proposal:** Curator emits a structured JSON proposal (not free-text) stored in `audit_events` and queryable via `mika skills curator status`. The curator does not auto-archive — it proposes only. (Steps 4, 5, 8)
+6. **AC6 — Archive snapshot:** CLI `archive` command captures a `tar.gz` snapshot of the skill directory into `<agent_home>/skills/.archived/` before the `lifecycle_state` UPDATE. (Step 6)
+7. **AC7 — CLI restore:** CLI `mika skills restore <name>` extracts the most recent snapshot and sets `lifecycle_state = 'staged'` (operator must re-promote). Missing snapshot returns an error. (Step 7)
+8. **AC8 — HTTP restore:** `POST /api/v1/skills/{name}/restore` mirrors the CLI restore behavior — extracts snapshot, sets `lifecycle_state = 'staged'`, returns structured JSON response. Requires internal token auth. (Step 9)
+9. **AC9 — Test: fresh agent:** Fresh agent with no agent-authored skills → curator returns zero candidates. (Step 4 tests)
+10. **AC10 — Test: staged skill:** Agent with a staged (not promoted) skill → curator returns zero candidates (curator only considers `lifecycle_state = 'active'`). (Step 4 tests)
+11. **AC11 — Test: idle promoted skill:** Agent with a promoted+active skill where `last_used_at` is older than 30 days → curator returns one candidate. (Step 4 tests)
+12. **AC12 — Test: bundled/marketplace:** Bundled or marketplace skill with `NULL lifecycle_state` and `NULL last_used_at` → curator returns zero candidates. (Step 4 tests)
+
 ## Out of scope
 
 - Auto-archive without operator action (Phase 2).
@@ -423,3 +438,7 @@ tar = "0.4"
 - Snapshot pruning / `max_archived_snapshots_per_skill` config.
 - `view_count` / `patch_count` tracking (deferred to follow-on).
 - Cross-tenant skill usage aggregation.
+
+## Revision history
+
+- rev 2 (2026-06-28): addressed F1 by adding `## Acceptance criteria` section transcribing all 12 ACs from the issue body (AC1–AC12), with cross-references to the plan steps that implement each. Citation: mika#1559 Acceptance-Criteria Gate; mika#1585 qa-review `block[pipeline]`.

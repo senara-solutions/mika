@@ -1,5 +1,6 @@
 pub mod builtin_handlers;
 pub mod context;
+pub mod curator;
 pub mod executor;
 pub mod git;
 pub mod index;
@@ -1830,6 +1831,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: None,
+            ..Default::default()
         }]);
 
         assert!(registry.skills[0].manifest.skill.always_on);
@@ -1855,6 +1857,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: None,
+            ..Default::default()
         }]);
 
         assert!(registry.skills[0].manifest.skill.always_on);
@@ -1878,6 +1881,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: None,
+            ..Default::default()
         }]);
 
         assert!(!registry.skills[0].manifest.skill.always_on);
@@ -1901,6 +1905,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: None,
+            ..Default::default()
         }]);
 
         // No crash, web-search unchanged
@@ -1929,6 +1934,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: None,
+            ..Default::default()
         }]);
 
         assert_eq!(registry.always_on_skills().len(), 2);
@@ -2015,6 +2021,7 @@ mod tests {
             llm_provider: Some("anthropic".to_string()),
             llm_model: Some("claude-sonnet-4-6".to_string()),
             enabled: None,
+            ..Default::default()
         }]);
 
         assert!(registry.skills[0].has_override);
@@ -2054,6 +2061,7 @@ mod tests {
             llm_provider: None,
             llm_model: Some("deepseek-reasoner".to_string()),
             enabled: None,
+            ..Default::default()
         }]);
 
         assert!(registry.skills[0].has_override);
@@ -2091,6 +2099,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: None,
+            ..Default::default()
         }]);
 
         // Should still be present — no prompt file means tool-only, not broken
@@ -2118,6 +2127,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: Some(false),
+            ..Default::default()
         }]);
 
         assert_eq!(registry.skills.len(), 1);
@@ -2141,6 +2151,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: None,
+            ..Default::default()
         }]);
 
         assert_eq!(registry.skills.len(), 1);
@@ -2162,6 +2173,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: Some(true),
+            ..Default::default()
         }]);
 
         assert_eq!(registry.skills.len(), 1);
@@ -2183,6 +2195,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: Some(false),
+            ..Default::default()
         }]);
 
         assert!(registry.skills.is_empty());
@@ -2204,6 +2217,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: Some(false),
+            ..Default::default()
         }]);
 
         assert_eq!(registry.skills.len(), 1);
@@ -2226,6 +2240,7 @@ mod tests {
             llm_provider: None,
             llm_model: None,
             enabled: Some(false),
+            ..Default::default()
         }]);
         registry.apply_load_safety_check();
 
@@ -3260,6 +3275,7 @@ keywords = ["big-test"]
             enabled: None,
             llm_provider: Some("anthropic".to_string()),
             llm_model: Some("claude-opus-4-7".to_string()),
+            ..Default::default()
         }];
         registry.apply_overrides(&overrides);
 
@@ -3299,6 +3315,7 @@ keywords = ["big-test"]
             enabled: Some(false),
             llm_provider: None,
             llm_model: None,
+            ..Default::default()
         }];
         registry.apply_overrides(&overrides);
 

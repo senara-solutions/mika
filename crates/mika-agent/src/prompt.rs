@@ -63,6 +63,20 @@ fn default_heartbeat_enabled() -> bool {
     true // Back-compat: heartbeat is enabled by default
 }
 
+/// Configuration for the periodic curator review task (mika#1584).
+///
+/// The curator periodically scans agent-authored skills for idle candidates
+/// and proposes archival. It never auto-archives — it proposes only.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CuratorConfig {
+    /// Interval in hours between curator reviews. Converted to a cron expression
+    /// at registration time. Default: 24 (daily at 03:00 UTC).
+    pub interval_hours: Option<u32>,
+    /// Number of days a skill must be idle before being proposed for archival.
+    /// Default: 30.
+    pub max_idle_days: Option<u32>,
+}
+
 /// Per-agent Knowledge Graph configuration from `[kg]` section of `identity.toml`.
 ///
 /// Controls whether the KG subsystem runs for this agent and which docs root
@@ -253,6 +267,8 @@ pub struct Identity {
     pub tools: ToolsIdentityConfig,
     #[serde(default)]
     pub context: ContextIdentityConfig,
+    #[serde(default)]
+    pub curator: Option<CuratorConfig>,
 }
 
 fn default_name() -> String {
@@ -274,6 +290,7 @@ impl Default for Identity {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            curator: None,
         }
     }
 }
@@ -377,6 +394,7 @@ fn fail_closed_identity() -> Identity {
                 max_tokens: None,
             },
         },
+        curator: None,
     }
 }
 
@@ -1057,6 +1075,7 @@ mod tests {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            curator: None,
         }
     }
 
@@ -1139,6 +1158,7 @@ mod tests {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            curator: None,
         };
         let ctx = PromptContext {
             soul_content: "",

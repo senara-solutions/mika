@@ -207,6 +207,7 @@ impl TaskDispatcher {
             "heartbeat" => Ok(self.dispatch_heartbeat(task).await?),
             "reflection" => Ok(self.dispatch_reflection(task).await?),
             "auto_pull_groomed" => Ok(self.dispatch_auto_pull_groomed(task).await?),
+            "curator_review" => Ok(self.dispatch_curator_review(task).await?),
             other => Err(anyhow!("unknown run_skill trigger: {}", other).into()),
         }
     }
@@ -892,6 +893,50 @@ impl TaskDispatcher {
                     "auto_pull: no action taken"
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    /// Run the curator review (mika#1584).
+    ///
+    /// This is a deterministic query+notification task — no LLM call.
+    /// Queries for idle agent-authored skills and emits proposals.
+    async fn dispatch_curator_review(&self, task: &Task) -> Result<()> {
+        let identity = crate::prompt::load_identity_async(&self.home_dir).await;
+        let max_idle_days = identity
+            .curator
+            .as_ref()
+            .and_then(|c| c.max_idle_days)
+            .unwrap_or(30);
+
+        let candidates = self
+            .db
+            .get_archival_candidates(&task.agent_id, max_idle_days)
+            .await?;
+
+        if candidates.is_empty() {
+            debug!(
+                agent = %task.agent_id,
+                "curator review: no archival candidates"
+            );
+            return Ok(());
+        }
+
+        let proposals = crate::skills::curator::build_proposals(&candidates, max_idle_days);
+
+        crate::skills::curator::emit_curator_proposal(&self.db, &task.agent_id, &proposals).await?;
+
+        // Notify operator if message_sender is available
+        if let Some(ref sender) = self.message_sender {
+            let summary = format!(
+                "[Curator] {} skill(s) idle >{}d for agent {}. Run `mika skills curator status --agent {}` for details.",
+                candidates.len(),
+                max_idle_days,
+                task.agent_id,
+                task.agent_id,
+            );
+            let _ = sender.send(&summary).await;
         }
 
         Ok(())

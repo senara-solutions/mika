@@ -555,6 +555,22 @@ pub enum SkillsCommand {
         #[command(subcommand)]
         action: SkillVariantsAction,
     },
+    /// Restore an archived skill from its most recent snapshot
+    Restore {
+        /// Skill name to restore
+        name: String,
+    },
+    /// Curator operations
+    Curator {
+        #[command(subcommand)]
+        action: CuratorAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CuratorAction {
+    /// Show the most recent curator review results
+    Status,
 }
 
 #[derive(Subcommand)]
