@@ -72,8 +72,8 @@ When `customer_id` is `None` (CLI/dev mode, no `MIKA_CUSTOMER_ID` set), the payl
 | `crates/mika-agent/src/server/handlers.rs` | Pass `customer_id` at request handler and flush sender construction |
 | `crates/mika-agent/src/tools/delegate_task.rs` | Pass `customer_id` at delegate sender construction |
 
-## Acceptance
+## Acceptance criteria
 
-- Per-customer agent (provisioned with `MIKA_CUSTOMER_ID`) delivers outbound reply through gateway in multi-bot mode — no 400, no `failed_sends` entry.
-- Single-bot mode (no `MIKA_CUSTOMER_ID`) continues to work unchanged.
-- `cargo test -p mika-agent` passes including the new payload tests.
+- [ ] Per-customer agent (provisioned with `MIKA_CUSTOMER_ID`) includes `customer_id` in the `/send` payload so the gateway resolves the per-customer bot token in multi-bot mode — no 400, no `failed_sends` entry.
+- [ ] Single-bot mode (no `MIKA_CUSTOMER_ID`) continues to work unchanged — `customer_id` key omitted.
+- [ ] `cargo test -p mika-agent` passes including the new payload tests.
