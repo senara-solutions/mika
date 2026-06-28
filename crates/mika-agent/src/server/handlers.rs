@@ -756,6 +756,7 @@ async fn run_agent_for_message(
         Some(req.request_id.clone()),
         Some(a.db.agent_id().to_string()),
         None,
+        a.settings.customer_id.clone(),
     );
     let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
@@ -1006,6 +1007,7 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
         None,
         Some(agent_state.db.agent_id().to_string()),
         None,
+        agent_state.settings.customer_id.clone(),
     );
 
     for send in sends {

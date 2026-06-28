@@ -58,9 +58,20 @@ pub struct GatewayMessageSender {
     /// Used by delegated agents whose agent-scoped `customer_config` doesn't
     /// contain the chat_id (it's stored under the orchestrator's agent_id).
     chat_id: Option<i64>,
+    /// Per-customer identifier (from `MIKA_CUSTOMER_ID` → `Settings.customer_id`).
+    /// When `Some`, included in the `/send` payload so the gateway can resolve
+    /// the per-customer bot token in multi-bot mode (#1607). When `None`
+    /// (CLI/dev, single-bot deployments), the field is omitted and the gateway
+    /// falls back to its global single-bot path — no behavioral change.
+    customer_id: Option<String>,
 }
 
 impl GatewayMessageSender {
+    // Constructor threads transport config + routing identity (request_id,
+    // agent_name, chat_id override, customer_id) through positionally. The arg
+    // count is inherent to the sender's responsibilities, not accidental
+    // complexity; a builder would add ceremony without clarifying intent.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gateway_url: String,
         internal_token: SecretString,
@@ -69,6 +80,7 @@ impl GatewayMessageSender {
         request_id: Option<String>,
         agent_name: Option<String>,
         chat_id: Option<i64>,
+        customer_id: Option<String>,
     ) -> Self {
         Self {
             client,
@@ -78,6 +90,7 @@ impl GatewayMessageSender {
             request_id,
             agent_name,
             chat_id,
+            customer_id,
         }
     }
 
@@ -92,6 +105,27 @@ impl GatewayMessageSender {
                 .parse::<i64>()
                 .map_err(|e| anyhow!("invalid chat_id: {e}")),
         }
+    }
+
+    /// Build the `/send` request payload. In multi-bot gateway mode (`customer_id`
+    /// is `Some`), the `customer_id` field is included so the gateway can resolve
+    /// the per-customer bot token (#1607). In single-bot/CLI mode (`None`), the
+    /// field is omitted — the gateway's `SendPayload.customer_id` defaults to
+    /// `None` and it falls back to its global single-bot path. Extracted from
+    /// `send()` so the payload contract is unit-testable without an HTTP round-trip.
+    fn build_payload(&self, chat_id: i64, text: &str) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "request_id": self.request_id,
+            "agent_name": self.agent_name,
+        });
+
+        if let Some(customer_id) = &self.customer_id {
+            payload["customer_id"] = serde_json::json!(customer_id);
+        }
+
+        payload
     }
 
     async fn try_send(&self, payload: &serde_json::Value) -> Result<()> {
@@ -164,12 +198,7 @@ impl MessageSender for GatewayMessageSender {
             "GatewayMessageSender: sending outbound message"
         );
 
-        let payload = serde_json::json!({
-            "chat_id": chat_id,
-            "text": text,
-            "request_id": self.request_id,
-            "agent_name": self.agent_name,
-        });
+        let payload = self.build_payload(chat_id, text);
 
         // First attempt
         match self.try_send(&payload).await {
@@ -237,6 +266,7 @@ mod tests {
             None,
             Some("delegate-agent".to_string()),
             Some(12345),
+            None,
         );
 
         let chat_id = sender.resolve_chat_id().await.unwrap();
@@ -260,6 +290,7 @@ mod tests {
             None,
             Some("mika".to_string()),
             None,
+            None,
         );
 
         let chat_id = sender.resolve_chat_id().await.unwrap();
@@ -277,6 +308,7 @@ mod tests {
             reqwest::Client::new(),
             None,
             Some("delegate-agent".to_string()),
+            None,
             None,
         );
 
@@ -315,6 +347,7 @@ mod tests {
             None,
             Some("mika".to_string()),
             None,
+            None,
         );
 
         let chat_id = sender.resolve_chat_id().await.unwrap();
@@ -345,6 +378,7 @@ mod tests {
             None,
             Some("mika".to_string()),
             None,
+            None,
         );
 
         let chat_id = sender.resolve_chat_id().await.unwrap();
@@ -366,6 +400,7 @@ mod tests {
             None,
             Some("test-agent".to_string()),
             Some(0), // explicit chat_id override of 0
+            None,
         );
 
         let outcome = sender.send("hello").await.unwrap();
@@ -394,6 +429,7 @@ mod tests {
             None,
             Some("mika".to_string()),
             None, // no explicit override — falls back to DB
+            None,
         );
 
         let outcome = sender.send("hello").await.unwrap();
@@ -424,6 +460,7 @@ mod tests {
             None,
             Some("no-chat-agent".to_string()),
             None, // no explicit override, no DB entry
+            None,
         );
 
         let result = sender.send("hello").await;
@@ -438,6 +475,69 @@ mod tests {
                 .contains("chat_id not configured"),
             "error should mention chat_id not configured"
         );
+    }
+
+    // --- customer_id payload tests (mika#1607) ---
+
+    /// Multi-bot mode: when `customer_id` is `Some`, the `/send` payload includes
+    /// it so the gateway can resolve the per-customer bot token. The fixture uses a
+    /// real UUID string because that is the production wire shape — the gateway's
+    /// `SendPayload.customer_id: Option<Uuid>` deserializes the JSON string back
+    /// into a `Uuid` (see mika-gateway `test_send_payload_with_customer_id`).
+    #[tokio::test]
+    async fn test_send_payload_includes_customer_id() {
+        let customer_uuid = "12345678-1234-1234-1234-123456789abc";
+        let harness = TestHarness::with_agent("customer-agent");
+        let sender = GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("customer-agent".to_string()),
+            Some(12345),
+            Some(customer_uuid.to_string()),
+        );
+
+        let payload = sender.build_payload(12345, "hello");
+        assert_eq!(
+            payload["customer_id"],
+            serde_json::json!(customer_uuid),
+            "multi-bot payload must carry customer_id"
+        );
+        // The emitted value must parse as a Uuid — the gateway deserializes the
+        // JSON string into Option<Uuid>, so a non-UUID would 400 at the gateway.
+        assert!(
+            uuid::Uuid::parse_str(payload["customer_id"].as_str().unwrap()).is_ok(),
+            "customer_id must be a valid UUID on the wire"
+        );
+        assert_eq!(payload["chat_id"], serde_json::json!(12345));
+        assert_eq!(payload["text"], serde_json::json!("hello"));
+    }
+
+    /// Backward compatibility: when `customer_id` is `None` (single-bot/CLI), the
+    /// payload omits the key entirely — the gateway falls back to single-bot mode.
+    #[tokio::test]
+    async fn test_send_payload_omits_customer_id_when_none() {
+        let harness = TestHarness::with_agent("single-bot-agent");
+        let sender = GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("single-bot-agent".to_string()),
+            Some(12345),
+            None,
+        );
+
+        let payload = sender.build_payload(12345, "hello");
+        assert!(
+            payload.get("customer_id").is_none(),
+            "single-bot payload must NOT include customer_id key"
+        );
+        assert_eq!(payload["chat_id"], serde_json::json!(12345));
+        assert_eq!(payload["text"], serde_json::json!("hello"));
     }
 
     // --- truncate_for_log tests (mika#1090) ---

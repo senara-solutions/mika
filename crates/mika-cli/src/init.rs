@@ -268,6 +268,7 @@ pub fn make_message_sender(
         None,
         Some(agent_name.to_string()),
         None,
+        settings.customer_id.clone(),
     );
     Some(Arc::new(sender))
 }
