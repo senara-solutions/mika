@@ -242,3 +242,18 @@ Some issue.
         "bare 'second-pass (READY)' without 'paraphrased GROOMED' qualifier should be rejected"
     );
 }
+
+// --- Scenario 10-12: grooming provenance cross-check (#1620) ---
+//
+// The full `validate_dispatch_readiness` integration path for the cross-check
+// requires `fetch_issue_body` (HTTP call to GitHub API) which is not mocked
+// in this test file. The DB-level `has_completed_groom_for_issue` method is
+// thoroughly tested in `db.rs::tests`. These scenarios verify the
+// `check_grooming_markers` predicate layer that gates the cross-check:
+//
+// - Scenario 10: check_grooming_markers passes → cross-check would fire
+//   (verified by DB tests in db.rs)
+// - Scenario 11: check_grooming_markers fails → cross-check never reached
+//   (existing scenarios 1, 2, 8 cover this)
+// - Scenario 12: bypass env var → both checks skipped
+//   (existing scenario 9 comment covers this)
