@@ -6184,6 +6184,29 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Check whether a completed groom-class task exists for a given GitHub
+    /// issue. Used by the dispatch-classification gate (#1620) to verify that
+    /// grooming markers in an issue body were written by the autonomous
+    /// `dev-groom` loop (which creates tasks with `?phase=groom` URL suffix)
+    /// rather than pre-stamped by a manual `/mika-ask-arch` session.
+    ///
+    /// `issue_url` is the canonical issue URL without the `?phase=groom` suffix
+    /// (e.g., `https://github.com/owner/repo/issues/123`). The method appends
+    /// the suffix internally to match the autonomous groom flow's URL pattern.
+    pub fn has_completed_groom_for_issue(&self, agent_id: &str, issue_url: &str) -> Result<bool> {
+        let groom_url = format!("{}?phase=groom", issue_url);
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND dispatch_class = 'groom'
+               AND status IN ('completed', 'delivered')
+               AND reference_url = ?2",
+            params![agent_id, groom_url],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Count pending callback tasks for a given team run with depth > 1.
     /// Used to detect grandchild long-running tasks spawned during a team run.
     pub fn count_pending_callback_tasks_by_team_run(&self, team_run_id: &str) -> Result<i64> {
@@ -18629,5 +18652,115 @@ mod tests {
 
         let result = db.get_last_cli_session_for_agent("mika").unwrap();
         assert!(result.is_none());
+    }
+
+    // --- has_completed_groom_for_issue (#1620) ---
+
+    fn groom_task(agent_id: &str, reference_url: &str) -> NewTask {
+        NewTask {
+            agent_id: agent_id.to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "groom senara-solutions/mika#123".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some(reference_url.to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_groom_cross_check_no_task_returns_false() {
+        let db = db();
+        let result = db
+            .has_completed_groom_for_issue(
+                "mika",
+                "https://github.com/senara-solutions/mika/issues/123",
+            )
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_groom_cross_check_completed_task_returns_true() {
+        let db = db();
+        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
+        let groom_url = format!("{}?phase=groom", issue_url);
+        let task = groom_task("mika", &groom_url);
+        let id = db.create_task(&task).unwrap();
+        db.update_task_status(&id, "completed").unwrap();
+
+        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_groom_cross_check_delivered_task_returns_true() {
+        let db = db();
+        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
+        let groom_url = format!("{}?phase=groom", issue_url);
+        let task = groom_task("mika", &groom_url);
+        let id = db.create_task(&task).unwrap();
+        db.update_task_status(&id, "completed").unwrap();
+        db.update_task_status(&id, "delivered").unwrap();
+
+        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_groom_cross_check_pending_task_returns_false() {
+        let db = db();
+        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
+        let groom_url = format!("{}?phase=groom", issue_url);
+        let task = groom_task("mika", &groom_url);
+        db.create_task(&task).unwrap();
+        // Status is "pending" (default) — should not satisfy the gate
+
+        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_groom_cross_check_implement_class_returns_false() {
+        let db = db();
+        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
+        let groom_url = format!("{}?phase=groom", issue_url);
+        let mut task = groom_task("mika", &groom_url);
+        task.dispatch_class = Some("implement".to_string());
+        let id = db.create_task(&task).unwrap();
+        db.update_task_status(&id, "completed").unwrap();
+
+        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_groom_cross_check_different_agent_returns_false() {
+        let db = db();
+        db.register_agent("other-agent", "Other", "").unwrap();
+        let issue_url = "https://github.com/senara-solutions/mika/issues/123";
+        let groom_url = format!("{}?phase=groom", issue_url);
+        let task = groom_task("other-agent", &groom_url);
+        let id = db.create_task(&task).unwrap();
+        db.update_task_status(&id, "completed").unwrap();
+
+        // Query for "mika" agent — should not find the other-agent's task
+        let result = db.has_completed_groom_for_issue("mika", issue_url).unwrap();
+        assert!(!result);
     }
 }

@@ -698,6 +698,16 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Check whether a completed groom-class task exists for a given GitHub
+    /// issue (#1620). Used by the dispatch-classification gate to verify
+    /// grooming markers were written by the autonomous loop.
+    pub async fn has_completed_groom_for_issue(&self, issue_url: &str) -> Result<bool> {
+        let a = self.agent_id.clone();
+        let u = issue_url.to_owned();
+        self.with_db(move |db| db.has_completed_groom_for_issue(&a, &u))
+            .await
+    }
+
     /// Count pending deferred-dispatch callbacks for this agent (mika#1011).
     pub async fn count_pending_deferred_callbacks(&self) -> Result<i64> {
         let a = self.agent_id.clone();
