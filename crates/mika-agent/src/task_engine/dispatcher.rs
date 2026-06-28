@@ -25,6 +25,7 @@ use crate::async_db::AsyncDatabase;
 use crate::db::Task;
 use crate::messaging::MessageSender;
 use crate::skills::SkillRegistry;
+use crate::skills::manifest::ToolHandler;
 use crate::tools::ToolRegistry;
 
 use super::types::action_type;
@@ -419,15 +420,20 @@ impl TaskDispatcher {
             // depending on the LLM to fire the transition. Coupled pair with
             // `reap_orphaned_parent_tasks` (failure path).
             try_complete_parent_on_callback_success(&self.db, task).await;
-            // mika#1289: structural counterpart to the prompt-level groom-
-            // success handler in self-dev-callback (PR #1291). When a groom
-            // callback delivers with `Outcome: PLAN_GROOMED`, re-add the
-            // `ready` label so the ready-label webhook handler dispatches
-            // dev-pilot — engine-side, not LLM-mediated, so it fires every
-            // time. Prompt-level path remains as defense-in-depth
-            // (idempotent — re-adding an already-present label is a no-op).
-            try_dispatch_pilot_after_groom_success(&self.db, task, self.github_token.as_deref())
-                .await;
+            // mika#1289 / mika#1614: structural counterpart to the prompt-level
+            // groom-success handler in self-dev-callback (PR #1291). When a groom
+            // callback delivers with `Outcome: PLAN_GROOMED`, the engine spawns the
+            // implement-class dev-pilot dispatch DIRECTLY (mirroring the
+            // ready_label_handler engine-side path, mika#1572) — no `gh` label
+            // round-trip, no LLM-mediated turn, so it fires every time. The
+            // prompt-level path in self-dev-callback remains as defense-in-depth.
+            try_dispatch_pilot_after_groom_success(
+                &self.db,
+                task,
+                self.github_token.as_deref(),
+                &self.skills,
+            )
+            .await;
         }
 
         // Suppress user-facing notifications for team-child callbacks.
@@ -1778,13 +1784,29 @@ fn is_team_child_callback(task: &Task) -> bool {
 ///   - parent task has a parseable `reference_url` of shape
 ///     `https://github.com/<owner>/<repo>/issues/<n>`
 ///
-/// `gh` subprocess uses the resolved GitHub token from `github_token` (already
-/// scrubbed-and-re-injected pattern from `run_gh`). Audit event written under
-/// `tool_name='task_engine_groom_pilot_dispatcher'` for traceability.
+/// Dispatch is **engine-side and direct** (mika#1614): the function resolves the
+/// `run_claude_pilot` tool from the `SkillRegistry`, **reuses the groom parent
+/// task** by flipping its `dispatch_class` groom→implement (mika#996 task-reuse
+/// pattern — NOT a new parent, which would collide with the groom parent on the
+/// `reference_url` unique index while it is still `in_progress`), validates
+/// dispatch readiness, and spawns the claude-pilot subprocess via
+/// `spawn_long_running_exec` — mirroring `ready_label_handler`'s steps 9a–9i
+/// (mika#1572). This replaces the prior `gh issue edit --add-label ready` →
+/// webhook round-trip → LLM-mediated turn chain, which was vulnerable to LLM
+/// fabrication (an "auto-fired dispatch" log line with no actual subprocess
+/// spawn — observed on mika#1609, 2026-06-28).
+///
+/// Fire-and-forget: on ANY precondition failure (tool not in registry, readiness
+/// rejection, handler missing) the function logs a WARN and returns. The
+/// prompt-level path in `self-dev-callback` remains as defense-in-depth.
+///
+/// Audit event written under `tool_name='task_engine_groom_pilot_dispatcher'`
+/// with `after_value='implement_dispatched'` for traceability.
 async fn try_dispatch_pilot_after_groom_success(
     db: &AsyncDatabase,
     task: &Task,
     github_token: Option<&str>,
+    skills: &SkillRegistry,
 ) {
     // 1. Groom-class callbacks only.
     if task.dispatch_class.as_deref() != Some("groom") {
@@ -1792,8 +1814,8 @@ async fn try_dispatch_pilot_after_groom_success(
     }
 
     // 2. Canonical success marker in callback result text.
-    let result = match &task.result {
-        Some(r) if r.contains("Outcome: PLAN_GROOMED") => r,
+    match &task.result {
+        Some(r) if r.contains("Outcome: PLAN_GROOMED") => {}
         _ => return,
     };
 
@@ -1807,94 +1829,234 @@ async fn try_dispatch_pilot_after_groom_success(
         _ => return,
     };
     let reference_url = match parent.reference_url.as_deref() {
-        Some(url) => url,
+        Some(url) => url.to_string(),
         None => return,
     };
-    let (repo, issue_num) = match parse_repo_issue_from_url(reference_url) {
+    let (repo, issue_num) = match parse_repo_issue_from_url(&reference_url) {
         Some(parsed) => parsed,
         None => return,
     };
 
-    // 4. GitHub token required.
-    let token = match github_token {
-        Some(t) if !t.is_empty() => t,
-        _ => {
+    // 4. GitHub token required (the grooming-marker readiness check fetches the
+    //    issue body; without a token it fails-open, but the dispatch is
+    //    meaningless without GitHub access — keep the original precondition).
+    if github_token.is_none_or(str::is_empty) {
+        warn!(
+            groom_parent_task_id = %parent_id,
+            callback_task_id = %task.id,
+            "engine: groom-pilot auto-fire skipped — no GitHub token configured"
+        );
+        return;
+    }
+
+    // 5. Engine-side direct dispatch (mika#1614, mirrors ready_label_handler
+    //    steps 9a–9i / mika#1572). Grooming just succeeded, so the follow-up is
+    //    always the implement-class dev-pilot run.
+    //
+    //    CRITICAL — task REUSE, not a new parent (mika#996 pattern). The groom
+    //    parent is still `in_progress` here (groom callbacks carry no `pr_url`,
+    //    so the earlier `try_complete_parent_on_callback_success` is a no-op for
+    //    them). Creating a *separate* implement parent with the same
+    //    `reference_url` would collide with the partial-unique index
+    //    `idx_tasks_manual_active_ref_url` (active manual tasks, per agent+url) —
+    //    `create_task` would error and the dispatch would silently never fire,
+    //    re-introducing the very bug this fixes. Instead we flip the groom
+    //    parent's `dispatch_class` groom→implement and reuse it as the implement
+    //    parent (one task identity per issue, no leak — it completes normally
+    //    when the pilot delivers a `pr_url`).
+    let system_session = format!("system-{}", parent.agent_id);
+    let trace_id = mika_common::trace::generate_trace_id();
+
+    // 5a. Resolve the dev-pilot dispatch tool from the agent's SkillRegistry.
+    let skill_tool = match skills.resolve_tool_by_name("run_claude_pilot") {
+        Some(t) => t,
+        None => {
             warn!(
                 parent_task_id = %parent_id,
                 callback_task_id = %task.id,
-                "engine: groom-pilot auto-fire skipped — no GitHub token configured"
+                "engine: groom-pilot auto-fire skipped — run_claude_pilot not in \
+                 SkillRegistry (prompt-level path remains as fallback)"
             );
             return;
         }
     };
 
-    // 5. Spawn `gh issue edit <n> --repo senara-solutions/<repo> --add-label ready`.
-    //    Idempotent: re-adding an already-present label is a no-op on GitHub.
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "edit",
-        &issue_num.to_string(),
-        "--repo",
-        &format!("senara-solutions/{repo}"),
-        "--add-label",
-        "ready",
-    ]);
-    cmd.env("GH_TOKEN", token);
-    cmd.env("GH_PROMPT_DISABLED", "1");
-
-    match cmd.output().await {
-        Ok(out) if out.status.success() => {
-            info!(
-                parent_task_id = %parent_id,
-                callback_task_id = %task.id,
-                repo = %repo,
-                issue = issue_num,
-                _result_len = result.len(),
-                "engine: auto-fired dev-pilot dispatch after groom success (mika#1289 — re-added ready label)"
-            );
-            let system_session = format!("system-{}", parent.agent_id);
-            let trace_id = mika_common::trace::generate_trace_id();
-            let reason = format!("groom_pilot_dispatch_fired (issue: {repo}#{issue_num})");
-            if let Err(e) = db
-                .log_audit_event(
-                    &system_session,
-                    "task_engine_groom_pilot_dispatcher",
-                    &parent_id,
-                    Some("groom_delivered"),
-                    Some("ready_label_re_added"),
-                    Some(&reason),
-                    Some(&trace_id),
-                )
-                .await
-            {
-                warn!(
-                    parent_task_id = %parent_id,
-                    error = %e,
-                    "engine: failed to write groom-pilot-dispatcher audit event"
-                );
-            }
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+    // 5b. Resolve the long-running exec command + estimated duration from the
+    //     tool handler (binds the callback timeout to the same value the LLM
+    //     tool-call path uses; dev-pilot declares estimated_duration_secs).
+    let (command, estimated_duration_secs) = match &skill_tool.handler {
+        ToolHandler::Exec {
+            command,
+            long_running: true,
+            estimated_duration_secs,
+        } => (command.clone(), *estimated_duration_secs),
+        _ => {
             warn!(
                 parent_task_id = %parent_id,
                 callback_task_id = %task.id,
-                repo = %repo,
-                issue = issue_num,
-                exit_code = ?out.status.code(),
-                stderr = %stderr,
-                "engine: groom-pilot auto-fire failed — gh issue edit returned non-zero"
+                "engine: groom-pilot auto-fire skipped — run_claude_pilot is not a \
+                 long-running exec handler"
             );
+            return;
+        }
+    };
+
+    // 5c. Flip the groom parent's dispatch_class groom→implement BEFORE the
+    //     readiness check, so the per-class slot guard (#1001) scopes to the
+    //     `implement` slot (not the now-vacated `groom` slot). On failure, abort
+    //     before any dispatch state is created.
+    match db.update_task_dispatch_class(&parent_id, "implement").await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                parent_task_id = %parent_id,
+                "engine: groom-pilot auto-fire skipped — groom parent not found for \
+                 dispatch_class flip"
+            );
+            return;
         }
         Err(e) => {
             warn!(
                 parent_task_id = %parent_id,
-                callback_task_id = %task.id,
                 error = %e,
-                "engine: groom-pilot auto-fire failed — could not spawn gh subprocess"
+                "engine: groom-pilot auto-fire failed — could not flip dispatch_class"
             );
+            return;
         }
+    }
+
+    // 5d. The dispatch input the LLM would have provided. `prompt` is the bare
+    //     `<repo>#<num>` reference (dispatch-lib's worktree-setup parser requires
+    //     the bare form, mika#1593). `task_id` is the reused (now implement)
+    //     parent.
+    let dispatch_input = serde_json::json!({
+        "skill": "dev-pilot",
+        "prompt": format!("{repo}#{issue_num}"),
+        "task_id": parent_id,
+    });
+
+    // 5e. Re-use the dispatch-readiness gate (slot availability, grooming
+    //     markers, blockedBy). `originating_message = None` — this is an engine
+    //     callback, not a webhook fallthrough event, so guard (0) is a no-op. On
+    //     rejection (e.g. slot occupied), the rejection JSON is written to the
+    //     task's `result` by `validate_dispatch_readiness` itself (operator-
+    //     visible); the prompt-level path remains as defense-in-depth.
+    if let Err(rejection) = crate::skills::executor::validate_dispatch_readiness(
+        db,
+        &parent_id,
+        github_token,
+        Some(&dispatch_input),
+        None,
+    )
+    .await
+    {
+        warn!(
+            parent_task_id = %parent_id,
+            rejection = %rejection,
+            "engine: groom-pilot auto-fire skipped — dispatch readiness check failed"
+        );
+        return;
+    }
+
+    // 5f. Create the callback child task (same shape + timeout as the LLM
+    //     tool-call path via the shared `build_callback_task` helper).
+    let timeout_secs = (estimated_duration_secs.unwrap_or(3600) * 3).clamp(600, 7_776_000);
+    let callback_task = crate::skills::executor::build_callback_task(
+        parent.agent_id.clone(),
+        Some(parent_id.clone()),
+        "run_claude_pilot",
+        &dispatch_input,
+        timeout_secs,
+        &system_session,
+        &trace_id,
+    );
+    let callback_task_id = match db.create_task(callback_task).await {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: groom-pilot auto-fire failed — could not create callback child"
+            );
+            return;
+        }
+    };
+
+    // 5g. Verify the handler script exists before committing to the spawn. If
+    //     missing, mark the callback child failed so it does not dangle.
+    let cmd_path = skill_tool.skill_dir.join(&command);
+    if !cmd_path.exists() {
+        warn!(
+            parent_task_id = %parent_id,
+            callback_task_id = %callback_task_id,
+            cmd_path = %cmd_path.display(),
+            "engine: groom-pilot auto-fire failed — dispatch handler script not found"
+        );
+        let _ = db
+            .update_task_failed(
+                &callback_task_id,
+                &format!("handler not found: {}", cmd_path.display()),
+            )
+            .await;
+        return;
+    }
+
+    // 5h. The reused parent is already `in_progress` (it was the groom parent),
+    //     so no status transition is needed — execute_long_running's #525
+    //     pending→in_progress transition does not apply to task reuse.
+
+    // 5i. Inject subprocess metadata, mirroring execute_long_running:
+    //     `__mika_task_id` is the callback child (delivery target), `__mika_agent`
+    //     is this agent.
+    let mut enriched_input = dispatch_input.clone();
+    if let serde_json::Value::Object(ref mut map) = enriched_input {
+        map.insert(
+            "__mika_task_id".to_string(),
+            serde_json::Value::String(callback_task_id.clone()),
+        );
+        map.insert(
+            "__mika_agent".to_string(),
+            serde_json::Value::String(parent.agent_id.clone()),
+        );
+    }
+
+    // 5j. Spawn the detached subprocess. No webhook round-trip, no LLM turn.
+    crate::skills::executor::spawn_long_running_exec(
+        cmd_path,
+        skill_tool.skill_dir.clone(),
+        enriched_input,
+        callback_task_id.clone(),
+        db.clone(),
+        github_token.map(|s| s.to_string()),
+    );
+
+    info!(
+        parent_task_id = %parent_id,
+        callback_task_id = %callback_task_id,
+        repo = %repo,
+        issue = issue_num,
+        "engine: auto-fired dev-pilot dispatch after groom success \
+         (mika#1614 — engine-side direct spawn, task reuse, no webhook round-trip)"
+    );
+
+    let reason = format!("groom_pilot_dispatch_fired (issue: {repo}#{issue_num})");
+    if let Err(e) = db
+        .log_audit_event(
+            &system_session,
+            "task_engine_groom_pilot_dispatcher",
+            &parent_id,
+            Some("groom_delivered"),
+            Some("implement_dispatched"),
+            Some(&reason),
+            Some(&trace_id),
+        )
+        .await
+    {
+        warn!(
+            parent_task_id = %parent_id,
+            error = %e,
+            "engine: failed to write groom-pilot-dispatcher audit event"
+        );
     }
 }
 
@@ -3654,5 +3816,306 @@ mod tests {
             parent.status, "in_progress",
             "non-self_dev parent must not be auto-completed"
         );
+    }
+
+    // ---- mika#1614: engine-side auto-fire-after-groom ----
+
+    /// Create a groom-class parent + groom-class callback child. The callback's
+    /// result text controls whether `Outcome: PLAN_GROOMED` is present; the
+    /// parent carries the GitHub issue reference_url.
+    async fn create_groom_callback_pair(
+        db: &AsyncDatabase,
+        plan_groomed: bool,
+        reference_url: Option<&str>,
+    ) -> (String, String) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "ready-label: senara-solutions/mika#1614".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: reference_url.map(|s| s.to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("groom".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        db.update_task_status(&parent_id, "in_progress")
+            .await
+            .unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot_groom".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        let body = if plan_groomed {
+            "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED\nSession: sess-1614"
+        } else {
+            "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE\nSession: sess-1614"
+        };
+        db.update_task_completed(&callback_id, Some(body))
+            .await
+            .unwrap();
+        (parent_id, callback_id)
+    }
+
+    /// Read the current dispatch_class of a task (None → "<none>").
+    async fn dispatch_class_of(db: &AsyncDatabase, task_id: &str) -> String {
+        db.get_task_unscoped(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .dispatch_class
+            .unwrap_or_else(|| "<none>".to_string())
+    }
+
+    /// Count active (non-terminal) manual tasks with the given reference_url —
+    /// the population the `idx_tasks_manual_active_ref_url` unique index covers.
+    async fn count_active_manual_with_ref(db: &AsyncDatabase, reference_url: &str) -> usize {
+        db.list_manual_tasks(None, None, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(t, _)| {
+                t.reference_url.as_deref() == Some(reference_url)
+                    && !matches!(
+                        t.status.as_str(),
+                        "completed" | "cancelled" | "failed" | "delivered"
+                    )
+            })
+            .count()
+    }
+
+    const TEST_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/1614";
+
+    #[tokio::test]
+    async fn test_auto_fire_skips_non_groom_class() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        // Flip the callback to implement-class → precondition 1 returns early.
+        db.update_task_dispatch_class(&callback_id, "implement")
+            .await
+            .unwrap();
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+        )
+        .await;
+
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "non-groom callback must not flip the parent's dispatch_class"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_fire_skips_without_plan_groomed_marker() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, false, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+        )
+        .await;
+
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "groom callback without PLAN_GROOMED must not dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_fire_skips_without_github_token() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        // No token → precondition 4 returns before any dispatch state changes.
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            None,
+            &crate::skills::SkillRegistry::empty(),
+        )
+        .await;
+
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "no github token must short-circuit before the dispatch_class flip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_fire_skips_when_tool_not_in_registry() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        // Token + PLAN_GROOMED present, but empty registry has no run_claude_pilot
+        // tool → step 5a returns BEFORE the dispatch_class flip (5c).
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+        )
+        .await;
+
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "missing run_claude_pilot tool must not flip the parent before bailing"
+        );
+    }
+
+    /// Regression guard for the mika#1614 design decision: the engine MUST reuse
+    /// the groom parent (flip its dispatch_class), NOT create a new implement
+    /// parent. A new parent would reuse the groom parent's reference_url while the
+    /// groom parent is still `in_progress`, colliding with the partial-unique
+    /// index `idx_tasks_manual_active_ref_url` — `create_task` errors and the
+    /// dispatch silently never fires. This test pins that collision so a future
+    /// refactor back to "new parent" fails loudly here.
+    #[tokio::test]
+    async fn test_new_parent_would_collide_on_active_groom_ref_url() {
+        let db = test_db();
+        let (_groom_parent, _cb) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+
+        // Simulate the rejected "new parent" approach: a second active manual
+        // task with the SAME reference_url while the groom parent is in_progress.
+        let dup = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "auto-fire: mika#1614".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some(TEST_ISSUE_URL.to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        };
+        let res = db.create_task(dup).await;
+        assert!(
+            res.is_err(),
+            "EXPECTED COLLISION on idx_tasks_manual_active_ref_url — a new implement \
+             parent cannot coexist with the active groom parent; the engine must REUSE \
+             the groom parent instead. got Ok({res:?})"
+        );
+    }
+
+    /// The chosen fix mechanism: flipping the groom parent's dispatch_class
+    /// groom→implement succeeds in-place, keeps a single active task on the issue
+    /// URL (no collision, no leak), and the reused parent accepts an
+    /// implement-class callback child.
+    #[tokio::test]
+    async fn test_reuse_flips_groom_parent_in_place_without_collision() {
+        let db = test_db();
+        let (parent_id, _cb) = create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+
+        // Exactly one active manual task on the issue URL before the flip.
+        assert_eq!(count_active_manual_with_ref(&db, TEST_ISSUE_URL).await, 1);
+
+        let flipped = db
+            .update_task_dispatch_class(&parent_id, "implement")
+            .await
+            .unwrap();
+        assert!(flipped, "flip must report the row was updated");
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "implement",
+            "groom parent is reused as the implement parent"
+        );
+        // Still exactly one active manual task — reuse, not duplication.
+        assert_eq!(
+            count_active_manual_with_ref(&db, TEST_ISSUE_URL).await,
+            1,
+            "reuse must not create a second active task on the same reference_url"
+        );
+
+        // The reused parent accepts an implement callback child (the dispatch
+        // slot the engine then validates + spawns against).
+        let dispatch_input = serde_json::json!({
+            "skill": "dev-pilot",
+            "prompt": "mika#1614",
+            "task_id": parent_id,
+        });
+        let callback = crate::skills::executor::build_callback_task(
+            "mika".to_string(),
+            Some(parent_id.clone()),
+            "run_claude_pilot",
+            &dispatch_input,
+            7200,
+            "system-mika",
+            "trace-xyz",
+        );
+        let cb_id = db
+            .create_task(callback)
+            .await
+            .expect("implement callback child must be creatable on the reused parent");
+        let cb = db.get_task_unscoped(&cb_id).await.unwrap().unwrap();
+        assert_eq!(cb.dispatch_class.as_deref(), Some("implement"));
+        assert_eq!(cb.parent_task_id.as_deref(), Some(parent_id.as_str()));
     }
 }
