@@ -294,6 +294,13 @@ impl AsyncDatabase {
         self.with_db(move |db| db.get_task(&i, &a)).await
     }
 
+    pub async fn resolve_task_id_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let p = prefix.to_owned();
+        let a = self.agent_id.clone();
+        self.with_db(move |db| db.resolve_task_id_by_prefix(&p, &a))
+            .await
+    }
+
     pub async fn get_manual_task(&self, id: &str) -> Result<Option<Task>> {
         let i = id.to_owned();
         let a = self.agent_id.clone();

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{ForcePromoteResult, Task, format_ts};
 use serde_json::{Value, json};
 
@@ -6,6 +7,36 @@ use crate::cli::{OutputFormat, TaskArgs, TaskCommand};
 use crate::init;
 
 const VALID_DISPATCH_CLASSES: &[&str] = &["implement", "groom"];
+
+/// Resolve a potentially truncated task ID to its full UUID.
+/// Returns `Some(full_id)` on exact or unique prefix match, `None` on no match.
+/// Exits with code 1 on ambiguous prefix (multiple matches).
+async fn resolve_task_id(db: &AsyncDatabase, input: &str) -> Result<Option<String>> {
+    // Try exact match first (fast path, no regression)
+    if db.get_task(input).await?.is_some() {
+        return Ok(Some(input.to_string()));
+    }
+
+    // Minimum prefix length guard
+    if input.len() < 4 {
+        return Ok(None);
+    }
+
+    // Prefix expansion
+    let matches = db.resolve_task_id_by_prefix(input).await?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches.into_iter().next().unwrap())),
+        _ => {
+            eprintln!("\n  Ambiguous task ID prefix '{input}'. Matches:");
+            for id in &matches {
+                eprintln!("    {id}");
+            }
+            eprintln!();
+            std::process::exit(1);
+        }
+    }
+}
 
 pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
     let ctx = init::init_db_only_for_agent(agent_name)?;
@@ -48,7 +79,14 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
             }
         }
         Some(TaskCommand::Get { id, format }) => {
-            let task = db.get_task(&id).await?;
+            let resolved_id = match resolve_task_id(db, &id).await? {
+                Some(id) => id,
+                None => {
+                    println!("\n  Task {id} not found.\n");
+                    return Ok(());
+                }
+            };
+            let task = db.get_task(&resolved_id).await?;
             match task {
                 Some(t) => match format {
                     OutputFormat::Text => print_task_detail(&t),
@@ -65,22 +103,34 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
             }
         }
         Some(TaskCommand::Cancel { id }) => {
-            match mika_agent::task_engine::process_kill::cancel_task_and_kill(db, &id).await? {
+            let resolved_id = match resolve_task_id(db, &id).await? {
+                Some(id) => id,
+                None => {
+                    println!("\n  Task {id} not found or already completed.\n");
+                    return Ok(());
+                }
+            };
+            match mika_agent::task_engine::process_kill::cancel_task_and_kill(db, &resolved_id)
+                .await?
+            {
                 Some(outcome) => match (outcome.process_killed, outcome.pid) {
                     (Some(true), Some(pid)) => {
                         println!(
-                            "\n  Cancelled task {id} (\"{}\") — process (PID {pid}) terminated.\n",
+                            "\n  Cancelled task {resolved_id} (\"{}\") — process (PID {pid}) terminated.\n",
                             outcome.label
                         );
                     }
                     (Some(false), Some(pid)) => {
                         println!(
-                            "\n  Cancelled task {id} (\"{}\") — warning: process (PID {pid}) may still be running.\n",
+                            "\n  Cancelled task {resolved_id} (\"{}\") — warning: process (PID {pid}) may still be running.\n",
                             outcome.label
                         );
                     }
                     _ => {
-                        println!("\n  Cancelled task {id} (\"{}\").\n", outcome.label);
+                        println!(
+                            "\n  Cancelled task {resolved_id} (\"{}\").\n",
+                            outcome.label
+                        );
                     }
                 },
                 None => {
