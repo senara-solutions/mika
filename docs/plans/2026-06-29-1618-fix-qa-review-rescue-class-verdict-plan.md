@@ -175,7 +175,7 @@ This step is deliberately simple — it reads structured data (HTML comment + is
 
 ---
 
-## Acceptance Criteria
+## Acceptance criteria
 
 - [ ] AC1: Both rescue classes (dirty-worktree and commit-pushed-no-pr) produce PR bodies containing the HTML comment `<!-- rescue-pipeline-verified: no -->`.
 - [ ] AC2: Both rescue classes produce PR bodies with identical structure (same headers, same instruction text), differing only in the one-sentence factual description and recovery-class metadata value.
