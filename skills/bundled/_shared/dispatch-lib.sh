@@ -662,6 +662,7 @@ _run_claude_pilot() {
 
     # Unit 3 (mika#1282): flag for dirty-worktree rescue, checked by Unit 2.
     RESCUED_DIRTY_WORKTREE=0
+    POST_RUN_HEAD=""
 
     STDERR_FILE=$(mktemp)
     STDOUT_FILE=$(mktemp)
@@ -699,6 +700,15 @@ _run_claude_pilot() {
     COST=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.cost_usd // empty' 2>/dev/null)
     DURATION=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.duration_ms // empty' 2>/dev/null)
 
+    # Compute POST_RUN_HEAD unconditionally (mika#1615): needed by recovery
+    # blocks and downstream Unit 2 draft-PR creation regardless of whether
+    # claude-pilot produced structured JSON output. Previously computed inside
+    # Branch A only — Branch B (exit 0, non-JSON) and Branch C (non-zero exit)
+    # silently skipped recovery because POST_RUN_HEAD was never set.
+    if [ -n "$PRE_RUN_HEAD" ] && [ -n "$WORKTREE_DIR" ]; then
+        POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+    fi
+
     if [ -n "$STATUS" ]; then
         RESULT="claude-pilot completed (status: ${STATUS}).
 Session: ${SESSION_ID:-unknown}
@@ -709,460 +719,6 @@ Duration: ${DURATION:-unknown}ms"
         if [ "$PILOT_EXIT" -ne 0 ]; then
             RESULT="${RESULT}
 Note: process exited with code ${PILOT_EXIT} after session completed — result is valid."
-        fi
-
-        # Post-flight diff check: detect zero-commit "success" in repo#number mode.
-        if [ -n "$PRE_RUN_HEAD" ] && [ -n "$REPO" ]; then
-            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-            if [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ]; then
-                # Policy-deny pre-check (Class C disambiguation, extended to dev-pilot
-                # from dev-groom — companion to mika#1534). If the pilot halted on a
-                # tier1/policy deny mid-flight, "Zero new commits" is the SYMPTOM, not
-                # the cause. Read persistent stderr for [policy:deny] before declaring
-                # the generic HEAD-unchanged failure. Fail-open: missing stderr → empty
-                # POLICY_DENY → fall through to existing messages.
-                #
-                # See: docs/solutions/workflow-issues/
-                #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
-                POLICY_DENY=""
-                PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
-                if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
-                    POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                        | grep -m1 '\[policy:deny\]' || true)
-                fi
-
-                # mika#1333 Unit 2: For dev-groom re-dispatch, HEAD-unchanged is
-                # expected when the plan was already committed in a prior run.
-                # The architect pass (_iterate_groom_loop) is what matters — don't
-                # poison RESULT with PIPELINE FAILURE for the expected re-dispatch state.
-                if [ -n "$POLICY_DENY" ]; then
-                    # Class C — policy-deny halt. The pilot tried to do legitimate
-                    # work and was prevented by a tier1/policy allow-list gap. NOT
-                    # to be confused with LLM drift or genuine dirty-worktree-rescue.
-                    RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit.
-
-Halt event: ${POLICY_DENY}
-
-Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-dispatching without addressing the substrate gap will hit the same wall.
-
-See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
-
-${RESULT}"
-                elif [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && \
-                   find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | grep -q .; then
-                    RESULT="Note: HEAD unchanged on dev-groom re-dispatch — plan already committed from prior run. Architect pass will determine outcome.
-
-${RESULT}"
-                else
-                    RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
-
-${RESULT}"
-                fi
-            fi
-
-            # Unit 1 (mika#1282): detect dirty worktree on zero-commit dev-pilot.
-            # If the pilot wrote files but never committed, auto-rescue the content
-            # so it isn't lost with the worktree. This is dispatch-lib exercising its
-            # structural git-workflow ownership per the content/workflow split
-            # (mika#1271 architect verdict; pilot-vs-substrate-contract-split-2026-05-25.md).
-            if [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ] && [ -n "$WORKTREE_DIR" ]; then
-                DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
-                if [ -n "$DIRTY_FILES" ]; then
-                    # Stage all dirty files EXCEPT worktree-scaffold paths copied by
-                    # _set_up_worktree (mika#1288, mika#1419, mika#1552):
-                    #   - .claude/commands/         slash-command snapshots from mika-platform
-                    #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
-                    #   - .claude/settings.local.json  permission allowlist cp'd at :490 (mika#1552)
-                    #   - .claude/*.local.*          general guard for any future Claude-local
-                    #                                files (.env-class — operator-machine-specific)
-                    # None is pilot-authored content. Without the second exclusion, the rescue
-                    # commit re-introduces .claude/claude-pilot.json whose intentional deletion
-                    # shipped in PR #1348 (mika#1193 Phase C) — the founding incident for
-                    # mika#1419. The third + fourth catch the .claude/settings.local.json class
-                    # — cm#5 dispatch (2026-06-16) produced PR #16 whose only "rescued" content
-                    # was a 143-line operator allowlist leak (mika#1552 founding incident).
-                    git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-
-                    # Guard: if pathspec exclusion left nothing staged, skip the rescue
-                    # commit. Handles the edge case where the pilot wrote ONLY to scaffold
-                    # paths (mika#1288, mika#1419).
-                    if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
-                        echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
-                        RESCUED_DIRTY_WORKTREE=0
-                    else
-                        # Compute accurate rescued-files list for the PIPELINE FAILURE
-                        # message. DIRTY_FILES (from git status --porcelain) includes
-                        # excluded scaffold paths; RESCUED_FILES reflects what was actually
-                        # staged and will be committed.
-                        RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
-
-                        # Proactive formatting (mika#1336): the dominant rescue-failure class is
-                        # pilot-authored Rust that was never `cargo fmt`-ed, so the first commit
-                        # trips the lefthook rust-fmt gate. Formatting up front makes the first
-                        # commit succeed, halves wall-clock (one clippy compile, not two), and
-                        # removes reliance on parsing lefthook stdout to detect a fmt rejection.
-                        # The reactive rust-fmt retry below remains as belt-and-suspenders.
-                        # Gated on staged *.rs so docs-only / non-Rust pilots don't pay cargo startup.
-                        if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
-                            PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-                            [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
-                            # Same exclusion pathspec as the initial `git add -A` above
-                            # (mika#1288, mika#1419) — keeps scaffold paths out of the
-                            # post-fmt re-add.
-                            git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-                        fi
-
-                        # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
-                        # mika#1341: scratch file MUST live outside the worktree tree, NOT under
-                        # "$WORKTREE_DIR/.git/". In a linked worktree (every autonomous dev-pilot run)
-                        # ".git" is a FILE (a `gitdir:` pointer), not a directory — so a redirect into
-                        # "$WORKTREE_DIR/.git/<name>" fails to OPEN (ENOTDIR). A failed output redirect
-                        # means `git commit` never runs and exits non-zero with no captured output,
-                        # producing the "non-rustfmt empty-capture" PIPELINE FAILURE with HEAD unchanged.
-                        # `mktemp` keeps the original intent (off the working tree, away from .iterate/)
-                        # while guaranteeing a real, writable path in both linked and non-linked checkouts.
-                        # Named template preserves the descriptive "mika-rescue-commit-err" scratch name.
-                        # NOTE: the literal token "mika-rescue-commit-err" is also a sed anchor in
-                        # test-dispatch-lib.sh (rescue-block extraction); renaming it breaks those tests.
-                        RESCUE_COMMIT_ERR="$(mktemp "${TMPDIR:-/tmp}/mika-rescue-commit-err.XXXXXX")"
-
-                        # mika#1310: capture BOTH stdout and stderr. Lefthook
-                        # pre-commit hooks print their summary + failure marks
-                        # to stdout (not stderr); a `2>` redirect alone captured
-                        # an empty file and the operator saw "Hook output:"
-                        # blank on every false-positive rejection. Combined
-                        # `>file 2>&1` captures the full lefthook decoration
-                        # block including ⛔ failure lines.
-                        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
-
-Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
-Auto-rescued by dispatch-lib dirty-worktree detection.
-Scaffold paths excluded (mika#1288, mika#1419)." > "$RESCUE_COMMIT_ERR" 2>&1; then
-                            # Commit succeeded on first try — proceed normally
-                            rm -f "$RESCUE_COMMIT_ERR"
-
-                            # Update POST_RUN_HEAD so _push_branch sees new commits
-                            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-
-                            # Amend the PIPELINE FAILURE message (already set above) with rescue note
-                            RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
-Files rescued:
-${RESCUED_FILES}
-
-${RESULT}"
-
-                            # Mark for draft PR creation in Unit 2
-                            RESCUED_DIRTY_WORKTREE=1
-                        elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
-                            # Pre-commit rust-fmt hook rejected — auto-fix and retry (mika#1296).
-                            # Capture cargo fmt stderr so it surfaces in the PIPELINE FAILURE message
-                            # if the retry also fails (review-guide.md § Single Responsibility — failure
-                            # paths must surface all available diagnostic information).
-                            CARGO_FMT_ERR=""
-                            echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
-                            CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
-                            # Same exclusion pathspec as the initial `git add -A` above
-                            # (mika#1288, mika#1419) — scaffold paths stay excluded on the
-                            # post-fmt retry path too.
-                            git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
-
-                            # mika#1310: capture both stdout+stderr (see above).
-                            if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
-
-Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
-Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
-Scaffold paths excluded (mika#1288, mika#1419)." > "$RESCUE_COMMIT_ERR" 2>&1; then
-                                # Retry succeeded after cargo fmt
-                                rm -f "$RESCUE_COMMIT_ERR"
-
-                                POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-
-                                RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed after cargo fmt (mika#1282 + mika#1296 recovery).
-Files rescued:
-${RESCUED_FILES}
-
-${RESULT}"
-
-                                RESCUED_DIRTY_WORKTREE=1
-                            else
-                                # Retry also failed — abort rescue, leave dirty.
-                                # Surface the full diagnostic chain: cargo fmt output + retry commit
-                                # hook output, so the operator can diagnose from the message alone
-                                # (mika#1296 acceptance criteria).
-                                RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
-                            # mika#1310: if captured output is empty, dump git
-                            # diagnostic state as fallback so PIPELINE FAILURE
-                            # carries SOMETHING the operator can act on.
-                            if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
-                                RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
-git status:
-$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
-git diff --cached --name-only:
-$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
-                            fi
-                                RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
-cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
-Hook output: ${RESCUE_ERR_CONTENT}
-Worktree left dirty for operator inspection: ${WORKTREE_DIR}
-
-${RESULT}"
-                                # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
-                                rm -f "$RESCUE_COMMIT_ERR"
-                            fi
-                        else
-                            # Unknown hook failure — abort rescue, leave dirty
-                            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
-                            # mika#1310: if captured output is empty, dump git
-                            # diagnostic state as fallback so PIPELINE FAILURE
-                            # carries SOMETHING the operator can act on.
-                            if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
-                                RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
-git status:
-$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
-git diff --cached --name-only:
-$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
-                            fi
-                            RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
-Hook output: ${RESCUE_ERR_CONTENT}
-Worktree left dirty for operator inspection: ${WORKTREE_DIR}
-
-${RESULT}"
-                            # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
-                            rm -f "$RESCUE_COMMIT_ERR"
-                        fi
-                    fi
-                fi
-            fi
-
-            # mika#1383: structural completion gate for HEAD-advanced-no-PR.
-            # The pilot session ran content and committed, but ended its turn
-            # before invoking `gh pr create` (Mode 1 = bare `/ce-work` launch
-            # never had commit→PR in scope; Mode 2 = full `/mika` launch hit
-            # prompt-enforcement fragility on the tail). dispatch-lib owns the
-            # git/PR tail per mika#1271 (content/workflow split). Honors
-            # Vincent's pre-reboot framing: "gate the loop until the tail's
-            # fixed". Companion to mika#1282 (handles HEAD-unchanged + dirty);
-            # this block handles HEAD-changed + missing PR.
-            #
-            # Decision matrix when this block fires (HEAD changed):
-            #   dirty worktree           → Phase A: rescue dirty into wip() commit
-            #   PR exists for branch     → Phase B no-op (existing path is success)
-            #   no PR exists for branch  → Phase B: gh pr create from existing commits
-            #
-            # Scoped to dev-pilot only — dev-groom produces plan-only commits
-            # and intentionally has no PR (plan goes on the branch, not in a PR).
-            if [ "$SKILL" = "dev-pilot" ] && \
-               [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && \
-               [ -n "$WORKTREE_DIR" ] && [ -n "$BRANCH" ]; then
-
-                # Phase A: rescue any trailing dirty content (pilot committed but
-                # left additional uncommitted changes). Same exclusion pattern as
-                # mika#1282 (scaffold paths must not be re-committed).
-                DIRTY_AFTER_COMMITS=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -5)
-                if [ -n "$DIRTY_AFTER_COMMITS" ]; then
-                    git -C "$WORKTREE_DIR" add -A -- \
-                        ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9 || true
-                    if ! git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
-                        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" 2>&9; then
-                            git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9 || true
-                            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-                            RESULT="${RESULT}
-
-dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit before PR check."
-                        fi
-                    fi
-                fi
-
-                # Phase B: PR existence check. Use `gh pr list` filtered by
-                # head branch — `gh pr view <branch>` requires the PR exist;
-                # listing is the discoverable read.
-                EXISTING_PR=""
-                if command -v gh &>/dev/null; then
-                    EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
-                fi
-
-                if [ -z "$EXISTING_PR" ]; then
-                    # No PR exists for this branch. Auto-create from existing commits.
-                    # Title: derive from latest commit subject (preserves pilot intent).
-                    # Body: link to dispatch-lib's structural completion gate doc.
-                    PR_TITLE=$(git -C "$WORKTREE_DIR" log -1 --format='%s' 2>/dev/null || echo "Auto-PR for ${REPO}#${ISSUE_NUM}")
-                    PR_BODY="$(cat <<PR_BODY_EOF
-Auto-created by dispatch-lib (mika#1383 structural completion gate).
-
-The pilot session completed work and committed but did not reach \`gh pr create\` before its turn ended. dispatch-lib takes ownership of the commit→PR tail per mika#1271 (content/workflow split). The pilot owned content; dispatch-lib owns git/PR.
-
-Pilot session: \`${LOG_ID}\`
-Branch: \`${BRANCH}\`
-
-Closes #${ISSUE_NUM}
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
-PR_BODY_EOF
-)"
-
-                    if PR_CREATE_OUT=$(gh pr create \
-                            --repo "$REPO" \
-                            --base main \
-                            --head "$BRANCH" \
-                            --title "$PR_TITLE" \
-                            --body "$PR_BODY" 2>&1); then
-                        # Re-query the PR URL (gh pr create prints it but parsing is fragile).
-                        EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
-                        RESULT="${RESULT}
-
-dispatch-lib (mika#1383): auto-created PR ${EXISTING_PR} from pilot's commits — pilot reached end_turn without invoking gh pr create."
-                    else
-                        # PR creation failed — surface manual recovery.
-                        # Common causes: gh auth scope, branch already has closed PR, base branch mismatch.
-                        RESULT="PIPELINE FAILURE: pilot produced commits on ${BRANCH} but no PR exists, and dispatch-lib's auto-create attempt failed.
-gh pr create error: $(printf '%s' "$PR_CREATE_OUT" | head -5)
-
-Manual recovery:
-  gh pr create --repo ${REPO} --base main --head ${BRANCH} --title \"<title>\" --body \"<body>\"
-
-${RESULT}"
-                    fi
-                fi
-            fi
-        fi
-
-        # Post-flight plan validation (mika#1033, mika#1032, mika#1394): detect
-        # dev-groom drift where the session exits "success" but produced no valid
-        # plan file (or only a stub/empty one) and/or never invoked /ce:plan.
-        #
-        # mika#1394: replaced date-specific `${TODAY_PREFIX}-*-plan.md` with
-        # `_find_issue_plan` (issue-number match + content fallback). The old
-        # date-prefix pattern false-negatived on re-dispatch when the plan was
-        # committed on a prior day, poisoning RESULT with PIPELINE_INCOMPLETE
-        # and preventing the GROOMED outcome from reaching mika-dev.
-        if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
-            VALID_PLAN=$(_find_issue_plan 2>/dev/null) || VALID_PLAN=""
-
-            # Check session log for /ce:plan invocation (mika#1032).
-            # Broad pattern covers Skill tool call JSON, command strings, etc.
-            # Fail-open: if log is unavailable, skip the check with a warning.
-            SESSION_LOG="/var/log/claude-pilot/${LOG_ID}.log"
-            CE_PLAN_INVOKED=""
-            if [ -f "$SESSION_LOG" ] && [ -r "$SESSION_LOG" ]; then
-                if grep -qiE 'ce[.:\-_]plan' "$SESSION_LOG" 2>/dev/null; then
-                    CE_PLAN_INVOKED="1"
-                fi
-            else
-                echo "Warning: session log not available at $SESSION_LOG — skipping /ce:plan invocation check" >&2
-                # Treat as unknown — don't fail on missing log
-                CE_PLAN_INVOKED="unknown"
-            fi
-
-            # Policy-deny pre-check (drift-misdiagnosis fix, docs/solutions/
-            # workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md).
-            # If the pilot was halted by claude-pilot's tier1/policy classifier
-            # on a research bash command, it is NOT LLM drift — the pilot
-            # tried to do its work and was prevented. Disambiguate by reading
-            # the persistent stderr for [policy:deny] before declaring drift.
-            # Fail-open: if stderr is unavailable, fall through to the
-            # existing drift messages.
-            POLICY_DENY=""
-            PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
-            if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
-                # Strip ANSI color codes, then extract the first [policy:deny] line.
-                # The line shape is `[policy:deny] <Tool>: <command>[ \[rule-id\]]`.
-                POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                    | grep -m1 '\[policy:deny\]' || true)
-            fi
-
-            if [ -n "$POLICY_DENY" ]; then
-                # Class C — policy-deny-induced early halt. The pilot made a
-                # legitimate research request that hit a tier1/policy allow-list
-                # gap. This is NOT LLM drift; the operator should investigate
-                # the deny rule, not the pilot's reasoning.
-                RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift.
-
-Halt event: ${POLICY_DENY}
-
-Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate research command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-grooming this ticket without addressing the substrate gap will hit the same wall.
-
-See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
-
-${RESULT}"
-            elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
-                # Both checks failed: no plan file AND /ce:plan never called
-                RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md and no header-line match in first 20 lines for known prefixes) and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's regex didn't match the header shape — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1602 class).
-
-${RESULT}"
-            elif [ -z "$VALID_PLAN" ]; then
-                # Plan file missing but /ce:plan was called (or log unavailable)
-                RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md and no header-line match in first 20 lines for known prefixes). Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1602 class); if no plan exists, the pilot drifted into executor mode.
-
-${RESULT}"
-            elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
-                # Valid plan file exists but /ce:plan was never invoked.
-                # Demoted from PIPELINE FAILURE to advisory note (mika#1303):
-                # pilot Write-tool plan creation is a valid path. The plan
-                # file's existence + size threshold + downstream architect
-                # verdict are the structural contract — the slash-command
-                # invocation is one of multiple valid paths to producing a
-                # plan, not the gate itself.
-                echo "Note: dev-groom produced a plan file ($VALID_PLAN) without explicit /ce:plan invocation. Plan-file existence is the operative gate." >&2
-            fi
-        fi
-
-        # Issue #138: Discover actual PR URL from the branch
-        PR_URL=""
-        if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
-            PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
-            if [ -n "$PR_URL" ]; then
-                RESULT="${RESULT}
-PR: ${PR_URL}"
-            fi
-        fi
-
-        # mika#940 Unit 1: post-flight PR-existence check.
-        # Detect dev-pilot success-with-commits-but-no-PR — the premature-EndTurn
-        # family where the model emits `[done] Success` after Edit/Compound
-        # phases but before reaching git push + gh pr create. Classify as
-        # PIPELINE FAILURE so mika-dev surfaces the gap instead of marking the
-        # parent task `completed` on a stranded worktree.
-        #
-        # Guards:
-        #   - $STATUS = success: don't double-classify already-failed sessions
-        #     (per architect-validated plan; QA-review-#1140 finding 1).
-        #   - $SKILL = dev-pilot: dev-groom commits a plan but no PR; the
-        #     existing plan-validation check (mika#1134) covers that path.
-        #   - $PR_URL empty: PR-discovery above found nothing.
-        #   - $PRE_RUN_HEAD != $POST_RUN_HEAD: commits exist. If HEAD unchanged,
-        #     the zero-commit check earlier in this block already fires.
-        if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ]; then
-            RESULT="PIPELINE FAILURE: claude-pilot produced commits (${PRE_RUN_HEAD}..${POST_RUN_HEAD}) but no PR was opened on branch '${BRANCH}'. Pipeline truncated before git push + gh pr create.
-
-${RESULT}"
-        fi
-
-        # mika#940 Unit 3: outcome classification line for operator/mika-dev
-        # consumption. Replaces heuristic log inspection with a single
-        # structured marker. Order matters: pipeline failure wins over any
-        # success-shape outcome.
-        if echo "$RESULT" | grep -qF "PIPELINE FAILURE:"; then
-            RESULT="${RESULT}
-
-Outcome: PIPELINE_INCOMPLETE — manual recovery needed."
-        elif [ -n "$PR_URL" ]; then
-            RESULT="${RESULT}
-
-Outcome: PR_OPENED — ${PR_URL}"
-        elif [ "$SKILL" = "dev-groom" ] && [ -n "${VALID_PLAN:-}" ]; then
-            # $VALID_PLAN is set by the dev-groom plan-validation block earlier
-            # in this success branch (~line 476) when a docs/plans/*-plan.md
-            # file >500 bytes is found. Non-local — in scope here.
-            # mika#1333: emit PLAN_COMMITTED (not PLAN_GROOMED) at this stage.
-            # The architect pass hasn't run yet — PLAN_GROOMED is only emitted
-            # after _iterate_groom_loop succeeds (see dispatch_claude_pilot).
-            RESULT="${RESULT}
-
-Outcome: PLAN_COMMITTED — ${VALID_PLAN}"
-        else
-            RESULT="${RESULT}
-
-Outcome: UNKNOWN — inspect worktree manually."
         fi
     elif [ "$PILOT_EXIT" -eq 0 ]; then
         RESULT="claude-pilot completed (exit 0) but output was not structured JSON.
@@ -1178,6 +734,12 @@ Stdout:
 ${PILOT_OUTPUT_RAW}"
     fi
 
+    # Post-flight recovery (mika#1615): runs unconditionally after exit
+    # classification. Previously this logic lived inside the if [ -n "$STATUS" ]
+    # branch only — Branch B (exit 0, non-JSON) and Branch C (non-zero exit)
+    # silently skipped all recovery, losing uncommitted work.
+    _post_flight_recovery
+
     # Append stderr tail for debugging context (last 10KB)
     if [ -s "$STDERR_FILE" ]; then
         STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" | _scrub_secrets_from_output)
@@ -1190,6 +752,471 @@ ${STDERR_TAIL}"
 
     # Truncate to ~90KB to stay within the 100KB callback limit
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
+}
+
+_post_flight_recovery() {
+    # Post-flight recovery (mika#1615): extracted from the if [ -n "$STATUS" ]
+    # branch so recovery fires on ALL exit paths — structured JSON output,
+    # non-structured exit 0, and non-zero exit. Guards within each block use
+    # PRE_RUN_HEAD, POST_RUN_HEAD, SKILL, REPO, BRANCH, WORKTREE_DIR — none
+    # depend on STATUS. The mika#940 check explicitly checks STATUS=success
+    # and naturally short-circuits when STATUS is empty.
+    #
+    # Variables read/written: PRE_RUN_HEAD, POST_RUN_HEAD, WORKTREE_DIR, SKILL,
+    # REPO, BRANCH, ISSUE_NUM, SESSION_ID, LOG_ID, RESULT, STATUS,
+    # RESCUED_DIRTY_WORKTREE, PR_URL, VALID_PLAN (all global/caller-scoped).
+
+    # Post-flight diff check: detect zero-commit "success" in repo#number mode.
+    if [ -n "$PRE_RUN_HEAD" ] && [ -n "$REPO" ]; then
+        if [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ]; then
+            # Policy-deny pre-check (Class C disambiguation, extended to dev-pilot
+            # from dev-groom — companion to mika#1534). If the pilot halted on a
+            # tier1/policy deny mid-flight, "Zero new commits" is the SYMPTOM, not
+            # the cause. Read persistent stderr for [policy:deny] before declaring
+            # the generic HEAD-unchanged failure. Fail-open: missing stderr → empty
+            # POLICY_DENY → fall through to existing messages.
+            #
+            # See: docs/solutions/workflow-issues/
+            #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+            POLICY_DENY=""
+            PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
+            if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
+                POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
+                    | grep -m1 '\[policy:deny\]' || true)
+            fi
+
+            # mika#1333 Unit 2: For dev-groom re-dispatch, HEAD-unchanged is
+            # expected when the plan was already committed in a prior run.
+            # The architect pass (_iterate_groom_loop) is what matters — don't
+            # poison RESULT with PIPELINE FAILURE for the expected re-dispatch state.
+            if [ -n "$POLICY_DENY" ]; then
+                # Class C — policy-deny halt. The pilot tried to do legitimate
+                # work and was prevented by a tier1/policy allow-list gap. NOT
+                # to be confused with LLM drift or genuine dirty-worktree-rescue.
+                RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit.
+
+Halt event: ${POLICY_DENY}
+
+Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-dispatching without addressing the substrate gap will hit the same wall.
+
+See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+
+${RESULT}"
+            elif [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && \
+               find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | grep -q .; then
+                RESULT="Note: HEAD unchanged on dev-groom re-dispatch — plan already committed from prior run. Architect pass will determine outcome.
+
+${RESULT}"
+            else
+                RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
+
+${RESULT}"
+            fi
+        fi
+
+        # Unit 1 (mika#1282): detect dirty worktree on zero-commit dev-pilot.
+        # If the pilot wrote files but never committed, auto-rescue the content
+        # so it isn't lost with the worktree. This is dispatch-lib exercising its
+        # structural git-workflow ownership per the content/workflow split
+        # (mika#1271 architect verdict; pilot-vs-substrate-contract-split-2026-05-25.md).
+        if [ "$PRE_RUN_HEAD" = "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ] && [ -n "$WORKTREE_DIR" ]; then
+            DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
+            if [ -n "$DIRTY_FILES" ]; then
+                # Stage all dirty files EXCEPT worktree-scaffold paths copied by
+                # _set_up_worktree (mika#1288, mika#1419, mika#1552):
+                #   - .claude/commands/         slash-command snapshots from mika-platform
+                #   - .claude/claude-pilot.json relay config cp'd from $PLATFORM_DIR at :489
+                #   - .claude/settings.local.json  permission allowlist cp'd at :490 (mika#1552)
+                #   - .claude/*.local.*          general guard for any future Claude-local
+                #                                files (.env-class — operator-machine-specific)
+                # None is pilot-authored content. Without the second exclusion, the rescue
+                # commit re-introduces .claude/claude-pilot.json whose intentional deletion
+                # shipped in PR #1348 (mika#1193 Phase C) — the founding incident for
+                # mika#1419. The third + fourth catch the .claude/settings.local.json class
+                # — cm#5 dispatch (2026-06-16) produced PR #16 whose only "rescued" content
+                # was a 143-line operator allowlist leak (mika#1552 founding incident).
+                git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+
+                # Guard: if pathspec exclusion left nothing staged, skip the rescue
+                # commit. Handles the edge case where the pilot wrote ONLY to scaffold
+                # paths (mika#1288, mika#1419).
+                if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
+                    echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
+                    RESCUED_DIRTY_WORKTREE=0
+                else
+                    # Compute accurate rescued-files list for the PIPELINE FAILURE
+                    # message. DIRTY_FILES (from git status --porcelain) includes
+                    # excluded scaffold paths; RESCUED_FILES reflects what was actually
+                    # staged and will be committed.
+                    RESCUED_FILES=$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9)
+
+                    # Proactive formatting (mika#1336): the dominant rescue-failure class is
+                    # pilot-authored Rust that was never `cargo fmt`-ed, so the first commit
+                    # trips the lefthook rust-fmt gate. Formatting up front makes the first
+                    # commit succeed, halves wall-clock (one clippy compile, not two), and
+                    # removes reliance on parsing lefthook stdout to detect a fmt rejection.
+                    # The reactive rust-fmt retry below remains as belt-and-suspenders.
+                    # Gated on staged *.rs so docs-only / non-Rust pilots don't pay cargo startup.
+                    if git -C "$WORKTREE_DIR" diff --cached --name-only 2>&9 | grep -q '\.rs$'; then
+                        PROACTIVE_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
+                        [ -n "$PROACTIVE_FMT_ERR" ] && echo "NOTE: proactive cargo fmt: ${PROACTIVE_FMT_ERR}" >&2
+                        # Same exclusion pathspec as the initial `git add -A` above
+                        # (mika#1288, mika#1419) — keeps scaffold paths out of the
+                        # post-fmt re-add.
+                        git -C "$WORKTREE_DIR" add -u -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+                    fi
+
+                    # Attempt rescue commit — capture stderr for hook-failure diagnosis (mika#1296).
+                    # mika#1341: scratch file MUST live outside the worktree tree, NOT under
+                    # "$WORKTREE_DIR/.git/". In a linked worktree (every autonomous dev-pilot run)
+                    # ".git" is a FILE (a `gitdir:` pointer), not a directory — so a redirect into
+                    # "$WORKTREE_DIR/.git/<name>" fails to OPEN (ENOTDIR). A failed output redirect
+                    # means `git commit` never runs and exits non-zero with no captured output,
+                    # producing the "non-rustfmt empty-capture" PIPELINE FAILURE with HEAD unchanged.
+                    # `mktemp` keeps the original intent (off the working tree, away from .iterate/)
+                    # while guaranteeing a real, writable path in both linked and non-linked checkouts.
+                    # Named template preserves the descriptive "mika-rescue-commit-err" scratch name.
+                    # NOTE: the literal token "mika-rescue-commit-err" is also a sed anchor in
+                    # test-dispatch-lib.sh (rescue-block extraction); renaming it breaks those tests.
+                    RESCUE_COMMIT_ERR="$(mktemp "${TMPDIR:-/tmp}/mika-rescue-commit-err.XXXXXX")"
+
+                    # mika#1310: capture BOTH stdout and stderr. Lefthook
+                    # pre-commit hooks print their summary + failure marks
+                    # to stdout (not stderr); a `2>` redirect alone captured
+                    # an empty file and the operator saw "Hook output:"
+                    # blank on every false-positive rejection. Combined
+                    # `>file 2>&1` captures the full lefthook decoration
+                    # block including ⛔ failure lines.
+                    if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
+
+Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
+Auto-rescued by dispatch-lib dirty-worktree detection.
+Scaffold paths excluded (mika#1288, mika#1419)." > "$RESCUE_COMMIT_ERR" 2>&1; then
+                        # Commit succeeded on first try — proceed normally
+                        rm -f "$RESCUE_COMMIT_ERR"
+
+                        # Update POST_RUN_HEAD so _push_branch sees new commits
+                        POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+
+                        # Amend the PIPELINE FAILURE message (already set above) with rescue note
+                        RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed (mika#1282 recovery).
+Files rescued:
+${RESCUED_FILES}
+
+${RESULT}"
+
+                        # Mark for draft PR creation in Unit 2
+                        RESCUED_DIRTY_WORKTREE=1
+                    elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
+                        # Pre-commit rust-fmt hook rejected — auto-fix and retry (mika#1296).
+                        # Capture cargo fmt stderr so it surfaces in the PIPELINE FAILURE message
+                        # if the retry also fails (review-guide.md § Single Responsibility — failure
+                        # paths must surface all available diagnostic information).
+                        CARGO_FMT_ERR=""
+                        echo "NOTE: rescue commit rejected by rust-fmt hook — running cargo fmt and retrying" >&2
+                        CARGO_FMT_ERR=$( (cd "$WORKTREE_DIR" && cargo fmt --all) 2>&1 ) || true
+                        # Same exclusion pathspec as the initial `git add -A` above
+                        # (mika#1288, mika#1419) — scaffold paths stay excluded on the
+                        # post-fmt retry path too.
+                        git -C "$WORKTREE_DIR" add -A -- ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9
+
+                        # mika#1310: capture both stdout+stderr (see above).
+                        if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
+
+Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
+Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
+Scaffold paths excluded (mika#1288, mika#1419)." > "$RESCUE_COMMIT_ERR" 2>&1; then
+                            # Retry succeeded after cargo fmt
+                            rm -f "$RESCUE_COMMIT_ERR"
+
+                            POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+
+                            RESULT="PIPELINE FAILURE: claude-pilot exited 0 but HEAD unchanged — dirty worktree detected and auto-committed after cargo fmt (mika#1282 + mika#1296 recovery).
+Files rescued:
+${RESCUED_FILES}
+
+${RESULT}"
+
+                            RESCUED_DIRTY_WORKTREE=1
+                        else
+                            # Retry also failed — abort rescue, leave dirty.
+                            # Surface the full diagnostic chain: cargo fmt output + retry commit
+                            # hook output, so the operator can diagnose from the message alone
+                            # (mika#1296 acceptance criteria).
+                            RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
+                        # mika#1310: if captured output is empty, dump git
+                        # diagnostic state as fallback so PIPELINE FAILURE
+                        # carries SOMETHING the operator can act on.
+                        if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
+                            RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
+git status:
+$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
+git diff --cached --name-only:
+$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
+                        fi
+                            RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook after cargo-fmt retry.
+cargo fmt stderr: ${CARGO_FMT_ERR:-<empty>}
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+
+${RESULT}"
+                            # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
+                            rm -f "$RESCUE_COMMIT_ERR"
+                        fi
+                    else
+                        # Unknown hook failure — abort rescue, leave dirty
+                        RESCUE_ERR_CONTENT=$(cat "$RESCUE_COMMIT_ERR" 2>/dev/null | head -50)
+                        # mika#1310: if captured output is empty, dump git
+                        # diagnostic state as fallback so PIPELINE FAILURE
+                        # carries SOMETHING the operator can act on.
+                        if [ -z "$(printf '%s' "$RESCUE_ERR_CONTENT" | tr -d '[:space:]')" ]; then
+                            RESCUE_ERR_CONTENT="<rescue capture was empty — likely no hook output, falling back to git diagnostic>
+git status:
+$(git -C "$WORKTREE_DIR" status --short 2>&1 | head -10)
+git diff --cached --name-only:
+$(git -C "$WORKTREE_DIR" diff --cached --name-only 2>&1 | head -10)"
+                        fi
+                        RESULT="PIPELINE FAILURE: auto-rescue commit rejected by pre-commit hook (non-rustfmt).
+Hook output: ${RESCUE_ERR_CONTENT}
+Worktree left dirty for operator inspection: ${WORKTREE_DIR}
+
+${RESULT}"
+                        # Do NOT set RESCUED_DIRTY_WORKTREE — prevents empty draft PR
+                        rm -f "$RESCUE_COMMIT_ERR"
+                    fi
+                fi
+            fi
+        fi
+
+        # mika#1383: structural completion gate for HEAD-advanced-no-PR.
+        # The pilot session ran content and committed, but ended its turn
+        # before invoking `gh pr create` (Mode 1 = bare `/ce-work` launch
+        # never had commit→PR in scope; Mode 2 = full `/mika` launch hit
+        # prompt-enforcement fragility on the tail). dispatch-lib owns the
+        # git/PR tail per mika#1271 (content/workflow split). Honors
+        # Vincent's pre-reboot framing: "gate the loop until the tail's
+        # fixed". Companion to mika#1282 (handles HEAD-unchanged + dirty);
+        # this block handles HEAD-changed + missing PR.
+        #
+        # Decision matrix when this block fires (HEAD changed):
+        #   dirty worktree           → Phase A: rescue dirty into wip() commit
+        #   PR exists for branch     → Phase B no-op (existing path is success)
+        #   no PR exists for branch  → Phase B: gh pr create from existing commits
+        #
+        # Scoped to dev-pilot only — dev-groom produces plan-only commits
+        # and intentionally has no PR (plan goes on the branch, not in a PR).
+        if [ "$SKILL" = "dev-pilot" ] && \
+           [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && \
+           [ -n "$WORKTREE_DIR" ] && [ -n "$BRANCH" ]; then
+
+            # Phase A: rescue any trailing dirty content (pilot committed but
+            # left additional uncommitted changes). Same exclusion pattern as
+            # mika#1282 (scaffold paths must not be re-committed).
+            DIRTY_AFTER_COMMITS=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -5)
+            if [ -n "$DIRTY_AFTER_COMMITS" ]; then
+                git -C "$WORKTREE_DIR" add -A -- \
+                    ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9 || true
+                if ! git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
+                    if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" 2>&9; then
+                        git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9 || true
+                        POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
+                        RESULT="${RESULT}
+
+dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit before PR check."
+                    fi
+                fi
+            fi
+
+            # Phase B: PR existence check. Use `gh pr list` filtered by
+            # head branch — `gh pr view <branch>` requires the PR exist;
+            # listing is the discoverable read.
+            EXISTING_PR=""
+            if command -v gh &>/dev/null; then
+                EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
+            fi
+
+            if [ -z "$EXISTING_PR" ]; then
+                # No PR exists for this branch. Auto-create from existing commits.
+                # Title: derive from latest commit subject (preserves pilot intent).
+                # Body: link to dispatch-lib's structural completion gate doc.
+                PR_TITLE=$(git -C "$WORKTREE_DIR" log -1 --format='%s' 2>/dev/null || echo "Auto-PR for ${REPO}#${ISSUE_NUM}")
+                PR_BODY="$(cat <<PR_BODY_EOF
+Auto-created by dispatch-lib (mika#1383 structural completion gate).
+
+The pilot session completed work and committed but did not reach \`gh pr create\` before its turn ended. dispatch-lib takes ownership of the commit→PR tail per mika#1271 (content/workflow split). The pilot owned content; dispatch-lib owns git/PR.
+
+Pilot session: \`${LOG_ID}\`
+Branch: \`${BRANCH}\`
+
+Closes #${ISSUE_NUM}
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+PR_BODY_EOF
+)"
+
+                if PR_CREATE_OUT=$(gh pr create \
+                        --repo "$REPO" \
+                        --base main \
+                        --head "$BRANCH" \
+                        --title "$PR_TITLE" \
+                        --body "$PR_BODY" 2>&1); then
+                    # Re-query the PR URL (gh pr create prints it but parsing is fragile).
+                    EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
+                    RESULT="${RESULT}
+
+dispatch-lib (mika#1383): auto-created PR ${EXISTING_PR} from pilot's commits — pilot reached end_turn without invoking gh pr create."
+                else
+                    # PR creation failed — surface manual recovery.
+                    # Common causes: gh auth scope, branch already has closed PR, base branch mismatch.
+                    RESULT="PIPELINE FAILURE: pilot produced commits on ${BRANCH} but no PR exists, and dispatch-lib's auto-create attempt failed.
+gh pr create error: $(printf '%s' "$PR_CREATE_OUT" | head -5)
+
+Manual recovery:
+  gh pr create --repo ${REPO} --base main --head ${BRANCH} --title \"<title>\" --body \"<body>\"
+
+${RESULT}"
+                fi
+            fi
+        fi
+    fi
+
+    # Post-flight plan validation (mika#1033, mika#1032, mika#1394): detect
+    # dev-groom drift where the session exits "success" but produced no valid
+    # plan file (or only a stub/empty one) and/or never invoked /ce:plan.
+    #
+    # mika#1394: replaced date-specific `${TODAY_PREFIX}-*-plan.md` with
+    # `_find_issue_plan` (issue-number match + content fallback). The old
+    # date-prefix pattern false-negatived on re-dispatch when the plan was
+    # committed on a prior day, poisoning RESULT with PIPELINE_INCOMPLETE
+    # and preventing the GROOMED outcome from reaching mika-dev.
+    if [ "$SKILL" = "dev-groom" ] && [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ]; then
+        VALID_PLAN=$(_find_issue_plan 2>/dev/null) || VALID_PLAN=""
+
+        # Check session log for /ce:plan invocation (mika#1032).
+        # Broad pattern covers Skill tool call JSON, command strings, etc.
+        # Fail-open: if log is unavailable, skip the check with a warning.
+        SESSION_LOG="/var/log/claude-pilot/${LOG_ID}.log"
+        CE_PLAN_INVOKED=""
+        if [ -f "$SESSION_LOG" ] && [ -r "$SESSION_LOG" ]; then
+            if grep -qiE 'ce[.:\-_]plan' "$SESSION_LOG" 2>/dev/null; then
+                CE_PLAN_INVOKED="1"
+            fi
+        else
+            echo "Warning: session log not available at $SESSION_LOG — skipping /ce:plan invocation check" >&2
+            # Treat as unknown — don't fail on missing log
+            CE_PLAN_INVOKED="unknown"
+        fi
+
+        # Policy-deny pre-check (drift-misdiagnosis fix, docs/solutions/
+        # workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md).
+        # If the pilot was halted by claude-pilot's tier1/policy classifier
+        # on a research bash command, it is NOT LLM drift — the pilot
+        # tried to do its work and was prevented. Disambiguate by reading
+        # the persistent stderr for [policy:deny] before declaring drift.
+        # Fail-open: if stderr is unavailable, fall through to the
+        # existing drift messages.
+        POLICY_DENY=""
+        PERSISTENT_STDERR_PATH="/var/log/claude-pilot/${LOG_ID}.stderr"
+        if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
+            # Strip ANSI color codes, then extract the first [policy:deny] line.
+            # The line shape is `[policy:deny] <Tool>: <command>[ \[rule-id\]]`.
+            POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
+                | grep -m1 '\[policy:deny\]' || true)
+        fi
+
+        if [ -n "$POLICY_DENY" ]; then
+            # Class C — policy-deny-induced early halt. The pilot made a
+            # legitimate research request that hit a tier1/policy allow-list
+            # gap. This is NOT LLM drift; the operator should investigate
+            # the deny rule, not the pilot's reasoning.
+            RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift.
+
+Halt event: ${POLICY_DENY}
+
+Likely a tier1 or tier2 allow-list gap in claude-pilot-py. Investigate the deny rule and either (a) widen the policy to include the legitimate research command shape, or (b) rewrite the dispatch context so the pilot avoids the denied command. The pilot was prevented from completing its work — re-grooming this ticket without addressing the substrate gap will hit the same wall.
+
+See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
+
+${RESULT}"
+        elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
+            # Both checks failed: no plan file AND /ce:plan never called
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md and no header-line match in first 20 lines for known prefixes) and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's regex didn't match the header shape — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1602 class).
+
+${RESULT}"
+        elif [ -z "$VALID_PLAN" ]; then
+            # Plan file missing but /ce:plan was called (or log unavailable)
+            RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md and no header-line match in first 20 lines for known prefixes). Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1602 class); if no plan exists, the pilot drifted into executor mode.
+
+${RESULT}"
+        elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
+            # Valid plan file exists but /ce:plan was never invoked.
+            # Demoted from PIPELINE FAILURE to advisory note (mika#1303):
+            # pilot Write-tool plan creation is a valid path. The plan
+            # file's existence + size threshold + downstream architect
+            # verdict are the structural contract — the slash-command
+            # invocation is one of multiple valid paths to producing a
+            # plan, not the gate itself.
+            echo "Note: dev-groom produced a plan file ($VALID_PLAN) without explicit /ce:plan invocation. Plan-file existence is the operative gate." >&2
+        fi
+    fi
+
+    # Issue #138: Discover actual PR URL from the branch
+    PR_URL=""
+    if [ -n "$REPO" ] && [ -n "$BRANCH" ]; then
+        PR_URL=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+        if [ -n "$PR_URL" ]; then
+            RESULT="${RESULT}
+PR: ${PR_URL}"
+        fi
+    fi
+
+    # mika#940 Unit 1: post-flight PR-existence check.
+    # Detect dev-pilot success-with-commits-but-no-PR — the premature-EndTurn
+    # family where the model emits `[done] Success` after Edit/Compound
+    # phases but before reaching git push + gh pr create. Classify as
+    # PIPELINE FAILURE so mika-dev surfaces the gap instead of marking the
+    # parent task `completed` on a stranded worktree.
+    #
+    # Guards:
+    #   - $STATUS = success: don't double-classify already-failed sessions
+    #     (per architect-validated plan; QA-review-#1140 finding 1).
+    #   - $SKILL = dev-pilot: dev-groom commits a plan but no PR; the
+    #     existing plan-validation check (mika#1134) covers that path.
+    #   - $PR_URL empty: PR-discovery above found nothing.
+    #   - $PRE_RUN_HEAD != $POST_RUN_HEAD: commits exist. If HEAD unchanged,
+    #     the zero-commit check earlier in this block already fires.
+    if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ]; then
+        RESULT="PIPELINE FAILURE: claude-pilot produced commits (${PRE_RUN_HEAD}..${POST_RUN_HEAD}) but no PR was opened on branch '${BRANCH}'. Pipeline truncated before git push + gh pr create.
+
+${RESULT}"
+    fi
+
+    # mika#940 Unit 3: outcome classification line for operator/mika-dev
+    # consumption. Replaces heuristic log inspection with a single
+    # structured marker. Order matters: pipeline failure wins over any
+    # success-shape outcome.
+    if echo "$RESULT" | grep -qF "PIPELINE FAILURE:"; then
+        RESULT="${RESULT}
+
+Outcome: PIPELINE_INCOMPLETE — manual recovery needed."
+    elif [ -n "$PR_URL" ]; then
+        RESULT="${RESULT}
+
+Outcome: PR_OPENED — ${PR_URL}"
+    elif [ "$SKILL" = "dev-groom" ] && [ -n "${VALID_PLAN:-}" ]; then
+        # $VALID_PLAN is set by the dev-groom plan-validation block earlier
+        # when a docs/plans/*-plan.md file >500 bytes is found.
+        # mika#1333: emit PLAN_COMMITTED (not PLAN_GROOMED) at this stage.
+        # The architect pass hasn't run yet — PLAN_GROOMED is only emitted
+        # after _iterate_groom_loop succeeds (see dispatch_claude_pilot).
+        RESULT="${RESULT}
+
+Outcome: PLAN_COMMITTED — ${VALID_PLAN}"
+    else
+        RESULT="${RESULT}
+
+Outcome: UNKNOWN — inspect worktree manually."
+    fi
 }
 
 _check_pilot_force_push() {
