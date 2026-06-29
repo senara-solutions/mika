@@ -27,6 +27,7 @@ use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use crate::skills::SkillRegistry;
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     CheckClassification, classify_checks, is_behind_main, run_gh_checks, run_gh_merge,
@@ -117,6 +118,7 @@ pub async fn try_handle_pr_review_verdict(
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
+    skills: &SkillRegistry,
 ) -> VerdictAction {
     // 1. Parse the PR review event from formatted text
     let event = match parse_pr_review_event(text) {
@@ -196,6 +198,7 @@ pub async fn try_handle_pr_review_verdict(
                     message_sender,
                     session_id,
                     trace_id,
+                    skills,
                 )
                 .await
             }
@@ -207,6 +210,7 @@ pub async fn try_handle_pr_review_verdict(
                     message_sender,
                     session_id,
                     trace_id,
+                    skills,
                 )
                 .await
             }
@@ -538,6 +542,217 @@ async fn handle_pass_verdict(
 }
 
 // ---------------------------------------------------------------------------
+// Engine-side dispatch helper (mika#1630)
+// ---------------------------------------------------------------------------
+
+/// Result of an engine-side dispatch attempt from the verdict handler.
+enum EngineDispatchResult {
+    /// Subprocess spawned; return Dispatched to the LLM.
+    Spawned { callback_task_id: String },
+    /// Slot busy; deferred callback registered engine-side.
+    Deferred { deferred_task_id: String },
+    /// Dispatch readiness failed for a non-slot reason; fall back to LLM-mediated.
+    Fallback { reason: String },
+}
+
+/// Attempt engine-side dispatch following the ready-label handler pattern (mika#1572).
+///
+/// Eliminates the LLM-dependency gap for block[ac]/block[ci] verdicts:
+/// 1. Resolves the dispatch tool from SkillRegistry
+/// 2. Validates dispatch readiness
+/// 3. On slot-busy (`global_dispatch_active`), registers a deferred callback
+/// 4. On other failures, falls back to LLM-mediated dispatch
+#[allow(clippy::too_many_arguments)]
+async fn try_engine_dispatch(
+    db: &AsyncDatabase,
+    skills: &SkillRegistry,
+    task_id: &str,
+    github_token: Option<&str>,
+    event: &PrReviewEvent,
+    target_skill: &str,
+    target_tool: &str,
+    iteration_context: &str,
+    session_id: &str,
+    trace_id: &str,
+) -> EngineDispatchResult {
+    use crate::skills::manifest::ToolHandler;
+
+    // 1. Resolve the dispatch tool from the agent's loaded SkillRegistry.
+    let skill_tool = match skills.resolve_tool_by_name(target_tool) {
+        Some(t) => t,
+        None => {
+            return EngineDispatchResult::Fallback {
+                reason: format!("dispatch tool '{target_tool}' not in SkillRegistry"),
+            };
+        }
+    };
+
+    // 2. Resolve long-running exec command + estimated duration.
+    let (command, estimated_duration_secs) = match &skill_tool.handler {
+        ToolHandler::Exec {
+            command,
+            long_running: true,
+            estimated_duration_secs,
+        } => (command.clone(), *estimated_duration_secs),
+        _ => {
+            return EngineDispatchResult::Fallback {
+                reason: format!("dispatch tool '{target_tool}' is not a long-running exec handler"),
+            };
+        }
+    };
+
+    // 3. Build dispatch input. `prompt` uses bare `<repo>#<pr_number>` form
+    //    (not owner-qualified — dispatch-lib only accepts bare form, per mika#1593).
+    let repo_name = event.repo.rsplit('/').next().unwrap_or(&event.repo);
+    let dispatch_input = serde_json::json!({
+        "skill": target_skill,
+        "prompt": format!("{repo_name}#{}", event.pr_number),
+        "task_id": task_id,
+        "iteration_context": iteration_context,
+    });
+
+    // 4. Validate dispatch readiness. `originating_message = None` because
+    //    the dispatch is engine-authorized by the verdict handler's own
+    //    event-type gate — the webhook already passed the PR review parse.
+    //    Passing `None` skips guard (0) (unauthorized_webhook_dispatch),
+    //    which is correct: the verdict handler already validated the event type.
+    if let Err(rejection) = crate::skills::executor::validate_dispatch_readiness(
+        db,
+        task_id,
+        github_token,
+        Some(&dispatch_input),
+        None,
+    )
+    .await
+    {
+        // 5. Check if the rejection is slot-busy (global_dispatch_active).
+        if let Ok(rejection_json) = serde_json::from_str::<serde_json::Value>(&rejection)
+            && rejection_json.get("error").and_then(|e| e.as_str())
+                == Some("global_dispatch_active")
+        {
+            // Register deferred callback engine-side (AC2).
+            if crate::skills::executor::register_deferred_callback(db, task_id, &dispatch_input)
+                .await
+            {
+                // Find the deferred task ID for observability.
+                let deferred_task_id = match db.get_child_tasks(task_id).await {
+                    Ok(children) => children
+                        .iter()
+                        .rev()
+                        .find(|c| {
+                            c.label == crate::agent::DEFERRED_DISPATCH_LABEL
+                                && c.status == "pending"
+                        })
+                        .map(|c| c.id.clone())
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                return EngineDispatchResult::Deferred { deferred_task_id };
+            }
+            // Registration failed (cap exceeded or DB error) — fall back.
+            return EngineDispatchResult::Fallback {
+                reason: "deferred callback registration failed (cap exceeded or DB error)"
+                    .to_string(),
+            };
+        }
+        // Non-slot rejection — fall back to LLM-mediated.
+        return EngineDispatchResult::Fallback {
+            reason: format!("dispatch readiness check failed: {rejection}"),
+        };
+    }
+
+    // 6. Dispatch readiness passed — create callback child task and spawn.
+    let timeout_secs = (estimated_duration_secs.unwrap_or(3600) * 3).clamp(600, 7_776_000);
+    let callback_task = crate::skills::executor::build_callback_task(
+        db.agent_id().to_string(),
+        Some(task_id.to_string()),
+        target_tool,
+        &dispatch_input,
+        timeout_secs,
+        session_id,
+        trace_id,
+    );
+    let callback_task_id = match db.create_task(callback_task).await {
+        Ok(id) => id,
+        Err(e) => {
+            return EngineDispatchResult::Fallback {
+                reason: format!("failed to create callback child: {e}"),
+            };
+        }
+    };
+
+    // Resolve and verify handler script exists.
+    let cmd_path = skill_tool.skill_dir.join(&command);
+    if !cmd_path.exists() {
+        let _ = db
+            .update_task_failed(
+                &callback_task_id,
+                &format!("handler not found: {}", cmd_path.display()),
+            )
+            .await;
+        return EngineDispatchResult::Fallback {
+            reason: format!("handler script not found: {}", cmd_path.display()),
+        };
+    }
+
+    // Auto-transition parent task to in_progress (mirrors execute_long_running #525).
+    if let Err(e) = db.update_manual_task_status(task_id, "in_progress").await {
+        warn!(
+            task_id = %task_id,
+            error = %e,
+            "verdict engine-dispatch: failed to auto-transition parent to in_progress"
+        );
+    }
+
+    // Inject subprocess metadata (__mika_task_id, __mika_agent).
+    let mut enriched_input = dispatch_input.clone();
+    if let serde_json::Value::Object(ref mut map) = enriched_input {
+        map.insert(
+            "__mika_task_id".to_string(),
+            serde_json::Value::String(callback_task_id.clone()),
+        );
+        map.insert(
+            "__mika_agent".to_string(),
+            serde_json::Value::String(db.agent_id().to_string()),
+        );
+    }
+
+    // Spawn the detached subprocess.
+    crate::skills::executor::spawn_long_running_exec(
+        cmd_path,
+        skill_tool.skill_dir.clone(),
+        enriched_input,
+        callback_task_id.clone(),
+        db.clone(),
+        github_token.map(|s| s.to_string()),
+    );
+
+    info!(
+        event = "verdict_engine_dispatched",
+        repo = %event.repo,
+        pr_number = event.pr_number,
+        target_tool,
+        target_skill,
+        task_id = %task_id,
+        callback_task_id = %callback_task_id,
+        "verdict handler: engine-side dispatch spawned"
+    );
+
+    EngineDispatchResult::Spawned { callback_task_id }
+}
+
+/// Check if a task has a pending deferred-dispatch child (`:deferred` label suffix).
+async fn has_pending_deferred_child(db: &AsyncDatabase, task_id: &str) -> bool {
+    match db.get_child_tasks(task_id).await {
+        Ok(children) => children.iter().any(|c| {
+            c.label == crate::agent::DEFERRED_DISPATCH_LABEL
+                && matches!(c.status.as_str(), "pending")
+        }),
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Block[ac] handler (#889)
 // ---------------------------------------------------------------------------
 
@@ -550,6 +765,7 @@ async fn handle_block_ac(
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
+    skills: &SkillRegistry,
 ) -> VerdictAction {
     let pr_url = event.pr_url();
 
@@ -569,20 +785,33 @@ async fn handle_block_ac(
 
     let task_id = task.id.clone();
 
-    // Check if fix is already in-flight
+    // Check if fix is already in-flight or queued (AC3 — idempotent collapse)
     if has_active_callback_child(db, &task_id).await {
+        let is_deferred = has_pending_deferred_child(db, &task_id).await;
+        let (status_msg, action_msg) = if is_deferred {
+            (
+                "a fix is queued (deferred — waiting for dispatch slot)",
+                "Do NOT dispatch run_claude_pilot — a deferred callback will auto-fire when the slot frees.",
+            )
+        } else {
+            (
+                "a fix is already in-flight",
+                "Do NOT dispatch run_claude_pilot — a session is already running.",
+            )
+        };
         info!(
             task_id = %task_id,
             pr_number = event.pr_number,
-            "block[ac] but fix already in-flight — enriching passthrough"
+            is_deferred,
+            "block[ac] but {status_msg} — suppressing duplicate dispatch"
         );
         return VerdictAction::Handled {
             pre_digest: format!(
                 "<verdict_handler>\n\
                  [GitHub] PR review ({}) on {}#{} by @{}\n\
-                 VERDICT: block[ac] — but a fix is already in-flight for task {task_id}.\n\n\
+                 VERDICT: block[ac] — but {status_msg} for task {task_id}.\n\n\
                  Wait for the active callback to finish before taking further action.\n\
-                 Do NOT dispatch run_claude_pilot — a session is already running.\n\
+                 {action_msg}\n\
                  </verdict_handler>",
                 event.state, event.repo, event.pr_number, event.reviewer
             ),
@@ -749,6 +978,68 @@ async fn handle_block_ac(
         "Structural verdict handler: block[ac] — AC-fix dispatch preparing"
     );
 
+    // Engine-side dispatch (mika#1630) — eliminate LLM-dependency gap.
+    match try_engine_dispatch(
+        db,
+        skills,
+        &task_id,
+        github_token,
+        event,
+        "dev-pilot",
+        "run_claude_pilot",
+        &ac_summary,
+        session_id,
+        trace_id,
+    )
+    .await
+    {
+        EngineDispatchResult::Spawned { callback_task_id } => {
+            return VerdictAction::Dispatched {
+                pre_digest: format_block_ac_dispatched_pre_digest(
+                    event,
+                    &ac_summary,
+                    &task_id,
+                    new_count,
+                    &callback_task_id,
+                ),
+                task_id: task_id.clone(),
+            };
+        }
+        EngineDispatchResult::Deferred { deferred_task_id } => {
+            // Emit audit event (AC4).
+            let _ = db
+                .log_audit_event(
+                    session_id,
+                    "verdict_redispatch_deferred",
+                    &format!("task:{task_id}"),
+                    None,
+                    Some("deferred"),
+                    Some(&format!(
+                        "verdict=block[ac] deferred_id={deferred_task_id} pr_url={}",
+                        pr_url
+                    )),
+                    Some(trace_id),
+                )
+                .await;
+            return VerdictAction::Handled {
+                pre_digest: format_block_ac_deferred_pre_digest(
+                    event,
+                    &ac_summary,
+                    &task_id,
+                    new_count,
+                ),
+            };
+        }
+        EngineDispatchResult::Fallback { reason } => {
+            warn!(
+                task_id = %task_id,
+                reason = %reason,
+                "verdict engine-dispatch fallback — LLM-mediated path"
+            );
+        }
+    }
+
+    // Existing code: return prescriptive pre-digest for LLM-mediated dispatch
     VerdictAction::Handled {
         pre_digest: format_block_ac_pre_digest(event, &ac_summary, &task_id, new_count),
     }
@@ -768,6 +1059,7 @@ async fn handle_block_ci(
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
+    skills: &SkillRegistry,
 ) -> VerdictAction {
     let pr_url = event.pr_url();
 
@@ -786,19 +1078,33 @@ async fn handle_block_ci(
 
     let task_id = task.id.clone();
 
+    // Check if fix is already in-flight or queued (AC3 — idempotent collapse)
     if has_active_callback_child(db, &task_id).await {
+        let is_deferred = has_pending_deferred_child(db, &task_id).await;
+        let (status_msg, action_msg) = if is_deferred {
+            (
+                "a fix is queued (deferred — waiting for dispatch slot)",
+                "Do NOT dispatch run_claude_pilot — a deferred callback will auto-fire when the slot frees.",
+            )
+        } else {
+            (
+                "a fix is already in-flight",
+                "Do NOT dispatch run_claude_pilot — a session is already running.",
+            )
+        };
         info!(
             task_id = %task_id,
             pr_number = event.pr_number,
-            "block[ci] but fix already in-flight — enriching passthrough"
+            is_deferred,
+            "block[ci] but {status_msg} — suppressing duplicate dispatch"
         );
         return VerdictAction::Handled {
             pre_digest: format!(
                 "<verdict_handler>\n\
                  [GitHub] PR review ({}) on {}#{} by @{}\n\
-                 VERDICT: block[ci] — but a fix is already in-flight for task {task_id}.\n\n\
+                 VERDICT: block[ci] — but {status_msg} for task {task_id}.\n\n\
                  Wait for the active callback to finish before taking further action.\n\
-                 Do NOT dispatch run_claude_pilot — a session is already running.\n\
+                 {action_msg}\n\
                  </verdict_handler>",
                 event.state, event.repo, event.pr_number, event.reviewer
             ),
@@ -940,13 +1246,71 @@ async fn handle_block_ci(
         "Structural verdict handler: block[ci] — CI-fix dispatch preparing"
     );
 
+    // Engine-side dispatch (mika#1630) — eliminate LLM-dependency gap.
+    let ci_context = truncate_body(&event.body);
+    match try_engine_dispatch(
+        db,
+        skills,
+        &task_id,
+        github_token,
+        event,
+        "dev-pilot",
+        "run_claude_pilot",
+        &ci_context,
+        session_id,
+        trace_id,
+    )
+    .await
+    {
+        EngineDispatchResult::Spawned { callback_task_id } => {
+            return VerdictAction::Dispatched {
+                pre_digest: format_block_ci_dispatched_pre_digest(
+                    event,
+                    &ci_context,
+                    &task_id,
+                    new_count,
+                    &callback_task_id,
+                ),
+                task_id: task_id.clone(),
+            };
+        }
+        EngineDispatchResult::Deferred { deferred_task_id } => {
+            // Emit audit event (AC4).
+            let _ = db
+                .log_audit_event(
+                    session_id,
+                    "verdict_redispatch_deferred",
+                    &format!("task:{task_id}"),
+                    None,
+                    Some("deferred"),
+                    Some(&format!(
+                        "verdict=block[ci] deferred_id={deferred_task_id} pr_url={}",
+                        pr_url
+                    )),
+                    Some(trace_id),
+                )
+                .await;
+            return VerdictAction::Handled {
+                pre_digest: format_block_ci_deferred_pre_digest(
+                    event,
+                    &ci_context,
+                    &task_id,
+                    new_count,
+                ),
+            };
+        }
+        EngineDispatchResult::Fallback { reason } => {
+            warn!(
+                task_id = %task_id,
+                reason = %reason,
+                "verdict engine-dispatch fallback — LLM-mediated path"
+            );
+        }
+    }
+
+    // Existing code: return prescriptive pre-digest for LLM-mediated dispatch
     VerdictAction::Handled {
-        pre_digest: format_block_ci_pre_digest(
-            event,
-            &truncate_body(&event.body),
-            &task_id,
-            new_count,
-        ),
+        pre_digest: format_block_ci_pre_digest(event, &ci_context, &task_id, new_count),
     }
 }
 
@@ -2097,6 +2461,104 @@ fn format_block_ci_limit_pre_digest(event: &PrReviewEvent, task_id: &str) -> Str
     )
 }
 
+/// Format pre-digest for block[ac] engine-side dispatch succeeded (mika#1630).
+fn format_block_ac_dispatched_pre_digest(
+    event: &PrReviewEvent,
+    ac_summary: &str,
+    task_id: &str,
+    retry_count: u32,
+    callback_task_id: &str,
+) -> String {
+    format!(
+        "<verdict_handler>\n\
+         [GitHub] PR review ({}) on {}#{} by @{}\n\
+         VERDICT: block[ac] — engine-side AC-fix dispatch fired.\n\n\
+         {ac_summary}\n\n\
+         Task: {task_id}\n\
+         Retry: {retry_count}/{BLOCK_AC_MAX_RETRIES}\n\
+         Callback: {callback_task_id}\n\
+         Review: {}\n\n\
+         The AC-fix dispatch has already been spawned engine-side.\n\
+         Do NOT dispatch run_claude_pilot — the subprocess is already running.\n\
+         Do NOT re-increment the retry counter — the structural handler already updated it.\n\
+         </verdict_handler>",
+        event.state, event.repo, event.pr_number, event.reviewer, event.review_url
+    )
+}
+
+/// Format pre-digest for block[ac] slot busy, deferred callback registered (mika#1630).
+fn format_block_ac_deferred_pre_digest(
+    event: &PrReviewEvent,
+    ac_summary: &str,
+    task_id: &str,
+    retry_count: u32,
+) -> String {
+    format!(
+        "<verdict_handler>\n\
+         [GitHub] PR review ({}) on {}#{} by @{}\n\
+         VERDICT: block[ac] — dispatch slot busy; AC-fix queued (deferred).\n\n\
+         {ac_summary}\n\n\
+         Task: {task_id}\n\
+         Retry: {retry_count}/{BLOCK_AC_MAX_RETRIES}\n\
+         Review: {}\n\n\
+         The dispatch slot is currently occupied. A deferred callback has been registered \
+         engine-side and will auto-fire when the slot frees.\n\
+         Do NOT dispatch run_claude_pilot — the deferred wrapper handles it.\n\
+         Do NOT re-increment the retry counter — the structural handler already updated it.\n\
+         </verdict_handler>",
+        event.state, event.repo, event.pr_number, event.reviewer, event.review_url
+    )
+}
+
+/// Format pre-digest for block[ci] engine-side dispatch succeeded (mika#1630).
+fn format_block_ci_dispatched_pre_digest(
+    event: &PrReviewEvent,
+    ci_context: &str,
+    task_id: &str,
+    retry_count: u32,
+    callback_task_id: &str,
+) -> String {
+    format!(
+        "<verdict_handler>\n\
+         [GitHub] PR review ({}) on {}#{} by @{}\n\
+         VERDICT: block[ci] — engine-side CI-fix dispatch fired.\n\n\
+         CI failure context:\n{ci_context}\n\n\
+         Task: {task_id}\n\
+         Retry: {retry_count}/{BLOCK_CI_MAX_RETRIES}\n\
+         Callback: {callback_task_id}\n\
+         Review: {}\n\n\
+         The CI-fix dispatch has already been spawned engine-side.\n\
+         Do NOT dispatch run_claude_pilot — the subprocess is already running.\n\
+         Do NOT re-increment the retry counter — the structural handler already updated it.\n\
+         </verdict_handler>",
+        event.state, event.repo, event.pr_number, event.reviewer, event.review_url
+    )
+}
+
+/// Format pre-digest for block[ci] slot busy, deferred callback registered (mika#1630).
+fn format_block_ci_deferred_pre_digest(
+    event: &PrReviewEvent,
+    ci_context: &str,
+    task_id: &str,
+    retry_count: u32,
+) -> String {
+    format!(
+        "<verdict_handler>\n\
+         [GitHub] PR review ({}) on {}#{} by @{}\n\
+         VERDICT: block[ci] — dispatch slot busy; CI-fix queued (deferred).\n\n\
+         CI failure context:\n{ci_context}\n\n\
+         Task: {task_id}\n\
+         Retry: {retry_count}/{BLOCK_CI_MAX_RETRIES}\n\
+         Review: {}\n\n\
+         The dispatch slot is currently occupied. A deferred callback has been registered \
+         engine-side and will auto-fire when the slot frees.\n\
+         Do NOT dispatch run_claude_pilot — the deferred wrapper handles it.\n\
+         Do NOT re-increment the retry counter — the structural handler already updated it.\n\
+         </verdict_handler>",
+        event.state, event.repo, event.pr_number, event.reviewer, event.review_url
+    )
+}
+
 /// Format pre-digest for block[security] / block[pipeline] escalation.
 fn format_escalate_pre_digest(event: &PrReviewEvent, reason: &str, task_id: &str) -> String {
     format!(
@@ -3048,6 +3510,413 @@ mod tests {
         assert!(
             text.contains("Rebase"),
             "Behind-main enrichment should instruct rebase: {text}"
+        );
+    }
+
+    // ---- Engine-side dispatch pre-digest tests (mika#1630) ----
+
+    #[test]
+    fn block_ac_dispatched_pre_digest_avoids_completion_claim_words() {
+        let event = sample_event_commented();
+        let text = format_block_ac_dispatched_pre_digest(
+            &event,
+            "2 unsatisfied AC(s):\n  1. Unit 1\n  2. Unit 3",
+            "task-456",
+            1,
+            "callback-789",
+        );
+        assert!(
+            !COMPLETION_CLAIM_RE.is_match(&text),
+            "block[ac] dispatched pre-digest contains completion-claim trigger word: {text}"
+        );
+        assert!(text.starts_with("<verdict_handler>"));
+        assert!(text.contains("engine-side"));
+        assert!(text.contains("Do NOT dispatch run_claude_pilot"));
+        assert!(text.contains("callback-789"));
+    }
+
+    #[test]
+    fn block_ac_deferred_pre_digest_avoids_completion_claim_words() {
+        let event = sample_event_commented();
+        let text = format_block_ac_deferred_pre_digest(
+            &event,
+            "2 unsatisfied AC(s):\n  1. Unit 1",
+            "task-456",
+            1,
+        );
+        assert!(
+            !COMPLETION_CLAIM_RE.is_match(&text),
+            "block[ac] deferred pre-digest contains completion-claim trigger word: {text}"
+        );
+        assert!(text.starts_with("<verdict_handler>"));
+        assert!(text.contains("deferred"));
+        assert!(text.contains("Do NOT dispatch run_claude_pilot"));
+    }
+
+    #[test]
+    fn block_ci_dispatched_pre_digest_avoids_completion_claim_words() {
+        let mut event = sample_event_commented();
+        event.body = "VERDICT: block[ci]\nREASON: CI failing.".to_string();
+        let text = format_block_ci_dispatched_pre_digest(
+            &event,
+            "CI checks failing",
+            "task-789",
+            1,
+            "callback-101",
+        );
+        assert!(
+            !COMPLETION_CLAIM_RE.is_match(&text),
+            "block[ci] dispatched pre-digest contains completion-claim trigger word: {text}"
+        );
+        assert!(text.starts_with("<verdict_handler>"));
+        assert!(text.contains("engine-side"));
+        assert!(text.contains("Do NOT dispatch run_claude_pilot"));
+    }
+
+    #[test]
+    fn block_ci_deferred_pre_digest_avoids_completion_claim_words() {
+        let mut event = sample_event_commented();
+        event.body = "VERDICT: block[ci]\nREASON: CI failing.".to_string();
+        let text = format_block_ci_deferred_pre_digest(&event, "CI checks failing", "task-789", 1);
+        assert!(
+            !COMPLETION_CLAIM_RE.is_match(&text),
+            "block[ci] deferred pre-digest contains completion-claim trigger word: {text}"
+        );
+        assert!(text.starts_with("<verdict_handler>"));
+        assert!(text.contains("deferred"));
+        assert!(text.contains("Do NOT dispatch run_claude_pilot"));
+    }
+
+    // ---- Engine dispatch fallback test (mika#1630) ----
+
+    /// Create a task with pr_url metadata that `find_active_task_by_pr_url` can find.
+    async fn create_task_with_pr_url(db: &AsyncDatabase, pr_url: &str, status: &str) -> String {
+        let task = crate::db::NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test-task".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: Some(serde_json::json!({"claude_pilot": {"pr_url": pr_url}}).to_string()),
+            r#type: None,
+            dispatch_class: None,
+        };
+        let task_id = db.create_task(task).await.unwrap();
+        if status != "pending" {
+            db.update_task_status(&task_id, status).await.unwrap();
+        }
+        task_id
+    }
+
+    /// Create a callback child task for the given parent.
+    async fn create_callback_child(
+        db: &AsyncDatabase,
+        parent_id: &str,
+        label: &str,
+        status: &str,
+    ) -> String {
+        let task = crate::db::NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: crate::task_engine::types::trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: crate::task_engine::types::action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let child_id = db.create_task(task).await.unwrap();
+        if status != "pending" {
+            db.update_task_status(&child_id, status).await.unwrap();
+        }
+        child_id
+    }
+
+    #[tokio::test]
+    async fn block_ac_fallback_to_llm_when_tool_not_found() {
+        // Empty SkillRegistry — run_claude_pilot is not resolvable.
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
+        let db = cb_test_db().await;
+
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1630";
+        let task_id = create_task_with_pr_url(&db, pr_url, "in_progress").await;
+
+        let event = PrReviewEvent {
+            state: "commented".to_string(),
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 1630,
+            title: "fix: something".to_string(),
+            reviewer: "mika-qa".to_string(),
+            review_url: "https://github.com/senara-solutions/mika/pull/1630#pullrequestreview-1"
+                .to_string(),
+            body: "VERDICT: block[ac]\n- [❌] unsatisfied: AC1 missing".to_string(),
+        };
+
+        let result = try_engine_dispatch(
+            &db,
+            &skills,
+            &task_id,
+            None,
+            &event,
+            "dev-pilot",
+            "run_claude_pilot",
+            "AC1 missing",
+            "test-session",
+            "trace-1",
+        )
+        .await;
+
+        assert!(
+            matches!(result, EngineDispatchResult::Fallback { .. }),
+            "Expected Fallback when tool not in registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_ac_idempotent_collapse_with_deferred() {
+        // Set up a task with a pending deferred child — subsequent block[ac]
+        // should return "fix is queued" without creating new tasks.
+        let db = cb_test_db().await;
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1631";
+        let task_id = create_task_with_pr_url(&db, pr_url, "in_progress").await;
+
+        // Create a pending deferred child
+        create_callback_child(
+            &db,
+            &task_id,
+            crate::agent::DEFERRED_DISPATCH_LABEL,
+            "pending",
+        )
+        .await;
+
+        let event = PrReviewEvent {
+            state: "commented".to_string(),
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 1631,
+            title: "fix: something".to_string(),
+            reviewer: "mika-qa".to_string(),
+            review_url: "https://github.com/senara-solutions/mika/pull/1631#pullrequestreview-1"
+                .to_string(),
+            body: "VERDICT: block[ac]\n- [❌] unsatisfied: AC1 missing".to_string(),
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
+
+        let action =
+            handle_block_ac(&event, &db, None, None, "test-session", "trace-1", &skills).await;
+
+        // Should return Handled with "queued" message, not a new dispatch
+        match action {
+            VerdictAction::Handled { pre_digest } => {
+                assert!(
+                    pre_digest.contains("queued"),
+                    "Expected 'queued' in idempotent collapse pre-digest, got: {pre_digest}"
+                );
+                assert!(
+                    pre_digest.contains("deferred"),
+                    "Expected 'deferred' in idempotent collapse pre-digest, got: {pre_digest}"
+                );
+            }
+            other => panic!("Expected VerdictAction::Handled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn block_ac_idempotent_collapse_in_flight() {
+        // Set up a task with an in-flight (non-deferred) callback child.
+        let db = cb_test_db().await;
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1632";
+        let task_id = create_task_with_pr_url(&db, pr_url, "in_progress").await;
+
+        // Create an in-progress (active, non-deferred) callback child
+        create_callback_child(
+            &db,
+            &task_id,
+            "long_running:run_claude_pilot",
+            "in_progress",
+        )
+        .await;
+
+        let event = PrReviewEvent {
+            state: "commented".to_string(),
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 1632,
+            title: "fix: something".to_string(),
+            reviewer: "mika-qa".to_string(),
+            review_url: "https://github.com/senara-solutions/mika/pull/1632#pullrequestreview-1"
+                .to_string(),
+            body: "VERDICT: block[ac]\n- [❌] unsatisfied: AC1 missing".to_string(),
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
+
+        let action =
+            handle_block_ac(&event, &db, None, None, "test-session", "trace-1", &skills).await;
+
+        // Should return Handled with "in-flight" message
+        match action {
+            VerdictAction::Handled { pre_digest } => {
+                assert!(
+                    pre_digest.contains("in-flight"),
+                    "Expected 'in-flight' in pre-digest, got: {pre_digest}"
+                );
+                assert!(
+                    !pre_digest.contains("queued"),
+                    "Should NOT contain 'queued' for in-flight dispatch: {pre_digest}"
+                );
+            }
+            other => panic!("Expected VerdictAction::Handled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn has_pending_deferred_child_detects_deferred() {
+        let db = cb_test_db().await;
+        let task = crate::db::NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test-parent".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = db.create_task(task).await.unwrap();
+
+        // No deferred child yet
+        assert!(!has_pending_deferred_child(&db, &parent_id).await);
+
+        // Add a deferred child
+        create_callback_child(
+            &db,
+            &parent_id,
+            crate::agent::DEFERRED_DISPATCH_LABEL,
+            "pending",
+        )
+        .await;
+        assert!(has_pending_deferred_child(&db, &parent_id).await);
+    }
+
+    #[tokio::test]
+    async fn has_pending_deferred_child_ignores_non_deferred() {
+        let db = cb_test_db().await;
+        let task = crate::db::NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test-parent".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = db.create_task(task).await.unwrap();
+
+        // Add a regular (non-deferred) callback child
+        create_callback_child(&db, &parent_id, "long_running:run_claude_pilot", "pending").await;
+
+        // Should NOT detect as deferred
+        assert!(!has_pending_deferred_child(&db, &parent_id).await);
+    }
+
+    #[tokio::test]
+    async fn block_ci_fallback_to_llm_when_tool_not_found() {
+        // Mirror of block_ac_fallback test for block[ci].
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
+        let db = cb_test_db().await;
+
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1633";
+        let task_id = create_task_with_pr_url(&db, pr_url, "in_progress").await;
+
+        let event = PrReviewEvent {
+            state: "commented".to_string(),
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 1633,
+            title: "fix: something".to_string(),
+            reviewer: "mika-qa".to_string(),
+            review_url: "https://github.com/senara-solutions/mika/pull/1633#pullrequestreview-1"
+                .to_string(),
+            body: "VERDICT: block[ci]\nREASON: CI failing".to_string(),
+        };
+
+        let result = try_engine_dispatch(
+            &db,
+            &skills,
+            &task_id,
+            None,
+            &event,
+            "dev-pilot",
+            "run_claude_pilot",
+            "CI failing",
+            "test-session",
+            "trace-1",
+        )
+        .await;
+
+        assert!(
+            matches!(result, EngineDispatchResult::Fallback { .. }),
+            "Expected Fallback when tool not in registry"
         );
     }
 }
