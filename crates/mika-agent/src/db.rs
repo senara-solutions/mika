@@ -13452,6 +13452,102 @@ mod tests {
         assert_eq!(ov.enabled, Some(false));
     }
 
+    /// Seed a `skill_overrides` row with explicit curator-relevant columns for
+    /// the archival-candidate query tests (AC9–AC12). Bypasses the upsert
+    /// helpers so `lifecycle_state` and `last_used_at` can be set to arbitrary
+    /// values (the helpers only manage `always_on`/`llm_*`/`enabled`).
+    fn seed_curator_skill_row(
+        db: &Database,
+        agent_id: &str,
+        skill_name: &str,
+        lifecycle_state: Option<&str>,
+        use_count: i64,
+        last_used_at: Option<&str>,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO skill_overrides
+                    (agent_id, skill_name, lifecycle_state, use_count, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    agent_id,
+                    skill_name,
+                    lifecycle_state,
+                    use_count,
+                    last_used_at
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_v43_migration_adds_curator_columns() {
+        // Mechanically enforce the schema the curator candidate query depends
+        // on: migrate_v42_to_v43 must add lifecycle_state, use_count, and
+        // last_used_at to skill_overrides. This dependency is self-contained in
+        // mika#1584 — the migration adds all three columns here, so the query is
+        // not coupled to any other PR's schema. (qa#1624: schema dependency
+        // mechanically enforced.)
+        let db = db();
+        let cols: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info('skill_overrides')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for required in ["lifecycle_state", "use_count", "last_used_at"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "skill_overrides missing curator column '{required}' (v43 migration); have: {cols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_archival_candidates_fresh_agent_returns_zero() {
+        // AC9: a fresh agent with no agent-authored skills yields zero
+        // candidates from the curator candidate query.
+        let db = db();
+        let candidates = db.get_archival_candidates("mika", 30).unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_archival_candidates_staged_skill_excluded() {
+        // AC10: a staged (not yet promoted) skill is excluded even when idle —
+        // the query only considers lifecycle_state = 'active'.
+        let db = db();
+        let idle = crate::timestamp::now_minus(chrono::Duration::days(60));
+        seed_curator_skill_row(&db, "mika", "staged-skill", Some("staged"), 0, Some(&idle));
+        let candidates = db.get_archival_candidates("mika", 30).unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_archival_candidates_idle_active_skill_returned() {
+        // AC11: a promoted+active skill idle beyond the threshold (last used 40
+        // days ago, threshold 30) is returned as exactly one candidate.
+        let db = db();
+        let idle = crate::timestamp::now_minus(chrono::Duration::days(40));
+        seed_curator_skill_row(&db, "mika", "idle-skill", Some("active"), 3, Some(&idle));
+        let candidates = db.get_archival_candidates("mika", 30).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].skill_name, "idle-skill");
+        assert_eq!(candidates[0].lifecycle_state.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn test_archival_candidates_bundled_null_lifecycle_excluded() {
+        // AC12: a bundled/marketplace skill (NULL lifecycle_state, never used)
+        // is excluded by construction — NULL never equals 'active'.
+        let db = db();
+        seed_curator_skill_row(&db, "mika", "bundled-skill", None, 0, None);
+        let candidates = db.get_archival_candidates("mika", 30).unwrap();
+        assert!(candidates.is_empty());
+    }
+
     #[test]
     fn test_set_skill_enabled_enable_with_always_on_keeps_row() {
         let mut db = db();
