@@ -100,7 +100,7 @@ pub static MIKA_DEV: WellKnownAgent = WellKnownAgent {
     soul: MIKA_DEV_SOUL,
     // Empty: mika-dev uses identity allowlist, not denylist (#815).
     disabled_skills: &[],
-    config_toml: None,
+    config_toml: Some(MIKA_DEV_CONFIG),
     // KG disabled (#800): mika-dev has zero `query_knowledge_graph` usage —
     // retrieval goes through `search_memory` (FTS5+vec over memory_facts).
     // Eliminates shared-corpus extractor race on the mika-docs corpus.
@@ -159,6 +159,17 @@ allowlist = [\n\
   \"mcp\",\n\
   \"browser-control\",\n\
 ]\n";
+
+/// mika-dev config.toml — switches base model to openrouter/z-ai/glm-5.2
+/// for cost reduction (mika#1633). Calibration gate satisfied: 100% pass (5/5).
+const MIKA_DEV_CONFIG: &str = r#"# Mika Dev — autonomous development agent.
+# Base model switched to glm-5.2 per mika#1633 (cost reduction).
+
+llm_provider = "openrouter"
+openrouter_model = "z-ai/glm-5.2"
+llm_max_tokens = 8192
+log_level = "info"
+"#;
 
 /// mika-qa agent specification.
 ///
@@ -637,6 +648,63 @@ pub fn reconcile_well_known_identity(home_dir: &Path, spec: &WellKnownAgent, set
     );
 }
 
+/// Reconcile the on-disk `config.toml` for an existing well-known agent against
+/// the spec's `config_toml` content. When the spec defines a config and the
+/// on-disk content differs, overwrite with atomic tmp+rename (mika#1633).
+///
+/// Agents without a spec-defined config (`config_toml: None`) are unaffected.
+fn reconcile_well_known_config(home_dir: &Path, spec: &WellKnownAgent) {
+    let expected = match spec.config_toml {
+        Some(content) => content,
+        None => return, // No spec-defined config — nothing to reconcile.
+    };
+
+    let agent_home = mika_common::agent::agent_dir(home_dir, spec.name);
+    let config_path = agent_home.join("config.toml");
+
+    // Read on-disk content; missing file counts as "differs".
+    let on_disk = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    if on_disk == expected {
+        info!(
+            event = "config_reconcile.unchanged",
+            agent = spec.name,
+            "config.toml in sync — no reconciliation needed"
+        );
+        return;
+    }
+
+    // Atomic write: tmp + rename.
+    let tmp_path = config_path.with_extension("toml.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, expected) {
+        warn!(
+            event = "config_reconcile.skipped",
+            reason = "tmp_write_failed",
+            agent = spec.name,
+            error = %e,
+            "config reconciliation failed — could not write tmp file"
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
+        warn!(
+            event = "config_reconcile.skipped",
+            reason = "rename_failed",
+            agent = spec.name,
+            error = %e,
+            "config reconciliation failed — atomic rename"
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+
+    info!(
+        event = "config_reconcile.updated",
+        agent = spec.name,
+        "reconciled config.toml for well-known agent"
+    );
+}
+
 /// Platform agents that can be dispatched via `mika ask --agent <peer>` without
 /// requiring LLM permission classification. These are intra-platform peers that
 /// claude-pilot should structurally allow.
@@ -702,6 +770,9 @@ pub fn provision_well_known_agents(home_dir: &Path, settings: &Settings, disable
             // changes (e.g., new bundled skill added to MIKA_DEV_IDENTITY) propagate
             // to on-disk identity.toml. See mika#1220.
             reconcile_well_known_identity(home_dir, spec, settings);
+            // Reconcile config.toml so model swaps take effect on existing
+            // agents without requiring re-provisioning. See mika#1633.
+            reconcile_well_known_config(home_dir, spec);
             continue;
         }
 
@@ -1785,6 +1856,14 @@ mod tests {
     }
 
     #[test]
+    fn test_mika_dev_config_toml_is_valid_toml() {
+        let config: toml::Value =
+            toml::from_str(MIKA_DEV_CONFIG).expect("MIKA_DEV_CONFIG should be valid TOML");
+        assert_eq!(config["llm_provider"].as_str(), Some("openrouter"));
+        assert_eq!(config["openrouter_model"].as_str(), Some("z-ai/glm-5.2"));
+    }
+
+    #[test]
     fn test_seed_skill_overrides_non_well_known() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
@@ -2720,6 +2799,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Config reconciliation tests (mika#1633) --
+
+    fn read_config(home: &Path, agent_name: &str) -> String {
+        let agent_dir = mika_common::agent::agent_dir(home, agent_name);
+        fs::read_to_string(agent_dir.join("config.toml")).unwrap()
+    }
+
+    #[test]
+    fn test_reconcile_config_toml_for_mika_dev() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // Pre-seed mika-dev with an old config (no openrouter).
+        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        let agent_dir = mika_common::agent::agent_dir(home, "mika-dev");
+        fs::write(agent_dir.join("identity.toml"), MIKA_DEV_IDENTITY).unwrap();
+        fs::write(agent_dir.join("config.toml"), "log_level = \"info\"\n").unwrap();
+
+        // Run reconciliation.
+        reconcile_well_known_config(home, &MIKA_DEV);
+
+        let after = read_config(home, "mika-dev");
+        assert_eq!(
+            after, MIKA_DEV_CONFIG,
+            "config.toml must be reconciled to spec"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_config_toml_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // Pre-seed with the correct config.
+        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        let agent_dir = mika_common::agent::agent_dir(home, "mika-dev");
+        fs::write(agent_dir.join("identity.toml"), MIKA_DEV_IDENTITY).unwrap();
+        fs::write(agent_dir.join("config.toml"), MIKA_DEV_CONFIG).unwrap();
+
+        // First reconcile — should be a no-op.
+        reconcile_well_known_config(home, &MIKA_DEV);
+        let after_first = read_config(home, "mika-dev");
+        assert_eq!(after_first, MIKA_DEV_CONFIG);
+
+        // Second reconcile — still a no-op.
+        reconcile_well_known_config(home, &MIKA_DEV);
+        let after_second = read_config(home, "mika-dev");
+        assert_eq!(after_second, MIKA_DEV_CONFIG);
+    }
+
+    #[test]
+    fn test_reconcile_config_skips_agents_without_spec_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // Pre-seed mika-qa (which has config_toml: None) with a custom config.
+        mika_common::home::bootstrap_agent(home, "mika-qa").unwrap();
+        let agent_dir = mika_common::agent::agent_dir(home, "mika-qa");
+        fs::write(agent_dir.join("identity.toml"), MIKA_QA_IDENTITY).unwrap();
+        let custom = "log_level = \"debug\"\n";
+        fs::write(agent_dir.join("config.toml"), custom).unwrap();
+
+        // Reconcile must not overwrite — spec has no config_toml.
+        reconcile_well_known_config(home, &MIKA_QA);
+        let after = read_config(home, "mika-qa");
+        assert_eq!(
+            after, custom,
+            "agents without spec config must be untouched"
+        );
     }
 
     /// U2 verification (mika#737): display_name fields on the static specs
