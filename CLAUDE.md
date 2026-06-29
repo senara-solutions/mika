@@ -17,7 +17,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - **HTTP server:** Axum 0.8 (mika-spirit binary). See `crates/mika-agent/CLAUDE.md` for endpoint details.
 - **HTTP client:** reqwest 0.12 with rustls-tls
 - **Async runtime:** tokio
-- **MCP client:** rmcp 0.17 (official Rust MCP SDK) — stdio and Streamable HTTP transports
+- **MCP client:** rmcp 2.0 (official Rust MCP SDK) — stdio and Streamable HTTP transports
 - **Config:** config-rs with `MIKA_` env prefix + dotenvy for `~/.mika/.env` secrets
 - **Logging:** tracing + tracing-subscriber (JSON for prod, pretty for dev) + optional OpenTelemetry export via `telemetry` feature flag
 - **Telemetry:** opentelemetry 0.31 + tracing-opentelemetry 0.32, feature-gated OTLP HTTP export (Langfuse-compatible)

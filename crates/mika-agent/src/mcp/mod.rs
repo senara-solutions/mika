@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use mika_common::claude::ToolDefinition;
-use rmcp::model::{CallToolRequestParams, RawContent};
+use rmcp::model::{CallToolRequestParams, ContentBlock};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::TokioChildProcess;
 use tracing::{info, warn};
@@ -177,14 +177,12 @@ impl McpManager {
             }
         };
 
-        let arguments = input.as_object().cloned();
-
-        let params = CallToolRequestParams {
-            meta: None,
-            name: tool_name.clone().into(),
-            arguments,
-            task: None,
-        };
+        // rmcp 2.0: CallToolRequestParams is #[non_exhaustive] — construct via
+        // the name constructor + builder instead of a struct literal.
+        let mut params = CallToolRequestParams::new(tool_name.clone());
+        if let Some(arguments) = input.as_object().cloned() {
+            params = params.with_arguments(arguments);
+        }
 
         let result = match conn.service.call_tool(params).await {
             Ok(r) => r,
@@ -359,14 +357,14 @@ fn convert_mcp_result(result: &rmcp::model::CallToolResult, tool_name: &str) -> 
     let mut images = Vec::new();
 
     for content in &result.content {
-        match &**content {
-            RawContent::Text(t) => {
+        match content {
+            ContentBlock::Text(t) => {
                 if !text.is_empty() {
                     text.push('\n');
                 }
                 text.push_str(&t.text);
             }
-            RawContent::Image(img) => {
+            ContentBlock::Image(img) => {
                 if images.len() >= MAX_MCP_IMAGES {
                     warn!(
                         tool = tool_name,
@@ -423,7 +421,7 @@ fn convert_mcp_result(result: &rmcp::model::CallToolResult, tool_name: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{CallToolResult, Content};
+    use rmcp::model::{CallToolResult, ContentBlock};
 
     /// Create an empty manager for testing.
     fn empty_manager() -> McpManager {
@@ -490,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_convert_mcp_result_text_only() {
-        let result = CallToolResult::success(vec![Content::text("Hello from MCP")]);
+        let result = CallToolResult::success(vec![ContentBlock::text("Hello from MCP")]);
         let output = convert_mcp_result(&result, "greet");
         assert!(!output.is_error);
         assert_eq!(output.content, "Hello from MCP");
@@ -499,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_convert_mcp_result_error() {
-        let result = CallToolResult::error(vec![Content::text("Something went wrong")]);
+        let result = CallToolResult::error(vec![ContentBlock::text("Something went wrong")]);
         let output = convert_mcp_result(&result, "fail");
         assert!(output.is_error);
         assert_eq!(output.content, "Something went wrong");
@@ -516,7 +514,7 @@ mod tests {
     #[test]
     fn test_convert_mcp_result_truncation() {
         let long_text = "x".repeat(MAX_OUTPUT_LEN + 500);
-        let result = CallToolResult::success(vec![Content::text(long_text)]);
+        let result = CallToolResult::success(vec![ContentBlock::text(long_text)]);
         let output = convert_mcp_result(&result, "verbose");
         assert!(output.content.contains("truncated"));
         assert!(output.content.len() < MAX_OUTPUT_LEN + 100);
@@ -525,9 +523,9 @@ mod tests {
     #[test]
     fn test_convert_mcp_result_multiple_text_blocks() {
         let result = CallToolResult::success(vec![
-            Content::text("Line 1"),
-            Content::text("Line 2"),
-            Content::text("Line 3"),
+            ContentBlock::text("Line 1"),
+            ContentBlock::text("Line 2"),
+            ContentBlock::text("Line 3"),
         ]);
         let output = convert_mcp_result(&result, "multi");
         assert!(!output.is_error);
