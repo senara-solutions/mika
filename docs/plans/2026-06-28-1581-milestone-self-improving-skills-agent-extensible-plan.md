@@ -197,3 +197,15 @@ The `lifecycle_state = 'active'` clause is the structural exclusion for bundled/
 - [ ] AC2: End-to-end: authorized agent authors skill → lands `staged` → operator promotes → resolver injects → curator can archive → resolver stops injecting.
 - [ ] AC3: No sub-issue PR adds an agent-authorable path to the guard chain (EndTurn guards, `[constraints]`, identity `[tools].disabled`).
 - [ ] AC4: Nudge identity-allowlist defaults off; mika-dev/qa/arch blocked by #1580 spike outcome.
+
+## Acceptance criteria
+
+This milestone plan ships the foundation (#1582 — `skill_manage` + `lifecycle_state`) in PR #1623; sibling sub-issues #1583 (nudge) and #1584 (curator, PR #1624) ship separately. The 7 milestone-level ACs cover the foundation slice scope:
+
+- **AC1** — Schema: `lifecycle_state TEXT CHECK(...)` column on `skill_overrides`; migration v42→v43 with idempotency guard; `schema_v27_convergence.rs` asserts v43.
+- **AC2** — `skill_manage` builtin tool registered (`create`/`update`/`inspect` actions); identity-gated at entry via `allow_authoring`; all 4 well-known agents default `allow_authoring = false`.
+- **AC3** — CLI `Promote`/`Archive` variants in `SkillsCommand`; `set_lifecycle_state()` calls `db.set_skill_lifecycle_state()`; bundled/marketplace bail path present.
+- **AC4** — HTTP `POST /skills/{name}/promote` + `/archive` registered; structured JSON response; 400 for bundled; 200 idempotent on no-change.
+- **AC5** — End-to-end lifecycle test: `apply_overrides()` evicts `lifecycle_state IN ('staged','archived')`; retains `'active'` and `NULL`. (Tests in `skills/mod.rs::tests`.)
+- **AC6** — Predicate-extension equivalence test: all-NULL `lifecycle_state` fixtures produce identical eviction set to pre-change baseline. (Test in `skills/mod.rs::tests`.)
+- **AC7** — No automated guard-aware promotion; no EndTurn guard chain / `[constraints]` / `[tools].disabled` modifications. The guard chain stays operator-owned (Surface 3).
