@@ -2301,6 +2301,8 @@ mod tests {
                 llm_model: None,
                 enabled: None,
                 lifecycle_state: state.map(str::to_string),
+                use_count: 0,
+                last_used_at: None,
             }]);
             let survivors = registry
                 .skills
@@ -2360,6 +2362,8 @@ mod tests {
                 llm_model: None,
                 enabled: Some(false),
                 lifecycle_state: None,
+                use_count: 0,
+                last_used_at: None,
             },
             SkillOverride {
                 skill_name: "beta".to_string(),
@@ -2368,6 +2372,8 @@ mod tests {
                 llm_model: None,
                 enabled: None,
                 lifecycle_state: None,
+                use_count: 0,
+                last_used_at: None,
             },
             SkillOverride {
                 skill_name: "gamma".to_string(),
@@ -2376,6 +2382,8 @@ mod tests {
                 llm_model: None,
                 enabled: Some(true),
                 lifecycle_state: None,
+                use_count: 0,
+                last_used_at: None,
             },
         ];
 
@@ -3511,6 +3519,8 @@ keywords = ["big-test"]
             llm_model: None,
             enabled: None,
             lifecycle_state: state.map(|s| s.to_string()),
+            use_count: 0,
+            last_used_at: None,
         }
     }
 
@@ -3603,6 +3613,8 @@ keywords = ["big-test"]
                 llm_model: None,
                 enabled: Some(false),
                 lifecycle_state: None,
+                use_count: 0,
+                last_used_at: None,
             },
             override_for("gamma", None),
         ]);
