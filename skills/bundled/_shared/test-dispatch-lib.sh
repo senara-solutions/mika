@@ -2507,6 +2507,241 @@ assert_eq "Negative: **Issue:** mika#1602 on line 30 not matched (header-zone sc
     "NOTFOUND" \
     "$(_fip_probe 1602 '**Issue:** mika#1602' '2026-06-27-009-deep-header-plan.md' 30)"
 
+# --- Test 17: Post-flight recovery fires on all exit paths (mika#1615) ---
+
+echo ""
+echo "Test 17: Post-flight recovery fires on all exit paths (mika#1615)"
+echo "-----------------------------------------------------------------"
+
+# Structural: POST_RUN_HEAD computed unconditionally (before the three-branch if/elif/else)
+# The computation must appear BEFORE the `if [ -n "$STATUS" ]` line that opens Branch A.
+POST_RUN_HEAD_LINE=$(grep -n 'POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD' "$DISPATCH_LIB" \
+    | grep -v '#' | grep -v 'rescue' | grep -v 'trailing' | head -1 | cut -d: -f1)
+BRANCH_A_LINE=$(grep -n 'if \[ -n "$STATUS" \]; then' "$DISPATCH_LIB" | head -1 | cut -d: -f1)
+
+if [ -n "$POST_RUN_HEAD_LINE" ] && [ -n "$BRANCH_A_LINE" ] && [ "$POST_RUN_HEAD_LINE" -lt "$BRANCH_A_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ POST_RUN_HEAD computed before Branch A (line $POST_RUN_HEAD_LINE < $BRANCH_A_LINE)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ POST_RUN_HEAD must be computed before Branch A (POST_RUN_HEAD=$POST_RUN_HEAD_LINE, Branch A=$BRANCH_A_LINE)"
+fi
+
+# Structural: _post_flight_recovery function exists
+assert_contains "_post_flight_recovery function defined" \
+    "_post_flight_recovery()" \
+    "$(grep '_post_flight_recovery()' "$DISPATCH_LIB")"
+
+# Structural: _post_flight_recovery called from _run_claude_pilot after three-branch fi
+RUN_CLAUDE_PILOT_BODY=$(sed -n '/_run_claude_pilot()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "_post_flight_recovery called in _run_claude_pilot" \
+    "_post_flight_recovery" \
+    "$RUN_CLAUDE_PILOT_BODY"
+
+# Structural: dirty-worktree rescue is inside _post_flight_recovery, NOT inside Branch A
+BRANCH_A_BLOCK=$(sed -n '/if \[ -n "\$STATUS" \]; then/,/elif \[ "\$PILOT_EXIT" -eq 0 \]/p' "$DISPATCH_LIB")
+assert_not_contains "Dirty-worktree rescue NOT inside Branch A" \
+    "Unit 1 (mika#1282): detect dirty worktree" \
+    "$BRANCH_A_BLOCK"
+
+RECOVERY_FUNC=$(sed -n '/_post_flight_recovery()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "Dirty-worktree rescue inside _post_flight_recovery" \
+    "Unit 1 (mika#1282): detect dirty worktree" \
+    "$RECOVERY_FUNC"
+
+# Structural: dev-groom plan validation is inside _post_flight_recovery
+assert_contains "Dev-groom plan validation inside _post_flight_recovery" \
+    "Post-flight plan validation" \
+    "$RECOVERY_FUNC"
+assert_not_contains "Dev-groom plan validation NOT inside Branch A" \
+    "Post-flight plan validation" \
+    "$BRANCH_A_BLOCK"
+
+# Structural: PR-existence check is inside _post_flight_recovery
+assert_contains "PR-existence check inside _post_flight_recovery" \
+    "Discover actual PR URL" \
+    "$RECOVERY_FUNC"
+
+# Structural: outcome classification is inside _post_flight_recovery
+assert_contains "Outcome classification inside _post_flight_recovery" \
+    "outcome classification line" \
+    "$RECOVERY_FUNC"
+
+# Structural: POST_RUN_HEAD initialization (empty string) alongside RESCUED_DIRTY_WORKTREE
+assert_contains "POST_RUN_HEAD initialized to empty" \
+    'POST_RUN_HEAD=""' \
+    "$RUN_CLAUDE_PILOT_BODY"
+
+# Structural: the unconditional POST_RUN_HEAD computation is guarded by PRE_RUN_HEAD and WORKTREE_DIR
+UNCONDITIONAL_HEAD_BLOCK=$(sed -n '/Compute POST_RUN_HEAD unconditionally/,/fi/p' "$DISPATCH_LIB" | head -10)
+assert_contains "POST_RUN_HEAD guard checks PRE_RUN_HEAD" \
+    'PRE_RUN_HEAD' \
+    "$UNCONDITIONAL_HEAD_BLOCK"
+assert_contains "POST_RUN_HEAD guard checks WORKTREE_DIR" \
+    'WORKTREE_DIR' \
+    "$UNCONDITIONAL_HEAD_BLOCK"
+
+# Behavioral: verify recovery fires when STATUS is empty (Branch B scenario)
+# Simulates a dirty-worktree rescue path with no structured JSON output.
+test_recovery_fires_on_branch_b() {
+    local base_dir wt_dir pre_head
+    base_dir=$(mktemp -d)
+    wt_dir="$base_dir/worktree"
+
+    # Set up a git repo to simulate dirty worktree
+    git init -q "$wt_dir" 2>/dev/null
+    git -C "$wt_dir" config user.email "test@test.com"
+    git -C "$wt_dir" config user.name "Test"
+    echo "initial" > "$wt_dir/file.txt"
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "initial" 2>/dev/null
+    pre_head=$(git -C "$wt_dir" rev-parse HEAD)
+
+    # Create dirty file (pilot-authored content)
+    echo "pilot work" > "$wt_dir/new_feature.rs"
+
+    # Source dispatch-lib and set up variables as _run_claude_pilot would
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB"
+
+        # Simulate Branch B state: STATUS is empty, exit 0, dirty worktree
+        PRE_RUN_HEAD="$pre_head"
+        POST_RUN_HEAD="$pre_head"  # Same as PRE — no commits
+        WORKTREE_DIR="$wt_dir"
+        SKILL="dev-pilot"
+        REPO="mika"
+        BRANCH="test-branch"
+        ISSUE_NUM="9999"
+        SESSION_ID="test-session"
+        LOG_ID="test-log"
+        STATUS=""  # Branch B — no structured JSON output
+        RESULT="claude-pilot completed (exit 0) but output was not structured JSON."
+        RESCUED_DIRTY_WORKTREE=0
+
+        # Redirect fd 9 to stderr for the rescue block
+        exec 9>&2
+
+        # Run the recovery function
+        _post_flight_recovery 2>/dev/null
+
+        # Check results
+        post_head=$(git -C "$wt_dir" rev-parse HEAD)
+        if [ "$pre_head" != "$post_head" ] && [ "$RESCUED_DIRTY_WORKTREE" -eq 1 ]; then
+            echo "OK"
+        else
+            echo "FAIL: pre=$pre_head post=$post_head rescued=$RESCUED_DIRTY_WORKTREE"
+        fi
+    )
+
+    rm -rf "$base_dir"
+}
+
+RESULT_17A=$(test_recovery_fires_on_branch_b 2>/dev/null)
+assert_eq "Branch B (non-JSON exit 0): dirty-worktree rescue fires and commits" "OK" "$RESULT_17A"
+
+# Behavioral: verify recovery fires when exit code is non-zero (Branch C scenario)
+test_recovery_fires_on_branch_c() {
+    local base_dir wt_dir pre_head
+    base_dir=$(mktemp -d)
+    wt_dir="$base_dir/worktree"
+
+    git init -q "$wt_dir" 2>/dev/null
+    git -C "$wt_dir" config user.email "test@test.com"
+    git -C "$wt_dir" config user.name "Test"
+    echo "initial" > "$wt_dir/file.txt"
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "initial" 2>/dev/null
+    pre_head=$(git -C "$wt_dir" rev-parse HEAD)
+
+    # Create dirty file
+    echo "pilot crash content" > "$wt_dir/partial_impl.rs"
+
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB"
+
+        PRE_RUN_HEAD="$pre_head"
+        POST_RUN_HEAD="$pre_head"
+        WORKTREE_DIR="$wt_dir"
+        SKILL="dev-pilot"
+        REPO="mika"
+        BRANCH="test-branch"
+        ISSUE_NUM="9999"
+        SESSION_ID="test-session"
+        LOG_ID="test-log"
+        STATUS=""  # Branch C — non-zero exit, no structured output
+        RESULT="claude-pilot FAILED (exit code 1)."
+        RESCUED_DIRTY_WORKTREE=0
+
+        exec 9>&2
+
+        _post_flight_recovery 2>/dev/null
+
+        post_head=$(git -C "$wt_dir" rev-parse HEAD)
+        if [ "$pre_head" != "$post_head" ] && [ "$RESCUED_DIRTY_WORKTREE" -eq 1 ]; then
+            echo "OK"
+        else
+            echo "FAIL: pre=$pre_head post=$post_head rescued=$RESCUED_DIRTY_WORKTREE"
+        fi
+    )
+
+    rm -rf "$base_dir"
+}
+
+RESULT_17B=$(test_recovery_fires_on_branch_c 2>/dev/null)
+assert_eq "Branch C (non-zero exit): dirty-worktree rescue fires and commits" "OK" "$RESULT_17B"
+
+# Behavioral: verify POST_RUN_HEAD is available for outcome classification
+# when STATUS is empty (previously Outcome was never emitted for Branch B/C)
+test_outcome_emitted_on_branch_b() {
+    local base_dir wt_dir pre_head
+    base_dir=$(mktemp -d)
+    wt_dir="$base_dir/worktree"
+
+    git init -q "$wt_dir" 2>/dev/null
+    git -C "$wt_dir" config user.email "test@test.com"
+    git -C "$wt_dir" config user.name "Test"
+    echo "initial" > "$wt_dir/file.txt"
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "initial" 2>/dev/null
+    pre_head=$(git -C "$wt_dir" rev-parse HEAD)
+
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB"
+
+        PRE_RUN_HEAD="$pre_head"
+        POST_RUN_HEAD="$pre_head"
+        WORKTREE_DIR="$wt_dir"
+        SKILL="dev-pilot"
+        REPO="mika"
+        BRANCH="test-branch"
+        ISSUE_NUM="9999"
+        SESSION_ID="test-session"
+        LOG_ID="test-log"
+        STATUS=""
+        RESULT="claude-pilot completed (exit 0) but output was not structured JSON."
+        RESCUED_DIRTY_WORKTREE=0
+
+        exec 9>&2
+
+        _post_flight_recovery 2>/dev/null
+
+        # Outcome classification should have run (PIPELINE_INCOMPLETE for zero-commit)
+        if printf '%s' "$RESULT" | grep -qF "Outcome:"; then
+            echo "OK"
+        else
+            echo "FAIL: no Outcome line in RESULT"
+        fi
+    )
+
+    rm -rf "$base_dir"
+}
+
+RESULT_17C=$(test_outcome_emitted_on_branch_b 2>/dev/null)
+assert_eq "Branch B: outcome classification fires (Outcome: line present)" "OK" "$RESULT_17C"
+
 # --- Summary ---
 
 echo ""
