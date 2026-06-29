@@ -1,0 +1,148 @@
+name: Wip Staleness Check
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: wip-staleness-check
+  cancel-in-progress: true
+
+jobs:
+  check-wip-prs:
+    name: Check wip-rescue PRs against main
+    runs-on: [self-hosted, Linux, X64, gentux]
+    steps:
+      - name: Clean stale runner diagnostic pages (mika#1542)
+        run: rm -f /var/lib/actions-runner/runner/_diag/pages/*.log 2>/dev/null || true
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install rustup if missing (self-hosted runner)
+        run: |
+          if ! command -v rustup &>/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Install Rust toolchain
+        run: rustup show  # reads rust-toolchain.toml
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2
+        with:
+          prefix-key: v1-rust
+
+      - name: Create dashboard dist placeholder
+        run: mkdir -p dashboard/dist
+
+      - name: Find and check wip-rescue PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Find open draft PRs with wip-rescue label OR wip( title prefix
+          WIP_PRS=$(gh pr list --state open --draft --json number,headRefName,title,labels \
+            --jq '[.[] | select(
+              (.title | startswith("wip(")) or
+              (.labels | map(.name) | index("wip-rescue"))
+            )]' 2>/dev/null || echo "[]")
+
+          COUNT=$(echo "$WIP_PRS" | jq 'length')
+          echo "Found $COUNT wip-rescue PR(s) to check"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No wip-rescue PRs open — nothing to do"
+            exit 0
+          fi
+
+          echo "$WIP_PRS" | jq -c '.[]' | while IFS= read -r pr; do
+            PR_NUM=$(echo "$pr" | jq -r '.number')
+            BRANCH=$(echo "$pr" | jq -r '.headRefName')
+            TITLE=$(echo "$pr" | jq -r '.title')
+            HAS_STALE_LABEL=$(echo "$pr" | jq '[.labels[].name] | index("stale-against-main") != null')
+
+            echo ""
+            echo "=== Checking PR #${PR_NUM}: ${TITLE} (branch: ${BRANCH}) ==="
+
+            # Fetch the PR branch
+            if ! git fetch origin "$BRANCH" 2>/dev/null; then
+              echo "WARN: could not fetch branch $BRANCH for PR #$PR_NUM — skipping"
+              continue
+            fi
+
+            # Create a temporary branch for the rebase test
+            TEMP_BRANCH="staleness-check/${PR_NUM}"
+            git branch -D "$TEMP_BRANCH" 2>/dev/null || true
+            git checkout -b "$TEMP_BRANCH" "origin/$BRANCH" 2>/dev/null
+
+            # Attempt rebase onto main
+            if ! git rebase origin/main 2>/dev/null; then
+              echo "Rebase conflict detected for PR #$PR_NUM — marking stale"
+              git rebase --abort 2>/dev/null || true
+              git checkout main 2>/dev/null
+              git branch -D "$TEMP_BRANCH" 2>/dev/null || true
+
+              if [ "$HAS_STALE_LABEL" = "false" ]; then
+                gh pr edit "$PR_NUM" --add-label "stale-against-main" || true
+                gh pr comment "$PR_NUM" --body "## Stale against main (mika#1631 probe)
+
+          This wip-rescue PR has **rebase conflicts** against current \`main\` (detected after merge of ${{ github.sha }}).
+
+          Action needed: rebase and resolve conflicts before promoting from draft." || true
+              fi
+              continue
+            fi
+
+            # Rebase succeeded — run clippy
+            CLIPPY_OUTPUT=""
+            if CLIPPY_OUTPUT=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1); then
+              echo "PR #$PR_NUM: clippy passes after rebase — OK"
+
+              # Remove stale label if it was set from a prior run
+              if [ "$HAS_STALE_LABEL" = "true" ]; then
+                gh pr edit "$PR_NUM" --remove-label "stale-against-main" || true
+                gh pr comment "$PR_NUM" --body "## No longer stale (mika#1631 probe)
+
+          This wip-rescue PR now passes clippy after rebase onto current \`main\`. The \`stale-against-main\` label has been removed." || true
+              fi
+            else
+              echo "PR #$PR_NUM: clippy FAILS after rebase — marking stale"
+
+              # Truncate clippy output for the comment (keep first 80 lines)
+              CLIPPY_EXCERPT=$(echo "$CLIPPY_OUTPUT" | head -80)
+
+              if [ "$HAS_STALE_LABEL" = "false" ]; then
+                gh pr edit "$PR_NUM" --add-label "stale-against-main" || true
+              fi
+
+              gh pr comment "$PR_NUM" --body "## Stale against main (mika#1631 probe)
+
+          This wip-rescue PR **fails clippy** after rebase onto current \`main\` (triggered by merge of \`${{ github.sha }}\`).
+
+          <details>
+          <summary>Clippy errors (first 80 lines)</summary>
+
+          \`\`\`
+          ${CLIPPY_EXCERPT}
+          \`\`\`
+
+          </details>
+
+          Action needed: rebase onto main, fix the compilation errors, then promote from draft." || true
+            fi
+
+            # Clean up
+            git checkout main 2>/dev/null
+            git branch -D "$TEMP_BRANCH" 2>/dev/null || true
+          done
+
+          echo ""
+          echo "Staleness check complete."

@@ -158,6 +158,14 @@
   color: "6e40c9"
   description: Release PR created by CI (release-pr workflow)
 
+- name: wip-rescue
+  color: "d97706"
+  description: "PR created by dispatch-lib wip-rescue recovery (mika#1282)"
+
+- name: stale-against-main
+  color: "b60205"
+  description: "PR branch fails clippy after rebase onto current main (mika#1631)"
+
 # ── Eval Calibration ─────────────────────────────────────────────────────────
 - name: eval-calibration
   color: "c2e0c6"

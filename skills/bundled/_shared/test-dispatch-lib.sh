@@ -2742,6 +2742,38 @@ test_outcome_emitted_on_branch_b() {
 RESULT_17C=$(test_outcome_emitted_on_branch_b 2>/dev/null)
 assert_eq "Branch B: outcome classification fires (Outcome: line present)" "OK" "$RESULT_17C"
 
+# --- Test: wip-rescue label application (mika#1631) ---
+
+echo ""
+echo "Test: wip-rescue label applied to rescued PRs (mika#1631)"
+echo "----------------------------------------------------------"
+
+# Verify the rescue flow applies the wip-rescue label after PR creation.
+# The `gh pr edit ... --add-label "wip-rescue"` call is inside the deeply-nested
+# `if [ -n "$RESCUED_PR_URL" ]` block of _post_flight_recovery. We grep the
+# file directly rather than extracting by sed range (nested braces defeat the
+# simple /pattern/,/^}/p extraction; full-file cat hits shell string limits).
+
+if grep -qF -- '--add-label "wip-rescue"' "$DISPATCH_LIB"; then
+    PASS=$((PASS + 1)); echo "  ✓ Rescue flow applies wip-rescue label"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Rescue flow applies wip-rescue label"
+fi
+
+# Verify the label application targets RESCUED_PR_URL
+if grep -qF 'gh pr edit "$RESCUED_PR_URL" --add-label "wip-rescue"' "$DISPATCH_LIB"; then
+    PASS=$((PASS + 1)); echo "  ✓ Label applied to RESCUED_PR_URL"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Label applied to RESCUED_PR_URL"
+fi
+
+# Verify it's fault-tolerant (|| true) — label failure must not break the rescue
+if grep -qF 'wip-rescue" 2>&9 || true' "$DISPATCH_LIB"; then
+    PASS=$((PASS + 1)); echo "  ✓ Label application is fault-tolerant (|| true)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Label application is fault-tolerant (|| true)"
+fi
+
 # --- Summary ---
 
 echo ""
