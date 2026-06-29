@@ -3879,6 +3879,147 @@ mod tests {
         assert!(!has_pending_deferred_child(&db, &parent_id).await);
     }
 
+    /// AC1 + AC4: When a block[ac] verdict arrives and the global dispatch slot
+    /// is busy (another active callback occupies it), the handler calls
+    /// `register_deferred_callback` which creates a deferred child task, and
+    /// emits the `verdict_redispatch_deferred` audit event.
+    #[tokio::test]
+    async fn block_ac_registers_deferred_when_slot_busy() {
+        use crate::skills::index::{ResolvedSkillTool, SkillEntry};
+        use crate::skills::manifest::ToolHandler;
+        use mika_common::claude::ToolDefinition;
+
+        let db = cb_test_db().await;
+
+        // 1. Create the task that will receive the block[ac] verdict.
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1630";
+        let task_id = create_task_with_pr_url(&db, pr_url, "in_progress").await;
+
+        // 2. Create a DIFFERENT task with an active (non-deferred) callback child
+        //    to occupy the global implement dispatch slot.
+        let blocker_pr = "https://github.com/senara-solutions/mika/pull/9999";
+        let blocker_id = create_task_with_pr_url(&db, blocker_pr, "in_progress").await;
+        create_callback_child(
+            &db,
+            &blocker_id,
+            "long_running:run_claude_pilot",
+            "in_progress",
+        )
+        .await;
+
+        // 3. Build a SkillRegistry with a resolvable `run_claude_pilot` tool so
+        //    the handler reaches `validate_dispatch_readiness` instead of falling
+        //    back immediately.
+        let tmp = tempfile::tempdir().unwrap();
+        let handler_path = tmp.path().join("run.sh");
+        std::fs::write(&handler_path, "#!/bin/sh\nexit 0").unwrap();
+
+        let mut dev_pilot = {
+            use crate::skills::manifest::{SkillInfo, SkillManifest, Triggers};
+            SkillEntry {
+                manifest: SkillManifest {
+                    skill: SkillInfo {
+                        name: "dev-pilot".to_string(),
+                        description: "dev-pilot skill".to_string(),
+                        version: String::new(),
+                        always_on: false,
+                        timeout_secs: 30,
+                        dependencies: vec![],
+                        max_prompt_size: None,
+                    },
+                    triggers: Triggers { keywords: vec![] },
+                    llm: Default::default(),
+                    constraints: Default::default(),
+                    output: Default::default(),
+                    context: std::collections::HashMap::new(),
+                    variants: Default::default(),
+                },
+                dir: tmp.path().to_path_buf(),
+                keywords_lower: vec![],
+                prompt_snippet: String::new(),
+                skill_tools: vec![],
+                enabled: true,
+                has_override: false,
+                provider_overrides: std::collections::HashMap::new(),
+                prompt_sources: SkillEntry::empty_prompt_sources(),
+                model_overrides: std::collections::HashMap::new(),
+            }
+        };
+        dev_pilot.skill_tools = vec![ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "dispatch".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "run.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(600),
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        }];
+        let skills = SkillRegistry::from_test_entries(vec![dev_pilot]);
+
+        // 4. Send the block[ac] verdict through handle_block_ac.
+        let event = PrReviewEvent {
+            state: "commented".to_string(),
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 1630,
+            title: "fix: verdict handler".to_string(),
+            reviewer: "mika-qa".to_string(),
+            review_url: "https://github.com/senara-solutions/mika/pull/1630#pullrequestreview-1"
+                .to_string(),
+            body: "PLAN-AC VERIFICATION:\n\
+                   - [❌] unsatisfied: AC1 missing test\n\n\
+                   VERDICT: block[ac]\n\
+                   REASON: AC1 unsatisfied."
+                .to_string(),
+        };
+
+        let session_id = "cb-test-session";
+        let trace_id = "trace-deferred-1";
+        let action = handle_block_ac(&event, &db, None, None, session_id, trace_id, &skills).await;
+
+        // 5. Assert VerdictAction::Handled with deferred mention in pre-digest.
+        match &action {
+            VerdictAction::Handled { pre_digest } => {
+                assert!(
+                    pre_digest.contains("deferred") || pre_digest.contains("queued"),
+                    "Expected deferred/queued in pre-digest, got: {pre_digest}"
+                );
+            }
+            other => {
+                panic!("Expected VerdictAction::Handled for slot-busy deferred path, got {other:?}")
+            }
+        }
+
+        // 6. Assert a deferred child task was created in the DB.
+        let children = db.get_child_tasks(&task_id).await.unwrap();
+        let deferred_child = children
+            .iter()
+            .find(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL && c.status == "pending");
+        assert!(
+            deferred_child.is_some(),
+            "Expected a pending deferred child task (label = '{}'), children: {:?}",
+            crate::agent::DEFERRED_DISPATCH_LABEL,
+            children
+                .iter()
+                .map(|c| (&c.label, &c.status))
+                .collect::<Vec<_>>()
+        );
+
+        // 7. AC4: Assert `verdict_redispatch_deferred` audit event was emitted.
+        let events = db.get_audit_events(session_id).await.unwrap();
+        let has_deferred_event = events
+            .iter()
+            .any(|e| e.tool_name == "verdict_redispatch_deferred");
+        assert!(
+            has_deferred_event,
+            "Expected verdict_redispatch_deferred audit event, found: {:?}",
+            events.iter().map(|e| &e.tool_name).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn block_ci_fallback_to_llm_when_tool_not_found() {
         // Mirror of block_ac_fallback test for block[ci].
