@@ -2483,6 +2483,8 @@ RESCUEBODY
 
         if [ -n "$RESCUED_PR_URL" ]; then
             PR_URL="$RESCUED_PR_URL"
+            # mika#1631: tag rescued PRs for staleness-probe targeting
+            gh pr edit "$RESCUED_PR_URL" --add-label "wip-rescue" 2>&9 || true
             # mika#1352: emit canonical `PR:` line alongside the descriptive
             # `Draft PR (dispatch-lib recovery):` line. mika-dev's callback
             # parser (dispatcher.rs:1780) matches line-anchored `^PR: ` —
