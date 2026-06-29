@@ -127,3 +127,13 @@ cargo test -p mika-gateway
 - **P1 #2** adds a second SQL statement on the success path. The window between upsert and UPDATE is short; a crash there leaves the old secret (safe — inbound works). The only risk is the UPDATE failing silently, which we mitigate by logging the error.
 - **P2, P3, P3-log** are minor, isolated changes.
 - **Integration tests** require a Postgres test database (`sqlx::test` handles this automatically via `DATABASE_URL`).
+
+## Acceptance criteria
+
+- **AC1** — `make_interval(hours => $9)` bind: change `ttl_hours as f64` → `ttl_hours as i32` at `crates/mika-gateway/src/routes.rs:1032`. Endpoint returns 2xx for provisioning paths instead of 500.
+- **AC2** — `webhook_secret` rotation atomic with successful `setWebhook`: two-phase upsert preserves existing secret on conflict when status is not `provisioned`; rotation UPDATE runs only after `setWebhook` returns 2xx.
+- **AC3** — Case-insensitive `bot_username` comparison in the active-customer guard.
+- **AC4** — Pairing-token fabrication suppressed for active customers.
+- **AC5** — Integration test exercises upsert + active-customer re-register (make_interval bind, secret rotation, idempotent re-register).
+- **AC6** — `setWebhook` error log redacts the bot-token URL.
+- **AC7** — `cargo build -p mika-gateway` and `cargo test -p mika-gateway` pass.
