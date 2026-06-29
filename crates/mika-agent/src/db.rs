@@ -4986,6 +4986,18 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Resolve a task ID prefix to matching full task IDs, scoped to the given agent.
+    /// Returns up to 10 matching IDs for ambiguity reporting.
+    pub fn resolve_task_id_by_prefix(&self, prefix: &str, agent_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM tasks WHERE id LIKE ?1 || '%' AND agent_id = ?2 ORDER BY id LIMIT 10",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![prefix, agent_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Get a manual (task) task by ID, scoped to the given agent.
     pub fn get_manual_task(&self, id: &str, agent_id: &str) -> Result<Option<Task>> {
         let sql = format!(
@@ -11299,6 +11311,124 @@ mod tests {
         assert_eq!(t.status, "cancelled");
         // Cancelling again returns false
         assert!(!db.cancel_task(&id, "mika").unwrap());
+    }
+
+    #[test]
+    fn test_resolve_task_id_by_prefix_unique_match() {
+        let db = db();
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Prefix test".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let id = db.create_task(&task).unwrap();
+        // Use the first 12 chars as prefix (same as tasks list display)
+        let prefix = &id[..12];
+        let matches = db.resolve_task_id_by_prefix(prefix, "mika").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], id);
+    }
+
+    #[test]
+    fn test_resolve_task_id_by_prefix_exact_match() {
+        let db = db();
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Full UUID test".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let id = db.create_task(&task).unwrap();
+        // Full UUID also works via prefix match
+        let matches = db.resolve_task_id_by_prefix(&id, "mika").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], id);
+    }
+
+    #[test]
+    fn test_resolve_task_id_by_prefix_no_match() {
+        let db = db();
+        let matches = db
+            .resolve_task_id_by_prefix("nonexistent-prefix", "mika")
+            .unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_task_id_by_prefix_scoped_to_agent() {
+        let db = db();
+        db.register_agent("agent-a", "Agent A", "/tmp/a").unwrap();
+        db.register_agent("agent-b", "Agent B", "/tmp/b").unwrap();
+        let task = NewTask {
+            agent_id: "agent-a".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Agent A task".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let id = db.create_task(&task).unwrap();
+        let prefix = &id[..12];
+        // Same prefix, different agent — should not match
+        let matches = db.resolve_task_id_by_prefix(prefix, "agent-b").unwrap();
+        assert!(matches.is_empty());
+        // Correct agent — should match
+        let matches = db.resolve_task_id_by_prefix(prefix, "agent-a").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], id);
     }
 
     #[test]
