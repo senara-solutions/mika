@@ -6,6 +6,16 @@
 //! Usage:
 //!   calibrate --role mika-dev --model anthropic/claude-sonnet-4-6
 //!   calibrate --role mika-arch --model anthropic/claude-opus-4-6 --baseline docs/eval/calibration/baselines/latest.md
+//!
+//! ## Authentication
+//!
+//! The binary performs the same dotenv initialization as mika-spirit
+//! (`resolve_home_dir` + `load_dotenv`) before creating the LLM provider.
+//! For Anthropic OAuth tokens (`sk-ant-oat*`), this ensures the
+//! `OAuthTokenManager` can resolve the token cache at `~/.mika/oauth.json`.
+//! The `check_health()` preflight (below) verifies auth before running
+//! scenarios — if mika-spirit can call Anthropic on this host, so can
+//! `calibrate`.
 
 use std::path::PathBuf;
 
@@ -51,6 +61,16 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // Initialize environment — same sequence as mika-spirit
+    let home_dir = match mika_common::home::resolve_home_dir() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Error: could not resolve Mika home directory: {e}");
+            std::process::exit(2);
+        }
+    };
+    mika_common::dotenv::load_dotenv(&home_dir);
 
     // Validate role
     let scenarios = match args.role.as_str() {
