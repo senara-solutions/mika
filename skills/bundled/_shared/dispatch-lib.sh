@@ -1032,7 +1032,7 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit befor
             # listing is the discoverable read.
             EXISTING_PR=""
             if command -v gh &>/dev/null; then
-                EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
+                EXISTING_PR=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
             fi
 
             if [ -z "$EXISTING_PR" ]; then
@@ -1055,13 +1055,13 @@ PR_BODY_EOF
 )"
 
                 if PR_CREATE_OUT=$(gh pr create \
-                        --repo "$REPO" \
+                        --repo "senara-solutions/$REPO" \
                         --base main \
                         --head "$BRANCH" \
                         --title "$PR_TITLE" \
                         --body "$PR_BODY" 2>&1); then
                     # Re-query the PR URL (gh pr create prints it but parsing is fragile).
-                    EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
+                    EXISTING_PR=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
                     RESULT="${RESULT}
 
 dispatch-lib (mika#1383): auto-created PR ${EXISTING_PR} from pilot's commits â€” pilot reached end_turn without invoking gh pr create."
@@ -1072,7 +1072,7 @@ dispatch-lib (mika#1383): auto-created PR ${EXISTING_PR} from pilot's commits â€
 gh pr create error: $(printf '%s' "$PR_CREATE_OUT" | head -5)
 
 Manual recovery:
-  gh pr create --repo ${REPO} --base main --head ${BRANCH} --title \"<title>\" --body \"<body>\"
+  gh pr create --repo senara-solutions/${REPO} --base main --head ${BRANCH} --title \"<title>\" --body \"<body>\"
 
 ${RESULT}"
                 fi
