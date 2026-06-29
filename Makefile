@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install test test-async-db-saturation test-dispatch-symmetry verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch
+.PHONY: build build-dashboard deploy stop restart install test test-async-db-saturation test-dispatch-symmetry verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -85,6 +85,10 @@ calibrate-mika-dev: ## Pre-swap calibration gate for mika-dev (MODEL=provider/mo
 calibrate-mika-arch: ## Pre-swap calibration gate for mika-arch (MODEL=provider/model required)
 	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-arch MODEL=anthropic/claude-sonnet-4-6" >&2; exit 1; fi
 	cargo run --bin calibrate --release -- --role mika-arch --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
+
+calibrate-mika-qa: ## Pre-swap calibration gate for mika-qa (MODEL=provider/model required)
+	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-qa MODEL=anthropic/claude-sonnet-4-6" >&2; exit 1; fi
+	cargo run --bin calibrate --release -- --role mika-qa --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
 
 test: ## Run all tests
 	cargo test

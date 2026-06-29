@@ -262,9 +262,10 @@ See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, 
 
 `src/calibration/` — Pre-swap calibration gate for agent model changes. Role-scoped scenario suites with structural assertions (no LLM-as-judge). Framework lives in the library crate; the `calibrate` binary (`src/bin/calibrate.rs`) provides the operator-facing CLI.
 
-**Two role suites (v1):**
+**Three role suites (v1):**
 - **mika-dev** (5 scenarios): refusal_regression (#1168), contract_dev_groom (#1166), golden_path_dispatch, required_tools_gate, plan_callout_recognition
 - **mika-arch** (5 scenarios): groom_ticket_basic, groom_milestone, citation_discipline, disposition_keyword_discipline, required_finding_list
+- **mika-qa** (5 scenarios, #1632): verdict_format_precision, per_ac_enumeration, absence_claim_grounding, wip_rescue_skip, no_fabricated_fix
 
 **Fixtures:** Markdown inputs at `tests/eval/calibration_fixtures/<role>/<scenario>.md` + YAML manifests at `tests/eval/calibration_fixtures/<role>/manifest.yaml`.
 
@@ -278,6 +279,7 @@ See `tests/eval/golden/README.md` for author-facing guidance (fixture patterns, 
 - `calibration/failure.rs` — FailureClass enum (Refusal, Fabrication, EmptyResponse, Timeout, TransportError, ContractViolation, Other)
 - `calibration/roles/mika_dev.rs` — mika-dev scenario implementations
 - `calibration/roles/mika_arch.rs` — mika-arch scenario implementations
+- `calibration/roles/mika_qa.rs` — mika-qa scenario implementations (#1632)
 
 **Baselines:** `docs/eval/calibration/baselines/`. Every model-swap PR must include the calibration report.
 

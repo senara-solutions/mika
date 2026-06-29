@@ -14,7 +14,7 @@ use clap::Parser;
 use mika_agent::calibration::artifact::CalibrationArtifact;
 use mika_agent::calibration::providers::create_provider_from_spec;
 use mika_agent::calibration::role::RoleScoreReport;
-use mika_agent::calibration::roles::{mika_arch, mika_dev};
+use mika_agent::calibration::roles::{mika_arch, mika_dev, mika_qa};
 
 /// Model calibration gate for Mika agent roles.
 ///
@@ -56,9 +56,10 @@ async fn main() {
     let scenarios = match args.role.as_str() {
         "mika-dev" => mika_dev::SCENARIOS,
         "mika-arch" => mika_arch::SCENARIOS,
+        "mika-qa" => mika_qa::SCENARIOS,
         other => {
             eprintln!(
-                "Error: unknown role '{}'. Valid roles: mika-dev, mika-arch",
+                "Error: unknown role '{}'. Valid roles: mika-dev, mika-arch, mika-qa",
                 other
             );
             std::process::exit(2);
@@ -127,6 +128,7 @@ async fn main() {
         let result = match args.role.as_str() {
             "mika-dev" => mika_dev::run_scenario(scenario.id, provider.clone()).await,
             "mika-arch" => mika_arch::run_scenario(scenario.id, provider.clone()).await,
+            "mika-qa" => mika_qa::run_scenario(scenario.id, provider.clone()).await,
             _ => unreachable!(),
         };
 
