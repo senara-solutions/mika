@@ -288,4 +288,79 @@ mod tests {
                 .contains("no archived snapshot")
         );
     }
+
+    // --- AC9-12 DB-level candidate query tests (mika#1584) ---
+
+    fn insert_override(
+        db: &crate::db::Database,
+        agent_id: &str,
+        name: &str,
+        lifecycle: Option<&str>,
+        use_count: i64,
+        last_used: Option<&str>,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO skill_overrides
+                 (agent_id, skill_name, always_on, llm_provider, llm_model, enabled,
+                  lifecycle_state, use_count, last_used_at)
+                 VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3, ?4, ?5)",
+                rusqlite::params![agent_id, name, lifecycle, use_count, last_used],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_get_archival_candidates_fresh_agent_returns_empty() {
+        // AC9: no skill rows → zero candidates
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let result = db.get_archival_candidates("test-agent", 30).unwrap();
+        assert!(result.is_empty(), "fresh agent should have no candidates");
+    }
+
+    #[test]
+    fn test_get_archival_candidates_staged_skill_excluded() {
+        // AC10: lifecycle_state='staged' → zero candidates (gate excludes non-active)
+        let db = crate::db::Database::open_in_memory().unwrap();
+        insert_override(&db, "test-agent", "staged-skill", Some("staged"), 0, None);
+        let result = db.get_archival_candidates("test-agent", 30).unwrap();
+        assert!(
+            result.is_empty(),
+            "staged skill must be excluded from archival candidates"
+        );
+    }
+
+    #[test]
+    fn test_get_archival_candidates_idle_active_skill_returned() {
+        // AC11: active skill with last_used_at >30d ago → one candidate
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let old_time = crate::timestamp::format(&(chrono::Utc::now() - chrono::Duration::days(60)));
+        insert_override(
+            &db,
+            "test-agent",
+            "idle-active-skill",
+            Some("active"),
+            1,
+            Some(&old_time),
+        );
+        let result = db.get_archival_candidates("test-agent", 30).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "idle active skill must be returned as a candidate"
+        );
+        assert_eq!(result[0].skill_name, "idle-active-skill");
+    }
+
+    #[test]
+    fn test_get_archival_candidates_null_lifecycle_excluded() {
+        // AC12: bundled/marketplace skill (NULL lifecycle_state) → zero candidates
+        let db = crate::db::Database::open_in_memory().unwrap();
+        insert_override(&db, "test-agent", "bundled-skill", None, 0, None);
+        let result = db.get_archival_candidates("test-agent", 30).unwrap();
+        assert!(
+            result.is_empty(),
+            "NULL lifecycle_state (bundled/marketplace) must be excluded"
+        );
+    }
 }
