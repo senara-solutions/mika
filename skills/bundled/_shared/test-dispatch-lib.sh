@@ -2421,15 +2421,18 @@ assert_eq "Bare hyphenated repo parses unchanged" \
 assert_eq "Free-text prompt with embedded # stays free-text (empty REPO)" \
     "|" "$(_parse_prompt 'fix the foo#bar thing and more')"
 
-# --- Test 16: _find_issue_plan header-shape discovery (mika#1602, n=3) ---
+# --- Test 16: _find_issue_plan header-shape discovery (mika#1602, n=3; mika#1617, n=5) ---
 #
 # Behavioral test: source dispatch-lib.sh (verified side-effect-free — function
 # definitions only, no top-level execution) and call the real _find_issue_plan
-# against temp `docs/plans/` fixtures. Proves AC1–AC4:
-#   AC1 — `**Issue:** mika#N` (and `issue: mika#N`) headers are discoverable.
-#   AC2 — the legacy `**Ticket:** mika#N` and `ticket: mika#N` shapes still match.
-#   AC3 — the primary filename pass (`*-N-*-plan.md`) still matches.
+# against temp `docs/plans/` fixtures. Proves AC1–AC4 (tier 2) plus tier-3
+# broad content scan (mika#1617):
+#   AC1 — `**Issue:** mika#N` (and `issue: mika#N`) headers are discoverable (tier 2).
+#   AC2 — the legacy `**Ticket:** mika#N` and `ticket: mika#N` shapes still match (tier 2).
+#   AC3 — the primary filename pass (`*-N-*-plan.md`) still matches (tier 1).
 #   AC4 — the `**Issue:**` case FAILS on the pre-fix regex and PASSES after.
+#
+# Tier-3 tests live in tests/test_find_issue_plan.sh (dedicated test suite).
 #
 # Each fixture is padded > 500 bytes to satisfy the mika#1033 size filter.
 
@@ -2502,10 +2505,12 @@ assert_eq "Negative: **Issue:** mika#9999 not matched for ISSUE_NUM=1602" \
     "NOTFOUND" \
     "$(_fip_probe 1602 '**Issue:** mika#9999' '2026-06-27-008-wrong-number-plan.md')"
 
-# Negative — header below the first-20-lines zone must NOT match (header-zone scope intact).
-assert_eq "Negative: **Issue:** mika#1602 on line 30 not matched (header-zone scope)" \
+# Negative — header below the first-50-lines zone must NOT match (header-zone scope intact).
+# With tier 3 (mika#1617), the broad scan covers 50 lines, so the offset must
+# push the reference past line 50 to remain a negative test.
+assert_eq "Negative: **Issue:** mika#1602 on line 55 not matched (header-zone scope)" \
     "NOTFOUND" \
-    "$(_fip_probe 1602 '**Issue:** mika#1602' '2026-06-27-009-deep-header-plan.md' 30)"
+    "$(_fip_probe 1602 '**Issue:** mika#1602' '2026-06-27-009-deep-header-plan.md' 55)"
 
 # --- Summary ---
 

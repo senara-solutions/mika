@@ -1086,12 +1086,12 @@ See: docs/solutions/workflow-issues/2026-06-14-dev-groom-drift-misdiagnosis-poli
 ${RESULT}"
             elif [ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]; then
                 # Both checks failed: no plan file AND /ce:plan never called
-                RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md and no header-line match in first 20 lines for known prefixes) and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's regex didn't match the header shape — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1602 class).
+                RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines) and no /ce:plan invocation detected in session log. Likely causes: (a) pilot drifted into executor mode without writing a plan, (b) plan was written but _find_issue_plan's regex didn't match the header shape — check \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes to distinguish (see mika#1602 class).
 
 ${RESULT}"
             elif [ -z "$VALID_PLAN" ]; then
                 # Plan file missing but /ce:plan was called (or log unavailable)
-                RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md and no header-line match in first 20 lines for known prefixes). Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1602 class); if no plan exists, the pilot drifted into executor mode.
+                RESULT="PIPELINE FAILURE: dev-groom: _find_issue_plan returned empty for $REPO#$ISSUE_NUM (no filename match *-${ISSUE_NUM}-*-plan.md, no anchored header match in first 20 lines, and no broad issue-number reference in first 50 lines). Inspect \${WORKTREE_DIR}/docs/plans/*-plan.md >500 bytes directly — if a plan exists, this is a _find_issue_plan discovery bug (see mika#1617 class); if no plan exists, the pilot drifted into executor mode.
 
 ${RESULT}"
             elif [ "$CE_PLAN_INVOKED" != "1" ] && [ "$CE_PLAN_INVOKED" != "unknown" ]; then
@@ -1405,23 +1405,27 @@ Dedup-rebase failed (${dedup_conflicts:+conflict: $dedup_conflicts}${dedup_confl
 _find_issue_plan() {
     # Locate the plan file for $REPO#$ISSUE_NUM in $WORKTREE_DIR/docs/plans.
     #
-    # Primary: filename embeds the issue number — `*-${ISSUE_NUM}-*-plan.md`
+    # Three-tier discovery (evaluated in strict order; first match wins):
+    #
+    # Tier 1 (filename): `*-${ISSUE_NUM}-*-plan.md` — fast, exact.
     #          (the convention most existing plans follow:
     #          e.g. `2026-06-05-001-fix-1407-pilot-push-diagnosis-plan.md`).
     #
-    # Fallback: scan recently-written plan files for an explicit ticket
-    #          reference in their content. The pilot is instructed to set
-    #          `**Ticket:** mika issue#N` in the plan header but may also
-    #          name the plan with a date-prefix slug-tail that does NOT
-    #          embed the issue number (e.g. mika#771 wrote
-    #          `2026-06-06-003-feat-post-condition-guard-send-message-plan.md`).
-    #          Without this fallback, `_iterate_groom_loop` returns 1, the
-    #          architect is never called, and the ticket lands in a half-state
-    #          (plan committed, verdict missing). This is the founding
-    #          incident for mika#1421 — bound at n=2 on 2026-06-06 across
-    #          mika#1381 (n=1, 11:37Z) and mika#771 (n=2, 17:29Z).
+    # Tier 2 (anchored header, first 20 lines): scan for four prefixes
+    #          (`**Ticket:**`, `**Issue:**`, `ticket:`, `issue:`) followed
+    #          by `mika ... #${ISSUE_NUM}`. Covers the pilot's standard
+    #          header shapes. 20-line zone prevents false-positives from
+    #          body prose that quotes other tickets' headers (mika#1421).
+    #          Founding incident: mika#1421 (n=2, 2026-06-06).
     #
-    # Both passes apply the >500-byte filter (mika#1033) and return the
+    # Tier 3 (broad content scan, first 50 lines): catches remaining
+    #          shapes where the issue number appears in a non-standard
+    #          format — parenthesized in H1 `(#N)`, bare `#N` in summary,
+    #          `Closes #N`, YAML `number: N`, etc. Wider zone (50 lines)
+    #          to cover preamble sections below frontmatter. Five founding
+    #          incidents this month (mika#1617, n=5).
+    #
+    # All tiers apply the >500-byte filter (mika#1033) and return the
     # most-recent match. Prints the absolute plan path on success; returns
     # non-zero with no stdout on failure. Callers must check `[ -n ... ]`
     # AND `[ -r ... ]` exactly as before.
@@ -1463,6 +1467,20 @@ _find_issue_plan() {
         [ -r "$candidate" ] || continue
         if head -n 20 "$candidate" 2>/dev/null \
             | grep -qE "^(\*\*Ticket:\*\*|\*\*Issue:\*\*|ticket:|issue:)\s+mika[[:space:]]?(issue)?#${ISSUE_NUM}\b"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done < <(find "$WORKTREE_DIR/docs/plans" -name "*-plan.md" -size +500c 2>/dev/null | sort -r)
+
+    # Tier 3: broad issue-number reference in header zone (first 50 lines).
+    # Catches plan shapes where the issue number appears in a non-standard
+    # format — parenthesized in H1, bare `#N` in summary, YAML `number: N`,
+    # etc. Wider zone (50 lines vs tier-2's 20) to cover preamble sections
+    # that sit below frontmatter. (mika#1617, N=5 founding incidents.)
+    while IFS= read -r candidate; do
+        [ -r "$candidate" ] || continue
+        if head -n 50 "$candidate" 2>/dev/null \
+            | grep -qE "(#${ISSUE_NUM}\b|(issue|ticket|number|id):[[:space:]]*${ISSUE_NUM}\b)"; then
             printf '%s' "$candidate"
             return 0
         fi
