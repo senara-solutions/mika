@@ -543,6 +543,16 @@ pub enum SkillsCommand {
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
     },
+    /// Promote a staged skill to active (mika#1582)
+    Promote {
+        /// Skill name
+        name: String,
+    },
+    /// Archive an active skill (mika#1582)
+    Archive {
+        /// Skill name
+        name: String,
+    },
     /// Manage per-skill LLM provider/model overrides
     Llm {
         /// Skill name

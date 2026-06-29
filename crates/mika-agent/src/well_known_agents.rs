@@ -131,6 +131,7 @@ emoji = \"🛠\"\n\
 enabled = false\n\
 \n\
 [skills]\n\
+allow_authoring = false\n\
 allowlist = [\n\
   \"self-dev\",\n\
   \"self-dev-callback\",\n\
@@ -190,6 +191,7 @@ emoji = \"🔍\"\n\
 enabled = false\n\
 \n\
 [skills]\n\
+allow_authoring = false\n\
 allowlist = [\n\
   \"qa-review\",\n\
   \"qa-review-build-callback\",\n\
@@ -265,6 +267,7 @@ pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
     "delete_skill",
     "toggle_skill",
     "update_skill",
+    "skill_manage",
     // Config / files
     "set_config",
     "write_agent_file",
@@ -357,6 +360,7 @@ docs_roots = [
 inject = false
 
 [skills]
+allow_authoring = false
 allowlist = [{allowlist_block}]
 
 [tools]
@@ -431,8 +435,12 @@ pub fn well_known_skill_allowlists() -> Vec<(&'static str, Vec<String>)> {
 ///
 /// Sections NOT listed here are preserved verbatim from the on-disk file (operator-owned:
 /// `name`, `emoji`, `[reflection]`, `[kg]`).
-pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] =
-    &["skills.allowlist", "tools.disabled", "context.summary"];
+pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] = &[
+    "skills.allowlist",
+    "skills.allow_authoring",
+    "tools.disabled",
+    "context.summary",
+];
 
 /// Walk a dotted path through a `toml::Value` tree.
 ///
@@ -1236,6 +1244,7 @@ emoji = \"🧪\"\n\
 enabled = false\n\
 \n\
 [skills]\n\
+allow_authoring = false\n\
 allowlist = [\"__mika_test_no_skills__\"]\n";
 
 const MIKA_ARCH_SOUL: &str = r#"# Mika Architect — Plan Review Agent

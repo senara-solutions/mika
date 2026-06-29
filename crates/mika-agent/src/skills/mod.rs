@@ -643,8 +643,8 @@ impl SkillRegistry {
     /// doesn't match an installed skill name. Does not fail — only emits
     /// `tracing::warn` for each unresolvable dependency.
     pub fn apply_overrides(&mut self, overrides: &[SkillOverride]) {
-        // Phase 0: Evict disabled skills.
-        // Collect disabled skill names first, then evict using retain() + staging vec.
+        // Phase 0: Evict disabled skills AND lifecycle-gated skills (staged/archived).
+        // Collect names to evict first, then evict using retain() + staging vec.
         // Can't borrow `self.disabled` while `self.skills` is mutably borrowed by retain().
         let disabled_names: Vec<String> = overrides
             .iter()
@@ -652,22 +652,41 @@ impl SkillRegistry {
             .map(|ov| ov.skill_name.clone())
             .collect();
 
-        if !disabled_names.is_empty() {
+        // Lifecycle-gated eviction (mika#1582): skills with lifecycle_state
+        // `staged` or `archived` are not yet promoted / have been retired.
+        let lifecycle_evict_names: Vec<String> = overrides
+            .iter()
+            .filter(|ov| {
+                matches!(
+                    ov.lifecycle_state.as_deref(),
+                    Some("staged") | Some("archived")
+                )
+            })
+            .map(|ov| ov.skill_name.clone())
+            .collect();
+
+        if !disabled_names.is_empty() || !lifecycle_evict_names.is_empty() {
             let mut evicted = Vec::new();
             self.skills.retain(|entry| {
-                let is_disabled = disabled_names
+                let name = &entry.manifest.skill.name;
+                let is_disabled = disabled_names.iter().any(|n| name.eq_ignore_ascii_case(n));
+                let is_lifecycle_gated = lifecycle_evict_names
                     .iter()
-                    .any(|n| entry.manifest.skill.name.eq_ignore_ascii_case(n));
+                    .any(|n| name.eq_ignore_ascii_case(n));
                 if is_disabled {
                     tracing::info!(
-                        skill = %entry.manifest.skill.name,
+                        skill = %name,
                         "skill disabled via DB override — evicted from registry"
                     );
-                    evicted.push(DisabledSkill {
-                        name: entry.manifest.skill.name.clone(),
-                    });
+                    evicted.push(DisabledSkill { name: name.clone() });
+                } else if is_lifecycle_gated {
+                    tracing::info!(
+                        skill = %name,
+                        "skill lifecycle-gated (staged/archived) — evicted from registry"
+                    );
+                    evicted.push(DisabledSkill { name: name.clone() });
                 }
-                !is_disabled
+                !is_disabled && !is_lifecycle_gated
             });
             self.disabled.extend(evicted);
         }
@@ -2249,6 +2268,170 @@ mod tests {
         assert_eq!(registry.disabled().len(), 1);
     }
 
+    // -- Lifecycle-gated eviction tests (#1582 — AC5 end-to-end flow, AC6 equivalence) --
+
+    /// AC5: End-to-end lifecycle flow. A skill is evicted while `staged`,
+    /// retained once promoted to `active`, and evicted again once `archived`.
+    /// Each step rebuilds the registry from scratch to mirror production, where
+    /// `lifecycle_state` is re-read from the DB and `apply_overrides()` re-runs
+    /// on every skill (re)load — eviction is destructive within a single load,
+    /// so the "flow" is a sequence of reload cycles. Covers all four predicate
+    /// branches the new `lifecycle_evict_names` path adds: staged/archived →
+    /// evicted, active/None → retained.
+    #[test]
+    fn test_apply_overrides_lifecycle_state_end_to_end_flow() {
+        use crate::db::SkillOverride;
+
+        // Helper: fresh registry holding a single lifecycle-managed skill plus a
+        // bystander, apply one lifecycle_state override, return (survivors, evicted).
+        fn evict_for_state(state: Option<&str>) -> (Vec<String>, Vec<String>) {
+            let mut registry = SkillRegistry {
+                skipped: Vec::new(),
+                disabled: Vec::new(),
+                validated_warnings: Vec::new(),
+                skills: vec![
+                    make_entry("authored-skill", false, true),
+                    make_entry("bystander", false, true),
+                ],
+            };
+            registry.apply_overrides(&[SkillOverride {
+                skill_name: "authored-skill".to_string(),
+                always_on: None,
+                llm_provider: None,
+                llm_model: None,
+                enabled: None,
+                lifecycle_state: state.map(str::to_string),
+                use_count: 0,
+                last_used_at: None,
+            }]);
+            let survivors = registry
+                .skills
+                .iter()
+                .map(|e| e.manifest.skill.name.clone())
+                .collect();
+            let evicted = registry.disabled.iter().map(|d| d.name.clone()).collect();
+            (survivors, evicted)
+        }
+
+        // Step 1 — staged: skill not yet promoted, evicted from the registry.
+        let (survivors, evicted) = evict_for_state(Some("staged"));
+        assert_eq!(survivors, vec!["bystander".to_string()]);
+        assert_eq!(evicted, vec!["authored-skill".to_string()]);
+
+        // Step 2 — active: skill promoted, retained in the registry.
+        let (survivors, evicted) = evict_for_state(Some("active"));
+        assert_eq!(
+            survivors,
+            vec!["authored-skill".to_string(), "bystander".to_string()]
+        );
+        assert!(evicted.is_empty());
+
+        // Step 3 — archived: skill retired, evicted from the registry.
+        let (survivors, evicted) = evict_for_state(Some("archived"));
+        assert_eq!(survivors, vec!["bystander".to_string()]);
+        assert_eq!(evicted, vec!["authored-skill".to_string()]);
+
+        // Step 4 — None (no lifecycle row): unmanaged skill, retained.
+        let (survivors, evicted) = evict_for_state(None);
+        assert_eq!(
+            survivors,
+            vec!["authored-skill".to_string(), "bystander".to_string()]
+        );
+        assert!(evicted.is_empty());
+    }
+
+    /// AC6: Predicate-extension equivalence. With every override carrying
+    /// `lifecycle_state: None`, the new `lifecycle_evict_names` branch must
+    /// contribute nothing — the eviction set must equal the pre-change,
+    /// disabled-only eviction set. Asserted as an explicit `assert_eq!` between
+    /// the observed eviction set and the independently-computed `enabled ==
+    /// Some(false)` set, pinning the invariant that NULL lifecycle_state is
+    /// behaviourally identical to the code before #1582.
+    #[test]
+    fn test_apply_overrides_null_lifecycle_state_equivalent_to_disabled_only() {
+        use crate::db::SkillOverride;
+
+        // Fixture: four skills; one explicitly disabled, the rest untouched —
+        // all overrides carry lifecycle_state: None (the shape the #1582 diff
+        // added to 20+ existing fixtures).
+        let overrides = vec![
+            SkillOverride {
+                skill_name: "alpha".to_string(),
+                always_on: None,
+                llm_provider: None,
+                llm_model: None,
+                enabled: Some(false),
+                lifecycle_state: None,
+                use_count: 0,
+                last_used_at: None,
+            },
+            SkillOverride {
+                skill_name: "beta".to_string(),
+                always_on: Some(true),
+                llm_provider: None,
+                llm_model: None,
+                enabled: None,
+                lifecycle_state: None,
+                use_count: 0,
+                last_used_at: None,
+            },
+            SkillOverride {
+                skill_name: "gamma".to_string(),
+                always_on: None,
+                llm_provider: None,
+                llm_model: None,
+                enabled: Some(true),
+                lifecycle_state: None,
+                use_count: 0,
+                last_used_at: None,
+            },
+        ];
+
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("alpha", false, true),
+                make_entry("beta", false, true),
+                make_entry("gamma", false, true),
+                make_entry("delta", false, true),
+            ],
+        };
+
+        registry.apply_overrides(&overrides);
+
+        // Eviction set observed after applying overrides with all-NULL lifecycle.
+        let mut observed_evicted: Vec<String> =
+            registry.disabled.iter().map(|d| d.name.clone()).collect();
+        observed_evicted.sort();
+
+        // Pre-change behaviour: only `enabled == Some(false)` overrides evict.
+        let mut expected_disabled_only: Vec<String> = overrides
+            .iter()
+            .filter(|ov| ov.enabled == Some(false))
+            .map(|ov| ov.skill_name.clone())
+            .collect();
+        expected_disabled_only.sort();
+
+        assert_eq!(
+            observed_evicted, expected_disabled_only,
+            "NULL lifecycle_state must reproduce the pre-#1582 disabled-only eviction set"
+        );
+
+        // And the registry retains exactly the non-disabled skills.
+        let mut survivors: Vec<String> = registry
+            .skills
+            .iter()
+            .map(|e| e.manifest.skill.name.clone())
+            .collect();
+        survivors.sort();
+        assert_eq!(
+            survivors,
+            vec!["beta".to_string(), "delta".to_string(), "gamma".to_string()]
+        );
+    }
+
     // -- migrate_disabled_markers tests (#629) --
 
     #[test]
@@ -3324,5 +3507,132 @@ keywords = ["big-test"]
         assert_eq!(registry.skills[0].manifest.skill.name, "skill-b");
         // skill-a in disabled list (twice — once identity didn't evict it, then DB did)
         assert!(registry.disabled.iter().any(|d| d.name == "skill-a"));
+    }
+
+    // --- AC5 lifecycle-state eviction (mika#1582) -----------------------
+
+    fn override_for(name: &str, state: Option<&str>) -> crate::db::SkillOverride {
+        crate::db::SkillOverride {
+            skill_name: name.to_string(),
+            always_on: None,
+            llm_provider: None,
+            llm_model: None,
+            enabled: None,
+            lifecycle_state: state.map(|s| s.to_string()),
+            use_count: 0,
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_overrides_lifecycle_staged_evicts() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("a", false, true), make_entry("b", false, true)],
+        };
+
+        registry.apply_overrides(&[override_for("a", Some("staged"))]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "b");
+        assert!(registry.disabled.iter().any(|d| d.name == "a"));
+    }
+
+    #[test]
+    fn test_apply_overrides_lifecycle_archived_evicts() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("a", false, true), make_entry("b", false, true)],
+        };
+
+        registry.apply_overrides(&[override_for("a", Some("archived"))]);
+
+        assert_eq!(registry.skills.len(), 1);
+        assert_eq!(registry.skills[0].manifest.skill.name, "b");
+        assert!(registry.disabled.iter().any(|d| d.name == "a"));
+    }
+
+    #[test]
+    fn test_apply_overrides_lifecycle_active_retains() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("a", false, true), make_entry("b", false, true)],
+        };
+
+        registry.apply_overrides(&[override_for("a", Some("active"))]);
+
+        assert_eq!(registry.skills.len(), 2);
+        assert!(!registry.disabled.iter().any(|d| d.name == "a"));
+    }
+
+    #[test]
+    fn test_apply_overrides_lifecycle_none_retains() {
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![make_entry("a", false, true), make_entry("b", false, true)],
+        };
+
+        registry.apply_overrides(&[override_for("a", None)]);
+
+        assert_eq!(registry.skills.len(), 2);
+        assert!(!registry.disabled.iter().any(|d| d.name == "a"));
+    }
+
+    // --- AC6 predicate-extension equivalence on NULL fixtures ----------
+
+    #[test]
+    fn test_apply_overrides_lifecycle_none_equivalence_to_pre_change() {
+        // With all-NULL lifecycle_state, eviction behavior must be identical
+        // to the pre-#1582 baseline: only `enabled=Some(false)` causes eviction.
+        // Three skills, only one disabled via the `enabled` flag.
+        let mut registry = SkillRegistry {
+            skipped: Vec::new(),
+            disabled: Vec::new(),
+            validated_warnings: Vec::new(),
+            skills: vec![
+                make_entry("alpha", false, true),
+                make_entry("beta", false, true),
+                make_entry("gamma", false, true),
+            ],
+        };
+
+        registry.apply_overrides(&[
+            override_for("alpha", None),
+            crate::db::SkillOverride {
+                skill_name: "beta".to_string(),
+                always_on: None,
+                llm_provider: None,
+                llm_model: None,
+                enabled: Some(false),
+                lifecycle_state: None,
+                use_count: 0,
+                last_used_at: None,
+            },
+            override_for("gamma", None),
+        ]);
+
+        // beta evicted via `enabled=false`; alpha + gamma retained (lifecycle_state=None
+        // must produce SAME result as if the lifecycle-eviction code path didn't exist).
+        assert_eq!(registry.skills.len(), 2);
+        let names: Vec<&str> = registry
+            .skills
+            .iter()
+            .map(|s| s.manifest.skill.name.as_str())
+            .collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"gamma"));
+        assert!(!names.contains(&"beta"));
+        assert!(registry.disabled.iter().any(|d| d.name == "beta"));
+        // Critically: no lifecycle-gated entries leaked into disabled list.
+        assert!(!registry.disabled.iter().any(|d| d.name == "alpha"));
+        assert!(!registry.disabled.iter().any(|d| d.name == "gamma"));
     }
 }

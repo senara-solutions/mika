@@ -4535,12 +4535,59 @@ impl Database {
                     AND always_on IS NULL
                     AND llm_provider IS NULL
                     AND llm_model IS NULL
-                    AND enabled IS NULL",
+                    AND enabled IS NULL
+                    AND lifecycle_state IS NULL",
                 params![agent_id, skill_name],
             )?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Set the lifecycle state for an agent-authored skill (mika#1582).
+    ///
+    /// Valid states: `staged`, `active`, `archived`. The CHECK constraint on
+    /// the column enforces this at the SQL layer.
+    pub fn set_skill_lifecycle_state(
+        &mut self,
+        agent_id: &str,
+        skill_name: &str,
+        state: &str,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let affected = tx.execute(
+            "UPDATE skill_overrides SET lifecycle_state = ?3
+             WHERE agent_id = ?1 AND skill_name = ?2",
+            params![agent_id, skill_name, state],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("no skill_overrides row for agent={agent_id}, skill={skill_name}");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get the lifecycle state for a skill (mika#1582).
+    ///
+    /// Returns `None` if no override row exists or `lifecycle_state` is NULL.
+    pub fn get_skill_lifecycle_state(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+    ) -> Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT lifecycle_state FROM skill_overrides
+             WHERE agent_id = ?1 AND skill_name = ?2",
+            params![agent_id, skill_name],
+            |r| r.get(0),
+        );
+        match result {
+            Ok(state) => Ok(state),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Clear the LLM override columns for a skill. If the resulting row has no
@@ -4566,7 +4613,8 @@ impl Database {
                 AND always_on IS NULL
                 AND llm_provider IS NULL
                 AND llm_model IS NULL
-                AND enabled IS NULL",
+                AND enabled IS NULL
+                AND lifecycle_state IS NULL",
             params![agent_id, skill_name],
         )?;
         tx.commit()?;

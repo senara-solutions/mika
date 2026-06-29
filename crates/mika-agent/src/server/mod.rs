@@ -187,6 +187,15 @@ fn build_router(state: AppState) -> Router {
         )
         // Skills listing with optional property filters (mika#606)
         .route("/skills", get(dashboard::handle_skills_list))
+        // Skill lifecycle management (mika#1582) — operator-tier
+        .route(
+            "/skills/{name}/promote",
+            post(handlers::handle_skill_promote),
+        )
+        .route(
+            "/skills/{name}/archive",
+            post(handlers::handle_skill_archive),
+        )
         .route("/dev-runs", get(dashboard_dev_runs::handle_dev_runs_list))
         .route(
             "/dev-runs/{task_id}",

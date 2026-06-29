@@ -1036,3 +1036,103 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
         }
     }
 }
+
+// ===== Skill Lifecycle Endpoints (mika#1582) =====
+
+/// POST /api/v1/skills/{name}/promote — promote a staged skill to active.
+pub async fn handle_skill_promote(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    skill_lifecycle_transition(state, name, "active").await
+}
+
+/// POST /api/v1/skills/{name}/archive — archive an active skill.
+pub async fn handle_skill_archive(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    skill_lifecycle_transition(state, name, "archived").await
+}
+
+async fn skill_lifecycle_transition(
+    state: AppState,
+    skill_name: String,
+    target_state: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Use default agent for lifecycle transitions.
+    let Some(agent_state) = state.resolve_agent("").await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no agent found" })),
+        );
+    };
+
+    // Check current lifecycle state
+    let current = match agent_state
+        .db
+        .get_skill_lifecycle_state(&agent_state.db.agent_id, &skill_name)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("database error: {e}") })),
+            );
+        }
+    };
+
+    match current {
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "skill '{skill_name}' has no lifecycle_state — \
+                         bundled/marketplace skills cannot be promoted or archived"
+                    )
+                })),
+            );
+        }
+        Some(ref s) if s == target_state => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "no_change",
+                    "skill": skill_name,
+                    "lifecycle_state": target_state,
+                    "message": format!("skill '{skill_name}' is already in '{target_state}' state")
+                })),
+            );
+        }
+        _ => {}
+    }
+
+    match agent_state
+        .db
+        .set_skill_lifecycle_state(&agent_state.db.agent_id, &skill_name, target_state)
+        .await
+    {
+        Ok(()) => {
+            info!(
+                skill = %skill_name,
+                from = current.as_deref().unwrap_or("unknown"),
+                to = target_state,
+                "skill lifecycle state changed"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "updated",
+                    "skill": skill_name,
+                    "lifecycle_state": target_state,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to update lifecycle state: {e}") })),
+        ),
+    }
+}

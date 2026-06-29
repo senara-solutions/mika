@@ -137,6 +137,11 @@ pub struct SkillsIdentityConfig {
     /// `None` or empty = all bundled skills enabled (current default).
     #[serde(default)]
     pub allowlist: Option<Vec<String>>,
+    /// Whether this agent is allowed to author skills via `skill_manage` (mika#1582).
+    /// `None` or `Some(false)` = authoring disabled (default).
+    /// `Some(true)` = authoring enabled.
+    #[serde(default)]
+    pub allow_authoring: Option<bool>,
 }
 
 /// Tool visibility config from the `[tools]` block in identity.toml.
@@ -379,6 +384,7 @@ fn fail_closed_identity() -> Identity {
         kg: KgIdentityConfig::default(),
         skills: SkillsIdentityConfig {
             allowlist: Some(vec!["__fail_closed_no_skills__".to_string()]),
+            allow_authoring: None,
         },
         tools: ToolsIdentityConfig {
             disabled: crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS

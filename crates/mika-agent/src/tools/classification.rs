@@ -37,6 +37,7 @@ pub fn is_write_tool(name: &str) -> bool {
             | "delete_skill"
             | "toggle_skill"
             | "update_skill"
+            | "skill_manage"
             // Config mutation
             | "set_config"
             // File mutations
