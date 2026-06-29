@@ -908,7 +908,9 @@ struct RegisterCustomerResponse {
     bot_username: String,
     /// `None` for active customers whose pairing token was already consumed —
     /// the endpoint never fabricates a token it did not persist (mika#1612).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pairing_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pairing_url: Option<String>,
     webhook_registered: bool,
 }
