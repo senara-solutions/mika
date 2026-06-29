@@ -10,6 +10,7 @@ use crate::calibration::role::RoleScenarioResult;
 
 pub mod mika_arch;
 pub mod mika_dev;
+pub mod mika_qa;
 
 /// Shared helper: classify an LLM error into a `RoleScenarioResult` failure
 /// using `classify_failure` instead of hardcoding `TransportError`.

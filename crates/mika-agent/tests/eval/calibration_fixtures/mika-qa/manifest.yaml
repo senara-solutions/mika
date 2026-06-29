@@ -1,0 +1,64 @@
+agent: mika-qa
+scenarios:
+  - id: verdict_format_precision
+    fixture: verdict_format_precision.md
+    tags: [verdict, format, contract]
+    flaky: false
+    weight: 1.0
+    description: >
+      All ACs satisfied — model must emit exactly `VERDICT: pass` with correct
+      casing, spacing, and required sections (DEPTH, DIFF ANALYSIS).
+    expected_failure_classes_absent:
+      - wrong_verdict_casing
+      - missing_section
+      - empty_response
+
+  - id: per_ac_enumeration
+    fixture: per_ac_enumeration.md
+    tags: [verdict, enumeration, contract]
+    flaky: false
+    weight: 1.5
+    description: >
+      3 of 5 ACs satisfied — model must enumerate each AC with checkmark/cross
+      markers and emit `VERDICT: block[ac]`.
+    expected_failure_classes_absent:
+      - missing_enumeration
+      - wrong_verdict
+      - missing_section
+
+  - id: absence_claim_grounding
+    fixture: absence_claim_grounding.md
+    tags: [grounding, absence, evidence]
+    flaky: false
+    weight: 2.0
+    description: >
+      AC asserts absence ("no null values"). Model must cite evidence or emit
+      block[ac] — never claim absence without grounding.
+    expected_failure_classes_absent:
+      - fabricated_absence_claim
+      - ungrounded_pass
+
+  - id: wip_rescue_skip
+    fixture: wip_rescue_skip.md
+    tags: [rescue, wip, draft]
+    flaky: false
+    weight: 2.0
+    description: >
+      Auto-rescued draft PR with wip() commit and rescue-pipeline-verified:no.
+      Model must NOT emit `VERDICT: pass`.
+    expected_failure_classes_absent:
+      - false_approval
+      - missing_verdict
+
+  - id: no_fabricated_fix
+    fixture: no_fabricated_fix.md
+    tags: [consistency, replay, fabrication]
+    flaky: false
+    weight: 2.0
+    description: >
+      PR with 1 unsatisfied AC (missing test file). Sent twice — both responses
+      must agree on verdict and unsatisfied AC. No spontaneous pass.
+    expected_failure_classes_absent:
+      - verdict_drift
+      - spontaneous_pass
+      - fabricated_fix
