@@ -17,7 +17,20 @@ mika-dev currently uses the global default LLM provider (anthropic/claude-sonnet
 
 ## Design
 
-### Approach: Add `config_toml` to MIKA_DEV spec
+### Why config.toml, not identity.toml
+
+The issue body suggests editing `MIKA_DEV_IDENTITY`. However, `identity.toml` and `config.toml` are deserialized into **separate Rust types** with no schema overlap:
+
+- **`identity.toml`** → `Identity` struct (via `prompt::load_identity()`) — carries agent metadata: `[skills].allowlist`, `[kg]`, `[tools].disabled`, `[context]`, `name`, `emoji`. No LLM provider fields exist in this schema.
+- **`config.toml`** → `Settings` struct (via `config-rs`) — carries runtime config: `llm_provider: ProviderKind`, `openrouter_model: Option<String>`, `llm_max_tokens`, `log_level`, API keys, etc.
+
+`llm_provider` and `openrouter_model` are `Settings` fields (defined in `crates/mika-common/src/config.rs:601-625`). Placing them in `identity.toml` would silently fail — `config-rs` does not read `identity.toml`, and `prompt::load_identity()` does not deserialize `Settings` fields. The existing mika-arch precedent (`MIKA_ARCH_CONFIG`) confirms this separation: mika-arch's openrouter/kimi override lives in `config_toml`, not in identity.
+
+**Conclusion:** `config.toml` is the sole vehicle for per-agent LLM provider config. The existing `reconcile_well_known_identity()` cannot propagate this change because it operates on `identity.toml` only.
+
+> Citation: review-guide.md § KISS — the simplest correct path is the one that uses the existing type system rather than fighting it.
+
+### Approach: Add `config_toml` to MIKA_DEV spec + minimal reconciliation
 
 The `WellKnownAgent` struct already supports a `config_toml: Option<&'static str>` field that writes an agent-specific `config.toml` on first creation. mika-arch uses this pattern (`MIKA_ARCH_CONFIG`) to override the global provider to openrouter/kimi.
 
@@ -27,17 +40,20 @@ The `WellKnownAgent` struct already supports a `config_toml: Option<&'static str
 
 The current `reconcile_well_known_identity()` only reconciles `identity.toml` — it does NOT reconcile `config.toml`. The `config_toml` field is only written on first agent creation (line ~748 of `well_known_agents.rs`).
 
-For existing mika-dev agents, the on-disk `config.toml` will remain unchanged after deploy. Two reconciliation options:
+For existing mika-dev agents, the on-disk `config.toml` will remain unchanged after deploy. Without reconciliation, the model swap is a no-op for any existing installation — the new constant is dead code until the agent directory is deleted and re-provisioned.
 
-**Option A (recommended): Add config.toml reconciliation to `reconcile_well_known_identity`.**
-Extend the existing reconcile function to also overwrite `config.toml` when `spec.config_toml` changes from `None` to `Some(...)` or when the content differs. This is the correct long-term shape — any future well-known agent config change will auto-propagate.
+### Why reconciliation is in-scope, not scope creep
 
-**Option B: Document manual operator action.**
-Operator manually writes the new config.toml or deletes the agent dir for re-provision. Not acceptable for an autonomous-loop agent that should self-heal on deploy.
+The reconciliation is **not** general-purpose infrastructure — it is the minimum mechanism required for the model swap to take effect. Without it, AC1 ("new identity provisions openrouter/z-ai/glm-5.2") is only satisfied for fresh installations. The issue body assumes "auto-provisioning will rewrite config.toml on next restart" — this assumption is wrong, and the reconciliation fixes it for this specific case.
 
-### Implementation: Option A
+The function is scoped to `provision_well_known_agents` (the same call site as identity reconciliation) and follows the identical pattern: compare on-disk content with spec content, overwrite if different. It is ~20 lines of code, not a new subsystem.
 
-Add a `reconcile_config_toml` step inside `reconcile_well_known_identity` (or as a separate function called from `provision_well_known_agents`). When `spec.config_toml` is `Some(content)`, compare with on-disk `config.toml`. If they differ, overwrite. Log the change.
+> Citation: review-guide.md § Single Responsibility — the single responsibility here is "make mika-dev use openrouter/z-ai/glm-5.2." The constant change and the reconciliation are two steps of the same concern, not two independent concerns. One without the other does not deliver the AC.
+> Citation: review-guide.md § YAGNI — the reconciliation is right-sized: it fires only when `spec.config_toml` is `Some` and on-disk content differs. Agents without a spec config (mika-qa, mika-relay) are unaffected.
+
+### Implementation
+
+Add a `reconcile_well_known_config` function called from `provision_well_known_agents`, after `reconcile_well_known_identity`. When `spec.config_toml` is `Some(content)`, compare with on-disk `config.toml`. If they differ, overwrite with atomic tmp+rename (matching identity reconcile pattern). Log the change.
 
 ## Changes
 
@@ -129,3 +145,7 @@ Note: The `Makefile` references `docs/eval/calibration/baselines/latest.json` wh
 - mika-qa swap (mika#1632 — separate calibration suite needed).
 - mika-arch model change.
 - `Makefile` `--baseline` path fix (the `baselines/latest.json` path doesn't exist; tracked separately).
+
+## Revision history
+
+- rev 2 (2026-06-29): addressed F1 by adding "Why config.toml, not identity.toml" section documenting the structural reason `identity.toml` cannot carry LLM provider config (`llm_provider`/`openrouter_model` are `Settings` fields deserialized from `config.toml` via `config-rs`, not `Identity` fields from `identity.toml`); reframed reconciliation as in-scope prerequisite (not scope creep) with citations to review-guide.md § Single Responsibility, § YAGNI, and § KISS; removed the Option A/Option B decision matrix in favor of a single justified approach.
