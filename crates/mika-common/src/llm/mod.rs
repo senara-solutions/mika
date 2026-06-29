@@ -252,6 +252,8 @@ pub enum ProviderKind {
     Qwen,
     #[serde(rename = "mikamodel")]
     MikaModel,
+    #[serde(rename = "zai")]
+    ZAi,
 }
 
 impl ProviderKind {
@@ -269,6 +271,7 @@ impl ProviderKind {
         ProviderKind::Kimi,
         ProviderKind::Qwen,
         ProviderKind::MikaModel,
+        ProviderKind::ZAi,
     ];
 
     /// Config key prefix for per-provider settings (e.g., `"anthropic"` → `anthropic_model`).
@@ -286,6 +289,7 @@ impl ProviderKind {
             ProviderKind::Kimi => "kimi",
             ProviderKind::Qwen => "qwen",
             ProviderKind::MikaModel => "mikamodel",
+            ProviderKind::ZAi => "zai",
         }
     }
 
@@ -308,6 +312,9 @@ impl ProviderKind {
             // requests flow through the same /api/chat transport. Phase 2: swap to a
             // hosted endpoint by overriding `mikamodel_base_url` — no code change.
             ProviderKind::MikaModel => Some("http://localhost:11434"),
+            // Z.AI's OpenAI-compatible chat completions API. Note the path is
+            // `/api/paas/v4` (not `/v1`); `chat_url()` appends `/chat/completions`.
+            ProviderKind::ZAi => Some("https://api.z.ai/api/paas/v4"),
         }
     }
 
@@ -330,6 +337,9 @@ impl ProviderKind {
             ProviderKind::Qwen => 8_192,
             // MikaModel uses the Ollama transport, which imposes no hard cap.
             ProviderKind::MikaModel => 131_072,
+            // GLM models served by Z.AI support large outputs; mirror OpenRouter's
+            // conservative default (varies by model).
+            ProviderKind::ZAi => 128_000,
         }
     }
 
@@ -354,6 +364,7 @@ impl ProviderKind {
             ProviderKind::Kimi => "moonshot-v1-128k",
             ProviderKind::Qwen => "qwen-plus",
             ProviderKind::MikaModel => "mika",
+            ProviderKind::ZAi => "glm-5.2",
         }
     }
 }
@@ -381,8 +392,9 @@ impl FromStr for ProviderKind {
             "kimi" => Ok(ProviderKind::Kimi),
             "qwen" => Ok(ProviderKind::Qwen),
             "mikamodel" => Ok(ProviderKind::MikaModel),
+            "zai" => Ok(ProviderKind::ZAi),
             _ => Err(format!(
-                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax, kimi, qwen, mikamodel"
+                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax, kimi, qwen, mikamodel, zai"
             )),
         }
     }
@@ -441,7 +453,7 @@ pub fn create_provider(
         }
         _ => {
             // OpenAI-compatible fallback — covers OpenAi, OpenRouter, Groq, Mistral,
-            // Google, DeepSeek, MiniMax, Kimi, Qwen (9 variants)
+            // Google, DeepSeek, MiniMax, Kimi, Qwen, ZAi (10 variants)
             let base_url = spec.effective_base_url().ok_or_else(|| {
                 anyhow::anyhow!(
                     "base URL is required for provider '{}'. Set {}_base_url in config.toml.",
@@ -550,10 +562,27 @@ mod tests {
 
     #[test]
     fn test_provider_kind_all() {
-        assert_eq!(ProviderKind::ALL.len(), 12);
+        assert_eq!(ProviderKind::ALL.len(), 13);
         assert_eq!(ProviderKind::ALL[0], ProviderKind::Anthropic);
         assert_eq!(ProviderKind::ALL[10], ProviderKind::Qwen);
         assert_eq!(ProviderKind::ALL[11], ProviderKind::MikaModel);
+        assert_eq!(ProviderKind::ALL[12], ProviderKind::ZAi);
+    }
+
+    #[test]
+    fn test_zai_defaults() {
+        // Z.AI is an OpenAI-compatible provider (routes through the `_` arm of
+        // `create_provider`). Its base URL ends in `/api/paas/v4`, not `/v1`.
+        assert_eq!(ProviderKind::ZAi.config_prefix(), "zai");
+        assert_eq!(
+            ProviderKind::ZAi.default_base_url(),
+            Some("https://api.z.ai/api/paas/v4")
+        );
+        assert_eq!(ProviderKind::ZAi.default_model(), "glm-5.2");
+        assert_eq!(ProviderKind::ZAi.max_output_tokens(), 128_000);
+        // Z.AI direct uses bare model ids (e.g. `glm-5.2`), no provider slash.
+        assert!(!ProviderKind::ZAi.model_names_contain_slash());
+        assert_eq!("zai".parse::<ProviderKind>(), Ok(ProviderKind::ZAi));
     }
 
     #[test]
