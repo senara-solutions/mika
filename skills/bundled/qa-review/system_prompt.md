@@ -91,6 +91,23 @@ State: <state>
 
 This anchors your review to the actual PR data. If any of these fields don't match what the tool returned, STOP — you are hallucinating. Re-read the tool output and try again.
 
+**Step 1.5 — Rescue-class PR detection (mika#1618)**
+
+This step determines whether the PR is an auto-rescued dispatch-lib PR and, if so, whether its pipeline verification is complete. It reads a machine-readable marker instead of interpreting free-text boilerplate, eliminating rescue-class-dependent verdict divergence.
+
+1. **Detect rescue PR.** Check the PR body (already fetched in Step 1 via `qa_pr_view`) for the header `## Auto-rescued PR (dispatch-lib recovery, class:`. If not found, this is not a rescue PR — skip to Step 2 normally.
+
+2. **Read the marker.** Search the PR body for `<!-- rescue-pipeline-verified: yes -->` or `<!-- rescue-pipeline-verified: no -->`.
+
+3. **Evaluate verification state.** The PR is considered pipeline-verified if ANY of these conditions hold:
+   - The marker reads `yes`
+   - The PR `isDraft` field is `false` (operator un-drafted it — this is a stronger signal than any body marker)
+   - No marker is found at all (backward compatibility — pre-mika#1618 rescue PRs proceed normally)
+
+4. **Route based on verification state:**
+   - **Verified:** Note "Rescue PR (class: `<class>`), pipeline verified — proceeding to standard review." Continue to Step 2 normally. The rescue boilerplate text is not treated as a review gate.
+   - **Not verified** (marker is `no` AND PR is still draft): Emit `hold[review]` with reason: "Auto-rescued PR (class: `<class>`) is still in draft with pipeline-verification marker set to `no`. Operator must verify pipeline completion and either mark the PR as Ready for Review or edit the body to set `<!-- rescue-pipeline-verified: yes -->`." End the review — do not proceed to Step 2.
+
 **Step 2 — Pipeline compliance checks (hard blocks)**
 
 Run these checks using `run_gh`. Combine into as few calls as possible. If ANY check fails, the verdict is a `block` sub-type (see below).

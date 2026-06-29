@@ -2445,19 +2445,15 @@ ${RESULT}"
     fi
 
     if [ -n "$RECOVERY_CLASS" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
-        # Recovery-class-specific PR body
+        # Recovery-class-specific PR title + unified body template (mika#1618)
         local _rescue_title
-        local _rescue_body_note
+        local _rescue_class_fact
         if [ "$RECOVERY_CLASS" = "dirty-worktree" ]; then
             _rescue_title=$(_derive_recovery_pr_title "dirty-worktree" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
-            _rescue_body_note="The dev-pilot session wrote file changes but never completed the git workflow (no \`git commit\` or \`gh pr create\`). Per the mika#1271 content/workflow split contract, dispatch-lib took ownership of the git layer: staged, committed with \`wip()\` prefix, pushed, and opened this draft PR to preserve the content.
-
-**This is a draft PR requiring human review.** The content has NOT passed \`/ce:review\` and may contain partially-coherent multi-file changes."
+            _rescue_class_fact="The pilot session wrote file changes but never committed. dispatch-lib auto-committed with \`wip()\` prefix."
         else
             _rescue_title=$(_derive_recovery_pr_title "commit-pushed-no-pr" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
-            _rescue_body_note="The dev-pilot session committed and pushed the implementation but \`gh pr create\` failed (typically a transient AxiosError 5000ms timeout from claude-cli's internal HTTP relay). Branch is on origin with the impl commit; only the final PR-creation step needed recovery.
-
-**This is a draft PR — operator should verify pilot's pipeline (/ce:work, /ce:review, /ce:compound) completed before marking ready.** The recovery path is uniform with mika#1282's draft-PR pattern for audit consistency."
+            _rescue_class_fact="The pilot session committed and pushed but \`gh pr create\` failed. dispatch-lib opened this PR from the existing branch."
         fi
 
         RESCUED_PR_URL=$(gh pr create \
@@ -2469,9 +2465,11 @@ ${RESULT}"
             --body "$(cat <<RESCUEBODY
 ## Auto-rescued PR (dispatch-lib recovery, class: ${RECOVERY_CLASS})
 
-This PR was created by dispatch-lib's git-workflow recovery.
+<!-- rescue-pipeline-verified: no -->
 
-${_rescue_body_note}
+This PR was created by dispatch-lib's git-workflow recovery. ${_rescue_class_fact}
+
+**Auto-rescued PR.** Operator: verify pipeline completion, then either un-draft this PR or set the marker above to \`yes\`.
 
 ### Recovery metadata
 - Recovery class: \`${RECOVERY_CLASS}\`
