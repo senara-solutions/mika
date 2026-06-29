@@ -1562,3 +1562,63 @@ pub async fn handle_operational_items(
         }
     }
 }
+
+// ===== Skill Restore (mika#1584) =====
+
+#[derive(Deserialize)]
+pub struct SkillRestoreRequest {
+    /// Agent name (required for multi-agent routing).
+    pub agent: String,
+}
+
+/// `POST /api/v1/skills/{name}/restore` — restore a skill from its archived snapshot.
+pub async fn handle_skill_restore(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SkillRestoreRequest>,
+) -> impl IntoResponse {
+    let agent_state = match state.resolve_agent(&req.agent).await {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("agent '{}' not found", req.agent)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match crate::skills::curator::restore_skill_from_snapshot(&agent_state.home_dir, &name) {
+        Ok(_snapshot_path) => {
+            // Update lifecycle_state to 'staged'
+            if let Err(e) = agent_state
+                .db
+                .update_skill_lifecycle_state(&req.agent, &name, "staged")
+                .await
+            {
+                error!(error = %e, skill = %name, "failed to update lifecycle_state after restore");
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "restored": true,
+                    "skill": name,
+                    "lifecycle_state": "staged"
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("no archived snapshot") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({"error": msg}))).into_response()
+        }
+    }
+}

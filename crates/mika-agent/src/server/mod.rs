@@ -84,6 +84,9 @@ const HEARTBEAT_CRON: &str = "0 0 * * * *";
 /// Pre-filters (groomed-not-ready, priority ordering, queue-empty gate) applied at dispatch time.
 const AUTO_PULL_CRON: &str = "0 */10 * * * *";
 
+/// Default cron schedule for the curator review: daily at 03:00 UTC (mika#1584).
+const CURATOR_REVIEW_CRON: &str = "0 0 3 * * *";
+
 /// Build the Axum router with all routes and middleware.
 ///
 /// Shared between production `run_server` and test `test_app`.
@@ -243,6 +246,11 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/skills/{skill}/variants/{provider}/{model}/promote",
             post(variants::handle_variant_promote),
+        )
+        // Skill restore endpoint (mika#1584)
+        .route(
+            "/skills/{name}/restore",
+            post(dashboard::handle_skill_restore),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1377,6 +1385,24 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 )
                 .await;
             }
+        }
+
+        // Register curator review recurring task (mika#1584).
+        {
+            let identity = crate::prompt::load_identity_async(&agent_state.home_dir).await;
+            let curator_cron = identity
+                .curator
+                .as_ref()
+                .and_then(|c| c.interval_hours)
+                .map(|h| format!("0 0 */{h} * * *"))
+                .unwrap_or_else(|| CURATOR_REVIEW_CRON.to_string());
+            task_engine::ensure_recurring_task(
+                &db,
+                "curator_review",
+                &curator_cron,
+                r#"{"trigger":"curator_review"}"#,
+            )
+            .await;
         }
 
         // Startup recovery (expire timed-out tasks, mark orphaned in_progress as failed, load heap)

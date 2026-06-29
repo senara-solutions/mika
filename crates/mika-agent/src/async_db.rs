@@ -185,6 +185,38 @@ impl AsyncDatabase {
             .await
     }
 
+    pub async fn increment_skill_usage(
+        &self,
+        agent_id: &str,
+        skill_names: &[String],
+    ) -> Result<()> {
+        let a = agent_id.to_owned();
+        let names = skill_names.to_vec();
+        self.with_db(move |db| db.increment_skill_usage(&a, &names))
+            .await
+    }
+
+    pub async fn get_archival_candidates(
+        &self,
+        agent_id: &str,
+        max_idle_days: u32,
+    ) -> Result<Vec<crate::db::SkillOverride>> {
+        let a = agent_id.to_owned();
+        self.with_db(move |db| db.get_archival_candidates(&a, max_idle_days))
+            .await
+    }
+
+    pub async fn update_skill_lifecycle_state(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+        state: &str,
+    ) -> Result<()> {
+        let (a, s, st) = (agent_id.to_owned(), skill_name.to_owned(), state.to_owned());
+        self.with_db(move |db| db.update_skill_lifecycle_state(&a, &s, &st))
+            .await
+    }
+
     // -- Team CRUD --
 
     pub async fn register_team(&self, id: &str, name: &str, config_path: &str) -> Result<()> {

@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 42;
+pub const CURRENT_SCHEMA_VERSION: i64 = 43;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -342,6 +342,13 @@ pub struct SkillOverride {
     /// Tri-state: `None` = default (enabled), `Some(false)` = disabled,
     /// `Some(true)` = explicitly enabled.
     pub enabled: Option<bool>,
+    /// Lifecycle state for agent-authored skills: `staged`, `active`, `archived`.
+    /// `None` for bundled/marketplace skills (they don't go through the lifecycle).
+    pub lifecycle_state: Option<String>,
+    /// Number of turns this skill was injected into.
+    pub use_count: i64,
+    /// ISO 8601 timestamp of the last turn this skill was injected into.
+    pub last_used_at: Option<String>,
 }
 
 // ===== Observability Types =====
@@ -1018,6 +1025,11 @@ impl Database {
             info!(version = 42, "database migrated to v42");
         }
 
+        if (3..=42).contains(&version) {
+            self.migrate_v42_to_v43()?;
+            info!(version = 43, "database migrated to v43");
+        }
+
         Ok(())
     }
 
@@ -1072,7 +1084,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (42);
+            INSERT INTO schema_version (version) VALUES (43);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1388,12 +1400,15 @@ impl Database {
             );
 
             CREATE TABLE skill_overrides (
-                agent_id     TEXT NOT NULL COLLATE NOCASE,
-                skill_name   TEXT NOT NULL COLLATE NOCASE,
-                always_on    INTEGER,
-                llm_provider TEXT,
-                llm_model    TEXT,
-                enabled      INTEGER,
+                agent_id        TEXT NOT NULL COLLATE NOCASE,
+                skill_name      TEXT NOT NULL COLLATE NOCASE,
+                always_on       INTEGER,
+                llm_provider    TEXT,
+                llm_model       TEXT,
+                enabled         INTEGER,
+                lifecycle_state TEXT CHECK (lifecycle_state IN ('staged', 'active', 'archived')),
+                use_count       INTEGER NOT NULL DEFAULT 0,
+                last_used_at    TEXT,
                 PRIMARY KEY (agent_id, skill_name)
             );
 
@@ -4257,6 +4272,53 @@ impl Database {
         Ok(())
     }
 
+    /// v42→v43: Add `lifecycle_state`, `use_count`, `last_used_at` columns to
+    /// `skill_overrides` for curator background task (mika#1584).
+    fn migrate_v42_to_v43(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 43 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Additive ALTER TABLE with column_exists guard for crash-recovery safety.
+        if !Self::column_exists_tx(&tx, "skill_overrides", "lifecycle_state")? {
+            tx.execute_batch(
+                "ALTER TABLE skill_overrides ADD COLUMN lifecycle_state TEXT
+                 CHECK (lifecycle_state IN ('staged', 'active', 'archived'));",
+            )?;
+        }
+        if !Self::column_exists_tx(&tx, "skill_overrides", "use_count")? {
+            tx.execute_batch(
+                "ALTER TABLE skill_overrides ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !Self::column_exists_tx(&tx, "skill_overrides", "last_used_at")? {
+            tx.execute_batch("ALTER TABLE skill_overrides ADD COLUMN last_used_at TEXT;")?;
+        }
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (43)", [])?;
+        tx.commit()?;
+
+        info!(
+            "v42→v43: added lifecycle_state, use_count, last_used_at to skill_overrides (mika#1584)"
+        );
+
+        Ok(())
+    }
+
+    /// Check if a column exists on a table within a transaction scope.
+    fn column_exists_tx(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = tx.prepare(&format!("PRAGMA table_info('{table}')"))?;
+        let exists = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .any(|name| name.as_ref().is_ok_and(|n| n == column));
+        Ok(exists)
+    }
+
     /// v27 startup guard: refuse to open the database if the coalesce step
     /// from #787 has not run. Pins to `schema_version == 27` — future v28
     /// should carry its own guard, not inherit v27's.
@@ -4385,7 +4447,8 @@ impl Database {
     /// Get all skill overrides for an agent.
     pub fn get_skill_overrides(&self, agent_id: &str) -> Result<Vec<SkillOverride>> {
         let mut stmt = self.conn.prepare(
-            "SELECT skill_name, always_on, llm_provider, llm_model, enabled
+            "SELECT skill_name, always_on, llm_provider, llm_model, enabled,
+                    lifecycle_state, use_count, last_used_at
              FROM skill_overrides WHERE agent_id = ?1",
         )?;
         let rows = stmt
@@ -4396,6 +4459,9 @@ impl Database {
                     llm_provider: r.get(2)?,
                     llm_model: r.get(3)?,
                     enabled: r.get(4)?,
+                    lifecycle_state: r.get(5)?,
+                    use_count: r.get(6)?,
+                    last_used_at: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -4514,6 +4580,91 @@ impl Database {
             params![agent_id, skill_name],
         )?;
         Ok(())
+    }
+
+    /// Batch-increment usage counters for all injected skills in a single turn.
+    /// Creates rows for skills without prior overrides via UPSERT.
+    pub fn increment_skill_usage(&self, agent_id: &str, skill_names: &[String]) -> Result<()> {
+        if skill_names.is_empty() {
+            return Ok(());
+        }
+        let now = crate::timestamp::now();
+        let tx = self.conn.unchecked_transaction()?;
+        for name in skill_names {
+            tx.execute(
+                "INSERT INTO skill_overrides (agent_id, skill_name, use_count, last_used_at)
+                 VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(agent_id, skill_name) DO UPDATE SET
+                    use_count = use_count + 1,
+                    last_used_at = ?3",
+                params![agent_id, name, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Query skills eligible for archival by the curator.
+    /// Only considers agent-authored skills with `lifecycle_state = 'active'`
+    /// that have been idle beyond `max_idle_days`.
+    pub fn get_archival_candidates(
+        &self,
+        agent_id: &str,
+        max_idle_days: u32,
+    ) -> Result<Vec<SkillOverride>> {
+        let cutoff = crate::timestamp::now_minus(chrono::Duration::days(i64::from(max_idle_days)));
+        let mut stmt = self.conn.prepare(
+            "SELECT skill_name, always_on, llm_provider, llm_model, enabled,
+                    lifecycle_state, use_count, last_used_at
+             FROM skill_overrides
+             WHERE agent_id = ?1
+               AND lifecycle_state = 'active'
+               AND (
+                 (last_used_at IS NULL AND use_count = 0)
+                 OR last_used_at < ?2
+               )",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, cutoff], |r| {
+                Ok(SkillOverride {
+                    skill_name: r.get(0)?,
+                    always_on: r.get(1)?,
+                    llm_provider: r.get(2)?,
+                    llm_model: r.get(3)?,
+                    enabled: r.get(4)?,
+                    lifecycle_state: r.get(5)?,
+                    use_count: r.get(6)?,
+                    last_used_at: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Update the lifecycle_state of a skill override.
+    pub fn update_skill_lifecycle_state(
+        &self,
+        agent_id: &str,
+        skill_name: &str,
+        state: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE skill_overrides SET lifecycle_state = ?3
+             WHERE agent_id = ?1 AND skill_name = ?2",
+            params![agent_id, skill_name, state],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the most recent curator proposal from audit_events.
+    pub fn get_latest_curator_proposal(&self, agent_id: &str) -> Result<Option<(String, String)>> {
+        self.query_row_2(
+            "SELECT after_value, created_at FROM audit_events
+             WHERE tool_name = 'curator_review' AND target_key = 'curator_proposal'
+               AND agent_id = ?1
+             ORDER BY created_at DESC LIMIT 1",
+            &[&agent_id as &dyn rusqlite::types::ToSql],
+        )
     }
 
     // ===== Team CRUD =====
@@ -13301,6 +13452,102 @@ mod tests {
         assert_eq!(ov.enabled, Some(false));
     }
 
+    /// Seed a `skill_overrides` row with explicit curator-relevant columns for
+    /// the archival-candidate query tests (AC9–AC12). Bypasses the upsert
+    /// helpers so `lifecycle_state` and `last_used_at` can be set to arbitrary
+    /// values (the helpers only manage `always_on`/`llm_*`/`enabled`).
+    fn seed_curator_skill_row(
+        db: &Database,
+        agent_id: &str,
+        skill_name: &str,
+        lifecycle_state: Option<&str>,
+        use_count: i64,
+        last_used_at: Option<&str>,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO skill_overrides
+                    (agent_id, skill_name, lifecycle_state, use_count, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    agent_id,
+                    skill_name,
+                    lifecycle_state,
+                    use_count,
+                    last_used_at
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_v43_migration_adds_curator_columns() {
+        // Mechanically enforce the schema the curator candidate query depends
+        // on: migrate_v42_to_v43 must add lifecycle_state, use_count, and
+        // last_used_at to skill_overrides. This dependency is self-contained in
+        // mika#1584 — the migration adds all three columns here, so the query is
+        // not coupled to any other PR's schema. (qa#1624: schema dependency
+        // mechanically enforced.)
+        let db = db();
+        let cols: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info('skill_overrides')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for required in ["lifecycle_state", "use_count", "last_used_at"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "skill_overrides missing curator column '{required}' (v43 migration); have: {cols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_archival_candidates_fresh_agent_returns_zero() {
+        // AC9: a fresh agent with no agent-authored skills yields zero
+        // candidates from the curator candidate query.
+        let db = db();
+        let candidates = db.get_archival_candidates("mika", 30).unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_archival_candidates_staged_skill_excluded() {
+        // AC10: a staged (not yet promoted) skill is excluded even when idle —
+        // the query only considers lifecycle_state = 'active'.
+        let db = db();
+        let idle = crate::timestamp::now_minus(chrono::Duration::days(60));
+        seed_curator_skill_row(&db, "mika", "staged-skill", Some("staged"), 0, Some(&idle));
+        let candidates = db.get_archival_candidates("mika", 30).unwrap();
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_archival_candidates_idle_active_skill_returned() {
+        // AC11: a promoted+active skill idle beyond the threshold (last used 40
+        // days ago, threshold 30) is returned as exactly one candidate.
+        let db = db();
+        let idle = crate::timestamp::now_minus(chrono::Duration::days(40));
+        seed_curator_skill_row(&db, "mika", "idle-skill", Some("active"), 3, Some(&idle));
+        let candidates = db.get_archival_candidates("mika", 30).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].skill_name, "idle-skill");
+        assert_eq!(candidates[0].lifecycle_state.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn test_archival_candidates_bundled_null_lifecycle_excluded() {
+        // AC12: a bundled/marketplace skill (NULL lifecycle_state, never used)
+        // is excluded by construction — NULL never equals 'active'.
+        let db = db();
+        seed_curator_skill_row(&db, "mika", "bundled-skill", None, 0, None);
+        let candidates = db.get_archival_candidates("mika", 30).unwrap();
+        assert!(candidates.is_empty());
+    }
+
     #[test]
     fn test_set_skill_enabled_enable_with_always_on_keeps_row() {
         let mut db = db();
@@ -15622,6 +15869,7 @@ mod tests {
         db2.migrate_v39_to_v40().unwrap();
         db2.migrate_v40_to_v41().unwrap();
         db2.migrate_v41_to_v42().unwrap();
+        db2.migrate_v42_to_v43().unwrap();
 
         let final_version: i64 = db2
             .conn

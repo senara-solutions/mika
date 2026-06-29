@@ -15,7 +15,7 @@ use mika_common::home;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::cli::{SkillLlmAction, SkillsArgs, SkillsCommand};
+use crate::cli::{CuratorAction, SkillLlmAction, SkillsArgs, SkillsCommand};
 use crate::commands::skills_variants;
 
 pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
@@ -117,6 +117,12 @@ pub async fn run(args: SkillsArgs, agent_name: &str) -> Result<()> {
         }
         Some(SkillsCommand::Variants { action }) => {
             skills_variants::run(action, &skills_dir)?;
+        }
+        Some(SkillsCommand::Restore { name }) => {
+            run_skill_restore(&agent_home, &global_home, agent_name, &name)?;
+        }
+        Some(SkillsCommand::Curator { action }) => {
+            run_curator_action(&global_home, agent_name, action).await?;
         }
     }
     Ok(())
@@ -1680,6 +1686,89 @@ fn validate_skills(
     }
 
     Ok(())
+}
+
+/// `mika skills restore <name>`: restore a skill from its most recent snapshot.
+fn run_skill_restore(
+    agent_home: &Path,
+    global_home: &Path,
+    agent_name: &str,
+    skill_name: &str,
+) -> Result<()> {
+    let snapshot_path =
+        mika_agent::skills::curator::restore_skill_from_snapshot(agent_home, skill_name)?;
+
+    // Update lifecycle_state to 'staged' (operator must re-promote).
+    let db_path = global_home.join("data").join("mika.db");
+    if db_path.exists() {
+        let db = mika_agent::db::Database::open(&db_path)?;
+        db.update_skill_lifecycle_state(agent_name, skill_name, "staged")?;
+    }
+
+    println!(
+        "Restored skill '{}' from snapshot: {}",
+        skill_name,
+        snapshot_path.display()
+    );
+    println!("Lifecycle state set to 'staged'. Use skill management to re-promote.");
+    Ok(())
+}
+
+/// `mika skills curator status`: show the most recent curator review results.
+async fn run_curator_action(
+    global_home: &Path,
+    agent_name: &str,
+    action: CuratorAction,
+) -> Result<()> {
+    match action {
+        CuratorAction::Status => {
+            let db_path = global_home.join("data").join("mika.db");
+            if !db_path.exists() {
+                println!("No database found. No curator review data available.");
+                return Ok(());
+            }
+            let db = mika_agent::db::Database::open(&db_path)?;
+
+            // Query the most recent curator_proposal audit event.
+            let result = db.get_latest_curator_proposal(agent_name)?;
+
+            match result {
+                Some((json, created_at)) => {
+                    println!("Last curator review: {created_at}\n");
+                    let proposals: Vec<mika_agent::skills::curator::CuratorProposal> =
+                        serde_json::from_str(&json).context("failed to parse curator proposals")?;
+                    if proposals.is_empty() {
+                        println!("No archival candidates found.");
+                    } else {
+                        println!(
+                            "{:<30} {:>10} {:>12} {:>20} {:>12}",
+                            "SKILL", "USE COUNT", "DAYS IDLE", "LAST USED", "RECOMMENDATION"
+                        );
+                        println!("{}", "-".repeat(86));
+                        for p in &proposals {
+                            let last_used = p.last_used_at.as_deref().unwrap_or("never");
+                            let rec = match p.recommendation {
+                                mika_agent::skills::curator::CuratorRecommendation::Archive => {
+                                    "archive"
+                                }
+                                mika_agent::skills::curator::CuratorRecommendation::Review => {
+                                    "review"
+                                }
+                            };
+                            println!(
+                                "{:<30} {:>10} {:>12} {:>20} {:>12}",
+                                p.skill_name, p.use_count, p.days_idle, last_used, rec
+                            );
+                        }
+                    }
+                }
+                None => {
+                    println!("No curator review data available for agent '{agent_name}'.");
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
