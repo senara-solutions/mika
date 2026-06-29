@@ -188,6 +188,16 @@ Guard the test with `#[cfg(feature = "integration")]` or `#[ignore]` + a clear c
 | `crates/mika-gateway/src/telegram.rs` | Step 5: sanitize `set_webhook_impl` error messages |
 | `crates/mika-gateway/tests/admin_customers.rs` | Step 6: new integration test file |
 
+## Acceptance criteria
+
+1. `make_interval` binds `ttl_hours` as `int4` — endpoint returns 201/200 instead of 500ing.
+2. Re-registering an active customer when `setWebhook` fails does not corrupt inbound — the stored `webhook_secret` never diverges from Telegram's.
+3. `getMe` username match is case-insensitive.
+4. Response never advertises a `pairing_url` with an unpersisted token.
+5. DB-backed integration test covers the upsert SQL + the active-customer re-register-with-setWebhook-failure path.
+6. P3 `bot_token`-in-log concern confirmed and fixed if real.
+7. `cargo clippy` and `cargo test` pass.
+
 ## Risk assessment
 
 - **Low risk:** Steps 1, 3, 5 are one-line fixes with clear before/after behavior.
@@ -200,3 +210,7 @@ Guard the test with `#[cfg(feature = "integration")]` or `#[ignore]` + a clear c
 - `bot_token`/`bot_username` uniqueness constraint (per ticket: file separately).
 - `DELETE`/`GET /admin/customers`.
 - HTTP-level integration tests (Axum test harness with mock Telegram) — the SQL-level test catches the bind/logic bugs; full HTTP tests are a separate enhancement.
+
+## Revision history
+
+- rev 2 (2026-06-28): addressed F1 by adding `## Acceptance criteria` section transcribing the 7 ACs from the mika#1612 issue body verbatim (mika#1559 Acceptance-Criteria Gate; mika#1585 qa-review `block[pipeline]`).
