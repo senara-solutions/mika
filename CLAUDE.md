@@ -12,7 +12,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 
 - **Language:** Rust (edition 2024)
 - **Agent engine:** Explicit Rust loop (no framework) — retrieve context -> build prompt -> LLM API -> match stop_reason -> execute tools or respond
-- **LLM:** Multi-provider via `LlmProvider` trait (12 providers). See `crates/mika-common/CLAUDE.md` for provider details.
+- **LLM:** Multi-provider via `LlmProvider` trait (13 providers). See `crates/mika-common/CLAUDE.md` for provider details.
 - **Database:** SQLite via rusqlite (single DB per container at `~/.mika/data/mika.db`)
 - **HTTP server:** Axum 0.8 (mika-spirit binary). See `crates/mika-agent/CLAUDE.md` for endpoint details.
 - **HTTP client:** reqwest 0.12 with rustls-tls
@@ -124,6 +124,7 @@ See `.env.example` for the full list. Per-provider API keys (set the one for you
 - `MIKA_MISTRAL_API_KEY` — Mistral API key
 - `MIKA_GOOGLE_API_KEY` — Google AI API key
 - `MIKA_DEEPSEEK_API_KEY` — DeepSeek API key
+- `MIKA_ZAI_API_KEY` — Z.AI API key (GLM models, direct subscription)
 
 Optional (web search):
 - `MIKA_BRAVE_API_KEY` — Brave Search API key for `web_search` builtin skill (get free key at https://brave.com/search/api/)
