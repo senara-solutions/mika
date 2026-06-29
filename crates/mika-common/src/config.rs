@@ -542,6 +542,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
             .map(|_| "[SET]".to_string()),
         "kimi_api_key" => settings.kimi_api_key.as_ref().map(|_| "[SET]".to_string()),
         "qwen_api_key" => settings.qwen_api_key.as_ref().map(|_| "[SET]".to_string()),
+        "zai_api_key" => settings.zai_api_key.as_ref().map(|_| "[SET]".to_string()),
         "deepseek_base_url" => settings.deepseek_base_url.clone(),
         // Per-provider: MikaModel
         "mikamodel_model" => settings.mikamodel_model.clone(),
@@ -671,6 +672,13 @@ pub struct Settings {
     pub qwen_api_key: Option<SecretString>,
     pub qwen_model: Option<String>,
     pub qwen_base_url: Option<String>,
+    // -- Per-provider fields: Z.AI (direct GLM API, OpenAI-compatible) --
+    #[serde(default)]
+    pub zai_api_key: Option<SecretString>,
+    #[serde(default)]
+    pub zai_model: Option<String>,
+    #[serde(default)]
+    pub zai_base_url: Option<String>,
     // -- Per-provider fields: MikaModel (internal endpoint, served via Ollama transport) --
     pub mikamodel_model: Option<String>,
     pub mikamodel_api_key: Option<SecretString>,
@@ -1105,6 +1113,11 @@ impl Settings {
                 self.mikamodel_api_key.as_ref().map(|s| s.expose_secret()),
                 self.mikamodel_base_url.as_deref(),
             ),
+            ProviderKind::ZAi => (
+                self.zai_model.as_deref(),
+                self.zai_api_key.as_ref().map(|s| s.expose_secret()),
+                self.zai_base_url.as_deref(),
+            ),
         }
     }
 
@@ -1137,6 +1150,7 @@ impl Settings {
             ProviderKind::Kimi => self.kimi_model = model,
             ProviderKind::Qwen => self.qwen_model = model,
             ProviderKind::MikaModel => self.mikamodel_model = model,
+            ProviderKind::ZAi => self.zai_model = model,
         }
     }
 
@@ -1403,6 +1417,9 @@ impl Settings {
             qwen_model: None,
             qwen_api_key: None,
             qwen_base_url: None,
+            zai_model: None,
+            zai_api_key: None,
+            zai_base_url: None,
             mikamodel_model: None,
             mikamodel_api_key: None,
             mikamodel_base_url: None,
@@ -1515,6 +1532,10 @@ impl std::fmt::Debug for Settings {
             .field(
                 "qwen_api_key",
                 &self.qwen_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "zai_api_key",
+                &self.zai_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("deepseek_base_url", &self.deepseek_base_url)
             // Non-provider
