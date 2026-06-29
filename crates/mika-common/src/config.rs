@@ -237,6 +237,28 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "DeepSeek base URL override",
     },
+    // -- Per-provider: Z.AI --
+    ConfigKeyInfo {
+        key: "zai_model",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_ZAI_MODEL"),
+        secret: false,
+        description: "Z.AI model ID",
+    },
+    ConfigKeyInfo {
+        key: "zai_api_key",
+        backend: ConfigBackend::Env,
+        env_var: Some("MIKA_ZAI_API_KEY"),
+        secret: true,
+        description: "Z.AI API key",
+    },
+    ConfigKeyInfo {
+        key: "zai_base_url",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_ZAI_BASE_URL"),
+        secret: false,
+        description: "Z.AI base URL override",
+    },
     // -- Per-provider: MikaModel (internal endpoint) --
     ConfigKeyInfo {
         key: "mikamodel_model",
@@ -543,6 +565,10 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "kimi_api_key" => settings.kimi_api_key.as_ref().map(|_| "[SET]".to_string()),
         "qwen_api_key" => settings.qwen_api_key.as_ref().map(|_| "[SET]".to_string()),
         "deepseek_base_url" => settings.deepseek_base_url.clone(),
+        // Per-provider: Z.AI
+        "zai_model" => settings.zai_model.clone(),
+        "zai_api_key" => settings.zai_api_key.as_ref().map(|_| "[SET]".to_string()),
+        "zai_base_url" => settings.zai_base_url.clone(),
         // Per-provider: MikaModel
         "mikamodel_model" => settings.mikamodel_model.clone(),
         "mikamodel_api_key" => settings
@@ -671,6 +697,10 @@ pub struct Settings {
     pub qwen_api_key: Option<SecretString>,
     pub qwen_model: Option<String>,
     pub qwen_base_url: Option<String>,
+    // -- Per-provider fields: Z.AI --
+    pub zai_model: Option<String>,
+    pub zai_api_key: Option<SecretString>,
+    pub zai_base_url: Option<String>,
     // -- Per-provider fields: MikaModel (internal endpoint, served via Ollama transport) --
     pub mikamodel_model: Option<String>,
     pub mikamodel_api_key: Option<SecretString>,
@@ -1100,6 +1130,11 @@ impl Settings {
                 self.qwen_api_key.as_ref().map(|s| s.expose_secret()),
                 self.qwen_base_url.as_deref(),
             ),
+            ProviderKind::Zai => (
+                self.zai_model.as_deref(),
+                self.zai_api_key.as_ref().map(|s| s.expose_secret()),
+                self.zai_base_url.as_deref(),
+            ),
             ProviderKind::MikaModel => (
                 self.mikamodel_model.as_deref(),
                 self.mikamodel_api_key.as_ref().map(|s| s.expose_secret()),
@@ -1136,6 +1171,7 @@ impl Settings {
             ProviderKind::MiniMax => self.minimax_model = model,
             ProviderKind::Kimi => self.kimi_model = model,
             ProviderKind::Qwen => self.qwen_model = model,
+            ProviderKind::Zai => self.zai_model = model,
             ProviderKind::MikaModel => self.mikamodel_model = model,
         }
     }
@@ -1403,6 +1439,9 @@ impl Settings {
             qwen_model: None,
             qwen_api_key: None,
             qwen_base_url: None,
+            zai_model: None,
+            zai_api_key: None,
+            zai_base_url: None,
             mikamodel_model: None,
             mikamodel_api_key: None,
             mikamodel_base_url: None,
@@ -1517,6 +1556,12 @@ impl std::fmt::Debug for Settings {
                 &self.qwen_api_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("deepseek_base_url", &self.deepseek_base_url)
+            .field("zai_model", &self.zai_model)
+            .field(
+                "zai_api_key",
+                &self.zai_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("zai_base_url", &self.zai_base_url)
             // Non-provider
             .field("db_path", &self.db_path)
             .field("log_level", &self.log_level)

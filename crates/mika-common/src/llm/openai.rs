@@ -426,6 +426,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 | ProviderKind::Mistral
                 | ProviderKind::Google
                 | ProviderKind::DeepSeek
+                | ProviderKind::Zai
         )
     }
 

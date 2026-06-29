@@ -250,6 +250,8 @@ pub enum ProviderKind {
     MiniMax,
     Kimi,
     Qwen,
+    #[serde(rename = "zai")]
+    Zai,
     #[serde(rename = "mikamodel")]
     MikaModel,
 }
@@ -268,6 +270,7 @@ impl ProviderKind {
         ProviderKind::MiniMax,
         ProviderKind::Kimi,
         ProviderKind::Qwen,
+        ProviderKind::Zai,
         ProviderKind::MikaModel,
     ];
 
@@ -285,6 +288,7 @@ impl ProviderKind {
             ProviderKind::MiniMax => "minimax",
             ProviderKind::Kimi => "kimi",
             ProviderKind::Qwen => "qwen",
+            ProviderKind::Zai => "zai",
             ProviderKind::MikaModel => "mikamodel",
         }
     }
@@ -303,6 +307,7 @@ impl ProviderKind {
             ProviderKind::MiniMax => Some("https://api.minimax.io/v1"),
             ProviderKind::Kimi => Some("https://api.moonshot.cn/v1"),
             ProviderKind::Qwen => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            ProviderKind::Zai => Some("https://open.z.ai/api/paas/v4"),
             // MikaModel ships in two phases. Phase 1 (current): served via a local
             // Ollama runtime, so the default base URL matches the Ollama default and
             // requests flow through the same /api/chat transport. Phase 2: swap to a
@@ -328,6 +333,7 @@ impl ProviderKind {
             ProviderKind::MiniMax => 16_384,
             ProviderKind::Kimi => 8_192,
             ProviderKind::Qwen => 8_192,
+            ProviderKind::Zai => 16_384,
             // MikaModel uses the Ollama transport, which imposes no hard cap.
             ProviderKind::MikaModel => 131_072,
         }
@@ -353,6 +359,7 @@ impl ProviderKind {
             ProviderKind::MiniMax => "MiniMax-M2.7",
             ProviderKind::Kimi => "moonshot-v1-128k",
             ProviderKind::Qwen => "qwen-plus",
+            ProviderKind::Zai => "glm-4-plus",
             ProviderKind::MikaModel => "mika",
         }
     }
@@ -380,9 +387,10 @@ impl FromStr for ProviderKind {
             "minimax" => Ok(ProviderKind::MiniMax),
             "kimi" => Ok(ProviderKind::Kimi),
             "qwen" => Ok(ProviderKind::Qwen),
+            "zai" => Ok(ProviderKind::Zai),
             "mikamodel" => Ok(ProviderKind::MikaModel),
             _ => Err(format!(
-                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax, kimi, qwen, mikamodel"
+                "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax, kimi, qwen, zai, mikamodel"
             )),
         }
     }
@@ -550,10 +558,11 @@ mod tests {
 
     #[test]
     fn test_provider_kind_all() {
-        assert_eq!(ProviderKind::ALL.len(), 12);
+        assert_eq!(ProviderKind::ALL.len(), 13);
         assert_eq!(ProviderKind::ALL[0], ProviderKind::Anthropic);
         assert_eq!(ProviderKind::ALL[10], ProviderKind::Qwen);
-        assert_eq!(ProviderKind::ALL[11], ProviderKind::MikaModel);
+        assert_eq!(ProviderKind::ALL[11], ProviderKind::Zai);
+        assert_eq!(ProviderKind::ALL[12], ProviderKind::MikaModel);
     }
 
     #[test]
