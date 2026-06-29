@@ -144,6 +144,7 @@ allowlist = [\n\
   \"build-mika\",\n\
   \"deploy-mika\",\n\
   \"agents-teams\",\n\
+  \"skill-review\",\n\
   \"address-pr-comments\",\n\
   \"resolve-pr-conflicts\",\n\
   \"self-check\",\n\
@@ -1913,7 +1914,10 @@ mod tests {
             );
         }
 
-        let qa_only = ["qa-review", "qa-review-build-callback", "skill-review"];
+        // skill-review is SHARED, not role-only (like tmux/shell-exec above): mika-qa
+        // reviews skills, and mika-dev self-tunes model-specific variants of its own
+        // prompts via review_skill. Reclassified from qa-only when added to mika-dev.
+        let qa_only = ["qa-review", "qa-review-build-callback"];
         for skill in &qa_only {
             assert!(
                 qa_allowlist.contains(&skill.to_string()),
@@ -2098,8 +2102,8 @@ mod tests {
             .expect("mika-dev must have allowlist");
         assert_eq!(
             allowlist.len(),
-            25,
-            "mika-dev allowlist should have 25 skills (permission-policy retired mika#1193)"
+            26,
+            "mika-dev allowlist should have 26 skills (permission-policy retired mika#1193)"
         );
     }
 
@@ -2423,8 +2427,8 @@ mod tests {
             .expect("reconciler must add [skills].allowlist");
         assert_eq!(
             allowlist.len(),
-            25,
-            "mika-dev reconciled allowlist must contain all 25 spec skills"
+            26,
+            "mika-dev reconciled allowlist must contain all 26 spec skills"
         );
         assert!(allowlist.contains(&"self-dev".to_string()));
         assert!(allowlist.contains(&"dev-pilot".to_string()));
@@ -2516,7 +2520,7 @@ mod tests {
             !allowlist.contains(&"only-self-dev".to_string()),
             "operator-weakened allowlist must be overwritten"
         );
-        assert_eq!(allowlist.len(), 25);
+        assert_eq!(allowlist.len(), 26);
     }
 
     #[test]
