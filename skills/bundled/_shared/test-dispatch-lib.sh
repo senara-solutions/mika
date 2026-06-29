@@ -2356,7 +2356,7 @@ assert_contains "Gate scoped to dev-pilot only (groom intentionally has no PR)" 
 assert_contains "Gate fires only when HEAD has advanced (PRE != POST)" \
     'PRE_RUN_HEAD" != "$POST_RUN_HEAD"' "$GATE_BLOCK"
 assert_contains "Gate uses gh pr list --head <branch> for PR existence check" \
-    'gh pr list --repo "$REPO" --head "$BRANCH"' "$GATE_BLOCK"
+    'gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH"' "$GATE_BLOCK"
 assert_contains "Phase A: trailing dirty rescue with wip() prefix" \
     'wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)' "$GATE_BLOCK"
 assert_contains "Phase A: same scaffold-path exclusion as mika#1282 (.claude/commands, claude-pilot.json)" \
@@ -2772,6 +2772,23 @@ if grep -qF 'wip-rescue" 2>&9 || true' "$DISPATCH_LIB"; then
     PASS=$((PASS + 1)); echo "  ✓ Label application is fault-tolerant (|| true)"
 else
     FAIL=$((FAIL + 1)); echo "  ✗ Label application is fault-tolerant (|| true)"
+fi
+
+# --- Regression: no bare $REPO in gh --repo arguments (mika#1643) ---
+
+echo ""
+echo "=== Regression: no bare \$REPO in gh --repo (mika#1643) ==="
+
+# All gh --repo call sites must use senara-solutions/$REPO, never bare $REPO.
+BARE_REPO_HITS=$(grep -n 'gh.*--repo[[:space:]]*"\$REPO"' "$DISPATCH_LIB" | grep -v 'senara-solutions/' || true)
+BARE_REPO_HITS_UNQUOTED=$(grep -n 'gh.*--repo[[:space:]]*\${REPO}' "$DISPATCH_LIB" | grep -v 'senara-solutions/' || true)
+
+if [ -z "$BARE_REPO_HITS" ] && [ -z "$BARE_REPO_HITS_UNQUOTED" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ No bare \$REPO in gh --repo arguments"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Found bare \$REPO in gh --repo arguments:"
+    [ -n "$BARE_REPO_HITS" ] && echo "$BARE_REPO_HITS"
+    [ -n "$BARE_REPO_HITS_UNQUOTED" ] && echo "$BARE_REPO_HITS_UNQUOTED"
 fi
 
 # --- Summary ---
