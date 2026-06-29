@@ -197,3 +197,14 @@ The key structural change: these blocks move from being **nested inside** `if [ 
 - [ ] New tests cover dirty-worktree rescue on non-structured-output exit
 - [ ] All existing test-dispatch-lib.sh tests pass
 - [ ] PR opened with `Closes #1615`
+
+## Acceptance criteria
+
+- **AC1** — `POST_RUN_HEAD` is computed unconditionally in `_run_claude_pilot()` after the three-branch STATUS/exit-code classification, NOT inside any STATUS-conditional. Structural assertion: `grep -c 'POST_RUN_HEAD=' skills/bundled/_shared/dispatch-lib.sh` returns ≥ 2 (init + computation), with the computation outside `if [ -n "$STATUS" ]`.
+- **AC2** — All post-flight recovery logic (dirty-worktree rescue, dev-groom plan validation, PR-existence check, mika#940 post-flight check, outcome classification) is extracted into a single `_post_flight_recovery()` function, called from exactly one site after exit classification.
+- **AC3** — Branch B (exit 0, non-JSON output) triggers `_post_flight_recovery()` with RESULT pre-set; previously this path skipped recovery entirely.
+- **AC4** — Branch C (non-zero exit) triggers `_post_flight_recovery()` with RESULT pre-set; previously this path skipped dirty-worktree rescue.
+- **AC5** — Existing Branch A behavior is preserved: all existing tests in `test-dispatch-lib.sh` pass without modification.
+- **AC6** — New test (Test 17, mika#1615) covers 10 structural assertions + 3 behavioral sub-tests exercising Branch B and Branch C recovery using real git repos via mktemp + subshell isolation.
+- **AC7** — `RESCUED_DIRTY_WORKTREE=1` propagates correctly to Unit 2 draft-PR creation in `dispatch_claude_pilot()` from all three branches when dirty-worktree rescue fires.
+- **AC8** — Plan filename matches `<date>-<seq>-<issue>-<slug>-plan.md` pattern so `_find_issue_plan` regex matches (mika#1617 backcompat).
