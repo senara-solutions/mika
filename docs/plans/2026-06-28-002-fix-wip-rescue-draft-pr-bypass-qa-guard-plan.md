@@ -185,6 +185,15 @@ Add a calibration rule documenting this defense-in-depth:
 
 ---
 
+## Acceptance criteria
+
+1. A PR opened by the mika#1282 dirty-worktree rescue (or mika#1383 auto-PR-create tail) does **not** get autonomously un-drafted/auto-merged: qa-webhook skips verdict processing and escalates to the operator, matching the existing `unpushed_recovery_pending` behavior.
+2. The signal is durable: prefer task-metadata flag set at rescue time; if also recognizing the `wip(...mika#1282)` commit signature, document why.
+3. A test (dispatch-lib test harness and/or a qa-webhook decision test) covers: wip-rescue draft PR → qa event → verdict processing skipped + operator escalation.
+4. Regression coverage so a future rescue-path addition that forgets the flag is caught.
+
+---
+
 ## Definition of Done
 
 - [ ] dispatch-lib appends `RECOVERY_PENDING: true` to RESULT when a rescue PR is created
