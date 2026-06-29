@@ -1713,7 +1713,7 @@ const MAX_PENDING_DEFERRED_CALLBACKS: i64 = 10;
 /// Adding a new call site that does NOT pass guard 0 first would let
 /// unauthorized dispatches forge authorization. If you add one, document the
 /// guard-0 equivalence at the call site and update this comment.
-async fn register_deferred_callback(
+pub(crate) async fn register_deferred_callback(
     db: &AsyncDatabase,
     task_id: &str,
     input: &serde_json::Value,

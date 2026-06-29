@@ -15,11 +15,18 @@ use serde_json::json;
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, NewTask};
 use mika_agent::server::verdict_handler::{VerdictAction, try_handle_pr_review_verdict};
+use mika_agent::skills::SkillRegistry;
 use mika_agent::task_engine::types::{action_type, trigger_type};
 
 /// Default agent ID used by `AsyncDatabase::new()`.
 const AGENT_ID: &str = "mika";
 const SESSION_ID: &str = "verdict-test-session";
+
+/// Empty SkillRegistry for tests that don't need real skill resolution.
+fn test_skills() -> SkillRegistry {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    SkillRegistry::from_dir(tmp.path())
+}
 
 /// Helper to create an in-memory async database for tests.
 async fn test_db() -> AsyncDatabase {
@@ -100,14 +107,21 @@ async fn verdict_block_ci_no_task_passes_through_with_enrichment() -> Result<()>
         "VERDICT: block[ci]\n\nCI checks are failing.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     // With no matching task, block[ci] passes through with enrichment
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             let e = enrichment.expect("block[ci] with no task should enrich");
@@ -142,13 +156,20 @@ async fn verdict_block_ci_with_task_is_handled() -> Result<()> {
         "VERDICT: block[ci]\n\nCI checks are failing.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(
@@ -194,13 +215,20 @@ async fn verdict_block_ac_with_task_is_handled() -> Result<()> {
          REASON: Two plan ACs unsatisfied.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(
@@ -254,13 +282,20 @@ async fn verdict_block_ac_retry_limit_escalates() -> Result<()> {
         "VERDICT: block[ac]\nREASON: ACs still unsatisfied after 3 attempts.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(
@@ -313,13 +348,20 @@ async fn verdict_block_security_escalates() -> Result<()> {
         "VERDICT: block[security]\nREASON: Hardcoded API key found.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(
@@ -372,13 +414,20 @@ async fn verdict_block_pipeline_escalates() -> Result<()> {
         "VERDICT: block[pipeline]\nREASON: Missing pipeline artifacts.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(pre_digest.contains("block[pipeline]"));
@@ -422,13 +471,20 @@ async fn verdict_block_ci_retry_limit_escalates() -> Result<()> {
         "VERDICT: block[ci]\nREASON: CI still failing after 3 fix attempts.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(
@@ -481,13 +537,20 @@ async fn verdict_hold_review_with_task_is_handled() -> Result<()> {
         "VERDICT: hold[review]\n\nNeeds design input.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(
@@ -537,14 +600,21 @@ async fn verdict_hold_review_no_task_passes_through() -> Result<()> {
         "VERDICT: hold[review]\n\nNeeds another look.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     // With no task, hold[review] passes through with enrichment
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             let e = enrichment.expect("hold[review] with no task should enrich");
@@ -572,13 +642,20 @@ async fn verdict_missing_is_handled_structurally() -> Result<()> {
         "Looks good, approved!",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(
@@ -615,9 +692,16 @@ async fn verdict_missing_logs_audit_event() -> Result<()> {
         "Just some comments without a verdict line.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     // Should be handled
     assert!(
@@ -659,13 +743,20 @@ async fn verdict_changes_requested_block_ac_single_dispatch() -> Result<()> {
         "VERDICT: block[ac]\nREASON: ACs unsatisfied.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Handled { pre_digest } => {
             assert!(pre_digest.contains("block[ac]"));
@@ -704,14 +795,19 @@ async fn verdict_pass_approved_with_task_no_token_passthrough() -> Result<()> {
     );
 
     let action = try_handle_pr_review_verdict(
-        &text, &db, None, // no token
-        None, SESSION_ID, "trace-1",
+        &text,
+        &db,
+        None, // no token
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
     )
     .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             let e = enrichment.expect("no-token pass should enrich");
@@ -750,6 +846,7 @@ async fn verdict_block_ac_sequential_retries() -> Result<()> {
         None,
         SESSION_ID,
         "trace-1",
+        &test_skills(),
     )
     .await;
     match &action1 {
@@ -771,6 +868,7 @@ async fn verdict_block_ac_sequential_retries() -> Result<()> {
         None,
         SESSION_ID,
         "trace-2",
+        &test_skills(),
     )
     .await;
     match &action2 {
@@ -792,6 +890,7 @@ async fn verdict_block_ac_sequential_retries() -> Result<()> {
         None,
         SESSION_ID,
         "trace-3",
+        &test_skills(),
     )
     .await;
     match &action3 {
@@ -813,6 +912,7 @@ async fn verdict_block_ac_sequential_retries() -> Result<()> {
         None,
         SESSION_ID,
         "trace-4",
+        &test_skills(),
     )
     .await;
     match &action4 {
@@ -855,13 +955,20 @@ async fn non_pr_review_event_passes_through() -> Result<()> {
                 https://github.com/senara-solutions/mika/issues/100\n\n\
                 Assigned to: @mika-dev";
 
-    let action =
-        try_handle_pr_review_verdict(text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
@@ -891,13 +998,20 @@ async fn verdict_pass_no_task_passes_through() -> Result<()> {
         "VERDICT: pass\n\nAll good.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
@@ -935,13 +1049,20 @@ async fn verdict_pass_completed_task_passes_through() -> Result<()> {
         "VERDICT: pass\n\nAll good.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
@@ -1010,13 +1131,20 @@ async fn verdict_pass_pending_task_passes_through() -> Result<()> {
         "VERDICT: pass\n\nAll good.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             assert!(
@@ -1050,14 +1178,19 @@ async fn verdict_pass_no_github_token_passes_through() -> Result<()> {
     );
 
     let action = try_handle_pr_review_verdict(
-        &text, &db, None, // no github token
-        None, SESSION_ID, "trace-1",
+        &text,
+        &db,
+        None, // no github token
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
     )
     .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             let e = enrichment.expect("no-token should enrich");
@@ -1085,13 +1218,20 @@ async fn non_approved_review_passes_through() -> Result<()> {
         "VERDICT: pass\n\nLooks good.",
     );
 
-    let action =
-        try_handle_pr_review_verdict(&text, &db, Some("fake-token"), None, SESSION_ID, "trace-1")
-            .await;
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-1",
+        &test_skills(),
+    )
+    .await;
 
     match action {
         VerdictAction::Dispatched { .. } => {
-            unreachable!("verdict handler never returns Dispatched (mika#1572)")
+            unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
         VerdictAction::Passthrough { enrichment } => {
             assert!(

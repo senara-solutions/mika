@@ -778,6 +778,7 @@ async fn run_agent_for_message(
             Some(&sender_arc),
             &session_id,
             &req.request_id,
+            &skills,
         )
         .await;
         match action {
@@ -790,8 +791,10 @@ async fn run_agent_for_message(
                 req.text = format!("{e}{}", req.text);
             }
             VerdictAction::Passthrough { enrichment: None } => {}
-            // Only the ready-label handler returns Dispatched (mika#1572).
-            VerdictAction::Dispatched { .. } => {}
+            // Engine-side dispatch fired (mika#1572 ready-label, mika#1630 verdict).
+            VerdictAction::Dispatched { pre_digest, .. } => {
+                req.text = pre_digest;
+            }
         }
 
         // Structural CI success handler: intercept check_suite.completed(success)
