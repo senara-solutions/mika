@@ -48,3 +48,7 @@ tower = { workspace = true }
 http-body-util = { workspace = true }
 mika-common = { workspace = true, features = ["test-utils"] }
 jsonwebtoken = { workspace = true }
+# For the #[ignore]'d DB-backed admin_customers integration test (mika#1612).
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }

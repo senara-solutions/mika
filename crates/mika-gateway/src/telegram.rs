@@ -593,7 +593,9 @@ async fn set_webhook_impl(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("setWebhook request failed: {e}"))?;
+        // Do not interpolate the reqwest error: its Display includes the request URL,
+        // which embeds `bot<TOKEN>` and would leak the bot token into logs (mika#1612).
+        .map_err(|_| anyhow::anyhow!("setWebhook network request failed"))?;
 
     let body: TelegramResponse = resp
         .json()

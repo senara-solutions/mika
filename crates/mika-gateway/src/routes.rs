@@ -906,9 +906,31 @@ struct RegisterCustomerPayload {
 struct RegisterCustomerResponse {
     customer_id: Uuid,
     bot_username: String,
-    pairing_token: String,
-    pairing_url: String,
+    /// `None` for active customers whose pairing token was already consumed —
+    /// the endpoint never fabricates a token it did not persist (mika#1612).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing_url: Option<String>,
     webhook_registered: bool,
+}
+
+/// Build the response pairing fields from the DB's effective pairing token.
+///
+/// Returns `(None, None)` when the customer has no live pairing token (active
+/// customers — the token was consumed by `handle_pairing`), so the response never
+/// advertises a `pairing_url` that cannot pair (mika#1612).
+fn pairing_response_fields(
+    row_pairing_token: Option<&str>,
+    bot_username: &str,
+) -> (Option<String>, Option<String>) {
+    match row_pairing_token {
+        Some(token) => {
+            let url = format!("https://t.me/{bot_username}?start={token}");
+            (Some(token.to_string()), Some(url))
+        }
+        None => (None, None),
+    }
 }
 
 /// Validate bot_username: alphanumeric + underscores, 1-32 chars, no leading `@`.
@@ -973,7 +995,9 @@ async fn handle_register_customer(
     );
     match customer_tg.get_me().await {
         Ok(actual_username) => {
-            if actual_username != payload.bot_username {
+            // Telegram usernames are case-insensitive; getMe returns canonical
+            // casing, so a case-differing caller must not get a 400 (mika#1612).
+            if !actual_username.eq_ignore_ascii_case(&payload.bot_username) {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
@@ -1016,7 +1040,10 @@ async fn handle_register_customer(
                name = EXCLUDED.name,
                bot_token = EXCLUDED.bot_token,
                bot_username = EXCLUDED.bot_username,
-               webhook_secret = EXCLUDED.webhook_secret,
+               -- Preserve the existing secret for active customers so the DB never
+               -- holds a secret Telegram doesn't yet have. The new secret is only
+               -- promoted after a successful setWebhook below (mika#1612).
+               webhook_secret = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.webhook_secret ELSE customers.webhook_secret END,
                pairing_token = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_token ELSE customers.pairing_token END,
                pairing_expires_at = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_expires_at ELSE customers.pairing_expires_at END
            RETURNING status, pairing_token, (xmax = 0) AS was_inserted"#,
@@ -1029,7 +1056,11 @@ async fn handle_register_customer(
     .bind(&payload.bot_username)
     .bind(&webhook_secret)
     .bind(&pairing_token)
-    .bind(ttl_hours as f64)
+    // Postgres `make_interval(hours => $N)` expects int4; binding f64 (float8) is
+    // only an assignment cast and fails function resolution (mika#1612). Out-of-i32
+    // values fall back to the 48h default; `.max(1)` then floors zero/negative inputs
+    // to 1h so a nonsensical TTL can't mint an already-expired (unpairable) token.
+    .bind(i32::try_from(ttl_hours).unwrap_or(48).max(1))
     .fetch_one(&state.pool)
     .await;
 
@@ -1072,12 +1103,30 @@ async fn handle_register_customer(
         }
     };
 
-    // Use the effective pairing_token from the DB (may be the old one for active customers)
-    let effective_token = row.pairing_token.unwrap_or_else(|| pairing_token.clone());
-    let pairing_url = format!(
-        "https://t.me/{}?start={}",
-        payload.bot_username, effective_token
-    );
+    // Promote the freshly-generated secret to the DB only when Telegram has actually
+    // accepted it. The upsert above preserved the old secret for active customers, so
+    // a failed setWebhook leaves inbound validation working against the old secret
+    // (mika#1612). Fresh inserts already hold the new secret, so skip them.
+    if webhook_registered
+        && !row.was_inserted
+        && let Err(e) = sqlx::query("UPDATE customers SET webhook_secret = $1 WHERE id = $2")
+            .bind(&webhook_secret)
+            .bind(payload.customer_id)
+            .execute(&state.pool)
+            .await
+    {
+        warn!(
+            error = %e,
+            customer_id = %payload.customer_id,
+            "failed to rotate webhook_secret after successful setWebhook; DB retains old secret"
+        );
+    }
+
+    // Use the effective pairing_token from the DB. Active customers have a NULL
+    // pairing_token (consumed by handle_pairing) — return no pairing fields rather
+    // than fabricate a token that was never persisted (mika#1612).
+    let (pairing_token_resp, pairing_url) =
+        pairing_response_fields(row.pairing_token.as_deref(), &payload.bot_username);
 
     let status_code = if row.was_inserted {
         StatusCode::CREATED
@@ -1090,7 +1139,7 @@ async fn handle_register_customer(
         Json(RegisterCustomerResponse {
             customer_id: payload.customer_id,
             bot_username: payload.bot_username,
-            pairing_token: effective_token,
+            pairing_token: pairing_token_resp,
             pairing_url,
             webhook_registered,
         }),
@@ -1886,6 +1935,22 @@ mod tests {
     fn test_generate_pairing_token_is_hex() {
         let token = generate_pairing_token();
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_pairing_response_fields_some_builds_url() {
+        let (token, url) = pairing_response_fields(Some("abc123"), "mikabot");
+        assert_eq!(token.as_deref(), Some("abc123"));
+        assert_eq!(url.as_deref(), Some("https://t.me/mikabot?start=abc123"));
+    }
+
+    #[test]
+    fn test_pairing_response_fields_none_omits_both() {
+        // Active customers have a consumed (NULL) pairing token — the response must
+        // not fabricate a token/url that cannot pair (mika#1612).
+        let (token, url) = pairing_response_fields(None, "mikabot");
+        assert_eq!(token, None);
+        assert_eq!(url, None);
     }
 
     #[test]
