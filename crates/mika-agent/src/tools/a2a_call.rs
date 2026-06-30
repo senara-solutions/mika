@@ -9,6 +9,16 @@ use tracing::debug;
 
 use super::{MAX_INPUT_LEN, Tool, ToolContext, ToolOutput};
 
+/// Error returned when `a2a_call` is targeted at a loopback/private address
+/// (mika#1653). The address shape signals a local agent, which `a2a_call`
+/// cannot reach — so the message redirects to the correct mechanism instead of
+/// dead-ending on a refusal.
+const LOCAL_TARGET_HINT: &str = "This looks like a local agent on this host \
+    (loopback/private address). `a2a_call` only reaches external, remote \
+    (cross-container) agents by URL. To reach a local agent, use `delegate_task` \
+    in conversation mode, or assign it a task in your team decompose JSON array \
+    in a team run.";
+
 pub struct A2aCallTool;
 
 #[async_trait]
@@ -20,9 +30,16 @@ impl Tool for A2aCallTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "a2a_call".to_string(),
-            description: "Call a remote A2A (Agent-to-Agent) agent. Sends a message via the \
-                A2A protocol's message/send method and returns the agent's response. Use this \
-                to interact with external agents that expose an A2A endpoint."
+            description: "Call an external, remote (cross-container) A2A \
+                (Agent-to-Agent) agent addressed by URL. Sends a message via the \
+                A2A protocol's message/send method and returns the agent's \
+                response. Use this ONLY for external agents that expose a public \
+                A2A endpoint. This is NOT how you reach a local agent on this \
+                host: local agents are addressed by name, not URL. To reach a \
+                local agent in conversation mode use `delegate_task`; in a team \
+                run, assign the member a task in your decompose JSON array (the \
+                engine spawns it for you). `a2a_call` cannot reach local siblings \
+                and will fail on loopback/private URLs."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -73,7 +90,7 @@ impl Tool for A2aCallTool {
 
         if let Some(host) = parsed_url.host_str() {
             if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-                return Ok(ToolOutput::error("Cannot call localhost URLs."));
+                return Ok(ToolOutput::error(LOCAL_TARGET_HINT));
             }
             if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                 let is_private = match ip {
@@ -83,9 +100,7 @@ impl Tool for A2aCallTool {
                     std::net::IpAddr::V6(v6) => v6.is_loopback(),
                 };
                 if is_private {
-                    return Ok(ToolOutput::error(
-                        "Cannot call private or internal IP addresses.",
-                    ));
+                    return Ok(ToolOutput::error(LOCAL_TARGET_HINT));
                 }
             }
         } else {
@@ -189,5 +204,78 @@ impl Tool for A2aCallTool {
         } else {
             Ok(ToolOutput::success(parts_text.join("\n\n")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::test_helpers::TestHarness;
+
+    #[test]
+    fn test_description_is_remote_only_and_points_to_delegate_task() {
+        // mika#1653 Layer 3: the static description must mark the tool as
+        // remote/external-only and name `delegate_task` as the local alternative.
+        let desc = A2aCallTool.definition().description;
+        let lower = desc.to_lowercase();
+        assert!(
+            lower.contains("remote") || lower.contains("external"),
+            "a2a_call description must mark itself remote/external-only; got: {desc}"
+        );
+        assert!(
+            desc.contains("delegate_task"),
+            "a2a_call description must redirect local targets to delegate_task; got: {desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_localhost_target_redirects_to_delegate_task() {
+        // The SSRF guard fires before any network/DB access, so the harness ctx
+        // is sufficient. The rejection must be actionable, not a dead end.
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = A2aCallTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "http://localhost:8080/a2a", "message": "hi"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "localhost target must be rejected");
+        assert!(
+            result.content.contains("delegate_task"),
+            "localhost rejection must point to delegate_task; got: {}",
+            result.content
+        );
+        assert!(
+            result.content.to_lowercase().contains("local agent"),
+            "localhost rejection must name the local-agent alternative; got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_private_ip_target_redirects_to_delegate_task() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let tool = A2aCallTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "http://10.0.0.5/a2a", "message": "hi"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "private-IP target must be rejected");
+        assert!(
+            result.content.contains("delegate_task"),
+            "private-IP rejection must point to delegate_task; got: {}",
+            result.content
+        );
     }
 }

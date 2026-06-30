@@ -662,6 +662,23 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
+    /// Remove a tool (and its cached definition) by name.
+    ///
+    /// Returns `true` if a tool was removed. Used by the team engine to drop
+    /// `a2a_call` from its private registry so the orchestrator never sees a
+    /// cross-container reach tool for local team members (mika#1653). Local
+    /// siblings are routed by name via the decompose→spawn→resume cycle, not by
+    /// `a2a_call`, which is URL-addressed and 503s on local targets.
+    pub fn remove(&mut self, name: &str) -> bool {
+        if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
+            self.tools.remove(pos);
+            self.cached_defs.retain(|d| d.name != name);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn definitions(&self) -> &[ToolDefinition] {
         &self.cached_defs
     }
@@ -891,6 +908,37 @@ pub fn management_tools_if_needed(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// mika#1653 — `ToolRegistry::remove` drops a tool and its cached
+    /// definition; returns false when the name is absent.
+    #[test]
+    fn test_tool_registry_remove() {
+        let mut registry = default_tools();
+        assert!(
+            registry.definitions().iter().any(|d| d.name == "a2a_call"),
+            "default_tools() should register a2a_call"
+        );
+
+        assert!(
+            registry.remove("a2a_call"),
+            "remove should return true on hit"
+        );
+        assert!(
+            !registry.definitions().iter().any(|d| d.name == "a2a_call"),
+            "a2a_call definition must be gone after remove"
+        );
+        assert!(
+            registry.get("a2a_call").is_none(),
+            "a2a_call tool must be gone after remove"
+        );
+
+        // Idempotent / absent-name case.
+        assert!(!registry.remove("a2a_call"), "second remove returns false");
+        assert!(
+            !registry.remove("nonexistent_tool"),
+            "removing unknown name returns false"
+        );
+    }
 
     /// mika#1217 F4 — `BUILTIN_TOOL_NAMES` must list every engine-registered
     /// tool name (default_tools + management_tools_if_needed + KNOWN_BUILTINS).

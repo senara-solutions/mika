@@ -41,6 +41,40 @@ struct AgentResources {
     llm: Arc<dyn LlmProvider>,
 }
 
+/// Build the team-mode tool registry: base tools + workspace tools, with the
+/// team-mode suppression list applied (mika#1653).
+///
+/// `a2a_call` is removed because no agent inside a team run — orchestrator or
+/// member — has a valid use for it: local team members are routed by name via
+/// the decompose→spawn→resume cycle, and `a2a_call` is URL-addressed and
+/// structurally 503s on local siblings (no gateway route exists for
+/// `~/.mika/agents/<name>`). Suppression is scoped to this private registry, so
+/// conversation-mode agents (which legitimately reach external A2A agents) are
+/// unaffected. This is the structural enforcement behind the prompt guidance in
+/// `teams::prompt::build_orchestrator_context` — with the tool absent from the
+/// array, the orchestrator cannot mis-reach regardless of prompt drift.
+///
+/// The `TEAM_SUPPRESSED_TOOLS` invariant is regression-gated by
+/// `test_team_registry_suppresses_a2a_call` below — a future `default_tools()`
+/// change cannot silently re-introduce the affordance.
+fn build_team_tool_registry(
+    workspace_dir: &Path,
+    reference_workspace: Option<&Path>,
+) -> ToolRegistry {
+    let mut registry = tools::default_tools();
+    for tool in tools::team_tools(workspace_dir, reference_workspace) {
+        registry.register(tool);
+    }
+    for name in TEAM_SUPPRESSED_TOOLS {
+        registry.remove(name);
+    }
+    registry
+}
+
+/// Tools removed from the team-mode tool array (mika#1653). See
+/// [`build_team_tool_registry`] for the rationale.
+const TEAM_SUPPRESSED_TOOLS: &[&str] = &["a2a_call"];
+
 /// Shared initialization resources produced by [`TeamEngine::init_resources`].
 struct EngineResources {
     agents: HashMap<String, AgentResources>,
@@ -140,11 +174,10 @@ impl TeamEngine {
             );
         }
 
-        // Build tool registry once with base tools + workspace tools (#255)
-        let mut tool_registry = tools::default_tools();
-        for tool in tools::team_tools(&workspace_dir, reference_workspace.as_deref()) {
-            tool_registry.register(tool);
-        }
+        // Build tool registry once with base tools + workspace tools (#255),
+        // with the team-mode suppression applied (mika#1653).
+        let tool_registry =
+            build_team_tool_registry(&workspace_dir, reference_workspace.as_deref());
 
         Ok(EngineResources {
             agents,
@@ -1782,6 +1815,42 @@ mod tests {
             ],
             flow: TeamFlow { max_iterations: 3 },
         }
+    }
+
+    #[test]
+    fn test_team_registry_suppresses_a2a_call() {
+        // mika#1653 F1: hard structural assertion that the team orchestrator's
+        // tool array never contains `a2a_call`. Anchored to the real registry
+        // builder used by `init_resources()`, so a future `default_tools()`
+        // change cannot silently re-introduce the cross-container reach tool.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = build_team_tool_registry(tmp.path(), None);
+        let names: Vec<&str> = registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+
+        assert!(
+            !names.contains(&"a2a_call"),
+            "a2a_call must be suppressed from the team-mode tool array (mika#1653); found: {names:?}"
+        );
+
+        // Workspace tools must still be present — the decompose→spawn→resume
+        // cycle relies on members exchanging results via the workspace.
+        for ws_tool in ["read_workspace", "write_workspace", "list_workspace"] {
+            assert!(
+                names.contains(&ws_tool),
+                "team registry must retain workspace tool '{ws_tool}'; found: {names:?}"
+            );
+        }
+
+        // A representative core tool must survive suppression — only `a2a_call`
+        // is dropped, not the rest of `default_tools()`.
+        assert!(
+            names.contains(&"send_message"),
+            "team registry must retain core tools like send_message; found: {names:?}"
+        );
     }
 
     #[test]
