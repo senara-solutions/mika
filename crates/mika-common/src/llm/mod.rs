@@ -392,7 +392,12 @@ impl FromStr for ProviderKind {
             "kimi" => Ok(ProviderKind::Kimi),
             "qwen" => Ok(ProviderKind::Qwen),
             "mikamodel" => Ok(ProviderKind::MikaModel),
-            "zai" => Ok(ProviderKind::ZAi),
+            // `zai` is the canonical config-key form (matches `config_prefix`
+            // and `Display`). `z-ai` is the OpenRouter-namespace alias
+            // (`z-ai/glm-5.2`) — accepted so `resolve_canonical_provider_model`
+            // can normalize aggregator-split provider names to the canonical
+            // key the skill-variant loader requires (mika#1663).
+            "zai" | "z-ai" => Ok(ProviderKind::ZAi),
             _ => Err(format!(
                 "unknown provider '{s}'. Known providers: anthropic, openai, openrouter, groq, ollama, mistral, google, deepseek, minimax, kimi, qwen, mikamodel, zai"
             )),
@@ -583,6 +588,12 @@ mod tests {
         // Z.AI direct uses bare model ids (e.g. `glm-5.2`), no provider slash.
         assert!(!ProviderKind::ZAi.model_names_contain_slash());
         assert_eq!("zai".parse::<ProviderKind>(), Ok(ProviderKind::ZAi));
+        // OpenRouter-namespace alias (`z-ai/glm-5.2`) parses to the same kind
+        // so `resolve_canonical_provider_model` can normalize it (mika#1663).
+        assert_eq!("z-ai".parse::<ProviderKind>(), Ok(ProviderKind::ZAi));
+        assert_eq!("Z-AI".parse::<ProviderKind>(), Ok(ProviderKind::ZAi));
+        // Canonical form survives a Display→FromStr round-trip as `zai`.
+        assert_eq!(ProviderKind::ZAi.to_string(), "zai");
     }
 
     #[test]

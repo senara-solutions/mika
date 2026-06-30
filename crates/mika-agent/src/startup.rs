@@ -2,7 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use mika_common::home;
-use tracing::info;
+use mika_common::llm::ProviderKind;
+use tracing::{info, warn};
 
 use crate::db::Database;
 
@@ -54,6 +55,12 @@ pub fn seed_core_memory_if_empty(db: &Database, home_dir: &Path, agent_name: &st
 /// (`_shared/`) are seeded unconditionally because they are infrastructure
 /// (dispatch plumbing), not skill prompts. See mika#923.
 pub fn seed_bundled_skills_if_needed(agent_home: &Path, disabled: bool) {
+    // One-shot repair of orphaned generated skill variants (mika#1663). Runs
+    // in all modes — including MIKA_DISABLE_BUNDLED_SKILLS — because orphaned
+    // variants exist independently of bundled-skill seeding and should be
+    // repaired regardless of that debugging flag.
+    migrate_generated_variant_provider_dirs(agent_home);
+
     let (global_home, is_multi_agent) = resolve_global_home(agent_home);
     let library_dir = home::library_skills_dir(&global_home);
     let agent_skills_dir = agent_home.join("skills");
@@ -129,6 +136,131 @@ fn resolve_global_home(agent_home: &Path) -> (std::path::PathBuf, bool) {
     (agent_home.to_path_buf(), false)
 }
 
+/// One-shot migration: rename generated-variant provider directories whose
+/// name is a non-canonical `ProviderKind` alias (e.g. OpenRouter's `z-ai`) to
+/// the canonical config-key form (`zai`) that `scan_generated_variants`
+/// accepts (mika#1663).
+///
+/// Variants written under an aggregator-namespace provider segment were
+/// silently orphaned: the writer used the raw OpenRouter namespace string
+/// (`z-ai`), but the loader only recognizes `ProviderKind::from_str`-parseable
+/// config-key names (`zai`). The writer is fixed forward
+/// (`resolve_canonical_provider_model` now normalizes the aggregator split);
+/// this migration repairs variants already on disk.
+///
+/// Walks `<agent_home>/skills/*/generated/<provider>/`. A provider dir
+/// qualifies when its name parses to a `ProviderKind` but differs from that
+/// kind's `config_prefix()` — exactly the alias case (e.g. `z-ai` → `zai`).
+/// Skill directories are commonly symlinks into the shared library, so the
+/// physical rename lands in the library; idempotent across agents that share
+/// it.
+///
+/// Idempotent: a directory already in canonical form is skipped. When both the
+/// alias dir and the canonical dir exist, model subdirectories are merged
+/// (canonical wins on collision) and the alias dir is removed. All filesystem
+/// errors are warn-and-continue — a migration failure must never block startup.
+pub fn migrate_generated_variant_provider_dirs(agent_home: &Path) {
+    let skills_dir = agent_home.join("skills");
+    let skill_entries = match std::fs::read_dir(&skills_dir) {
+        Ok(rd) => rd,
+        Err(_) => return, // no skills dir yet (fresh install) — nothing to migrate
+    };
+
+    for skill_entry in skill_entries.flatten() {
+        let skill_name = skill_entry.file_name().to_string_lossy().into_owned();
+        // Skip support dirs (`_shared/`) and dotfiles — they hold no variants.
+        if skill_name.starts_with('_') || skill_name.starts_with('.') {
+            continue;
+        }
+        let generated_root = skill_entry.path().join("generated");
+        let provider_dirs = match std::fs::read_dir(&generated_root) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+
+        for provider_entry in provider_dirs.flatten() {
+            let provider_path = provider_entry.path();
+            if !provider_path.is_dir() {
+                continue;
+            }
+            let name = match provider_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            // Only alias dirs qualify: parseable to a ProviderKind but not
+            // already the canonical config-key form.
+            let Ok(kind) = name.parse::<ProviderKind>() else {
+                continue;
+            };
+            let canonical = kind.config_prefix();
+            if name == canonical {
+                continue;
+            }
+
+            let canonical_path = generated_root.join(canonical);
+            if !canonical_path.exists() {
+                match std::fs::rename(&provider_path, &canonical_path) {
+                    Ok(()) => info!(
+                        skill = %skill_name,
+                        from = %name,
+                        to = %canonical,
+                        "migrated orphaned generated variant provider dir (mika#1663)"
+                    ),
+                    Err(e) => warn!(
+                        skill = %skill_name,
+                        from = %name,
+                        to = %canonical,
+                        error = %e,
+                        "failed to migrate generated variant provider dir"
+                    ),
+                }
+                continue;
+            }
+
+            // Canonical dir already exists — merge per-model subdirs.
+            let model_dirs = match std::fs::read_dir(&provider_path) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for model_entry in model_dirs.flatten() {
+                let src_model = model_entry.path();
+                let model_name = match src_model.file_name() {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                let dst_model = canonical_path.join(&model_name);
+                if dst_model.exists() {
+                    // Canonical wins — drop the stale alias copy.
+                    let _ = std::fs::remove_dir_all(&src_model);
+                } else if let Err(e) = std::fs::rename(&src_model, &dst_model) {
+                    warn!(
+                        skill = %skill_name,
+                        model = %model_name.to_string_lossy(),
+                        error = %e,
+                        "failed to merge generated variant model dir during migration"
+                    );
+                }
+            }
+            // Remove the (now hopefully empty) alias provider dir.
+            if let Err(e) = std::fs::remove_dir(&provider_path) {
+                warn!(
+                    skill = %skill_name,
+                    dir = %name,
+                    error = %e,
+                    "failed to remove migrated alias provider dir (may be non-empty)"
+                );
+            } else {
+                info!(
+                    skill = %skill_name,
+                    from = %name,
+                    to = %canonical,
+                    "merged orphaned generated variants into canonical provider dir (mika#1663)"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +306,113 @@ mod tests {
             skill_dirs.is_empty(),
             "skill directories should not be created when disabled"
         );
+    }
+
+    fn write_variant(agent_home: &Path, skill: &str, provider: &str, model: &str, body: &str) {
+        let dir = agent_home
+            .join("skills")
+            .join(skill)
+            .join("generated")
+            .join(provider)
+            .join(model);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("system_prompt.md"), body).unwrap();
+    }
+
+    #[test]
+    fn test_migrate_renames_zai_alias_dir() {
+        // mika#1663: an orphaned `z-ai/` variant dir is renamed to canonical `zai/`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_variant(tmp.path(), "dev-pilot", "z-ai", "glm-5.2", "GLM variant");
+
+        migrate_generated_variant_provider_dirs(tmp.path());
+
+        let gen_dir = tmp.path().join("skills/dev-pilot/generated");
+        assert!(
+            !gen_dir.join("z-ai").exists(),
+            "alias dir should be removed after migration"
+        );
+        let migrated = gen_dir.join("zai/glm-5.2/system_prompt.md");
+        assert!(migrated.is_file(), "variant should now live under zai/");
+        assert_eq!(std::fs::read_to_string(migrated).unwrap(), "GLM variant");
+    }
+
+    #[test]
+    fn test_migrate_is_idempotent_and_skips_canonical() {
+        // A canonical `zai/` dir is untouched; a second run is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        write_variant(
+            tmp.path(),
+            "dev-pilot",
+            "zai",
+            "glm-5.2",
+            "already canonical",
+        );
+
+        migrate_generated_variant_provider_dirs(tmp.path());
+        migrate_generated_variant_provider_dirs(tmp.path());
+
+        let path = tmp
+            .path()
+            .join("skills/dev-pilot/generated/zai/glm-5.2/system_prompt.md");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "already canonical");
+    }
+
+    #[test]
+    fn test_migrate_merges_into_existing_canonical_dir() {
+        // When both alias and canonical dirs exist, non-colliding models move
+        // over and the canonical copy wins on collision; alias dir is removed.
+        let tmp = tempfile::tempdir().unwrap();
+        // Collision: same model in both — canonical must win.
+        write_variant(tmp.path(), "dev-pilot", "zai", "glm-5.2", "canonical wins");
+        write_variant(tmp.path(), "dev-pilot", "z-ai", "glm-5.2", "stale alias");
+        // Non-colliding model only in the alias dir — must migrate.
+        write_variant(tmp.path(), "dev-pilot", "z-ai", "glm-4.6", "alias only");
+
+        migrate_generated_variant_provider_dirs(tmp.path());
+
+        let gen_dir = tmp.path().join("skills/dev-pilot/generated");
+        assert!(!gen_dir.join("z-ai").exists(), "alias dir should be gone");
+        assert_eq!(
+            std::fs::read_to_string(gen_dir.join("zai/glm-5.2/system_prompt.md")).unwrap(),
+            "canonical wins",
+            "canonical content must win on collision"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gen_dir.join("zai/glm-4.6/system_prompt.md")).unwrap(),
+            "alias only",
+            "non-colliding model must migrate into canonical dir"
+        );
+    }
+
+    #[test]
+    fn test_migrate_ignores_unknown_and_support_dirs() {
+        // Unknown provider names (not a ProviderKind) and `_shared/` are left alone.
+        let tmp = tempfile::tempdir().unwrap();
+        write_variant(tmp.path(), "dev-pilot", "mystery-vendor", "m1", "keep me");
+        write_variant(tmp.path(), "_shared", "z-ai", "glm-5.2", "support dir");
+
+        migrate_generated_variant_provider_dirs(tmp.path());
+
+        assert!(
+            tmp.path()
+                .join("skills/dev-pilot/generated/mystery-vendor/m1/system_prompt.md")
+                .is_file(),
+            "unknown provider dir must be left untouched"
+        );
+        assert!(
+            tmp.path()
+                .join("skills/_shared/generated/z-ai/glm-5.2/system_prompt.md")
+                .is_file(),
+            "support dirs must be skipped by the migration"
+        );
+    }
+
+    #[test]
+    fn test_migrate_no_skills_dir_is_noop() {
+        // Fresh install with no skills dir must not panic.
+        let tmp = tempfile::tempdir().unwrap();
+        migrate_generated_variant_provider_dirs(tmp.path());
     }
 
     #[test]
