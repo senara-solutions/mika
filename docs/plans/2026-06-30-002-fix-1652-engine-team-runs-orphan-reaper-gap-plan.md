@@ -193,6 +193,18 @@ This is a one-line section per ticket discipline; **not a separate ticket**.
 - Architect first-pass: **READY** at session `6b2e7667-f4b6-4173-a44d-0453e0e5ffac` (Path 2, 20min/5min thresholds, `'failed'` status, `reaper.team_runs` audit name, F1 sharpening on C-rider).
 - Architect F2 (documentation): this plan references mika#959's liveness pattern explicitly — the SQL `NOT EXISTS` form adapts it for non-process entities. The `/proc/<pid>/stat` form mika#959 ships is for callback subprocesses; team_runs aren't subprocesses (child sessions are LLM-call rows in `llm_calls`/`tool_calls`), so the adaptation is by-design.
 
+## Implementation status (mika#1652)
+
+Delivered per the architect-ratified decisions (Path 2, 20min/5min thresholds, `'failed'` status, `reaper.team_runs` audit name):
+
+- **AC1, AC2, AC3, AC5 — shipped.** Reaper + DB layer + tick wiring + 6 tests.
+- **AC4 (C-rider) — split to a follow-up (mika#1671).** Implementing the reaper surfaced that AC4 is unimplementable as groomed: (1) `is_terminal_transport()` does not exist in the codebase; (2) the specified location (after `parse_task_assignments()`, before the `join_set`) has no delegation results — those only exist post-`join_set`, stringified into `TaskStatus::Failed(String)`; (3) the founding-incident shape (`a2a_call` 503 → `ToolOutput::error` *inside* the agent loop, `a2a_call.rs:131`) produces `Ok`/`Completed` delegations, not failed ones, so an all-delegations-failed check would never fire on the motivating case. Honoring the F1 "terminal-transport-only" sharpening needs tool-call-result inspection (new infra), which #1652's "do not widen scope" rule precludes. The reaper alone resolves the founding incident (frees the stuck slot); AC4 is a latency optimization routed to the architect for re-groom with the corrected code model. See mika#1671 for full evidence.
+
+**File-location corrections vs. plan (confirmed during implementation):**
+- DB methods live in the monolithic `crates/mika-agent/src/db.rs` (+ async wrappers in `async_db.rs`), not a `db/team_runs.rs` module — the plan flagged this to "confirm."
+- `team_runs.status` CHECK constraint (`db.rs:1129`) already allows `'failed'` — no migration needed (as the plan predicted).
+- Reaper is a free function `reap_orphaned_team_runs(&AsyncDatabase)` in `teams/engine.rs` (honoring the architect's team-domain module-boundary choice), called from `task_engine/engine.rs::tick()` at the `DB_SCAN_INTERVAL_TICKS` (60-tick) cadence. It is not a `TeamEngine` method — the reaper is a periodic sweep, not per-run state.
+
 ## References
 
 - mika#871 — task orphan reaper (sibling pattern)

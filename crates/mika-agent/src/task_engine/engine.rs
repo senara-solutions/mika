@@ -252,6 +252,12 @@ impl TaskEngine {
             // sibling to the reaper: catches crash-recovery cases and pre-deploy
             // wedges that the inline path in `dispatch_resume_agent` can't reach.
             self.complete_parent_tasks_on_callback_success().await;
+
+            // Reap orphaned team runs left in `status='running'` when no
+            // terminal-state writer ran (mika#1652). Failure-path sibling of
+            // the parent-task reaper above, for the `team_runs` lifecycle:
+            // frees team slots held by runs whose finalizer never executed.
+            crate::teams::engine::reap_orphaned_team_runs(&self.db).await;
         }
 
         let now = crate::timestamp::now();
