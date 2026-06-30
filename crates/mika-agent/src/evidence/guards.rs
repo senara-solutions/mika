@@ -484,6 +484,91 @@ pub(crate) fn equivalence_claim_satisfied(
     })
 }
 
+// ---------------------------------------------------------------------------
+// #1680 — Non-Latin-script (CJK/Hangul) response-quality guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the non-Latin-script
+/// guard (#1680). Inline guard (not in `INTENT_GUARDS`): checks *assistant*
+/// text and needs a dynamic correction message that quotes the offending
+/// substring.
+///
+/// Response-quality class, NOT fabrication class (architect F1): CJK bleed is a
+/// wrong-language regression, not a grounding failure — the guard sits AFTER
+/// `persistence-eval` in the EndTurn chain, not among the fabrication guards
+/// (6c/6d). It is therefore intentionally absent from the #953 guard-fabrication
+/// telemetry pairs.
+pub const NON_LATIN_SCRIPT_LABEL: &str = "non_latin_script";
+
+/// Codepoint-count threshold for firing the non-Latin-script guard.
+///
+/// Architect F3 rationale: 5 catches the observed emission density (the mika#1680
+/// sample was 576 chars of fluent Mandarin — well above threshold) while leaving
+/// headroom for incidental single-character technical content (a lone CJK char
+/// quoted verbatim from a foreign issue body). Raise to 10 if false positives are
+/// observed on legitimate foreign-language quotes.
+pub const NON_LATIN_SCRIPT_THRESHOLD: usize = 5;
+
+/// Max chars of the offending substring quoted back in the correction message.
+const NON_LATIN_SCRIPT_SAMPLE_CHARS: usize = 100;
+
+/// A non-Latin-script detection hit.
+pub struct NonLatinScriptHit {
+    /// Number of codepoints from the targeted CJK/Hangul ranges.
+    pub count: usize,
+    /// First `NON_LATIN_SCRIPT_SAMPLE_CHARS` chars starting at the first
+    /// offending codepoint — quoted in the correction message (architect F4)
+    /// so the model sees exactly what it emitted.
+    pub sample: String,
+}
+
+/// Returns `true` when `c` is in one of the targeted CJK/Hangul ranges.
+///
+/// Ranges (mika#1680): CJK Symbols and Punctuation (U+3000–U+303F), Hiragana
+/// (U+3040–U+309F), Katakana (U+30A0–U+30FF), CJK Unified Ideographs
+/// (U+4E00–U+9FFF), Hangul Syllables (U+AC00–U+D7AF). Deliberately NOT general
+/// non-ASCII: emoji, accented Latin, and mathematical symbols are legitimate
+/// output and must not trip the guard (plan § Out of scope — "General Unicode
+/// normalization").
+fn is_targeted_cjk_codepoint(c: char) -> bool {
+    matches!(c,
+        '\u{3000}'..='\u{303F}'   // CJK Symbols and Punctuation
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
+    )
+}
+
+/// Detects CJK/Hangul-script bleed in assistant text (mika#1680).
+///
+/// Counts codepoints in the targeted ranges; returns `Some(hit)` once the count
+/// reaches `NON_LATIN_SCRIPT_THRESHOLD`, else `None`. The hit carries a sample of
+/// the offending region (starting at the first CJK/Hangul codepoint) for the
+/// correction message.
+///
+/// Root cause: CN-trained models (glm-5.2 on mika-dev/mika-qa since mika#1633 /
+/// mika#1670) respond in Chinese to English-language prompts. This guard is the
+/// engine-level defense-in-depth behind the prompt-level English-only instruction
+/// in the agents' souls and skill prompts — prompt enforcement alone does not bind
+/// across model classes (see
+/// `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`).
+pub(crate) fn detect_non_latin_script(text: &str) -> Option<NonLatinScriptHit> {
+    let count = text
+        .chars()
+        .filter(|c| is_targeted_cjk_codepoint(*c))
+        .count();
+    if count < NON_LATIN_SCRIPT_THRESHOLD {
+        return None;
+    }
+    let sample: String = text
+        .chars()
+        .skip_while(|c| !is_targeted_cjk_codepoint(*c))
+        .take(NON_LATIN_SCRIPT_SAMPLE_CHARS)
+        .collect();
+    Some(NonLatinScriptHit { count, sample })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1446,6 +1531,82 @@ mod tests {
         assert!(
             equivalence_claim_satisfied(&claim, &summaries),
             "failed attempt to fetch the compared artifact should satisfy"
+        );
+    }
+
+    // -- detect_non_latin_script tests (#1680) --
+
+    #[test]
+    fn test_non_latin_script_pure_ascii_returns_none() {
+        let text = "mika#1665 grooming completed — plan on fix/1665 branch, ready label applied. \
+                    Task f76f594e created and in_progress.";
+        assert!(
+            detect_non_latin_script(text).is_none(),
+            "pure-ASCII (with an em-dash) must not trip the CJK guard"
+        );
+    }
+
+    #[test]
+    fn test_non_latin_script_five_cjk_returns_some() {
+        // Exactly five CJK Unified Ideographs reaches the threshold.
+        let text = "Status update: 引擎已确认 dispatch is authorized.";
+        let hit = detect_non_latin_script(text).expect("5 CJK codepoints must fire");
+        assert_eq!(hit.count, 5);
+        assert!(
+            hit.sample.starts_with('引'),
+            "sample must start at the first offending codepoint"
+        );
+    }
+
+    #[test]
+    fn test_non_latin_script_four_cjk_below_threshold() {
+        // Four CJK codepoints is below the threshold of five — no fire.
+        let text = "Quoting an issue title: 引擎已确 (partial) for context.";
+        assert!(
+            detect_non_latin_script(text).is_none(),
+            "4 CJK codepoints must stay below the threshold boundary"
+        );
+    }
+
+    #[test]
+    fn test_non_latin_script_mixed_japanese_kanji_returns_some() {
+        // Mixed English + Japanese (kanji + hiragana) over the threshold fires.
+        let text = "Summary: エンジンが確認しました — dispatch proceeding.";
+        let hit = detect_non_latin_script(text).expect("mixed Japanese script must fire");
+        assert!(hit.count >= NON_LATIN_SCRIPT_THRESHOLD);
+    }
+
+    #[test]
+    fn test_non_latin_script_hangul_returns_some() {
+        // Korean Hangul syllables over the threshold fire.
+        let text = "Result: 엔진이확인되었습니다 dispatch ok.";
+        assert!(
+            detect_non_latin_script(text).is_some(),
+            "Hangul syllables over the threshold must fire"
+        );
+    }
+
+    #[test]
+    fn test_non_latin_script_emoji_and_accents_do_not_fire() {
+        // Emoji and accented Latin are legitimate non-ASCII — must NOT fire,
+        // even in quantity (plan § Out of scope: general Unicode normalization).
+        let text = "Déjà vu — résumé café naïve 🚀✅🔥📦🎯 done.";
+        assert!(
+            detect_non_latin_script(text).is_none(),
+            "emoji and accented Latin must not be treated as CJK bleed"
+        );
+    }
+
+    #[test]
+    fn test_non_latin_script_sample_capped_at_100_chars() {
+        // A long CJK run is sampled to at most NON_LATIN_SCRIPT_SAMPLE_CHARS chars.
+        let long_cjk: String = std::iter::repeat('确').take(300).collect();
+        let hit = detect_non_latin_script(&long_cjk).expect("300 CJK chars must fire");
+        assert_eq!(hit.count, 300);
+        assert_eq!(
+            hit.sample.chars().count(),
+            NON_LATIN_SCRIPT_SAMPLE_CHARS,
+            "sample must be capped at the sample-char limit"
         );
     }
 }

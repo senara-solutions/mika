@@ -21,8 +21,9 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, EQUIVALENCE_CLAIM_LABEL,
-    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
-    detect_asserted_unavailability, detect_equivalence_claim, detect_fabricated_action_claim,
+    NON_LATIN_SCRIPT_LABEL, assert_grounded_satisfied, asserted_unavailability_satisfied,
+    detect_affirmative_state_claim, detect_asserted_unavailability, detect_equivalence_claim,
+    detect_fabricated_action_claim, detect_non_latin_script,
     detect_unverified_callback_state_claim, equivalence_claim_satisfied,
 };
 use crate::mcp::McpManager;
@@ -1959,6 +1960,76 @@ async fn run_loop(
                                 )),
                             });
                             continue;
+                        }
+                    }
+
+                    // #1680 — Non-Latin-script (CJK/Hangul) response-quality guard.
+                    // CN-trained base models (glm-5.2 on mika-dev/mika-qa) bleed
+                    // fluent Chinese into English-language responses — most often
+                    // on webhook dispatch-summary turns. Position: AFTER
+                    // persistence-eval, as a response-quality gate — NOT a
+                    // fabrication-class guard (architect F1: wrong-language output
+                    // is a quality regression, not a grounding failure). Fires in
+                    // all modes (conversation AND silent/webhook — the body
+                    // evidence shows the bleed lands mostly on webhook turns) and
+                    // is intentionally NOT gated by `skip_remaining_guards`: a
+                    // successful PR review does not license an unreadable
+                    // foreign-language summary. Single retry tracked via
+                    // `intent_guard_retries`; the correction quotes the offending
+                    // substring (architect F4) so the model sees what it emitted.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && let Some(hit) = detect_non_latin_script(&text)
+                    {
+                        if !intent_guard_retries.contains(NON_LATIN_SCRIPT_LABEL) {
+                            intent_guard_retries.insert(NON_LATIN_SCRIPT_LABEL);
+                            warn!(
+                                target: "mika::otel",
+                                trace_id = %tool_ctx.trace_id,
+                                agent_id = %db.agent_id(),
+                                session_id,
+                                step,
+                                cjk_codepoints = hit.count,
+                                sample = %hit.sample,
+                                intent_guard = NON_LATIN_SCRIPT_LABEL,
+                                label = mode.label(),
+                                event = "guard.non_latin_script",
+                                "Non-Latin-script guard fired — re-prompting for English"
+                            );
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::Assistant,
+                                content: LlmContent::Blocks(
+                                    mika_common::llm::response_content_to_blocks(&response.content),
+                                ),
+                            });
+                            request.messages.push(LlmMessage {
+                                role: LlmRole::User,
+                                content: LlmContent::Text(format!(
+                                    "[mika-engine] Your previous response contained \
+                                     non-English (CJK/Hangul) script — the operator reads \
+                                     English only. Offending excerpt: \"{}\". Restate your \
+                                     ENTIRE message in English. Use ASCII for all technical \
+                                     terms, code, identifiers, and punctuation. Do not \
+                                     include any Chinese, Japanese, or Korean characters.",
+                                    hit.sample,
+                                )),
+                            });
+                            continue;
+                        } else {
+                            // Single-retry budget exhausted: the corrected turn
+                            // still contains CJK/Hangul. Accept the EndTurn (don't
+                            // loop forever) but flag it for operator visibility.
+                            warn!(
+                                target: "mika::otel",
+                                trace_id = %tool_ctx.trace_id,
+                                agent_id = %db.agent_id(),
+                                session_id,
+                                step,
+                                cjk_codepoints = hit.count,
+                                sample = %hit.sample,
+                                label = mode.label(),
+                                event = "non_latin_script_persistent",
+                                "Non-Latin-script persisted after retry — accepting EndTurn"
+                            );
                         }
                     }
 

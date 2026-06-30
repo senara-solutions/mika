@@ -15,5 +15,5 @@ pub mod guards;
 pub use audit::AuditEvent;
 pub use guards::{
     ASSERT_GROUNDED_LABEL, AffirmativeStateClaim, EQUIVALENCE_CLAIM_LABEL, EquivalenceClaim,
-    GROUNDING_TOOLS,
+    GROUNDING_TOOLS, NON_LATIN_SCRIPT_LABEL, NonLatinScriptHit,
 };
