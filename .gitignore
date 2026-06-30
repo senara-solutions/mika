@@ -32,6 +32,7 @@ data/
 compound-engineering.local.md
 .claude/worktrees
 .claude/scheduled_tasks.lock
+.claude/groom-verdict-trail.log
 node_modules
 
 # Lefthook
