@@ -241,6 +241,10 @@ impl TeamEngine {
             ended_at: None,
             deliverable: None,
             coverage_retry_fired: false,
+            conversational_retry_fired: false,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
         };
 
         Ok(Self {
@@ -576,12 +580,23 @@ impl TeamEngine {
             Some(ts)
         };
 
+        // mika#1676 Unit B: a Completed run that delegated to zero members is a
+        // solo-absorption — the orchestrator did the work itself. Flag it so the
+        // failure class is queryable without a manual DB audit. (Trivial
+        // conversational goals also land here; that's intentional — the column is
+        // a backstop, the gate in Unit A is the prevention.)
+        self.run.solo_absorption =
+            self.run.status == RunStatus::Completed && self.run.delegation_count == 0;
+
         // Update run status in DB
+        let no_delegation_reason = "orchestrator returned a conversational reply for an actionable goal and \
+             delegated to zero members (after one reinforced retry)";
         let (status_str, failure_reason) = match &self.run.status {
             RunStatus::Running => ("running", None),
             RunStatus::Completed => ("completed", None),
             RunStatus::Suspended => ("suspended", None),
             RunStatus::Failed(reason) => ("failed", Some(reason.as_str())),
+            RunStatus::FailedNoDelegation => ("failed_no_delegation", Some(no_delegation_reason)),
         };
         if let Err(e) = self
             .team_db
@@ -592,6 +607,9 @@ impl TeamEngine {
                 self.run.iteration,
                 self.run.deliverable.as_deref(),
                 ended_at.as_deref(),
+                self.run.delegation_count,
+                self.run.solo_absorption,
+                self.run.failure_context.as_deref(),
             )
             .await
         {
@@ -643,19 +661,37 @@ impl TeamEngine {
         // Write goal metadata (once, at first decompose)
         self.write_metadata_file("goal.md", &self.run.goal);
 
+        let first_result = self
+            .decompose(None, &history, previous_run_summary.as_ref(), None)
+            .await?;
         match self
-            .decompose(None, &history, previous_run_summary.as_ref())
+            .apply_delegation_gate(
+                first_result,
+                None,
+                &history,
+                previous_run_summary.as_ref(),
+                DecomposePhase::First,
+            )
             .await?
         {
-            DecomposeResult::Tasks(tasks) => {
+            GateOutcome::Tasks(tasks) => {
                 self.run.tasks = tasks;
                 // Write assignments metadata
                 let assignments = self.format_assignments();
                 self.write_metadata_file("assignments.md", &assignments);
             }
-            DecomposeResult::Conversational(reply) => {
+            GateOutcome::Conversational(reply) => {
                 self.run.deliverable = Some(reply.clone());
                 self.emit_event(TeamEvent::Deliverable(reply));
+                return Ok(());
+            }
+            GateOutcome::NoDelegation => {
+                // Status + failure_context already set on self.run by the gate.
+                // Return Ok so execute()'s Ok arm runs, but it won't override the
+                // terminal status (guarded by `status == Running`).
+                self.emit_event(TeamEvent::RunFailed(
+                    "team run did not delegate the goal to any member".to_string(),
+                ));
                 return Ok(());
             }
         }
@@ -698,19 +734,39 @@ impl TeamEngine {
                 "Iteration {}: critic requested revisions...",
                 self.run.iteration
             )));
+            let redecompose_result = self
+                .decompose(
+                    Some(&feedback),
+                    &history,
+                    previous_run_summary.as_ref(),
+                    None,
+                )
+                .await?;
             match self
-                .decompose(Some(&feedback), &history, previous_run_summary.as_ref())
+                .apply_delegation_gate(
+                    redecompose_result,
+                    Some(&feedback),
+                    &history,
+                    previous_run_summary.as_ref(),
+                    DecomposePhase::RevisionAfterCritic,
+                )
                 .await?
             {
-                DecomposeResult::Tasks(tasks) => {
+                GateOutcome::Tasks(tasks) => {
                     self.run.tasks = tasks;
                     // Update assignments metadata on re-decompose
                     let assignments = self.format_assignments();
                     self.write_metadata_file("assignments.md", &assignments);
                 }
-                DecomposeResult::Conversational(reply) => {
+                GateOutcome::Conversational(reply) => {
                     self.run.deliverable = Some(reply.clone());
                     self.emit_event(TeamEvent::Deliverable(reply));
+                    return Ok(());
+                }
+                GateOutcome::NoDelegation => {
+                    self.emit_event(TeamEvent::RunFailed(
+                        "team run did not delegate the goal to any member".to_string(),
+                    ));
                     return Ok(());
                 }
             }
@@ -737,6 +793,7 @@ impl TeamEngine {
         feedback: Option<&str>,
         history: &[crate::db::TeamRunRow],
         previous_run: Option<&crate::db::TeamRunSummary>,
+        reinforcement: Option<&str>,
     ) -> Result<DecomposeResult> {
         let listing = prompt::workspace_listing(&self.workspace_dir);
         let context = prompt::build_orchestrator_context(
@@ -749,7 +806,7 @@ impl TeamEngine {
 
         let orchestrator_name = &self.team.team.orchestrator;
 
-        let message = if feedback.is_some() {
+        let mut message = if feedback.is_some() {
             format!(
                 "The previous attempt was rejected by the critic. Revise the task assignments.\n\nOriginal goal: {}",
                 self.run.goal
@@ -757,6 +814,16 @@ impl TeamEngine {
         } else {
             self.run.goal.clone()
         };
+
+        // mika#1676 Unit A: delegation-gate retry reinforcement. Appended only on
+        // the gated re-prompt after a Conversational fallthrough for an actionable
+        // goal. Fresh context (architect U3) — the failed first attempt is NOT
+        // included as history, to avoid biasing the model toward repeating the
+        // prose-around-JSON pattern.
+        if let Some(reinforce) = reinforcement {
+            message.push_str("\n\n");
+            message.push_str(reinforce);
+        }
 
         let response = self
             .run_agent(orchestrator_name, &message, &context)
@@ -915,6 +982,81 @@ impl TeamEngine {
         Ok(DecomposeResult::Tasks(tasks))
     }
 
+    /// Delegation gate (mika#1676 Unit A).
+    ///
+    /// Wraps a decompose outcome. When the orchestrator returned `Tasks`, passes
+    /// through. When it returned `Conversational`, decides whether that reply is
+    /// an honest "no delegation needed" (trivial goal) or a *silent absorption*
+    /// of an actionable goal:
+    ///
+    /// - Not actionable → clean `Conversational` (preserves the trivial-goal path).
+    /// - Actionable → issue ONE reinforced retry with fresh context. If the retry
+    ///   produces tasks, use them. If it is still actionable-but-conversational,
+    ///   transition the run to the terminal `RunStatus::FailedNoDelegation` (with
+    ///   `failure_context` carrying the phase) rather than letting it complete as
+    ///   a zero-delegation success.
+    async fn apply_delegation_gate(
+        &mut self,
+        first_result: DecomposeResult,
+        feedback: Option<&str>,
+        history: &[crate::db::TeamRunRow],
+        previous_run: Option<&crate::db::TeamRunSummary>,
+        phase: DecomposePhase,
+    ) -> Result<GateOutcome> {
+        let reply = match first_result {
+            DecomposeResult::Tasks(tasks) => return Ok(GateOutcome::Tasks(tasks)),
+            DecomposeResult::Conversational(reply) => reply,
+        };
+
+        // Not actionable → honest conversational reply, complete as orchestrator-solo.
+        let Some(signal) = detect_actionability(&reply) else {
+            return Ok(GateOutcome::Conversational(reply));
+        };
+
+        // Operator visibility into why the gate is about to fire (bounded volume).
+        debug!(
+            team_run_id = %self.run.run_id,
+            team_id = %self.team.team.name,
+            phase = %phase.as_str(),
+            signal = %signal,
+            "team_engine_actionability_signal"
+        );
+
+        // One reinforced retry with fresh context (architect U3).
+        self.run.conversational_retry_fired = true;
+        let retry = self
+            .decompose(
+                feedback,
+                history,
+                previous_run,
+                Some(CONVERSATIONAL_REINFORCEMENT),
+            )
+            .await?;
+
+        match retry {
+            DecomposeResult::Tasks(tasks) => Ok(GateOutcome::Tasks(tasks)),
+            DecomposeResult::Conversational(retry_reply) => {
+                // If the retry is a non-actionable reply (e.g. an honest `[]` or a
+                // plain message), respect it as orchestrator-solo. Only a second
+                // actionable-but-no-tasks outcome is a confirmed failure.
+                if detect_actionability(&retry_reply).is_none() {
+                    return Ok(GateOutcome::Conversational(retry_reply));
+                }
+
+                self.run.status = RunStatus::FailedNoDelegation;
+                self.run.failure_context = Some(format!("{{\"phase\": \"{}\"}}", phase.as_str()));
+                self.run.deliverable = Some(retry_reply);
+                warn!(
+                    team_run_id = %self.run.run_id,
+                    team_id = %self.team.team.name,
+                    phase = %phase.as_str(),
+                    "team_engine_no_delegation_failure"
+                );
+                Ok(GateOutcome::NoDelegation)
+            }
+        }
+    }
+
     /// Execute all tasks by delegating to specialist agents concurrently.
     ///
     /// Uses `tokio::task::JoinSet` to run all specialist agents in parallel.
@@ -970,6 +1112,15 @@ impl TeamEngine {
                 child_task_id: None, // Populated below after task tree creation
             });
         }
+
+        // mika#1676 Unit B: count member sessions being delegated this iteration.
+        // Accumulated across re-decompose iterations; persisted by
+        // `finalize_and_shutdown`. A terminal `Completed` run with
+        // `delegation_count == 0` is flagged `solo_absorption`.
+        self.run.delegation_count = self
+            .run
+            .delegation_count
+            .saturating_add(inputs.len() as u32);
 
         // Phase 4.2: Create parent/child task tree for sibling completion detection.
         // Parent task: invoke_orchestrator (fires when all children complete).
@@ -1710,6 +1861,77 @@ enum DecomposeResult {
     Conversational(String),
 }
 
+/// Outcome of the delegation gate (mika#1676 Unit A).
+enum GateOutcome {
+    /// Orchestrator produced (or recovered, on retry) valid task assignments.
+    Tasks(Vec<TaskAssignment>),
+    /// Honest conversational reply — complete the run as orchestrator-solo.
+    Conversational(String),
+    /// Actionable goal absorbed with zero delegation, confirmed after one
+    /// reinforced retry. The terminal status + `failure_context` are already set
+    /// on `self.run`; the caller returns without completing.
+    NoDelegation,
+}
+
+/// Which decompose phase the delegation gate is evaluating (mika#1676 Unit A,
+/// architect F2 — phase carried in `failure_context`, single terminal state).
+#[derive(Clone, Copy)]
+enum DecomposePhase {
+    First,
+    RevisionAfterCritic,
+}
+
+impl DecomposePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            DecomposePhase::First => "first_decompose",
+            DecomposePhase::RevisionAfterCritic => "revision_after_critic",
+        }
+    }
+}
+
+/// Reinforcement appended to the gated decompose retry (mika#1676 Unit A).
+const CONVERSATIONAL_REINFORCEMENT: &str = "Your previous response did not contain a parseable JSON array of task \
+     assignments. Emit a JSON array of task assignments as your sole output, on \
+     its own line, with no prose before or after. If this goal genuinely does \
+     not require delegating to any team member, respond with exactly `[]`.";
+
+/// Detect whether a conversational orchestrator reply nonetheless *intended* to
+/// delegate an actionable goal (mika#1676 Unit A, architect F1 pinned).
+///
+/// Returns `Some(signal_description)` when EITHER:
+/// - (a) the text matches the anchored intent-to-delegate keyword regex, OR
+/// - (b) the text contains a JSON-array-of-objects shape (`[ { … } ]`) — which,
+///   since we only reach here on the `Conversational` branch, means the array
+///   failed `Vec<TaskAssignment>` validation (intent-to-delegate-via-JSON).
+///
+/// Plain prose with neither signal returns `None`, preserving the trivial-goal
+/// conversational path. False negatives are covered by Unit B's observability
+/// column; false positives only cost one extra retry (the gate is fail-open).
+fn detect_actionability(text: &str) -> Option<String> {
+    use std::sync::LazyLock;
+    static KEYWORD_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)\b(dispatching?|decompos\w*|delegat\w*|assign(?:ed|ing)?\s+(?:to|for)|hand(?:ing|ed)?\s+(?:off|over)\s+to|split\w*\s+(?:work|task)|parallel\w*\s+(?:delegat|specialis|member))\b",
+        )
+        .expect("actionability keyword regex is valid")
+    });
+    // (?s) so `.` spans newlines — a JSON array often straddles lines.
+    static JSON_ARRAY_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?s)\[\s*\{.*\}\s*\]").expect("json-array-shape regex is valid")
+    });
+
+    if let Some(m) = KEYWORD_RE.find(text) {
+        let span = m.as_str();
+        let truncated: String = span.chars().take(200).collect();
+        return Some(format!("keyword:{truncated}"));
+    }
+    if let Some(m) = JSON_ARRAY_RE.find(text) {
+        return Some(format!("json_array_shape@{}", m.start()));
+    }
+    None
+}
+
 /// Parse the orchestrator's JSON response into task assignments.
 ///
 /// If the orchestrator replied conversationally (via `{"reply": "..."}`),
@@ -1724,8 +1946,17 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Decom
         return Ok(DecomposeResult::Conversational(reply.to_string()));
     }
 
-    // Try to extract JSON array from the response (#257: unified extract_json)
-    let json_str = match extract_json(response, '[', ']') {
+    // Extract JSON array from the response. mika#1676 Unit C: a prose/fence-
+    // tolerant preprocessor feeds the existing schema-validation path. Strip
+    // markdown fences, then locate the first balanced `[ { … } ]` even when
+    // surrounded by narration (sibling of #876's `extract_first_json_object`).
+    // Falls back to the legacy `extract_json` extractor (#257). On either hit the
+    // extracted text flows into the SAME `Vec<serde_json::Value>` validation
+    // below — tolerance is added, schema strictness is unchanged.
+    let stripped = strip_markdown_fences(response);
+    let json_str = match extract_first_json_array(&stripped)
+        .or_else(|| extract_json(&stripped, '[', ']').map(|s| s.to_string()))
+    {
         Some(s) => s,
         None => {
             warn!("orchestrator response contains no JSON array, treating as conversational");
@@ -1733,7 +1964,7 @@ fn parse_task_assignments(response: &str, team: &TeamDefinition) -> Result<Decom
         }
     };
 
-    let parsed: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "failed to parse orchestrator task array, treating as conversational");
@@ -1834,6 +2065,71 @@ fn parse_review_response(response: &str) -> Result<(bool, String)> {
 /// - For arrays (`[`/`]`): looks for `[{` as the start pattern
 /// - For objects (`{`/`}`): looks for `{"` as the start pattern
 ///   Then searches backwards from the end for the matching close bracket. (#257)
+/// Strip markdown code-fence delimiter lines (```lang / ```), keeping inner
+/// content (mika#1676 Unit C). A common non-Anthropic model behavior is to wrap
+/// the decompose JSON in a fenced block; removing the delimiters lets the
+/// extractor and `serde_json` see the bare array.
+fn strip_markdown_fences(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Locate the first balanced JSON array-of-objects (`[ { … } ]`) within prose
+/// (mika#1676 Unit C). Sibling of #876's `extract_first_json_object` for braces.
+///
+/// Unlike [`extract_json`] (which grabs the last `]` in the whole string via
+/// `rfind` and so over-captures trailing prose), this does string-literal- and
+/// escape-aware bracket-depth matching, so narration after the array does not
+/// break the parse. Returns `None` when no `[` is followed by a `{`.
+fn extract_first_json_array(text: &str) -> Option<String> {
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find('[') {
+        let open = search_from + rel;
+        // Only treat as an array-of-objects start when the next non-ws char is `{`.
+        if text[open + 1..].trim_start().starts_with('{')
+            && let Some(close) = match_balanced_array(text, open)
+        {
+            return Some(text[open..=close].to_string());
+        }
+        search_from = open + 1;
+    }
+    None
+}
+
+/// Find the byte index of the `]` that closes the `[` at `open_idx`, tracking
+/// square-bracket depth while skipping over string literals (escape-aware).
+fn match_balanced_array(text: &str, open_idx: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, c) in text.char_indices().filter(|(i, _)| *i >= open_idx) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn extract_json(text: &str, open: char, close: char) -> Option<&str> {
     let expected_inner = if open == '[' { '{' } else { '"' };
 

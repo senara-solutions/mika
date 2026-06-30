@@ -52,6 +52,19 @@ pub(crate) fn build_run_completion_message(run: &TeamRun) -> Option<CompletionMe
             deliverable_chars: 0,
             truncated: false,
         }),
+        // mika#1676: orchestrator returned a conversational reply for an
+        // actionable goal and delegated to zero members (even after one retry).
+        RunStatus::FailedNoDelegation => Some(CompletionMessage {
+            text: format!(
+                "Team '{}' did not run: the orchestrator did not delegate the goal \
+                 to any member. The goal looked actionable but produced no task \
+                 assignments. Try rephrasing the goal or check the team's member roster.",
+                run.team_name
+            ),
+            notification_kind: "failure",
+            deliverable_chars: 0,
+            truncated: false,
+        }),
         // Running and Suspended are non-terminal — no notification.
         RunStatus::Running | RunStatus::Suspended => None,
     }
@@ -96,6 +109,18 @@ pub(crate) fn build_run_completion_message_from_row(run: &TeamRunRow) -> Option<
         "cancelled" => Some(CompletionMessage {
             text: format!("Team '{}' was cancelled.", run.team_name),
             notification_kind: "cancelled",
+            deliverable_chars: 0,
+            truncated: false,
+        }),
+        // mika#1676: orchestrator delegated to zero members for an actionable goal.
+        "failed_no_delegation" => Some(CompletionMessage {
+            text: format!(
+                "Team '{}' did not run: the orchestrator did not delegate the goal \
+                 to any member. The goal looked actionable but produced no task \
+                 assignments. Try rephrasing the goal or check the team's member roster.",
+                run.team_name
+            ),
+            notification_kind: "failure",
             deliverable_chars: 0,
             truncated: false,
         }),
@@ -151,6 +176,10 @@ mod tests {
             ended_at: Some("2026-04-24T12:05:00Z".to_string()),
             deliverable,
             coverage_retry_fired: false,
+            conversational_retry_fired: false,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
         }
     }
 

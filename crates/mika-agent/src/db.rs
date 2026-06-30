@@ -311,6 +311,12 @@ pub struct TeamRunRow {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub trace_id: Option<String>,
+    /// Number of member sessions delegated during the run (mika#1676 Unit B).
+    pub delegation_count: u32,
+    /// Whether the run completed without delegating to any member (mika#1676).
+    pub solo_absorption: bool,
+    /// Structured failure context for `failed_no_delegation` runs (JSON phase).
+    pub failure_context: Option<String>,
 }
 
 // ===== Dashboard Filter Types =====
@@ -1199,7 +1205,7 @@ impl Database {
                 team_id TEXT NOT NULL REFERENCES teams(id),
                 goal TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'running'
-                    CHECK (status IN ('running','completed','failed','cancelled','suspended')),
+                    CHECK (status IN ('running','completed','failed','cancelled','suspended','failed_no_delegation')),
                 failure_reason TEXT,
                 iteration INTEGER NOT NULL DEFAULT 1,
                 max_iterations INTEGER NOT NULL DEFAULT 3,
@@ -1207,7 +1213,10 @@ impl Database {
                 checkpoint TEXT,
                 trace_id TEXT,
                 started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                ended_at TEXT
+                ended_at TEXT,
+                delegation_count INTEGER NOT NULL DEFAULT 0,
+                solo_absorption INTEGER NOT NULL DEFAULT 0,
+                failure_context TEXT
             );
             CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);
 
@@ -4706,6 +4715,110 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// v45→v46: team_runs delegation-visibility (mika#1676).
+    ///
+    /// Two coupled schema changes, one atomic table-rebuild:
+    ///
+    /// 1. **CHECK expansion** on `team_runs.status` to add
+    ///    `'failed_no_delegation'` — the terminal state Unit A's delegation
+    ///    gate transitions to when the orchestrator returns Conversational
+    ///    for an actionable goal (after one reinforced retry). The v1 DDL
+    ///    already declares the expanded set for fresh installs; this
+    ///    migration lifts existing databases into parity.
+    /// 2. **Additive columns** for Unit B observability:
+    ///    - `delegation_count INTEGER NOT NULL DEFAULT 0` — incremented per
+    ///      spawned member session in `execute_tasks()`.
+    ///    - `solo_absorption INTEGER NOT NULL DEFAULT 0` — flag set by
+    ///      `finalize_and_shutdown()` when the run completed with zero
+    ///      delegations.
+    ///    - `failure_context TEXT` — nullable JSON `{"phase": "…"}` carrying
+    ///      the phase in which the delegation gate fired
+    ///      (`first_decompose` / `revision_after_critic`).
+    ///
+    /// Table-rebuild is mandatory here because SQLite does not support
+    /// `ALTER TABLE … MODIFY CONSTRAINT` and the CHECK constraint must widen.
+    /// Follows the exact shape of `migrate_v34_to_v35` (kg_resolutions_log
+    /// outcome CHECK expansion, #1154): rename existing table to `_v45_backup`,
+    /// create new table with expanded CHECK + new columns, INSERT SELECT
+    /// (backfilling new columns with their DEFAULTs), DROP backup, recreate
+    /// index. `PRAGMA foreign_keys = OFF` for the rebuild window because
+    /// `tasks.team_run_id` FKs into `team_runs(id)`; the RENAME/DROP would
+    /// otherwise violate FK enforcement even though row IDs are preserved.
+    fn migrate_v45_to_v46(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 46 {
+            return Ok(());
+        }
+
+        let count_before: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM team_runs", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+
+             ALTER TABLE team_runs RENAME TO team_runs_v45_backup;
+
+             CREATE TABLE team_runs (
+                 id TEXT PRIMARY KEY,
+                 team_id TEXT NOT NULL REFERENCES teams(id),
+                 goal TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'running'
+                     CHECK (status IN (
+                         'running','completed','failed','cancelled','suspended',
+                         'failed_no_delegation'
+                     )),
+                 failure_reason TEXT,
+                 iteration INTEGER NOT NULL DEFAULT 1,
+                 max_iterations INTEGER NOT NULL DEFAULT 3,
+                 deliverable TEXT,
+                 checkpoint TEXT,
+                 trace_id TEXT,
+                 started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                 ended_at TEXT,
+                 delegation_count INTEGER NOT NULL DEFAULT 0,
+                 solo_absorption INTEGER NOT NULL DEFAULT 0,
+                 failure_context TEXT
+             );
+
+             INSERT INTO team_runs
+                 (id, team_id, goal, status, failure_reason,
+                  iteration, max_iterations, deliverable, checkpoint,
+                  trace_id, started_at, ended_at,
+                  delegation_count, solo_absorption, failure_context)
+             SELECT id, team_id, goal, status, failure_reason,
+                    iteration, max_iterations, deliverable, checkpoint,
+                    trace_id, started_at, ended_at,
+                    0, 0, NULL
+             FROM team_runs_v45_backup;
+
+             DROP TABLE team_runs_v45_backup;
+
+             CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);
+
+             PRAGMA foreign_keys = ON;",
+        )?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (46)", [])?;
+        tx.commit()?;
+
+        let count_after: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM team_runs", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        info!(
+            count_before = count_before,
+            count_after = count_after,
+            "v45→v46: expanded team_runs.status CHECK to include 'failed_no_delegation' + added delegation_count/solo_absorption/failure_context columns (mika#1676)"
+        );
+
+        Ok(())
     }
 
     /// Check if a column exists on a table within a transaction scope.
@@ -9197,6 +9310,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_team_run(
         &self,
         run_id: &str,
@@ -9205,17 +9319,24 @@ impl Database {
         iteration: u32,
         deliverable: Option<&str>,
         ended_at: Option<&str>,
+        delegation_count: u32,
+        solo_absorption: bool,
+        failure_context: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
-             deliverable = ?4, ended_at = ?5
-             WHERE id = ?6",
+             deliverable = ?4, ended_at = ?5, delegation_count = ?6,
+             solo_absorption = ?7, failure_context = ?8
+             WHERE id = ?9",
             params![
                 status,
                 failure_reason,
                 iteration,
                 deliverable,
                 ended_at,
+                delegation_count,
+                solo_absorption as i64,
+                failure_context,
                 run_id
             ],
         )?;
@@ -9343,7 +9464,8 @@ impl Database {
     }
 
     const TEAM_RUN_COLUMNS: &'static str = "r.id, t.name, r.goal, r.status, r.failure_reason,
-         r.iteration, r.max_iterations, r.deliverable, r.started_at, r.ended_at, r.trace_id";
+         r.iteration, r.max_iterations, r.deliverable, r.started_at, r.ended_at, r.trace_id,
+         r.delegation_count, r.solo_absorption, r.failure_context";
 
     fn row_to_team_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<TeamRunRow> {
         Ok(TeamRunRow {
@@ -9358,6 +9480,9 @@ impl Database {
             started_at: r.get(8)?,
             ended_at: r.get(9)?,
             trace_id: r.get(10)?,
+            delegation_count: r.get::<_, u32>(11)?,
+            solo_absorption: r.get::<_, i64>(12)? != 0,
+            failure_context: r.get(13)?,
         })
     }
 

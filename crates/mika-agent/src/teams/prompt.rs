@@ -137,7 +137,9 @@ pub fn build_orchestrator_context(
          \n\
          Use `list_workspace` to check the current workspace state before planning.\n\
          \n\
-         Respond ONLY with compact (single-line) JSON, not pretty-printed. Examples:\n\
+         Respond ONLY with compact (single-line) JSON, not pretty-printed. Emit \
+         the JSON array (or the conversational `reply` object) as your sole \
+         output, on its own line, with no prose before or after it. Examples:\n\
          Conversational: {{\"reply\": \"Hey! The team is ready and waiting for a goal.\"}}\n\
          Actionable: [{{\"agent\": \"researcher\", \"task\": \"Research X and write findings\", \"output_file\": \"research.md\"}}]\n",
         team_name = def.team.name,
@@ -544,6 +546,10 @@ mod tests {
             ended_at: None,
             deliverable: None,
             coverage_retry_fired: false,
+            conversational_retry_fired: false,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
         };
 
         let def = test_def();
@@ -568,6 +574,10 @@ mod tests {
             ended_at: None,
             deliverable: None,
             coverage_retry_fired: false,
+            conversational_retry_fired: false,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
         };
 
         let ctx = build_deliverable_context(&run);
