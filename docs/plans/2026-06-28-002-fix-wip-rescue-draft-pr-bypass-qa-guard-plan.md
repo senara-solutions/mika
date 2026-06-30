@@ -158,8 +158,8 @@ Add a calibration rule documenting this defense-in-depth:
 >
 > Three independent guards prevent rescue draft PRs from autonomous merge:
 > 1. `unpushed_recovery_pending: true` in task metadata (primary, set by callback handler)
-> 2. `isDraft: true` on the PR (defense-in-depth, catches any draft PR)
-> 3. Head commit message starts with `wip(` (defense-in-depth, catches rescue-commit signature)
+> 2. `isDraft: true` AND head commit `^wip\(` (defense-in-depth, architect-narrowed to wip-prefixed drafts only)
+> 3. Test surface: dispatch-lib harness (Layers 1+2) + mika-qa calibration (Layer 3)
 >
 > All three must be checked before routing any verdict. Any single guard firing skips all verdict processing and escalates to the operator. Incident: mika#1610 — rescue draft PR auto-merged unreviewed code because only the metadata-flag guard existed and the flag was never set.
 
@@ -214,3 +214,16 @@ Add a calibration rule documenting this defense-in-depth:
 - `skills/bundled/_shared/dispatch-lib.sh` lines 763-886 (rescue logic), 2401-2472 (Unit 2 draft PR creation)
 - `skills/bundled/self-dev-callback/system_prompt.md` lines 78-88 (recover_unpushed_work handler)
 - `skills/bundled/self-dev-webhook-qa/system_prompt.md` lines 199-204 (recovery-skip guard)
+
+
+---
+
+## Architect-pinned details (session `060b313a-0f98-404d-bb6e-19b02d5cd9ff`, first-pass READY)
+
+- **Test surface (AC3+AC4):**
+  - `skills/bundled/_shared/test-dispatch-lib.sh` — verify `RECOVERY_PENDING: true` appears in RESULT for both dirty-worktree (mika#1282) and auto-PR-create (mika#1383) paths.
+  - `crates/mika-agent/src/calibration/roles/mika_qa.rs` (or wherever mika-qa scenarios live post-mika#1632) — new scenario: rescue draft PR with `wip(` commit → expects skip + escalate verdict.
+
+- **Layer 3 narrowed condition:** `pr.isDraft && /^wip\(/.test(headCommit.message)`. The two pieces are AND-conjoined, not OR-disjoined. Plain drafts (no `wip(` prefix) pass through to normal verdict processing — preserves "draft PR for feedback" workflows.
+
+- **Layer 3 wip-regex:** `^wip\(` literal — matches `wip(...mika#1282)`, `wip(mika#1396)`, and any future `wip(<scope>)` rescue convention. Anchored at line start.
