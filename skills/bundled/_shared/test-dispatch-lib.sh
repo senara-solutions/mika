@@ -2421,15 +2421,16 @@ assert_eq "Bare hyphenated repo parses unchanged" \
 assert_eq "Free-text prompt with embedded # stays free-text (empty REPO)" \
     "|" "$(_parse_prompt 'fix the foo#bar thing and more')"
 
-# --- Test 16: _find_issue_plan header-shape discovery (mika#1602, n=3) ---
+# --- Test 16: _find_issue_plan header-shape discovery (mika#1602, n=3; tier 3 added in mika#1617) ---
 #
 # Behavioral test: source dispatch-lib.sh (verified side-effect-free — function
 # definitions only, no top-level execution) and call the real _find_issue_plan
-# against temp `docs/plans/` fixtures. Proves AC1–AC4:
+# against temp `docs/plans/` fixtures. Proves AC1–AC4 for tier-2 shapes:
 #   AC1 — `**Issue:** mika#N` (and `issue: mika#N`) headers are discoverable.
 #   AC2 — the legacy `**Ticket:** mika#N` and `ticket: mika#N` shapes still match.
 #   AC3 — the primary filename pass (`*-N-*-plan.md`) still matches.
 #   AC4 — the `**Issue:**` case FAILS on the pre-fix regex and PASSES after.
+# Tier-3 broad content scan tests live in tests/test_find_issue_plan.sh (mika#1617).
 #
 # Each fixture is padded > 500 bytes to satisfy the mika#1033 size filter.
 
@@ -2502,10 +2503,12 @@ assert_eq "Negative: **Issue:** mika#9999 not matched for ISSUE_NUM=1602" \
     "NOTFOUND" \
     "$(_fip_probe 1602 '**Issue:** mika#9999' '2026-06-27-008-wrong-number-plan.md')"
 
-# Negative — header below the first-20-lines zone must NOT match (header-zone scope intact).
-assert_eq "Negative: **Issue:** mika#1602 on line 30 not matched (header-zone scope)" \
+# Negative — header below the 50-line zone must NOT match (tier-3 zone boundary).
+# Pre-mika#1617 this was offset 30 (tier-2's 20-line zone); now tier 3 extends
+# the scan to 50 lines, so the offset must be past 50 to remain a negative case.
+assert_eq "Negative: **Issue:** mika#1602 on line 55 not matched (past tier-3 zone)" \
     "NOTFOUND" \
-    "$(_fip_probe 1602 '**Issue:** mika#1602' '2026-06-27-009-deep-header-plan.md' 30)"
+    "$(_fip_probe 1602 '**Issue:** mika#1602' '2026-06-27-009-deep-header-plan.md' 55)"
 
 # --- Test 17: Post-flight recovery fires on all exit paths (mika#1615) ---
 
