@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "timestamp": "2026-06-30T11:15:18.400777880+00:00",
+  "providers": {
+    "mika-qa": {
+      "model": "zai/glm-5.2",
+      "scenarios": {
+        "absence_claim_grounding": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 500,
+          "output_tokens": 1276,
+          "latency_ms": 23487
+        },
+        "no_fabricated_fix": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 1212,
+          "output_tokens": 1152,
+          "latency_ms": 20313
+        },
+        "per_ac_enumeration": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 657,
+          "output_tokens": 781,
+          "latency_ms": 14221
+        },
+        "verdict_format_precision": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 594,
+          "output_tokens": 427,
+          "latency_ms": 9492
+        },
+        "wip_rescue_skip": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 525,
+          "output_tokens": 903,
+          "latency_ms": 16597
+        }
+      }
+    }
+  }
+}
