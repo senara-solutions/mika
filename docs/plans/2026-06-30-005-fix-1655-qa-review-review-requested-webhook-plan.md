@@ -90,6 +90,21 @@ Tests:
 - Implementer first task: confirm gateway already forwards `review_requested` events to mika-dev. If yes → Layer 1 only. If no → Layer 1 + Layer 2.
 - Regression: existing `opened`+`synchronize` qa-review tests stay green.
 
+## Implementation note (discovered during /ce:work)
+
+The F2 prerequisite investigation found that the `review_requested` path was **already wired end-to-end on `main`**, contrary to the plan's premise:
+
+1. **Gateway routing** — `crates/mika-gateway/src/github.rs` `route_event()` already maps `("pull_request", "review_requested") → "mika-qa"` (added 2026-04-20, #506/#707).
+2. **Event formatting** — `format_event_text()` already emits `Requested reviewer: @<login>` and the `GitHubWebhookEvent` struct already parses `requested_reviewer`.
+3. **Skill prompt** — `skills/bundled/qa-review/system_prompt.md:5` already lists `pull_request.review_requested` as a trigger; the skill is `always_on`.
+4. **Engine passthrough** — `handlers.rs::handle_message` intercepts only `pull_request_review.submitted` / `check_suite.*`; a `pull_request.review_requested` message passes straight through to the always-on qa-review turn.
+
+So "add a webhook handler" (ticket framing) and "extend skill triggers" (Layer 1 framing) were both already satisfied. The genuine, testable gap matching architect **F1 (BLOCKING — reviewer-login filter)** is **reviewer discrimination**: `route_event` routed *every* `review_requested` to mika-qa regardless of reviewer, so requesting any human reviewer would wrongly spin up a full qa-review (failing AC2's negative case).
+
+**Chosen placement — gateway post-route guard, not skill prompt.** F1 sketched the filter living in the skill's prompt/keywords, but an LLM-prompt filter cannot be deterministically tested (AC2 demands "integration test exercising the path"), and reviewer-login routing is a structural concern, not a judgment one. The filter is implemented as `is_suppressed_review_request(action, requested_reviewer)` — a pure predicate consumed by a handler guard placed alongside the existing skill-denylist (#845) and synchronize-no-diff (#886) guards. `QA_REVIEWER_LOGIN = "mika-platform-qa"`. Fail-closed: missing/unresolvable reviewer (e.g. team requests carrying `requested_team`) is suppressed.
+
+**AC mapping:** AC1 → `test_review_request_for_qa_bot_is_dispatched` (+ existing `test_format_event_text_pr_review_requested_with_reviewer`); AC2 negative → `test_review_request_for_human_reviewer_is_suppressed` + `test_review_request_with_no_reviewer_is_suppressed`; AC3 → `test_non_review_request_actions_are_never_suppressed` + existing `test_route_event_pr_*` routing tests stay green.
+
 ## References
 
 - mika#841 — `ready` label autonomous-consent design (parent design context)

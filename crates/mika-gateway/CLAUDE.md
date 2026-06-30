@@ -26,6 +26,7 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 HMAC-SHA256 signature validation via `X-Hub-Signature-256`. Event routing:
 - `issues.assigned` and `issues.labeled` and `issue_comment.created` and `pull_request_review.submitted` and `pull_request.closed` and `check_suite.completed(failure/timed_out/success)` -> mika-dev
 - `pull_request.opened/synchronize/review_requested` -> mika-qa
+- **Review-requested reviewer filter (mika#1655):** `pull_request.review_requested` routes to mika-qa via `route_event`, but a post-route guard (`is_suppressed_review_request` in `github.rs`) drops the event unless `requested_reviewer.login == QA_REVIEWER_LOGIN` (`mika-platform-qa`). This makes operator-driven re-requests (`gh api .../requested_reviewers` for the QA bot) trigger an autonomous qa-review while preventing human-reviewer requests (or team requests carrying `requested_team` instead of `requested_reviewer`) from spinning up a full qa-review session. Fail-closed: a missing/unresolvable reviewer is suppressed. The guard sits between routing and the `info!` dispatch log, alongside the skill denylist (#845) and synchronize no-diff (#886) guards.
 - Delivery UUID dedup via 10k-entry LRU cache
 - 256KB body limit
 - Multi-tenant routing via `github_repos` table lookup with `agent_base_url` fallback for single-tenant mode

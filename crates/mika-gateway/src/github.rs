@@ -231,6 +231,13 @@ async fn commits_have_file_changes(
 /// is dropped with a warning — the skill never reaches the agent.
 const WEBHOOK_SKILL_DENYLIST: &[&str] = &["dev-groom"];
 
+/// GitHub login of the autonomous QA reviewer bot. Only `review_requested`
+/// events addressed to this reviewer trigger an autonomous qa-review session;
+/// requests for human reviewers (e.g. the operator) must NOT spin up a full
+/// qa-review (mika#1655). Out of scope: routing other reviewers to other
+/// agents (different agents may want different handlers — see mika#1655 body).
+const QA_REVIEWER_LOGIN: &str = "mika-platform-qa";
+
 /// Internal org repos that should route to the well-known mika-dev agent container
 /// without requiring a `github_repos` row. These are org-internal development repos,
 /// not customer repos — they bypass the customer-registry lookup in multi-tenant mode.
@@ -281,6 +288,21 @@ fn is_webhook_denylisted_skill(
     WEBHOOK_SKILL_DENYLIST
         .iter()
         .any(|skill| name_lower == *skill)
+}
+
+/// Returns `true` when a `pull_request.review_requested` event must be
+/// suppressed because the requested reviewer is not the autonomous QA bot
+/// ([`QA_REVIEWER_LOGIN`]).
+///
+/// `route_event` maps the `review_requested` action to `mika-qa`, but the
+/// routing table cannot see the reviewer login. Without this filter, requesting
+/// *any* reviewer on a PR — including the human operator — would spin up a full
+/// autonomous qa-review session. Only requests addressed to the QA bot should
+/// trigger one (mika#1655 AC1); every other reviewer (human, team, or a missing
+/// `requested_reviewer`) is suppressed (mika#1655 AC2). Non-`review_requested`
+/// actions are never suppressed by this guard (mika#1655 AC3).
+fn is_suppressed_review_request(action: Option<&str>, requested_reviewer: Option<&str>) -> bool {
+    action == Some("review_requested") && requested_reviewer != Some(QA_REVIEWER_LOGIN)
 }
 
 /// Route a GitHub event to the target agent name based on event type and action.
@@ -711,6 +733,25 @@ pub(crate) async fn handle_github_webhook(
             return StatusCode::OK;
         }
     };
+
+    // 9a. Review-requested reviewer filter (mika#1655). `route_event` maps the
+    // `review_requested` action to mika-qa, but only requests addressed to the
+    // QA bot should trigger an autonomous qa-review. Suppress requests for human
+    // reviewers (or teams / missing reviewer) here — before the routing info!
+    // log and any dispatch — so a human-reviewer request never spins up a full
+    // qa-review session.
+    if is_suppressed_review_request(
+        event.action.as_deref(),
+        event.requested_reviewer.as_ref().map(|u| u.login.as_str()),
+    ) {
+        warn!(
+            event_type,
+            delivery_id = %delivery_id,
+            requested_reviewer = ?event.requested_reviewer.as_ref().map(|u| u.login.as_str()),
+            "GitHub webhook review_requested dropped — reviewer is not the QA bot"
+        );
+        return StatusCode::OK;
+    }
 
     info!(
         event_type,
@@ -1365,10 +1406,59 @@ mod tests {
 
     #[test]
     fn test_route_event_pr_review_requested() {
+        // route_event maps the action to mika-qa regardless of reviewer; the
+        // reviewer-login discrimination is enforced separately by
+        // is_suppressed_review_request (mika#1655). This test pins the routing
+        // table's behavior (AC3 — no regression on the action→agent mapping).
         assert_eq!(
             route_event("pull_request", Some("review_requested"), None),
             Some("mika-qa")
         );
+    }
+
+    // --- mika#1655: review-requested reviewer filter ---
+
+    #[test]
+    fn test_review_request_for_qa_bot_is_dispatched() {
+        // AC1: a review_requested addressed to the QA bot is NOT suppressed,
+        // so it reaches mika-qa and triggers an autonomous qa-review.
+        assert!(!is_suppressed_review_request(
+            Some("review_requested"),
+            Some(QA_REVIEWER_LOGIN)
+        ));
+    }
+
+    #[test]
+    fn test_review_request_for_human_reviewer_is_suppressed() {
+        // AC2 (negative case): a review_requested addressed to a human reviewer
+        // MUST be suppressed — it must not spin up a qa-review session.
+        assert!(is_suppressed_review_request(
+            Some("review_requested"),
+            Some("vincent")
+        ));
+    }
+
+    #[test]
+    fn test_review_request_with_no_reviewer_is_suppressed() {
+        // AC2 (defensive): a review_requested whose reviewer cannot be resolved
+        // (e.g. a team request carrying `requested_team` instead of
+        // `requested_reviewer`) is suppressed — fail-closed, not fail-open.
+        assert!(is_suppressed_review_request(Some("review_requested"), None));
+    }
+
+    #[test]
+    fn test_non_review_request_actions_are_never_suppressed() {
+        // AC3: the filter only governs the review_requested action. opened,
+        // synchronize, and closed pass through untouched regardless of the
+        // (absent) reviewer field.
+        assert!(!is_suppressed_review_request(Some("opened"), None));
+        assert!(!is_suppressed_review_request(Some("synchronize"), None));
+        assert!(!is_suppressed_review_request(Some("closed"), None));
+        // Even if a reviewer login is somehow present on a non-review action.
+        assert!(!is_suppressed_review_request(
+            Some("opened"),
+            Some(QA_REVIEWER_LOGIN)
+        ));
     }
 
     #[test]
