@@ -196,14 +196,25 @@ When you receive a GitHub webhook event for `pull_request.closed`:
 
 **Verdict class `recover_unpushed_work`** is handled in `self-dev-callback/system_prompt.md`, not here. It fires when claude-pilot returns the `error_max_turns` marker (or the conservative stale-in-progress heuristic triggers) AND the task's branch has unpushed local commits verified via `git log origin/main..<branch>`.
 
-**Webhook handler interaction (all event types — including `pull_request_review.submitted`):** Before routing any verdict in Step 3, check if the correlated task (Step 4) has `unpushed_recovery_pending: true` in its metadata. If set, skip ALL verdict processing regardless of verdict type (`pass`, `hold`, `block[ci]`, `block[ac]`, etc.) and stale event type (`check_suite`, `pull_request_review`):
+**Webhook handler interaction (all event types — including `pull_request_review.submitted`):** Before routing any verdict in Step 3, evaluate the **recovery-skip guards** below. They are independent and OR-combined — **any single guard firing** skips ALL verdict processing regardless of verdict type (`pass`, `hold`, `block[ci]`, `block[ac]`, etc.) and stale event type (`check_suite`, `pull_request_review`):
+
+> **Guard 1 — recovery-pending metadata flag (primary, mika#1613).** Check if the correlated task (Step 4) has `unpushed_recovery_pending: true` in its metadata. Set by the callback handler when dispatch-lib's dirty-worktree (mika#1282) or commit-pushed-no-pr (mika#1396) recovery opens a rescue draft PR (also set by the `recover_unpushed_work` callback verdict).
+>
+> **Guard 2 — wip-rescue draft signature (defense-in-depth, mika#1613).** Fetch the PR's draft status and head-commit message, then fire **only when BOTH conditions hold** (AND-conjoined — architect-narrowed so plain "draft PR for feedback" workflows are NOT blocked):
+> 1. `isDraft: true` — `run_gh("pr view <number> --repo senara-solutions/<repo> --json isDraft --jq '.isDraft'")`
+> 2. The head-commit message matches the anchored regex `^wip\(` (the mika#1282 / mika#1396 rescue-commit prefix, e.g. `wip(...mika#1282): impl staged by post-flight recovery`) — `run_gh("pr view <number> --repo senara-solutions/<repo> --json commits --jq '.commits[-1].messageHeadline'")`.
+>
+> This guard is the regression net for R4: a future rescue-path addition that forgets to set the metadata flag (Guard 1) is still caught here, because dispatch-lib always opens rescue PRs as `--draft` with a `wip(` head commit.
+
+When any guard fires:
 - Do NOT call `pr_merge_with_gate`
+- Do NOT mark the PR ready for review / un-draft it
 - Do NOT auto-retry via `run_claude_pilot`
 - Do NOT increment `pipeline_retry_count`, `qa_retry_count`, or `ci_fix_count`
 - Do NOT transition the task to `blocked` or `failed`
-- Acknowledge the event, notify Vincent "Stale webhook for recovery-pending task — skipping verdict processing", and stop — the operator recovery path owns this task
+- Acknowledge the event, notify Vincent "Recovery-pending / wip-rescue draft PR for {repo}#{pr_number} — skipping autonomous verdict processing. Operator must review and promote.", and stop — the operator recovery path owns this task
 
-**Cross-reference:** mika#838, mika#825 (`block[ac]` precedent for operator-routed verdicts).
+**Cross-reference:** mika#838, mika#825 (`block[ac]` precedent for operator-routed verdicts); mika#1610 (incident — rescue draft PR auto-merged unreviewed code because only Guard 1 existed and the flag was never set).
 
 ---
 
@@ -234,6 +245,17 @@ Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR
 `run_gh` takes TWO SEPARATE INPUTS: `"command"` (array of gh subcommand arguments) and `"repo"` (string, `owner/repo` target). `--repo` is a **sibling parameter to `command`**, NOT a flag inside the array. Any shorthand example like `run_gh("pr list --repo senara-solutions/mika ...")` is **not literal** — split it: put every token EXCEPT `--repo VALUE` into `command`, pull `VALUE` into `repo`. Including `--repo` inside `command` causes the wrapper to reject the call. If that happens, **move `--repo` out of the array** — do NOT drop it (you will silently query the wrong repo). Permitted: `pr, issue, run, workflow, release, repo, search, label, api`. Use `gh api` for milestone/project mutations and arbitrary REST/GraphQL operations (e.g., `gh api --method PATCH /repos/owner/repo/milestones/N -f state=closed`).
 
 **Incident:** session `4cbc6de7-...` on 2026-04-17 — milestone #12 dispatch failed because `--repo` was passed inside `command`, wrapper rejected it, agent dropped `--repo` on retry and falsely concluded milestone didn't exist.
+
+### Rule 8 — Rescue draft PRs never auto-merge (mika#1613)
+
+A dispatch-lib rescue PR (dirty-worktree mika#1282, commit-pushed-no-pr mika#1396) must NEVER be autonomously un-drafted + auto-merged. Two independent guards (see "Webhook handler interaction" above) enforce this — any one firing skips all verdict processing and escalates to the operator:
+
+1. **`unpushed_recovery_pending: true` in task metadata** (primary) — set by the callback handler from dispatch-lib's `RECOVERY_PENDING: true` RESULT marker.
+2. **`isDraft: true` AND head commit matches `^wip\(`** (defense-in-depth, architect-narrowed) — the wip-rescue draft signature. AND-conjoined so plain "draft PR for feedback" workflows are not blocked; a non-`wip(` draft passes through to normal verdict processing.
+
+Test surface: dispatch-lib harness asserts the `RECOVERY_PENDING: true` marker on both rescue classes (Guard 1 source); mika-qa calibration asserts the wip-rescue draft → skip + escalate verdict (Guard 2 behavior).
+
+**Incident:** mika#1610 on 2026-06-28 — a dirty-worktree rescue draft PR was approved, un-drafted, and auto-merged to main, shipping unreviewed broken code. Only Guard 1's metadata flag existed at the time and dispatch-lib never set it, so nothing blocked the merge. The defense-in-depth Guard 2 closes the regression class: a future rescue path that forgets the flag is still caught by the draft + wip-commit signature.
 
 ---
 

@@ -2520,7 +2520,15 @@ RESCUEBODY
             # R4 for the canonical contract.
             RESULT="${RESULT}
 Draft PR (dispatch-lib recovery): ${PR_URL}
-PR: ${PR_URL}"
+PR: ${PR_URL}
+RECOVERY_PENDING: true"
+            # mika#1613: structured marker parsed by self-dev-callback, which
+            # writes `unpushed_recovery_pending: true` into tasks.metadata. That
+            # flag makes the qa-webhook recovery-skip guard fire so this rescue
+            # draft PR is NOT autonomously un-drafted + auto-merged. Both recovery
+            # classes (dirty-worktree mika#1282, commit-pushed-no-pr mika#1396)
+            # flow through this block, so a single marker covers both. Guarded by
+            # `if [ -n "$RESCUED_PR_URL" ]` — only emitted when a rescue PR opened.
         fi
     fi
 

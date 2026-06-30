@@ -87,6 +87,14 @@ Permitted post-callback actions are described prosaically in the success/failure
 > 4. Do NOT call `run_claude_pilot` again for this task.
 > 5. Proceed to Step 6 with `in_progress` and note "recover_unpushed_work: {commit_count} commits on local branch, awaiting operator recovery. Branch: {branch}".
 
+**Recovery-pending detection (universal pre-check, mika#1613 — runs BEFORE the pipeline-failure / success / failure routing split below):**
+
+If the callback text contains the line `RECOVERY_PENDING: true` (emitted by dispatch-lib when its dirty-worktree (mika#1282) or commit-pushed-no-pr (mika#1396) recovery opens a draft PR):
+
+1. Write `unpushed_recovery_pending: true` to `tasks.metadata` via `update_task_status` (status stays `in_progress`). Atomicity: this metadata write happens BEFORE any `send_message` or routing — same discipline as the `recover_unpushed_work` handler above.
+2. Log: "Recovery-pending flag set for task {task_id} — rescue PR will require operator review and promotion."
+3. **Continue to normal routing below.** This pre-check does NOT short-circuit or change callback routing — the callback still extracts metadata, notifies Vincent about the PR, and routes through its normal path. The flag's only effect is downstream: when mika-qa reviews the rescue draft PR, the qa-webhook recovery-skip guard sees `unpushed_recovery_pending: true` and skips autonomous verdict processing + un-draft + auto-merge. (The flag is set even if no `PR:` URL is present — defense-in-depth; the routing below handles the missing-PR case normally.)
+
 **On pipeline failure (callback contains "PIPELINE FAILURE:"):**
 
 1. Extract metadata (Session, Cost, Turns, Duration) from lines after the prefix.
