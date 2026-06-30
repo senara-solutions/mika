@@ -354,6 +354,136 @@ pub(crate) fn assert_grounded_satisfied(
         .any(|s| GROUNDING_TOOLS.contains(&s.name.as_str()) && s.input_summary.contains(bare_ref))
 }
 
+// ---------------------------------------------------------------------------
+// #1645 — Cross-artifact equivalence-claim guard (qa-review-scoped)
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the equivalence-claim
+/// guard (#1645). Inline guard, scoped to qa-review (via the `qa_pr_view`
+/// tool's presence in the turn-start enabled set). Sibling of the
+/// assert-grounded guard (#1331), specialized for cross-artifact equivalence
+/// assertions ("duplicate of #X", "content identical", "same as PR #Y").
+pub const EQUIVALENCE_CLAIM_LABEL: &str = "equivalence_claim";
+
+/// Tools whose call grounds a cross-artifact equivalence claim by fetching the
+/// *compared* artifact: `run_gh` (`pr diff` / `pr list` / `issue view`),
+/// `qa_pr_view` (the compared PR's metadata + file list), and `gh_read` (the
+/// architect read path). The satisfaction predicate additionally requires the
+/// compared artifact's reference to appear in the tool's input — qa-review
+/// always fetches the *current* PR's diff in Step 2, so a bare "any diff call"
+/// check would trivially satisfy the guard and defeat it.
+pub const EQUIVALENCE_GROUNDING_TOOLS: &[&str] = &["run_gh", "qa_pr_view", "gh_read"];
+
+/// Structured result from cross-artifact equivalence-claim detection.
+pub struct EquivalenceClaim {
+    /// The compared artifact reference (e.g. `#1638`), extracted from the
+    /// vicinity of the equivalence keyword.
+    pub compared_ref: String,
+    /// The matched claim-keyword fragment (for logging).
+    pub claim_text: String,
+}
+
+/// Four regex patterns detecting cross-artifact equivalence assertions. Keyword
+/// list per mika#1645 AC1: `identical` (in equivalence context), `duplicate of`,
+/// `duplicate to`, `same as`, `equivalent to`, `content identical`.
+static EQUIVALENCE_CLAIM_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        vec![
+            // P1: "duplicate of" / "duplicate to" — "Duplicate of merged mika#1638"
+            regex::Regex::new(r"(?i)\bduplicate (?:of|to)\b").expect("equivalence_claim pattern 1"),
+            // P2: "identical" in equivalence context — "content identical",
+            // "identical to PR #X", "is/are identical".
+            regex::Regex::new(
+                r"(?i)\b(?:content[s]?\s+identical|identical\s+to|(?:is|are|both)\s+identical)\b",
+            )
+            .expect("equivalence_claim pattern 2"),
+            // P3: "same as" — "same as #X"
+            regex::Regex::new(r"(?i)\bsame as\b").expect("equivalence_claim pattern 3"),
+            // P4: "equivalent to" — "equivalent to commit Z"
+            regex::Regex::new(r"(?i)\bequivalent to\b").expect("equivalence_claim pattern 4"),
+        ]
+    });
+
+/// Detects cross-artifact equivalence assertions in assistant text.
+///
+/// Scans for one of four equivalence-keyword patterns. On a match, extracts the
+/// *compared* artifact reference (`#N`) — biased FORWARD of the keyword, since
+/// the compared artifact normally follows it ("duplicate of <ref>", "identical
+/// to <ref>"), with a bounded fall-back to a reference shortly before. Returns
+/// `None` when no pattern matches OR no nearby reference can be extracted
+/// (lean-narrow fail-open, mirroring the assert-grounded guard's D2 policy).
+///
+/// Reference extraction iterates `#N` matches and compares byte positions
+/// instead of slicing the string — panic-safe on multi-byte text (the founding
+/// incident verdict contained an em-dash; see mika#764 byte-slice lint).
+pub(crate) fn detect_equivalence_claim(text: &str) -> Option<EquivalenceClaim> {
+    // Fast path: skip regex when no candidate substring is present.
+    let lower = text.to_lowercase();
+    if !(lower.contains("duplicate")
+        || lower.contains("identical")
+        || lower.contains("same as")
+        || lower.contains("equivalent to"))
+    {
+        return None;
+    }
+
+    const FORWARD_WINDOW: usize = 200;
+    const BACKWARD_WINDOW: usize = 100;
+
+    for re in EQUIVALENCE_CLAIM_PATTERNS.iter() {
+        let Some(kw) = re.find(text) else { continue };
+        let kw_start = kw.start();
+        let kw_end = kw.end();
+
+        let mut after: Option<&str> = None;
+        let mut before: Option<&str> = None;
+        for caps in RESOURCE_REF_RE.captures_iter(text) {
+            let whole = caps.get(0).expect("regex match 0 always present");
+            let num = caps.get(1).expect("resource_ref capture group 1").as_str();
+            let pos = whole.start();
+            if pos >= kw_end {
+                if after.is_none() && pos - kw_end <= FORWARD_WINDOW {
+                    after = Some(num);
+                }
+            } else if pos < kw_start && kw_start - pos <= BACKWARD_WINDOW {
+                // Iteration is position-ascending, so the last assignment is
+                // the reference closest before the keyword.
+                before = Some(num);
+            }
+        }
+
+        if let Some(num) = after.or(before) {
+            return Some(EquivalenceClaim {
+                compared_ref: format!("#{num}"),
+                claim_text: kw.as_str().to_string(),
+            });
+        }
+
+        // Pattern matched but no nearby ref → fail-open; try the next pattern.
+        debug!(
+            matched = kw.as_str(),
+            "equivalence_claim: pattern matched but no nearby resource ref — skipping"
+        );
+    }
+    None
+}
+
+/// Returns `true` when the equivalence-claim guard should NOT fire (i.e. a
+/// grounding tool call that fetched the *compared* artifact exists in the turn).
+///
+/// Accepts any attempt (success or failure) to an equivalence-grounding tool
+/// whose input references the compared artifact — same accept-any-attempt
+/// semantics as `assert_grounded_satisfied`.
+pub(crate) fn equivalence_claim_satisfied(
+    claim: &EquivalenceClaim,
+    summaries: &[ToolCallSummary],
+) -> bool {
+    let bare_ref = claim.compared_ref.trim_start_matches('#');
+    summaries.iter().any(|s| {
+        EQUIVALENCE_GROUNDING_TOOLS.contains(&s.name.as_str()) && s.input_summary.contains(bare_ref)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,6 +1274,178 @@ mod tests {
         assert!(
             assert_grounded_satisfied(&claim, &summaries),
             "Grounding call at any step in the turn should satisfy"
+        );
+    }
+
+    // -- #1645 cross-artifact equivalence-claim detection tests --
+
+    #[test]
+    fn test_detect_equivalence_claim_founding_incident() {
+        // The verbatim mika#1644 incident verdict (em-dash included).
+        let result = detect_equivalence_claim(
+            "VERDICT: hold[review] — Duplicate of merged mika#1638 — content identical; \
+             dispatch-lib opened a second wip-rescue vehicle.",
+        );
+        let claim = result.expect("founding-incident verdict should match");
+        assert_eq!(claim.compared_ref, "#1638");
+    }
+
+    #[test]
+    fn test_detect_equivalence_claim_content_identical() {
+        let result =
+            detect_equivalence_claim("The diff is content identical to the prior PR #900.");
+        let claim = result.expect("'content identical' should match");
+        assert_eq!(claim.compared_ref, "#900");
+    }
+
+    #[test]
+    fn test_detect_equivalence_claim_identical_to() {
+        let result = detect_equivalence_claim("This PR is identical to PR #512.");
+        let claim = result.expect("'identical to' should match");
+        assert_eq!(claim.compared_ref, "#512");
+    }
+
+    #[test]
+    fn test_detect_equivalence_claim_same_as() {
+        let result = detect_equivalence_claim("These changes are the same as #777.");
+        let claim = result.expect("'same as' should match");
+        assert_eq!(claim.compared_ref, "#777");
+    }
+
+    #[test]
+    fn test_detect_equivalence_claim_equivalent_to() {
+        let result = detect_equivalence_claim("Functionally equivalent to #321 already merged.");
+        let claim = result.expect("'equivalent to' should match");
+        assert_eq!(claim.compared_ref, "#321");
+    }
+
+    #[test]
+    fn test_detect_equivalence_claim_forward_bias_over_current_pr() {
+        // The current PR (#1644) precedes the keyword; the compared artifact
+        // (#1638) follows it. Forward bias must select the compared artifact.
+        let result =
+            detect_equivalence_claim("PR #1644 is a duplicate of the merged work in #1638.");
+        let claim = result.expect("forward-bias case should match");
+        assert_eq!(
+            claim.compared_ref, "#1638",
+            "compared artifact (#1638), not the current PR (#1644), must be chosen"
+        );
+    }
+
+    #[test]
+    fn test_detect_equivalence_claim_no_ref_fail_open() {
+        // Keyword present but no nearby #N → fail-open (None).
+        assert!(
+            detect_equivalence_claim("The two implementations are content identical.").is_none(),
+            "no nearby resource ref should fail-open to None"
+        );
+    }
+
+    #[test]
+    fn test_detect_equivalence_claim_no_keyword() {
+        assert!(
+            detect_equivalence_claim("PR #1644 adds a new calibration scenario for mika-qa.")
+                .is_none(),
+            "non-equivalence verdict should not match"
+        );
+    }
+
+    // -- #1645 equivalence-claim satisfaction predicate tests --
+
+    #[test]
+    fn test_equivalence_claim_satisfied_run_gh_pr_diff_compared_ref() {
+        let claim = EquivalenceClaim {
+            compared_ref: "#1638".to_string(),
+            claim_text: "duplicate of".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: "gh pr diff 1638 --name-only".to_string(),
+            output_summary: "skills/bundled/qa-review/system_prompt.md".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(
+            equivalence_claim_satisfied(&claim, &summaries),
+            "run_gh pr diff of the compared artifact should satisfy"
+        );
+    }
+
+    #[test]
+    fn test_equivalence_claim_not_satisfied_only_current_pr_diff() {
+        // qa-review's Step 2 always fetches the CURRENT PR's diff (#1644).
+        // That does NOT ground an equivalence claim about #1638 — the guard
+        // must still fire.
+        let claim = EquivalenceClaim {
+            compared_ref: "#1638".to_string(),
+            claim_text: "content identical".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: "gh pr diff 1644 --name-only".to_string(),
+            output_summary: "crates/mika-agent/src/calibration/roles/mika_qa.rs".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(
+            !equivalence_claim_satisfied(&claim, &summaries),
+            "current-PR diff (#1644) must NOT satisfy a claim about #1638"
+        );
+    }
+
+    #[test]
+    fn test_equivalence_claim_satisfied_qa_pr_view_compared_ref() {
+        let claim = EquivalenceClaim {
+            compared_ref: "#1638".to_string(),
+            claim_text: "same as".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "qa_pr_view".to_string(),
+            input_summary: "pr_url: https://github.com/senara-solutions/mika/pull/1638".to_string(),
+            output_summary: "PR #1638: files ...".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }];
+        assert!(
+            equivalence_claim_satisfied(&claim, &summaries),
+            "qa_pr_view of the compared PR (URL contains 1638) should satisfy"
+        );
+    }
+
+    #[test]
+    fn test_equivalence_claim_not_satisfied_empty_summaries() {
+        let claim = EquivalenceClaim {
+            compared_ref: "#1638".to_string(),
+            claim_text: "duplicate of".to_string(),
+        };
+        assert!(
+            !equivalence_claim_satisfied(&claim, &[]),
+            "no tool calls should NOT satisfy"
+        );
+    }
+
+    #[test]
+    fn test_equivalence_claim_satisfied_failed_attempt() {
+        // A failed fetch still shows the reviewer attempted the comparison —
+        // a real failure is a signal, not a fabrication (accept-any-attempt).
+        let claim = EquivalenceClaim {
+            compared_ref: "#1638".to_string(),
+            claim_text: "duplicate of".to_string(),
+        };
+        let summaries = vec![ToolCallSummary {
+            step: 0,
+            name: "run_gh".to_string(),
+            input_summary: "gh pr diff 1638".to_string(),
+            output_summary: "Error: rate limited".to_string(),
+            success: false,
+            non_zero_exit: false,
+        }];
+        assert!(
+            equivalence_claim_satisfied(&claim, &summaries),
+            "failed attempt to fetch the compared artifact should satisfy"
         );
     }
 }

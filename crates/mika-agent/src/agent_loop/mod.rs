@@ -20,10 +20,10 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::evidence::guards::{
-    ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, assert_grounded_satisfied,
-    asserted_unavailability_satisfied, detect_affirmative_state_claim,
-    detect_asserted_unavailability, detect_fabricated_action_claim,
-    detect_unverified_callback_state_claim,
+    ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, EQUIVALENCE_CLAIM_LABEL,
+    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    detect_asserted_unavailability, detect_equivalence_claim, detect_fabricated_action_claim,
+    detect_unverified_callback_state_claim, equivalence_claim_satisfied,
 };
 use crate::mcp::McpManager;
 use crate::messaging::MessageSender;
@@ -1193,11 +1193,12 @@ async fn run_loop(
 
                     // PR review early-accept: if the turn already contains a
                     // successful `gh pr review` call, skip guards #4–#6b, #7–#9.
-                    // Guards 6c (asserted_unavailability) and 6d (assert-grounded)
-                    // are NOT skipped — they detect a different failure family
-                    // (claim-without-evidence vs action-without-completion). The primary
-                    // action completed — forced continuation would risk duplicate
-                    // review submissions. See #695, #1178.
+                    // Guards 6c (asserted_unavailability), 6d (assert-grounded),
+                    // and 6e (equivalence_claim, mika#1645) are NOT skipped — they
+                    // detect a different failure family (claim-without-evidence vs
+                    // action-without-completion). The primary action completed —
+                    // forced continuation would risk duplicate review submissions.
+                    // See #695, #1178, #1645.
                     let skip_remaining_guards =
                         matches!(response.stop_reason, LlmStopReason::EndTurn)
                             && has_successful_pr_review(&all_tool_summaries);
@@ -1762,6 +1763,80 @@ async fn run_loop(
                                  tool returned — or remove the unverified claim from \
                                  your response.",
                                 claim.resource_type, claim.resource_ref,
+                            )),
+                        });
+                        continue;
+                    }
+
+                    // #1645 — Cross-artifact equivalence-claim guard
+                    // (qa-review-scoped). Catches verdicts asserting that this
+                    // PR is equivalent to another PR/commit/issue ("duplicate
+                    // of #X", "content identical", "same as #Y") without a
+                    // tool call that fetched the COMPARED artifact this turn.
+                    // Sibling of the assert-grounded guard (6d), specialized
+                    // for the cross-artifact equivalence class (mika#1644
+                    // founding incident: qa emitted "Duplicate of merged
+                    // mika#1638 — content identical" with zero source-file
+                    // overlap, never having fetched #1638). Scoped to qa-review
+                    // via the `qa_pr_view` tool's presence in the turn-start
+                    // enabled set — on other skills it is a no-op. Like 6c/6d,
+                    // NOT skipped by `skip_remaining_guards` (#1178): a posted
+                    // PR review does not ground an unverified equivalence claim.
+                    // Single retry via intent_guard_retries.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && enabled_tool_names.contains("qa_pr_view")
+                        && !intent_guard_retries.contains(EQUIVALENCE_CLAIM_LABEL)
+                        && let Some(claim) = detect_equivalence_claim(&text)
+                        && !equivalence_claim_satisfied(&claim, &all_tool_summaries)
+                    {
+                        intent_guard_retries.insert(EQUIVALENCE_CLAIM_LABEL);
+                        let corr_id = format!("{}:{}:equivalence_claim", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "equivalence_claim",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            compared_ref = %claim.compared_ref,
+                            claim = %claim.claim_text,
+                            intent_guard = EQUIVALENCE_CLAIM_LABEL,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.equivalence_claim",
+                            "Equivalence-claim guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(format!(
+                                "[mika-engine] The previous verdict asserts \
+                                 cross-artifact equivalence to {} without a tool \
+                                 call this turn that fetched {}'s file set. \
+                                 Equivalence claims (identical / duplicate of / \
+                                 same as / equivalent to) require a diff-backed \
+                                 citation: call `run_gh pr diff {}` (or `pr list` \
+                                 / `issue view`) — or `qa_pr_view` of {} — and \
+                                 compare the file sets. Co-occurring surface \
+                                 signals (recovery-class headers, title-keyword \
+                                 overlap, core-memory entries) are NEVER \
+                                 sufficient. Without the fetch, downgrade to \
+                                 hedged language — \"possible duplicate — operator \
+                                 should verify file diffs\" — and do not assert \
+                                 identity.",
+                                claim.compared_ref,
+                                claim.compared_ref,
+                                claim.compared_ref.trim_start_matches('#'),
+                                claim.compared_ref,
                             )),
                         });
                         continue;
