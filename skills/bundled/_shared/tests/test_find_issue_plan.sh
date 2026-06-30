@@ -1,12 +1,12 @@
 #!/bin/bash
-# Test suite for dispatch-lib.sh's _find_issue_plan helper (mika#1421).
+# Test suite for dispatch-lib.sh's _find_issue_plan helper (mika#1421, mika#1617).
 #
-# Verifies plan-file discovery against the two filename conventions the
-# pilot has been observed to produce:
-#   (1) Filename embeds issue number: `2026-06-05-001-fix-1407-...-plan.md`
-#   (2) Filename omits issue number: `2026-06-06-003-feat-post-condition-...-plan.md`
-#       (the pilot writes this when its slug-tail doesn't naturally include
-#       the issue number; content header references `**Ticket:** mika issue#N`)
+# Verifies three-tier plan-file discovery:
+#   (1) Tier 1: Filename embeds issue number: `2026-06-05-001-fix-1407-...-plan.md`
+#   (2) Tier 2: Filename omits issue number, content header references
+#       `**Ticket:** mika issue#N` / `**Issue:** mika#N` / YAML `ticket:`/`issue:`
+#   (3) Tier 3: Broad issue-number reference in first 50 lines — bare `#N`,
+#       `Closes #N`, YAML `number: N`, etc. (mika#1617)
 #
 # Founding incident: mika#1421 bound the architect-convergence class at n=2
 # on 2026-06-06. The brittle filename-only pattern in three callsites caused
@@ -128,20 +128,28 @@ assert_eq "YAML frontmatter ticket: mika#N matches" \
 # ============================================================================
 
 echo
-echo "Negative (prose-only mention of #N must NOT match):"
-write_plan "$TMPROOT/docs/plans/2026-06-04-003-unrelated-cleanup-plan.md" \
-    "Sister to mika#1234 but ticket is something else"
+echo "Negative (prose-only mention of #N past line 50 must NOT match):"
+# Prose mention of #N is not enough for ANY tier when outside all header zones.
+# Tier 2 checks first 20 lines, tier 3 checks first 50 lines.
+{
+    echo "# Plan: unrelated cleanup"
+    echo ""
+    for i in $(seq 1 52); do echo "Body padding line $i — approach discussion."; done
+    echo "Sister to mika#1234 but ticket is something else"
+    for i in $(seq 1 5); do echo "More body line $i."; done
+} > "$TMPROOT/docs/plans/2026-06-04-003-unrelated-cleanup-plan.md"
 ISSUE_NUM=1234
 RESULT=$(_find_issue_plan || true)
-assert_empty "prose '#1234' in line 3 (not anchored as **Ticket:**) → no match" "$RESULT"
+assert_empty "prose '#1234' past line 50 → no match (outside all tier zones)" "$RESULT"
 
 echo
-echo "Negative (quoted **Ticket:** line in BODY prose must NOT match):"
+echo "Negative (quoted **Ticket:** line in BODY prose past line 50 must NOT match):"
 # Regression test for self-test failure: mika#1421's plan QUOTED mika#771's
 # `**Ticket:** mika issue#771` header on line 49 (a body quote) to illustrate
 # the founding incident. The v1 helper false-positive'd on ISSUE_NUM=771 and
 # returned the #1421 plan instead of the actual #771 plan. The header-zone
-# scope (first 20 lines) closes this class.
+# scope (first 20 lines for tier 2, first 50 lines for tier 3) closes this
+# class. The quoted reference must be past line 50 to avoid tier-3 match.
 {
     echo "---"
     echo "ticket: mika#5050"  # CANONICAL ticket in YAML frontmatter
@@ -152,10 +160,10 @@ echo "Negative (quoted **Ticket:** line in BODY prose must NOT match):"
     echo ""
     echo "Some preamble text in the header zone."
     echo ""
-    # Pad to push the quoted Ticket reference past line 20
-    for i in $(seq 1 25); do echo "Body padding line $i — discussion of approach."; done
-    # NOW the quoted reference appears in BODY (past line 20)
-    echo "Line 35 quotes another plan's header to illustrate a point:"
+    # Pad to push the quoted Ticket reference past line 50 (tier 3 zone)
+    for i in $(seq 1 45); do echo "Body padding line $i — discussion of approach."; done
+    # NOW the quoted reference appears in BODY (past line 50)
+    echo "Line 55 quotes another plan's header to illustrate a point:"
     echo ""
     echo "**Ticket:** mika issue#6060"  # This is a QUOTE, not the real ticket
     echo ""
@@ -164,7 +172,7 @@ echo "Negative (quoted **Ticket:** line in BODY prose must NOT match):"
 
 ISSUE_NUM=6060
 RESULT=$(_find_issue_plan || true)
-assert_empty "quoted **Ticket:** mika issue#6060 in body (line ~35) → no false-positive match" "$RESULT"
+assert_empty "quoted **Ticket:** mika issue#6060 in body (line ~55) → no false-positive match" "$RESULT"
 
 # And verify the canonical issue (5050) still matches via its frontmatter header
 ISSUE_NUM=5050
@@ -228,6 +236,111 @@ echo "**Ticket:** mika issue#5555" >> "$TMPROOT/docs/plans/2026-06-04-small-plan
 ISSUE_NUM=5555
 RESULT=$(_find_issue_plan 2>/dev/null || true)
 assert_empty "<500-byte plan filtered by size guard" "$RESULT"
+
+# ============================================================================
+# Tier 3: broad issue-number reference in header zone (mika#1617)
+# ============================================================================
+
+echo
+echo "Tier 3 (broad issue-number reference in header zone, first 50 lines):"
+
+# Positive: bare #N in H1 (line 1–5)
+{
+    echo "# Fix for (#1617)"
+    echo ""
+    echo "Some summary text without a Ticket: or Issue: prefix."
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$TMPROOT/docs/plans/2026-06-28-001-fix-console-agent-image-tag-plan.md"
+ISSUE_NUM=1617
+RESULT=$(_find_issue_plan)
+assert_eq "tier 3: bare #N in H1 → matches" \
+    "$TMPROOT/docs/plans/2026-06-28-001-fix-console-agent-image-tag-plan.md" \
+    "$RESULT"
+
+echo
+echo "Tier 3 positive: YAML number: N without #:"
+{
+    echo "---"
+    echo "number: 3030"
+    echo "type: fix"
+    echo "---"
+    echo ""
+    echo "# Some plan title"
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$TMPROOT/docs/plans/2026-06-28-002-yaml-number-shape-plan.md"
+ISSUE_NUM=3030
+RESULT=$(_find_issue_plan)
+assert_eq "tier 3: YAML 'number: N' without # → matches" \
+    "$TMPROOT/docs/plans/2026-06-28-002-yaml-number-shape-plan.md" \
+    "$RESULT"
+
+echo
+echo "Tier 3 positive: Closes #N in summary (~line 10):"
+{
+    echo "# Plan: fix something"
+    echo ""
+    echo "## Problem"
+    echo ""
+    echo "Something is broken."
+    echo ""
+    echo "## Solution"
+    echo ""
+    echo "Closes #4040 by fixing the root cause."
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$TMPROOT/docs/plans/2026-06-28-003-closes-ref-plan.md"
+ISSUE_NUM=4040
+RESULT=$(_find_issue_plan)
+assert_eq "tier 3: 'Closes #N' in summary → matches" \
+    "$TMPROOT/docs/plans/2026-06-28-003-closes-ref-plan.md" \
+    "$RESULT"
+
+echo
+echo "Tier 3 negative: #N only past line 50:"
+{
+    echo "# Plan: unrelated topic"
+    echo ""
+    for i in $(seq 1 55); do echo "Filler line $i with no issue reference."; done
+    echo "This references #7070 but it is past line 50."
+    echo ""
+    for i in $(seq 1 5); do echo "More filler line $i."; done
+} > "$TMPROOT/docs/plans/2026-06-28-004-deep-body-ref-plan.md"
+ISSUE_NUM=7070
+RESULT=$(_find_issue_plan 2>/dev/null || true)
+assert_empty "tier 3: #N only past line 50 → no match (zone boundary)" "$RESULT"
+
+echo
+echo "Tier 3 priority: tier 1 wins over tier 3:"
+# Create a plan with issue number in filename AND bare #N in body
+{
+    echo "# Plan: something about (#8080)"
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$TMPROOT/docs/plans/2026-06-28-005-fix-8080-something-plan.md"
+ISSUE_NUM=8080
+RESULT=$(_find_issue_plan)
+assert_eq "tier 1 wins over tier 3 (filename match returned)" \
+    "$TMPROOT/docs/plans/2026-06-28-005-fix-8080-something-plan.md" \
+    "$RESULT"
+
+echo
+echo "Tier 3 priority: tier 2 wins over tier 3:"
+# Create a plan with **Ticket:** in first 20 lines AND bare #N on line 40
+{
+    echo "# Plan: something"
+    echo ""
+    echo "**Ticket:** mika issue#9090"
+    echo ""
+    for i in $(seq 1 40); do echo "Body padding line $i for size."; done
+    echo "Also references #9090 here on line ~45."
+} > "$TMPROOT/docs/plans/2026-06-28-006-tier2-wins-plan.md"
+ISSUE_NUM=9090
+RESULT=$(_find_issue_plan)
+assert_eq "tier 2 wins over tier 3 (anchored header match returned)" \
+    "$TMPROOT/docs/plans/2026-06-28-006-tier2-wins-plan.md" \
+    "$RESULT"
 
 # ============================================================================
 # Summary
