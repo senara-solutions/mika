@@ -98,6 +98,14 @@ Update the Test 16 header comment to mention tier 3 if it tests `_find_issue_pla
 - **False-positive risk** is bounded by the 50-line header zone. The only scenario: a plan for issue X mentions `#Y` in its first 50 lines, and we're searching for issue Y, and no plan actually matches Y via tiers 1–2. This is rare (plans don't cross-reference other issues in their preamble) and the most-recent-file ordering further reduces it.
 - **Test coverage** is extended to validate all three tiers plus zone-boundary negative cases.
 
+## Acceptance criteria
+
+1. `_find_issue_plan()` locates plan files using bare `#N` references or YAML `number: N` keys within the first 50 lines, when tiers 1 and 2 miss.
+2. Tier 3 only fires after tiers 1 and 2 have been exhausted — first match wins.
+3. Plans mentioning the issue number only past line 50 are NOT matched by tier 3.
+4. All existing tier-1 and tier-2 tests continue to pass unchanged.
+5. Test 16 in `test-dispatch-lib.sh` passes with updated tier-3 coverage.
+
 ## Verification
 
 1. Run the updated test suite: `bash skills/bundled/_shared/tests/test_find_issue_plan.sh` — all assertions pass.
