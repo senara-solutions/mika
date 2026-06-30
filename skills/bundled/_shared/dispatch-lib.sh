@@ -887,11 +887,37 @@ ${RESULT}"
                     # blank on every false-positive rejection. Combined
                     # `>file 2>&1` captures the full lefthook decoration
                     # block including ⛔ failure lines.
+                    #
+                    # mika#1685: rescue commits bypass the pre-commit hook
+                    # (--no-verify) BY DESIGN. The rescue path's purpose is to
+                    # SALVAGE pilot work for operator review, not to gate it on
+                    # lint. lefthook runs rust-clippy on pre-commit; a single
+                    # clippy nit (one-line typo like `repeat().collect()`) would
+                    # otherwise reject the rescue commit and strand a 29-turn,
+                    # $4-cost pilot's work as a dead block (modal loop-wedge
+                    # cause, n=3+ on 2026-06-30). CI re-runs cargo fmt --check +
+                    # clippy on the resulting draft PR (ci.yml; wip-staleness-check
+                    # re-clippies wip-rescue drafts when main moves), so the LINT
+                    # signal still surfaces at the right layer — for the operator
+                    # and the autonomous-loop's clippy-fix-retry path, not as a
+                    # hard pre-commit block.
+                    #
+                    # TRADE-OFF, by design: --no-verify is all-or-nothing, so it
+                    # ALSO skips lefthook's no-secrets + no-large-files gates,
+                    # which CI does NOT replicate today (mika#1689 tracks adding a
+                    # CI secret-scan net). Accepted because the rescue output is a
+                    # DRAFT PR (operator-gated, never auto-merged), the secret-prone
+                    # scaffold paths are already excluded from staging above, and
+                    # secrets are scrubbed at the DB/tool-call layer. Do NOT remove
+                    # --no-verify here without first moving the LINT gate somewhere
+                    # the rescue path can still open its draft PR.
+                    # Mika Prime bearing 2026-06-30 ~16:32Z ratified this as the
+                    # wedge-cause fix (Concern 2, ahead of mika#1058).
                     if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): impl staged by post-flight recovery (mika#1282)
 
 Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
 Auto-rescued by dispatch-lib dirty-worktree detection.
-Scaffold paths excluded (mika#1288, mika#1419)." > "$RESCUE_COMMIT_ERR" 2>&1; then
+Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
                         # Commit succeeded on first try — proceed normally
                         rm -f "$RESCUE_COMMIT_ERR"
 
@@ -908,6 +934,12 @@ ${RESULT}"
                         # Mark for draft PR creation in Unit 2
                         RESCUED_DIRTY_WORKTREE=1
                     elif grep -q "rust-fmt\|cargo fmt\|rustfmt" "$RESCUE_COMMIT_ERR" 2>/dev/null; then
+                        # mika#1685 (AC4, kept-and-noted): with --no-verify on the
+                        # initial commit above, the pre-commit hook no longer runs,
+                        # so this fmt-rejection branch is now effectively unreachable
+                        # on hook grounds. Retained defensively rather than removed —
+                        # the retry commit below also carries --no-verify so the path
+                        # stays consistent if a future change reintroduces a hook.
                         # Pre-commit rust-fmt hook rejected — auto-fix and retry (mika#1296).
                         # Capture cargo fmt stderr so it surfaces in the PIPELINE FAILURE message
                         # if the retry also fails (review-guide.md § Single Responsibility — failure
@@ -925,7 +957,7 @@ ${RESULT}"
 
 Content written by pilot session ${SESSION_ID:-unknown} but git commit was never invoked.
 Auto-rescued by dispatch-lib dirty-worktree detection (cargo fmt applied).
-Scaffold paths excluded (mika#1288, mika#1419)." > "$RESCUE_COMMIT_ERR" 2>&1; then
+Scaffold paths excluded (mika#1288, mika#1419)." --no-verify > "$RESCUE_COMMIT_ERR" 2>&1; then
                             # Retry succeeded after cargo fmt
                             rm -f "$RESCUE_COMMIT_ERR"
 
@@ -1017,7 +1049,9 @@ ${RESULT}"
                 git -C "$WORKTREE_DIR" add -A -- \
                     ':!.claude/commands/' ':!.claude/claude-pilot.json' ':!.claude/settings.local.json' ':!.claude/*.local.*' 2>&9 || true
                 if ! git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
-                    if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" 2>&9; then
+                    # mika#1685: bypass pre-commit hook — see rationale on the
+                    # mika#1282 rescue commit above. Same salvage-not-gate principle.
+                    if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" --no-verify 2>&9; then
                         git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9 || true
                         POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
                         RESULT="${RESULT}
