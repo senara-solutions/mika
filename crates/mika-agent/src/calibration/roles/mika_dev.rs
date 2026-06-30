@@ -14,7 +14,7 @@ use mika_common::llm::LlmProvider;
 
 use crate::calibration::failure::FailureClass;
 use crate::calibration::role::{RoleScenario, RoleScenarioResult};
-use crate::calibration::roles::llm_error_result;
+use crate::calibration::roles::{empty_response_result, llm_error_result};
 
 /// Static scenario definitions for the mika-dev role.
 pub const SCENARIOS: &[RoleScenario] = &[
@@ -103,7 +103,11 @@ async fn run_refusal_regression(
             content: LlmContent::Text(fixture.to_string()),
         }],
         tools: None,
-        max_tokens: 1000,
+        // Parity with the other scenarios (2000): reasoning-mode models (e.g.
+        // GLM-5.2) can burn a 1000-token budget entirely on internal reasoning
+        // before emitting visible content, producing a false EmptyResponse
+        // fail. See mika#1665.
+        max_tokens: 2000,
         thinking: None,
     };
 
@@ -137,14 +141,7 @@ async fn run_refusal_regression(
             }
 
             if text.trim().is_empty() {
-                return RoleScenarioResult::fail(
-                    "refusal_regression",
-                    FailureClass::EmptyResponse,
-                    "Empty response".to_string(),
-                    Some(response.usage.input_tokens),
-                    Some(response.usage.output_tokens),
-                    latency,
-                );
+                return empty_response_result("refusal_regression", &response, latency);
             }
 
             RoleScenarioResult::pass(
@@ -186,14 +183,7 @@ async fn run_contract_dev_groom(
             let latency = start.elapsed().as_millis() as u64;
 
             if text.trim().is_empty() {
-                return RoleScenarioResult::fail(
-                    "contract_dev_groom",
-                    FailureClass::EmptyResponse,
-                    "Empty response — groom dispatch produced no output".to_string(),
-                    Some(response.usage.input_tokens),
-                    Some(response.usage.output_tokens),
-                    latency,
-                );
+                return empty_response_result("contract_dev_groom", &response, latency);
             }
 
             // Contract check: must contain structured planning content (not just acknowledgment)
@@ -248,14 +238,7 @@ async fn run_golden_path_dispatch(
             let latency = start.elapsed().as_millis() as u64;
 
             if text.trim().is_empty() {
-                return RoleScenarioResult::fail(
-                    "golden_path_dispatch",
-                    FailureClass::EmptyResponse,
-                    "Empty response".to_string(),
-                    Some(response.usage.input_tokens),
-                    Some(response.usage.output_tokens),
-                    latency,
-                );
+                return empty_response_result("golden_path_dispatch", &response, latency);
             }
 
             // Should mention code-related actions
@@ -321,14 +304,7 @@ async fn run_required_tools_gate(
             let latency = start.elapsed().as_millis() as u64;
 
             if text.trim().is_empty() {
-                return RoleScenarioResult::fail(
-                    "required_tools_gate",
-                    FailureClass::EmptyResponse,
-                    "Empty response".to_string(),
-                    Some(response.usage.input_tokens),
-                    Some(response.usage.output_tokens),
-                    latency,
-                );
+                return empty_response_result("required_tools_gate", &response, latency);
             }
 
             // Must reference the required tool by name
@@ -384,14 +360,7 @@ async fn run_plan_callout_recognition(
             let latency = start.elapsed().as_millis() as u64;
 
             if text.trim().is_empty() {
-                return RoleScenarioResult::fail(
-                    "plan_callout_recognition",
-                    FailureClass::EmptyResponse,
-                    "Empty response".to_string(),
-                    Some(response.usage.input_tokens),
-                    Some(response.usage.output_tokens),
-                    latency,
-                );
+                return empty_response_result("plan_callout_recognition", &response, latency);
             }
 
             // Must reference the specific plan path or plan-on-branch concept
