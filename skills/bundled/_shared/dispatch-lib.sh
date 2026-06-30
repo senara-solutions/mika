@@ -2495,14 +2495,31 @@ ${RESULT}"
         # the title — only the head-commit headline Guard 2 inspects. The
         # dirty-worktree class is already wip()-prefixed by its mika#1282 rescue
         # commit, so it is excluded here (no second empty commit).
+        #
+        # Idempotent (no marker stacking on re-dispatch): skip the commit when HEAD
+        # is already a wip(mika#1383) marker, but still (re-)push so a marker from a
+        # prior attempt whose push failed reaches origin. Push failure is surfaced,
+        # not silently swallowed: `gh pr create` below opens the PR from the ORIGIN
+        # branch, so an unpushed marker means the PR head won't match `^wip\(` and
+        # Guard 2 won't arm. The rescue still proceeds — Guard 1 (RECOVERY_PENDING)
+        # and qa-review Step 1.5 (rescue header) hold the draft regardless — but the
+        # operator/telemetry must see that the Guard-2 belt is missing.
         if [ "$RECOVERY_CLASS" = "commit-pushed-no-pr" ]; then
-            if git -C "$WORKTREE_DIR" commit --allow-empty --no-verify -m "wip(mika#1383): auto-PR-create rescue for ${REPO}#${ISSUE_NUM}
+            _marker_at_head=1
+            if printf '%s' "$(git -C "$WORKTREE_DIR" log -1 --format='%s' 2>/dev/null)" \
+                | grep -qF 'wip(mika#1383): auto-PR-create rescue'; then
+                echo "rescue_marker.skip_commit: head already a wip(mika#1383) marker (branch=$BRANCH)" >&2
+            elif ! git -C "$WORKTREE_DIR" commit --allow-empty --no-verify -m "wip(mika#1383): auto-PR-create rescue for ${REPO}#${ISSUE_NUM}
 
 The pilot committed and pushed but did not reach gh pr create before its turn
 ended. dispatch-lib's mika#1396 rescue opened the draft PR. This empty marker
 commit signals the rescue class so the qa-webhook wip-rescue draft guard fires.
 The pilot's implementation work is in the commit(s) below this one." 2>&9; then
-                git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9 || true
+                _marker_at_head=0
+                echo "rescue_marker.commit_failed: could not create wip(mika#1383) marker (branch=$BRANCH) — Guard 2 not armed; rescue proceeds on Guard 1 + qa-review Step 1.5" >&2
+            fi
+            if [ "$_marker_at_head" = "1" ] && ! git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9; then
+                echo "rescue_marker_push.failed: Guard 2 not armed — wip(mika#1383) marker did not reach origin (branch=$BRANCH); rescue proceeds on Guard 1 + qa-review Step 1.5" >&2
             fi
         fi
 

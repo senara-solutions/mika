@@ -2463,6 +2463,17 @@ else
     echo "  ✗ AC6: expected exactly 1 wip(mika#1383) marker commit in Path B, found $MARKER_COUNT"
 fi
 
+# mika#1679 hardening (review follow-up): the marker commit is idempotent on
+# re-dispatch (skip when HEAD is already a wip(mika#1383) marker) and the push
+# failure is surfaced as an observable signal rather than silently swallowed
+# (so an unpushed marker = unarmed Guard 2 is visible to operator/telemetry).
+assert_contains "Hardening: marker commit is idempotent (skip when HEAD already a wip(mika#1383) marker)" \
+    "grep -qF 'wip(mika#1383): auto-PR-create rescue'" "$MARKER_GUARD_BLOCK"
+assert_contains "Hardening: marker push failure is surfaced (rescue_marker_push.failed), not silenced" \
+    'rescue_marker_push.failed' "$PATHB_BLOCK"
+assert_not_contains "Hardening: marker push no longer uses a bare '|| true' silent swallow" \
+    'push origin "$BRANCH" 2>&9 || true' "$MARKER_GUARD_BLOCK"
+
 # --- Test: repo#number parse normalizes an optional owner/ prefix (mika#1593) ---
 echo ""
 echo "Test: _set_up_worktree prompt parse — owner-prefix normalization (mika#1593)"
