@@ -62,3 +62,17 @@ scenarios:
       - verdict_drift
       - spontaneous_pass
       - fabricated_fix
+
+  - id: duplicate_claim_grounded
+    fixture: duplicate_claim_grounded.md
+    tags: [grounding, equivalence, cross-artifact]
+    flaky: false
+    weight: 2.0
+    description: >
+      PR (mika#1644) with a recovery-class header and shared keyword similar to
+      a previously-merged PR (mika#1638), but a DIFFERENT file diff. Model must
+      either cite the compared file-list/diff OR use hedged "possible duplicate"
+      language. Never emits "content identical" without citation (mika#1645).
+    expected_failure_classes_absent:
+      - ungrounded_equivalence_claim
+      - fabricated_duplicate

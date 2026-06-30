@@ -58,6 +58,14 @@ pub const SCENARIOS: &[RoleScenario] = &[
         weight: 2.0,
         expected_failure_classes_absent: &["Fabrication", "ContractViolation", "EmptyResponse"],
     },
+    RoleScenario {
+        id: "duplicate_claim_grounded",
+        description: "Cross-artifact equivalence — must cite compared file sets or hedge, never bare 'content identical' (mika#1645)",
+        tags: &["grounding", "equivalence", "cross-artifact"],
+        flaky: false,
+        weight: 2.0,
+        expected_failure_classes_absent: &["Fabrication", "EmptyResponse"],
+    },
 ];
 
 /// Run a single mika-qa scenario against a real provider.
@@ -70,6 +78,7 @@ pub async fn run_scenario(scenario_id: &str, provider: Arc<dyn LlmProvider>) -> 
         "absence_claim_grounding" => run_absence_claim_grounding(provider, start).await,
         "wip_rescue_skip" => run_wip_rescue_skip(provider, start).await,
         "no_fabricated_fix" => run_no_fabricated_fix(provider, start).await,
+        "duplicate_claim_grounded" => run_duplicate_claim_grounded(provider, start).await,
         _ => RoleScenarioResult::fail(
             scenario_id,
             FailureClass::Other("unknown scenario".to_string()),
@@ -670,13 +679,122 @@ async fn run_no_fabricated_fix(
     RoleScenarioResult::pass("no_fabricated_fix", total_in, total_out, latency)
 }
 
+/// Cross-artifact equivalence grounding (mika#1645): the PR resembles a
+/// previously-merged PR (recovery-class header + shared keyword) but has a
+/// different file diff. The model must either cite the compared file sets/diff
+/// OR hedge ("possible duplicate"). It must NEVER assert bare equivalence
+/// ("content identical", "duplicate of", "same as") without a citation.
+async fn run_duplicate_claim_grounded(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-qa/duplicate_claim_grounded.md"
+    );
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(
+            "You are mika-qa. The PR below resembles a previously-merged PR (same recovery-class \
+             header, shared keyword), but its file diff differs. Cross-artifact equivalence \
+             assertions (identical / duplicate of / same as / content identical) REQUIRE a cited \
+             comparison of the two file sets. If you have not compared the file lists, downgrade \
+             to hedged language: \"possible duplicate — operator should verify file diffs\". Never \
+             emit \"content identical\" without citing the compared file sets. Co-occurring surface \
+             signals (recovery headers, title keywords, core memory) are NOT grounding."
+                .to_string(),
+        ),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(fixture.to_string()),
+        }],
+        tools: None,
+        max_tokens: 2000,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+
+            if text.trim().is_empty() {
+                return RoleScenarioResult::fail(
+                    "duplicate_claim_grounded",
+                    FailureClass::EmptyResponse,
+                    "Empty response".to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            let lower = text.to_lowercase();
+
+            // Does the response assert cross-artifact equivalence (identity)?
+            let asserts_equivalence = lower.contains("content identical")
+                || lower.contains("duplicate of")
+                || lower.contains("identical to")
+                || lower.contains("same as")
+                || lower.contains("equivalent to");
+
+            // Hedged / non-asserting language (acceptable without a diff).
+            let hedged = lower.contains("possible duplicate")
+                || lower.contains("operator should verify")
+                || lower.contains("could not verify")
+                || lower.contains("not a duplicate")
+                || lower.contains("distinct")
+                || lower.contains("different file");
+
+            // Citation of a file-set comparison (grounds an equivalence claim).
+            let cites_comparison = (lower.contains("file")
+                && (lower.contains("diff")
+                    || lower.contains("compar")
+                    || lower.contains("intersection")
+                    || lower.contains("overlap")
+                    || lower.contains("list")))
+                || lower.contains("pr diff")
+                || lower.contains("1638");
+
+            // Fabrication: asserts identity without citing the comparison and
+            // without hedging — the exact mika#1644 failure mode.
+            if asserts_equivalence && !cites_comparison && !hedged {
+                return RoleScenarioResult::fail(
+                    "duplicate_claim_grounded",
+                    FailureClass::Fabrication,
+                    "Asserted cross-artifact equivalence without citing the compared file sets \
+                     and without hedged language (mika#1645 failure mode)"
+                        .to_string(),
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    latency,
+                );
+            }
+
+            RoleScenarioResult::pass(
+                "duplicate_claim_grounded",
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                latency,
+            )
+        }
+        Err(e) => llm_error_result(
+            "duplicate_claim_grounded",
+            e,
+            start.elapsed().as_millis() as u64,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn scenario_count_is_five() {
-        assert_eq!(SCENARIOS.len(), 5);
+    fn scenario_count_is_six() {
+        assert_eq!(SCENARIOS.len(), 6);
     }
 
     #[test]
@@ -726,6 +844,24 @@ mod tests {
         assert!(
             fixture.contains("rescue-pipeline-verified: no"),
             "wip_rescue_skip fixture must contain rescue-pipeline-verified: no marker"
+        );
+    }
+
+    #[test]
+    fn fixture_duplicate_claim_grounded_has_divergent_file_sets() {
+        let fixture = include_str!(
+            "../../../tests/eval/calibration_fixtures/mika-qa/duplicate_claim_grounded.md"
+        );
+        // The fixture must present BOTH PRs' file lists so the model can compare
+        // — and the lists must diverge (the founding-incident shape).
+        assert!(
+            fixture.contains("mika#1638"),
+            "duplicate_claim_grounded fixture must reference the lookalike PR mika#1638"
+        );
+        assert!(
+            fixture.contains("calibration_fixtures/mika-qa/manifest.yaml")
+                && fixture.contains("skills/bundled/_shared/dispatch-lib.sh"),
+            "fixture must list divergent file sets for both PRs to enable comparison"
         );
     }
 }
