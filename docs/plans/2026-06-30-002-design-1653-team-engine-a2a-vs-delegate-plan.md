@@ -155,6 +155,7 @@ Update `crates/mika-agent/CLAUDE.md` (Team Engine / Management Tools sections) t
 
 - ADR records the Shape-A verdict with Shape-B/C rejection rationale (AC1, AC2).
 - Team-mode orchestrator can no longer call `a2a_call` to reach a member (Layer 2 structural suppression), and the prompt names the decompose mechanism as the exclusive path (Layer 1) (AC2).
+- **Unit test asserts `a2a_call` is not present in the tool definitions returned to the team orchestrator LLM** (registry-level assertion against the team tool registry built in `init_resources()`, or the presentation-level array per the Layer 2 mechanism pinned by the implementer). This hard assertion defines the structural boundary so a future change to `default_tools()` or `init_resources()` cannot silently re-introduce the affordance (F1; Step 3 / Step 5 coverage).
 - `a2a_call` self-describes as remote-only and redirects local targets to `delegate_task` (AC2 — "what `a2a_call` does when targeted at a local agent": error-with-hint).
 - No team manifest schema change; existing manifests work unchanged (AC4).
 - Design note in ADR + PR body documents composability with mika#1652 (AC3).
@@ -181,3 +182,7 @@ How this plan satisfies them:
 - **Team-run completing without delegation** (run #1 solo behavior) — ticket observation D; resurfaces only if n=2.
 - **Why `add_team_member` shifted the dispatch** — resolves from Shape A: with the structural decompose path enforced and `a2a_call` removed, roster size no longer steers the orchestrator toward a URL-based reach tool.
 - **Cross-container team members** — teams hold only local agents today; a future remote-member feature would revisit Shape C on its own merits (and is not blocked by this design).
+
+## Revision history
+
+- rev 2 (2026-06-30): addressed F1 by adding an explicit Definition-of-Done line requiring a unit test that asserts `a2a_call` is absent from the tool definitions returned to the team orchestrator LLM (registry- or presentation-level per the pinned Layer 2 mechanism), making the structural boundary a hard, regression-gated assertion rather than only narrative coverage in Step 3/Step 5; citation preserved to review-guide.md § Orthogonality. F2 (missing `## Acceptance criteria` header) was already satisfied in the rev-1 content — the plan carries a standalone top-level `## Acceptance criteria` section transcribing AC1–AC4 verbatim from mika#1653 with the "How this plan satisfies them" mapping beneath it; no structural change required.

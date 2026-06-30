@@ -118,6 +118,23 @@ pub fn build_orchestrator_context(
          - \"task\": a clear, specific description of what to do\n\
          - \"output_file\": the workspace filename where results should be written\n\
          \n\
+         ## How to reach team members\n\
+         Team members are reached **only** by including them in the JSON \
+         task-assignment array above. The team engine spawns each assigned \
+         member's session automatically and returns their results to you on the \
+         next turn — you do not call any tool to invoke a member.\n\
+         \n\
+         Do **NOT** use the `a2a_call` tool to reach a team member. `a2a_call` \
+         is for external, cross-container agents addressed by a URL; your team \
+         members are local siblings addressed by name. Calling `a2a_call` for a \
+         team member will fail (it routes to per-customer containers that do not \
+         exist for local agents). To reach a team member, assign them a task in \
+         the JSON array — nothing else.\n\
+         \n\
+         Members do not call each other directly. They communicate results \
+         through workspace files: a member writes its deliverable with \
+         `write_workspace`, and downstream members read it with `read_workspace`.\n\
+         \n\
          Use `list_workspace` to check the current workspace state before planning.\n\
          \n\
          Respond ONLY with compact (single-line) JSON, not pretty-printed. Examples:\n\
@@ -397,6 +414,39 @@ mod tests {
         // Existing response format must still be present
         assert!(ctx.contains("Respond with a JSON array"));
         assert!(ctx.contains("Respond ONLY with compact"));
+    }
+
+    #[test]
+    fn test_orchestrator_context_reach_mechanism_guidance() {
+        // mika#1653 Layer 1: the prompt must name the decompose-JSON assignment
+        // as the exclusive way to reach a member, and explicitly forbid using
+        // `a2a_call` for team members.
+        let def = test_def();
+        let ctx = build_orchestrator_context(&def, "", None, &[], None);
+
+        // The engine spawns assigned members automatically — the model must be
+        // told this so it doesn't reach for a per-member invocation tool.
+        let lower = ctx.to_lowercase();
+        assert!(
+            lower.contains("spawns") && lower.contains("automatically"),
+            "prompt must explain the engine spawns assigned members automatically"
+        );
+
+        // `a2a_call` must be explicitly named and forbidden for team members.
+        assert!(
+            ctx.contains("a2a_call"),
+            "prompt must name a2a_call so the orchestrator knows not to use it for members"
+        );
+        assert!(
+            lower.contains("do") && lower.contains("not") && lower.contains("a2a_call"),
+            "prompt must forbid using a2a_call to reach a team member"
+        );
+
+        // Members exchange results via workspace files, not direct calls.
+        assert!(
+            ctx.contains("write_workspace") && ctx.contains("read_workspace"),
+            "prompt must point members to workspace files for result exchange"
+        );
     }
 
     #[test]
