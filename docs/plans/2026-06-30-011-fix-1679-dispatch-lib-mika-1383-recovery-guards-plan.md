@@ -6,157 +6,119 @@ date: 2026-06-30
 
 # Plan — fix(dispatch-lib): mika#1383 auto-PR-create path bypasses mika#1613 recovery-pending guards (mika#1679)
 
+> **rev 2 (2026-07-01) — design overturned to Resolution 2 (defer-to-Path-B).** The original rev-1 plan added four coordinated edits to the mika#1383 auto-PR-create block ("Path A") to make it emit `--draft` + `RECOVERY_PENDING` + a `wip()` marker commit + a rescue-body header. Implementation-time confidence check revealed that a second, **already-correct** rescue path ("Path B", mika#1396 `commit-pushed-no-pr`) exists and is **shadowed** by Path A. mika-arch ESCALATED (session `2d397bee`); Mika Prime ruled R2 on bearing grounds (single-source-of-truth on a churning safety contract). See **Revision history** at the bottom for the full lineage. The rev-1 four-edit shape is preserved in Revision history for traceability.
+
 ## Problem
 
 mika#1613's fix (PR #1677, merged + deployed 2026-06-30 13:48Z) added two qa-webhook guards in `skills/bundled/self-dev-webhook-qa/system_prompt.md` AND qa-review's Step 1.5 rescue-class detection in `skills/bundled/qa-review/system_prompt.md`:
 - **Guard 1** — checks `unpushed_recovery_pending: true` task metadata flag (set when callback parses `RECOVERY_PENDING: true` from RESULT).
-- **Guard 2** — `isDraft AND ^wip\(` conjunction check.
+- **Guard 2** — `isDraft AND ^wip\(` conjunction check (defense-in-depth; parses `gh pr view --json commits --jq '.commits[-1].messageHeadline'`).
 - **qa-review Step 1.5** — looks for `## Auto-rescued PR (dispatch-lib recovery, class: ...)` header in PR body to classify as rescue and emit `hold[review]`.
 
-**All three layers bypass for mika#1383's auto-PR-create path:**
+**The observable bug:** the mika#1383 auto-PR-create path opens a **non-draft** PR with a plain body and no marker, so all three layers bypass and the rescue PR is eligible for autonomous un-draft + auto-merge without operator review. Hard evidence: mika#PR1678 (mika#1645 impl, opened 2026-06-30 14:05Z post-deploy, `isDraft: false`, no marker) and mika#PR1683 (mika-qa auto-approved at 15:54:35Z because the body lacked the rescue header).
 
-1. **mika#1383 doesn't emit `RECOVERY_PENDING: true` marker.** The marker is only emitted in the mika#1282 dirty-worktree rescue block at `skills/bundled/_shared/dispatch-lib.sh:2524-2526`. The mika#1383 auto-PR-create tail at `dispatch-lib.sh:1067` only appends a descriptive `dispatch-lib (mika#1383): auto-created PR ...` line, no marker. → Guard 1 doesn't fire.
+**What the rev-1 diagnosis missed — the shadowing (rev-2 discovery, hard evidence @ `dispatch-lib.sh` HEAD `ad001aaf`):** there are now **two** PR-creation paths in dispatch-lib with the *same* trigger condition, and the first shadows the second:
 
-2. **mika#1383 opens PRs as non-draft.** The `gh pr create` invocation at `dispatch-lib.sh:1054-1059` lacks `--draft`. → `isDraft = false` → Guard 2's conjunction (`isDraft = true AND ^wip\(`) fails. PR opens normal, eligible for auto-merge.
+- **Path A** — the mika#1383 "structural completion gate", `skills/bundled/_shared/dispatch-lib.sh:1023-1114`, inside `_post_flight_recovery()` (def@757). Guard at 1040: `SKILL=dev-pilot && POST_RUN_HEAD set && PRE_RUN_HEAD != POST_RUN_HEAD && WORKTREE_DIR && BRANCH`. It opens a **non-draft** PR (1091-1101), then at 1198-1204 re-queries and **sets the global `PR_URL`** (documented global at 766-768, no `local`) and emits a `PR:` line.
 
-3. **mika#1383 doesn't write `## Auto-rescued PR` header in PR body.** The body it writes is `"Auto-created by dispatch-lib (mika#1383 structural completion gate)..."` — no rescue header. → qa-review Step 1.5 short-circuits with "this is not a rescue PR — skip to Step 2 normally" → proceeds to standard review → approves. **Hard evidence: mika#PR1683 mika-qa approval at 2026-06-30 15:54:35Z despite draft + wip-rescue label** (manual draft conversion held the merge gate; otherwise this would have auto-merged). Filed as mika#1684; absorbed here as Edit 4 per Mika Prime bearing 2026-06-30 ~16:02Z (architect-coherent producer-side fix in one PR).
+- **Path B** — the mika#1396 `commit-pushed-no-pr` rescue, `dispatch-lib.sh:2488-2567`, inside `dispatch_claude_pilot()` (def@2312), runs after `_run_claude_pilot` (2421) → `_push_branch` (2486). Guard at 2502: `[ -z "$PR_URL" ] && PRE_RUN_HEAD set && POST_RUN_HEAD set && PRE != POST && SKILL=dev-pilot`. This path **already** does everything rev-1 wanted to add to Path A: `--draft` (2523), the `## Auto-rescued PR (dispatch-lib recovery, class: commit-pushed-no-pr)` header + `<!-- rescue-pipeline-verified: no -->` marker (2526-2528), `RECOVERY_PENDING: true` (2558), the `wip-rescue` label (2547), the canonical `PR:` line (2557), and a purpose-built title via `_derive_recovery_pr_title("commit-pushed-no-pr", …)` (2207-2214).
 
-**Hard evidence:** mika#PR1678 (mika#1645 implementation, opened 2026-06-30 14:05Z post-mika#1613-deploy). The commit message `wip(mika#1645): impl staged by post-flight recovery (mika#1282)` confirms a rescue fired, but `isDraft: false` indicates the PR was opened by the mika#1383 path (not mika#1282 which sets `--draft`). Neither Guard 1 nor Guard 2 fired — the auto-merge vulnerability remains.
+Because Path A runs first and sets the global `PR_URL`, Path B's `[ -z "$PR_URL" ]` guard is false → **Path B never fires for the commit-pushed-no-pr case**. Path B's `commit-pushed-no-pr` branch is effectively dead code (it survives only as a fallback when Path A's own `gh pr create` errors). The rev-1 four-edit plan would have made Path A *duplicate* Path B's correct behavior — two implementations of one safety contract that must stay in sync forever, on a contract that demonstrably churned four times this week (draft, marker, header, label).
 
 ## Architectural lineage
 
-- mika#1613 (CLOSED via PR #1677) — parent fix, incomplete. The fix shape was structurally correct for the mika#1282 path; this fix completes coverage for mika#1383.
-- mika#1282 — original dirty-worktree rescue (where the marker + `--draft` convention started).
-- mika#1383 — auto-PR-create structural-completion gate (where the marker + `--draft` were never added).
-- mika#1352 — canonical `PR:` line convention (the precedent for line-shape standardization in dispatch-lib RESULT).
+- mika#1613 (CLOSED via PR #1677) — parent fix, incomplete. Structurally correct for the mika#1282 path; never covered the mika#1383 path.
+- mika#1282 — original dirty-worktree rescue (where the marker + `--draft` + rescue-body convention started). Flows through Path B's `dirty-worktree` class.
+- mika#1396 — `commit-pushed-no-pr` rescue (Path B). **This is the already-correct handler the rev-1 plan did not reference and Path A shadows.**
+- mika#1383 — auto-PR-create structural-completion gate (Path A). Predates / duplicates mika#1396's coverage and pre-empts it via the global `PR_URL`.
+- mika#1618 — qa-review Step 1.5 rescue-class detection (the body-header consumer).
+- mika#1352 — canonical `PR:` line convention.
 
-## Fix shape
+## Fix shape (Resolution 2 — defer to Path B)
 
-Three coordinated edits to a single file (`skills/bundled/_shared/dispatch-lib.sh`), architect-F1-narrowed:
+**Single structural edit + one defense-in-depth decision, both in `skills/bundled/_shared/dispatch-lib.sh`.** The principle (Mika Prime bearing): a churning safety contract gets a single source of truth. Path B already owns the correct `commit-pushed-no-pr` rescue-PR shape; the fix is to stop Path A from shadowing it, not to duplicate it.
 
-### Edit 1 — emit `RECOVERY_PENDING: true` marker in mika#1383 path
+### Edit 1 (core) — delete Path A's Phase-B PR-creation; let Path B own it
 
-After `dispatch-lib.sh:1067` (the line appending `dispatch-lib (mika#1383): auto-created PR ${EXISTING_PR} ...` to RESULT), also append `RECOVERY_PENDING: true` to RESULT — mirroring the mika#1282 path's structure at lines 2524-2526.
+Remove the **Phase B** block of the mika#1383 gate — the PR-existence check + `gh pr create` + result append (`dispatch-lib.sh:1064-1113`, the `EXISTING_PR=""` discovery through the end of the `if [ -z "$EXISTING_PR" ]` block, inclusive of its failure branch). **Keep Path A's Phase A** (trailing-dirty-content rescue, 1044-1062) untouched — it commits trailing dirty content with a `wip()` prefix and advances `POST_RUN_HEAD` so Path B sees the latest commits; it is complementary to Path B, not duplicate.
 
-Operator-review semantics: a mika#1383 auto-PR-create means the pilot session committed and pushed but ran out of turns before invoking `gh pr create`. dispatch-lib opened the PR on its behalf — same "operator must review the salvaged work before merge" contract as mika#1282's dirty-worktree rescue. The marker carries the operator-review requirement structurally.
+After Edit 1, the mika#1383 trigger flows: `_post_flight_recovery` runs Phase A only → does **not** set `PR_URL` (the 1198-1204 re-query returns empty when no PR exists on the branch) → control returns to `dispatch_claude_pilot` → Path B's guard sees `[ -z "$PR_URL" ]` true → Path B fires and opens the correct draft rescue PR.
 
-### Edit 2 — open mika#1383 PRs as draft
+The Phase-A wip-prefix update of `POST_RUN_HEAD` keeps Path B's `PRE != POST` guard satisfied. The "PR already exists" case stays safe: if a PR exists, the 1200 re-query sets `PR_URL` → Path B's `[ -z "$PR_URL" ]` is false → Path B no-ops → no double-create.
 
-Add `--draft` flag to the `gh pr create` invocation at `dispatch-lib.sh:1054-1059`. Mirrors mika#1282's convention. Operator un-drafts when ready to merge.
+**Reachability proof (Mika Prime's required pre-condition — "A shadows B" ≈ but ≠ "B runs when A is gone"):** verified at HEAD `ad001aaf`. Between `_post_flight_recovery` (called inside `_run_claude_pilot` @741) and Path B's guard (@2502), the only early-return is `_check_pilot_force_push` (@2427). That function returns 0 unconditionally for dev-pilot (`dispatch-lib.sh:1265` — `[ "$SKILL" = "dev-groom" ] || return 0`), so it never short-circuits the dev-pilot path. The dev-groom block (2450-2484) is skipped for `SKILL=dev-pilot`. `_push_branch` (2486) does not touch `PR_URL`. Therefore, with Path A's PR-creation removed, Path B is reachable and fires for the mika#1383 trigger with `PR_URL` empty. **No fail-silent-no-PR risk for dev-pilot.**
 
-### Edit 3 (architect F1 BLOCKING) — ensure head commit matches Guard 2's `^wip\(` regex
+### Edit 2 (defense-in-depth — architect's call on second-pass) — preserve Guard 2 coverage for commit-pushed-no-pr
 
-Guard 2's defense-in-depth check parses `gh pr view --json commits --jq '.commits[-1].messageHeadline'` and matches against the anchored regex `^wip\(`. The mika#1383 path uses the pilot's existing commits as-is — whose head-commit headline is whatever the pilot wrote (typically a conventional-commit title like `fix(...)` or `feat(...)`, NOT `wip(...)`). Without Edit 3, Guard 2's conjunction (`isDraft AND ^wip\(`) still fails even after Edits 1+2 land — half the regression net is wasted.
+Guard 2 (`isDraft AND ^wip\(`) parses the PR's **head-commit headline**. Path B opens the PR from the pilot's existing commits — whose head-commit headline is the pilot's own conventional-commit subject (`fix(...)`, `feat(...)`), **not** `wip(`. So under R2, the `commit-pushed-no-pr` rescue fires **Guard 1** (`RECOVERY_PENDING` → metadata flag) and **qa-review Step 1.5** (rescue-body header) but **not** Guard 2. This is unchanged from Path B's pre-existing behavior — Guard 2 only ever fired for the `dirty-worktree` class, where the mika#1282 rescue commit *is* `wip()`-prefixed.
 
-**Mechanism:** before `gh pr create` (after the branch already has the pilot's commits + push), add an **empty marker commit** on top:
-
-```bash
-git -C "$WORKTREE_DIR" commit --allow-empty -m "wip(mika#1383): auto-PR-create rescue for ${REPO}#${ISSUE_NUM}
-
-The pilot session committed and pushed but did not reach gh pr create
-before its turn ended. dispatch-lib took ownership of the PR creation
-per mika#1271 (content/workflow split). This marker commit signals the
-rescue class so Guard 2's wip-rescue draft signature fires correctly.
-
-The pilot's actual implementation work is in the commit(s) below this one."
-```
-
-Then `git push` the marker commit + invoke `gh pr create --draft ...`. The `commits[-1].messageHeadline` will be `wip(mika#1383): auto-PR-create rescue for ...` — Guard 2's `^wip\(` regex matches.
-
-**Why a marker commit, not `git commit --amend`:** amending a pushed commit rewrites history and requires `--force-with-lease`. The marker commit is purely additive — no force-push, no history rewrite, preserves the pilot's commit shape. The cost is one extra commit in the PR's history — explicitly justified by the marker message.
-
-**Position relative to Edits 1+2:** Edit 3 happens between the existing `git push` (pilot's commits already pushed) and the `gh pr create` call — a new `git push` is needed for the marker commit. Implementation outline §2-3 carries the sequencing.
-
-### Edit 4 (absorbed from mika#1684, Prime-ratified 2026-06-30 ~16:02Z) — emit rescue PR body header
-
-The mika#1383 path's current PR body (`Auto-created by dispatch-lib (mika#1383 structural completion gate)...`) does NOT contain the `## Auto-rescued PR (dispatch-lib recovery, class: ...)` header that qa-review's Step 1.5 keys on. As a result, qa-review classifies the PR as non-rescue → proceeds to standard review → approves (witnessed live on mika#PR1683 at 15:54:35Z).
-
-**Mechanism:** replace the mika#1383 path's PR body construction (around `dispatch-lib.sh:1045-1075`) with the same structured rescue-body shape used by the mika#1282/mika#1396 rescue path at lines 2491-2508. The body must contain:
-
-```markdown
-## Auto-rescued PR (dispatch-lib recovery, class: commit-pushed-no-pr)
-
-<!-- rescue-pipeline-verified: no -->
-
-This PR was created by dispatch-lib's git-workflow recovery. The pilot session
-committed and pushed but did not reach `gh pr create` before its turn ended.
-dispatch-lib opened this PR from the existing branch.
-
-**Auto-rescued PR.** Operator: verify pipeline completion, then either un-draft
-this PR or set the marker above to `yes`.
-
-### Recovery metadata
-- Recovery class: `commit-pushed-no-pr`
-- Pilot session: `${SESSION_ID:-unknown}`
-- Turns: ${TURNS:-unknown}
-- Cost: $${COST:-unknown}
-
-Closes #${ISSUE_NUM}
-```
-
-This makes qa-review's Step 1.5 correctly detect the rescue header, evaluate `<!-- rescue-pipeline-verified: no -->`, see the PR is still draft (after Edit 2's `--draft` flag fix), and emit `hold[review]` per Step 1.5 §4's "Not verified" branch. **Operator must manually verify before un-drafting + merging.**
-
-**Composition with Edits 1-3:** producer-side coherent fix — Edits 1 (marker), 2 (`--draft`), 3 (wip commit), 4 (body header) all together make the mika#1383 path's PR-open shape match the downstream consumer contracts (Guard 1 + Guard 2 + qa-review Step 1.5). Shipping any subset leaves a half-closed contract that's arguably worse than the current clean-bypass (e.g., a rescue-header body on a non-draft PR misleads).
+The rev-1 plan added a `wip()` marker commit (its "Edit 3") specifically to make Guard 2 fire. **Recommended sub-option:** relocate that single defense-in-depth commit into **Path B's `commit-pushed-no-pr` branch** (an empty `git commit --allow-empty -m "wip(mika#1383): auto-PR-create rescue for ${REPO}#${ISSUE_NUM}…"` + `git push` immediately before Path B's `gh pr create`, guarded to the `commit-pushed-no-pr` class only). This restores all three guard layers on the single-source-of-truth path, matching rev-1's defense-in-depth intent without re-introducing duplication. **Architect decides on second-pass:** (a) include Edit 2 (all three guards fire, +1 empty commit in rescue PR history), or (b) omit it and rely on Guard 1 + Step 1.5 (two independent guards; Guard 2 stays dirty-worktree-only as today). Recommendation: **(a)** — the contract churned four times this week; belt-and-suspenders on a safety path is cheap.
 
 ## Implementation outline
 
-1. **Locate the mika#1383 tail block** (`dispatch-lib.sh` around lines 1045-1080). Identify the exact `gh pr create` call and the line that appends `dispatch-lib (mika#1383): auto-created PR ...` to RESULT.
+1. **Locate Path A's Phase B** in `dispatch-lib.sh` (the `EXISTING_PR=""` discovery at ~1064 through the close of the `if [ -z "$EXISTING_PR" ]` block at ~1113, including the `gh pr create` and both success/failure RESULT appends). Confirm the boundary: Phase A (trailing-dirty rescue, 1044-1062) ends just before `EXISTING_PR=""`; the function continues at the `# Post-flight plan validation` block (~1117) after the deleted region.
 
-2. **Apply Edit 3 (marker commit) BEFORE `gh pr create`:** insert a `git commit --allow-empty -m "wip(mika#1383): auto-PR-create rescue for ${REPO}#${ISSUE_NUM}\n\n..."` step, followed by `git push origin "$BRANCH"`. Verify the push succeeds before proceeding to `gh pr create`. Fail-loud on push failure (the marker commit must reach origin for Guard 2 to see it).
+2. **Delete Phase B.** Remove the PR-existence check, the `gh pr create` invocation, and the result-append lines. Leave the surrounding `if [ "$SKILL" = "dev-pilot" ] && … ]; then` structure and Phase A intact. If removing Phase B leaves the outer `if` containing only Phase A, keep the `if` (Phase A still needs its guard).
 
-3. **Apply Edit 2 (add `--draft`):** modify the `gh pr create` invocation to include `--draft` flag. Position: alongside `--repo`, `--base`, `--head`, `--title`, `--body` — alphabetical or grouped, no preference.
+3. **(Edit 2, if architect approves)** Add the `commit-pushed-no-pr`-scoped empty `wip()` marker commit + push to Path B, immediately before the `gh pr create` at 2519, inside the `if [ "$RECOVERY_CLASS" = "commit-pushed-no-pr" ]`-equivalent branch (guard so the `dirty-worktree` class — which is already `wip()`-prefixed — does not get a second empty commit).
 
-4. **Apply Edit 1 (emit marker):** after the `RESULT="${RESULT}` append block at line 1067, append a second line setting `RECOVERY_PENDING: true`. Use the same multi-line heredoc-style append shape that mika#1282 uses at lines 2524-2526 for visual consistency.
+4. **Verify Path B's `dirty-worktree` regression** — read 2499-2567 to confirm the `dirty-worktree` class still emits its header, `--draft`, `RECOVERY_PENDING: true`, `wip-rescue` label, and `PR:` line. Edit 1 must not touch this block.
 
-5. **Apply Edit 4 (rescue body header):** replace the mika#1383 path's PR body string with the heredoc-shaped rescue body per §Fix shape Edit 4. Set `RECOVERY_CLASS="commit-pushed-no-pr"` in the body literal (this path's class). Verify body contains both the `## Auto-rescued PR (dispatch-lib recovery, class: commit-pushed-no-pr)` header AND the `<!-- rescue-pipeline-verified: no -->` HTML comment marker.
-
-6. **Verify mika#1282 path still works:** read lines 2491-2540 to confirm the existing block still emits `## Auto-rescued PR (dispatch-lib recovery, class: dirty-worktree)` header, `<!-- rescue-pipeline-verified: no -->` marker, `--draft`, `PR:`, `Draft PR (dispatch-lib recovery):`, and `RECOVERY_PENDING: true` — no regression. (AC3 + AC6 cover this.)
-
-7. **Test surface** — add a dispatch-lib integration test (or extend an existing one in `skills/bundled/_shared/tests/` if the harness exists) that covers both rescue paths. Verify (a) both paths emit `RECOVERY_PENDING: true`, (b) both PRs open as draft, (c) the mika#1383 path's head commit headline matches `^wip\(`, (d) both PR bodies contain the `## Auto-rescued PR (dispatch-lib recovery, class: <class>)` header AND `<!-- rescue-pipeline-verified: no -->` marker (Edit 4 / AC6). Implementer first task: grep `skills/bundled/_shared/` for existing test scaffolding.
+5. **Test surface** — extend `skills/bundled/_shared/test-dispatch-lib.sh` (Test 15 already covers the mika#1383 gate) and/or `_shared/tests/`. Assert: (a) the mika#1383 commit-pushed-no-pr trigger no longer creates a non-draft PR from Path A (the `gh pr create` string is gone from the Path A block), (b) the trigger routes to Path B (the rescue body header + `RECOVERY_PENDING: true` + `--draft` are the only PR-create path for this trigger), (c) the `dirty-worktree` class is unchanged. Implementer first task: grep the gate block + Test 15 to anchor the assertions.
 
 ## Acceptance criteria
 
-- **AC1** — `skills/bundled/_shared/dispatch-lib.sh:~1067` mika#1383 auto-PR-create tail emits `RECOVERY_PENDING: true` to RESULT after the descriptive `dispatch-lib (mika#1383): auto-created PR ...` line. Marker on its own line, no leading whitespace (mirror mika#1282's emission).
+- **AC1** — Path A's Phase-B PR-creation is removed from the mika#1383 gate in `dispatch-lib.sh`: no `gh pr create` invocation remains inside `_post_flight_recovery()`. Verified by reading the PR diff (the `EXISTING_PR` discovery + `gh pr create` block at the old ~1064-1113 is deleted).
 
-- **AC2** — `skills/bundled/_shared/dispatch-lib.sh:~1054` mika#1383 `gh pr create` invocation includes `--draft` flag. PR opens as draft (`isDraft: true` per `gh pr view --json isDraft`).
+- **AC2** — Path A's **Phase A** (trailing-dirty-content rescue, old 1044-1062) is **retained** unchanged — it still commits trailing dirty content with `wip()` and advances `POST_RUN_HEAD`. Verified by reading the PR diff (Phase A block untouched).
 
-- **AC3** — Regression check: mika#1282 dirty-worktree rescue path (lines 2510-2540) continues to emit `RECOVERY_PENDING: true` AND open PRs as draft. Verified by reading the block in PR diff — no inadvertent edits.
+- **AC3** — For the `commit-pushed-no-pr` trigger (pilot committed + pushed, no PR, `SKILL=dev-pilot`), the resulting rescue PR is produced by **Path B** and: (a) opens as **draft** (`gh pr view --json isDraft` → `true`), (b) RESULT contains `RECOVERY_PENDING: true`, (c) PR body contains both `## Auto-rescued PR (dispatch-lib recovery, class: commit-pushed-no-pr)` and `<!-- rescue-pipeline-verified: no -->`, (d) the PR carries the `wip-rescue` label, (e) RESULT contains a canonical `PR:` line. Validated by the test harness and/or live evidence in the PR body.
 
-- **AC4** — Integration test covers both paths producing all three Guard signals: (a) RESULT contains `RECOVERY_PENDING: true`, (b) PR opens as draft (`isDraft: true`), (c) head commit headline matches `^wip\(` regex. Test placement: dispatch-lib's existing test harness if any (e.g., `skills/bundled/_shared/tests/test-dispatch-lib.sh`), or a new test if the harness doesn't yet cover rescue scenarios. PR body must include test invocation + pass output. If no harness exists, AC4 is reduced to documented manual verification in PR body — implementer surfaces this in the PR description (architect F3 ratified path).
+- **AC4 (reachability)** — Evidence in the PR body (test or trace) that with Path A's PR-creation removed, Path B's `[ -z "$PR_URL" ]` guard fires for the mika#1383 trigger — i.e. the trigger produces exactly **one** rescue PR (no fail-silent-no-PR, no double-create). The reachability proof in §Fix shape Edit 1 is transcribed or cited in the PR description.
 
-- **AC5 (architect F1)** — Edit 3 marker commit verification: after a mika#1383 rescue runs end-to-end, `gh pr view <N> --json commits --jq '.commits[-1].messageHeadline'` returns a string starting with `wip(mika#1383):`. Test or live-run evidence in PR body.
+- **AC5 (regression)** — The mika#1282 `dirty-worktree` rescue class (Path B, `RESCUED_DIRTY_WORKTREE=1`) is unchanged: still emits the rescue header, `--draft`, `RECOVERY_PENDING: true`, `wip-rescue` label, and `PR:` line. Verified by reading the Path B block in the PR diff — no inadvertent edits.
 
-- **AC6 (Prime refinement, absorbed from mika#1684)** — Edit 4 PR body header verification: after a mika#1383 rescue runs end-to-end, `gh pr view <N> --json body` returns a body that contains BOTH the literal string `## Auto-rescued PR (dispatch-lib recovery, class: commit-pushed-no-pr)` AND the HTML comment `<!-- rescue-pipeline-verified: no -->`. qa-review's Step 1.5 detects the header and short-circuits to `hold[review]` rather than approving. Validate by replaying a synthetic webhook against qa-review's prompt logic OR by capturing live evidence in the next mika#1383-path PR's qa verdict. mika#1684 closes as subsumed when this AC passes.
+- **AC6 (Guard 2 — conditional on Edit 2)** — *If the architect approves Edit 2:* after a `commit-pushed-no-pr` rescue, `gh pr view <N> --json commits --jq '.commits[-1].messageHeadline'` returns a string starting with `wip(mika#1383):`, so Guard 2's `isDraft AND ^wip\(` conjunction fires. *If the architect omits Edit 2:* this AC is dropped and the PR description documents that Guard 1 + qa-review Step 1.5 are the two active guards for this class (Guard 2 remains dirty-worktree-only, unchanged from current behavior).
+
+- **AC7 (integration test)** — `test-dispatch-lib.sh` (or `_shared/tests/`) covers: (a) the mika#1383 commit-pushed-no-pr trigger no longer creates a PR from Path A, (b) it routes to Path B producing draft + marker + header + label + `PR:` line, (c) the `dirty-worktree` class still works. PR body includes the test invocation + pass output. If the harness can't drive a full rescue end-to-end, AC7 reduces to documented manual/trace verification in the PR body (architect-ratified path, as in rev-1 AC4).
 
 ## Out of scope
 
-- **Engine-side guard for non-marker, non-draft PRs.** Would require qa-webhook architectural redesign (the guard contract is currently anchored to BOTH metadata flag + PR-shape signals; broader catch-all "any PR with `wip(` title regardless of draft state" would change the contract semantics). File a separate ticket if mika#1679's coverage proves insufficient post-deploy.
-- **Migration of existing non-draft wip-rescue PRs.** PR #1678 + any in-flight non-draft rescues from before this fix lands remain operator-managed. Fix prevents future occurrences.
-- **Unifying mika#1282 + mika#1383 rescue blocks into a shared helper.** The blocks already share structural shape; refactor only if further drift surfaces.
+- **Engine-side guard for non-marker, non-draft PRs.** Would require qa-webhook architectural redesign. File a separate ticket if R2's coverage proves insufficient post-deploy.
+- **Migration of existing non-draft wip-rescue PRs.** PR #1678 + any in-flight non-draft rescues from before this fix remain operator-managed. Fix prevents future occurrences.
+- **Broader unification of the mika#1282/mika#1396/mika#1383 rescue surface beyond removing the Path A shadow.** R2 removes the one shadowing duplication; any further consolidation (e.g., folding Phase A into Path B) is a separate refactor, filed only if more drift surfaces.
 
 ## Files involved
 
-- `skills/bundled/_shared/dispatch-lib.sh` — Edit 1 (~line 1067) + Edit 2 (~line 1054) + Edit 3 (marker commit + push, between push and `gh pr create`) + Edit 4 (rescue body header in the PR body, ~line 1045-1075)
-- `skills/bundled/_shared/tests/test-dispatch-lib.sh` (if exists) — AC4 + AC6 integration test
+- `skills/bundled/_shared/dispatch-lib.sh` — Edit 1 (delete Path A Phase B, ~1064-1113) + Edit 2 if approved (wip-marker commit in Path B's `commit-pushed-no-pr` branch, ~2519)
+- `skills/bundled/_shared/test-dispatch-lib.sh` and/or `skills/bundled/_shared/tests/` — AC7 integration test (extend Test 15)
 - No Rust/source-code changes; no schema migration; no engine guard changes
 
 ## Verification
 
-- **Static:** read PR diff. Edit 2 visible at `gh pr create` call (the `--draft` flag added). Edit 1 visible at the mika#1383 tail RESULT append (the marker line added). mika#1282 block untouched.
-- **Synthetic test (AC4):** invoke the dispatch-lib test harness with a mock pilot session that (a) commits + pushes but doesn't `gh pr create` (mika#1383 trigger), and (b) leaves dirty worktree (mika#1282 trigger). Verify both produce `RECOVERY_PENDING: true` in callback RESULT AND open draft PRs.
-- **Live verification post-merge:** the next pilot session that hits either rescue path opens a draft PR with the marker. Confirm `gh pr view <N> --json isDraft` returns `true` AND `tasks.metadata` carries `unpushed_recovery_pending: true` via SQL: `SELECT json_extract(metadata, '$.unpushed_recovery_pending') FROM tasks WHERE id = <task>`.
+- **Static:** read the PR diff. Path A's `gh pr create` block is gone; Phase A retained; Path B's `dirty-worktree` block untouched; (if Edit 2) the `commit-pushed-no-pr` wip-marker commit added under its class guard.
+- **Synthetic test (AC7):** drive the mika#1383 trigger (pilot commits + pushes, no PR) against the harness; assert the PR is created by Path B as draft with the rescue header + `RECOVERY_PENDING: true`, and the `dirty-worktree` path still works.
+- **Live verification post-merge:** the next pilot session that hits the commit-pushed-no-pr path opens a single draft PR with the rescue header + marker; `gh pr view <N> --json isDraft` → `true`; `SELECT json_extract(metadata, '$.unpushed_recovery_pending') FROM tasks WHERE id = <task>` → `true`.
 
 ## References
 
 - mika#1613 (CLOSED) — parent fix (PR #1677, merged 13:48Z)
-- mika#1282 — original dirty-worktree rescue, source of the marker + `--draft` + rescue-body convention
-- mika#1383 — auto-PR-create structural completion (where these gaps originated)
-- mika#PR1678 (MERGED) — bypassed case (mika#1645 impl, opened non-draft via mika#1383 path 14:05Z post-deploy)
-- mika#PR1683 — layer-3 bypass evidence: mika-qa auto-approved at 15:54:35Z because the mika#1383 PR body lacked the `## Auto-rescued PR` rescue header (motivates Edit 4)
-- mika#1684 (filed 16:00Z, absorbed here as Edit 4 per Mika Prime bearing ~16:02Z — close as subsumed when this lands)
-- mika#1618 — qa-review Step 1.5 rescue-class detection (the consumer Edit 4 feeds)
+- mika#1282 — original dirty-worktree rescue (Path B `dirty-worktree` class)
+- mika#1396 — `commit-pushed-no-pr` rescue (Path B) — the already-correct handler Path A shadowed
+- mika#1383 — auto-PR-create structural completion gate (Path A) — the shadowing block
+- mika#PR1678 (MERGED) — bypassed case (non-draft via Path A 14:05Z post-deploy)
+- mika#PR1683 — layer-3 bypass evidence (mika-qa auto-approved 15:54:35Z, no rescue header)
+- mika#1684 — Edit-4-source in rev-1 (rescue body header); subsumed: Path B already emits the header, so #1684's concern is resolved by routing to Path B. Close as subsumed when this lands.
+- mika#1618 — qa-review Step 1.5 rescue-class detection
 - `skills/bundled/self-dev-webhook-qa/system_prompt.md` — Guard 1 + Guard 2 source
-- `skills/bundled/qa-review/system_prompt.md:113-122` — Step 1.5 rescue-header detection (Edit 4's consumer)
-- `skills/bundled/_shared/dispatch-lib.sh:1045-1080` — mika#1383 auto-PR-create tail (edit targets)
-- `skills/bundled/_shared/dispatch-lib.sh:2491-2540` — mika#1282 dirty-worktree rescue (the convention to mirror — body shape at 2491-2508, draft + marker at 2510-2540)
-- Mika Prime bearing 2026-06-30 ~16:02Z (session `00000000-...`): absorb mika#1684 as Edit 4 because the four edits are one producer-side contract-fix in four sites, not four independent fixes.
+- `skills/bundled/qa-review/system_prompt.md` — Step 1.5 rescue-header detection
+- `skills/bundled/_shared/dispatch-lib.sh:1023-1114` — Path A (mika#1383 gate; Phase A keep / Phase B delete)
+- `skills/bundled/_shared/dispatch-lib.sh:2488-2567` — Path B (mika#1396 rescue; the single source of truth R2 defers to)
+- `skills/bundled/_shared/dispatch-lib.sh:1265` — `_check_pilot_force_push` dev-pilot no-op (reachability proof)
+- mika-arch ESCALATE, session `2d397bee` (2026-07-01) — confirmed the shadowing + that its own "refactor only if further drift surfaces" criterion is met; ruled operator-ratify.
+- Mika Prime bearing, session `00000000-…` (2026-07-01) — ruled **R2**, bearing-scope (not milestone): "R1 creates two implementations of one safety contract that must stay in sync forever; R2 leaves one correct implementation. On a rescue path whose contract demonstrably churns, single-source-of-truth is the correctness floor." Required the reachability pre-condition check (now satisfied, §Fix shape Edit 1).
+
+## Revision history
+
+- **rev 1 (2026-06-30):** original groomed plan (mika-arch first-pass ITERATE F1 BLOCKING → revisions → second-pass GROOMED). Fix shape: four coordinated edits to Path A (the mika#1383 gate) — Edit 1 emit `RECOVERY_PENDING`, Edit 2 add `--draft`, Edit 3 add a `wip()` marker commit (to fire Guard 2), Edit 4 emit the rescue-body header (absorbed from mika#1684). Explicitly scoped *out* "unifying mika#1282 + mika#1383 rescue blocks" with the criterion "refactor only if further drift surfaces." **Superseded by rev 2** — see below.
+- **rev 2 (2026-07-01):** **design overturned to Resolution 2 (defer-to-Path-B).** Implementation-time confidence check (the rev-1 plan referenced #1282/#1383 but not #1396) revealed Path B (mika#1396 `commit-pushed-no-pr`) already implements the full correct rescue-PR shape and is shadowed by Path A's earlier global `PR_URL` set. mika-arch (session `2d397bee`) confirmed the shadowing, confirmed its own drift-criterion is now met (this finding *is* the further drift), and **ESCALATED** for operator ratification. Mika Prime (session `00000000-…`) ruled **R2** on bearing grounds (bearing-scope, not milestone): single-source-of-truth on a churning safety contract; R1 would institutionalize a two-implementations-one-contract divergence trap. Prime required, before calling R2 safe, an explicit reachability check that Path B fires once Path A's PR-creation is gone — **satisfied** (§Fix shape Edit 1 proof; `_check_pilot_force_push` is a dev-pilot no-op). Rev-2 fix shape: **delete Path A's Phase-B PR-creation** (Edit 1), **keep Path A Phase A**, defer PR creation to Path B; **optionally relocate rev-1's Edit 3 wip-marker commit into Path B** (Edit 2, architect's call) to preserve Guard 2's defense-in-depth. ACs remapped from "verify Path A output" to "verify Path B output for this trigger" + a reachability AC. Could-not-address: none — all rev-1 findings (draft, marker, header, Guard 2) are satisfied by Path B's existing behavior plus optional Edit 2; the four-edit *mechanism* is overturned, but every guard *outcome* rev-1 sought is preserved.
