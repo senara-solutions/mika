@@ -2333,16 +2333,19 @@ else
     echo "    (POLICY_LINE=$POLICY_LINE, GROOM_LINE=$GROOM_LINE, ZERO_COMMITS_LINE=$ZERO_COMMITS_LINE)"
 fi
 
-# --- Test 15: mika#1383 structural completion gate (HEAD-changed + missing PR) ---
+# --- Test 15: mika#1383 structural completion gate — Phase A only, no PR (mika#1679) ---
 #
-# mika#1383: dispatch-lib now auto-creates a PR when the pilot committed but
-# didn't reach `gh pr create`. This is the structural completion gate for the
-# tail-loss failure modes (Mode 1: bare /ce-work, Mode 2: full /mika tail).
-# Tests validate the placement, scope (dev-pilot only), decision flow.
+# mika#1383 originally auto-created a PR when the pilot committed but didn't
+# reach `gh pr create`. mika#1679 OVERTURNED that: the gate opened a NON-draft
+# PR and set the global PR_URL, which SHADOWED the mika#1396 commit-pushed-no-pr
+# rescue (Path B) — letting a non-draft PR bypass the mika#1613 recovery guards
+# (evidence mika#PR1678/#PR1683). Under R2 the gate keeps only Phase A (trailing
+# dirty rescue) and defers ALL PR creation to Path B (single source of truth).
+# These tests assert the gate no longer creates a PR and the deferral is wired.
 
 echo ""
-echo "Test 15: mika#1383 structural completion gate (HEAD-changed + no PR)"
-echo "--------------------------------------------------------------------"
+echo "Test 15: mika#1383 gate — Phase A retained, PR creation deferred to Path B (mika#1679)"
+echo "------------------------------------------------------------------------------------"
 
 # Block extraction: from the gate's marker comment to the next major section.
 GATE_BLOCK=$(sed -n '/mika#1383: structural completion gate/,/Post-flight plan validation/p' "$DISPATCH_LIB")
@@ -2355,22 +2358,31 @@ assert_contains "Gate scoped to dev-pilot only (groom intentionally has no PR)" 
     'SKILL" = "dev-pilot"' "$GATE_BLOCK"
 assert_contains "Gate fires only when HEAD has advanced (PRE != POST)" \
     'PRE_RUN_HEAD" != "$POST_RUN_HEAD"' "$GATE_BLOCK"
-assert_contains "Gate uses gh pr list --head <branch> for PR existence check" \
-    'gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH"' "$GATE_BLOCK"
 assert_contains "Phase A: trailing dirty rescue with wip() prefix" \
     'wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)' "$GATE_BLOCK"
 assert_contains "Phase A: same scaffold-path exclusion as mika#1282 (.claude/commands, claude-pilot.json)" \
     ":!.claude/commands/" "$GATE_BLOCK"
-assert_contains "Phase B: gh pr create with --base main --head BRANCH" \
-    'gh pr create' "$GATE_BLOCK"
-assert_contains "Phase B: PR title derived from latest commit subject" \
-    'git -C "$WORKTREE_DIR" log -1 --format=' "$GATE_BLOCK"
-assert_contains "Phase B: Closes #ISSUE_NUM in body" \
-    'Closes #${ISSUE_NUM}' "$GATE_BLOCK"
-assert_contains "PR-create failure surfaces structured manual recovery command" \
-    'PIPELINE FAILURE: pilot produced commits on' "$GATE_BLOCK"
-assert_contains "Manual recovery names the gh pr create command verbatim" \
-    'Manual recovery:' "$GATE_BLOCK"
+
+# mika#1679 (AC1): the gate must NOT create a PR. Path A creating a PR is what
+# set PR_URL and shadowed Path B. The negative checks run against the CODE only
+# (comment lines stripped) — the comments legitimately document the removed
+# behavior and the shadow history, so they must not trip the regression net.
+GATE_CODE=$(printf '%s\n' "$GATE_BLOCK" | grep -v '^[[:space:]]*#')
+assert_not_contains "AC1: gate code no longer invokes gh pr create (deferred to Path B)" \
+    'gh pr create' "$GATE_CODE"
+assert_not_contains "AC1: gate code no longer lists PRs for an existence check" \
+    'gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH"' "$GATE_CODE"
+assert_not_contains "AC1: gate code no longer emits the auto-created-PR result line" \
+    'auto-created PR' "$GATE_CODE"
+assert_not_contains "AC1: gate code no longer surfaces the manual-recovery PIPELINE FAILURE" \
+    'PIPELINE FAILURE: pilot produced commits on' "$GATE_CODE"
+
+# mika#1679: deferral to Path B (mika#1396 commit-pushed-no-pr) is documented in
+# the gate so the shadow cannot be silently reintroduced.
+assert_contains "Gate documents deferral to the mika#1396 commit-pushed-no-pr rescue" \
+    'mika#1396' "$GATE_BLOCK"
+assert_contains "Gate names mika#1679 as the reason PR creation moved out" \
+    'mika#1679' "$GATE_BLOCK"
 
 # Structural placement: the gate must fire AFTER the mika#1282 dirty-rescue
 # (which only handles HEAD-unchanged) and BEFORE the dev-groom-specific
@@ -2386,6 +2398,69 @@ else
     FAIL=$((FAIL + 1))
     echo "  ✗ Gate placement violated source-order invariant"
     echo "    (GATE_LINE=$GATE_LINE, M1282_LINE=$M1282_LINE, GROOM_PLAN_LINE=$GROOM_PLAN_LINE)"
+fi
+
+# --- Test 15b: Path B (mika#1396) owns the commit-pushed-no-pr rescue PR (mika#1679) ---
+#
+# After mika#1679, the mika#1383 trigger flows to Path B's commit-pushed-no-pr
+# branch. Path B is the single source of truth for the rescue-PR shape: --draft,
+# rescue header, RECOVERY_PENDING marker, wip-rescue label, canonical PR: line,
+# plus (mika#1679 Edit 2 / AC6) a wip(mika#1383) marker commit so Guard 2's
+# `isDraft AND ^wip\(` conjunction fires.
+
+echo ""
+echo "Test 15b: Path B owns commit-pushed-no-pr rescue + Guard 2 marker commit (mika#1679)"
+echo "-----------------------------------------------------------------------------------"
+
+# Extract Path B (the mika#1282 + mika#1396 draft-PR rescue) up to its callback.
+PATHB_BLOCK=$(sed -n '/Unit 2 (mika#1282 + mika#1396): open a draft PR/,/^    _deliver_callback/p' "$DISPATCH_LIB")
+
+# Needle avoids a leading '--' so grep doesn't parse it as a flag; 'draft \'
+# uniquely matches the `--draft \` line of the gh pr create invocation.
+assert_contains "AC3: Path B opens the rescue PR as draft" \
+    'draft \' "$PATHB_BLOCK"
+assert_contains "AC3: Path B writes the Auto-rescued PR rescue header (qa-review Step 1.5)" \
+    '## Auto-rescued PR (dispatch-lib recovery, class: ${RECOVERY_CLASS})' "$PATHB_BLOCK"
+assert_contains "AC3: Path B emits the rescue-pipeline-verified marker" \
+    'rescue-pipeline-verified: no' "$PATHB_BLOCK"
+assert_contains "AC3: Path B emits RECOVERY_PENDING: true (Guard 1)" \
+    'RECOVERY_PENDING: true' "$PATHB_BLOCK"
+assert_contains "AC3: Path B tags the rescued PR with the wip-rescue label" \
+    'add-label "wip-rescue"' "$PATHB_BLOCK"
+assert_contains "AC3: Path B emits the canonical PR: line (mika#1352)" \
+    'PR: ${PR_URL}' "$PATHB_BLOCK"
+
+# AC6 (Edit 2): the wip(mika#1383) marker commit makes the head-commit headline
+# match Guard 2's ^wip\( regex — and must be guarded to commit-pushed-no-pr ONLY
+# (the dirty-worktree class is already wip()-prefixed; a second empty commit there
+# would be wrong).
+assert_contains "AC6: Path B adds an empty wip(mika#1383) marker commit for Guard 2" \
+    'commit --allow-empty --no-verify -m "wip(mika#1383): auto-PR-create rescue' "$PATHB_BLOCK"
+
+# Structural: the marker commit must sit INSIDE a commit-pushed-no-pr class guard.
+# Assert the guard opens before the marker commit and that the dirty-worktree
+# arm does not contain the marker.
+MARKER_GUARD_BLOCK=$(printf '%s\n' "$PATHB_BLOCK" | sed -n '/RECOVERY_CLASS" = "commit-pushed-no-pr"/,/RESCUED_PR_URL=\$(gh pr create/p')
+assert_contains "AC6: marker commit is scoped under the commit-pushed-no-pr guard" \
+    'wip(mika#1383): auto-PR-create rescue' "$MARKER_GUARD_BLOCK"
+assert_contains "AC6: the marker-commit guard tests RECOVERY_CLASS = commit-pushed-no-pr" \
+    'RECOVERY_CLASS" = "commit-pushed-no-pr"' "$MARKER_GUARD_BLOCK"
+
+# AC5 regression: the dirty-worktree class still flows through Path B unchanged
+# (its title/fact branch and the shared draft body remain).
+assert_contains "AC5: dirty-worktree class still handled by Path B" \
+    'RECOVERY_CLASS="dirty-worktree"' "$PATHB_BLOCK"
+
+# AC6 structural: the marker commit appears EXACTLY ONCE in Path B (only in the
+# commit-pushed-no-pr arm; the dirty-worktree class is already wip()-prefixed and
+# must not get a second empty commit). A count > 1 means it leaked into both arms.
+MARKER_COUNT=$(printf '%s\n' "$PATHB_BLOCK" | grep -c 'commit --allow-empty --no-verify -m "wip(mika#1383): auto-PR-create rescue')
+if [ "$MARKER_COUNT" -eq 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ AC6: wip(mika#1383) marker commit appears exactly once (commit-pushed-no-pr arm only)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ AC6: expected exactly 1 wip(mika#1383) marker commit in Path B, found $MARKER_COUNT"
 fi
 
 # --- Test: repo#number parse normalizes an optional owner/ prefix (mika#1593) ---
