@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 43;
+pub const CURRENT_SCHEMA_VERSION: i64 = 44;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -253,6 +253,12 @@ pub struct TeamRunRow {
     pub started_at: String,
     pub ended_at: Option<String>,
     pub trace_id: Option<String>,
+    /// Number of member sessions delegated during the run (mika#1676 Unit B).
+    pub delegation_count: u32,
+    /// Whether the run completed without delegating to any member (mika#1676).
+    pub solo_absorption: bool,
+    /// Structured failure context for `failed_no_delegation` runs (JSON phase).
+    pub failure_context: Option<String>,
 }
 
 // ===== Dashboard Filter Types =====
@@ -1030,6 +1036,11 @@ impl Database {
             info!(version = 43, "database migrated to v43");
         }
 
+        if (3..=43).contains(&version) {
+            self.migrate_v43_to_v44()?;
+            info!(version = 44, "database migrated to v44");
+        }
+
         Ok(())
     }
 
@@ -1126,7 +1137,7 @@ impl Database {
                 team_id TEXT NOT NULL REFERENCES teams(id),
                 goal TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'running'
-                    CHECK (status IN ('running','completed','failed','cancelled','suspended')),
+                    CHECK (status IN ('running','completed','failed','cancelled','suspended','failed_no_delegation')),
                 failure_reason TEXT,
                 iteration INTEGER NOT NULL DEFAULT 1,
                 max_iterations INTEGER NOT NULL DEFAULT 3,
@@ -1134,7 +1145,10 @@ impl Database {
                 checkpoint TEXT,
                 trace_id TEXT,
                 started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                ended_at TEXT
+                ended_at TEXT,
+                delegation_count INTEGER NOT NULL DEFAULT 0,
+                solo_absorption INTEGER NOT NULL DEFAULT 0,
+                failure_context TEXT
             );
             CREATE INDEX idx_team_runs_team ON team_runs(team_id, started_at DESC);
 
@@ -8620,6 +8634,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_team_run(
         &self,
         run_id: &str,
@@ -8628,17 +8643,24 @@ impl Database {
         iteration: u32,
         deliverable: Option<&str>,
         ended_at: Option<&str>,
+        delegation_count: u32,
+        solo_absorption: bool,
+        failure_context: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE team_runs SET status = ?1, failure_reason = ?2, iteration = ?3,
-             deliverable = ?4, ended_at = ?5
-             WHERE id = ?6",
+             deliverable = ?4, ended_at = ?5, delegation_count = ?6,
+             solo_absorption = ?7, failure_context = ?8
+             WHERE id = ?9",
             params![
                 status,
                 failure_reason,
                 iteration,
                 deliverable,
                 ended_at,
+                delegation_count,
+                solo_absorption as i64,
+                failure_context,
                 run_id
             ],
         )?;
@@ -8766,7 +8788,8 @@ impl Database {
     }
 
     const TEAM_RUN_COLUMNS: &'static str = "r.id, t.name, r.goal, r.status, r.failure_reason,
-         r.iteration, r.max_iterations, r.deliverable, r.started_at, r.ended_at, r.trace_id";
+         r.iteration, r.max_iterations, r.deliverable, r.started_at, r.ended_at, r.trace_id,
+         r.delegation_count, r.solo_absorption, r.failure_context";
 
     fn row_to_team_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<TeamRunRow> {
         Ok(TeamRunRow {
@@ -8781,6 +8804,9 @@ impl Database {
             started_at: r.get(8)?,
             ended_at: r.get(9)?,
             trace_id: r.get(10)?,
+            delegation_count: r.get::<_, u32>(11)?,
+            solo_absorption: r.get::<_, i64>(12)? != 0,
+            failure_context: r.get(13)?,
         })
     }
 

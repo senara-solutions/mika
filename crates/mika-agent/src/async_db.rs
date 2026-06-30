@@ -1722,6 +1722,7 @@ impl AsyncDatabase {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_team_run(
         &self,
         run_id: &str,
@@ -1730,13 +1731,17 @@ impl AsyncDatabase {
         iteration: u32,
         deliverable: Option<&str>,
         ended_at: Option<&str>,
+        delegation_count: u32,
+        solo_absorption: bool,
+        failure_context: Option<&str>,
     ) -> Result<()> {
-        let (ri, s, fr, d, ea) = (
+        let (ri, s, fr, d, ea, fc) = (
             run_id.to_owned(),
             status.to_owned(),
             failure_reason.map(|s| s.to_owned()),
             deliverable.map(|s| s.to_owned()),
             ended_at.map(|s| s.to_owned()),
+            failure_context.map(|s| s.to_owned()),
         );
         self.with_db(move |db| {
             db.update_team_run(
@@ -1746,6 +1751,9 @@ impl AsyncDatabase {
                 iteration,
                 d.as_deref(),
                 ea.as_deref(),
+                delegation_count,
+                solo_absorption,
+                fc.as_deref(),
             )
         })
         .await

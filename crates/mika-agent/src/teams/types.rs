@@ -94,6 +94,31 @@ pub struct TeamRun {
     /// re-prompt was issued. Observable via `team_coverage_gap` warn log.
     #[serde(default)]
     pub coverage_retry_fired: bool,
+    /// Whether the conversational-fallthrough retry fired during decomposition
+    /// (mika#1676 Unit A). Set when the orchestrator returned a `Conversational`
+    /// result for an *actionable* goal and the delegation gate issued one
+    /// reinforced re-prompt. Distinct from `coverage_retry_fired` (#286,
+    /// omitted-member case) — different trigger, different correction prompt.
+    #[serde(default)]
+    pub conversational_retry_fired: bool,
+    /// Number of member sessions delegated during this run (mika#1676 Unit B).
+    /// Incremented in `execute_tasks` per spawned member, accumulated across
+    /// iterations. A terminal `Completed` run with `delegation_count == 0` is a
+    /// solo-absorption (the orchestrator did the work itself).
+    #[serde(default)]
+    pub delegation_count: u32,
+    /// Whether the run completed without delegating to any member (mika#1676
+    /// Unit B). Set by `finalize_and_shutdown` when the run reached `Completed`
+    /// with `delegation_count == 0`. Queryable backstop so this failure class is
+    /// visible without a manual audit.
+    #[serde(default)]
+    pub solo_absorption: bool,
+    /// Structured failure context for `FailedNoDelegation` runs (mika#1676
+    /// Unit A). JSON holding `{"phase": "first_decompose"|"revision_after_critic"}`
+    /// so a single terminal state can carry which decompose phase failed
+    /// (architect F2 — phase as JSON detail, not enum proliferation).
+    #[serde(default)]
+    pub failure_context: Option<String>,
 }
 
 fn default_timestamp() -> String {
@@ -112,6 +137,12 @@ pub enum RunStatus {
     Completed,
     Suspended,
     Failed(String),
+    /// Terminal state for a run that refused to complete because the
+    /// orchestrator returned a conversational reply for an actionable goal and
+    /// delegated to zero members, even after one reinforced retry (mika#1676
+    /// Unit A). Persisted as `status='failed_no_delegation'`; the failing
+    /// decompose phase is carried in `TeamRun::failure_context`.
+    FailedNoDelegation,
 }
 
 /// A task delegated to a specialist agent.
@@ -236,6 +267,7 @@ impl std::fmt::Display for RunStatus {
             RunStatus::Completed => write!(f, "completed"),
             RunStatus::Suspended => write!(f, "suspended"),
             RunStatus::Failed(msg) => write!(f, "failed: {msg}"),
+            RunStatus::FailedNoDelegation => write!(f, "failed_no_delegation"),
         }
     }
 }
@@ -382,6 +414,10 @@ mod tests {
             ended_at: None,
             deliverable: None,
             coverage_retry_fired: true,
+            conversational_retry_fired: false,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
         };
         let json = serde_json::to_string(&run).unwrap();
         let restored: TeamRun = serde_json::from_str(&json).unwrap();
@@ -424,6 +460,10 @@ mod tests {
             ended_at: None,
             deliverable: None,
             coverage_retry_fired: false,
+            conversational_retry_fired: false,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
         };
         let json = serialize_checkpoint(&run);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -446,6 +486,10 @@ mod tests {
             ended_at: Some("2026-01-01T01:00:00Z".to_string()),
             deliverable: Some("done".to_string()),
             coverage_retry_fired: false,
+            conversational_retry_fired: false,
+            delegation_count: 0,
+            solo_absorption: false,
+            failure_context: None,
         };
         let checkpoint = serialize_checkpoint(&run);
         let restored = deserialize_checkpoint(&checkpoint).unwrap();
