@@ -46,6 +46,10 @@ Plain prose with neither (a) nor (b) routes to `Conversational` cleanly — pres
 
 **Retry-flag separation from #286:** `coverage_retry_fired` (#286, omitted-member case) and `conversational_retry_fired` (this fix, JSON-shape-failure case) are separate fields on `TeamRun`. Different retry budgets, different correction prompts, cleanly co-existing.
 
+**Retry context (architect U3-ratified):** the retry decompose() call uses **fresh context** — same as first decompose, NOT including the failed first attempt as history. Including the failed attempt would bias the model toward repeating the prose-around-JSON pattern. Mirrors #286's `coverage_retry` precedent.
+
+**Detection-signal logging (architect U4-recommended):** when the actionability regex matches OR JSON-array-shape detects in `Conversational` content, emit a structured `DEBUG`-level log event `team_engine_actionability_signal` carrying the matched regex span (truncated to 200 chars) AND/OR the JSON-array detection position. Operator visibility into "why did the gate fire" with bounded log volume.
+
 ### Unit B (observability backstop) — delegation_count + completed_without_delegation
 
 Add structural visibility so this failure mode is queryable post-hoc regardless of whether Unit A is the right call for every case:
