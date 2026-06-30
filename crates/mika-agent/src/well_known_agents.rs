@@ -172,6 +172,19 @@ llm_max_tokens = 8192
 log_level = "info"
 "#;
 
+/// mika-qa config.toml — switches base model to the native Z.AI provider
+/// (zai/glm-5.2) per mika#1670. Calibration gate satisfied: 100% pass (5/5,
+/// mika#1632 suite). Uses native `zai` (mika#1657), not openrouter — that is
+/// the provider the calibration run exercised and the current-correct routing.
+const MIKA_QA_CONFIG: &str = r#"# Mika QA — fabrication-catching review agent.
+# Base model switched to zai/glm-5.2 per mika#1670 calibration evidence (5/5 PASS).
+
+llm_provider = "zai"
+zai_model = "glm-5.2"
+llm_max_tokens = 16384
+log_level = "info"
+"#;
+
 /// mika-qa agent specification.
 ///
 /// Uses identity-driven `[skills].allowlist` (D2 cross-cutting, #815).
@@ -184,7 +197,7 @@ pub static MIKA_QA: WellKnownAgent = WellKnownAgent {
     soul: MIKA_QA_SOUL,
     // Empty: mika-qa uses identity allowlist, not denylist (#815).
     disabled_skills: &[],
-    config_toml: None,
+    config_toml: Some(MIKA_QA_CONFIG),
     // KG disabled (#800): mika-qa has zero `query_knowledge_graph` usage —
     // retrieval goes through `search_memory` (FTS5+vec over memory_facts).
     // Eliminates shared-corpus extractor race on the mika-docs corpus.
@@ -1865,6 +1878,14 @@ mod tests {
     }
 
     #[test]
+    fn test_mika_qa_config_toml_is_valid_toml() {
+        let config: toml::Value =
+            toml::from_str(MIKA_QA_CONFIG).expect("MIKA_QA_CONFIG should be valid TOML");
+        assert_eq!(config["llm_provider"].as_str(), Some("zai"));
+        assert_eq!(config["zai_model"].as_str(), Some("glm-5.2"));
+    }
+
+    #[test]
     fn test_seed_skill_overrides_non_well_known() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("test.db");
@@ -2860,16 +2881,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        // Pre-seed mika-qa (which has config_toml: None) with a custom config.
-        mika_common::home::bootstrap_agent(home, "mika-qa").unwrap();
-        let agent_dir = mika_common::agent::agent_dir(home, "mika-qa");
-        fs::write(agent_dir.join("identity.toml"), MIKA_QA_IDENTITY).unwrap();
+        // Pre-seed mika-test (which has config_toml: None) with a custom config.
+        // mika-qa moved to Some(MIKA_QA_CONFIG) in mika#1670, so mika-test is now
+        // the well-known agent exemplifying the None-config skip path.
+        mika_common::home::bootstrap_agent(home, "mika-test").unwrap();
+        let agent_dir = mika_common::agent::agent_dir(home, "mika-test");
+        fs::write(agent_dir.join("identity.toml"), MIKA_TEST_IDENTITY).unwrap();
         let custom = "log_level = \"debug\"\n";
         fs::write(agent_dir.join("config.toml"), custom).unwrap();
 
         // Reconcile must not overwrite — spec has no config_toml.
-        reconcile_well_known_config(home, &MIKA_QA);
-        let after = read_config(home, "mika-qa");
+        reconcile_well_known_config(home, &MIKA_TEST);
+        let after = read_config(home, "mika-test");
         assert_eq!(
             after, custom,
             "agents without spec config must be untouched"
