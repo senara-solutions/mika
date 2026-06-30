@@ -531,4 +531,90 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].reason, MatchReason::Keyword);
     }
+
+    // --- gh-read-only required-tools-gate keyword-collision tests (mika#1650) ---
+
+    /// The fixed `gh-read-only` keyword set, mirrored from
+    /// `skills/bundled/gh-read-only/skill.toml`. Kept in sync with the manifest
+    /// by hand — the design rule (no bare common-English bigrams under
+    /// substring-only matching) is documented in
+    /// `docs/architecture/skill-keyword-design-rules.md`.
+    const GH_READ_ONLY_KEYWORDS: &[&str] = &[
+        "github issue",
+        "github pr",
+        "github pull request",
+        "pull request",
+        "pull requests",
+        "view issue",
+        "view pr",
+        "view pull request",
+        "check issue",
+        "check pr",
+        "check pull request",
+        "list issues",
+        "list prs",
+        "list pull requests",
+        "open issues",
+        "open prs",
+        "open pull requests",
+        "pr diff",
+        "pr body",
+        "issue body",
+        "issue list",
+        "fetch issue",
+        "fetch pr",
+        "merge pr",
+        "close pr",
+        "close issue",
+        "issue #",
+        "pr #",
+    ];
+
+    #[test]
+    fn test_gh_read_only_does_not_fire_on_incidental_prose() {
+        // AC3 (mika#1650): replay of mika-litha's offending turn class — prose
+        // that merely *mentions* "issue" and "pr" with zero intent to fetch
+        // GitHub data. The old bare-bigram keywords ("pr", "issue") matched as
+        // substrings of "approach"/"issue", firing the required_tools gate and
+        // forcing a spurious gh_read call. The fixed intent-phrase set must NOT
+        // match — no keyword hit → no required_tools constraint → no engine retry.
+        let skills = vec![make_entry("gh-read-only", GH_READ_ONLY_KEYWORDS, false)];
+        for prose in &[
+            "the issue with that pr approach is too risky",
+            "I thought the proposal was appropriate, though the process is rough",
+            "reissue the tissue report — high priority, brought up at the meeting",
+        ] {
+            let matched = match_skills(&skills, prose);
+            assert!(
+                matched.is_empty(),
+                "gh-read-only must NOT match incidental prose: {prose:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gh_read_only_fires_on_genuine_fetch_intent() {
+        // AC4 (mika#1650): genuine fetch-intent user requests Litha (or any
+        // agent with gh-read-only allowlisted) would legitimately send. The
+        // intent-phrase set must still catch these — tightening the keyword
+        // list trades false-positives-down for false-negatives-up, so verify
+        // the kept set covers the real request patterns.
+        let skills = vec![make_entry("gh-read-only", GH_READ_ONLY_KEYWORDS, false)];
+        for request in &[
+            "view issue #123",
+            "list open prs",
+            "merge pr 1678",
+            "check pr 1644",
+            "show me the pr diff for that branch",
+            "what's in the github issue tracker today",
+        ] {
+            let matched = match_skills(&skills, request);
+            assert_eq!(
+                matched.len(),
+                1,
+                "gh-read-only MUST match genuine fetch-intent: {request:?}"
+            );
+            assert_eq!(matched[0].reason, MatchReason::Keyword);
+        }
+    }
 }
