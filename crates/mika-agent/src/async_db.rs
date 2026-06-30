@@ -1751,6 +1751,35 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Find team runs stuck in `status='running'` with no recent child-session
+    /// liveness (mika#1652). Not agent-scoped — `team_runs` is shared across the
+    /// single container DB.
+    pub async fn find_stuck_team_runs(
+        &self,
+        threshold_secs: i64,
+        liveness_threshold_secs: i64,
+    ) -> Result<Vec<TeamRunRow>> {
+        self.with_db(move |db| db.find_stuck_team_runs(threshold_secs, liveness_threshold_secs))
+            .await
+    }
+
+    /// Idempotently transition a team run to a terminal status (mika#1652).
+    /// Returns `true` when a row changed (was still `running`).
+    pub async fn transition_team_run_terminal(
+        &self,
+        team_run_id: &str,
+        status: &str,
+        failure_reason: &str,
+    ) -> Result<bool> {
+        let (ri, s, fr) = (
+            team_run_id.to_owned(),
+            status.to_owned(),
+            failure_reason.to_owned(),
+        );
+        self.with_db(move |db| db.transition_team_run_terminal(&ri, &s, &fr))
+            .await
+    }
+
     pub async fn suspend_team_run(&self, run_id: &str, checkpoint: &str) -> Result<()> {
         let (r, c) = (run_id.to_owned(), checkpoint.to_owned());
         self.with_db(move |db| db.suspend_team_run(&r, &c)).await

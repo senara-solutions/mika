@@ -28,6 +28,22 @@ use super::types::*;
 /// Maximum wall-clock time for the entire team run (all phases combined).
 const TEAM_RUN_TIMEOUT_SECS: u64 = 900; // 15 minutes
 
+/// Team-run stuck-detection threshold (mika#1652). A run in `status='running'`
+/// older than this with no child-session liveness is considered orphaned.
+///
+/// 20 min captures "genuinely wedged" without false-positing on slow-but-
+/// legitimate multi-agent coordination — members may legitimately go quiet
+/// while waiting on workspace file I/O. 10× the 300s `run_team` tool timeout
+/// (50 min) would be too conservative for the founding-incident shape (team
+/// `d68fdcaf`, 2026-06-29: a2a_call 503s left a row stuck `running` for 80+ min).
+const TEAM_RUN_STUCK_THRESHOLD_SECS: i64 = 20 * 60;
+
+/// Liveness window for team child sessions (mika#1652). Any `llm_calls` or
+/// `tool_calls` activity on a `team-<id>%` session within this window proves
+/// the run is alive. 5 min matches the engine's periodic scan cadence with
+/// headroom.
+const TEAM_RUN_LIVENESS_THRESHOLD_SECS: i64 = 5 * 60;
+
 /// Resources needed to run a specific agent.
 struct AgentResources {
     db: AsyncDatabase,
@@ -1575,6 +1591,102 @@ impl TeamEngine {
     }
 }
 
+/// Reap orphaned team runs left in `status='running'` when no terminal-state
+/// writer ran (mika#1652).
+///
+/// The failure-path sibling of the team-run lifecycle finalizer
+/// (`AsyncDatabase::update_team_run`), analogous to `reap_orphaned_parent_tasks`
+/// (mika#871) for the task table. A `team_runs` row stays `running` indefinitely
+/// when the normal finalizer never executes — the `mika-spirit` process died
+/// mid-run, the `run_team` future was dropped at the tool timeout, or the run
+/// errored before `finalize_and_shutdown`. The held row keeps the team slot
+/// occupied, blocking subsequent `run_team` calls (founding incident
+/// `d68fdcaf`, 2026-06-29).
+///
+/// A run is orphaned when it has been `running` longer than
+/// `TEAM_RUN_STUCK_THRESHOLD_SECS` AND its child sessions show no `llm_calls`
+/// or `tool_calls` activity within `TEAM_RUN_LIVENESS_THRESHOLD_SECS` (the
+/// mika#959 `NOT EXISTS` liveness pattern). Matched runs transition to
+/// `'failed'` (not `'cancelled'` — the reaper is a system-level failure
+/// detector, not an operator proxy) with an audit-event trail. The
+/// `transition_team_run_terminal` guard (`WHERE status='running'`) makes the
+/// transition idempotent and race-safe against the normal finalizer.
+///
+/// Runs every `DB_SCAN_INTERVAL_TICKS` from the task engine tick loop.
+///
+/// SOLE WRITER: this function is the only site that writes the
+/// `reaper.team_runs` audit `tool_name`.
+pub async fn reap_orphaned_team_runs(db: &AsyncDatabase) {
+    let stuck = match db
+        .find_stuck_team_runs(
+            TEAM_RUN_STUCK_THRESHOLD_SECS,
+            TEAM_RUN_LIVENESS_THRESHOLD_SECS,
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "reaper.team_runs: failed to query stuck team runs");
+            return;
+        }
+    };
+
+    for run in stuck {
+        let trace_id = mika_common::trace::generate_trace_id();
+        let system_session = format!("system-{}", db.agent_id);
+        let reason = format!(
+            "Reaper: no liveness from child sessions for {TEAM_RUN_LIVENESS_THRESHOLD_SECS}s"
+        );
+
+        match db
+            .transition_team_run_terminal(&run.id, "failed", &reason)
+            .await
+        {
+            Ok(true) => {
+                if let Err(e) = db
+                    .log_audit_event(
+                        &system_session,
+                        "reaper.team_runs",
+                        &run.id,
+                        Some("running"),
+                        Some("failed"),
+                        Some(&reason),
+                        Some(&trace_id),
+                    )
+                    .await
+                {
+                    warn!(
+                        team_run_id = %run.id,
+                        error = %e,
+                        "reaper.team_runs: failed to write audit event"
+                    );
+                }
+                info!(
+                    team_run_id = %run.id,
+                    team = %run.team_name,
+                    started_at = %run.started_at,
+                    "reaper.team_runs: transitioned orphaned team run to failed"
+                );
+            }
+            Ok(false) => {
+                // Row already left `running` (normal finalizer or operator
+                // cancel won the race, or a duplicate query row) — skip.
+                debug!(
+                    team_run_id = %run.id,
+                    "reaper.team_runs: team run already terminal, skipping"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    team_run_id = %run.id,
+                    error = %e,
+                    "reaper.team_runs: db error during transition"
+                );
+            }
+        }
+    }
+}
+
 /// Compute non-orchestrator team members who were not assigned any task.
 ///
 /// Returns the names of members in `team.agents` (excluding the orchestrator)
@@ -2295,5 +2407,241 @@ mod tests {
     fn test_workspace_fallback_nonexistent_dir() {
         let path = std::path::PathBuf::from("/nonexistent/workspace/dir");
         assert!(build_workspace_fallback(&path).is_none());
+    }
+
+    // ---- team-run orphan reaper (mika#1652) ----
+
+    use crate::async_db::AsyncDatabase;
+    use crate::db::Database;
+
+    fn reaper_test_db() -> AsyncDatabase {
+        let db = Database::open_in_memory().unwrap();
+        AsyncDatabase::new_with_agent(db, "mika")
+    }
+
+    /// Insert a team run and force its `started_at` to `age_secs` ago.
+    async fn seed_team_run(db: &AsyncDatabase, run_id: &str, started_age_secs: i64) {
+        db.insert_team_run(
+            run_id,
+            "test-team",
+            "goal",
+            3,
+            &crate::timestamp::now(),
+            None,
+        )
+        .await
+        .unwrap();
+        let id = run_id.to_string();
+        let modifier = format!("-{started_age_secs} seconds");
+        db.with_db(move |inner| {
+            inner.conn.execute(
+                "UPDATE team_runs SET started_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2) WHERE id = ?1",
+                rusqlite::params![id, modifier],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Insert an `llm_calls` row on a child session aged `age_secs` ago.
+    async fn seed_llm_call(db: &AsyncDatabase, session_id: &str, age_secs: i64) {
+        let sid = session_id.to_string();
+        let modifier = format!("-{age_secs} seconds");
+        db.with_db(move |inner| {
+            inner.conn.execute(
+                "INSERT INTO llm_calls (id, agent_id, session_id, provider, model, created_at)
+                 VALUES (?1, 'mika', ?2, 'mock', 'mock', strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3))",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), sid, modifier],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Insert a `tool_calls` row on a child session aged `age_secs` ago.
+    async fn seed_tool_call(db: &AsyncDatabase, session_id: &str, age_secs: i64) {
+        let sid = session_id.to_string();
+        let modifier = format!("-{age_secs} seconds");
+        db.with_db(move |inner| {
+            inner.conn.execute(
+                "INSERT INTO tool_calls (id, agent_id, session_id, tool_name, created_at)
+                 VALUES (?1, 'mika', ?2, 'a2a_call', strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3))",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), sid, modifier],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// AC1 + AC2: a stuck run (old, no liveness) is transitioned to `failed`
+    /// with `ended_at`/`failure_reason` set and a `reaper.team_runs` audit event.
+    #[tokio::test]
+    async fn test_reaper_transitions_stuck_team_run_to_failed() {
+        let db = reaper_test_db();
+        let run_id = "stuck-run-1";
+        // Older than the 20-min stuck threshold, no child-session activity.
+        seed_team_run(&db, run_id, TEAM_RUN_STUCK_THRESHOLD_SECS + 60).await;
+
+        reap_orphaned_team_runs(&db).await;
+
+        let row = db.load_team_run_by_id(run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "failed", "stuck run must be reaped to failed");
+        assert!(row.ended_at.is_some(), "ended_at must be set");
+        let reason = row.failure_reason.expect("failure_reason must be set");
+        assert!(
+            reason.contains(&TEAM_RUN_LIVENESS_THRESHOLD_SECS.to_string()),
+            "failure_reason must name the liveness window, got: {reason}"
+        );
+
+        // AC2: audit event under the reaper system session.
+        let events = db
+            .get_audit_events(&format!("system-{}", db.agent_id))
+            .await
+            .unwrap();
+        let reaper_event = events
+            .iter()
+            .find(|e| e.tool_name == "reaper.team_runs")
+            .expect("a reaper.team_runs audit event must exist");
+        assert_eq!(reaper_event.target_key, run_id, "audit names the run id");
+        assert_eq!(reaper_event.after_value.as_deref(), Some("failed"));
+    }
+
+    /// AC1 (negative): a run younger than the stuck threshold is left alone.
+    #[tokio::test]
+    async fn test_reaper_ignores_young_running_team_run() {
+        let db = reaper_test_db();
+        let run_id = "young-run";
+        seed_team_run(&db, run_id, TEAM_RUN_STUCK_THRESHOLD_SECS - 120).await;
+
+        reap_orphaned_team_runs(&db).await;
+
+        let row = db.load_team_run_by_id(run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "running", "young run must not be reaped");
+    }
+
+    /// AC1 (liveness guard): an old run WITH recent child-session activity is
+    /// alive and must not be reaped — covers both `llm_calls` and `tool_calls`.
+    #[tokio::test]
+    async fn test_reaper_skips_old_run_with_recent_liveness() {
+        // Recent llm_call keeps it alive.
+        let db = reaper_test_db();
+        let run_id = "live-run-llm";
+        seed_team_run(&db, run_id, TEAM_RUN_STUCK_THRESHOLD_SECS + 60).await;
+        seed_llm_call(&db, &format!("team-{run_id}-worker"), 30).await;
+        reap_orphaned_team_runs(&db).await;
+        let row = db.load_team_run_by_id(run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "running", "recent llm_call proves liveness");
+
+        // Recent tool_call keeps it alive (the a2a_call shape).
+        let db2 = reaper_test_db();
+        let run_id2 = "live-run-tool";
+        seed_team_run(&db2, run_id2, TEAM_RUN_STUCK_THRESHOLD_SECS + 60).await;
+        seed_tool_call(&db2, &format!("team-{run_id2}"), 30).await;
+        reap_orphaned_team_runs(&db2).await;
+        let row2 = db2.load_team_run_by_id(run_id2).await.unwrap().unwrap();
+        assert_eq!(row2.status, "running", "recent tool_call proves liveness");
+    }
+
+    /// AC1 (stale liveness): an old run whose only child activity predates the
+    /// liveness window IS reaped — proves the window bound is enforced.
+    #[tokio::test]
+    async fn test_reaper_reaps_old_run_with_only_stale_liveness() {
+        let db = reaper_test_db();
+        let run_id = "stale-live-run";
+        seed_team_run(&db, run_id, TEAM_RUN_STUCK_THRESHOLD_SECS + 600).await;
+        // Activity older than the liveness window — does not count as alive.
+        seed_llm_call(
+            &db,
+            &format!("team-{run_id}-worker"),
+            TEAM_RUN_LIVENESS_THRESHOLD_SECS + 120,
+        )
+        .await;
+
+        reap_orphaned_team_runs(&db).await;
+
+        let row = db.load_team_run_by_id(run_id).await.unwrap().unwrap();
+        assert_eq!(
+            row.status, "failed",
+            "stale liveness must not protect the run"
+        );
+    }
+
+    /// AC5: a non-running run (completed/failed/suspended) is never touched.
+    #[tokio::test]
+    async fn test_reaper_ignores_non_running_team_runs() {
+        let db = reaper_test_db();
+        for status in ["completed", "failed", "suspended"] {
+            let run_id = format!("terminal-{status}");
+            seed_team_run(&db, &run_id, TEAM_RUN_STUCK_THRESHOLD_SECS + 600).await;
+            let id = run_id.clone();
+            let st = status.to_string();
+            db.with_db(move |inner| {
+                inner.conn.execute(
+                    "UPDATE team_runs SET status = ?2 WHERE id = ?1",
+                    rusqlite::params![id, st],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            reap_orphaned_team_runs(&db).await;
+
+            let row = db.load_team_run_by_id(&run_id).await.unwrap().unwrap();
+            assert_eq!(row.status, status, "{status} run must be left untouched");
+        }
+    }
+
+    /// AC3: idempotency — a second sweep does not double-transition, and the
+    /// guarded UPDATE returns `false` on an already-terminal row.
+    #[tokio::test]
+    async fn test_reaper_is_idempotent() {
+        let db = reaper_test_db();
+        let run_id = "idempotent-run";
+        seed_team_run(&db, run_id, TEAM_RUN_STUCK_THRESHOLD_SECS + 60).await;
+
+        reap_orphaned_team_runs(&db).await;
+        let ended_after_first = db
+            .load_team_run_by_id(run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .ended_at;
+
+        // Direct guard check: already-terminal row reports no change.
+        let changed = db
+            .transition_team_run_terminal(run_id, "failed", "second attempt")
+            .await
+            .unwrap();
+        assert!(
+            !changed,
+            "guarded UPDATE must not re-transition a terminal row"
+        );
+
+        // Second full sweep is a no-op (run no longer matches the query).
+        reap_orphaned_team_runs(&db).await;
+        let row = db.load_team_run_by_id(run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert_eq!(
+            row.ended_at, ended_after_first,
+            "ended_at must not change on a repeat sweep"
+        );
+
+        // Exactly one reaper audit event was written.
+        let events = db
+            .get_audit_events(&format!("system-{}", db.agent_id))
+            .await
+            .unwrap();
+        let count = events
+            .iter()
+            .filter(|e| e.tool_name == "reaper.team_runs")
+            .count();
+        assert_eq!(
+            count, 1,
+            "idempotent sweep must write exactly one audit event"
+        );
     }
 }

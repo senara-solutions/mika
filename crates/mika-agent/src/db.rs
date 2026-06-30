@@ -8645,6 +8645,82 @@ impl Database {
         Ok(())
     }
 
+    /// Find team runs stuck in `status='running'` past `threshold_secs` whose
+    /// child sessions show no recent liveness (mika#1652).
+    ///
+    /// A run is orphaned when no terminal-state writer ran (process died, the
+    /// `run_team` future was dropped mid-flight at the tool timeout, etc.), so
+    /// the row never left `running` and its team slot stays held. Liveness is
+    /// proven by any `llm_calls` or `tool_calls` activity on a `team-<id>%`
+    /// session within `liveness_threshold_secs` — the mika#959 `NOT EXISTS`
+    /// watchdog pattern, adapted for non-process entities (team child sessions
+    /// are LLM-call/tool-call rows, not subprocesses, so liveness is row
+    /// recency rather than a `/proc/<pid>/stat` check).
+    ///
+    /// The `team-<id>%` LIKE prefix matches both the orchestrator session
+    /// (`team-<id>`) and per-member sessions (`team-<id>-<agent>`); run ids are
+    /// UUIDs, so the prefix never bleeds across runs.
+    pub fn find_stuck_team_runs(
+        &self,
+        threshold_secs: i64,
+        liveness_threshold_secs: i64,
+    ) -> Result<Vec<TeamRunRow>> {
+        let stuck_modifier = format!("-{threshold_secs} seconds");
+        let liveness_modifier = format!("-{liveness_threshold_secs} seconds");
+        let sql = format!(
+            "SELECT {} FROM team_runs r JOIN teams t ON r.team_id = t.id
+              WHERE r.status = 'running'
+                AND r.started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1)
+                AND NOT EXISTS (
+                  SELECT 1 FROM llm_calls lc
+                  WHERE lc.session_id LIKE 'team-' || r.id || '%'
+                    AND lc.created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM tool_calls tc
+                  WHERE tc.session_id LIKE 'team-' || r.id || '%'
+                    AND tc.created_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                )
+              ORDER BY r.started_at",
+            Self::TEAM_RUN_COLUMNS,
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![stuck_modifier, liveness_modifier],
+                Self::row_to_team_run,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Transition a team run to a terminal status idempotently (mika#1652).
+    ///
+    /// The `WHERE status = 'running'` guard prevents double-transition and
+    /// loses cleanly to the normal finalizer (`update_team_run`) or an operator
+    /// cancel that won the race. Returns `true` when a row actually changed.
+    ///
+    /// `status` is `'failed'` for reaper-initiated transitions (system-level
+    /// failure detection); `'cancelled'` is reserved for operator-initiated
+    /// termination. Both are permitted by the `team_runs.status` CHECK
+    /// constraint.
+    pub fn transition_team_run_terminal(
+        &self,
+        team_run_id: &str,
+        status: &str,
+        failure_reason: &str,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE team_runs
+             SET status = ?1,
+                 failure_reason = ?2,
+                 ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?3 AND status = 'running'",
+            params![status, failure_reason, team_run_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Suspend a team run, saving a serialized checkpoint for later resume.
     pub fn suspend_team_run(&self, run_id: &str, checkpoint: &str) -> Result<()> {
         self.conn.execute(
