@@ -108,13 +108,18 @@ if [[ -n "$PLAN" ]]; then
   # Take the first plan file if multiple exist
   PLAN_FILE=$(echo "$PLAN" | head -1)
   if [[ -f "$PLAN_FILE" ]]; then
-    # Check for ## Acceptance criteria heading
-    if ! grep -q '^## Acceptance criteria' "$PLAN_FILE"; then
+    # Check for ## Acceptance criteria heading (case-insensitive: the autonomous
+    # groom command instructs lowercase, but the LLM frequently title-cases the
+    # noun phrase — mika#1639. `grep -qi` / sed start-address `I` flag (both GNU)
+    # fold case so `## Acceptance Criteria` is accepted.)
+    if ! grep -qi '^## Acceptance criteria' "$PLAN_FILE"; then
       echo "FAIL: Plan '$PLAN_FILE' missing '## Acceptance criteria' section. See mika#1600." >&2
       ERRORS=$((ERRORS + 1))
     else
-      # Check for at least one non-blank line after the heading
-      AC_CONTENT=$(sed -n '/^## Acceptance criteria/,/^## /{ /^## /d; /^[[:space:]]*$/d; p; }' "$PLAN_FILE")
+      # Check for at least one non-blank line after the heading. Only the start
+      # address needs the `I` flag; the end address `/^## /` and inner `/^## /d`
+      # already match any `## ` heading prefix case-agnostically.
+      AC_CONTENT=$(sed -n '/^## Acceptance criteria/I,/^## /{ /^## /d; /^[[:space:]]*$/d; p; }' "$PLAN_FILE")
       if [[ -z "$AC_CONTENT" ]]; then
         echo "FAIL: Plan '$PLAN_FILE' has empty '## Acceptance criteria' section. See mika#1600." >&2
         ERRORS=$((ERRORS + 1))

@@ -449,6 +449,32 @@ output=$(run_verify "") || exit_code=$?
 assert_fail "AC check: plan with empty AC section → FAIL" "$exit_code" "$output" "empty '## Acceptance criteria' section"
 cleanup_test_repo
 
+echo ""
+echo "=== AC check: plan with title-case heading → PASS (mika#1639) ==="
+setup_test_repo
+git checkout -b feat/test -q
+mkdir -p docs/plans src
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## Definition of Done
+
+- [ ] Something done
+
+## Acceptance Criteria
+
+- [ ] AC1. First criterion
+- [ ] AC2. Second criterion
+PLANEOF
+echo "code" > src/main.rs
+git add docs/plans/test-plan.md src/main.rs
+git commit -q -m "feat: plan with title-case AC heading"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_pass "AC check: title-case '## Acceptance Criteria' → PASS" "$exit_code" "$output" "Pipeline verification passed"
+cleanup_test_repo
+
 # =========================================================================
 # Summary
 # =========================================================================
