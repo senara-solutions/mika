@@ -836,13 +836,29 @@ async fn run_agent_for_message(
         a.skills.lock().unwrap().clone()
     };
 
-    let session_id = uuid::Uuid::new_v4().to_string();
-    if let Err(e) =
-        a.db.create_session(&session_id, a.db.agent_id(), &req.channel)
-            .await
-    {
-        warn!(error = %e, "failed to create session");
-    }
+    // Singleton agents (mika#1401) reuse one canonical session for every inbound
+    // message instead of minting a fresh UUID per `/send`. Resolved once at
+    // init_agent time and cached on AgentState. Idempotent INSERT OR IGNORE keeps
+    // the shared session alive across messages; normal agents get a per-message
+    // session as before.
+    let session_id = if let Some(ref canonical) = a.canonical_session_id {
+        if let Err(e) =
+            a.db.get_or_create_canonical_session(canonical, &req.channel)
+                .await
+        {
+            warn!(error = %e, "failed to create canonical session");
+        }
+        canonical.clone()
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        if let Err(e) =
+            a.db.create_session(&id, a.db.agent_id(), &req.channel)
+                .await
+        {
+            warn!(error = %e, "failed to create session");
+        }
+        id
+    };
     let is_onboarding = agent::check_onboarding(&a.db).await;
 
     let sender = GatewayMessageSender::new(

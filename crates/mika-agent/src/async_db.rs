@@ -956,9 +956,37 @@ impl AsyncDatabase {
         self.with_db(move |db| db.end_session(&i)).await
     }
 
+    /// End a session unless it is the agent's canonical singleton session (mika#1401).
+    /// No-ops when `id == canonical_id`; otherwise behaves like [`end_session`].
+    pub async fn end_session_unless_canonical(
+        &self,
+        id: &str,
+        canonical_id: Option<&str>,
+    ) -> Result<()> {
+        let (i, c) = (id.to_owned(), canonical_id.map(|s| s.to_owned()));
+        self.with_db(move |db| db.end_session_unless_canonical(&i, c.as_deref()))
+            .await
+    }
+
     pub async fn get_or_create_system_session(&self) -> Result<String> {
         let a = self.agent_id.clone();
         self.with_db(move |db| db.get_or_create_system_session(&a))
+            .await
+    }
+
+    /// Idempotently create the canonical singleton session (mika#1401).
+    /// `INSERT OR IGNORE` — safe to call on every invocation.
+    pub async fn get_or_create_canonical_session(
+        &self,
+        session_id: &str,
+        channel_type: &str,
+    ) -> Result<String> {
+        let (s, a, ct) = (
+            session_id.to_owned(),
+            self.agent_id.clone(),
+            channel_type.to_owned(),
+        );
+        self.with_db(move |db| db.get_or_create_canonical_session(&s, &a, &ct))
             .await
     }
 

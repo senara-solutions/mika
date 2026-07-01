@@ -436,6 +436,10 @@ async fn init_agent(
     let identity = crate::prompt::load_identity(agent_home);
     let kg_config = crate::kg::config::resolve_per_agent_docs_root(&identity, &agent_settings)
         .with_context(|| format!("failed to resolve [kg] config for agent {agent_name}"))?;
+    // Resolve the canonical session for singleton agents (mika#1401). `Some` only
+    // when `[session] singleton = true`; the `/send` handler reuses this session
+    // instead of minting a fresh UUID per message.
+    let canonical_session_id = crate::prompt::resolve_canonical_session_id(&identity, agent_name);
     db.register_agent(
         agent_name,
         &identity.name,
@@ -556,6 +560,7 @@ async fn init_agent(
         github_app,
         webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         kg_config,
+        canonical_session_id,
     };
 
     debug!(agent = agent_name, home = %agent_home.display(), "initialized agent");
@@ -1622,6 +1627,7 @@ mod tests {
             kg_config: crate::kg::config::KgAgentConfig::Disabled {
                 reason: crate::kg::config::DisabledReason::OperatorOptOut,
             },
+            canonical_session_id: None,
         };
 
         let agents = dashmap::DashMap::new();

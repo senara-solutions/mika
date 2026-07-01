@@ -50,6 +50,12 @@ pub struct AgentState {
     /// all KG subsystem construction; `Enabled` provides the validated docs_root
     /// and precomputed docs_root_hash for the three KG startup loops.
     pub kg_config: KgAgentConfig,
+    /// Canonical session ID for singleton agents (mika#1401). `Some` when the
+    /// agent's `identity.toml` sets `[session] singleton = true` — the `/send`
+    /// handler then reuses this one session instead of minting a UUID per message.
+    /// `None` for normal agents (default: fresh session per message). Resolved
+    /// once at `init_agent` time from the agent's identity.
+    pub canonical_session_id: Option<String>,
 }
 
 /// Shared application state for the Axum HTTP server.

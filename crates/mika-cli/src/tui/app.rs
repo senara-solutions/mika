@@ -537,6 +537,10 @@ pub struct App<'a> {
 
     // Display info
     pub session_id: String,
+    /// True when this agent is single-session-by-nature (mika#1401): `session_id`
+    /// is the agent's canonical session. Gates `/clear` (preserves the session
+    /// instead of minting a new one) and the session-teardown `end_session` calls.
+    pub is_singleton_session: bool,
     pub model: String,
     pub identity_name: String,
     /// The active LLM provider (for /provider command).
@@ -667,6 +671,7 @@ impl<'a> App<'a> {
         global_home: PathBuf,
         provider: mika_common::llm::ProviderKind,
         start_in_audit_mode: bool,
+        is_singleton_session: bool,
     ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
@@ -685,6 +690,7 @@ impl<'a> App<'a> {
             history: InputHistory::load(&home_dir),
             has_new_message: false,
             session_id,
+            is_singleton_session,
             model,
             identity_name,
             provider,
@@ -774,6 +780,7 @@ impl<'a> App<'a> {
             history: InputHistory::load(&team_dir),
             has_new_message: false,
             session_id: String::new(),
+            is_singleton_session: false,
             model: String::new(),
             identity_name: format!("Team: {team_name}"),
             provider: mika_common::llm::ProviderKind::Anthropic,
