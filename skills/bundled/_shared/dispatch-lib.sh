@@ -1030,10 +1030,16 @@ ${RESULT}"
         # fixed". Companion to mika#1282 (handles HEAD-unchanged + dirty);
         # this block handles HEAD-changed + missing PR.
         #
-        # Decision matrix when this block fires (HEAD changed):
-        #   dirty worktree           → Phase A: rescue dirty into wip() commit
-        #   PR exists for branch     → Phase B no-op (existing path is success)
-        #   no PR exists for branch  → Phase B: gh pr create from existing commits
+        # What this block does (HEAD changed):
+        #   trailing dirty worktree  → Phase A: rescue dirty into wip() commit,
+        #                              advance POST_RUN_HEAD.
+        #   PR creation              → mika#1679: deferred to the mika#1396
+        #                              "commit-pushed-no-pr" rescue in
+        #                              dispatch_claude_pilot() (Path B). This gate
+        #                              must NOT open its own PR — doing so set the
+        #                              global PR_URL and SHADOWED Path B's guard
+        #                              (`[ -z "$PR_URL" ]`), opening a non-draft PR
+        #                              that bypassed the mika#1613 recovery guards.
         #
         # Scoped to dev-pilot only — dev-groom produces plan-only commits
         # and intentionally has no PR (plan goes on the branch, not in a PR).
@@ -1056,61 +1062,23 @@ ${RESULT}"
                         POST_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
                         RESULT="${RESULT}
 
-dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit before PR check."
+dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR creation deferred to the mika#1396 commit-pushed-no-pr rescue."
                     fi
                 fi
             fi
 
-            # Phase B: PR existence check. Use `gh pr list` filtered by
-            # head branch — `gh pr view <branch>` requires the PR exist;
-            # listing is the discoverable read.
-            EXISTING_PR=""
-            if command -v gh &>/dev/null; then
-                EXISTING_PR=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
-            fi
-
-            if [ -z "$EXISTING_PR" ]; then
-                # No PR exists for this branch. Auto-create from existing commits.
-                # Title: derive from latest commit subject (preserves pilot intent).
-                # Body: link to dispatch-lib's structural completion gate doc.
-                PR_TITLE=$(git -C "$WORKTREE_DIR" log -1 --format='%s' 2>/dev/null || echo "Auto-PR for ${REPO}#${ISSUE_NUM}")
-                PR_BODY="$(cat <<PR_BODY_EOF
-Auto-created by dispatch-lib (mika#1383 structural completion gate).
-
-The pilot session completed work and committed but did not reach \`gh pr create\` before its turn ended. dispatch-lib takes ownership of the commit→PR tail per mika#1271 (content/workflow split). The pilot owned content; dispatch-lib owns git/PR.
-
-Pilot session: \`${LOG_ID}\`
-Branch: \`${BRANCH}\`
-
-Closes #${ISSUE_NUM}
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
-PR_BODY_EOF
-)"
-
-                if PR_CREATE_OUT=$(gh pr create \
-                        --repo "senara-solutions/$REPO" \
-                        --base main \
-                        --head "$BRANCH" \
-                        --title "$PR_TITLE" \
-                        --body "$PR_BODY" 2>&1); then
-                    # Re-query the PR URL (gh pr create prints it but parsing is fragile).
-                    EXISTING_PR=$(gh pr list --repo "senara-solutions/$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // ""' 2>/dev/null || true)
-                    RESULT="${RESULT}
-
-dispatch-lib (mika#1383): auto-created PR ${EXISTING_PR} from pilot's commits — pilot reached end_turn without invoking gh pr create."
-                else
-                    # PR creation failed — surface manual recovery.
-                    # Common causes: gh auth scope, branch already has closed PR, base branch mismatch.
-                    RESULT="PIPELINE FAILURE: pilot produced commits on ${BRANCH} but no PR exists, and dispatch-lib's auto-create attempt failed.
-gh pr create error: $(printf '%s' "$PR_CREATE_OUT" | head -5)
-
-Manual recovery:
-  gh pr create --repo senara-solutions/${REPO} --base main --head ${BRANCH} --title \"<title>\" --body \"<body>\"
-
-${RESULT}"
-                fi
-            fi
+            # mika#1679: PR creation is intentionally NOT done here. The pilot
+            # committed + pushed but never reached `gh pr create`; the mika#1396
+            # "commit-pushed-no-pr" rescue in dispatch_claude_pilot() (Path B) is
+            # the single source of truth for the rescue-PR shape and opens a
+            # correct *draft* PR (rescue header + `RECOVERY_PENDING: true` marker
+            # + `wip-rescue` label + canonical `PR:` line + a `wip(mika#1383)`
+            # marker commit for Guard 2). This gate previously opened its own
+            # NON-draft PR, which set the global PR_URL and SHADOWED Path B's
+            # `[ -z "$PR_URL" ]` guard — letting a non-draft PR bypass the
+            # mika#1613 recovery guards (evidence: mika#PR1678, mika#PR1683).
+            # Leaving PR_URL untouched here lets Path B fire correctly. Phase A
+            # above still runs so the branch carries the pilot's full work.
         fi
     fi
 
@@ -2513,7 +2481,46 @@ ${RESULT}"
             _rescue_class_fact="The pilot session wrote file changes but never committed. dispatch-lib auto-committed with \`wip()\` prefix."
         else
             _rescue_title=$(_derive_recovery_pr_title "commit-pushed-no-pr" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
-            _rescue_class_fact="The pilot session committed and pushed but \`gh pr create\` failed. dispatch-lib opened this PR from the existing branch."
+            _rescue_class_fact="The pilot session committed and pushed but did not open a PR (\`gh pr create\` failed, or the pilot ended its turn before invoking it — mika#1383). dispatch-lib opened this PR from the existing branch."
+        fi
+
+        # mika#1679 (Edit 2, mika-arch-ratified Option a, session 2d397bee): for
+        # the commit-pushed-no-pr class, add an empty wip(mika#1383) marker commit
+        # so the PR's head-commit headline matches Guard 2's `^wip\(` regex
+        # (self-dev-webhook-qa `isDraft AND ^wip\(` conjunction). The pilot's own
+        # head commit is a conventional `fix(/feat(` subject, so without this Guard
+        # 2 would not fire — though Guard 1 (RECOVERY_PENDING marker) and qa-review
+        # Step 1.5 (rescue header) still would. The PR *title* is already derived
+        # above from the pilot's real head commit, so this marker does not change
+        # the title — only the head-commit headline Guard 2 inspects. The
+        # dirty-worktree class is already wip()-prefixed by its mika#1282 rescue
+        # commit, so it is excluded here (no second empty commit).
+        #
+        # Idempotent (no marker stacking on re-dispatch): skip the commit when HEAD
+        # is already a wip(mika#1383) marker, but still (re-)push so a marker from a
+        # prior attempt whose push failed reaches origin. Push failure is surfaced,
+        # not silently swallowed: `gh pr create` below opens the PR from the ORIGIN
+        # branch, so an unpushed marker means the PR head won't match `^wip\(` and
+        # Guard 2 won't arm. The rescue still proceeds — Guard 1 (RECOVERY_PENDING)
+        # and qa-review Step 1.5 (rescue header) hold the draft regardless — but the
+        # operator/telemetry must see that the Guard-2 belt is missing.
+        if [ "$RECOVERY_CLASS" = "commit-pushed-no-pr" ]; then
+            _marker_at_head=1
+            if printf '%s' "$(git -C "$WORKTREE_DIR" log -1 --format='%s' 2>/dev/null)" \
+                | grep -qF 'wip(mika#1383): auto-PR-create rescue'; then
+                echo "rescue_marker.skip_commit: head already a wip(mika#1383) marker (branch=$BRANCH)" >&2
+            elif ! git -C "$WORKTREE_DIR" commit --allow-empty --no-verify -m "wip(mika#1383): auto-PR-create rescue for ${REPO}#${ISSUE_NUM}
+
+The pilot committed and pushed but did not reach gh pr create before its turn
+ended. dispatch-lib's mika#1396 rescue opened the draft PR. This empty marker
+commit signals the rescue class so the qa-webhook wip-rescue draft guard fires.
+The pilot's implementation work is in the commit(s) below this one." 2>&9; then
+                _marker_at_head=0
+                echo "rescue_marker.commit_failed: could not create wip(mika#1383) marker (branch=$BRANCH) — Guard 2 not armed; rescue proceeds on Guard 1 + qa-review Step 1.5" >&2
+            fi
+            if [ "$_marker_at_head" = "1" ] && ! git -C "$WORKTREE_DIR" push origin "$BRANCH" 2>&9; then
+                echo "rescue_marker_push.failed: Guard 2 not armed — wip(mika#1383) marker did not reach origin (branch=$BRANCH); rescue proceeds on Guard 1 + qa-review Step 1.5" >&2
+            fi
         fi
 
         RESCUED_PR_URL=$(gh pr create \
