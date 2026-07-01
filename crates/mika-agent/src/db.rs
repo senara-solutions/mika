@@ -7002,6 +7002,21 @@ impl Database {
         Ok(())
     }
 
+    /// End a session unless it is the agent's canonical singleton session (mika#1401).
+    ///
+    /// Singleton agents (`[session] singleton = true` in identity.toml) reuse one
+    /// canonical session across every invocation; ending it would set `ended_at`
+    /// and — worse — surface it in the dashboard as a finished conversation. This
+    /// helper no-ops when `id == canonical_id`, so the canonical session's
+    /// `ended_at` stays NULL forever. When `canonical_id` is `None` (non-singleton
+    /// agent) it behaves exactly like [`end_session`].
+    pub fn end_session_unless_canonical(&self, id: &str, canonical_id: Option<&str>) -> Result<()> {
+        if canonical_id == Some(id) {
+            return Ok(());
+        }
+        self.end_session(id)
+    }
+
     pub fn get_or_create_system_session(&self, agent_id: &str) -> Result<String> {
         let id = format!("system-{agent_id}");
         self.conn.execute(
@@ -7009,6 +7024,28 @@ impl Database {
             params![&id, agent_id],
         )?;
         Ok(id)
+    }
+
+    /// Idempotently create the canonical session for a singleton agent (mika#1401).
+    ///
+    /// Mirrors [`get_or_create_system_session`]: `INSERT OR IGNORE` so the first
+    /// invocation creates the row and every subsequent `mika ask` / `/send` reuses
+    /// it. Unlike the system session the ID is caller-supplied (either the derived
+    /// `canonical-{agent_id}` or an operator-chosen `canonical_id` such as
+    /// mika-prime's zero-UUID). Channel type defaults to `'cli'`; the singleton
+    /// concept is orthogonal to channel — multiple channels merging into one
+    /// session is the designed intent for single-surface oracles.
+    pub fn get_or_create_canonical_session(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        channel_type: &str,
+    ) -> Result<String> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, agent_id, channel_type) VALUES (?1, ?2, ?3)",
+            params![session_id, agent_id, channel_type],
+        )?;
+        Ok(session_id.to_string())
     }
 
     /// Prune ended system/silent sessions older than `retention_secs`.

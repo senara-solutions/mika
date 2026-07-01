@@ -104,9 +104,22 @@ pub async fn run(
         anyhow::bail!("--session-id value must not be empty");
     }
     let reusing_session = session_id.is_some();
-    let session_id = session_id
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Resolve the canonical session for singleton agents (mika#1401). An explicit
+    // --session-id always wins; otherwise a singleton agent (`[session] singleton =
+    // true` in identity.toml) reuses its one canonical session and non-singleton
+    // agents mint a fresh UUID per invocation. Identity is loaded once here and
+    // reused below for the skill allowlist.
+    let identity = mika_agent::prompt::load_identity(&ctx.home_dir);
+    let canonical_session_id =
+        mika_agent::prompt::resolve_canonical_session_id(&identity, ctx.async_db.agent_id());
+    let session_id = if let Some(s) = session_id {
+        s.to_string()
+    } else if let Some(ref canonical) = canonical_session_id {
+        canonical.clone()
+    } else {
+        Uuid::new_v4().to_string()
+    };
+    let is_canonical_session = canonical_session_id.as_deref() == Some(session_id.as_str());
     // Validate session ownership if reusing an existing session
     if reusing_session
         && let Ok(Some(existing)) = ctx.async_db.get_session(&session_id).await
@@ -119,20 +132,34 @@ pub async fn run(
             ctx.async_db.agent_id()
         );
     }
-    // Store task_id in session metadata and as a first-class column for observability correlation
-    let session_metadata = task_id.map(|tid| serde_json::json!({"task_id": tid}).to_string());
-    if let Err(e) = ctx
-        .async_db
-        .create_session_with_metadata(
-            &session_id,
-            ctx.async_db.agent_id(),
-            "cli",
-            session_metadata.as_deref(),
-            task_id,
-        )
-        .await
-    {
-        tracing::warn!(error = %e, "failed to create session");
+    // Create the session. Singleton agents use an idempotent INSERT OR IGNORE on the
+    // shared canonical session — task_id correlation rides on the messages
+    // (internal-tagged via correlated_task_id), not the shared session row. All other
+    // invocations create a per-ask session carrying task_id in metadata and as a
+    // first-class column for observability correlation.
+    if is_canonical_session {
+        if let Err(e) = ctx
+            .async_db
+            .get_or_create_canonical_session(&session_id, "cli")
+            .await
+        {
+            tracing::warn!(error = %e, "failed to create canonical session");
+        }
+    } else {
+        let session_metadata = task_id.map(|tid| serde_json::json!({"task_id": tid}).to_string());
+        if let Err(e) = ctx
+            .async_db
+            .create_session_with_metadata(
+                &session_id,
+                ctx.async_db.agent_id(),
+                "cli",
+                session_metadata.as_deref(),
+                task_id,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to create session");
+        }
     }
     let http_client = reqwest::Client::new();
     let message_sender = crate::init::make_message_sender(
@@ -216,8 +243,13 @@ pub async fn run(
                 );
             }
 
-            // End the session so the dashboard doesn't show it as "ongoing"
-            if let Err(e) = ctx.async_db.end_session(&session_id).await {
+            // End the session so the dashboard doesn't show it as "ongoing".
+            // No-op for singleton agents — the canonical session is never ended.
+            if let Err(e) = ctx
+                .async_db
+                .end_session_unless_canonical(&session_id, canonical_session_id.as_deref())
+                .await
+            {
                 tracing::warn!(error = %e, "failed to end session");
             }
             return Ok(());
@@ -283,7 +315,7 @@ pub async fn run(
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
     let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
-    let identity = mika_agent::prompt::load_identity(&ctx.home_dir);
+    // `identity` was loaded earlier for canonical-session resolution (mika#1401); reuse it.
     if let Some(ref allowlist) = identity.skills.allowlist {
         skill_registry.apply_identity_allowlist(allowlist);
     }
@@ -383,8 +415,13 @@ pub async fn run(
     })
     .await;
 
-    // End the session regardless of agent result so the dashboard shows duration
-    if let Err(e) = ctx.async_db.end_session(&session_id).await {
+    // End the session regardless of agent result so the dashboard shows duration.
+    // No-op for singleton agents — the canonical session is never ended (mika#1401).
+    if let Err(e) = ctx
+        .async_db
+        .end_session_unless_canonical(&session_id, canonical_session_id.as_deref())
+        .await
+    {
         tracing::warn!(error = %e, "failed to end session");
     }
 
