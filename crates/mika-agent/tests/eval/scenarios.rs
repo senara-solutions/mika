@@ -72,6 +72,7 @@ async fn scenario_basic_conversation(provider: Arc<dyn LlmProvider>) -> Scenario
                 input_tokens: Some(response.usage.input_tokens),
                 output_tokens: Some(response.usage.output_tokens),
                 latency_ms: start.elapsed().as_millis() as u64,
+                emitted_shape: None,
             }
         }
         Err(e) => ScenarioOutcome {
@@ -84,6 +85,7 @@ async fn scenario_basic_conversation(provider: Arc<dyn LlmProvider>) -> Scenario
             input_tokens: None,
             output_tokens: None,
             latency_ms: start.elapsed().as_millis() as u64,
+            emitted_shape: None,
         },
     }
 }
@@ -120,6 +122,7 @@ async fn scenario_multi_turn_greeting(provider: Arc<dyn LlmProvider>) -> Scenari
                 input_tokens: None,
                 output_tokens: None,
                 latency_ms: start.elapsed().as_millis() as u64,
+                emitted_shape: None,
             };
         }
     };
@@ -165,6 +168,7 @@ async fn scenario_multi_turn_greeting(provider: Arc<dyn LlmProvider>) -> Scenari
                 input_tokens: Some(response2.usage.input_tokens),
                 output_tokens: Some(response2.usage.output_tokens),
                 latency_ms: start.elapsed().as_millis() as u64,
+                emitted_shape: None,
             }
         }
         Err(e) => ScenarioOutcome {
@@ -177,6 +181,7 @@ async fn scenario_multi_turn_greeting(provider: Arc<dyn LlmProvider>) -> Scenari
             input_tokens: None,
             output_tokens: None,
             latency_ms: start.elapsed().as_millis() as u64,
+            emitted_shape: None,
         },
     }
 }

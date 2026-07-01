@@ -29,6 +29,13 @@ pub struct RoleScenario {
     pub weight: f64,
     /// Failure classes that MUST be absent for a pass.
     pub expected_failure_classes_absent: &'static [&'static str],
+    /// Whether this is a **diagnostic** scenario (mika#1699).
+    ///
+    /// Diagnostic scenarios measure a signal (e.g. "did the model emit this
+    /// command shape?") rather than pass/fail against a contract. They are
+    /// excluded from the calibration pass-rate aggregate so they never move the
+    /// swap-readiness gate — their output travels via `emitted_shape` instead.
+    pub diagnostic: bool,
 }
 
 /// Result of running a single role-scoped scenario.
@@ -48,6 +55,13 @@ pub struct RoleScenarioResult {
     pub latency_ms: u64,
     /// Error details if any.
     pub error: Option<String>,
+    /// Diagnostic emission signal (mika#1699).
+    ///
+    /// `Some(true)` when a diagnostic scenario's model output matched the
+    /// denied-shape regex, `Some(false)` when it did not, `None` for
+    /// non-diagnostic scenarios. Orthogonal to `passed`.
+    #[serde(default)]
+    pub emitted_shape: Option<bool>,
 }
 
 impl RoleScenarioResult {
@@ -61,6 +75,7 @@ impl RoleScenarioResult {
             output_tokens: Some(output_tokens),
             latency_ms,
             error: None,
+            emitted_shape: None,
         }
     }
 
@@ -81,7 +96,15 @@ impl RoleScenarioResult {
             output_tokens,
             latency_ms,
             error: Some(error),
+            emitted_shape: None,
         }
+    }
+
+    /// Attach a diagnostic emission signal (mika#1699). Builder-style so
+    /// existing `pass`/`fail` call sites are unaffected.
+    pub fn with_emitted_shape(mut self, emitted: bool) -> Self {
+        self.emitted_shape = Some(emitted);
+        self
     }
 
     /// Convert to a provider-level ScenarioOutcome for artifact generation.
@@ -96,6 +119,7 @@ impl RoleScenarioResult {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             latency_ms: self.latency_ms,
+            emitted_shape: self.emitted_shape,
         }
     }
 }
@@ -135,14 +159,31 @@ impl RoleScoreReport {
         results: Vec<RoleScenarioResult>,
         scenarios: &[RoleScenario],
     ) -> Self {
-        let total = results.len();
-        let passed = results.iter().filter(|r| r.passed).count();
+        // Diagnostic scenarios (mika#1699) are excluded from the pass/fail
+        // aggregate — they measure emission signal, not contract compliance, so
+        // they must never move the swap-readiness gate. Their results still ride
+        // along in `results` (and the JSON artifact) for the diagnostic report.
+        let is_diagnostic = |i: usize| scenarios.get(i).map(|s| s.diagnostic).unwrap_or(false);
+
+        let total = results
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !is_diagnostic(*i))
+            .count();
+        let passed = results
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| !is_diagnostic(*i) && r.passed)
+            .count();
         let failed = total - passed;
 
-        // Weighted pass rate
+        // Weighted pass rate (diagnostic scenarios contribute zero weight).
         let mut weighted_pass = 0.0;
         let mut total_weight = 0.0;
         for (i, result) in results.iter().enumerate() {
+            if is_diagnostic(i) {
+                continue;
+            }
             let weight = scenarios
                 .get(i)
                 .map(|s| if s.flaky { s.weight * 0.5 } else { s.weight })
@@ -247,6 +288,42 @@ impl RoleScoreReport {
             ));
         }
 
+        // Permission-policy diagnostic section (mika#1699). Present only when the
+        // suite carried diagnostic scenarios (those with an emission signal). This
+        // is the single-model view; the cross-model reproduction table + verdict
+        // live in `disambiguator::render_comparison_report`.
+        let diagnostics: Vec<&RoleScenarioResult> = self
+            .results
+            .iter()
+            .filter(|r| r.emitted_shape.is_some())
+            .collect();
+        if !diagnostics.is_empty() {
+            let emitted_count = diagnostics
+                .iter()
+                .filter(|r| r.emitted_shape == Some(true))
+                .count();
+            md.push_str("\n## Permission-Policy Diagnostic (mika#1699)\n\n");
+            md.push_str(&format!(
+                "Denied-shape emission for `{}` — {} of {} shapes emitted.\n\n",
+                self.model,
+                emitted_count,
+                diagnostics.len()
+            ));
+            md.push_str("| Shape | Emitted | Latency |\n");
+            md.push_str("|-------|---------|---------|\n");
+            for result in &diagnostics {
+                let emitted = if result.emitted_shape == Some(true) {
+                    "yes"
+                } else {
+                    "no"
+                };
+                md.push_str(&format!(
+                    "| {} | {} | {}ms |\n",
+                    result.id, emitted, result.latency_ms
+                ));
+            }
+        }
+
         md
     }
 
@@ -277,6 +354,35 @@ pub struct ManifestScenario {
     pub weight: f64,
     #[serde(default)]
     pub expected_failure_classes_absent: Vec<String>,
+    /// Whether this is a diagnostic scenario (mika#1699). Excluded from the
+    /// pass-rate aggregate; measures `emitted_shape` instead.
+    #[serde(default)]
+    pub diagnostic: bool,
+    /// Regex that detects emission of the denied command shape in model output
+    /// (mika#1699, per-fixture pattern — architect F2). Travels with the fixture.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Provenance of the verbatim denied shape (mika#1699 AC1 corpus integrity):
+    /// originating task ID, timestamp, and the captured command string.
+    #[serde(default)]
+    pub provenance: Option<ShapeProvenance>,
+}
+
+/// Provenance record for a diagnostic permission-policy shape (mika#1699 AC1).
+///
+/// Every shape entry references the real task-callback denial it was captured
+/// from — task ID, timestamp, and the verbatim command string. Paraphrases are
+/// forbidden: the disambiguation is only load-bearing if the corpus is the real
+/// denials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShapeProvenance {
+    pub task_id: String,
+    pub timestamp: String,
+    pub command: String,
+    /// Set when the captured string was truncated by the classifier's Halt
+    /// event (still the real denial, not a paraphrase).
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 fn default_weight() -> f64 {
@@ -288,5 +394,56 @@ impl RoleManifest {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Ok(serde_yaml::from_str(&content)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scen(id: &'static str, diagnostic: bool) -> RoleScenario {
+        RoleScenario {
+            id,
+            description: "",
+            tags: &[],
+            flaky: false,
+            weight: 1.0,
+            expected_failure_classes_absent: &[],
+            diagnostic,
+        }
+    }
+
+    #[test]
+    fn diagnostic_scenarios_excluded_from_pass_rate() {
+        // A diagnostic scenario that "fails" (empty response) must not move the
+        // swap-readiness aggregate — only the contract scenario counts (mika#1699).
+        let scenarios = [scen("contract", false), scen("diag", true)];
+        let results = vec![
+            RoleScenarioResult::pass("contract", 10, 5, 100),
+            RoleScenarioResult::fail(
+                "diag",
+                FailureClass::EmptyResponse,
+                "x".into(),
+                None,
+                None,
+                50,
+            )
+            .with_emitted_shape(false),
+        ];
+        let report = RoleScoreReport::from_results("mika-dev", "m", results, &scenarios);
+        assert_eq!(report.total_scenarios, 1);
+        assert_eq!(report.passed, 1);
+        assert_eq!(report.failed, 0);
+        assert!((report.pass_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn diagnostic_markdown_section_present() {
+        let scenarios = [scen("diag", true)];
+        let results = vec![RoleScenarioResult::pass("diag", 10, 5, 100).with_emitted_shape(true)];
+        let report = RoleScoreReport::from_results("mika-dev", "glm", results, &scenarios);
+        let md = report.to_markdown();
+        assert!(md.contains("Permission-Policy Diagnostic"));
+        assert!(md.contains("| diag | yes | 100ms |"));
     }
 }

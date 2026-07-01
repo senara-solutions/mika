@@ -43,6 +43,11 @@ pub struct ScenarioCalibration {
     pub output_tokens: Option<u64>,
     /// Wall-clock latency in milliseconds.
     pub latency_ms: u64,
+    /// Diagnostic emission signal (mika#1699): whether the model emitted the
+    /// denied command shape. `None` for non-diagnostic scenarios. Consumed by
+    /// `disambiguator::render_comparison_report` to compute the verdict.
+    #[serde(default)]
+    pub emitted_shape: Option<bool>,
 }
 
 /// A single change detected between two calibration artifacts.
@@ -95,6 +100,7 @@ impl CalibrationArtifact {
                     input_tokens: outcome.input_tokens,
                     output_tokens: outcome.output_tokens,
                     latency_ms: outcome.latency_ms,
+                    emitted_shape: outcome.emitted_shape,
                 },
             );
         }
@@ -253,6 +259,7 @@ mod tests {
             input_tokens: Some(100),
             output_tokens: Some(50),
             latency_ms: 200,
+            emitted_shape: None,
         }
     }
 

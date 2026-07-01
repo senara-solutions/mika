@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use mika_agent::calibration::artifact::CalibrationArtifact;
+use mika_agent::calibration::disambiguator::DisambiguatorReport;
 use mika_agent::calibration::providers::create_provider_from_spec;
 use mika_agent::calibration::role::RoleScoreReport;
 use mika_agent::calibration::roles::{mika_arch, mika_dev, mika_orchestrator, mika_qa};
@@ -33,13 +34,14 @@ use mika_agent::calibration::roles::{mika_arch, mika_dev, mika_orchestrator, mik
 #[derive(Parser, Debug)]
 #[command(name = "calibrate", version, about)]
 struct Args {
-    /// Agent role to calibrate (mika-dev, mika-arch).
+    /// Agent role to calibrate (mika-dev, mika-arch). Required unless --compare-disambiguator.
     #[arg(short, long)]
-    role: String,
+    role: Option<String>,
 
     /// Target model in provider/model format (e.g., anthropic/claude-sonnet-4-6).
+    /// Required unless --compare-disambiguator.
     #[arg(short, long)]
-    model: String,
+    model: Option<String>,
 
     /// Path to baseline report for comparison. Pass-rate must meet or exceed baseline.
     #[arg(short, long)]
@@ -48,6 +50,13 @@ struct Args {
     /// Output path for the JSON artifact. Defaults to target/eval-calibration/<role>-<timestamp>.json.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Cross-model disambiguator comparison (mika#1699). Takes two calibration
+    /// artifacts — the glm-5.2 run and the sonnet-4-6 run — and emits the
+    /// reproduction table, latency table, and decision-rule verdict. Skips the
+    /// calibration run entirely.
+    #[arg(long, num_args = 2, value_names = ["GLM_JSON", "SONNET_JSON"])]
+    compare_disambiguator: Option<Vec<PathBuf>>,
 
     /// Maximum cost budget in USD. v1: reported only (DR-7). v2 will enforce mid-suite abort.
     #[arg(long, default_value = "5.0")]
@@ -62,6 +71,23 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
+    // Disambiguator comparison mode (mika#1699) — no LLM calls, just read two
+    // artifacts and emit the cross-model verdict report.
+    if let Some(paths) = &args.compare_disambiguator {
+        run_disambiguator_comparison(paths, args.output.as_deref());
+        return;
+    }
+
+    // Normal calibration run requires role + model.
+    let role = args.role.clone().unwrap_or_else(|| {
+        eprintln!("Error: --role is required (unless --compare-disambiguator is used).");
+        std::process::exit(2);
+    });
+    let model = args.model.clone().unwrap_or_else(|| {
+        eprintln!("Error: --model is required (unless --compare-disambiguator is used).");
+        std::process::exit(2);
+    });
+
     // Initialize environment — same sequence as mika-spirit
     let home_dir = match mika_common::home::resolve_home_dir() {
         Ok(h) => h,
@@ -73,7 +99,7 @@ async fn main() {
     mika_common::dotenv::load_dotenv(&home_dir);
 
     // Validate role
-    let scenarios = match args.role.as_str() {
+    let scenarios = match role.as_str() {
         "mika-dev" => mika_dev::SCENARIOS,
         "mika-arch" => mika_arch::SCENARIOS,
         "mika-qa" => mika_qa::SCENARIOS,
@@ -88,12 +114,12 @@ async fn main() {
     };
 
     // Create provider
-    let provider = match create_provider_from_spec(&args.model) {
+    let provider = match create_provider_from_spec(&model) {
         Some(p) => p,
         None => {
             eprintln!(
                 "Error: could not create provider for '{}'. Check API key is set.",
-                args.model
+                model
             );
             std::process::exit(2);
         }
@@ -102,11 +128,11 @@ async fn main() {
     println!("╭─────────────────────────────────────────────────────╮");
     println!(
         "│  Model Calibration: {}                              ",
-        args.role
+        role
     );
     println!(
         "│  Model: {}                                          ",
-        args.model
+        model
     );
     println!(
         "│  Scenarios: {}                                      ",
@@ -146,7 +172,7 @@ async fn main() {
     for scenario in scenarios {
         print!("  Running {}... ", scenario.id);
 
-        let result = match args.role.as_str() {
+        let result = match role.as_str() {
             "mika-dev" => mika_dev::run_scenario(scenario.id, provider.clone()).await,
             "mika-arch" => mika_arch::run_scenario(scenario.id, provider.clone()).await,
             "mika-qa" => mika_qa::run_scenario(scenario.id, provider.clone()).await,
@@ -168,7 +194,7 @@ async fn main() {
     println!();
 
     // Build score report
-    let report = RoleScoreReport::from_results(&args.role, &args.model, results.clone(), scenarios);
+    let report = RoleScoreReport::from_results(&role, &model, results.clone(), scenarios);
 
     // Print summary
     println!("═══════════════════════════════════════════════════════");
@@ -194,7 +220,7 @@ async fn main() {
     // Write artifact
     let outcomes: Vec<_> = results
         .iter()
-        .map(|r| r.to_scenario_outcome(&args.role, &args.model))
+        .map(|r| r.to_scenario_outcome(&role, &model))
         .collect();
     let artifact = CalibrationArtifact::from_outcomes(&outcomes);
 
@@ -202,7 +228,7 @@ async fn main() {
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         PathBuf::from(format!(
             "target/eval-calibration/{}-{}.json",
-            args.role, timestamp
+            role, timestamp
         ))
     });
 
@@ -301,4 +327,75 @@ async fn main() {
     }
 
     println!("\n  Done.");
+}
+
+/// Cross-model disambiguator comparison (mika#1699).
+///
+/// Loads the glm-5.2 and sonnet-4-6 calibration artifacts, computes the
+/// reproduction/latency tables and the pre-registered decision-rule verdict, and
+/// prints the markdown report to stdout. When `--output` is given, also writes
+/// the markdown to that path and a machine-readable JSON summary alongside it.
+fn run_disambiguator_comparison(paths: &[PathBuf], output: Option<&std::path::Path>) {
+    // clap guarantees exactly 2 via `num_args = 2`.
+    let glm_path = &paths[0];
+    let sonnet_path = &paths[1];
+
+    let glm = match CalibrationArtifact::load(glm_path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "Error: could not load glm artifact {}: {e}",
+                glm_path.display()
+            );
+            std::process::exit(2);
+        }
+    };
+    let sonnet = match CalibrationArtifact::load(sonnet_path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "Error: could not load sonnet artifact {}: {e}",
+                sonnet_path.display()
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let report = DisambiguatorReport::from_artifacts(&glm, &sonnet);
+
+    if report.total_shapes == 0 {
+        eprintln!(
+            "Error: neither artifact contains diagnostic scenarios (emitted_shape). \
+             Did you run `make calibrate-mika-dev` with the mika#1699 scenarios present?"
+        );
+        std::process::exit(2);
+    }
+
+    let markdown = report.to_markdown();
+    println!("{markdown}");
+
+    if let Some(out) = output {
+        if let Err(e) = std::fs::write(out, &markdown) {
+            eprintln!(
+                "Warning: failed to write markdown report to {}: {e}",
+                out.display()
+            );
+        } else {
+            println!("\n  Report:  {}", out.display());
+        }
+        let json_path = out.with_extension("json");
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&json_path, json) {
+                    eprintln!(
+                        "Warning: failed to write JSON summary to {}: {e}",
+                        json_path.display()
+                    );
+                } else {
+                    println!("  Summary: {}", json_path.display());
+                }
+            }
+            Err(e) => eprintln!("Warning: failed to serialize JSON summary: {e}"),
+        }
+    }
 }

@@ -28,6 +28,12 @@ pub struct ScenarioOutcome {
     pub output_tokens: Option<u64>,
     /// Wall-clock latency in milliseconds.
     pub latency_ms: u64,
+    /// Diagnostic emission signal (mika#1699): `Some(true)` if a diagnostic
+    /// scenario's output matched the denied-shape regex, `Some(false)` if not,
+    /// `None` for non-diagnostic scenarios. Threaded into the calibration
+    /// artifact so the cross-model disambiguator verdict can be computed.
+    #[serde(default)]
+    pub emitted_shape: Option<bool>,
 }
 
 /// A boxed async future returning a `ScenarioOutcome`.

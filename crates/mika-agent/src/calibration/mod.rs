@@ -8,6 +8,7 @@
 //! - Failure classification taxonomy
 
 pub mod artifact;
+pub mod disambiguator;
 pub mod failure;
 pub mod providers;
 pub mod role;

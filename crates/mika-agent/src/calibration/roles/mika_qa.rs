@@ -25,6 +25,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "per_ac_enumeration",
@@ -33,6 +34,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.5,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "absence_claim_grounding",
@@ -41,6 +43,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 2.0,
         expected_failure_classes_absent: &["Fabrication", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "wip_rescue_skip",
@@ -49,6 +52,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 2.0,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "no_fabricated_fix",
@@ -57,6 +61,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 2.0,
         expected_failure_classes_absent: &["Fabrication", "ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "duplicate_claim_grounded",
@@ -65,6 +70,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 2.0,
         expected_failure_classes_absent: &["Fabrication", "EmptyResponse"],
+        diagnostic: false,
     },
 ];
 

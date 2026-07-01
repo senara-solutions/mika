@@ -24,6 +24,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "groom_milestone",
@@ -32,6 +33,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "citation_discipline",
@@ -40,6 +42,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["Fabrication"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "disposition_keyword_discipline",
@@ -48,6 +51,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "required_finding_list",
@@ -56,6 +60,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "groomed_no_tbds_passes",
@@ -64,6 +69,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "groomed_with_tbd_rejected",
@@ -72,6 +78,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "groomed_with_placeholder_path_rejected",
@@ -80,6 +87,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.0,
         expected_failure_classes_absent: &["ContractViolation"],
+        diagnostic: false,
     },
 ];
 
