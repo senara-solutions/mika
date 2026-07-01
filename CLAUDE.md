@@ -113,6 +113,30 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 - **Docker images:** Multi-stage builds with BuildKit cache. `Dockerfile.agent` (95MB) for per-customer containers. `Dockerfile.gateway` for the stateless gateway. Both use rustls, non-root user `mika` (UID 1000). Release profile: LTO + strip. `docker-compose.yml` defines agent, gateway, and postgres services. **Host dependency:** `jq` is required by all skill handler scripts.
 - **CI/CD:** Five GitHub Actions workflows: `ci.yml` (PR checks), `pr-body-validation.yml` (PR body validation), `release-pr.yml` (versioning/changelog via release-please), `release.yml` (cross-platform binaries), `publish-ui.yml` (`@senara-solutions/ui` to npmjs.org as a public package). All actions pinned to commit SHAs. CI includes a `byte-slice-lint` job that runs `scripts/check-byte-slices.sh` to prevent unsafe `&str` byte-slicing patterns that panic on multi-byte UTF-8 (#764), a `loop-select-lint` job that runs `scripts/check-loop-select.sh` to reject `tokio::select!` inside `run_loop`'s body — the deadline-check guarantee depends on iteration-top semantics not being shadowed (#848), and a `docker-build` job that builds all Dockerfiles (agent, gateway, mika-os, mika-runtime-server, mika-runtime-gateway, mika-runtime-cli, mika-runtime-all) on every PR to catch structural bugs before merge. **PR Body Validation (#527):** `pr-body-validation.yml` runs `scripts/check-pr-body-consistency.sh` on every `pull_request` event (opened, edited, synchronize). Two checks: (a) closure-consistency — when the PR body declares `Closes #N`, the script walks #N's formal sub-issues via GitHub GraphQL `trackedIssues`; if any are OPEN and not acknowledged, the gate hard-fails (`exit 1`); (b) follow-up tracker — when the body contains a deferral trigger phrase (e.g., "will be fixed in a follow-up", "deferred to a separate PR"), a `Tracked in: <ref>` line naming the tracker issue/PR is required. To resolve failures: add `Tracked in: senara-solutions/<repo>#<number>` lines to the PR body for each deferred item, or close the sub-issues in the same PR.
 
+## Orchestrator Role Transfer (mika#1641)
+
+The platform-orchestrator seat is transferring from Claude Code to **Mika** (the
+executive-assistant agent); Claude Code's role shrinks to **monitor-only**. This is a
+staged, bounded-reversible transfer with seven acceptance criteria (AC1–AC7). Code and
+docs (AC1 tool surface, AC2 calibration, AC3 handbook, AC7 rollback) ship ahead of the
+operational cut (AC5 pair-mode window, AC6 hard cut). Key documents:
+
+- **Operator handbook:** `docs/operator/mika-orchestrator-handbook.md` — daily-rhythm
+  checklist, wedge taxonomy, routing matrix, hard rules, escalation chain, tool
+  quickref. Seeds Mika's core memory (AC3).
+- **Rollback procedure:** `docs/operator/mika-orchestrator-rollback.md` — one-line
+  reverts to the pre-transfer topology (AC7).
+- **Bearing-circle decision:** `docs/operating/bearing-circle.md` — whether Mika enters
+  Mika Prime's conversation circle. **Vincent-only (AC4), decision pending**; AC5 gates
+  on it.
+- **Calibration:** `make calibrate-mika-orchestrator MODEL=<provider/model>` +
+  `docs/eval/calibration/mika-orchestrator-1641/` (AC2). No orchestrator model swap
+  without a passing run (mika#1190).
+
+Mika's orchestrator tool surface is the `github` skill added to
+`DEFAULT_AGENT_SKILL_ALLOWLIST` (`crates/mika-common/src/home.rs`), on top of the
+`git-ops` / `shell-exec` / `tmux` / `file-reader` / `gh-read-only` she already carries.
+
 ## Environment Variables
 
 See `.env.example` for the full list. Per-provider API keys (set the one for your active provider):
