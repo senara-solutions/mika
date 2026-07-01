@@ -1,0 +1,32 @@
+# mika#1699 permission-policy denial corpus (Phase 1 data — operator-provisioned)
+
+Provisioned by orchestrator-CC 2026-07-01 because Phase 1 (corpus recovery)
+requires DB access (`~/.mika/data/mika.db`) that permission-policy denies —
+the disambiguator is blocked by the exact class it's meant to disambiguate.
+Data-only operator work (no code, no plan change); pilot skips Phase 1 and
+starts at Phase 2 (fixture authoring) using these verbatim strings.
+
+## Verbatim denied shapes (from `tasks.result`, wedge window 2026-06-30 13:00-18:30Z)
+
+Format per entry: task_id (8-char) | timestamp | verbatim command from Halt event
+
+Select the top 8 for AC1 corpus (weighted by class distinctness — bare cd, cd+;-chain,
+grep-alternation, bash-if-conditional, perl-inline, make+redirect, bash-script+PIPESTATUS,
+cd+subshell+&&). Document exclusions in manifest per AC1's "exclude if unrecoverable" clause.
+
+## Corpus entries (sorted by shape uniqueness)
+
+d5fc8f4c | 2026-06-30T13:38:40 |  Bash: cd /data/workspace/mika-platform/.claude/worktrees/fix-1613-loop-ships-unreviewed-code-mika-1282-wip/mika
+82aa803d | 2026-06-30T13:48:49 |  Bash: cd /data/workspace/mika-platform/.claude/worktrees/fix-1645-qa-review-cross-artifact-equivalence/mika; cargo clippy -p mika-agent --tests 2>&1 | grep -E "warning|error" | head -20; echo "=== clippy ex [bash-grep]
+1c6955c8 | 2026-06-30T14:11:20 |  Bash: if [ -f ~/.mika/data/mika.db ]; then
+962a3504 | 2026-06-30T14:31:55 |  Bash: cd /data/workspace/mika-platform/.claude/worktrees/fix-1676-team-engine-team-run-completes-status/mika; grep -n "fn schema_version" crates/mika-agent/src/db.rs; sed -n '/fn schema_version/,/^    }/p'  [bash-grep]
+2c7f9ee2 | 2026-06-30T14:50:50 |  Bash: perl -i -pe 's/\bgen\b/gen_dir/g if $. >= 325 && $. <= 380' crates/mika-agent/src/startup.rs && grep -n "gen_dir\|let gen" crates/mika-agent/src/startup.rs [bash-grep]
+b816802e | 2026-06-30T14:58:28 |  Bash: cd /data/workspace/mika-platform/.claude/worktrees/fix-1671-teams-run-team-early-fail-on-all/mika; echo "=== LoopResult enum ==="; grep -n "enum LoopResult" crates/mika-agent/src/agent_loop/mod.rs; se [bash-grep]
+eb6913be | 2026-06-30T15:00:32 |  Bash: bash scripts/verify-pipeline.sh 2>&1 | tail -40; echo "verify exit: ${PIPESTATUS[0]}"
+b51d6c51 | 2026-06-30T15:24:38 |  Bash: cd /data/workspace/mika-platform/.claude/worktrees/fix-1682-mika-dev-mika-dev-auto-un-drafts-wip/mika
+9c6fb5ac | 2026-06-30T15:41:47 |  Bash: grep -n "^_[a-z_]*() {\|^[a-z_]*() {\|^function " skills/bundled/_shared/dispatch-lib.sh | awk -F: '$1 > 700 && $1 < 2540' [bash-grep]
+26437061 | 2026-06-30T15:45:46 |  Bash: make verify-bundled-skills 2>&1 | tail -30
+a50b63fe | 2026-06-30T16:06:52 |  Bash: cd /data/workspace/mika-platform/.claude/worktrees/fix-1680-mika-dev-tui-broken-glyph-rendering-in/mika
+031cd31e | 2026-06-30T16:42:33 |  Bash: cd /data/workspace/mika-platform/.claude/worktrees/fix-1655-qa-review-skill-does-not-auto-fire-on/mika
+18287c82 | 2026-06-30T17:55:36 |  Bash: cd "$(git rev-parse --show-toplevel)" && git add -A && git status --short
+9c554b38 | 2026-06-30T18:29:36 |  Bash: grep -n '^[a-zA-Z_][a-zA-Z0-9_]*()' skills/bundled/_shared/dispatch-lib.sh | awk -F: '$1 > 900 && $1 < 2570 {print}' | head -40 [bash-grep]
