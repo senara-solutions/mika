@@ -42,7 +42,14 @@ pub struct ScenarioCalibration {
     /// Output token count.
     pub output_tokens: Option<u64>,
     /// Wall-clock latency in milliseconds.
-    pub latency_ms: u64,
+    ///
+    /// `Option` (not bare `u64`) so hand-authored baselines that omit latency
+    /// (e.g. `mika-dev-1633`, which records `null`) still deserialize. A bare
+    /// `u64` here made those baselines unloadable — which, under the #1701 gate,
+    /// now means exit 2 instead of a silent pass. Tolerating `null` keeps a
+    /// genuine committed baseline usable as a real gate.
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
 }
 
 /// A single change detected between two calibration artifacts.
@@ -94,7 +101,7 @@ impl CalibrationArtifact {
                     error_class: outcome.error.as_ref().map(|e| classify_error(e)),
                     input_tokens: outcome.input_tokens,
                     output_tokens: outcome.output_tokens,
-                    latency_ms: outcome.latency_ms,
+                    latency_ms: Some(outcome.latency_ms),
                 },
             );
         }
@@ -132,6 +139,31 @@ impl CalibrationArtifact {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&content)?)
+    }
+
+    /// Unweighted pass rate across all providers/scenarios: `pass_count / total`.
+    ///
+    /// The swap-gate compares a run's unweighted pass rate against the baseline's
+    /// (#1701 AC8). Artifacts do not carry per-scenario weights (DR-7), so this is
+    /// the only rate an artifact can report — and the run side must use the same
+    /// unweighted accessor for the comparison to be meaningful. Returns `0.0` for
+    /// an empty artifact.
+    pub fn unweighted_pass_rate(&self) -> f64 {
+        let total = self
+            .providers
+            .values()
+            .flat_map(|p| p.scenarios.values())
+            .count();
+        if total == 0 {
+            return 0.0;
+        }
+        let passed = self
+            .providers
+            .values()
+            .flat_map(|p| p.scenarios.values())
+            .filter(|s| s.outcome == "pass")
+            .count();
+        passed as f64 / total as f64
     }
 }
 
@@ -254,6 +286,52 @@ mod tests {
             output_tokens: Some(50),
             latency_ms: 200,
         }
+    }
+
+    #[test]
+    fn test_unweighted_pass_rate() {
+        // 2 pass / 3 total = 0.666…
+        let artifact = CalibrationArtifact::from_outcomes(&[
+            sample_outcome("a", "role", true),
+            sample_outcome("b", "role", true),
+            sample_outcome("c", "role", false),
+        ]);
+        assert!((artifact.unweighted_pass_rate() - 2.0 / 3.0).abs() < 1e-9);
+
+        // All pass = 1.0
+        let all_pass = CalibrationArtifact::from_outcomes(&[sample_outcome("a", "role", true)]);
+        assert_eq!(all_pass.unweighted_pass_rate(), 1.0);
+    }
+
+    #[test]
+    fn test_load_tolerates_null_latency() {
+        // Regression for #1701: the mika-dev-1633 committed baseline records
+        // `latency_ms: null`. A bare-`u64` field made it unloadable, which the
+        // gate now treats as exit 2. Assert `null` deserializes to `None`.
+        let json = r#"{
+            "version": 1,
+            "timestamp": "2026-06-29T00:00:00+00:00",
+            "providers": {
+                "mika-dev": {
+                    "model": "openrouter/z-ai/glm-5.2",
+                    "scenarios": {
+                        "s1": {
+                            "outcome": "pass",
+                            "error_class": null,
+                            "input_tokens": null,
+                            "output_tokens": null,
+                            "latency_ms": null
+                        }
+                    }
+                }
+            }
+        }"#;
+        let artifact: CalibrationArtifact = serde_json::from_str(json).unwrap();
+        assert_eq!(artifact.unweighted_pass_rate(), 1.0);
+        assert_eq!(
+            artifact.providers["mika-dev"].scenarios["s1"].latency_ms,
+            None
+        );
     }
 
     #[test]
