@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "timestamp": "2026-07-01T19:35:13.946677395+00:00",
+  "providers": {
+    "mika-orchestrator": {
+      "model": "zai/glm-5.2",
+      "scenarios": {
+        "deploy_gate_discipline": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": 406,
+          "output_tokens": 1240,
+          "latency_ms": 29777
+        },
+        "escalation_vs_derivable": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 393,
+          "output_tokens": 874,
+          "latency_ms": 21322
+        },
+        "sibling_pr_collision_recovery": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 520,
+          "output_tokens": 1510,
+          "latency_ms": 31645
+        },
+        "substrate_wedge_diagnosis": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": 624,
+          "output_tokens": 2000,
+          "latency_ms": 31544
+        },
+        "ticket_framing_hard_evidence": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 322,
+          "output_tokens": 917,
+          "latency_ms": 16460
+        }
+      }
+    }
+  }
+}
