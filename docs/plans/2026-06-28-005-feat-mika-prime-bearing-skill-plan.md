@@ -189,6 +189,25 @@ This supplements (does not replace) the existing Stage 0→1 parity gate. Implem
 - Cloud transposition adjustments
 - Well-known agent provisioning changes — Prime is manually provisioned, not in `well_known_agents.rs`
 
+## Definition of Done
+
+- The `bearing` bundled skill exists at `skills/bundled/bearing/` with `skill.toml` and `system_prompt.md`, discovered at build time by `build.rs`.
+- `skill.toml` carries `[constraints] required_tools = ["run_gh", "search_memory", "query_knowledge_graph"]`, `always_on = false`, and the bearing trigger keywords.
+- `system_prompt.md` instructs the three required tool calls before any bearing text and documents the Ground watermark line format.
+- `make verify-bundled-skills`, `cargo build`, and `cargo test -p mika-agent` all pass.
+- Operational steps (Prime allowlist add, `core_memory` de-staling) documented in the plan for the operator to apply post-merge (runtime config, not CI-verified).
+
+## Acceptance criteria
+
+The issue body has no `## Acceptance criteria` section; these are derived from the plan's Implementation Steps and Verification (Piece E). Runtime-config items (Pieces C, D) are operator-applied and not CI-gated — they are documented, not asserted here.
+
+1. **Skill manifest exists and is correct.** `skills/bundled/bearing/skill.toml` exists with `[skill].name = "bearing"`, `always_on = false`, `[triggers].keywords` containing the bearing keywords (`status`, `bearing`, `what's next`, `priorities`, `where are we`, …), and `[constraints].required_tools = ["run_gh", "search_memory", "query_knowledge_graph"]`.
+2. **System prompt exists with the grounding ritual.** `skills/bundled/bearing/system_prompt.md` exists, mandates calling all three required tools before composing any bearing text, prohibits citing `core_memory` snapshots as world-state ground truth, and specifies the Ground watermark format `Ground: <ISO 8601 timestamp> · gh ✓ <issue count> open · search_memory ✓ · kg ✓ <entity count>` as the first line of a bearing.
+3. **Build-time discovery succeeds.** `cargo build` compiles clean; `build.rs` discovers the `bearing` bundle and includes it in `BUNDLED_SKILL_MANIFESTS`.
+4. **Structural bundle verification passes.** `make verify-bundled-skills` passes for the new bundle — required files present, manifest parses, `required_tools` tokens resolve, no `tools.json` needed (all required tools are builtins or provided by Prime's existing `github` skill).
+5. **No regressions.** `cargo test -p mika-agent` passes with no regressions in skill loading, manifest parsing, or `required_tools` enforcement.
+6. **Sibling-coordination note is honored.** The plan documents that the companion `gh_read`-only ticket must swap `run_gh` → `gh_read` in this `required_tools` line within the same PR, else the mika#516 availability filter drops the unavailable tool and the gate passes vacuously.
+
 ## Risk Assessment
 
 - **Low risk:** The new skill is additive — no existing code paths change. The `required_tools` enforcement mechanism is proven (used by qa-review, mika-arch-groom-ticket, mika-arch-second-review, etc.)
