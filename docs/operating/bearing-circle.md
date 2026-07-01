@@ -1,13 +1,11 @@
 # Bearing circle — who talks to Mika Prime (mika#1641 AC4)
 
-> **Status: DECISION PENDING (Vincent-only).** This document records the
-> bearing-circle question the orchestrator role transfer (mika#1641) raises, the
-> A/B/C options, and the gate contract. It **surfaces** the decision; it does not
-> resolve it. Per the hard rule `feedback-prime-conversation-circle-closed`
-> (2026-06-19), the architect cannot ratify a change to a closed conversation
-> circle — only Vincent can. When Vincent picks an option, record it in the
-> "Decision" section below and update `feedback-prime-conversation-circle-closed`
-> if the answer expands the circle, so future operators do not relitigate.
+> **Status: DECIDED — Option B (2026-07-01, Vincent).** Mika Orchestrator routes to
+> Mika Prime via orchestrator-CC (monitor-relay). The bearing-circle invariant from
+> `feedback-prime-conversation-circle-closed` is preserved unchanged — Mika is NOT
+> added to the circle. This document is retained as the decision record; the
+> "Options" and "How the decision should be routed" sections describe the
+> deliberation, and the "Decision" section at the bottom carries the ratify.
 
 ## The invariant today
 
@@ -53,13 +51,31 @@ that this document's "Decision" section is filled before dispatching.
 
 ## Decision
 
-> _Unfilled. Vincent has not yet picked A/B/C. Fill this section with the chosen
-> option, the date, and a one-line rationale when the call is made. Until then, the
-> orchestrator (Mika) does **not** assume direct Prime access — she routes any
-> Prime-level call through Vincent (the conservative default, equivalent to option C)
-> pending the decision._
+- **Chosen option:** **B — Mika routes to Prime through orchestrator-CC (monitor-relay).**
+- **Decided by:** Vincent
+- **Date:** 2026-07-01
+- **Rationale:** Preserves the bearing-protection invariant unchanged (Prime's
+  conversation circle stays: Vincent + orchestrator-CC + samidarko-claude
+  case-by-case). The added hop IS the protection — orchestrator-CC filters
+  proximity-vs-membership at both ends of the relay. Mika's routing pattern
+  becomes: rule-what's-mine directly; on recommend-what-isn't, formulate the
+  recommendation and hand it to orchestrator-CC to surface to Prime; Prime's
+  answer returns via the same monitor-relay path.
 
-- **Chosen option:** _pending_
-- **Decided by:** _pending (Vincent)_
-- **Date:** _pending_
-- **Rationale:** _pending_
+### Operational shape (implementation note for AC5 pair-mode window and AC3 handbook)
+
+- **Mika's side:** when she reaches a bearing-scope / founder-scope question she
+  cannot rule herself, she formulates a Prime-brief with A/B/C framing (or
+  equivalent recommendation shape) and hands it to orchestrator-CC via a
+  designated relay path (inbox message, direct A2A call, or a `/mika-relay-prime`
+  skill — the exact mechanism is AC5-window work).
+- **Orchestrator-CC's side:** on receiving a Prime-brief from Mika, orchestrator-CC
+  invokes `/mika-ask-prime` on Mika's behalf, receives Prime's ruling, and relays
+  it back to Mika verbatim. Orchestrator-CC does not re-interpret Prime's answer;
+  the relay is a courier role, not an editorial one.
+- **Escalation path:** if Prime surfaces the question as milestone-scope, the
+  usual escalation-to-Vincent chain fires — Mika receives the surface with the
+  same routing shape she would use for a direct Vincent call.
+- **`feedback-prime-conversation-circle-closed` remains unchanged:** the hard
+  rule's list of who talks to Prime is not amended. Mika reaches Prime through a
+  circle member (orchestrator-CC), not as a circle member herself.
