@@ -198,6 +198,17 @@ Wiring: `mika-platform/.claude/settings.json` PreToolUse entry, following the pa
 4. **False positive orphans.** If a branch exists locally but the corresponding PR was renamed/rebased, the PR-lookup may fail. Fallback: `gh pr list --head <branch>` returns empty even for merged PRs. Consider also probing `gh api repos/<repo>/pulls?head=<owner>:<branch>&state=all` for archived PRs.
 5. **Hook cadence.** Firing the hook on every `git commit` might spam. Rate-limit or dedupe to once per session? Or fire only on commit to main/orchestrator-CC session's own commits, not on worktree-internal commits (which would recursively check themselves)? Architect judgment.
 
+## Acceptance criteria
+
+Transcribed verbatim from mika#1694. This mika-scoped PR delivers the **mika-side** subset (AC3 webhook handler + AC5 docs); AC1/AC2/AC4/AC6 are the companion **mika-platform** PR's responsibility (scripts + Makefile + pre-commit hook + retroactive cleanup), per the cross-repo split in § Repository shape.
+
+- [ ] **AC1** — `make worktrees-audit` exists. Lists every worktree with: branch name, PR number (or `<no PR>`), PR state, dirty-flag. Exit 0 on clean state, non-zero on dirty/orphan presence. *(mika-platform companion PR)*
+- [ ] **AC2** — `make worktrees-clean` exists. Removes worktrees whose PRs are MERGED or CLOSED. Refuses to remove dirty worktrees. Lists orphans without removing unless `--orphans` passed. *(mika-platform companion PR)*
+- [ ] **AC3** — Git hook (or webhook handler) wired on `pull_request.closed`: invokes the cleanup for that specific worktree. Located in dispatch-lib OR a new hook script — architect-bearing. *(mika-side — this PR)*
+- [ ] **AC4** — Operator-CC handsoff pre-commit hook: asserts no dirty worktrees. Surfaces them loudly so the operator can decide salvage/discard. Located in `.claude/hooks/` or similar. *(mika-platform companion PR)*
+- [ ] **AC5** — Documentation in `docs/operator/worktree-hygiene.md` (NEW) explaining the audit + clean commands + when to run + recovery if a worktree gets stranded mid-pilot. *(mika-side — this PR)*
+- [ ] **AC6** — Post-implementation, the existing 14 worktrees are reduced to ~4 (main + active PRs). Verified by `make worktrees-audit`. *(mika-platform companion PR — retroactive cleanup)*
+
 ## Out of scope (repeated)
 
 - 30+ stale origin branches — separate operator decision (some are referenced by closed PRs for history).
