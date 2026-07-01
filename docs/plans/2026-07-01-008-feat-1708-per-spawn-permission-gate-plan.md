@@ -27,22 +27,25 @@ Copied here for plan-on-branch coherence — see mika#1708 body for the full rat
 4. **Migration: 3 phases with measurable thresholds.** Phase 1 opt-in (`MIKA_PERMISSION_POLICY_MODE=per_spawn`). Phase 2 flip default after N=50 dispatches + zero blocks. Phase 3 retire classic after M=7 days + zero rollbacks.
 5. **Fork strategy: (a) senara-solutions/claude-pilot-py-fork** — motto-aligned. **BUT Vincent-scope decision** per architect F4 pre-implementation gate.
 
-## Pre-implementation gate (Vincent-scope)
+## Fork strategy resolved 2026-07-01
 
-**Blocks dispatch of mika#1708 pilot** — do NOT toggle `ready` on this ticket until Vincent decides fork strategy per architect F4:
+Pre-implementation gate from prior architect F4 pass is **CLEARED**:
 
-- **(a) Fork claude-pilot-py under senara-solutions/claude-pilot-py-fork.** Preferred.
-- **(b) Upstream PR to Anthropic and wait.**
-- **(c) Internal patch layer wrapping cpp imports.**
+- Vincent made `senara-solutions/claude-pilot-py` **public** 2026-07-01 ~14:17Z. Repo pre-existed under this name; no separate `-fork` repo needed.
+- SSC ratified OSS shape 2026-07-01 ~15:29Z: Apache 2.0, evaluator-only scope, upstream-first PR posture, boundary-at-commit-one (no Mika-specific policy contents in the public repo — those stay in the mika repo, loaded by cpp as config).
+- Prime ruled 2026-07-01 ~15:00Z: (a) and (b) are one road with a merge point. Fork now (closes wedge today) AND open upstream PR to `anthropics/claude-agent-sdk` in parallel. Fork's success condition = its own retirement. (c) rejected.
 
-Once Vincent ratifies (a/b/c), toggle ready → dev-pilot dispatches.
+**Upstream PR track lives on `senara-solutions/claude-pilot-py#67`** — blocked-by this ticket; opens once the evaluator lands on cpp `main`.
 
-## Implementation phases (dispatch order after Vincent's fork decision)
+**Public-repo hygiene already applied** (commit `6dcbd62` on cpp main): Apache 2.0 LICENSE, repo description, three name-leak scrubs in plan docs.
 
-**Phase 1 — cpp fork + bashlex integration (~1-2 days):**
-- Fork `claude-pilot-py` per Vincent's decision (senara-solutions/claude-pilot-py-fork if (a)).
+## Implementation phases
+
+**Phase 1 — bashlex integration on `senara-solutions/claude-pilot-py` (~1-2 days):**
+- Land PR directly on `senara-solutions/claude-pilot-py` (public repo, no fork needed).
 - Add `bashlex` dependency in `pyproject.toml`.
 - Author `claude_pilot/per_spawn.py` — new module implementing the decomposition + state-tracking + per-binary evaluator. Does NOT touch existing `permissions.py` yet.
+- **Evaluator-only scope (SSC boundary discipline):** the module provides the generic per-spawn engine API. No Mika-specific policy contents. Test fixtures use synthetic "shell command safety" patterns unrelated to Mika's actual deployment.
 - Unit tests: decomposition (AC1), state-tracking built-ins (AC2), per-binary safety functions (AC3) — 30+ test cases covering supported + unsupported shell + built-in classifications.
 
 **Phase 2 — mode selection + audit events (~1 day):**
