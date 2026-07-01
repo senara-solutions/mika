@@ -370,7 +370,19 @@ pub(crate) fn resolve_canonical_provider_model<'a>(
         && !real_provider.is_empty()
         && !real_model.is_empty()
     {
-        return (real_provider, real_model);
+        // Normalize the aggregator-namespace provider segment to its canonical
+        // ProviderKind config-key form so the variant directory matches what
+        // `scan_generated_variants` accepts. OpenRouter routes GLM as
+        // `z-ai/glm-5.2`, but the loader only recognizes `zai` (the config
+        // key). Without this, variants were written under `generated/z-ai/`
+        // and silently orphaned (mika#1663). On parse failure (provider not a
+        // known ProviderKind), fall back to the raw split — fail-open,
+        // preserving legacy behavior for unmapped aggregator namespaces.
+        let canonical_provider: &'a str = match real_provider.parse::<ProviderKind>() {
+            Ok(real_kind) => real_kind.config_prefix(),
+            Err(_) => real_provider,
+        };
+        return (canonical_provider, real_model);
     }
 
     (provider_name, model_name)
@@ -5023,6 +5035,97 @@ mod tests {
             resolved.variant_descriptor(),
             "generated_canonical:minimax/minimax-m2.7"
         );
+    }
+
+    #[test]
+    fn test_resolve_canonical_normalizes_openrouter_zai_alias() {
+        // AC3 (mika#1663): OpenRouter routes GLM as `z-ai/glm-5.2`, but the
+        // variant loader only accepts the config-key form `zai`. The resolver
+        // must collapse the `z-ai` aggregator namespace to `zai` so the writer
+        // and the loader agree on the on-disk directory name.
+        assert_eq!(
+            resolve_canonical_provider_model("openrouter", "z-ai/glm-5.2"),
+            ("zai", "glm-5.2")
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_leaves_matching_namespace_unchanged() {
+        // Providers whose OpenRouter namespace already equals their config key
+        // (minimax, anthropic, deepseek, …) are unaffected by normalization.
+        assert_eq!(
+            resolve_canonical_provider_model("openrouter", "minimax/minimax-m2.7"),
+            ("minimax", "minimax-m2.7")
+        );
+        assert_eq!(
+            resolve_canonical_provider_model("openrouter", "anthropic/claude-sonnet-4"),
+            ("anthropic", "claude-sonnet-4")
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_native_zai_unchanged() {
+        // Native zai (`llm_provider = "zai"`) has no slash in its model name —
+        // the split path is never taken, inputs pass through unchanged. This is
+        // the read side that must converge on the same `zai` key the OpenRouter
+        // write side now produces.
+        assert_eq!(
+            resolve_canonical_provider_model("zai", "glm-5.2"),
+            ("zai", "glm-5.2")
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_unknown_namespace_fails_open() {
+        // An aggregator namespace that is not a known ProviderKind is left
+        // verbatim — fail-open preserves legacy behavior for unmapped routes.
+        assert_eq!(
+            resolve_canonical_provider_model("openrouter", "someprovider/some-model"),
+            ("someprovider", "some-model")
+        );
+    }
+
+    #[test]
+    fn test_resolve_prompt_openrouter_zai_finds_canonical_zai_variant() {
+        // End-to-end loop invariant for mika#1663: a variant stored under the
+        // canonical `zai/glm-5.2` key (where the fixed writer now lands) is
+        // found when resolved via the OpenRouter `z-ai/glm-5.2` ctx.
+        let mut entry = SkillEntry {
+            manifest: SkillManifest {
+                skill: super::super::manifest::SkillInfo {
+                    name: "test".to_string(),
+                    description: "test".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                },
+                triggers: super::super::manifest::Triggers { keywords: vec![] },
+                llm: Default::default(),
+                constraints: Default::default(),
+                output: Default::default(),
+                context: std::collections::HashMap::new(),
+                variants: Default::default(),
+            },
+            dir: PathBuf::from("/skills/test"),
+            keywords_lower: vec![],
+            prompt_snippet: "Base prompt.".to_string(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_overrides: HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
+            model_overrides: HashMap::new(),
+        };
+        entry
+            .generated_model_prompts_mut()
+            .insert("zai/glm-5.2".to_string(), "GLM variant.".to_string());
+
+        let resolved = entry.resolve_prompt("openrouter", "z-ai/glm-5.2");
+        assert_eq!(resolved.text, "GLM variant.");
+        assert_eq!(resolved.source, PromptVariantSource::GeneratedCanonical);
+        assert_eq!(resolved.key.as_deref(), Some("zai/glm-5.2"));
     }
 
     #[test]
