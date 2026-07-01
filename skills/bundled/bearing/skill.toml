@@ -1,0 +1,16 @@
+[skill]
+name = "bearing"
+version = "0.1.0"
+description = "Mika Prime's bearing-render skill — produces priority calls and verdicts grounded in current operational state."
+always_on = false
+timeout_secs = 30
+
+[triggers]
+keywords = [
+  "status", "mika status", "what's next", "what is next",
+  "priority", "priorities", "bearing", "what do you see",
+  "read the room", "where are we"
+]
+
+[constraints]
+required_tools = ["run_gh", "search_memory", "query_knowledge_graph"]
