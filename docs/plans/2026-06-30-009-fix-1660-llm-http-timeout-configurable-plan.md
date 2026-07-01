@@ -30,9 +30,9 @@ The retry deadline math (`TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS` at `mo
 
 ## Implementation outline
 
-0. **Pre-commit survey (architect F-Q3):** grep `crates/mika-common/src/llm/` for an existing `LlmConfig` or `Config` struct. If found, implement the helper as `LlmConfig::http_timeout()` and route call sites through that struct. If none exists, `mod.rs` is the correct home (per Step 1 below). Decision made at implementation time; either branch satisfies AC2.
+0. **Pre-commit survey (architect F-Q3) — RESOLVED at groom time:** grep of `crates/mika-common/src/llm/` (2026-07-01) confirms **no `LlmConfig` or `Config` struct exists** in that directory. The helper therefore lives as a free function in `mod.rs` (Step 1 below); there is no config struct to hang it off. This closes F-Q3 unconditionally — no at-implementation-time branch remains.
 
-1. **New helper in `mika-common/src/llm/mod.rs`** (or on existing `LlmConfig` per Step 0): `pub fn http_timeout_secs() -> u64` — reads `MIKA_LLM_HTTP_TIMEOUT_SECS`, defaults to 120 when unset/empty, panics with a clear message on values `< 10` or unparseable. Panic at provider construction (cold-path startup) is the fail-fast pattern; silent fallback to 120s would mask config errors until the next long-context timeout.
+1. **New helper in `mika-common/src/llm/mod.rs`**: `pub fn http_timeout_secs() -> u64` — reads `MIKA_LLM_HTTP_TIMEOUT_SECS`, defaults to 120 when unset/empty, panics with a clear message on values `< 10` or unparseable. Panic at provider construction (cold-path startup) is the fail-fast pattern; silent fallback to 120s would mask config errors until the next long-context timeout.
 2. **`openai.rs:160`** — replace `Duration::from_secs(120)` with `Duration::from_secs(http_timeout_secs())`.
 3. **`ollama.rs:219`** — same swap.
 4. **Unit tests in `mod.rs`** (or wherever the helper lives):
