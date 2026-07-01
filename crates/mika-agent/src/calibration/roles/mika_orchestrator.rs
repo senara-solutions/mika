@@ -43,6 +43,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 2.0,
         expected_failure_classes_absent: &["Fabrication", "ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "ticket_framing_hard_evidence",
@@ -51,6 +52,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 2.0,
         expected_failure_classes_absent: &["Fabrication", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "sibling_pr_collision_recovery",
@@ -59,6 +61,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.5,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "deploy_gate_discipline",
@@ -67,6 +70,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 1.5,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
     RoleScenario {
         id: "escalation_vs_derivable",
@@ -75,6 +79,7 @@ pub const SCENARIOS: &[RoleScenario] = &[
         flaky: false,
         weight: 2.0,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+        diagnostic: false,
     },
 ];
 
