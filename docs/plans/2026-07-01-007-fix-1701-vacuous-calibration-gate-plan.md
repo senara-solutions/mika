@@ -59,11 +59,13 @@ Empty body. Fires only when baseline exists AND pass-rate < 1.0, but even then d
 
 - **AC1** — `calibrate.rs:293-297` empty body replaced with a diagnostic-printing `std::process::exit(1)`. Diagnostic names the failing scenarios + pass-rate delta.
 - **AC2** — Missing `--baseline` file → exit 2 with clear error ("baseline path does not exist: <path>. Pass --establish-baseline to write a new one, or provide a valid baseline path"). No silent exit 0.
-- **AC3** — New `--establish-baseline` flag: when set, writes current run's artifact as the baseline + exits 0 regardless of pass-rate. Documented in `calibrate.rs` doc-comment.
+- **AC3** — New `--establish-baseline` flag: when set, writes current run's artifact as the baseline + exits 0 regardless of pass-rate. Documented in `calibrate.rs` doc-comment. **F2 default behavior on failing pass-rate:** by default REJECT writing a failing baseline (exit 1 with diagnostic, no write). Rationale: pre-registered gate discipline — writing a failing baseline poisons future compares. Override flag `--force-failing-baseline` writes the baseline anyway (Vincent-authorized future path if he chooses Option B on return; his call).
 - **AC4** — Makefile targets updated: use canonical `docs/eval/calibration/baselines/mika-{dev,arch,qa}.json` paths. Baselines committed at those paths (moved or symlinked from per-issue dirs).
 - **AC5** — Integration test: `cargo test -p mika-agent --test calibrate_integration` — invokes binary with pass_rate=0.6 (one scenario failed via mock) + valid baseline → asserts exit 1. Second test case: pass_rate=1.0 + valid baseline → asserts exit 0. Third: no baseline → asserts exit 2.
-- **AC6** — Docs update in `mika/CLAUDE.md § Model calibration (#1190)`: gate contract described (exit codes 0/1/2), `--establish-baseline` documented.
+- **AC6** — Docs update in `mika/CLAUDE.md § Model calibration (#1190)`: gate contract described (exit codes 0/1/2), `--establish-baseline` documented + default-reject-failing semantics + `--force-failing-baseline` override.
 - **AC7** — Regression check: `cargo test -p mika-agent` clean.
+- **AC8 (F1)** — Pass-rate calculation is **unweighted** consistently between baseline compare (calibrate.rs:244 comment already unweighted) and floor gate. Explicit assertion in code: both call the same `report.unweighted_pass_rate()` accessor. Test case in AC5 verifies with a mixed-weight scenario set that floor + compare produce identical pass-rate values.
+- **AC9 (F3)** — Cross-consumer verification: `grep -rn 'baselines/latest' /data/workspace/mika-platform/wizzard/ 2>/dev/null` before merge. If any refs found, file wizzard-side companion ticket noting the path migration (no wizzard-side code change in scope, just tracking). If zero refs, no follow-up needed.
 
 ## Implementation steps
 
