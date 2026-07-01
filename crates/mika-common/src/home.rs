@@ -301,6 +301,13 @@ pub const DEFAULT_AGENT_SKILL_ALLOWLIST: &[&str] = &[
     "tmux",
     "git-ops",
     "gh-read-only",
+    // Orchestrator surface (mika#1641): full read/write GitHub via the `github`
+    // skill's `run_gh` handler (issue edit/create, pr merge, gh api) on top of the
+    // read-only `gh-read-only`. Mika (the executive assistant) assumes the daily-
+    // orchestration seat and needs write GitHub reach. `git-ops`, `shell-exec`,
+    // `tmux`, and `file-reader` above already cover the rest of the orchestrator
+    // tool surface. See docs/operator/mika-orchestrator-handbook.md.
+    "github",
 ];
 
 pub const DEFAULT_IDENTITY: &str = r#"name = "Mika"
@@ -325,6 +332,9 @@ allowlist = [
     "tmux",
     "git-ops",
     "gh-read-only",
+    # Orchestrator surface (mika#1641): full read/write GitHub. Keep in sync with
+    # DEFAULT_AGENT_SKILL_ALLOWLIST above (home.rs tests assert they match).
+    "github",
 ]
 
 # [kg]
