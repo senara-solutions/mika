@@ -4,8 +4,28 @@
 //! a JSON artifact + markdown report.
 //!
 //! Usage:
-//!   calibrate --role mika-dev --model anthropic/claude-sonnet-4-6
-//!   calibrate --role mika-arch --model anthropic/claude-opus-4-6 --baseline docs/eval/calibration/baselines/latest.md
+//!   calibrate --role mika-dev --model anthropic/claude-sonnet-4-6 --baseline docs/eval/calibration/baselines/mika-dev.json
+//!   calibrate --role mika-arch --model anthropic/claude-opus-4-6 --establish-baseline --baseline docs/eval/calibration/baselines/mika-arch.json
+//!
+//! ## Gate contract (#1701)
+//!
+//! This binary is the sole structural guard on agent model swaps (#1190). Its
+//! exit code — not just its stdout — reflects the verdict:
+//!
+//! - **exit 0** — gate passed: 100% of the role's scenarios passed AND the run
+//!   met or exceeded the baseline. Also emitted when `--establish-baseline`
+//!   successfully writes a new baseline.
+//! - **exit 1** — gate failed: pass-rate fell below the 100% floor (the failing
+//!   scenarios are named), or regressed below the baseline. Also emitted when
+//!   `--establish-baseline` refuses to persist a failing baseline (override with
+//!   `--force-failing-baseline`).
+//! - **exit 2** — gate not enforceable: the `--baseline` file is absent, missing,
+//!   or unloadable (e.g. schema drift). A missing baseline is NOT a silent pass —
+//!   supply a valid baseline, or pass `--establish-baseline` to create one.
+//!
+//! Before #1701 every path exited 0 regardless of pass-rate, so any swap "gated"
+//! by this command was never actually gated. The decision logic lives in
+//! `mika_agent::calibration::gate` (unit-tested there + in `tests/calibrate_integration.rs`).
 //!
 //! ## Authentication
 //!
@@ -21,7 +41,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use mika_agent::calibration::artifact::CalibrationArtifact;
+use mika_agent::calibration::artifact::{CalibrationArtifact, diff_calibrations};
+use mika_agent::calibration::gate::{BaselineState, GateOutcome, PASS_RATE_FLOOR, evaluate_gate};
 use mika_agent::calibration::providers::create_provider_from_spec;
 use mika_agent::calibration::role::RoleScoreReport;
 use mika_agent::calibration::roles::{mika_arch, mika_dev, mika_qa};
@@ -42,8 +63,21 @@ struct Args {
     model: String,
 
     /// Path to baseline report for comparison. Pass-rate must meet or exceed baseline.
+    /// Required in gate mode — a missing/unloadable baseline exits 2 (gate not enforceable).
     #[arg(short, long)]
     baseline: Option<PathBuf>,
+
+    /// Write this run's artifact as the baseline (at --baseline, or --output) and exit,
+    /// bypassing the gate. Refuses to persist a failing (< 100%) run unless
+    /// --force-failing-baseline is also set.
+    #[arg(long)]
+    establish_baseline: bool,
+
+    /// With --establish-baseline, allow writing a baseline even when the run failed
+    /// the 100% floor. A failing baseline lowers the bar for every future compare,
+    /// so this is off by default (#1701 AC3).
+    #[arg(long)]
+    force_failing_baseline: bool,
 
     /// Output path for the JSON artifact. Defaults to target/eval-calibration/<role>-<timestamp>.json.
     #[arg(short, long)]
@@ -217,84 +251,153 @@ async fn main() {
         println!("  Report:   {}", md_path.display());
     }
 
-    // Compare with baseline if provided
-    if let Some(baseline_path) = &args.baseline {
-        if baseline_path.exists() {
-            println!("\n  Comparing with baseline: {}", baseline_path.display());
-            match CalibrationArtifact::load(baseline_path) {
-                Ok(baseline) => {
-                    let diff =
-                        mika_agent::calibration::artifact::diff_calibrations(&baseline, &artifact);
-                    if diff.changes.is_empty() {
-                        println!("  No changes from baseline.");
-                    } else {
-                        println!("  Changes from baseline:");
-                        for change in &diff.changes {
-                            println!(
-                                "    {} / {}: {} → {} ({})",
-                                change.provider,
-                                change.scenario,
-                                change.old_outcome,
-                                change.new_outcome,
-                                change.change_type
-                            );
-                        }
-                    }
+    // ── Swap-gate (#1701) ────────────────────────────────────────────────
+    // The gate's *exit code* is the verdict — not just stdout. Resolve the
+    // baseline state, print the informative diff when one loads, then delegate
+    // the exit-code decision to the pure, unit-tested `gate::evaluate_gate`.
+    let current_rate = report.unweighted_pass_rate();
 
-                    // Check pass rate against baseline (unweighted for both —
-                    // artifact does not carry weights per DR-7)
-                    let baseline_pass_count = baseline
-                        .providers
-                        .values()
-                        .flat_map(|p| p.scenarios.values())
-                        .filter(|s| s.outcome == "pass")
-                        .count();
-                    let baseline_total = baseline
-                        .providers
-                        .values()
-                        .flat_map(|p| p.scenarios.values())
-                        .count();
-                    let baseline_rate = if baseline_total > 0 {
-                        baseline_pass_count as f64 / baseline_total as f64
-                    } else {
-                        0.0
-                    };
-
-                    // Use unweighted pass rate for comparison (consistent with baseline)
-                    let current_unweighted_rate =
-                        report.passed as f64 / report.total_scenarios.max(1) as f64;
-                    if current_unweighted_rate < baseline_rate {
-                        eprintln!(
-                            "\n  ❌ FAIL: pass rate {:.1}% < baseline {:.1}%",
-                            current_unweighted_rate * 100.0,
-                            baseline_rate * 100.0
-                        );
-                        std::process::exit(1);
-                    } else {
+    // Load the baseline (if a path was given) into a `BaselineState`. A path
+    // that is missing or fails to load is NOT a silent pass — it renders the
+    // gate unenforceable (exit 2).
+    let baseline_state = match &args.baseline {
+        None => BaselineState::NotProvided,
+        Some(path) if !path.exists() => BaselineState::Missing,
+        Some(path) => match CalibrationArtifact::load(path) {
+            Ok(baseline) => {
+                println!("\n  Comparing with baseline: {}", path.display());
+                let diff = diff_calibrations(&baseline, &artifact);
+                if diff.changes.is_empty() {
+                    println!("  No changes from baseline.");
+                } else {
+                    println!("  Changes from baseline:");
+                    for change in &diff.changes {
                         println!(
-                            "\n  ✓ PASS: pass rate {:.1}% >= baseline {:.1}%",
-                            current_unweighted_rate * 100.0,
-                            baseline_rate * 100.0
+                            "    {} / {}: {} → {} ({})",
+                            change.provider,
+                            change.scenario,
+                            change.old_outcome,
+                            change.new_outcome,
+                            change.change_type
                         );
                     }
                 }
-                Err(e) => {
-                    eprintln!("  Warning: could not load baseline: {}", e);
+                BaselineState::Loaded {
+                    pass_rate: baseline.unweighted_pass_rate(),
                 }
             }
-        } else {
+            Err(e) => {
+                eprintln!(
+                    "\n  Error: could not load baseline {}: {}",
+                    path.display(),
+                    e
+                );
+                BaselineState::Unloadable
+            }
+        },
+    };
+
+    let outcome = evaluate_gate(
+        current_rate,
+        &baseline_state,
+        args.establish_baseline,
+        args.force_failing_baseline,
+    );
+
+    // Establish target: --baseline path if given, else the artifact output path.
+    let establish_target = args.baseline.clone().unwrap_or_else(|| output_path.clone());
+
+    println!();
+    match &outcome {
+        GateOutcome::Pass => {
+            println!(
+                "  ✓ PASS: pass rate {:.1}% meets the 100% floor{}.",
+                current_rate * 100.0,
+                match &baseline_state {
+                    BaselineState::Loaded { pass_rate } =>
+                        format!(" and baseline {:.1}%", pass_rate * 100.0),
+                    _ => String::new(),
+                }
+            );
+        }
+        GateOutcome::FailFloor => {
             eprintln!(
-                "  Warning: baseline path does not exist: {}",
-                baseline_path.display()
+                "  ❌ FAIL: pass rate {:.1}% is below the required 100% floor (delta {:.1}%).",
+                current_rate * 100.0,
+                (PASS_RATE_FLOOR - current_rate) * 100.0
+            );
+            eprintln!(
+                "  Failing scenarios: {}",
+                report.failing_scenario_ids().join(", ")
+            );
+            eprintln!("  A model that fails scenarios must not be swapped in (#1190).");
+        }
+        GateOutcome::FailBaseline => {
+            let baseline_rate = match &baseline_state {
+                BaselineState::Loaded { pass_rate } => *pass_rate,
+                _ => 0.0,
+            };
+            eprintln!(
+                "  ❌ FAIL: pass rate {:.1}% regressed below baseline {:.1}%.",
+                current_rate * 100.0,
+                baseline_rate * 100.0
+            );
+            eprintln!(
+                "  Failing scenarios: {}",
+                report.failing_scenario_ids().join(", ")
+            );
+        }
+        GateOutcome::NotEnforceable => {
+            let path_hint = args
+                .baseline
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none provided>".to_string());
+            eprintln!(
+                "  ⚠️  GATE NOT ENFORCEABLE: no usable baseline ({}).",
+                path_hint
+            );
+            eprintln!(
+                "  Supply a valid --baseline, or pass --establish-baseline to write one from this run."
+            );
+            eprintln!("  Exiting 2 — this is NOT a pass. Nothing was verified.");
+        }
+        GateOutcome::BaselineEstablished => {
+            if let Err(e) = artifact.write_to(&establish_target) {
+                eprintln!(
+                    "  Error: failed to write baseline to {}: {}",
+                    establish_target.display(),
+                    e
+                );
+                std::process::exit(2);
+            }
+            let forced = if current_rate < PASS_RATE_FLOOR {
+                " (FORCED — baseline is below the 100% floor)"
+            } else {
+                ""
+            };
+            println!(
+                "  ✓ Baseline established at {} — pass rate {:.1}%{}.",
+                establish_target.display(),
+                current_rate * 100.0,
+                forced
+            );
+        }
+        GateOutcome::BaselineRefused => {
+            eprintln!(
+                "  ❌ REFUSED: will not write a failing baseline (pass rate {:.1}% < 100%).",
+                current_rate * 100.0
+            );
+            eprintln!(
+                "  Failing scenarios: {}",
+                report.failing_scenario_ids().join(", ")
+            );
+            eprintln!(
+                "  A failing baseline poisons every future compare. Pass --force-failing-baseline to override."
             );
         }
     }
 
-    // Exit code: 0 = pass, 1 = fail
-    if report.pass_rate < 1.0 && args.baseline.is_some() {
-        // Only fail hard if there's a baseline to compare against
-        // Without baseline, we're just establishing one
-    }
-
     println!("\n  Done.");
+    std::process::exit(outcome.exit_code());
 }

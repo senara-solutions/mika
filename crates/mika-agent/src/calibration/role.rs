@@ -254,6 +254,31 @@ impl RoleScoreReport {
     pub fn passes_baseline(&self, baseline_pass_rate: f64) -> bool {
         self.pass_rate >= baseline_pass_rate
     }
+
+    /// Unweighted pass rate: `passed / total_scenarios`.
+    ///
+    /// The swap-gate (#1701) uses this for BOTH the 100% floor check and the
+    /// baseline comparison, so the two can never diverge (AC8). Distinct from
+    /// `pass_rate`, which is *weighted* (flaky scenarios count 0.5). Committed
+    /// baselines carry no weights (DR-7), so the gate compares unweighted rates
+    /// on both sides. Returns `0.0` when no scenarios ran.
+    pub fn unweighted_pass_rate(&self) -> f64 {
+        if self.total_scenarios == 0 {
+            0.0
+        } else {
+            self.passed as f64 / self.total_scenarios as f64
+        }
+    }
+
+    /// IDs of scenarios that failed, in report order. Used by the gate diagnostic
+    /// to name exactly which scenarios blocked a swap (#1701 AC1).
+    pub fn failing_scenario_ids(&self) -> Vec<&str> {
+        self.results
+            .iter()
+            .filter(|r| !r.passed)
+            .map(|r| r.id.as_str())
+            .collect()
+    }
 }
 
 /// YAML manifest schema for a role's scenario suite.

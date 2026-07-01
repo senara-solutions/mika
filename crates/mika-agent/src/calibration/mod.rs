@@ -6,9 +6,11 @@
 //! - Provider construction helpers
 //! - Role-scoped scenario abstractions
 //! - Failure classification taxonomy
+//! - Swap-gate exit-code decision logic
 
 pub mod artifact;
 pub mod failure;
+pub mod gate;
 pub mod providers;
 pub mod role;
 pub mod roles;
