@@ -1294,6 +1294,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         dashboard_enabled: Arc::new(AtomicBool::new(settings.dashboard_enabled)),
         a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
         pr_reviews_posted,
+        rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
     };
 
     let app = build_router(state.clone());
@@ -1580,6 +1581,7 @@ mod tests {
             dashboard_enabled: Arc::new(AtomicBool::new(false)),
             a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
             pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
+            rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -1759,6 +1761,90 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "agent busy");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_trip_emits_audit_event() {
+        // mika#1710 AC3: the busy-lock 429 path emits a `rate_limit_trip` audit
+        // event so the trip is visible to the orchestrator.
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        let db = agent_state.db.clone();
+        let _guard = agent_state.agent_lock.clone().lock_owned().await;
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(
+                        r#"{"text":"hi","chat_id":123,"channel":"telegram","request_id":"trip-1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let events = db.get_audit_events("system").await.unwrap();
+        let trips: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == "rate_limit_trip")
+            .collect();
+        assert_eq!(
+            trips.len(),
+            1,
+            "exactly one rate_limit_trip audit row expected"
+        );
+        assert_eq!(trips[0].target_key, "agent:mika");
+        assert_eq!(trips[0].after_value.as_deref(), Some("request_id=trip-1"));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_trip_audit_throttled() {
+        // mika#1710 AC3 volume guard: N rapid 429s within the interval emit at most
+        // one audit row per agent — the audit write must not itself become a flood.
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        let db = agent_state.db.clone();
+        let _guard = agent_state.agent_lock.clone().lock_owned().await;
+
+        let app = test_app(state);
+        for i in 0..3 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/message")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-token-secret")
+                        .body(Body::from(format!(
+                            r#"{{"text":"hi","chat_id":123,"channel":"telegram","request_id":"trip-{i}"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        let events = db.get_audit_events("system").await.unwrap();
+        let trips = events
+            .iter()
+            .filter(|e| e.tool_name == "rate_limit_trip")
+            .count();
+        assert_eq!(
+            trips, 1,
+            "rapid 429s within the throttle interval must emit at most one audit row"
+        );
     }
 
     #[tokio::test]

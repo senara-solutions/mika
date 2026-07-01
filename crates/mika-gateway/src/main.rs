@@ -1,5 +1,6 @@
 mod a2a_auth;
 mod a2a_routes;
+pub(crate) mod circuit_breaker;
 pub(crate) mod dlq;
 pub mod github;
 pub mod openapi;
@@ -181,6 +182,10 @@ async fn main() -> Result<()> {
         orchestrator_inbox_enabled,
         inbox_subscriber_semaphore: orchestrator_inbox::default_inbox_subscriber_semaphore(),
         gateway_external_url: settings.gateway_external_url.clone(),
+        target_health: Arc::new(circuit_breaker::TargetCircuitBreaker::new()),
+        delivery_slots: Arc::new(tokio::sync::Semaphore::new(
+            circuit_breaker::MAX_INFLIGHT_DELIVERIES,
+        )),
     };
 
     // Spawn DLQ background worker (retries pending deliveries every 30s)

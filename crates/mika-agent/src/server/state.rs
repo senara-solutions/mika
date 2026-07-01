@@ -94,6 +94,13 @@ pub struct AppState {
     /// inner set: PR dedup keys. Prevents duplicate `gh pr review` calls
     /// across turns within the same session. Evicted at `end_session()` callsites.
     pub pr_reviews_posted: Arc<DashMap<String, std::collections::HashSet<String>>>,
+    /// Throttle state for `rate_limit_trip` audit emission (mika#1710 AC3). Keyed by
+    /// agent name → last emit instant. When the per-agent concurrency-1 lock rejects a
+    /// message with 429 ("agent busy"), we emit an audit event so the trip is visible
+    /// to the orchestrator — but throttled to at most one row per agent per
+    /// `RATE_LIMIT_TRIP_AUDIT_INTERVAL` so a flood does not itself write tens of
+    /// thousands of audit rows.
+    pub rate_limit_audit_last: Arc<DashMap<String, std::time::Instant>>,
 }
 
 impl AppState {

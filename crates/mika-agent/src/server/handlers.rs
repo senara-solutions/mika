@@ -33,6 +33,12 @@ use super::webhook_queue::{
 /// Media types accepted by the Claude API for image content blocks.
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
+/// Minimum interval between `rate_limit_trip` audit-event emissions per agent
+/// (mika#1710 AC3). A naive emit-on-every-429 would write tens of thousands of
+/// audit rows during a flood; throttling keeps the trip visible to the
+/// orchestrator without re-creating a write flood.
+const RATE_LIMIT_TRIP_AUDIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// GET /health — Liveness/readiness probe (no auth required).
 #[utoipa::path(
     get,
@@ -222,6 +228,50 @@ pub async fn handle_message(
     let lock = match agent_state.agent_lock.clone().try_lock_owned() {
         Ok(guard) => guard,
         Err(_) => {
+            // Emit a throttled `rate_limit_trip` audit event so the busy-lock 429 is
+            // visible to the orchestrator (mika#1710 AC3). This is the server side of
+            // the 429-flood fix: the gateway circuit breaker (mika#1710 R1) sheds the
+            // amplification; this makes the trip observable. Throttled to one row per
+            // agent per interval so the audit write does not itself become a flood.
+            // An empty `req.agent` resolves to the default agent (see
+            // `resolve_agent`); label the trip with the effective name so the
+            // throttle key and audit target are meaningful.
+            let agent_label = if req.agent.is_empty() {
+                state.default_agent.clone()
+            } else {
+                req.agent.clone()
+            };
+            let now = std::time::Instant::now();
+            let should_emit = match state.rate_limit_audit_last.get(&agent_label) {
+                Some(last)
+                    if now.duration_since(*last.value()) < RATE_LIMIT_TRIP_AUDIT_INTERVAL =>
+                {
+                    false
+                }
+                _ => {
+                    state.rate_limit_audit_last.insert(agent_label.clone(), now);
+                    true
+                }
+            };
+            if should_emit {
+                let target_key = format!("agent:{agent_label}");
+                let after = format!("request_id={}", req.request_id);
+                if let Err(e) = agent_state
+                    .db
+                    .log_audit_event(
+                        "system",
+                        "rate_limit_trip",
+                        &target_key,
+                        None,
+                        Some(&after),
+                        Some("agent busy — message rejected with 429"),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to log rate_limit_trip audit event");
+                }
+            }
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({
