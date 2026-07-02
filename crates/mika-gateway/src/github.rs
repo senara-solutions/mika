@@ -608,6 +608,16 @@ fn apply_jitter(delay: Duration) -> Duration {
     Duration::from_millis(jittered)
 }
 
+/// Whether a [`ForwardResult::Retryable`] reason denotes an HTTP 429 ("agent
+/// busy") rejection — the only failure mode that drives the per-target circuit
+/// breaker (mika#1710). The reason string is produced by
+/// [`forward_to_resolved_route`] as `format!("HTTP {status}")`, so a 429 is
+/// exactly `"HTTP 429"`. 5xx and connection-error retries use a different reason
+/// and must not trip the 429 breaker (see `test_deliver_retry_budget_six_attempts_breaker_below_threshold`).
+fn is_rate_limit_reason(reason: &str) -> bool {
+    reason.starts_with("HTTP 429")
+}
+
 // -- Webhook handler --
 
 /// POST /webhook/github — receive GitHub App webhook events.
@@ -870,15 +880,54 @@ pub(crate) async fn handle_github_webhook(
         delivery_id.clone()
     };
 
-    // 12. Async dispatch with retry — return 200 to GitHub immediately.
-    // Retry budget: initial attempt + up to 5 retries with backoff [2s, 5s, 15s, 60s, 300s].
-    // Events that exhaust retries are persisted in the DLQ (#590).
-    let forwarding_state = state.clone();
     let target = target_agent.to_string();
     let repo_name = event.repository.as_ref().and_then(|r| r.full_name.clone());
+
+    // 11b. In-flight delivery bound (mika#1710 R4/AC4). The `webhook_semaphore`
+    // only bounds *concurrent HTTP* — tasks sleeping between retries hold no
+    // permit and could accumulate without limit under a flood. `delivery_slots`
+    // caps the number of concurrently-spawned delivery tasks; the permit is held
+    // for the entire delivery lifetime (including retry sleeps). At capacity we
+    // shed durably to the DLQ (bounded, drop-nothing overflow store) instead of
+    // spawning an unbounded task.
+    let delivery_slot = match state.delivery_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => {
+            warn!(
+                target_agent = %target,
+                request_id = %request_id,
+                event = "delivery_buffer_full",
+                "in-flight delivery cap reached — shedding webhook to DLQ instead of spawning"
+            );
+            crate::dlq::insert_delivery(
+                &state.pool,
+                crate::dlq::NewDelivery {
+                    delivery_id: &request_id,
+                    event_type,
+                    target_agent: &target,
+                    repo_full_name: repo_name.as_deref(),
+                    payload: &text,
+                    request_id: &request_id,
+                    attempts: 0,
+                    last_error: "delivery_buffer_full",
+                },
+            )
+            .await;
+            return StatusCode::OK;
+        }
+    };
+
+    // 12. Async dispatch with retry — return 200 to GitHub immediately.
+    // Retry budget: initial attempt + up to 5 retries with backoff [2s, 5s, 15s, 60s, 300s].
+    // Events that exhaust retries (or trip the target circuit breaker) are
+    // persisted in the DLQ (#590, mika#1710).
+    let forwarding_state = state.clone();
     let semaphore = state.webhook_semaphore.clone();
     let event_type_owned = event_type.to_string();
     tokio::spawn(async move {
+        // Hold the delivery slot for the whole delivery lifetime (retry sleeps
+        // included); it is released when this task ends.
+        let _delivery_slot = delivery_slot;
         deliver_with_retry(
             &forwarding_state,
             &target,
@@ -1200,6 +1249,44 @@ async fn deliver_with_retry_inner(
             }
         }
 
+        // Circuit breaker (mika#1710): if the target agent's circuit is open,
+        // short-circuit this delivery straight to the DLQ instead of issuing an
+        // HTTP attempt against a saturated agent. This is the cross-event
+        // coordination layer that stops N independent retry chains from
+        // co-amplifying a 429 flood — the DLQ re-attempts on its own spaced
+        // schedule. The half-open probe (see `check_delivery`) periodically lets
+        // one delivery through to re-test recovery.
+        if state.target_health.check_delivery(target_agent)
+            == crate::circuit_breaker::DeliveryDecision::ShortCircuit
+        {
+            warn!(
+                target_agent,
+                request_id,
+                attempts_made,
+                "target circuit open — short-circuiting delivery to DLQ (no HTTP attempt)"
+            );
+            current_permit.take();
+            crate::dlq::insert_delivery(
+                &state.pool,
+                crate::dlq::NewDelivery {
+                    delivery_id: request_id,
+                    event_type,
+                    target_agent,
+                    repo_full_name,
+                    payload: text,
+                    request_id,
+                    attempts: attempts_made as i32,
+                    last_error: if last_reason.is_empty() {
+                        "circuit_open"
+                    } else {
+                        &last_reason
+                    },
+                },
+            )
+            .await;
+            return;
+        }
+
         let attempt = retry_idx as u32 + 1;
         let result = forward_to_resolved_route(
             state,
@@ -1217,6 +1304,8 @@ async fn deliver_with_retry_inner(
 
         match result {
             ForwardResult::Success => {
+                // Delivery landed — close the target's circuit and reset 429 state.
+                state.target_health.record_success(target_agent);
                 if attempt == 1 {
                     info!(
                         target_agent,
@@ -1252,6 +1341,23 @@ async fn deliver_with_retry_inner(
                     reason = %reason,
                     "GitHub event delivery failed, will retry"
                 );
+                // Feed the per-target circuit breaker (mika#1710). Only genuine
+                // HTTP 429 "agent busy" rejections drive it — 5xx and connection
+                // retries are a different failure mode. On the soft threshold the
+                // circuit opens and the next iteration short-circuits to the DLQ;
+                // on the rolling-window hard threshold we emit the AC5 self-heal
+                // pause signal.
+                if is_rate_limit_reason(&reason)
+                    && state.target_health.record_429(target_agent)
+                        == crate::circuit_breaker::Record429Outcome::HardPaused
+                {
+                    warn!(
+                        target_agent,
+                        request_id,
+                        event = "gateway_target_paused",
+                        "target 429 flood crossed the hard threshold — pausing retries to this target (self-heal)"
+                    );
+                }
                 last_reason = reason;
             }
         }
@@ -2059,6 +2165,10 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
+            delivery_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
+            )),
         };
 
         axum::Router::new()
@@ -2174,6 +2284,10 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
+            delivery_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
+            )),
         };
 
         let app = axum::Router::new()
@@ -2601,6 +2715,10 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
+            delivery_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
+            )),
         }
     }
 
@@ -2747,60 +2865,178 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 30);
     }
 
+    /// Test-only short retry schedule: 5 sub-millisecond delays so the delivery
+    /// loop runs fast while the 30s soft-open circuit window still dominates.
+    const TEST_DELAYS_FAST: [Duration; 5] = [Duration::from_millis(1); 5];
+
     #[tokio::test]
-    #[ignore = "takes ~6.5 minutes of wall time (RETRY_DELAYS total 382s); run with --ignored"]
     async fn test_deliver_retry_budget_exhausted_after_six_attempts() {
-        // All 6 attempts (initial + 5 retries) return 429 — retry budget exhausted,
-        // ERROR logged, event dropped. This is the plan's Unit 2 required scenario.
-        //
-        // Wall-clock cost: 2 + 5 + 15 + 60 + 300 = 382s (±25% jitter per step).
-        // Marked #[ignore] so normal `cargo test` skips it; run with:
-        //   cargo test -p mika-gateway -- --ignored test_deliver_retry_budget_exhausted
-        //
-        // Queue 6 explicit 429s so every attempt is Retryable. Uses tokio::time::timeout
-        // to cap the test wall-clock in case of test infra issues.
-        let (base_url, call_count) = mock_agent_server(vec![
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::TOO_MANY_REQUESTS,
-        ])
-        .await;
+        // mika#1710 D1 REFRAME: with the shared per-target circuit breaker active,
+        // a lone event against a persistently-busy target trips the soft breaker at
+        // CB_SOFT_THRESHOLD (3) consecutive 429s and short-circuits to the DLQ
+        // instead of hammering all 6 attempts. The reduced in-chain retry budget is
+        // the ratified amplification-control semantics (plan § Decision D1);
+        // durability is preserved because the event lands in the DLQ, which
+        // re-attempts on its own spaced schedule. Previously this asserted 6 HTTP
+        // calls; the new correct outcome is CB_SOFT_THRESHOLD calls.
+        let (base_url, call_count) =
+            mock_agent_server(vec![StatusCode::TOO_MANY_REQUESTS; 6]).await;
         let state = test_state_with_base_url(&base_url);
         let semaphore = state.webhook_semaphore.clone();
         let permit = semaphore.clone().try_acquire_owned().unwrap();
 
-        // Total wall time: 2 + 5 + 15 + 60 + 300 = 382s base. Cap at 500s via timeout.
-        // NOTE: This test takes ~6.5 minutes of real time because RETRY_DELAYS is
-        // a compile-time const. Marked #[ignore] by default — run with `cargo test
-        // -- --ignored test_deliver_retry_budget_exhausted` for coverage.
-        let result = tokio::time::timeout(
-            Duration::from_secs(500),
-            deliver_with_retry(
-                &state,
-                "mika-dev",
-                "test event",
-                "delivery-exhausted",
-                Some("org/repo"),
-                "issues",
-                permit,
-                &semaphore,
-            ),
+        deliver_with_retry_inner(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-exhausted",
+            Some("org/repo"),
+            "issues",
+            permit,
+            &semaphore,
+            &TEST_DELAYS_FAST,
         )
         .await;
 
-        assert!(
-            result.is_ok(),
-            "deliver_with_retry did not return within 500s"
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            crate::circuit_breaker::CB_SOFT_THRESHOLD as usize,
+            "breaker must short-circuit to the DLQ at the soft trip (~3 attempts), not all 6"
         );
+        assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_retry_budget_six_attempts_breaker_below_threshold() {
+        // mika#1710 D1 COMPANION: non-429 retryable failures (503) do NOT drive the
+        // 429 circuit breaker, so the pure 6-attempt exhaustion path is preserved
+        // for the breaker-not-tripped case. Proves the breaker keys strictly on
+        // HTTP 429 ("agent busy"), not on generic retryable errors.
+        let (base_url, call_count) =
+            mock_agent_server(vec![StatusCode::SERVICE_UNAVAILABLE; 6]).await;
+        let state = test_state_with_base_url(&base_url);
+        let semaphore = state.webhook_semaphore.clone();
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        deliver_with_retry_inner(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-503-exhausted",
+            Some("org/repo"),
+            "issues",
+            permit,
+            &semaphore,
+            &TEST_DELAYS_FAST,
+        )
+        .await;
+
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             6,
-            "all retries should be exhausted — expected 6 HTTP calls"
+            "503s don't trip the 429 breaker — full 6-attempt budget must be spent"
         );
         assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_short_circuits_to_dlq_when_open() {
+        // mika#1710 R1: with the target's circuit pre-opened, deliver_with_retry_inner
+        // must persist to the DLQ WITHOUT issuing a single HTTP attempt.
+        let (base_url, call_count) = mock_agent_server(vec![StatusCode::OK]).await;
+        let state = test_state_with_base_url(&base_url);
+
+        // Pre-open the circuit for the target (3 consecutive 429s → 30s open window).
+        let now = std::time::Instant::now();
+        for _ in 0..crate::circuit_breaker::CB_SOFT_THRESHOLD {
+            state.target_health.record_429_at("mika-dev", now);
+        }
+
+        let semaphore = state.webhook_semaphore.clone();
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+
+        deliver_with_retry_inner(
+            &state,
+            "mika-dev",
+            "test event",
+            "delivery-open",
+            Some("org/repo"),
+            "issues",
+            permit,
+            &semaphore,
+            &TEST_DELAYS_FAST,
+        )
+        .await;
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "open circuit must short-circuit to the DLQ with zero HTTP attempts"
+        );
+        assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_inflight_bound_sheds_to_dlq() {
+        // mika#1710 R4/AC4: when the in-flight delivery bound is exhausted, a new
+        // webhook is shed to the DLQ instead of spawning an (unbounded) delivery
+        // task — the target agent must receive zero delivery attempts. The gateway
+        // still returns 200 to GitHub (durable at-least-once via the DLQ).
+        let (base_url, call_count) = mock_agent_server(vec![StatusCode::OK]).await;
+        let mut state = test_state_with_base_url(&base_url);
+        // Exhaust the in-flight delivery bound (zero available slots).
+        state.delivery_slots = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = axum::Router::new()
+            .route("/webhook/github", post(handle_github_webhook))
+            .with_state(state);
+
+        // issue_comment.created is routable (→ mika-dev), so the only reason the
+        // mock agent receives zero calls is the in-flight shed to the DLQ.
+        let body = br#"{"action":"created","sender":{"login":"octocat","type":"User"},"issue":{"number":7,"title":"t"},"comment":{"body":"hello"},"repository":{"full_name":"org/repo"}}"#;
+        let req = make_request("test-secret", body, "issue_comment", "inflight-shed-uuid");
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "shed path must still return 200 to GitHub"
+        );
+
+        // Give any (erroneously) spawned delivery task time to reach the mock agent.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            0,
+            "exhausted in-flight bound must shed to the DLQ, not deliver"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inflight_bound_allows_when_capacity() {
+        // mika#1710 R4/AC4: with capacity available, the webhook spawns a normal
+        // delivery that reaches the agent — proving the bound does not over-shed.
+        let (base_url, call_count) = mock_agent_server(vec![StatusCode::OK]).await;
+        let state = test_state_with_base_url(&base_url); // default MAX_INFLIGHT_DELIVERIES slots
+        let app = axum::Router::new()
+            .route("/webhook/github", post(handle_github_webhook))
+            .with_state(state);
+
+        let body = br#"{"action":"created","sender":{"login":"octocat","type":"User"},"issue":{"number":8,"title":"t"},"comment":{"body":"hello"},"repository":{"full_name":"org/repo"}}"#;
+        let req = make_request("test-secret", body, "issue_comment", "inflight-allow-uuid");
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Poll up to a generous budget for the async delivery to land (route
+        // resolution against the lazy fake pool errors after ~100ms then falls
+        // back to the mock agent base URL).
+        let start = std::time::Instant::now();
+        while call_count.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(3) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "with capacity available the webhook must be delivered exactly once"
+        );
     }
 
     /// Polls `semaphore.available_permits()` until it reaches `target`, up to `budget`.
@@ -3282,6 +3518,10 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
+            delivery_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
+            )),
         };
 
         axum::Router::new()

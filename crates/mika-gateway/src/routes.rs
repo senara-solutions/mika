@@ -124,6 +124,16 @@ pub struct AppState {
     /// Public HTTPS base URL of the gateway. Required for per-customer webhook
     /// registration (`POST /admin/customers`). `None` when not configured.
     pub gateway_external_url: Option<String>,
+    /// Per-target-agent circuit breaker (mika#1710). Shared 429 health state that
+    /// short-circuits webhook deliveries to a saturated agent straight to the DLQ
+    /// instead of hammering it with independent per-event retry chains. This is the
+    /// missing cross-event coordination layer that let the 2026-07-01 429 flood
+    /// self-amplify past the drain rate.
+    pub target_health: Arc<crate::circuit_breaker::TargetCircuitBreaker>,
+    /// In-flight delivery bound (mika#1710 R4/AC4). Caps concurrently-spawned
+    /// delivery tasks at `MAX_INFLIGHT_DELIVERIES`; overflow sheds durably to the
+    /// DLQ (drop-oldest via Postgres) rather than accumulating unbounded tasks.
+    pub delivery_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for AppState {
