@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "timestamp": "2026-07-01T19:36:55.665451994+00:00",
+  "providers": {
+    "mika-orchestrator": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "scenarios": {
+        "deploy_gate_discipline": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": 427,
+          "output_tokens": 946,
+          "latency_ms": 22761
+        },
+        "escalation_vs_derivable": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 402,
+          "output_tokens": 509,
+          "latency_ms": 10997
+        },
+        "sibling_pr_collision_recovery": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 566,
+          "output_tokens": 1044,
+          "latency_ms": 23324
+        },
+        "substrate_wedge_diagnosis": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": 659,
+          "output_tokens": 997,
+          "latency_ms": 21795
+        },
+        "ticket_framing_hard_evidence": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 333,
+          "output_tokens": 679,
+          "latency_ms": 16924
+        }
+      }
+    }
+  }
+}
