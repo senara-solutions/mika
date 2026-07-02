@@ -77,6 +77,30 @@ Pre-implementation gate from prior architect F4 pass is **CLEARED**:
 - **Regression:** `MIKA_PERMISSION_POLICY_MODE=classic` still works, dispatches unchanged.
 - **`cargo test -p mika-agent`** — clean.
 
+## Definition of Done
+
+- `claude_pilot/per_spawn.py` lands on `senara-solutions/claude-pilot-py` with the generic per-spawn engine API (evaluator-only scope, no Mika-specific policy contents).
+- `MIKA_PERMISSION_POLICY_MODE` env var recognized (`classic` default, `per_spawn` opt-in); both evaluators loaded, env var selects which fires per dispatch.
+- `audit_events` (`perm_policy_mode` on every dispatch; `perm_policy_rollback` on rollback trigger) emitted.
+- Unit tests (decomposition + built-ins + per-binary safety functions) and one integration test (mocked spawn stream) pass; no real subprocess execution in tests.
+- Docs updated: `crates/mika-agent/CLAUDE.md § permission-policy` (classic vs per_spawn + migration/rollback) and `claude-pilot-py/README.md` (mode selection + rollback procedure).
+- Canary dispatch verified: a command that blocked under `classic` passes under `per_spawn`, with the audit event confirmed. Documented in PR body.
+- Phase 2/3 migration (default flip, `tier1.py` retirement) is explicitly out of the initial dispatch — tracked as post-ship operator action.
+
+## Acceptance criteria
+
+Transcribed verbatim from the mika#1708 issue body.
+
+- **AC1 — bashlex decomposition + fail-safe deny.** Given command string, returns `(spawns: list[Spawn], reject_reason: str | None)`. Supported constructs decompose; unsupported return `(None, reason)` with the specific unsupported construct named.
+- **AC2 — state-tracking built-ins.** `cwd_stack` maintained across command sequence. Test: `cd /etc; cat passwd` correctly evaluates `cat` against `/etc/passwd`.
+- **AC3 — per-binary safety functions.** Each binary in the initial policy set has an `is_safe_<binary>(argv, cwd)` function returning `bool`. Initial set includes: `grep`, `awk`, `sed`, `cat`, `ls`, `find`, `git`, `gh`, `cargo`, `make`, `sqlite3`, `bash`, `sh`.
+- **AC4 — MIKA_PERMISSION_POLICY_MODE env var recognized.** Default `classic`. `per_spawn` opt-in loads new evaluator.
+- **AC5 — audit_events emitted.** Kind `perm_policy_mode` on every dispatch. Kind `perm_policy_rollback` on rollback trigger.
+- **AC6 — Rollback trigger works.** Test: force a per_spawn block scenario, assert env var flips + audit event fires.
+- **AC7 — Unit tests + integration tests.** Unit: decomposition + safety functions. Integration: mocked spawn event stream. No real subprocess execution in tests.
+- **AC8 — Documentation.** `crates/mika-agent/CLAUDE.md` § permission-policy — describe classic vs per_spawn modes + migration triggers. `claude-pilot-py/README.md` — mode selection + rollback procedure.
+- **AC9 — Phase 2 flip criteria validated.** After ship, monitor audit_events. When N=50 + zero blocks, ratify with Vincent for default flip.
+
 ## Risks (design-level, not implementation-level — design was ratified)
 
 1. **bashlex library maintenance.** External dependency. Version pin + audit for security. If library gets abandoned upstream, fork it too.
