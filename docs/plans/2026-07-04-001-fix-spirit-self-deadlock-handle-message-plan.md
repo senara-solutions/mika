@@ -248,3 +248,14 @@ Derived from the ticket's § Verification and § Fix shape (the issue has no
    4 unaddressed here); clippy structural enforcement deferred to a separate PR.
 6. **Clean gates.** `cargo build`, `cargo test -p mika-agent --lib`,
    `cargo clippy -p mika-agent --all-targets`, and `cargo fmt --check` all pass.
+
+---
+
+## Architect second-pass — GROOMED
+
+**Second-pass session:** fd4c1a14-d025-4183-8cd6-0f32533df591 (2026-07-04, orchestrator-CC fallback via /mika-ask-arch after auto-groom architect-convergence failure).
+**First-pass session:** d0e13fa6-69be-45e2-8d19-6b6589a3b89a (dev-groom auto-groom, 2026-07-04 17:58Z).
+
+**Verdict: GROOMED.** No F-list findings. Unresolved-Decision Gate PASS, Acceptance-Criteria Gate PASS, Output-format compatibility N/A. Second pass verifies verbatim consistency with first-pass approved shape.
+
+Ready to dispatch through dev-pilot.
