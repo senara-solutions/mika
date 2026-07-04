@@ -58,8 +58,8 @@ fn should_emit_rate_limit_audit(
     now: std::time::Instant,
     interval: std::time::Duration,
 ) -> bool {
-    match last_emitted.get(agent_label) {
-        Some(last) if now.duration_since(*last.value()) < interval => false,
+    match last_emitted.get(agent_label).map(|r| *r.value()) {
+        Some(last) if now.duration_since(last) < interval => false,
         _ => {
             last_emitted.insert(agent_label.to_string(), now);
             true
