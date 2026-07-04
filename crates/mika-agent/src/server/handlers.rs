@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::Instrument;
@@ -38,6 +39,33 @@ const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/g
 /// audit rows during a flood; throttling keeps the trip visible to the
 /// orchestrator without re-creating a write flood.
 const RATE_LIMIT_TRIP_AUDIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Decide whether to emit a throttled `rate_limit_trip` audit event, recording
+/// `now` as the last-emit instant when it returns `true`.
+///
+/// Guard-drop discipline (mika#1723): `.get(...).map(|r| *r.value())` extracts the
+/// `Copy` `Instant` and releases the shard read guard BEFORE the match, so the
+/// `.insert()` in the stale/absent arm never requests a write guard on a shard this
+/// thread already holds shared. DashMap shards are non-reentrant `parking_lot::RwLock`;
+/// holding a `Ref` across the `.insert()` self-deadlocks.
+///
+/// Accepted benign race: two threads may both observe stale and both insert, costing at
+/// most one duplicate audit row. DO NOT restructure into a guard-holding or `.entry()`
+/// shape to close this seam (mika#1723).
+fn should_emit_rate_limit_audit(
+    last_emitted: &DashMap<String, std::time::Instant>,
+    agent_label: &str,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match last_emitted.get(agent_label) {
+        Some(last) if now.duration_since(*last.value()) < interval => false,
+        _ => {
+            last_emitted.insert(agent_label.to_string(), now);
+            true
+        }
+    }
+}
 
 /// GET /health — Liveness/readiness probe (no auth required).
 #[utoipa::path(
@@ -242,17 +270,12 @@ pub async fn handle_message(
                 req.agent.clone()
             };
             let now = std::time::Instant::now();
-            let should_emit = match state.rate_limit_audit_last.get(&agent_label) {
-                Some(last)
-                    if now.duration_since(*last.value()) < RATE_LIMIT_TRIP_AUDIT_INTERVAL =>
-                {
-                    false
-                }
-                _ => {
-                    state.rate_limit_audit_last.insert(agent_label.clone(), now);
-                    true
-                }
-            };
+            let should_emit = should_emit_rate_limit_audit(
+                &state.rate_limit_audit_last,
+                &agent_label,
+                now,
+                RATE_LIMIT_TRIP_AUDIT_INTERVAL,
+            );
             if should_emit {
                 let target_key = format!("agent:{agent_label}");
                 let after = format!("request_id={}", req.request_id);
@@ -1187,5 +1210,105 @@ async fn skill_lifecycle_transition(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("failed to update lifecycle state: {e}") })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Primary regression test (mika#1723). Seed the map with a stale timestamp for
+    /// one label, then fan out N threads (above typical `num_cpus`) that all call
+    /// `should_emit_rate_limit_audit` for that same label concurrently. Under the
+    /// pre-fix guard-holding `match` shape, the stale/absent arm's `.insert()`
+    /// requested a write guard on a shard this thread already held shared and the
+    /// call hung forever (futex_wait); every subsequent same-shard call queued
+    /// behind it. Under the fix the read guard is dropped before the match, so all
+    /// threads complete. The assertion is on *completion within a bounded timeout*,
+    /// not on how many threads returned `true` — the accepted get→insert race
+    /// (mika#1723 § "Accepted benign race") makes the true-count non-deterministic
+    /// under extreme timing, so asserting exactly-one-true would be flaky.
+    #[test]
+    fn concurrent_stale_revisit_does_not_deadlock() {
+        const N: usize = 16;
+        let map: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+        let label = "agent-under-contention";
+        let now = Instant::now();
+        // Seed a stale entry so every thread takes the `Some`-but-stale path — the
+        // exact path that self-deadlocked pre-fix.
+        map.insert(label.to_string(), now - Duration::from_secs(60));
+
+        let interval = RATE_LIMIT_TRIP_AUDIT_INTERVAL;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let map = Arc::clone(&map);
+            handles.push(std::thread::spawn(move || {
+                should_emit_rate_limit_audit(&map, label, Instant::now(), interval)
+            }));
+        }
+
+        // Watchdog: a coordinator thread joins all workers and signals completion.
+        // The main thread waits with a bounded timeout — a timeout means a worker
+        // is wedged (the pre-fix deadlock), which fails the test instead of hanging
+        // the whole suite.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for h in handles {
+                // A panicking/wedged worker propagates here; the send below never
+                // fires and the main thread's recv_timeout catches it.
+                h.join().expect("worker thread panicked");
+            }
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("threads did not complete within 5s — self-deadlock regressed (mika#1723)");
+    }
+
+    /// Throttle semantics preserved: first call for a label emits, an immediate
+    /// second call is suppressed (within interval), and a call past the interval
+    /// emits again.
+    #[test]
+    fn throttle_semantics_preserved() {
+        let map: DashMap<String, Instant> = DashMap::new();
+        let label = "agent-a";
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+
+        // Absent key → insert, emit.
+        assert!(should_emit_rate_limit_audit(&map, label, t0, interval));
+        // Within interval → suppressed.
+        assert!(!should_emit_rate_limit_audit(
+            &map,
+            label,
+            t0 + Duration::from_secs(1),
+            interval
+        ));
+        // Past interval → stale, re-emit.
+        assert!(should_emit_rate_limit_audit(
+            &map,
+            label,
+            t0 + interval + Duration::from_secs(1),
+            interval
+        ));
+    }
+
+    /// Stale-entry revisit (trigger-condition unit): a single call on a pre-seeded
+    /// stale entry returns `true` and updates the stored instant to `now`. This is
+    /// the exact path that self-deadlocked pre-fix, exercised single-threaded.
+    #[test]
+    fn stale_entry_revisit_emits_and_updates() {
+        let map: DashMap<String, Instant> = DashMap::new();
+        let label = "agent-b";
+        let interval = Duration::from_secs(10);
+        let now = Instant::now();
+        let stale = now - interval - Duration::from_secs(1);
+        map.insert(label.to_string(), stale);
+
+        assert!(should_emit_rate_limit_audit(&map, label, now, interval));
+        // The stored instant advanced to `now` (stale entry was overwritten).
+        assert_eq!(*map.get(label).unwrap().value(), now);
     }
 }
