@@ -781,7 +781,7 @@ external A2A agents via the `a2a_call` tool.
 | Module | Responsibility |
 |--------|---------------|
 | `types.rs` | A2A protocol types: `AgentCard`, `Task`, `Message`, `Part`, `Artifact`, `TaskStatus`, `TaskState` |
-| `jsonrpc.rs` | JSON-RPC 2.0 request/response types, A2A method enum (`MessageSend`, `TaskGet`, `TaskCancel`, `TaskResubscribe`, `TaskPushNotificationSet`, `TaskPushNotificationGet`) |
+| `jsonrpc.rs` | JSON-RPC 2.0 request/response types, A2A method enum (`MessageSend`, `MessageStream`, `TaskGet`, `TaskCancel`, `TaskResubscribe`, `TaskPushNotificationSet`, `TaskPushNotificationGet`) |
 | `params.rs` | Typed parameter structs: `MessageSendParams`, `TaskIdParams`, `TaskQueryParams` |
 | `state_machine.rs` | `TaskStateMachine` — validates state transitions (submitted → working → completed/failed/canceled) |
 | `streaming.rs` | SSE streaming types: `StreamEvent`, `TaskStatusUpdateEvent`, `TaskArtifactUpdateEvent` |
@@ -793,7 +793,7 @@ A2A routes are merged into the main router with internal token auth (no CORS):
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
-| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit). Dispatches `message/send`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`. Returns SSE stream for `message/send`. |
+| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit). Dispatches `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`. Returns SSE stream for `message/stream` and `tasks/resubscribe`; single JSON response for `message/send`. |
 | `/a2a/{agent_name}/agent.json` | GET | Internal token | Returns the agent's A2A Agent Card (capabilities, skills, auth schemes) |
 
 ### Gateway Proxy
