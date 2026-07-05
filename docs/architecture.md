@@ -684,7 +684,7 @@ This separation lets you give dashboard users a read-only token that cannot muta
 | `/api/v1/rewind/resolve` | POST | Internal token | Resolve recent exchanges for a session (returns anchor point and trace IDs) |
 | `/api/v1/rewind/preview` | POST | Internal token | Preview a rewind operation (messages to delete, reversals, task cancellations, warnings) |
 | `/api/v1/rewind/execute` | POST | Internal token | Execute a rewind (delete messages, reverse mutations, cancel tasks, inject context marker) |
-| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit) — dispatches `message/send`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe` |
+| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit) — dispatches `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe` |
 | `/a2a/{agent_name}/agent.json` | GET | Internal token | Returns A2A Agent Card (capabilities, skills, auth schemes) |
 
 ### Dashboard API (read-only)
