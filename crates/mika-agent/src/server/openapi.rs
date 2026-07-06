@@ -16,6 +16,7 @@ use super::types;
     ),
     paths(
         handlers::handle_health,
+        handlers::handle_healthz,
         handlers::handle_message,
         handlers::handle_task_complete,
         embedded_dashboard::handle_enable,
