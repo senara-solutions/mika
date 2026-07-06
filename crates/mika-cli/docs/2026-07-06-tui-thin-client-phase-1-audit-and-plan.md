@@ -211,3 +211,25 @@ Estimated refactor PR size (post sub-ticket clearance): ~500-1500 lines deleted,
 - `senara-solutions/control-monitor#66` — claude-spirit implementation; same D4 wrapper-doctrine shape one layer up.
 - `senara-solutions/control-monitor#99` — async-emit path (cpp permission events → cm event_log); the wire-protocol shape sub-ticket C above needs to reference for spirit's own async-emit path.
 - `mika-platform/docs/decisions/2026-07-04-claude-spirit-shape.md` (D4) — wrapper-doctrine originating decision record.
+
+## Sub-tickets filed (2026-07-06 evening)
+
+Phase 2 fan-out list from §AC2 landed as individual issues. Each is a sub-issue of `senara-solutions/mika#1727`; cross-links populated in each body.
+
+| Sub | Issue | Title / Shape |
+|---|---|---|
+| A | `senara-solutions/mika#1731` | Verify + augment a2a `message/stream` SSE to carry tool-call events |
+| B | `senara-solutions/mika#1732` | New SSE endpoint: task-event live stream for TUI status pane |
+| C | `senara-solutions/mika#1733` | **Permission-decision request stream — structural discipline.** Carries the 6 sharpenings from today's §12 pass 1: structural-only guarantee (not LLM classifier), `decision_authority` server-side only, provenance day-one (`classifier_verdict` + `operator_decision` + `override_used`), pre-registered flip conditions, scoped config, `override_event` D6 class + fire-and-forget async emit. Shipped default: STRICT + override OFF regardless of Vincent's founder-question answer. |
+| D | `senara-solutions/mika#1734` | `AskUserQuestion` callback bridge — shares C's wire channel via discriminated event type. |
+| E | `senara-solutions/mika#1735` | Add `/healthz` liveness endpoint (small; ~20-line PR). |
+| F | `senara-solutions/mika#1736` | Session-messages ordered stream — verify sub-A coverage or file follow-up. |
+| G | `senara-solutions/mika#1737` | **MCP boundary — Option (a) CLI-side ratified by mika-arch** (session_id `0e01b314-4085-439e-95a4-ecc9cc103d6d`). Ratifying rationale (C1 wrapper-doctrine precedent + C2 YAGNI + C3 session lifecycle alignment + C4 structural simplicity) carried verbatim in sub-G body. No Prime routing required. |
+
+Sub-C is the largest wire-protocol scope; A/B/D/F/E are smaller each. G is the smallest doctrinally-load-bearing follow-up (arch-ratified, no Prime).
+
+**Sub-C shape check**: sharpenings 1-6 came from a two-seat §12 pass on 2026-07-06 (chat seat + gentux seat); chat seat's LLM-fragility catch qualifies as outsideness class per anchor §12, resetting the pass-1 window to 3 fresh passes from that point (samidarko relay).
+
+## Next action
+
+Attack mika#1727 Phase 2 refactor after sub-issues clear. Per Prime's discipline: the closing PR for mika#1727 lands only after sub-tickets have shipped their surfaces (or been closed as no-op verifications). Per-file line-by-line inventory (Phase 1 follow-up work) is an amendment commit on this same branch, not a separate PR.
