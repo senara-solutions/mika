@@ -124,6 +124,14 @@ pub struct AppState {
     /// Public HTTPS base URL of the gateway. Required for per-customer webhook
     /// registration (`POST /admin/customers`). `None` when not configured.
     pub gateway_external_url: Option<String>,
+    /// Base URL of the control-monitor (cm-api) HTTP surface (e.g.,
+    /// `http://127.0.0.1:8090`). When set, every validated inbound GitHub
+    /// webhook is fire-and-forget forwarded to
+    /// `{cm_api_url}/api/v1/webhooks/github` so cm's `pr_lifecycle` event log
+    /// populates from the same webhook stream. See cm#88 Option B — the
+    /// gateway is the deployed reachability path; cm-api is an additional
+    /// subscriber. `None` disables cm-forwarding.
+    pub cm_api_url: Option<String>,
     /// Per-target-agent circuit breaker (mika#1710). Shared 429 health state that
     /// short-circuits webhook deliveries to a saturated agent straight to the DLQ
     /// instead of hammering it with independent per-event retry chains. This is the

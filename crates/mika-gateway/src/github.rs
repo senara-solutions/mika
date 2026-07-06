@@ -656,6 +656,17 @@ pub(crate) async fn handle_github_webhook(
         return StatusCode::UNAUTHORIZED;
     }
 
+    // 2b. Fire-and-forget forward to cm-api (cm#88 Option B).
+    // Signature verified — safe to fan out. cm-api re-verifies HMAC against
+    // its own per-entity `webhook_secret` (samidarko populated all 6
+    // github_repo entities with the same value as MIKA_GITHUB_WEBHOOK_SECRET),
+    // so the same raw bytes + signature header land there authoritatively.
+    // Fire-and-forget on cm-unreachable is the deliberate discipline — cm
+    // MUST NEVER be on the gateway's critical path (same shape as cm#99
+    // async-emit for cpp permission events). Failures log and drop; the
+    // gateway's own routing to mika-spirit continues regardless.
+    forward_to_cm_api(&state, sig, &headers, &body);
+
     // 3. Parse X-GitHub-Event header
     let event_type = headers
         .get("x-github-event")
@@ -1116,6 +1127,89 @@ pub(crate) async fn forward_to_resolved_route(
             }
         }
     }
+}
+
+/// Fire-and-forget forward a validated GitHub webhook to cm-api (cm#88 Option B).
+///
+/// Called from [`handle_github_webhook`] immediately after HMAC verification
+/// succeeds. Preserves the raw body and the `X-Hub-Signature-256`,
+/// `X-GitHub-Event`, and `X-GitHub-Delivery` headers so cm-api can re-verify
+/// against its own per-entity `webhook_secret` (which samidarko populated
+/// with the same value as `MIKA_GITHUB_WEBHOOK_SECRET`, so any signed
+/// payload accepted here is accepted there).
+///
+/// **Discipline**: cm MUST NEVER be on the gateway's critical path. This
+/// mirrors the fire-and-forget contract from cm#99 (cpp permission events →
+/// cm event_log): time-bounded transport, drop-on-error, log-and-continue,
+/// never blocks the caller. The gateway's response to GitHub is unaffected
+/// by cm's reachability or verdict.
+///
+/// **Disabled path**: when `state.cm_api_url` is `None`, this is a no-op
+/// (zero cost, zero HTTP calls). Enable via `MIKA_CM_API_URL` env var.
+fn forward_to_cm_api(state: &AppState, signature: &str, headers: &HeaderMap, body: &Bytes) {
+    let Some(cm_url) = state.cm_api_url.as_ref() else {
+        return;
+    };
+    let event_type = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let delivery_id = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let sig = signature.to_string();
+    let url = format!("{}/api/v1/webhooks/github", cm_url.trim_end_matches('/'));
+    let http = state.http_client.clone();
+    let body = body.clone();
+
+    tokio::spawn(async move {
+        // Bounded transport so a slow cm-api never wedges the gateway task pool.
+        // 5s is well above cm-api's < 50ms healthy latency; treats any longer
+        // response as cm-unreachable and drops.
+        let req = http
+            .post(&url)
+            .header("x-hub-signature-256", &sig)
+            .header("x-github-event", &event_type)
+            .header("x-github-delivery", &delivery_id)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .timeout(Duration::from_secs(5));
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    debug!(
+                        cm_url = %url,
+                        event_type = %event_type,
+                        delivery_id = %delivery_id,
+                        status = status.as_u16(),
+                        "cm-api forwarded webhook accepted"
+                    );
+                } else {
+                    warn!(
+                        cm_url = %url,
+                        event_type = %event_type,
+                        delivery_id = %delivery_id,
+                        status = status.as_u16(),
+                        "cm-api rejected forwarded webhook (dropping)"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    cm_url = %url,
+                    event_type = %event_type,
+                    delivery_id = %delivery_id,
+                    error = %e,
+                    "cm-api forward failed (dropping — cm is not on the critical path)"
+                );
+            }
+        }
+    });
 }
 
 /// Retry wrapper for GitHub webhook delivery.
@@ -2165,6 +2259,7 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
@@ -2284,6 +2379,7 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
@@ -2715,6 +2811,7 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
@@ -3518,6 +3615,7 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
@@ -3726,6 +3824,56 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             agent_count.load(Ordering::SeqCst),
             1,
             "Agent should receive the event on token refresh failure (fail-open)"
+        );
+    }
+
+    // -- cm#88 Option B: fork GitHub webhook to cm-api tests --
+    //
+    // These verify the fire-and-forget discipline: cm MUST NEVER be on the
+    // gateway's critical path. See `forward_to_cm_api` for the contract.
+
+    /// When `cm_api_url` is `None`, forwarding is a compile-time no-op —
+    /// zero HTTP calls, no task spawn, no cost. This is the shipped default.
+    #[tokio::test]
+    async fn test_forward_to_cm_api_noop_when_url_absent() {
+        let state = test_state_with_base_url("http://unused");
+        assert!(
+            state.cm_api_url.is_none(),
+            "test_state_with_base_url must default cm_api_url to None"
+        );
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(b"{}");
+        // Function should return immediately without panicking. No easy
+        // observable side-effect to assert beyond "did not panic + did not
+        // block" — both follow from the code inspection + the `None` guard
+        // returning before any I/O.
+        forward_to_cm_api(&state, "sha256=deadbeef", &headers, &body);
+    }
+
+    /// When `cm_api_url` points at an unreachable address, the CALLER of
+    /// `forward_to_cm_api` must not be blocked — the spawned task takes
+    /// the timeout hit in the background. This is the load-bearing property
+    /// samidarko named: "cm MUST NEVER be on the gateway's critical path"
+    /// (mirrors cm#99 async-emit discipline).
+    #[tokio::test]
+    async fn test_forward_to_cm_api_is_fire_and_forget_on_unreachable() {
+        let mut state = test_state_with_base_url("http://unused");
+        // 240.0.0.1 is TEST-NET-3 reserved space — guaranteed unroutable,
+        // so the reqwest connect attempt hangs until timeout.
+        state.cm_api_url = Some("http://240.0.0.1:65535".to_string());
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(b"{}");
+
+        // The 5s timeout on the spawned task means the request itself takes
+        // seconds to fail. But the CALLER of forward_to_cm_api should
+        // return in microseconds — the spawned task takes the wait.
+        let start = std::time::Instant::now();
+        forward_to_cm_api(&state, "sha256=deadbeef", &headers, &body);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "forward_to_cm_api must return quickly (spawn only). Elapsed: {elapsed:?} — indicates the caller waited on the HTTP call, violating fire-and-forget."
         );
     }
 }
