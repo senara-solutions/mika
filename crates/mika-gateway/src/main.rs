@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
         orchestrator_inbox_enabled,
         inbox_subscriber_semaphore: orchestrator_inbox::default_inbox_subscriber_semaphore(),
         gateway_external_url: settings.gateway_external_url.clone(),
+        cm_api_url: settings.cm_api_url.clone(),
         target_health: Arc::new(circuit_breaker::TargetCircuitBreaker::new()),
         delivery_slots: Arc::new(tokio::sync::Semaphore::new(
             circuit_breaker::MAX_INFLIGHT_DELIVERIES,

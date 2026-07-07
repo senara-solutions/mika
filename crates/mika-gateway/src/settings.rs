@@ -89,6 +89,19 @@ pub struct GatewaySettings {
     /// Maps to `MIKA_GATEWAY_EXTERNAL_URL`.
     #[serde(default)]
     pub gateway_external_url: Option<String>,
+
+    /// Base URL of the control-monitor (cm-api) HTTP surface (e.g.,
+    /// `http://127.0.0.1:8090`). When set, every validated inbound GitHub
+    /// webhook is fire-and-forget forwarded to `{cm_api_url}/api/v1/webhooks/github`
+    /// with the raw payload + `X-Hub-Signature-256` + `X-GitHub-Event` headers
+    /// preserved so cm-api can re-verify HMAC against its own per-entity
+    /// `webhook_secret`. See cm#88 Option B — the gateway is the deployed
+    /// reachability path (`webhook.dupont.tech → Freebox → NAS nginx → gentux
+    /// mika-gateway`); cm-api sits behind it as an additional subscriber.
+    /// When absent, cm-forwarding is disabled and the gateway behaves as
+    /// pre-cm#88. Maps to `MIKA_CM_API_URL`.
+    #[serde(default)]
+    pub cm_api_url: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -347,6 +360,7 @@ mod tests {
                 github_app_installation_id: Some(67890),
                 orchestrator_inbox_enabled: None,
                 gateway_external_url: Some("https://gateway.test.example.com".to_string()),
+                cm_api_url: Some("http://127.0.0.1:8090".to_string()),
             }
         );
         assert!(!debug.contains("pass"));
@@ -450,6 +464,7 @@ mod tests {
             github_app_installation_id: None,
             orchestrator_inbox_enabled: None,
             gateway_external_url: None,
+            cm_api_url: None,
         }
     }
 
