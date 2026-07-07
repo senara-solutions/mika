@@ -678,7 +678,8 @@ This separation lets you give dashboard users a read-only token that cannot muta
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
-| `/health` | GET | None | Liveness/readiness probe |
+| `/health` | GET | None | Combined liveness+readiness probe — returns 503 during startup, 200 with `uptime_secs` when ready. |
+| `/healthz` | GET | None | Kubernetes-convention pure liveness probe — returns 200 unconditionally while the router is up, including during startup (mika#1735). |
 | `/message` | POST | Internal token | Receives messages (202 async processing, 10MB body limit) |
 | `/tasks/{id}/complete` | POST | Internal token | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
 | `/api/v1/rewind/resolve` | POST | Internal token | Resolve recent exchanges for a session (returns anchor point and trace IDs) |

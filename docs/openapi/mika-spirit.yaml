@@ -67,7 +67,7 @@ paths:
     get:
       tags:
       - handlers
-      summary: GET /health — Liveness/readiness probe (no auth required).
+      summary: GET /health — Combined liveness+readiness probe (no auth required).
       operationId: handle_health
       responses:
         '200':
@@ -78,6 +78,25 @@ paths:
                 $ref: '#/components/schemas/HealthResponse'
         '503':
           description: Server is starting up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /healthz:
+    get:
+      tags:
+      - handlers
+      summary: GET /healthz — Kubernetes-convention liveness probe (no auth required).
+      description: |-
+        Distinct from `/health`: this is a pure liveness endpoint — "is the process
+        alive and able to serve HTTP?" — so it returns 200 unconditionally when the
+        router is running, including during startup. This matches the semantics ops
+        tooling and K8s probes expect from `/healthz` (readiness is a separate
+        concern, tracked as a follow-up if `/readyz` is ever needed). See mika#1735.
+      operationId: handle_healthz
+      responses:
+        '200':
+          description: Server is alive
           content:
             application/json:
               schema:
