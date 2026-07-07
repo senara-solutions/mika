@@ -101,6 +101,10 @@ pub struct AppState {
     /// `RATE_LIMIT_TRIP_AUDIT_INTERVAL` so a flood does not itself write tens of
     /// thousands of audit rows.
     pub rate_limit_audit_last: Arc<DashMap<String, std::time::Instant>>,
+    /// Permission-decision coordination surface (mika#1733 sub-C AC1). Shared
+    /// broadcast channel + pending-decision map. See
+    /// `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md § AC1`.
+    pub permissions_channel: Arc<super::permissions_stream::PermissionsChannel>,
 }
 
 impl AppState {
