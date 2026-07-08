@@ -11,6 +11,7 @@ pub mod investigate;
 pub mod json_extractor;
 mod milestone_context_handler;
 pub mod openapi;
+pub mod permissions_stream;
 pub mod ready_label_handler;
 pub mod rewind;
 pub mod state;
@@ -260,6 +261,17 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/skills/{name}/restore",
             post(dashboard::handle_skill_restore),
+        )
+        // Permission-decision protocol (mika#1733 sub-C AC1): SSE stream +
+        // POST-back correlation. See
+        // `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md`.
+        .route(
+            "/dashboard/permissions/stream",
+            get(permissions_stream::handle_permissions_stream),
+        )
+        .route(
+            "/dashboard/permissions/{request_id}/decide",
+            post(permissions_stream::handle_permission_decide),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1299,6 +1311,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
         pr_reviews_posted,
         rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
+        permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
     };
 
     let app = build_router(state.clone());
@@ -1586,6 +1599,7 @@ mod tests {
             a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
             pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
             rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
+            permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
         }
     }
 
