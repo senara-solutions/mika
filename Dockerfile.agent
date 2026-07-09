@@ -13,7 +13,14 @@ RUN npm ci --ignore-scripts \
  && npm run build --prefix dashboard
 
 # === Builder stage ===
-FROM rust:1.93-slim AS builder
+# Use rust:1.93-bookworm (NOT -slim) to match debian:bookworm-slim runtime
+# (glibc 2.36). The -slim tag was rebased on Debian 13 (trixie, glibc 2.41),
+# so binaries built there link against GLIBC_2.39+ symbols and fail at runtime
+# with `libc.so.6: version 'GLIBC_2.39' not found`. Dockerfile.gateway already
+# migrated for this exact class; this file was missed until family-customer-1's
+# 2026-07-09 provisioning surfaced it (agent pod CrashLoopBackOff after image
+# rebuild against current mika main).
+FROM rust:1.93-bookworm AS builder
 
 # Install C compiler for rusqlite bundled SQLite (no OpenSSL needed — uses rustls)
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc-dev pkg-config && rm -rf /var/lib/apt/lists/*
