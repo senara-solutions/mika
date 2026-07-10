@@ -15,6 +15,7 @@ pub mod permissions_stream;
 pub mod ready_label_handler;
 pub mod rewind;
 pub mod state;
+pub mod tasks_stream;
 pub mod types;
 pub mod variants;
 pub(crate) mod verdict;
@@ -272,6 +273,13 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/dashboard/permissions/{request_id}/decide",
             post(permissions_stream::handle_permission_decide),
+        )
+        // Task-event live stream (mika#1732 sub-B): SSE surface for task
+        // lifecycle transitions. Wire-only in v1 — emission from task_engine
+        // transition sites lands in a follow-up ticket.
+        .route(
+            "/dashboard/tasks/stream",
+            get(tasks_stream::handle_tasks_events_stream),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1312,6 +1320,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         pr_reviews_posted,
         rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
         permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
+        task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
     };
 
     let app = build_router(state.clone());
@@ -1600,6 +1609,7 @@ mod tests {
             pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
             rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
             permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
+            task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
         }
     }
 

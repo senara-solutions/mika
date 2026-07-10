@@ -105,6 +105,12 @@ pub struct AppState {
     /// broadcast channel + pending-decision map. See
     /// `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md § AC1`.
     pub permissions_channel: Arc<super::permissions_stream::PermissionsChannel>,
+    /// Task-event live stream broadcast surface (mika#1732). Per-process
+    /// broadcast channel carrying `TaskEventFrame` lifecycle events. Wire
+    /// only in v1 — the emission-from-transition-sites plumbing lands in a
+    /// follow-up ticket. See
+    /// `crates/mika-agent/docs/tasks-event-stream-frame-catalog-2026-07-10.md`.
+    pub task_events_channel: Arc<super::tasks_stream::TaskEventsChannel>,
 }
 
 impl AppState {
