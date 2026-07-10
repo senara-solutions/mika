@@ -255,4 +255,5 @@ Estimated diff: ~400 net lines added (majority is tests).
 ## Grooming history
 
 - 2026-07-10 — `/ce:plan` draft
-- 2026-07-10 — pending: `mika-arch` first-pass review
+- 2026-07-10 — `mika-arch` first-pass review (session `ed46fdca-c74d-4067-8e77-29ead8daaab2`): **Disposition: ITERATE**. Single finding F1 — the pass-1 brief summarized the plan using scoped-bullet numbering rather than transcribing the `## Acceptance criteria` section, so the architect flagged the section as absent. All three uncertainties confirmed architecturally sound (stateless confirmation, POST verb, skip deleteWebhook). No plan revisions applied — communication fix, not a plan defect.
+- 2026-07-10 — `mika-arch` second-pass review (same session): **Verdict: GROOMED**. AC section transcribed verbatim into the brief; architect confirmed "non-empty, concrete, and testable (AC1–AC8)."
