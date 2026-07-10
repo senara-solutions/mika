@@ -274,6 +274,13 @@ fn build_router(state: AppState) -> Router {
             "/dashboard/permissions/{request_id}/decide",
             post(permissions_stream::handle_permission_decide),
         )
+        // AskUserQuestion answer path (mika#1734 sub-D AC2). Sibling of
+        // /decide on the same channel — see
+        // `crates/mika-agent/docs/ask-user-question-bridge-2026-07-10.md`.
+        .route(
+            "/dashboard/permissions/{request_id}/answer",
+            post(permissions_stream::handle_permission_answer),
+        )
         // Task-event live stream (mika#1732 sub-B): SSE surface for task
         // lifecycle transitions. Wire-only in v1 — emission from task_engine
         // transition sites lands in a follow-up ticket.
