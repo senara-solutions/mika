@@ -106,10 +106,21 @@ pub fn validate_agent(global_home: &Path, agent_name: &str) -> Vec<SkillDiagnost
         diags.push(SkillDiagnostic::warn("soul.md not found".to_string()));
     }
 
-    // 7. MCP config
-    let mcp_path = agent_home.join("mcp.json");
+    // 7. MCP config — operator-shell scoped (mika#1737 AC3).
+    //
+    // Runs the AC5 migration first so the operator sees the new-path
+    // status even on the very first `mika agents validate` after the
+    // upgrade. Validation errors on `load_operator_shell()` are surfaced
+    // as `fail` diagnostics; empty config is a silent no-op (validation
+    // only fires when at least one server is configured).
+    if let Err(e) = McpConfig::migrate_from_agent_home_if_needed(&agent_home) {
+        diags.push(SkillDiagnostic::warn(format!(
+            "mika#1737 AC5 MCP migration: {e}"
+        )));
+    }
+    let (mcp_path, _source) = mika_common::mcp_config_path::resolve_operator_mcp_config_path();
     if mcp_path.exists() {
-        match McpConfig::load(&agent_home) {
+        match McpConfig::load_operator_shell() {
             Ok(config) => {
                 let mut mcp_ok = true;
                 for (name, server) in &config.mcp_servers {
@@ -121,13 +132,15 @@ pub fn validate_agent(global_home: &Path, agent_name: &str) -> Vec<SkillDiagnost
                 if mcp_ok {
                     let count = config.mcp_servers.len();
                     diags.push(SkillDiagnostic::ok(format!(
-                        "mcp.json valid — {count} server(s)"
+                        "{} valid — {count} server(s)",
+                        mcp_path.display()
                     )));
                 }
             }
             Err(e) => {
                 diags.push(SkillDiagnostic::fail(format!(
-                    "mcp.json failed to parse: {e}"
+                    "{} failed to parse: {e}",
+                    mcp_path.display()
                 )));
             }
         }

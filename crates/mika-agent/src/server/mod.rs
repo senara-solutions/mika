@@ -508,8 +508,15 @@ async fn init_agent(
         dispatcher.clone(),
     )));
 
-    // Load MCP configuration and connect to configured servers
-    let mcp_config = crate::mcp::config::McpConfig::load(agent_home)?;
+    // Load MCP configuration and connect to configured servers.
+    // Reads from the operator-shell scoped path (mika#1737 AC3); runs the
+    // AC5 migration from `{agent_home}/mcp.json` if the operator-shell
+    // path does not yet exist. Migration failure is non-fatal — server
+    // proceeds with whatever config is loadable.
+    if let Err(e) = crate::mcp::config::McpConfig::migrate_from_agent_home_if_needed(agent_home) {
+        tracing::warn!(error = %e, "mika#1737 AC5 MCP migration failed at server init");
+    }
+    let mcp_config = crate::mcp::config::McpConfig::load_operator_shell()?;
     let mcp_manager = if mcp_config.mcp_servers.is_empty() {
         None
     } else {

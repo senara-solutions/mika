@@ -130,6 +130,101 @@ impl McpConfig {
             .filter(|(_, cfg)| cfg.enabled)
             .map(|(name, cfg)| (name.as_str(), cfg))
     }
+
+    /// Load MCP configuration from the operator-shell path resolved by
+    /// [`mika_common::mcp_config_path::resolve_operator_mcp_config_path`]
+    /// (mika#1737 AC3, AC4). Returns an empty config if the file does
+    /// not exist. Returns an error only when the file exists but is
+    /// malformed. The resolved source tier is logged so operators can
+    /// verify which resolution rung fired.
+    pub fn load_operator_shell() -> anyhow::Result<Self> {
+        let (path, source) = mika_common::mcp_config_path::resolve_operator_mcp_config_path();
+        if matches!(
+            source,
+            mika_common::mcp_config_path::McpConfigPathSource::CwdFallback
+        ) {
+            tracing::warn!(
+                path = %path.display(),
+                "MCP config path fell back to CWD; set MIKA_MCP_CONFIG, XDG_CONFIG_HOME, or HOME"
+            );
+        } else {
+            tracing::debug!(
+                path = %path.display(),
+                ?source,
+                "resolved operator-shell MCP config path"
+            );
+        }
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let config: McpConfig = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// Save MCP configuration to the operator-shell path (mika#1737
+    /// AC1). Creates parent directories as needed; sets `0600` on Unix
+    /// because headers/env may contain secrets.
+    pub fn save_operator_shell(&self) -> anyhow::Result<()> {
+        let (path, _source) = mika_common::mcp_config_path::resolve_operator_mcp_config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// One-shot AC5 migration: copy an existing per-agent
+    /// `{agent_home}/mcp.json` to the operator-shell path if the
+    /// operator-shell path does not yet exist. Idempotent — subsequent
+    /// invocations skip the copy once the operator-shell path exists.
+    ///
+    /// Returns `Ok(true)` if a copy happened, `Ok(false)` if not, or
+    /// `Err` on IO failure. IO errors are non-fatal to the caller (the
+    /// operator can hand-copy) so callers should log-and-continue.
+    ///
+    /// Multi-agent semantics: this migration is deliberately per-invocation
+    /// / per-agent. If several agents each have a distinct `mcp.json`, the
+    /// FIRST invocation across all agents wins and populates the shared
+    /// operator-shell config. Later invocations see the operator-shell
+    /// path already exists and become no-ops. Operators with divergent
+    /// per-agent configs must hand-merge — the ratified disposition
+    /// explicitly makes MCP config operator-shell scoped, so divergent
+    /// per-agent state was already an anti-pattern.
+    pub fn migrate_from_agent_home_if_needed(agent_home: &Path) -> anyhow::Result<bool> {
+        let (target, _source) = mika_common::mcp_config_path::resolve_operator_mcp_config_path();
+        if target.exists() {
+            return Ok(false);
+        }
+        let source_path = mika_common::mcp_config_path::legacy_per_agent_mcp_path(agent_home);
+        if !source_path.exists() {
+            return Ok(false);
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Copy contents (do NOT symlink) so a subsequent delete of the
+        // per-agent file does not lose the config.
+        let content = std::fs::read_to_string(&source_path)?;
+        std::fs::write(&target, &content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+        }
+        tracing::info!(
+            from = %source_path.display(),
+            to = %target.display(),
+            "migrated per-agent MCP config to operator-shell path (mika#1737 AC5)"
+        );
+        Ok(true)
+    }
 }
 
 impl McpServerConfig {
