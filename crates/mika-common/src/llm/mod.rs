@@ -24,6 +24,19 @@ pub use types::*;
 pub const TYPICAL_CALL_DURATION_SECS: u64 = 90;
 /// Buffer added to typical call duration for retry abort decisions.
 pub const RETRY_BUFFER_SECS: u64 = 30;
+/// Minimum remaining-deadline budget required to attempt a retry after a
+/// **transport-class** failure (mika#1744 AC4-primary).
+///
+/// Transport failures (DNS, connection refused, TLS handshake, socket
+/// reset) resolve in seconds — not the full 120s per-request timeout that
+/// governs HTTP-status errors. The retry loop uses this smaller threshold
+/// (60s) for transport-class errors so a well-tolerated transient network
+/// blip doesn't consume the full deadline budget and force an abort.
+///
+/// The 60s value matches the typical call duration (`TYPICAL_CALL_DURATION_SECS`)
+/// with 30s slack — enough for one retry to complete while preserving a
+/// safety margin against variance.
+pub const TRANSPORT_RETRY_MIN_REMAINING_SECS: u64 = 60;
 
 /// Internal tag names that should be stripped from LLM response text.
 /// These tags are injected into conversation history for LLM context (tool history,
