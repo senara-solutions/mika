@@ -1,8 +1,9 @@
 ---
 title: mika-cli TUI thin-client — Phase 1 audit and refactor plan
 issue: mika#1727
-status: audit-in-progress
+status: audit-complete
 authored: 2026-07-06
+finalized: 2026-07-10
 authors: orchestrator-CC (MPC) via samidarko relay of Prime ratification
 ---
 
@@ -63,7 +64,7 @@ From `crates/mika-agent/src/server/mod.rs` route table, non-exhaustive enumerati
 | `/checkpoint/*` | GET/POST | `checkpoint::*` | checkpoint infra |
 | `/ci/*` | POST | `ci_failure_handler::*`, `ci_success_handler::*` | CI event ingestion |
 
-**Note on missing `/healthz`**: samidarko's un-wedge diagnosis flagged that spirit lacks a `/healthz` endpoint. Not verified in this pass — call out as a small gap for follow-up. `/dashboard/timeline` was previously used as a de facto liveness probe.
+**Note on `/healthz`** (**corrected 2026-07-10**): samidarko's un-wedge diagnosis flagged an apparent `/healthz` gap. Re-verification during the 2026-07-10 finalization pass found that **spirit already exposes `/health`** (`crates/mika-agent/src/server/mod.rs`, deliberately outside the auth layer for probes). Sub-ticket E therefore downgrades from "add `/healthz` endpoint" to "verify `/health` covers TUI liveness needs; add an alias only if a specific probe contract requires the exact path." Not net-new endpoint work.
 
 ## AC1 — Duplication inventory (in-process consumption from mika-cli)
 
@@ -111,7 +112,7 @@ Cross-referencing TUI needs (from `chat.rs`, `tui/app.rs::App`) against spirit's
 - **Permission-decision request stream** — when spirit's classifier defers a tool call to the operator (Y/N approval), TUI needs to receive the request, prompt the operator, and reply. Mirrors claude-pilot's `canUseTool` protocol. Wire shape TBD; likely SSE event with correlated POST-back for the decision. **Phase 2 sub-ticket C — this is the biggest wire-protocol surface change.**
 - **AskUserQuestion callback bridge** — same wire shape as C above but for structured questions. Could be the same channel with a discriminated event type. **Phase 2 sub-ticket D (may combine with C).**
 - **Session-messages ordered stream** — for TUI's message pane, a session-scoped SSE of new assistant/user messages. `/dashboard/sessions/{id}` is snapshot-only. Augmentation of `message/stream` may cover this; verify in Phase 2 A.
-- **`/healthz` liveness endpoint** — small but structural; samidarko's un-wedge diagnosis surfaced its absence. **Phase 2 sub-ticket E (small).**
+- **`/healthz` liveness alias** — **corrected 2026-07-10**: spirit's `/health` already exists (`crates/mika-agent/src/server/mod.rs`, outside the auth layer). Sub-ticket E is a verification, not a build. May stay as a rename/alias if a specific probe contract requires the exact `/healthz` path.
 
 **Missing endpoints tally: 3 substantive (permission-decision, task-event stream, session-messages stream) + 1 small (`/healthz`) + verifications (stream contents).** Sub-tickets fan out per Prime's discipline; the actual TUI refactor lands after those clear.
 
@@ -230,6 +231,110 @@ Sub-C is the largest wire-protocol scope; A/B/D/F/E are smaller each. G is the s
 
 **Sub-C shape check**: sharpenings 1-6 came from a two-seat §12 pass on 2026-07-06 (chat seat + gentux seat); chat seat's LLM-fragility catch qualifies as outsideness class per anchor §12, resetting the pass-1 window to 3 fresh passes from that point (samidarko relay).
 
+## Sub-ticket landing status (finalization pass, 2026-07-10)
+
+Snapshot of every fan-out sub-ticket's implementation state, added on 2026-07-10 to close out AC2's "missing endpoints become individual follow-up tickets" gate. Nothing has been deployed to production; PRs sit in the qa-chain per samidarko-claude's discipline ("qa-chain merging as it reviews (nothing deployed)").
+
+| Sub | Ticket | PR | Status | Delivers |
+|---|---|---|---|---|
+| A | mika#1731 | PR#1756 | OPEN — wire shipped, emit-plumbing deferred | `StreamEvent::ToolCallStart` / `ToolCallResult` variants + frame catalog. Emission from `process_tool_calls` follows as a smaller sub-ticket per samidarko-claude's scope-reduction pattern (same as PR#1741 for sub-C AC1). |
+| B | mika#1732 | PR#1759 | OPEN — wire shipped | `TaskEventFrame` + `/dashboard/tasks/stream` SSE surface. Emission from task_engine transition sites is the follow-up. |
+| C | mika#1733 | PR#1760 | OPEN | AC1 SSE stream + POST-back (already merged as PR#1741). AC2-AC6/AC8 delta shipped in PR#1760: `permission_decisions` v44 provenance table, `resolve_decision` full-signature refactor (F1 architect sharpening), `DecisionAuthority` scoped resolver, grep-discipline test. AC7 async cm-emit deferred as mika#1761 (14-day/P1). |
+| D | mika#1734 | PR#1762 | OPEN — stacked on #1733 | Structured `AskUserQuestion { questions: Vec<AskQuestion> }` variant + `/answer` POST-back + hold-timeout materializing `operator-timeout`. Reuses C's SSE channel and auth surface. TUI-side stub consumer example. |
+| E | mika#1735 | (open PR TBD) | Downgraded to verification | `/health` already exists — sub-ticket carries the verification note and an optional `/healthz` alias if a probe contract demands the exact path. |
+| F | mika#1736 | PR#1763 | OPEN — closes as no-op | Sub-A's `StatusUpdate(Completed).status.message` already carries per-turn assistant text with all four fields TUI needs (role/content/timestamp/turn_id). Verification note landed; no augmentation required. |
+| G | mika#1737 | PR#1764 | OPEN | Operator-shell scoped MCP config path with four-tier resolver ($MIKA_MCP_CONFIG > XDG > HOME > CWD) + one-shot idempotent migration from `{agent_home}/mcp.json`. Ratified as Option (a) — CLI edit-time, spirit read-at-init. AC2's residual `McpManager` import in `chat.rs`/`ask.rs` folds into the closing refactor PR. |
+
+**Gap-fill status**: A/B/C/D/F/G are shipped as PRs and enter the qa-chain. E is a verification landing on a small follow-up PR. **The closing PR that satisfies AC5 (structural enforcement — `error[E0603]: module 'agent_loop' is private` compile-error demonstration) can be scheduled once these six PRs merge.**
+
+## AC1 — Per-file line-by-line inventory (finalization pass)
+
+Companion to the module-level table above (§AC1). Enumerates every `use mika_agent::` line in `crates/mika-cli/src/` from a full grep pass on `main` @ `71bf5ee7`. Provides the pin-down the earlier table called out as "Phase 1 follow-up work"; the closing PR uses this list to know exactly what to delete or rewire.
+
+### `crates/mika-cli/src/commands/` — hot-path (11 files touched)
+
+| File | Line | Import | Refactor disposition |
+|---|---|---|---|
+| `ask.rs` | 8 | `use mika_agent::agent::{self, AgentParams, check_onboarding};` | **Delete** — replace with A2A `message/send`; already partially covered by `remote_ask.rs`. |
+| `ask.rs` | 351 (call) | `agent::run_agent(&AgentParams { ... })` | **Delete** — remote path (`remote_ask.rs`) is the sole survivor. |
+| `chat.rs` | 26 | `use mika_agent::agent::{self, AgentParams, check_onboarding};` | **Delete** — replace with A2A `message/stream` consumer. |
+| `chat.rs` | 27 | `use mika_agent::agent_loop::LoopResult;` | **Delete** — LoopResult becomes an opaque outcome from the wire response. |
+| `chat.rs` | 28 | `use mika_agent::messaging::{...};` | **Move to spirit** — TUI outbound routes through spirit's a2a. |
+| `chat.rs` | 29 | `use mika_agent::skills::{SkillRegistry, executor, ...};` | **Split** — skill *management* stays CLI; skill *loading for turn execution* moves behind spirit. |
+| `chat.rs` | 29 | `use mika_agent::task_engine::{TaskEngine, TaskDispatcher};` | **Delete** — TUI status pane consumes `GET /dashboard/tasks` + new SSE task-event stream (sub-B). |
+| `chat.rs` | 96 | `use mika_agent::tools::{default_tools, management_tools_if_needed};` | **Delete** — spirit constructs its own tool registry per-session. |
+| `chat.rs` | 97 | `use mika_agent::tools::create_skill::validate_skill_name;` | **Move to mika-common** — validation is a pure function usable at CLI edit-time. |
+| `chat.rs` | 150 (call) | `init::connect_mcp(&ctx.home_dir).await` | **Delete for chat path** — spirit owns MCP runtime per mika#1737. `commands/mcp.rs` retains the CLI edit-time surface. |
+| `chat.rs` | 285/397 (call) | `agent::run_agent(&AgentParams { ... })` | **Delete** — A2A `message/stream` consumer replaces both callsites. |
+| `commands/skills.rs` | multiple | `use mika_agent::skills::*` | **Split** — management-side stays CLI, runtime-side moves behind spirit. |
+| `commands/skills_variants.rs` | multiple | `use mika_agent::skills::*` | Same split as `skills.rs`. |
+| `commands/mcp.rs` | 4 | `use mika_agent::mcp::config::{McpConfig, McpServerConfig, McpTransport};` | **Kept** post-mika#1737 — CLI edit-time surface. |
+| `commands/tasks.rs` | (multiple) | `use mika_agent::task_engine::*` | **Convert to HTTP wrappers** — `mika tasks *` commands become thin clients of `/dashboard/tasks*`. |
+| `commands/teams.rs` | (multiple) | `use mika_agent::teams::*` | **Types stay** (wire schema); logic moves behind spirit. |
+| `commands/doctor.rs` | (multiple) | `use mika_agent::mcp::config::*` | Same as `commands/mcp.rs` (kept for the edit-time surface). |
+| `commands/config.rs` | 1 | `use mika_agent::config_keys::*` | **Kept** — settable config-key allowlist is CLI territory. |
+| `commands/validate.rs` | (via server + agents) | `use mika_agent::validate::*` | Legitimate CLI territory (edit-time config validation). |
+
+### `crates/mika-cli/src/init.rs` — startup wiring
+
+| Line | Import | Refactor disposition |
+|---|---|---|
+| 2 | `use mika_agent::async_db::AsyncDatabase;` | **Delete** — TUI has no DB. Session/message reads go through spirit's HTTP API. |
+| 3 | `use mika_agent::db::Database;` | **Delete** — same. |
+| 4 | `use mika_agent::messaging::{GatewayMessageSender, MessageSender};` | **Delete** — outbound routes via a2a. |
+| 5 | `use mika_agent::startup;` | **Delete** — spirit does its own startup. |
+| 217 | `pub async fn connect_mcp(...) -> Option<McpManager>` | **Delete** — spirit owns runtime MCP after mika#1737. |
+
+### `crates/mika-cli/src/main.rs` and `src/tui/`
+
+`tui/` (ratatui rendering surface) does NOT import `mika_agent` directly beyond re-exports pulled through `commands`. The rendering layer is already structurally clean.
+
+`main.rs` wires the clap parser; its `mika_agent` visibility comes transitively through `commands::*`. Removing the hot-path uses above eliminates it.
+
+### `crates/mika-cli/src/remote_ask.rs`
+
+The A2A thin-client precedent. **Zero changes** — the refactor generalizes this shape to the interactive `chat` path.
+
+### Summary
+
+- **~14 hot-path callsites in `chat.rs`/`ask.rs`** to remove or reroute.
+- **~3 CLI-edit-time modules** (`commands/mcp.rs`, `commands/config.rs`, `commands/skills.rs` split) stay as CLI territory per the wrapper-doctrine's operator-shell carve-out.
+- **`init::connect_mcp` deleted** after mika#1737 lands the spirit-side MCP init.
+- **Net effect**: `mika-cli/Cargo.toml`'s `mika-agent.workspace = true` line either goes away entirely or is reduced to wire-type re-exports (per the plan's AC5 Option A/B decision).
+
+## Weekend loop-stall evidence — live rationale for the daemon-agent architecture
+
+Recorded on 2026-07-10 during the mika#1733 → #1734 → #1736 → #1737 drain, per Vincent's directive to "fold in the weekend loop-stall evidence — the drain proved live exactly why the daemon-agent architecture is needed."
+
+The mika#1741 → PR#1760 → PR#1762 → PR#1763 → PR#1764 sequence landed only because orchestrator-CC ran the pipeline **directly in-session** — the autonomous `ready`-label dispatch path stalled repeatedly across the weekend, and each recovery required either:
+
+1. A `/mika` invocation in the interactive session (which drives the pipeline inline, no ready-label handoff), or
+2. Direct-implement-from-plan (the anti-stall fallback: if `/mika` sits without producing implementation the way the ready-label did, fall back to in-session code changes from the committed plan).
+
+**This is exactly the case #1727 makes.** The autonomous loop stalled because:
+
+- The permission-classifier decision path was in-process in the standalone TUI/CLI (the sub-C surface) — no wire boundary meant no surface for external observation, replay, or intervention.
+- Session state and tool-call ordering had two persistence surfaces (D3/D4's two-truths anti-pattern) — every substrate hiccup could leave one surface authoritative and the other drifted.
+- MCP config was per-agent (sub-G surface) — dispatch handshakes had to coordinate config paths that didn't align between CLI and spirit.
+
+When the autonomous loop stalled, the recovery path was ALWAYS: (a) orchestrator-CC opens an interactive session, (b) reads the substrate state that spirit already had, (c) drives the pipeline through the /mika command, and (d) the code changes ship. That IS the thin-client shape working around a not-yet-thin CLI.
+
+**Post-refactor shape**: because spirit owns everything primitive, orchestrator-CC's `/mika` interactive session is a thin HTTP consumer of spirit — no in-process agent loop to stall, no dual-persistence to drift, no per-agent MCP handshake to coordinate. When the loop is autonomously wedged, the operator opens an interactive session, which is just another thin client of the same spirit. The recovery path becomes structurally identical to the happy path.
+
+This is not aspirational. It is what actually happened during the mika#1733-#1737 drain, when the orchestrator ran the pipeline against a spirit whose HTTP surface was already rich (§F4). What blocked full-thin-client operation was the CLI's residual in-process agent loop — the exact code the closing PR deletes.
+
 ## Next action
 
-Attack mika#1727 Phase 2 refactor after sub-issues clear. Per Prime's discipline: the closing PR for mika#1727 lands only after sub-tickets have shipped their surfaces (or been closed as no-op verifications). Per-file line-by-line inventory (Phase 1 follow-up work) is an amendment commit on this same branch, not a separate PR.
+The Phase-1 audit-and-plan portion of mika#1727 is now **audit-complete** — this document plus its companion plan (`docs/plans/2026-07-06-001-feat-1727-tui-thin-http-client-plan.md`) satisfy AC1-AC4 as documents and sketch AC5 as a compile-error demonstration for the closing PR.
+
+The Phase-2 refactor PR that structurally lands AC5 (the compile-error property) queues behind sub-tickets A/B/C/D/F/G merging (E is a verification; may fold into A). Once those merge, the closing PR:
+
+1. Deletes standalone-mode consumption of `mika_agent::agent::run_agent` from `chat.rs` and `ask.rs`.
+2. Rewires `chat.rs` to consume A2A `message/stream` (via `mika_a2a::client::A2aClient`) with sub-A's tool-call event augmentation.
+3. Wires permission-decision requests (sub-C) and AskUserQuestion (sub-D) into TUI's existing approval-prompt UI.
+4. Reduces `crates/mika-cli/Cargo.toml`'s `mika-agent` dependency to wire-type-only re-exports (or drops it entirely per the AC5 Option A/B decision).
+5. Applies Option A (`pub(crate)` visibility flip on `agent_loop`, `tool_execution`, session-manager types in `mika-agent`) to make standalone-mode compilation structurally impossible.
+6. Deletes commands/paths made unreachable (`AgentParams` construction, `startup::*` in TUI, task_engine local spawn, `init::connect_mcp`).
+7. Documents fresh-install behavior: `mika-spirit` starts as a user-service before first `mika chat` invocation.
+
+Estimated: ~500-1500 lines deleted, ~200-400 added. Net reduction is the point.

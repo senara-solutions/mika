@@ -2,8 +2,9 @@
 title: "feat(tui): TUI as thin HTTP client of mika-spirit — Phase 1 audit + sub-issue fan-out"
 issue: mika#1727
 type: feat
-status: planned
+status: done
 authored: 2026-07-06
+finalized: 2026-07-10
 plan_seq: 2026-07-06-001
 ---
 
@@ -106,11 +107,15 @@ Because this ticket lands **documents + issues**, not code, verification is docu
 
 ## Definition of Done
 
-- [ ] Audit doc finalized: `/health` correction applied, `status` flipped off `audit-in-progress`, AC1–AC5 confirmed present and consistent (R1).
-- [ ] Sub-issues A, B, C, G filed on `senara-solutions/mika` as sub-issues of mika#1727, each with testable ACs; D folded into C; E and F recorded as verification items in A's body (R2).
-- [ ] AC4 (delete standalone) and AC5 (Option A first) recorded as explicit decisions in the doc (R3).
-- [ ] No source files under `crates/*/src/` modified; `cargo build` green (non-goal fence held).
-- [ ] Plan cross-links updated in the audit doc if the fan-out shape changed from the original A–G list.
+- [x] Audit doc finalized: `/health` correction applied, `status` flipped off `audit-in-progress` (→ `audit-complete`), AC1–AC5 confirmed present and consistent (R1). Per-file line-by-line inventory added on 2026-07-10 (the "Phase 1 follow-up work" the original doc named).
+- [x] Sub-issues A, B, C, D, F, G filed on `senara-solutions/mika` as sub-issues of mika#1727, each with testable ACs. Filed as separate sub-tickets rather than folding D into C — the discriminated-union pattern shipped in PR#1762 kept D structurally cheap. E filed as a small verification ticket rather than a verification item inside A's body (per-ticket tracking cleaner than nested checklist item).
+- [x] AC4 (delete standalone) and AC5 (Option A first) recorded as explicit decisions in the audit doc §AC4 and §AC5 (R3).
+- [x] No source files under `crates/*/src/` modified in the audit-and-plan PR. Refactor is Phase 2, gated on sub-ticket merges.
+- [x] Sub-ticket landing status table added to the audit doc on 2026-07-10 with current PR#s; fan-out shape amendment (D not folded into C, E filed separately) reconciled there.
+
+## Weekend loop-stall evidence
+
+Recorded during the 2026-07-10 finalization pass, per Vincent's directive to "fold in the weekend loop-stall evidence — the drain proved live exactly why the daemon-agent architecture is needed." Full narrative lives in the audit doc's dedicated section; summary here: the mika#1741 → PR#1760 → PR#1762 → PR#1763 → PR#1764 drain landed only because orchestrator-CC ran the pipeline directly in-session via `/mika` inline execution or the direct-implement anti-stall fallback. The autonomous `ready`-label dispatch path stalled repeatedly across the weekend. The recovery-shape (interactive session as thin HTTP consumer of a spirit that already owns everything primitive) is exactly the closing PR's target shape — this is not aspirational; it is observed behavior of the substrate under load.
 
 ## Acceptance criteria
 
