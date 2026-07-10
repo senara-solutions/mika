@@ -27,7 +27,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 43;
+pub const CURRENT_SCHEMA_VERSION: i64 = 44;
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1030,6 +1030,11 @@ impl Database {
             info!(version = 43, "database migrated to v43");
         }
 
+        if (3..=43).contains(&version) {
+            self.migrate_v43_to_v44()?;
+            info!(version = 44, "database migrated to v44");
+        }
+
         Ok(())
     }
 
@@ -1084,7 +1089,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (43);
+            INSERT INTO schema_version (version) VALUES (44);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1710,6 +1715,29 @@ impl Database {
                 last_failure_at TEXT,
                 PRIMARY KEY (repo_full_name, issue_number)
             );
+
+            -- Permission-decision provenance ledger (mika#1733 AC4)
+            CREATE TABLE permission_decisions (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                args_summary TEXT,
+                classifier_verdict TEXT NOT NULL
+                    CHECK (classifier_verdict IN ('approved', 'denied', 'held')),
+                operator_decision TEXT
+                    CHECK (operator_decision IN ('approve', 'deny')),
+                override_used INTEGER NOT NULL DEFAULT 0
+                    CHECK (override_used IN (0, 1)),
+                decision_authority TEXT NOT NULL
+                    CHECK (decision_authority IN ('strict', 'override')),
+                tenant_id TEXT,
+                agent_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_permission_decisions_request_id
+                ON permission_decisions(request_id);
+            CREATE INDEX idx_permission_decisions_created_at
+                ON permission_decisions(created_at DESC);
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -4307,6 +4335,96 @@ impl Database {
             "v42→v43: added lifecycle_state, use_count, last_used_at to skill_overrides (mika#1584)"
         );
 
+        Ok(())
+    }
+
+    /// v43→v44: additive `permission_decisions` provenance ledger (mika#1733 AC4).
+    ///
+    /// Records every operator permission decision routed through
+    /// `PermissionsChannel::resolve_decision`, including the classifier
+    /// verdict, operator ratification, derived `override_used` flag, and the
+    /// scope (tenant/agent) at decision time. Additive-only — no rebuild of
+    /// existing tables. Two indexes support the two expected query shapes:
+    /// per-request lookup and time-window scans.
+    fn migrate_v43_to_v44(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 44 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS permission_decisions (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                args_summary TEXT,
+                classifier_verdict TEXT NOT NULL
+                    CHECK (classifier_verdict IN ('approved', 'denied', 'held')),
+                operator_decision TEXT
+                    CHECK (operator_decision IN ('approve', 'deny')),
+                override_used INTEGER NOT NULL DEFAULT 0
+                    CHECK (override_used IN (0, 1)),
+                decision_authority TEXT NOT NULL
+                    CHECK (decision_authority IN ('strict', 'override')),
+                tenant_id TEXT,
+                agent_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_permission_decisions_request_id
+                ON permission_decisions(request_id);
+            CREATE INDEX IF NOT EXISTS idx_permission_decisions_created_at
+                ON permission_decisions(created_at DESC);",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (44)", [])?;
+        tx.commit()?;
+
+        info!("v43→v44: added permission_decisions provenance table (mika#1733 AC4)");
+
+        Ok(())
+    }
+
+    /// Insert a permission-decision provenance record (mika#1733 AC4). All
+    /// fields correspond 1:1 to the v44 schema columns. `override_used` is
+    /// derived by the caller and asserted at the CHECK constraint here as
+    /// defense-in-depth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_permission_decision(
+        &self,
+        id: &str,
+        request_id: &str,
+        tool_name: &str,
+        args_summary: Option<&str>,
+        classifier_verdict: &str,
+        operator_decision: Option<&str>,
+        override_used: bool,
+        decision_authority: &str,
+        tenant_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO permission_decisions (
+                id, request_id, tool_name, args_summary,
+                classifier_verdict, operator_decision, override_used,
+                decision_authority, tenant_id, agent_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                request_id,
+                tool_name,
+                args_summary,
+                classifier_verdict,
+                operator_decision,
+                if override_used { 1i64 } else { 0i64 },
+                decision_authority,
+                tenant_id,
+                agent_id,
+            ],
+        )?;
         Ok(())
     }
 

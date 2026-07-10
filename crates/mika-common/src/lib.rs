@@ -9,6 +9,7 @@ pub mod home;
 pub mod llm;
 pub mod logging;
 pub mod oauth;
+pub mod permission_authority;
 pub mod team;
 pub mod telemetry;
 pub mod text;
