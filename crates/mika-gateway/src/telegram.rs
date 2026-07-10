@@ -118,6 +118,18 @@ pub enum ParsedMessage {
     BareStart {
         chat_id: i64,
     },
+    /// `/unlink` — request self-unlink of the paired Telegram binding (mika#1749).
+    /// Also produced when the user typed `/unlink <anything>` with a suffix we
+    /// don't recognize; the handler shows the warning and prompts the user to
+    /// send `/unlink confirm`.
+    Unlink {
+        chat_id: i64,
+    },
+    /// `/unlink confirm` — commit the self-unlink (mika#1749). Atomic UPDATE
+    /// releases `telegram_chat_id`.
+    UnlinkConfirm {
+        chat_id: i64,
+    },
     Unsupported {
         chat_id: i64,
     },
@@ -173,6 +185,18 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
                 chat_id,
                 pairing_token: token.to_string(),
             };
+        }
+        // /unlink family (mika#1749). Canonicalize whitespace so `/unlink   confirm`
+        // parses the same as `/unlink confirm`. Only exact `/unlink` and
+        // `/unlink confirm` match; a stray suffix (typo) falls back to the warning
+        // path. `/unlinkxxx` (no space after `/unlink`) does NOT match — it's not
+        // our command and gets forwarded to the agent as free text.
+        if text == "/unlink" || text.starts_with("/unlink ") {
+            let canonical: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if canonical == "/unlink confirm" {
+                return ParsedMessage::UnlinkConfirm { chat_id };
+            }
+            return ParsedMessage::Unlink { chat_id };
         }
         return ParsedMessage::Text {
             chat_id,
@@ -860,6 +884,77 @@ mod tests {
         assert_eq!(
             parse_update(&update),
             ParsedMessage::BareStart { chat_id: 42 }
+        );
+    }
+
+    // /unlink command family (mika#1749)
+
+    /// Exact `/unlink` produces `Unlink` — the warning-then-confirm entry point.
+    #[test]
+    fn test_parse_unlink_bare() {
+        let update = TelegramUpdate {
+            update_id: 200,
+            message: Some(text_msg(42, Some("/unlink"))),
+        };
+        assert_eq!(parse_update(&update), ParsedMessage::Unlink { chat_id: 42 });
+    }
+
+    /// `/unlink confirm` produces `UnlinkConfirm` — the atomic release.
+    #[test]
+    fn test_parse_unlink_confirm() {
+        let update = TelegramUpdate {
+            update_id: 201,
+            message: Some(text_msg(42, Some("/unlink confirm"))),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::UnlinkConfirm { chat_id: 42 }
+        );
+    }
+
+    /// Whitespace canonicalization: `/unlink   confirm` (extra spaces) still
+    /// resolves to `UnlinkConfirm`.
+    #[test]
+    fn test_parse_unlink_confirm_extra_whitespace() {
+        let update = TelegramUpdate {
+            update_id: 202,
+            message: Some(text_msg(42, Some("/unlink   confirm"))),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::UnlinkConfirm { chat_id: 42 }
+        );
+    }
+
+    /// Unknown suffix (typo, e.g. `/unlink now`) falls back to `Unlink` — the
+    /// handler shows the warning path. Better than silently no-oping.
+    #[test]
+    fn test_parse_unlink_unknown_suffix_falls_to_warning() {
+        let update = TelegramUpdate {
+            update_id: 203,
+            message: Some(text_msg(42, Some("/unlink now"))),
+        };
+        assert_eq!(parse_update(&update), ParsedMessage::Unlink { chat_id: 42 });
+    }
+
+    /// `/unlinkxxx` (no space between command and suffix) is NOT our command —
+    /// falls through to `Text` and is forwarded to the agent as free text.
+    /// Guards against accidental release from partial typos.
+    #[test]
+    fn test_parse_unlink_no_space_is_text() {
+        let update = TelegramUpdate {
+            update_id: 204,
+            message: Some(text_msg(42, Some("/unlinkxxx"))),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Text {
+                chat_id: 42,
+                text: "/unlinkxxx".to_string(),
+                update_id: 204,
+                reply_to_message_id: None,
+                reply_to_text: None,
+            }
         );
     }
 
