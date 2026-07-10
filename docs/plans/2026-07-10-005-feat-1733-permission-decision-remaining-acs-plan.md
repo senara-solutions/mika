@@ -333,4 +333,4 @@ Estimated diff: ~500 net lines added.
   1. Eliminated the wrapper — full-signature refactor with mechanical test edits per architect's step-by-step path (rewrite → update `handle_permission_decide` → update 8 unit tests in-place → no legacy variant).
   2. AC2 doctrine anchor comment format sharpened to be explicit about the cross-repo boundary (NOTE line naming the claude-pilot-py gap + follow-up ticket).
   3. AC7 follow-up ticket shape sharpened to carry a preparation note (contract for the cm-side endpoint: reference emit shape, acceptance criteria, payload shape, 14-day timeout).
-- 2026-07-10 — pending: `mika-arch` second-pass review.
+- 2026-07-10 — `mika-arch` second-pass review (same session): **Verdict: GROOMED**. All three revisions confirmed satisfying pass-1 concerns. Gates green: Unresolved-Decision Gate (no TBD/placeholder tokens), Acceptance-Criteria Gate (AC1-AC8 + AC-general present). Architect: "The plan is cleanly implementable as-written."
