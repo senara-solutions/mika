@@ -856,7 +856,8 @@ discriminator key + correlation scope. They coexist by design — do NOT unify.
 **Full field-by-field references:**
 
 - `crates/mika-agent/docs/a2a-stream-frame-catalog-2026-07-10.md` — `StreamEvent` variants.
-- `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md` — `PermissionStreamFrame` variants.
+- `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md` — `PermissionStreamFrame::PermissionRequest` (sub-C, AC1-AC8).
+- `crates/mika-agent/docs/ask-user-question-bridge-2026-07-10.md` — `PermissionStreamFrame::AskUserQuestion` (sub-D) + `/answer` POST-back + hold-timeout.
 - `crates/mika-agent/docs/tasks-event-stream-frame-catalog-2026-07-10.md` — `TaskEventFrame` variants.
 
 
