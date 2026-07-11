@@ -96,8 +96,19 @@ Regex::new(r"(?m)^> - \*\*Grooming history:\*\*.+second-pass \(GROOMED[\s\)\.,;:
 - **AC6 (existing test coverage preserved):** The existing tests at `crates/mika-agent/src/skills/executor.rs:5557+` (`test_grooming_markers_*`) continue to pass without modification. Only new tests are added.
 - **AC7 (in-flight tickets unaffected):** Tickets whose body carries the strict canonical `second-pass (GROOMED)` form (no comma parameter) continue to dispatch identically. No regression on cm#56/57/58/59/60 whose grooming-history callouts use the strict form.
 
+## Scope split (2026-07-11 amendment)
+
+Mechanism 2 (grooming-marker gate widening) is the sole scope of this PR. **Mechanism 1 (dev-groom `_iterate_groom_loop` convergence failure — AC1 investigation + AC2 fix) is deferred to a follow-up ticket, `senara-solutions/mika#1772`.** Rationale:
+
+- AC1 is investigation-first (server.log grep for tasks `e781006e-ade5-445d-83a3-dc1d005e8288` / `f490c32f-6aa0-4942-b10f-c3e13204f75e`, plus a shell handler read of `skills/bundled/dev-groom/handler.sh`). The A/B/C fix direction only becomes concrete after AC1 names the specific failure candidate.
+- AC2's regression test needs a reproducer fixture that depends on which of the A/B/C candidates AC1 identifies.
+- Mechanism 2 is a well-scoped structural regex widening that unblocks the mika#1723 dispatch-rejection route-around today, independent of the mechanism 1 diagnosis.
+
+Only AC3–AC7 (Mechanism 2's regex-widening ACs) apply to this PR. AC1 + AC2 are tracked in mika#1772 and will land in a separate scoped PR after root cause is named.
+
 ## Out of scope
 
+- **Mechanism 1 investigation and fix (AC1 + AC2)** — deferred to mika#1772 as documented above.
 - Renaming `_iterate_groom_loop` or restructuring dev-groom's handler flow (bigger refactor).
 - Changing the writer-side canonical form (this is a structural gate fix — writers can produce any of the accepted forms, and orchestrator-CC's current `— session-id:` shape is one accepted form).
 - Adding a `parse_paraphrased_disposition()` mika-arch helper library (future ticket if the paraphrase set grows).
