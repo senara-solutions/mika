@@ -101,6 +101,15 @@ Emission points: in `process_tool_calls` (`crates/mika-agent/src/tool_execution/
 - No change to `agent_loop` / tool-execution internals — this ticket only shapes the OUTBOUND SSE and adds a fire-and-forget emit call.
 - No cross-tenant streaming or authorization — same as parent ticket §Not in scope.
 
+### Scope split (2026-07-11 amendment)
+
+**AC4 (agent → SSE broadcast plumbing) and AC6 (integration test asserting the full frame sequence) are deferred to a follow-up ticket, `senara-solutions/mika#1757`.** Rationale:
+
+- AC4's emission call sites (`process_tool_calls` invocations across conversation/silent/team paths, plus the mid-turn `EndTurn` guard chain) require a separate scoping pass to avoid frame-order regressions with the retry/guard rebroadcast semantics documented in `crates/mika-agent/CLAUDE.md § Post-Conditions`. Landing AC4 in this PR risks tangling the frame-types substrate with emission-point semantics.
+- AC6's integration test depends on AC4 shipping — a full-sequence assertion can't run without emission call sites.
+
+This PR ships AC1 (documentation), AC2 (structural frame types), AC3 (`AgentParams.stream_tx` field + `StreamEventSender` alias + `truncate_tool_summary` helper), AC5 (frame catalog verification note), AC7–AC9 (unit tests, forward-compat, guardrails). The substrate is complete and usable — AC4/AC6 add the emission wiring in a scoped follow-up.
+
 ## Implementation guardrails
 
 ### File and function targets
