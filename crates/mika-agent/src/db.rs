@@ -16242,6 +16242,7 @@ mod tests {
         db2.migrate_v40_to_v41().unwrap();
         db2.migrate_v41_to_v42().unwrap();
         db2.migrate_v42_to_v43().unwrap();
+        db2.migrate_v43_to_v44().unwrap();
 
         let final_version: i64 = db2
             .conn
