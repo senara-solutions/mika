@@ -1,0 +1,14 @@
+[skill]
+name = "qa-review-webhook-success"
+description = "Webhook handler for CI check_suite successes — dispatches autonomous qa-review on a green PR"
+version = "0.1.0"
+always_on = false
+dependencies = ["qa-review"]
+
+[triggers]
+keywords = [
+    "check_suite",
+    "check suite",
+    "ci success",
+    "check_suite success",
+]

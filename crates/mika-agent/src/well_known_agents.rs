@@ -220,6 +220,7 @@ allow_authoring = false\n\
 allowlist = [\n\
   \"qa-review\",\n\
   \"qa-review-build-callback\",\n\
+  \"qa-review-webhook-success\",\n\
   \"skill-review\",\n\
   \"build-mika\",\n\
   \"deploy-mika\",\n\
@@ -1938,7 +1939,11 @@ mod tests {
         // skill-review is SHARED, not role-only (like tmux/shell-exec above): mika-qa
         // reviews skills, and mika-dev self-tunes model-specific variants of its own
         // prompts via review_skill. Reclassified from qa-only when added to mika-dev.
-        let qa_only = ["qa-review", "qa-review-build-callback"];
+        let qa_only = [
+            "qa-review",
+            "qa-review-build-callback",
+            "qa-review-webhook-success",
+        ];
         for skill in &qa_only {
             assert!(
                 qa_allowlist.contains(&skill.to_string()),
@@ -2138,8 +2143,8 @@ mod tests {
             .expect("mika-qa must have allowlist");
         assert_eq!(
             allowlist.len(),
-            17,
-            "mika-qa allowlist should have 17 skills"
+            18,
+            "mika-qa allowlist should have 18 skills"
         );
     }
 
