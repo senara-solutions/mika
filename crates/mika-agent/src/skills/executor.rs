@@ -840,6 +840,21 @@ async fn record_dispatch_rejection(db: &AsyncDatabase, task_id: &str, reason_jso
 /// Returns `Err(json_error_string)` on rejection, `Ok(status)` with the task's
 /// current status if dispatch may proceed. Each rejection site also writes the
 /// structured reason to `tasks.result` (#1108) for operator visibility.
+//
+// DOCTRINE: pre-classifier structural gate (mika#1733 AC2)
+// Applies per crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md §AC2:
+// "This agent structurally cannot do X" applies to pre-classifier engine gates
+// only, NEVER to LLM classifier decisions. This is such a gate — it rejects a
+// dispatch before any LLM classifier runs, based on structural task state
+// (status, callback children, grooming callouts, blockedBy edges) that the
+// classifier is not competent to evaluate.
+//
+// NOTE: The tier1/tier2/tier3 permission classifier code lives in
+// claude-pilot-py; the companion doctrine anchor for those sites is tracked
+// as a cross-repo follow-up filed alongside this PR (see PR body §Follow-ups).
+// This annotation covers the in-mika-agent structural gate only. See mika#1193
+// for the retirement of the in-repo `permission-policy` skill that moved the
+// classifier tiers into claude-pilot-py.
 pub(crate) async fn validate_dispatch_readiness(
     db: &AsyncDatabase,
     task_id: &str,

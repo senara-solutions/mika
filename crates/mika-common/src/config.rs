@@ -449,6 +449,21 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Colon-separated list of absolute paths to docs root directories for multi-corpus agents. Global fallback; per-agent identity.toml [kg].docs_roots takes precedence. Linux/macOS only.",
     },
+    // Permission-decision authority (mika#1733 AC3, AC8)
+    ConfigKeyInfo {
+        key: "decision_authority",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_DECISION_AUTHORITY"),
+        secret: false,
+        description: "Global permission-decision authority: 'strict' (default) means the classifier verdict wins; 'override' allows the operator to flip a classifier deny. Per-tenant/per-agent scopes resolved via MIKA_DECISION_AUTHORITY__TENANT__<id> / MIKA_DECISION_AUTHORITY__AGENT__<id> env vars.",
+    },
+    ConfigKeyInfo {
+        key: "permission_hold_timeout_secs",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_PERMISSION_HOLD_TIMEOUT_SECS"),
+        secret: false,
+        description: "Server-side held-request timeout in seconds. Timeout materializes an internal deny (fail-closed). Default: 300.",
+    },
     // ReadOnly (runtime-computed)
     ConfigKeyInfo {
         key: "home_dir",
@@ -591,10 +606,45 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join(":")
         }),
+        // Permission-decision authority (mika#1733)
+        "decision_authority" => Some(match settings.decision_authority {
+            DecisionAuthority::Strict => "strict".to_string(),
+            DecisionAuthority::Override => "override".to_string(),
+        }),
+        "permission_hold_timeout_secs" => Some(settings.permission_hold_timeout_secs.to_string()),
         // DB keys (timezone, thinking_level) not available from Settings
         _ => None,
     }
 }
+
+/// Server-side permission-decision authority (mika#1733 AC3, AC8).
+///
+/// Controls whether an operator's decision can flip a classifier verdict.
+/// Compile-time default is [`DecisionAuthority::Strict`] per AC8 — the operator's
+/// decision is advisory only and the classifier verdict always wins. `Override`
+/// mode is opt-in via configuration (env or config file) and NEVER via wire
+/// input; see [`crate::config::CONFIG_KEYS`] for the `MIKA_DECISION_AUTHORITY`
+/// key registration.
+///
+/// Wire-schema note: `PermissionDecideRequest` in `mika-agent` rejects any
+/// `decision_authority` field on the POST body via
+/// `#[serde(deny_unknown_fields)]` — server-side config is NEVER wire-carried.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionAuthority {
+    /// Operator decisions are advisory only; classifier verdict wins. This is
+    /// the shipped default per AC8.
+    #[default]
+    Strict,
+    /// Operator decisions can flip a classifier deny to approve. Enabled only
+    /// via explicit config.
+    Override,
+}
+
+/// Default server-side hold-timeout for a held permission request (seconds).
+/// Overridable via `MIKA_PERMISSION_HOLD_TIMEOUT_SECS`. Timeout materializes
+/// an internal `deny` per the fail-closed discipline.
+pub const DEFAULT_PERMISSION_HOLD_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Deserialize, Clone)]
 pub struct Settings {
@@ -883,9 +933,25 @@ pub struct Settings {
     #[serde(default)]
     pub operational_partner: bool,
 
+    /// Global permission-decision authority (mika#1733 AC3, AC8). Compile-time
+    /// default is [`DecisionAuthority::Strict`]. Per-tenant / per-agent scopes
+    /// are resolved by [`crate::permission_authority::resolve_authority`] (env
+    /// vars only — `Settings` is the global-tier fallback).
+    #[serde(default)]
+    pub decision_authority: DecisionAuthority,
+
+    /// Server-side held-request timeout in seconds (mika#1733 AC3). Default:
+    /// [`DEFAULT_PERMISSION_HOLD_TIMEOUT_SECS`] (300).
+    #[serde(default = "default_permission_hold_timeout_secs")]
+    pub permission_hold_timeout_secs: u64,
+
     /// Resolved home directory path (populated after load, not from config file)
     #[serde(skip)]
     pub home_dir: PathBuf,
+}
+
+fn default_permission_hold_timeout_secs() -> u64 {
+    DEFAULT_PERMISSION_HOLD_TIMEOUT_SECS
 }
 
 /// Default per-batch LLM call budget for KG extraction and resolution (#757).
@@ -1464,6 +1530,8 @@ impl Settings {
             kg_docs_root: None,
             kg_docs_roots: None,
             operational_partner: false,
+            decision_authority: DecisionAuthority::Strict,
+            permission_hold_timeout_secs: DEFAULT_PERMISSION_HOLD_TIMEOUT_SECS,
         }
     }
 }
@@ -1595,6 +1663,11 @@ impl std::fmt::Debug for Settings {
             .field("kg_docs_root", &self.kg_docs_root)
             .field("kg_docs_roots", &self.kg_docs_roots)
             .field("operational_partner", &self.operational_partner)
+            .field("decision_authority", &self.decision_authority)
+            .field(
+                "permission_hold_timeout_secs",
+                &self.permission_hold_timeout_secs,
+            )
             .field("home_dir", &self.home_dir)
             .finish()
     }
