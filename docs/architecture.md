@@ -838,12 +838,13 @@ discriminator key + correlation scope. They coexist by design — do NOT unify.
 | `PermissionStreamFrame` | `#[serde(tag = "event")]` | Per-process (single `AppState.permissions_channel`) | `GET /api/v1/dashboard/permissions/stream` (+ POST-back `/decide`) | `mika-agent` server | mika#1741 (sub-C AC1) |
 | `TaskEventFrame` (mika#1732) | `#[serde(tag = "event")]` | Per-process (single `AppState.task_events_channel`) | `GET /api/v1/dashboard/tasks/stream` | `mika-agent` server | this ticket |
 
-**Four axes of deliberate divergence:**
+**Five axes of deliberate divergence:**
 
 1. **Discriminator key** — A2A uses `kind`, Dashboard uses `event`.
 2. **Correlation scope** — A2A is per-task (each `message/stream` gets its own bounded broadcast); Dashboard streams are per-process global broadcasts frames tag their originating agent/session.
 3. **Route pattern** — A2A rides on JSON-RPC POST body; Dashboard uses dedicated GET endpoints.
 4. **Crate location** — A2A frames live in `mika-a2a` (protocol-owned); Dashboard frames live in `mika-agent` server module (deploy-owned).
+5. **Decision persistence** — Dashboard SSE surfaces may write a companion DB row when the frame carries a ratified decision. `PermissionStreamFrame::PermissionRequest` pairs with a `permission_decisions` row (mika#1733 AC4) once the operator POSTs back; task-event frames have no persistence yet (emission-from-transition sites land in a follow-up ticket). A2A `StreamEvent` writes go through the `a2a_task_map` + task-store path — orthogonal to the dashboard-SSE persistence axis.
 
 **Shared discipline (all three surfaces):**
 
