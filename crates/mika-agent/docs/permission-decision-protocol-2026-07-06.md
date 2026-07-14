@@ -332,6 +332,33 @@ Sub-C MUST NOT re-introduce coupling. Failure modes to guard against explicitly:
 
 - Control-monitor migration for `override_event` event_class_policy row (small, self-contained; landing separately keeps the two repos' PRs reviewable independently).
 
+## Implementation status
+
+**AC1 (shipped, PR#1741):** SSE request channel + POST-back handler at
+`crates/mika-agent/src/server/permissions_stream.rs`.
+
+**AC2-AC6, AC8 (shipping in this PR, feat/1733/permission-decision-request-stream):**
+
+| AC | Status | Landing site |
+|---|---|---|
+| AC2 | Partial — in-repo anchors landed | `crates/mika-agent/src/skills/executor.rs::validate_dispatch_readiness`, `crates/mika-agent/src/webhook_dispatch.rs::is_unauthorized_webhook_dispatch`. Claude-pilot-py companion anchors tracked as a follow-up (see PR body). |
+| AC3 | Landed | `Settings.decision_authority` + `Settings.permission_hold_timeout_secs` in `crates/mika-common/src/config.rs`; `MIKA_DECISION_AUTHORITY` / `MIKA_PERMISSION_HOLD_TIMEOUT_SECS` env vars; `PermissionDecideRequest` wire-schema rejection preserved from PR#1741. |
+| AC4 | Landed | Schema v43→v44 migration + `permission_decisions` table in `crates/mika-agent/src/db.rs`; `AsyncDatabase::insert_permission_decision` helper; `PermissionsChannel::resolve_decision` full-signature refactor with oneshot-first, DB-write-in-spawn ordering. |
+| AC5 | No new content | Pre-registered flip conditions shipped in PR#1740; this PR references verbatim. |
+| AC6 | Landed | `crates/mika-common/src/permission_authority.rs` (`DecisionScope` + `resolve_authority`); startup validation via `validate_env_authority_vars`; three-tier tests (agent > tenant > global > compile-time default). |
+| AC7 | Deferred (14-day / P1) | Follow-up ticket filed alongside this PR — cm-side ingest endpoint blocking. |
+| AC8 | Landed | `DecisionAuthority::default() == Strict` asserted by unit test; grep-discipline test in `crates/mika-agent/tests/ac8_grep_discipline.rs` enforces production emit paths never hard-set `override_used = true`. |
+
+**Signature note (F1 architect sharpening):** the plan called for a
+`resolve_decision_legacy` thin wrapper; the architect first-pass flagged
+it as a silent-data-loss seam and directed a full-signature refactor
+with mechanical test edits. The shipped shape reflects that: single
+`resolve_decision(db, request_id, classifier_verdict, decision,
+tool_name, args_summary, authority, scope)` function; no legacy variant;
+the eight existing unit tests were rewritten in-place with the extra
+provenance arguments plus new tests for the Strict-vs-Override
+`override_used` derivation matrix.
+
 ## Ratification-preservation clause
 
 This doc is the SOURCE OF TRUTH for sub-C's design. Implementation PRs cite section numbers here (e.g., "implements AC1 per permission-decision-protocol-2026-07-06.md § AC1"). If an implementer discovers a genuine architectural blocker requiring a design amendment, the implementer:
