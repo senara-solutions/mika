@@ -20,6 +20,7 @@ Telegram and GitHub webhook router with Postgres customer registry. Handles text
 | `/orchestrator/inbox/{orchestrator_id}/message` | POST | Internal token | Persist spawn→orchestrator message (256KB limit, mika#1189) |
 | `/orchestrator/inbox/{orchestrator_id}/stream` | GET | Internal token | SSE stream of inbox messages with cursor replay (mika#1189) |
 | `/admin/customers` | POST | Internal token | Register/re-register a per-customer Telegram bot (mika#1609) |
+| `/admin/customers/{customer_id}/unlink` | POST | Internal token | Release a customer's Telegram binding server-side (mika#1749) |
 
 ## GitHub Webhook Integration
 

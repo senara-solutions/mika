@@ -11,9 +11,11 @@ pub mod investigate;
 pub mod json_extractor;
 mod milestone_context_handler;
 pub mod openapi;
+pub mod permissions_stream;
 pub mod ready_label_handler;
 pub mod rewind;
 pub mod state;
+pub mod tasks_stream;
 pub mod types;
 pub mod variants;
 pub(crate) mod verdict;
@@ -261,6 +263,24 @@ fn build_router(state: AppState) -> Router {
             "/skills/{name}/restore",
             post(dashboard::handle_skill_restore),
         )
+        // Permission-decision protocol (mika#1733 sub-C AC1): SSE stream +
+        // POST-back correlation. See
+        // `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md`.
+        .route(
+            "/dashboard/permissions/stream",
+            get(permissions_stream::handle_permissions_stream),
+        )
+        .route(
+            "/dashboard/permissions/{request_id}/decide",
+            post(permissions_stream::handle_permission_decide),
+        )
+        // Task-event live stream (mika#1732 sub-B): SSE surface for task
+        // lifecycle transitions. Wire-only in v1 — emission from task_engine
+        // transition sites lands in a follow-up ticket.
+        .route(
+            "/dashboard/tasks/stream",
+            get(tasks_stream::handle_tasks_events_stream),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_dashboard_or_internal_token,
@@ -313,8 +333,12 @@ fn build_router(state: AppState) -> Router {
         .nest("/dashboard", embedded_dashboard::dashboard_routes())
         // Root: redirect to dashboard (if enabled) or return JSON info
         .route("/", get(embedded_dashboard::handle_root))
-        // Health endpoint is OUTSIDE auth layer (for health probes)
+        // Health endpoints are OUTSIDE auth layer (for health probes).
+        // `/health` is the combined liveness+readiness (503 during startup).
+        // `/healthz` is the K8s-convention pure liveness (always 200 when
+        // router is up) — see mika#1735.
         .route("/health", get(handlers::handle_health))
+        .route("/healthz", get(handlers::handle_healthz))
         // inject_request_meta must be inner to TraceLayer so that on the response
         // path it inserts RequestMeta into extensions BEFORE on_response reads them.
         .layer(middleware::from_fn(inject_request_meta))
@@ -323,7 +347,7 @@ fn build_router(state: AppState) -> Router {
                 .make_span_with(|request: &http::Request<_>| {
                     let path = request.uri().path();
                     let method = request.method();
-                    if path == "/health" {
+                    if path == "/health" || path == "/healthz" {
                         tracing::debug_span!("http_request", %method, path)
                     } else {
                         tracing::info_span!("http_request", %method, path)
@@ -1295,6 +1319,8 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
         pr_reviews_posted,
         rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
+        permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
+        task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
     };
 
     let app = build_router(state.clone());
@@ -1582,6 +1608,8 @@ mod tests {
             a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
             pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
             rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
+            permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
+            task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
         }
     }
 
@@ -1629,6 +1657,57 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert!(json["uptime_secs"].is_number());
+    }
+
+    // mika#1735: /healthz is a pure liveness probe — 200 unconditionally when
+    // the router is up, distinct from /health's combined liveness+readiness.
+    #[tokio::test]
+    async fn test_healthz_returns_200_before_ready() {
+        let state = test_state();
+        // Do NOT flip state.ready — /healthz must still return 200.
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        // Pure liveness omits uptime_secs — the field is skipped when None.
+        assert!(json.get("uptime_secs").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_healthz_returns_200_after_ready() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("uptime_secs").is_none());
     }
 
     #[tokio::test]

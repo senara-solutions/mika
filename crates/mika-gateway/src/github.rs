@@ -329,6 +329,28 @@ pub fn route_event(
     }
 }
 
+/// Secondary fan-out targets for events that need to reach more than one agent (mika#1711).
+///
+/// Returns an empty slice for events with only a primary target. Currently used only for
+/// `check_suite.completed(success)` — the primary target `mika-dev` handles merge-readiness
+/// while `mika-qa` (secondary) fires an autonomous review via the
+/// `qa-review-webhook-success` skill.
+///
+/// **Invariant:** the returned slice does NOT include the primary target from
+/// `route_event`. Callers dispatch to primary + all secondaries.
+pub fn secondary_targets(
+    event_type: &str,
+    action: Option<&str>,
+    check_conclusion: Option<&str>,
+) -> &'static [&'static str] {
+    match (event_type, action, check_conclusion) {
+        // check_suite success fan-out: mika-dev is primary (existing merge-readiness path),
+        // mika-qa is secondary (new autonomous review path — mika#1711).
+        ("check_suite", Some("completed"), Some("success")) => &["mika-qa"],
+        _ => &[],
+    }
+}
+
 // -- Message text formatting --
 
 /// Truncate text to `max_chars`, appending a truncation indicator if truncated.
@@ -656,6 +678,17 @@ pub(crate) async fn handle_github_webhook(
         return StatusCode::UNAUTHORIZED;
     }
 
+    // 2b. Fire-and-forget forward to cm-api (cm#88 Option B).
+    // Signature verified — safe to fan out. cm-api re-verifies HMAC against
+    // its own per-entity `webhook_secret` (samidarko populated all 6
+    // github_repo entities with the same value as MIKA_GITHUB_WEBHOOK_SECRET),
+    // so the same raw bytes + signature header land there authoritatively.
+    // Fire-and-forget on cm-unreachable is the deliberate discipline — cm
+    // MUST NEVER be on the gateway's critical path (same shape as cm#99
+    // async-emit for cpp permission events). Failures log and drop; the
+    // gateway's own routing to mika-spirit continues regardless.
+    forward_to_cm_api(&state, sig, &headers, &body);
+
     // 3. Parse X-GitHub-Event header
     let event_type = headers
         .get("x-github-event")
@@ -924,6 +957,9 @@ pub(crate) async fn handle_github_webhook(
     let forwarding_state = state.clone();
     let semaphore = state.webhook_semaphore.clone();
     let event_type_owned = event_type.to_string();
+    let repo_name_for_primary = repo_name.clone();
+    let text_for_primary = text.clone();
+    let request_id_for_primary = request_id.clone();
     tokio::spawn(async move {
         // Hold the delivery slot for the whole delivery lifetime (retry sleeps
         // included); it is released when this task ends.
@@ -931,15 +967,83 @@ pub(crate) async fn handle_github_webhook(
         deliver_with_retry(
             &forwarding_state,
             &target,
-            &text,
-            &request_id,
-            repo_name.as_deref(),
+            &text_for_primary,
+            &request_id_for_primary,
+            repo_name_for_primary.as_deref(),
             &event_type_owned,
             permit,
             &semaphore,
         )
         .await;
     });
+
+    // 12b. Fan-out to secondary agents (mika#1711). Currently only
+    // check_suite.completed(success) fans out — mika-dev (primary above) drives
+    // merge readiness, mika-qa (secondary here) fires autonomous review via the
+    // qa-review-webhook-success skill.
+    //
+    // Each secondary target acquires its own semaphore permit + delivery slot.
+    // If either slot cannot be acquired for a secondary, we log-and-skip (the
+    // primary is already dispatched — a secondary failure must not fail the
+    // primary). Fan-out failures also do NOT enqueue the DLQ: the primary is
+    // authoritative for retry/replay, and a lost secondary review will be
+    // re-driven by the next relevant event.
+    let secondaries = secondary_targets(event_type, event.action.as_deref(), check_conclusion);
+    for &secondary in secondaries {
+        let secondary_permit = match state.webhook_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(
+                    secondary_target = secondary,
+                    event_type,
+                    delivery_id = %delivery_id,
+                    "webhook fan-out skipped for secondary — semaphore full"
+                );
+                continue;
+            }
+        };
+        let secondary_slot = match state.delivery_slots.clone().try_acquire_owned() {
+            Ok(s) => s,
+            Err(_) => {
+                warn!(
+                    secondary_target = secondary,
+                    event_type,
+                    delivery_id = %delivery_id,
+                    "webhook fan-out skipped for secondary — delivery slots full"
+                );
+                continue;
+            }
+        };
+
+        let forwarding_state = state.clone();
+        let semaphore = state.webhook_semaphore.clone();
+        let event_type_owned = event_type.to_string();
+        let secondary_target = secondary.to_string();
+        let text_for_secondary = text.clone();
+        let request_id_for_secondary = request_id.clone();
+        let repo_name_for_secondary = repo_name.clone();
+        info!(
+            event_type,
+            action = ?event.action,
+            secondary_target = %secondary_target,
+            delivery_id = %delivery_id,
+            "GitHub webhook fan-out to secondary agent"
+        );
+        tokio::spawn(async move {
+            let _delivery_slot = secondary_slot;
+            deliver_with_retry(
+                &forwarding_state,
+                &secondary_target,
+                &text_for_secondary,
+                &request_id_for_secondary,
+                repo_name_for_secondary.as_deref(),
+                &event_type_owned,
+                secondary_permit,
+                &semaphore,
+            )
+            .await;
+        });
+    }
 
     StatusCode::OK
 }
@@ -1116,6 +1220,89 @@ pub(crate) async fn forward_to_resolved_route(
             }
         }
     }
+}
+
+/// Fire-and-forget forward a validated GitHub webhook to cm-api (cm#88 Option B).
+///
+/// Called from [`handle_github_webhook`] immediately after HMAC verification
+/// succeeds. Preserves the raw body and the `X-Hub-Signature-256`,
+/// `X-GitHub-Event`, and `X-GitHub-Delivery` headers so cm-api can re-verify
+/// against its own per-entity `webhook_secret` (which samidarko populated
+/// with the same value as `MIKA_GITHUB_WEBHOOK_SECRET`, so any signed
+/// payload accepted here is accepted there).
+///
+/// **Discipline**: cm MUST NEVER be on the gateway's critical path. This
+/// mirrors the fire-and-forget contract from cm#99 (cpp permission events →
+/// cm event_log): time-bounded transport, drop-on-error, log-and-continue,
+/// never blocks the caller. The gateway's response to GitHub is unaffected
+/// by cm's reachability or verdict.
+///
+/// **Disabled path**: when `state.cm_api_url` is `None`, this is a no-op
+/// (zero cost, zero HTTP calls). Enable via `MIKA_CM_API_URL` env var.
+fn forward_to_cm_api(state: &AppState, signature: &str, headers: &HeaderMap, body: &Bytes) {
+    let Some(cm_url) = state.cm_api_url.as_ref() else {
+        return;
+    };
+    let event_type = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let delivery_id = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let sig = signature.to_string();
+    let url = format!("{}/api/v1/webhooks/github", cm_url.trim_end_matches('/'));
+    let http = state.http_client.clone();
+    let body = body.clone();
+
+    tokio::spawn(async move {
+        // Bounded transport so a slow cm-api never wedges the gateway task pool.
+        // 5s is well above cm-api's < 50ms healthy latency; treats any longer
+        // response as cm-unreachable and drops.
+        let req = http
+            .post(&url)
+            .header("x-hub-signature-256", &sig)
+            .header("x-github-event", &event_type)
+            .header("x-github-delivery", &delivery_id)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .timeout(Duration::from_secs(5));
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    debug!(
+                        cm_url = %url,
+                        event_type = %event_type,
+                        delivery_id = %delivery_id,
+                        status = status.as_u16(),
+                        "cm-api forwarded webhook accepted"
+                    );
+                } else {
+                    warn!(
+                        cm_url = %url,
+                        event_type = %event_type,
+                        delivery_id = %delivery_id,
+                        status = status.as_u16(),
+                        "cm-api rejected forwarded webhook (dropping)"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    cm_url = %url,
+                    event_type = %event_type,
+                    delivery_id = %delivery_id,
+                    error = %e,
+                    "cm-api forward failed (dropping — cm is not on the critical path)"
+                );
+            }
+        }
+    });
 }
 
 /// Retry wrapper for GitHub webhook delivery.
@@ -1597,6 +1784,91 @@ mod tests {
             route_event("check_suite", Some("completed"), Some("success")),
             Some("mika-dev")
         );
+    }
+
+    // --- secondary_targets tests (mika#1711) ---
+
+    #[test]
+    fn test_secondary_targets_check_suite_success_fans_out_to_qa() {
+        // The core fix: mika-qa must receive check_suite.completed(success) via
+        // fan-out so autonomous review fires without needing an explicit
+        // review_requested webhook. Primary target stays mika-dev (route_event).
+        assert_eq!(
+            secondary_targets("check_suite", Some("completed"), Some("success")),
+            &["mika-qa"]
+        );
+    }
+
+    #[test]
+    fn test_secondary_targets_check_suite_failure_no_fanout() {
+        // Failures stay mika-dev-only — self-dev-webhook-ci handles them.
+        assert!(secondary_targets("check_suite", Some("completed"), Some("failure")).is_empty());
+    }
+
+    #[test]
+    fn test_secondary_targets_check_suite_timed_out_no_fanout() {
+        assert!(secondary_targets("check_suite", Some("completed"), Some("timed_out")).is_empty());
+    }
+
+    #[test]
+    fn test_secondary_targets_pull_request_events_no_fanout() {
+        for action in ["opened", "synchronize", "review_requested", "closed"] {
+            assert!(
+                secondary_targets("pull_request", Some(action), None).is_empty(),
+                "pull_request.{action} must not fan out"
+            );
+        }
+    }
+
+    #[test]
+    fn test_secondary_targets_issues_no_fanout() {
+        for action in ["assigned", "labeled"] {
+            assert!(
+                secondary_targets("issues", Some(action), None).is_empty(),
+                "issues.{action} must not fan out"
+            );
+        }
+    }
+
+    #[test]
+    fn test_secondary_targets_pull_request_review_no_fanout() {
+        assert!(secondary_targets("pull_request_review", Some("submitted"), None).is_empty());
+    }
+
+    #[test]
+    fn test_secondary_targets_check_suite_without_conclusion_no_fanout() {
+        // Defensive: an incomplete check_suite payload must not fan out.
+        assert!(secondary_targets("check_suite", Some("completed"), None).is_empty());
+    }
+
+    #[test]
+    fn test_secondary_targets_no_intersection_with_primary() {
+        // Invariant: for every routable event, the secondary list must NOT
+        // include the primary target — that would cause double-delivery to
+        // the same agent.
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("issues", Some("assigned"), None),
+            ("issues", Some("labeled"), None),
+            ("issue_comment", Some("created"), None),
+            ("pull_request", Some("opened"), None),
+            ("pull_request", Some("synchronize"), None),
+            ("pull_request", Some("review_requested"), None),
+            ("pull_request", Some("closed"), None),
+            ("pull_request_review", Some("submitted"), None),
+            ("check_suite", Some("completed"), Some("success")),
+            ("check_suite", Some("completed"), Some("failure")),
+            ("check_suite", Some("completed"), Some("timed_out")),
+        ];
+        for (event_type, action, conclusion) in cases {
+            let primary = route_event(event_type, *action, *conclusion);
+            let secondaries = secondary_targets(event_type, *action, *conclusion);
+            if let Some(primary_name) = primary {
+                assert!(
+                    !secondaries.contains(&primary_name),
+                    "{event_type}.{action:?}({conclusion:?}) — secondary_targets must not include primary '{primary_name}'"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2165,6 +2437,7 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
@@ -2284,6 +2557,7 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
@@ -2715,6 +2989,7 @@ mod tests {
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
@@ -3518,6 +3793,7 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             orchestrator_inbox_enabled: false,
             inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
@@ -3726,6 +4002,56 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             agent_count.load(Ordering::SeqCst),
             1,
             "Agent should receive the event on token refresh failure (fail-open)"
+        );
+    }
+
+    // -- cm#88 Option B: fork GitHub webhook to cm-api tests --
+    //
+    // These verify the fire-and-forget discipline: cm MUST NEVER be on the
+    // gateway's critical path. See `forward_to_cm_api` for the contract.
+
+    /// When `cm_api_url` is `None`, forwarding is a compile-time no-op —
+    /// zero HTTP calls, no task spawn, no cost. This is the shipped default.
+    #[tokio::test]
+    async fn test_forward_to_cm_api_noop_when_url_absent() {
+        let state = test_state_with_base_url("http://unused");
+        assert!(
+            state.cm_api_url.is_none(),
+            "test_state_with_base_url must default cm_api_url to None"
+        );
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(b"{}");
+        // Function should return immediately without panicking. No easy
+        // observable side-effect to assert beyond "did not panic + did not
+        // block" — both follow from the code inspection + the `None` guard
+        // returning before any I/O.
+        forward_to_cm_api(&state, "sha256=deadbeef", &headers, &body);
+    }
+
+    /// When `cm_api_url` points at an unreachable address, the CALLER of
+    /// `forward_to_cm_api` must not be blocked — the spawned task takes
+    /// the timeout hit in the background. This is the load-bearing property
+    /// samidarko named: "cm MUST NEVER be on the gateway's critical path"
+    /// (mirrors cm#99 async-emit discipline).
+    #[tokio::test]
+    async fn test_forward_to_cm_api_is_fire_and_forget_on_unreachable() {
+        let mut state = test_state_with_base_url("http://unused");
+        // 240.0.0.1 is TEST-NET-3 reserved space — guaranteed unroutable,
+        // so the reqwest connect attempt hangs until timeout.
+        state.cm_api_url = Some("http://240.0.0.1:65535".to_string());
+        let headers = HeaderMap::new();
+        let body = Bytes::from_static(b"{}");
+
+        // The 5s timeout on the spawned task means the request itself takes
+        // seconds to fail. But the CALLER of forward_to_cm_api should
+        // return in microseconds — the spawned task takes the wait.
+        let start = std::time::Instant::now();
+        forward_to_cm_api(&state, "sha256=deadbeef", &headers, &body);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "forward_to_cm_api must return quickly (spawn only). Elapsed: {elapsed:?} — indicates the caller waited on the HTTP call, violating fire-and-forget."
         );
     }
 }

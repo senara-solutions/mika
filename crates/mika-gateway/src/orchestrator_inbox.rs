@@ -549,6 +549,7 @@ mod tests {
             orchestrator_inbox_enabled,
             inbox_subscriber_semaphore: Arc::new(Semaphore::new(subscriber_cap)),
             gateway_external_url: None,
+            cm_api_url: None,
             target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
             delivery_slots: Arc::new(Semaphore::new(
                 crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,

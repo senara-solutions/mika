@@ -678,13 +678,14 @@ This separation lets you give dashboard users a read-only token that cannot muta
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
-| `/health` | GET | None | Liveness/readiness probe |
+| `/health` | GET | None | Combined liveness+readiness probe — returns 503 during startup, 200 with `uptime_secs` when ready. |
+| `/healthz` | GET | None | Kubernetes-convention pure liveness probe — returns 200 unconditionally while the router is up, including during startup (mika#1735). |
 | `/message` | POST | Internal token | Receives messages (202 async processing, 10MB body limit) |
 | `/tasks/{id}/complete` | POST | Internal token | Completes a callback task (200 sync; 409 if already completed; 100KB result cap; echoes `task_id` in error bodies) |
 | `/api/v1/rewind/resolve` | POST | Internal token | Resolve recent exchanges for a session (returns anchor point and trace IDs) |
 | `/api/v1/rewind/preview` | POST | Internal token | Preview a rewind operation (messages to delete, reversals, task cancellations, warnings) |
 | `/api/v1/rewind/execute` | POST | Internal token | Execute a rewind (delete messages, reverse mutations, cancel tasks, inject context marker) |
-| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit) — dispatches `message/send`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe` |
+| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit) — dispatches `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe` |
 | `/a2a/{agent_name}/agent.json` | GET | Internal token | Returns A2A Agent Card (capabilities, skills, auth schemes) |
 
 ### Dashboard API (read-only)
@@ -781,7 +782,7 @@ external A2A agents via the `a2a_call` tool.
 | Module | Responsibility |
 |--------|---------------|
 | `types.rs` | A2A protocol types: `AgentCard`, `Task`, `Message`, `Part`, `Artifact`, `TaskStatus`, `TaskState` |
-| `jsonrpc.rs` | JSON-RPC 2.0 request/response types, A2A method enum (`MessageSend`, `TaskGet`, `TaskCancel`, `TaskResubscribe`, `TaskPushNotificationSet`, `TaskPushNotificationGet`) |
+| `jsonrpc.rs` | JSON-RPC 2.0 request/response types, A2A method enum (`MessageSend`, `MessageStream`, `TaskGet`, `TaskCancel`, `TaskResubscribe`, `TaskPushNotificationSet`, `TaskPushNotificationGet`) |
 | `params.rs` | Typed parameter structs: `MessageSendParams`, `TaskIdParams`, `TaskQueryParams` |
 | `state_machine.rs` | `TaskStateMachine` — validates state transitions (submitted → working → completed/failed/canceled) |
 | `streaming.rs` | SSE streaming types: `StreamEvent`, `TaskStatusUpdateEvent`, `TaskArtifactUpdateEvent` |
@@ -793,7 +794,7 @@ A2A routes are merged into the main router with internal token auth (no CORS):
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
-| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit). Dispatches `message/send`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`. Returns SSE stream for `message/send`. |
+| `/a2a/{agent_name}` | POST | Internal token | A2A JSON-RPC handler (2MB body limit). Dispatches `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`. Returns SSE stream for `message/stream` and `tasks/resubscribe`; single JSON response for `message/send`. |
 | `/a2a/{agent_name}/agent.json` | GET | Internal token | Returns the agent's A2A Agent Card (capabilities, skills, auth schemes) |
 
 ### Gateway Proxy
@@ -825,6 +826,38 @@ Each A2A task gets its own session for message history.
 `build_agent_card()` in `a2a_card.rs` generates an `AgentCard` from the agent's skill
 registry. Skills are mapped to A2A skills with their keywords as `tags`. The card
 advertises `streaming` and `stateTransitionHistory` capabilities. Auth scheme: `bearer`.
+
+### 14.2 SSE Frame Catalog
+
+mika-spirit ships three sibling SSE surfaces, each with a deliberate choice of
+discriminator key + correlation scope. They coexist by design — do NOT unify.
+
+| Surface | Discriminator | Scope | Route pattern | Crate | Introduced |
+|---|---|---|---|---|---|
+| `mika_a2a::streaming::StreamEvent` | `#[serde(tag = "kind")]` | Per-task (`a2a_broadcasters: DashMap<TaskId, Sender>`) | JSON-RPC-inline SSE (`POST /a2a/{agent}` with `message/stream` method) | `mika-a2a` | mika#1731 adds `ToolCallStart` / `ToolCallResult` variants + `Unknown` catch-all |
+| `PermissionStreamFrame` | `#[serde(tag = "event")]` | Per-process (single `AppState.permissions_channel`) | `GET /api/v1/dashboard/permissions/stream` (+ POST-back `/decide`) | `mika-agent` server | mika#1741 (sub-C AC1) |
+| `TaskEventFrame` (mika#1732) | `#[serde(tag = "event")]` | Per-process (single `AppState.task_events_channel`) | `GET /api/v1/dashboard/tasks/stream` | `mika-agent` server | this ticket |
+
+**Five axes of deliberate divergence:**
+
+1. **Discriminator key** — A2A uses `kind`, Dashboard uses `event`.
+2. **Correlation scope** — A2A is per-task (each `message/stream` gets its own bounded broadcast); Dashboard streams are per-process global broadcasts frames tag their originating agent/session.
+3. **Route pattern** — A2A rides on JSON-RPC POST body; Dashboard uses dedicated GET endpoints.
+4. **Crate location** — A2A frames live in `mika-a2a` (protocol-owned); Dashboard frames live in `mika-agent` server module (deploy-owned).
+5. **Decision persistence** — Dashboard SSE surfaces may write a companion DB row when the frame carries a ratified decision. `PermissionStreamFrame::PermissionRequest` pairs with a `permission_decisions` row (mika#1733 AC4) once the operator POSTs back; task-event frames have no persistence yet (emission-from-transition sites land in a follow-up ticket). A2A `StreamEvent` writes go through the `a2a_task_map` + task-store path — orthogonal to the dashboard-SSE persistence axis.
+
+**Shared discipline (all three surfaces):**
+
+- Additive variants only. No renames; no field removals.
+- Forward-compat `#[serde(other)]` catch-all (`Unknown`) — consumers tolerate future `kind`/`event` values without a re-release gate.
+- Slow-consumer discipline: `tokio::sync::broadcast` drop-oldest + an explicit `OverflowMarker` frame that surfaces the drop count on the wire.
+- UTF-8-safe truncation on preview fields (500-char cap by convention).
+
+**Full field-by-field references:**
+
+- `crates/mika-agent/docs/a2a-stream-frame-catalog-2026-07-10.md` — `StreamEvent` variants.
+- `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md` — `PermissionStreamFrame` variants.
+- `crates/mika-agent/docs/tasks-event-stream-frame-catalog-2026-07-10.md` — `TaskEventFrame` variants.
 
 
 ## 15. Failed Sends (Durable Outbox Pattern)

@@ -124,6 +124,14 @@ pub struct AppState {
     /// Public HTTPS base URL of the gateway. Required for per-customer webhook
     /// registration (`POST /admin/customers`). `None` when not configured.
     pub gateway_external_url: Option<String>,
+    /// Base URL of the control-monitor (cm-api) HTTP surface (e.g.,
+    /// `http://127.0.0.1:8090`). When set, every validated inbound GitHub
+    /// webhook is fire-and-forget forwarded to
+    /// `{cm_api_url}/api/v1/webhooks/github` so cm's `pr_lifecycle` event log
+    /// populates from the same webhook stream. See cm#88 Option B — the
+    /// gateway is the deployed reachability path; cm-api is an additional
+    /// subscriber. `None` disables cm-forwarding.
+    pub cm_api_url: Option<String>,
     /// Per-target-agent circuit breaker (mika#1710). Shared 429 health state that
     /// short-circuits webhook deliveries to a saturated agent straight to the DLQ
     /// instead of hammering it with independent per-event retry chains. This is the
@@ -243,6 +251,16 @@ pub fn build_router(state: AppState) -> Router {
                     require_bearer_token,
                 ))
                 .layer(RequestBodyLimitLayer::new(16 * 1024)),
+        )
+        // Admin: unlink a customer's Telegram binding (mika#1749)
+        .route(
+            "/admin/customers/{customer_id}/unlink",
+            post(handle_admin_unlink)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(1024)),
         )
         // Health probes and version (no auth)
         .route("/health", get(handle_readiness))
@@ -564,6 +582,12 @@ async fn dispatch_parsed_message(
                     "Welcome! If you have an invite link, please use it to get started. If you're already set up, just type a message.",
                 )
                 .await;
+        }
+        ParsedMessage::Unlink { chat_id } => {
+            handle_unlink(state, tg, chat_id).await;
+        }
+        ParsedMessage::UnlinkConfirm { chat_id } => {
+            handle_unlink_confirm(state, tg, chat_id).await;
         }
         ParsedMessage::Unsupported { chat_id } => {
             // Fire-and-forget reply for non-image media (sticker/voice/video/etc.)
@@ -1165,6 +1189,87 @@ struct UpsertCustomerRow {
     was_inserted: bool,
 }
 
+// -- Admin unlink (mika#1749) --
+
+/// Response shape for `POST /admin/customers/{customer_id}/unlink`.
+#[derive(Debug, serde::Serialize)]
+struct AdminUnlinkResponse {
+    customer_id: Uuid,
+    /// The `telegram_chat_id` that was released, or `null` if the row was
+    /// already unbound. Idempotent — a repeat call returns `null` here.
+    previous_chat_id: Option<i64>,
+    /// ISO 8601 timestamp of the unlink operation (wall-clock, server-side).
+    unlinked_at: String,
+}
+
+/// Handle `POST /admin/customers/{customer_id}/unlink` — admin releases a
+/// customer's Telegram binding server-side. Same auth class as
+/// `POST /admin/customers` (bearer token). Idempotent on repeat calls.
+///
+/// Returns:
+/// - 200 with `{customer_id, previous_chat_id, unlinked_at}` on hit or idempotent no-op.
+/// - 404 with `{error}` on missing customer_id.
+async fn handle_admin_unlink(
+    State(state): State<AppState>,
+    axum::extract::Path(customer_id): axum::extract::Path<Uuid>,
+) -> impl IntoResponse {
+    // Postgres `RETURNING` returns the AFTER-image of the row, so to surface
+    // the previous `telegram_chat_id` we snapshot it in a subquery joined
+    // via FROM. The subquery reads the row BEFORE the UPDATE within the same
+    // statement (Postgres evaluates FROM subqueries against the pre-update
+    // snapshot). If the customer_id does not exist, the UPDATE affects zero
+    // rows and `fetch_optional` returns `Ok(None)` — signalled as 404.
+    //
+    // The returned `previous_chat_id` is `Option<i64>`: `Some(n)` when a
+    // binding was released, `None` when the row existed but was already
+    // unbound (idempotent no-op).
+    let result = sqlx::query_scalar::<_, Option<i64>>(
+        "UPDATE customers c \
+         SET telegram_chat_id = NULL \
+         FROM (SELECT id, telegram_chat_id FROM customers WHERE id = $1) AS old \
+         WHERE c.id = old.id \
+         RETURNING old.telegram_chat_id",
+    )
+    .bind(customer_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match result {
+        Ok(Some(previous_chat_id)) => {
+            info!(
+                %customer_id,
+                ?previous_chat_id,
+                "admin unlinked telegram binding"
+            );
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(AdminUnlinkResponse {
+                        customer_id,
+                        previous_chat_id,
+                        unlinked_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    })
+                    .expect("AdminUnlinkResponse serializes"),
+                ),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "customer not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin unlink query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 // -- Token generation --
 
 /// Generate a cryptographic pairing token (32 random bytes, hex-encoded → 64 chars).
@@ -1255,7 +1360,9 @@ async fn handle_pairing(
                     .constraint()
                     .is_some_and(|c| c.contains("telegram_chat_id"))
                 {
-                    "This Telegram account is already linked to another account."
+                    "This Telegram account is already linked to another Mika account. \
+                     If it's an account you control, send /unlink from that account \
+                     first, then click your invite link again. Otherwise, contact support."
                 } else {
                     "Pairing failed. Please contact support."
                 };
@@ -1263,6 +1370,82 @@ async fn handle_pairing(
                 return;
             }
             warn!(error = %e, chat_id, "pairing query failed");
+            reply_transient_error(tg, chat_id).await;
+        }
+    }
+}
+
+// -- /unlink self-service (mika#1749) --
+
+/// Handle `/unlink` — the paired user asks to release their own binding.
+///
+/// If the chat_id is not paired to any customer, replies "not linked" and returns.
+/// If paired, replies with a warning message telling the user to send
+/// `/unlink confirm` to commit. This handler NEVER mutates the DB — the
+/// confirmation happens in `handle_unlink_confirm`.
+async fn handle_unlink(state: &AppState, tg: &CustomerTelegramClient, chat_id: i64) {
+    let row = sqlx::query_scalar::<_, Uuid>("SELECT id FROM customers WHERE telegram_chat_id = $1")
+        .bind(chat_id)
+        .fetch_optional(&state.pool)
+        .await;
+
+    match row {
+        Ok(Some(_)) => {
+            let msg = "⚠️ Unlinking will release your Telegram from this Mika account.\n\
+                       You will need a new invite link from your admin to re-pair.\n\
+                       This cannot be undone.\n\n\
+                       To confirm, send: /unlink confirm";
+            let _ = tg.send_message(chat_id, msg).await;
+        }
+        Ok(None) => {
+            let _ = tg
+                .send_message(chat_id, "Your Telegram is not linked to any Mika account.")
+                .await;
+        }
+        Err(e) => {
+            warn!(error = %e, chat_id, "unlink lookup query failed");
+            reply_transient_error(tg, chat_id).await;
+        }
+    }
+}
+
+/// Handle `/unlink confirm` — commit the self-unlink. Atomic UPDATE releases
+/// `telegram_chat_id`. Idempotent: if the chat_id is already unbound (or cold
+/// `/unlink confirm` without prior `/unlink`), replies "nothing to unlink."
+async fn handle_unlink_confirm(state: &AppState, tg: &CustomerTelegramClient, chat_id: i64) {
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE customers SET telegram_chat_id = NULL WHERE telegram_chat_id = $1 RETURNING id",
+    )
+    .bind(chat_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match result {
+        Ok(Some(customer_id)) => {
+            info!(
+                customer_id = %customer_id,
+                chat_id,
+                "customer self-unlinked telegram binding"
+            );
+            let _ = tg
+                .send_message(
+                    chat_id,
+                    "✅ Unlinked. Your invite link (or a new one) will pair a fresh \
+                     session when you're ready.",
+                )
+                .await;
+        }
+        Ok(None) => {
+            let _ = tg
+                .send_message(
+                    chat_id,
+                    "Nothing to unlink. Send /unlink first if you meant to release \
+                     a Telegram binding.",
+                )
+                .await;
+        }
+        Err(e) => {
+            warn!(error = %e, chat_id, "unlink confirm query failed");
             reply_transient_error(tg, chat_id).await;
         }
     }

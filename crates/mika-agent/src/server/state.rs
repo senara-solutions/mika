@@ -101,6 +101,16 @@ pub struct AppState {
     /// `RATE_LIMIT_TRIP_AUDIT_INTERVAL` so a flood does not itself write tens of
     /// thousands of audit rows.
     pub rate_limit_audit_last: Arc<DashMap<String, std::time::Instant>>,
+    /// Permission-decision coordination surface (mika#1733 sub-C AC1). Shared
+    /// broadcast channel + pending-decision map. See
+    /// `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md § AC1`.
+    pub permissions_channel: Arc<super::permissions_stream::PermissionsChannel>,
+    /// Task-event live stream broadcast surface (mika#1732). Per-process
+    /// broadcast channel carrying `TaskEventFrame` lifecycle events. Wire
+    /// only in v1 — the emission-from-transition-sites plumbing lands in a
+    /// follow-up ticket. See
+    /// `crates/mika-agent/docs/tasks-event-stream-frame-catalog-2026-07-10.md`.
+    pub task_events_channel: Arc<super::tasks_stream::TaskEventsChannel>,
 }
 
 impl AppState {

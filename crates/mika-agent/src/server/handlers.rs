@@ -67,7 +67,7 @@ fn should_emit_rate_limit_audit(
     }
 }
 
-/// GET /health — Liveness/readiness probe (no auth required).
+/// GET /health — Combined liveness+readiness probe (no auth required).
 #[utoipa::path(
     get,
     path = "/health",
@@ -91,6 +91,30 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         Json(HealthResponse {
             status: "ok".to_string(),
             uptime_secs: Some(state.startup_time.elapsed().as_secs()),
+        }),
+    )
+}
+
+/// GET /healthz — Kubernetes-convention liveness probe (no auth required).
+///
+/// Distinct from `/health`: this is a pure liveness endpoint — "is the process
+/// alive and able to serve HTTP?" — so it returns 200 unconditionally when the
+/// router is running, including during startup. This matches the semantics ops
+/// tooling and K8s probes expect from `/healthz` (readiness is a separate
+/// concern, tracked as a follow-up if `/readyz` is ever needed). See mika#1735.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    responses(
+        (status = 200, description = "Server is alive", body = HealthResponse),
+    )
+)]
+pub async fn handle_healthz() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(HealthResponse {
+            status: "ok".to_string(),
+            uptime_secs: None,
         }),
     )
 }
