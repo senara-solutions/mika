@@ -106,12 +106,19 @@ pub async fn handle_a2a_jsonrpc(
 }
 
 /// Run the agent loop for an A2A request, similar to handle_message.
+///
+/// `stream_tx` is the per-task broadcast sender the caller (typically
+/// `handle_message_stream`) uses to publish SSE frames. It is threaded into
+/// `AgentParams.stream_tx` so `process_tool_calls` can emit `ToolCallStart` /
+/// `ToolCallResult` frames as tools dispatch (mika#1731). Non-streaming
+/// callers (`message/send`) pass `None`.
 async fn run_a2a_agent(
     state: &AppState,
     agent_state: &Arc<AgentState>,
     session_id: &str,
     input_text: &str,
     task_id: &str,
+    stream_tx: Option<mika_a2a::streaming::StreamEventSender>,
 ) -> Result<Option<String>, String> {
     // Hot-reload skills if dirty
     let skills = if agent_state.skills_dirty.load(Ordering::Acquire) {
@@ -166,6 +173,7 @@ async fn run_a2a_agent(
         correlated_task_id: None,
         internal: false,
         pr_reviews_posted: Some(&state.pr_reviews_posted),
+        stream_tx,
     };
 
     match agent::run_agent(&params).await {
@@ -258,8 +266,9 @@ async fn handle_message_send(
 
         let input_text = extract_text_from_parts(&params.message.parts);
 
-        // Run the real agent loop
-        match run_a2a_agent(state, agent_state, &session_id, &input_text, &task_id).await {
+        // Run the real agent loop. Non-streaming `message/send` path — no
+        // broadcast subscriber, so pass `None`.
+        match run_a2a_agent(state, agent_state, &session_id, &input_text, &task_id, None).await {
             Ok(_) => {
                 let _ = agent_state
                     .db
@@ -391,13 +400,18 @@ async fn handle_message_stream(
             metadata: None,
         }));
 
-        // Run the real agent loop
+        // Run the real agent loop. Streaming path (mika#1731) — pass the
+        // per-task broadcast sender so process_tool_calls can inject
+        // ToolCallStart / ToolCallResult frames as tools dispatch.
+        let stream_tx_for_agent: Option<mika_a2a::streaming::StreamEventSender> =
+            Some(Arc::new(tx.clone()));
         match run_a2a_agent(
             &state_clone,
             &agent_state_clone,
             &session_id,
             &input_text,
             &task_id_clone,
+            stream_tx_for_agent,
         )
         .await
         {
