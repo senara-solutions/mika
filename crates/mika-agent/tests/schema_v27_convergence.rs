@@ -180,7 +180,7 @@ fn fresh_db_has_schema_meta_with_coalesce_marker() {
 // ===== Schema version =====
 
 #[test]
-fn fresh_db_is_at_v43() {
+fn fresh_db_is_at_current_schema_version() {
     let (_dir, conn) = build_fresh_db().unwrap();
 
     let version: i64 = conn
@@ -189,7 +189,11 @@ fn fresh_db_is_at_v43() {
         })
         .unwrap();
 
-    assert_eq!(version, 43, "Fresh DB must be at schema version 43");
+    assert_eq!(
+        version,
+        mika_agent::db::CURRENT_SCHEMA_VERSION,
+        "Fresh DB must be at CURRENT_SCHEMA_VERSION"
+    );
 }
 
 // ===== Index verification =====

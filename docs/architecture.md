@@ -827,6 +827,38 @@ Each A2A task gets its own session for message history.
 registry. Skills are mapped to A2A skills with their keywords as `tags`. The card
 advertises `streaming` and `stateTransitionHistory` capabilities. Auth scheme: `bearer`.
 
+### 14.2 SSE Frame Catalog
+
+mika-spirit ships three sibling SSE surfaces, each with a deliberate choice of
+discriminator key + correlation scope. They coexist by design — do NOT unify.
+
+| Surface | Discriminator | Scope | Route pattern | Crate | Introduced |
+|---|---|---|---|---|---|
+| `mika_a2a::streaming::StreamEvent` | `#[serde(tag = "kind")]` | Per-task (`a2a_broadcasters: DashMap<TaskId, Sender>`) | JSON-RPC-inline SSE (`POST /a2a/{agent}` with `message/stream` method) | `mika-a2a` | mika#1731 adds `ToolCallStart` / `ToolCallResult` variants + `Unknown` catch-all |
+| `PermissionStreamFrame` | `#[serde(tag = "event")]` | Per-process (single `AppState.permissions_channel`) | `GET /api/v1/dashboard/permissions/stream` (+ POST-back `/decide`) | `mika-agent` server | mika#1741 (sub-C AC1) |
+| `TaskEventFrame` (mika#1732) | `#[serde(tag = "event")]` | Per-process (single `AppState.task_events_channel`) | `GET /api/v1/dashboard/tasks/stream` | `mika-agent` server | this ticket |
+
+**Five axes of deliberate divergence:**
+
+1. **Discriminator key** — A2A uses `kind`, Dashboard uses `event`.
+2. **Correlation scope** — A2A is per-task (each `message/stream` gets its own bounded broadcast); Dashboard streams are per-process global broadcasts frames tag their originating agent/session.
+3. **Route pattern** — A2A rides on JSON-RPC POST body; Dashboard uses dedicated GET endpoints.
+4. **Crate location** — A2A frames live in `mika-a2a` (protocol-owned); Dashboard frames live in `mika-agent` server module (deploy-owned).
+5. **Decision persistence** — Dashboard SSE surfaces may write a companion DB row when the frame carries a ratified decision. `PermissionStreamFrame::PermissionRequest` pairs with a `permission_decisions` row (mika#1733 AC4) once the operator POSTs back; task-event frames have no persistence yet (emission-from-transition sites land in a follow-up ticket). A2A `StreamEvent` writes go through the `a2a_task_map` + task-store path — orthogonal to the dashboard-SSE persistence axis.
+
+**Shared discipline (all three surfaces):**
+
+- Additive variants only. No renames; no field removals.
+- Forward-compat `#[serde(other)]` catch-all (`Unknown`) — consumers tolerate future `kind`/`event` values without a re-release gate.
+- Slow-consumer discipline: `tokio::sync::broadcast` drop-oldest + an explicit `OverflowMarker` frame that surfaces the drop count on the wire.
+- UTF-8-safe truncation on preview fields (500-char cap by convention).
+
+**Full field-by-field references:**
+
+- `crates/mika-agent/docs/a2a-stream-frame-catalog-2026-07-10.md` — `StreamEvent` variants.
+- `crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md` — `PermissionStreamFrame` variants.
+- `crates/mika-agent/docs/tasks-event-stream-frame-catalog-2026-07-10.md` — `TaskEventFrame` variants.
+
 
 ## 15. Failed Sends (Durable Outbox Pattern)
 
