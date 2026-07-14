@@ -1092,7 +1092,61 @@ async fn run_agent_for_message(
     );
 }
 
+/// Rows older than this are dropped without being sent (mika#1751).
+const FAILED_SEND_STALE_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Prefix applied to delivered rows that were parked in `failed_sends` (mika#1751).
+const FAILED_SEND_STALE_PREFIX: &str = "⏳ from earlier — ";
+
+/// Prefix applied when `created_at` cannot be parsed. Fail-open: keep the message
+/// visible with a loud marker rather than drop it silently (mika#1751,
+/// mika-arch first-pass §Uncertainty 3).
+const FAILED_SEND_UNPARSEABLE_PREFIX: &str = "⚠️ UNPARSEABLE TIMESTAMP — ";
+
+/// Classification decision for a row read from `failed_sends`.
+#[derive(Debug, PartialEq, Eq)]
+enum FlushAction {
+    /// Delete the row without sending. Reason: age exceeded the staleness
+    /// threshold; the fresh turn supersedes the parked reply.
+    Drop { age_secs: i64 },
+    /// Send the row after prepending `prefix` to its text.
+    Deliver { prefix: &'static str },
+}
+
+/// Decide what to do with a `failed_sends` row given its `created_at` timestamp.
+///
+/// Pure function — no I/O, no side effects. All decision policy lives here so
+/// it can be exercised by unit tests without touching the gateway sender.
+fn classify_failed_send(created_at: &str, now: chrono::DateTime<chrono::Utc>) -> FlushAction {
+    match crate::timestamp::parse(created_at) {
+        Ok(dt) => {
+            let age = now - dt;
+            if age > FAILED_SEND_STALE_THRESHOLD {
+                FlushAction::Drop {
+                    age_secs: age.num_seconds(),
+                }
+            } else {
+                FlushAction::Deliver {
+                    prefix: FAILED_SEND_STALE_PREFIX,
+                }
+            }
+        }
+        Err(_) => FlushAction::Deliver {
+            prefix: FAILED_SEND_UNPARSEABLE_PREFIX,
+        },
+    }
+}
+
 /// Flush previously failed outbound sends (best-effort, up to 5).
+///
+/// Policy (mika#1751):
+/// - Rows older than `FAILED_SEND_STALE_THRESHOLD` are dropped without a send.
+/// - Rows within the threshold are prefixed with `FAILED_SEND_STALE_PREFIX`.
+/// - Rows with an unparseable `created_at` are delivered with
+///   `FAILED_SEND_UNPARSEABLE_PREFIX` (fail-open).
+///
+/// The `Drop` branch does NOT call `increment_failed_send_retry` — a dropped
+/// row was never retried, so incrementing would be incorrect accounting.
 async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
     let sends = match agent_state.db.get_pending_failed_sends(5).await {
         Ok(s) if !s.is_empty() => s,
@@ -1110,28 +1164,55 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
         agent_state.settings.customer_id.clone(),
     );
 
+    let now = chrono::Utc::now();
     for send in sends {
-        match sender.send(&send.text).await {
-            Ok(crate::messaging::SendOutcome::Delivered) => {
-                let _ = agent_state.db.delete_failed_send(send.id).await;
-                info!(id = send.id, "flushed failed send");
-            }
-            Ok(crate::messaging::SendOutcome::Failed { reason }) => {
-                warn!(id = send.id, reason = %reason, "failed send flush: delivery failed again");
-                let _ = agent_state.db.increment_failed_send_retry(send.id).await;
-            }
-            Ok(crate::messaging::SendOutcome::NoChannel) => {
-                // Permanent condition — delete the entry instead of retrying.
-                // These entries were created before the NoChannel check existed.
-                let _ = agent_state.db.delete_failed_send(send.id).await;
+        match classify_failed_send(&send.created_at, now) {
+            FlushAction::Drop { age_secs } => {
+                let text_preview: String = send.text.chars().take(80).collect();
                 warn!(
                     id = send.id,
-                    "failed send flush: no reply channel (chat_id=0), deleting entry"
+                    age_secs,
+                    retry_count = send.retry_count,
+                    created_at = %send.created_at,
+                    text_preview = %text_preview,
+                    "dropping stale failed_send"
                 );
+                let _ = agent_state.db.delete_failed_send(send.id).await;
             }
-            Err(e) => {
-                warn!(id = send.id, error = %e, "failed send flush: sender error");
-                let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+            FlushAction::Deliver { prefix } => {
+                if prefix == FAILED_SEND_UNPARSEABLE_PREFIX {
+                    error!(
+                        id = send.id,
+                        created_at = %send.created_at,
+                        "failed_sends row has unparseable created_at; delivering fail-open with warning prefix"
+                    );
+                } else {
+                    debug!(id = send.id, "flushing failed_send with stale prefix");
+                }
+                let text_to_send = format!("{}{}", prefix, send.text);
+                match sender.send(&text_to_send).await {
+                    Ok(crate::messaging::SendOutcome::Delivered) => {
+                        let _ = agent_state.db.delete_failed_send(send.id).await;
+                        info!(id = send.id, "flushed failed send");
+                    }
+                    Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                        warn!(id = send.id, reason = %reason, "failed send flush: delivery failed again");
+                        let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+                    }
+                    Ok(crate::messaging::SendOutcome::NoChannel) => {
+                        // Permanent condition — delete the entry instead of retrying.
+                        // These entries were created before the NoChannel check existed.
+                        let _ = agent_state.db.delete_failed_send(send.id).await;
+                        warn!(
+                            id = send.id,
+                            "failed send flush: no reply channel (chat_id=0), deleting entry"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(id = send.id, error = %e, "failed send flush: sender error");
+                        let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+                    }
+                }
             }
         }
     }
@@ -1334,5 +1415,97 @@ mod tests {
         assert!(should_emit_rate_limit_audit(&map, label, now, interval));
         // The stored instant advanced to `now` (stale entry was overwritten).
         assert_eq!(*map.get(label).unwrap().value(), now);
+    }
+
+    // ============================================================================
+    // classify_failed_send tests (mika#1751)
+    // ============================================================================
+
+    /// A row whose `created_at` predates the staleness threshold classifies as `Drop`.
+    /// This is the primary fix for the "twice-hello" incident — the 3.5h-old parked
+    /// reply is dropped before the sender is invoked.
+    #[test]
+    fn classify_failed_send_drops_row_past_threshold() {
+        let now = chrono::Utc::now();
+        // 10 minutes ago — well past the 5-minute threshold.
+        let created_at = crate::timestamp::format(&(now - chrono::Duration::minutes(10)));
+        let action = classify_failed_send(&created_at, now);
+        match action {
+            FlushAction::Drop { age_secs } => {
+                // Age should be about 600 seconds (10 minutes). Allow a small window
+                // for the `now` value having advanced between format and classify.
+                assert!(
+                    (599..=601).contains(&age_secs),
+                    "unexpected age_secs: {age_secs}"
+                );
+            }
+            other => panic!("expected Drop, got {other:?}"),
+        }
+    }
+
+    /// A row within the staleness threshold classifies as `Deliver` with the stale
+    /// prefix — the reader gets an in-order marker so the delivery reads as "from
+    /// earlier" instead of a memory glitch.
+    #[test]
+    fn classify_failed_send_delivers_row_within_threshold_with_stale_prefix() {
+        let now = chrono::Utc::now();
+        // 30 seconds ago — well within the 5-minute threshold.
+        let created_at = crate::timestamp::format(&(now - chrono::Duration::seconds(30)));
+        let action = classify_failed_send(&created_at, now);
+        assert_eq!(
+            action,
+            FlushAction::Deliver {
+                prefix: FAILED_SEND_STALE_PREFIX
+            }
+        );
+    }
+
+    /// The threshold boundary: a row just under the threshold classifies as
+    /// `Deliver` (the `>` comparison in `classify_failed_send` is strict). The
+    /// `DB_FORMAT` used for `created_at` has second precision, so an exact
+    /// `now - threshold` timestamp round-trips through parse to a value
+    /// slightly BEFORE `now - threshold` (sub-second truncation) and tips into
+    /// `Drop`. This test uses `threshold - 5 seconds` to sit well within the
+    /// bound. The paired "past threshold" case is covered by
+    /// `classify_failed_send_drops_row_past_threshold`.
+    #[test]
+    fn classify_failed_send_just_under_threshold_delivers() {
+        let now = chrono::Utc::now();
+        let created_at = crate::timestamp::format(
+            &(now - FAILED_SEND_STALE_THRESHOLD + chrono::Duration::seconds(5)),
+        );
+        let action = classify_failed_send(&created_at, now);
+        assert_eq!(
+            action,
+            FlushAction::Deliver {
+                prefix: FAILED_SEND_STALE_PREFIX
+            }
+        );
+    }
+
+    /// Fail-open policy for unparseable timestamps: the row is delivered with a
+    /// screaming `UNPARSEABLE TIMESTAMP` prefix rather than dropped. This flips
+    /// the pass-1 default (Drop) per mika-arch first-pass §Uncertainty 3 —
+    /// dropping is silent data loss unless the accompanying `error!` is
+    /// actively paged, which it isn't at this frequency.
+    #[test]
+    fn classify_failed_send_unparseable_timestamp_delivers_fail_open() {
+        let now = chrono::Utc::now();
+        let action = classify_failed_send("not-a-timestamp", now);
+        assert_eq!(
+            action,
+            FlushAction::Deliver {
+                prefix: FAILED_SEND_UNPARSEABLE_PREFIX
+            }
+        );
+    }
+
+    /// The two prefixes are distinct — a delivery consumer that greps for one
+    /// won't accidentally match the other.
+    #[test]
+    fn failed_send_prefixes_are_distinct() {
+        assert_ne!(FAILED_SEND_STALE_PREFIX, FAILED_SEND_UNPARSEABLE_PREFIX);
+        assert!(FAILED_SEND_STALE_PREFIX.contains("from earlier"));
+        assert!(FAILED_SEND_UNPARSEABLE_PREFIX.contains("UNPARSEABLE"));
     }
 }
