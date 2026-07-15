@@ -99,6 +99,7 @@ impl EvalHarness {
             correlated_task_id: None,
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
+            stream_tx: None,
         };
 
         let output = run_agent(&params).await?;
@@ -145,6 +146,7 @@ impl EvalHarness {
             correlated_task_id: None,
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
+            stream_tx: None,
         };
 
         let output = run_agent_with_deadline(&params, deadline).await?;
@@ -202,6 +204,7 @@ impl EvalHarness {
             correlated_task_id: None,
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
+            stream_tx: None,
         };
 
         let output = run_agent(&params).await?;
