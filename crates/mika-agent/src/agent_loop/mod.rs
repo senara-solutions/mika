@@ -2570,6 +2570,14 @@ pub struct AgentParams<'a> {
     /// `None` in CLI/test contexts — falls back to per-turn AtomicBool defense.
     pub pr_reviews_posted:
         Option<&'a Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>>,
+    /// Optional broadcast sender for A2A SSE tool-call events (mika#1731).
+    /// When `Some`, `process_tool_calls` emits `StreamEvent::ToolCallStart` and
+    /// `StreamEvent::ToolCallResult` frames before/after each physical tool
+    /// dispatch. The A2A `handle_message_stream` handler populates this with
+    /// the per-task broadcaster it already owns; all other callers (CLI,
+    /// silent, team, delegate) pass `None`. Emission is fire-and-forget:
+    /// broadcast errors are logged at debug and never fail the tool call.
+    pub stream_tx: Option<mika_a2a::streaming::StreamEventSender>,
 }
 
 /// Run the agent loop for a single inbound message.
