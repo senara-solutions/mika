@@ -131,7 +131,7 @@ struct OpenAiErrorDetail {
 
 const MAX_RETRIES: u32 = 3;
 
-use super::{RETRY_BUFFER_SECS, TYPICAL_CALL_DURATION_SECS};
+use super::{RETRY_BUFFER_SECS, TRANSPORT_RETRY_MIN_REMAINING_SECS, TYPICAL_CALL_DURATION_SECS};
 
 /// OpenAI-compatible provider that works with OpenAI, Ollama, vLLM, Groq, etc.
 pub struct OpenAiCompatibleProvider {
@@ -262,14 +262,32 @@ impl OpenAiCompatibleProvider {
                 // Deadline-aware retry abort: if the remaining time before the
                 // agent deadline cannot fit another LLM call attempt, bail out
                 // instead of wasting time on a doomed retry.
+                //
+                // mika#1744 AC4-primary: transport-class errors (DNS,
+                // connection refused, TLS, socket reset) resolve in seconds,
+                // not the full 120s per-request timeout. Use a smaller
+                // remaining-budget threshold (60s) when the last error was
+                // a transport failure. This is what unblocks mika-qa's
+                // z.ai wedge — the 2026-07-07 kill happened because the
+                // deadline was already ~2min PAST when the transport error
+                // hit, and the 120s abort threshold left no room for the
+                // fast-failing transport retry.
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
-                    if remaining
-                        < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
-                    {
+                    let last_was_transport = last_error
+                        .as_ref()
+                        .is_some_and(super::error::LlmError::is_transport);
+                    let threshold_secs = if last_was_transport {
+                        TRANSPORT_RETRY_MIN_REMAINING_SECS
+                    } else {
+                        TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS
+                    };
+                    if remaining < Duration::from_secs(threshold_secs) {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
+                            threshold_secs,
+                            last_was_transport,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
                         break;
@@ -310,10 +328,23 @@ impl OpenAiCompatibleProvider {
             }
         }
 
-        // Distinguish deadline-abort from normal retry exhaustion for diagnostics.
+        // Distinguish deadline-abort from normal retry exhaustion for
+        // diagnostics. Mirrors the retry-loop's transport-aware threshold
+        // (mika#1744) so the two branches agree on which errors classify
+        // as "aborted by deadline" — otherwise a transport-late failure
+        // would classify as "max retries exceeded" instead of the more
+        // accurate "deadline budget insufficient" surface.
+        let last_was_transport = last_error
+            .as_ref()
+            .is_some_and(super::error::LlmError::is_transport);
+        let deadline_threshold_secs = if last_was_transport {
+            TRANSPORT_RETRY_MIN_REMAINING_SECS
+        } else {
+            TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS
+        };
         let deadline_aborted = deadline.is_some_and(|dl| {
             dl.saturating_duration_since(Instant::now())
-                < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
+                < Duration::from_secs(deadline_threshold_secs)
         });
 
         Err(last_error.unwrap_or_else(|| {
