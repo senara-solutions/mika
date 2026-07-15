@@ -348,20 +348,42 @@ const PROGRESS_TICKER_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 /// Read from an async reader into a buffer up to `max_bytes`, incrementing
 /// `counter` after each chunk. Enables external progress observation (#900).
+/// Read from `reader` capturing at most `max_bytes` into the returned buffer,
+/// then **keep draining** the pipe until EOF while discarding the excess.
+///
+/// The drain phase is load-bearing for mika#1746: dropping the read handle on
+/// buffer-full caused `gh pr diff` on ≥10-file PRs to receive SIGPIPE and
+/// truncate its output, so mika-qa lost the tail of the diff and fell back to
+/// per-file reads that burned her step budget. Draining lets the child exit
+/// with status 0 and its stdout arrives complete — the caller sees a clean
+/// prefix + a `discarded_bytes` counter suitable for surfacing a truncation
+/// marker.
 async fn read_with_counter<R: AsyncRead + Unpin>(
-    reader: R,
+    mut reader: R,
     max_bytes: usize,
     counter: Arc<AtomicUsize>,
-) -> Vec<u8> {
-    let mut take = reader.take(max_bytes as u64);
+) -> ReaderResult {
     let mut buf = Vec::with_capacity(max_bytes.min(8192));
-    let mut chunk = [0u8; 256];
+    let mut chunk = [0u8; 8192];
+    let mut discarded_bytes: u64 = 0;
     loop {
-        match take.read(&mut chunk).await {
+        match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
                 counter.fetch_add(n, Ordering::Relaxed);
+                // Capture prefix up to `max_bytes`; discard the rest but
+                // keep draining so the child sees a fully-consumed pipe
+                // instead of SIGPIPE.
+                if buf.len() < max_bytes {
+                    let remaining = max_bytes - buf.len();
+                    let take = n.min(remaining);
+                    buf.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        discarded_bytes += (n - take) as u64;
+                    }
+                } else {
+                    discarded_bytes += n as u64;
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -373,7 +395,18 @@ async fn read_with_counter<R: AsyncRead + Unpin>(
             }
         }
     }
-    buf
+    ReaderResult {
+        buf,
+        discarded_bytes,
+    }
+}
+
+/// Return type for [`read_with_counter`]: the captured prefix plus the count
+/// of bytes read from the pipe but not stored (used to build a truncation
+/// marker for the caller).
+struct ReaderResult {
+    buf: Vec<u8>,
+    discarded_bytes: u64,
 }
 
 /// Spawn a CLI subprocess, capture bounded stdout/stderr, and return ToolOutput.
@@ -446,29 +479,42 @@ async fn spawn_and_collect(
         tokio::join!(stdout_reader, stderr_reader, child.wait());
     progress_task.abort();
 
-    let stdout_buf = match stdout_res {
-        Ok(buf) => buf,
+    let (stdout_buf, stdout_discarded) = match stdout_res {
+        Ok(r) => (r.buf, r.discarded_bytes),
         Err(e) => {
             tracing::warn!(tool = %tool_name, error = %e, "stdout reader task failed");
-            Vec::new()
+            (Vec::new(), 0)
         }
     };
-    let stderr_buf = match stderr_res {
-        Ok(buf) => buf,
+    let (stderr_buf, _stderr_discarded) = match stderr_res {
+        Ok(r) => (r.buf, r.discarded_bytes),
         Err(e) => {
             tracing::warn!(tool = %tool_name, error = %e, "stderr reader task failed");
-            Vec::new()
+            (Vec::new(), 0)
         }
     };
 
-    // Post-completion summary (#900)
-    tracing::info!(
-        tool = %tool_name,
-        stdout_bytes = stdout_count.load(Ordering::Relaxed),
-        stderr_bytes = stderr_count.load(Ordering::Relaxed),
-        elapsed_ms = started_at.elapsed().as_millis() as u64,
-        "spawn_and_collect complete"
-    );
+    // Post-completion summary (#900). Emit `stdout_discarded_bytes` when
+    // non-zero so mika#1746's truncation events are searchable in the log.
+    if stdout_discarded > 0 {
+        tracing::info!(
+            tool = %tool_name,
+            stdout_bytes = stdout_count.load(Ordering::Relaxed),
+            stderr_bytes = stderr_count.load(Ordering::Relaxed),
+            stdout_discarded_bytes = stdout_discarded,
+            stdout_cap_bytes = MAX_OUTPUT_LEN as u64,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "spawn_and_collect complete (stdout truncated at cap; mika#1746)"
+        );
+    } else {
+        tracing::info!(
+            tool = %tool_name,
+            stdout_bytes = stdout_count.load(Ordering::Relaxed),
+            stderr_bytes = stderr_count.load(Ordering::Relaxed),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "spawn_and_collect complete"
+        );
+    }
 
     let status = match wait_res {
         Ok(s) => s,
@@ -480,8 +526,22 @@ async fn spawn_and_collect(
     let stdout = String::from_utf8_lossy(&stdout_buf);
     let stderr = String::from_utf8_lossy(&stderr_buf);
 
+    // mika#1746: when the output was drained past the cap, append an explicit
+    // marker so callers (mika-qa reviewing large diffs) see the discard
+    // without having to correlate with the log.
+    let truncation_marker = if stdout_discarded > 0 {
+        format!(
+            "\n\n[... run_gh output truncated at {} bytes; {} more bytes discarded to prevent SIGPIPE on the child (mika#1746) ...]\n",
+            MAX_OUTPUT_LEN, stdout_discarded
+        )
+    } else {
+        String::new()
+    };
+
     if status.success() {
-        ToolOutput::success(stdout.into_owned())
+        let mut out = stdout.into_owned();
+        out.push_str(&truncation_marker);
+        ToolOutput::success(out)
     } else {
         let code_display = match status.code() {
             Some(code) => format!("Exit code: {code}"),
@@ -507,6 +567,7 @@ async fn spawn_and_collect(
         if !stdout.is_empty() {
             result.push_str(&stdout);
         }
+        result.push_str(&truncation_marker);
         ToolOutput::success(result)
     }
 }
@@ -2835,6 +2896,58 @@ mod tests {
         truncate_output(&mut output);
         assert!(output.content.contains("truncated"));
         assert!(output.content.len() < MAX_OUTPUT_LEN + 100);
+    }
+
+    // ── mika#1746 SIGPIPE-drain regression ────────────────────────────────
+
+    /// The reader must keep draining bytes past the cap so the child sees a
+    /// fully-consumed pipe (avoids SIGPIPE truncation on `gh pr diff` for
+    /// ≥10-file PRs). Small-input case: everything fits, no discard.
+    #[tokio::test]
+    async fn read_with_counter_small_input_no_discard() {
+        let input = b"hello world".to_vec();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = read_with_counter(&input[..], 100, Arc::clone(&counter)).await;
+        assert_eq!(result.buf, b"hello world");
+        assert_eq!(result.discarded_bytes, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 11);
+    }
+
+    /// Input exceeds cap → buffer stops at cap, remainder is drained and
+    /// counted. Counter reflects ALL bytes read from the pipe (so the log
+    /// event surfaces the true source size, not the truncated view).
+    #[tokio::test]
+    async fn read_with_counter_drains_past_cap() {
+        let input = b"x".repeat(1500);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = read_with_counter(&input[..], 1000, Arc::clone(&counter)).await;
+        assert_eq!(result.buf.len(), 1000);
+        assert_eq!(result.discarded_bytes, 500);
+        assert_eq!(counter.load(Ordering::Relaxed), 1500);
+    }
+
+    /// A single read that spans the cap boundary must split cleanly: prefix
+    /// into buf up to cap, remainder into `discarded_bytes`.
+    #[tokio::test]
+    async fn read_with_counter_split_boundary() {
+        // 8192 is the chunk size — one read pulls the whole thing.
+        let input = b"y".repeat(9000);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = read_with_counter(&input[..], 5000, Arc::clone(&counter)).await;
+        assert_eq!(result.buf.len(), 5000);
+        assert_eq!(result.discarded_bytes, 4000);
+        assert_eq!(counter.load(Ordering::Relaxed), 9000);
+    }
+
+    /// Zero-cap edge case: everything is discarded, nothing is buffered.
+    #[tokio::test]
+    async fn read_with_counter_zero_cap_all_discarded() {
+        let input = b"any".to_vec();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = read_with_counter(&input[..], 0, Arc::clone(&counter)).await;
+        assert!(result.buf.is_empty());
+        assert_eq!(result.discarded_bytes, 3);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]
