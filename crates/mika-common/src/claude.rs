@@ -19,7 +19,9 @@ const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75";
 const CLAUDE_CODE_APP_HEADER: &str = "cli";
 
-use crate::llm::{RETRY_BUFFER_SECS, TYPICAL_CALL_DURATION_SECS};
+use crate::llm::{
+    RETRY_BUFFER_SECS, TRANSPORT_RETRY_MIN_REMAINING_SECS, TYPICAL_CALL_DURATION_SECS,
+};
 
 /// Prefix of the Anthropic error message when the account has insufficient credits.
 /// Pinned as a const because `invalid_request_error` is Anthropic's generic 4xx type
@@ -530,17 +532,28 @@ impl ClaudeClient {
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                // Deadline-aware retry abort: if the remaining time before the
-                // agent deadline cannot fit another LLM call attempt, bail out
-                // instead of wasting time on a doomed retry.
+                // Deadline-aware retry abort — mirrors the OpenAI-compatible
+                // retry loop's transport-aware threshold (mika#1744 AC4).
+                // See `crates/mika-common/src/llm/openai.rs` for the source
+                // of truth; keeping both paths symmetric ensures a single
+                // discipline shift lands identically for Anthropic and
+                // OpenAI-compatible providers.
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
-                    if remaining
-                        < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
-                    {
+                    let last_was_transport = last_error
+                        .as_ref()
+                        .is_some_and(|e| matches!(e, ClaudeApiError::Transport(_)));
+                    let threshold_secs = if last_was_transport {
+                        TRANSPORT_RETRY_MIN_REMAINING_SECS
+                    } else {
+                        TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS
+                    };
+                    if remaining < Duration::from_secs(threshold_secs) {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
+                            threshold_secs,
+                            last_was_transport,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
                         break;
@@ -632,10 +645,21 @@ impl ClaudeClient {
             }
         }
 
-        // Distinguish deadline-abort from normal retry exhaustion for diagnostics.
+        // Distinguish deadline-abort from normal retry exhaustion for
+        // diagnostics. Mirrors the retry-loop's transport-aware threshold
+        // (mika#1744) so the abort surface matches whichever threshold
+        // actually fired.
+        let last_was_transport = last_error
+            .as_ref()
+            .is_some_and(|e| matches!(e, ClaudeApiError::Transport(_)));
+        let deadline_threshold_secs = if last_was_transport {
+            TRANSPORT_RETRY_MIN_REMAINING_SECS
+        } else {
+            TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS
+        };
         let deadline_aborted = deadline.is_some_and(|dl| {
             dl.saturating_duration_since(Instant::now())
-                < Duration::from_secs(TYPICAL_CALL_DURATION_SECS + RETRY_BUFFER_SECS)
+                < Duration::from_secs(deadline_threshold_secs)
         });
 
         Err(last_error
