@@ -96,7 +96,11 @@ impl Tool for SearchMemoryTool {
             if !hybrid_results.is_empty() {
                 // Use hybrid search results
                 for r in hybrid_results {
-                    results.push(format!("[{}] {}", r.source_type, r.content));
+                    let label = match r.source_id {
+                        Some(id) => format!("[{} id={}]", r.source_type, id),
+                        None => format!("[{}]", r.source_type),
+                    };
+                    results.push(format!("{label} {}", r.content));
                 }
             } else {
                 // Fallback to LIKE-based search (index may not be populated yet)
@@ -223,7 +227,7 @@ async fn search_like_fallback(
     if category == "all" || category == "person" {
         let people = ctx.db.search_people(query).await?;
         for person in people {
-            let mut desc = format!("[person] {} (id:{})", person.canonical_name, person.id);
+            let mut desc = format!("[person id={}] {}", person.id, person.canonical_name);
             if let Some(ref rel) = person.relationship {
                 desc.push_str(&format!(" — {rel}"));
             }
@@ -238,8 +242,8 @@ async fn search_like_fallback(
         let commitments = ctx.db.search_commitments(query).await?;
         for c in commitments {
             let mut desc = format!(
-                "[commitment] {} (id:{}, status:{})",
-                c.description, c.id, c.status
+                "[commitment id={} status:{}] {}",
+                c.id, c.status, c.description
             );
             if let Some(ref due) = c.due_date {
                 desc.push_str(&format!(" due:{due}"));
@@ -258,11 +262,10 @@ async fn search_like_fallback(
     if category == "all" || category == "event" {
         let events = ctx.db.search_events(query).await?;
         for event in events {
-            let mut desc = format!("[event] {} (id:{}", event.description, event.id);
+            let mut desc = format!("[event id={}] {}", event.id, event.description);
             if let Some(ref date) = event.event_date {
-                desc.push_str(&format!(", {date}"));
+                desc.push_str(&format!(" ({date})"));
             }
-            desc.push(')');
             if let Some(ref context) = event.context
                 && !context.is_empty()
             {
@@ -464,7 +467,7 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Alice Chen"));
-        assert!(result.content.contains("[person]"));
+        assert!(result.content.contains("[person id="));
     }
 
     #[tokio::test]
@@ -484,7 +487,43 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("budget"));
-        assert!(result.content.contains("[commitment]"));
+        assert!(result.content.contains("[commitment id="));
+    }
+
+    #[tokio::test]
+    async fn test_commitment_id_precedes_description_for_update_fact() {
+        // Regression against the failure mode named in the closed #1743 comment:
+        // id at the tail of long prose is easy for the LLM to miss when
+        // constructing the update_fact call. Label-prefix ordering keeps it
+        // in front of the description.
+        let harness = TestHarness::new();
+        harness
+            .db
+            .add_commitment(
+                "Send Alice the Q4 revenue projection PDF she requested at the offsite",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let ctx = harness.ctx();
+        let tool = SearchMemoryTool;
+
+        let result = tool
+            .execute(serde_json::json!({"query": "Alice"}), &ctx)
+            .await
+            .unwrap();
+        let content = &result.content;
+        let id_pos = content
+            .find("[commitment id=")
+            .expect("commitment result missing id-prefix label");
+        let desc_pos = content
+            .find("Send Alice")
+            .expect("commitment description not found");
+        assert!(
+            id_pos < desc_pos,
+            "id label must precede description, got id@{id_pos} desc@{desc_pos}"
+        );
     }
 
     #[tokio::test]
@@ -521,8 +560,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.content.contains("[person]"));
-        assert!(!result.content.contains("[commitment]"));
+        assert!(result.content.contains("[person id="));
+        assert!(!result.content.contains("[commitment id="));
     }
 
     #[tokio::test]
@@ -637,8 +676,8 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("[event]"));
-        assert!(!result.content.contains("[person]"));
+        assert!(result.content.contains("[event id="));
+        assert!(!result.content.contains("[person id="));
     }
 
     #[tokio::test]
@@ -655,7 +694,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert!(result.content.contains("[person]"));
+        assert!(result.content.contains("[person id="));
         assert!(result.content.contains("Alice Chen"));
     }
 
@@ -678,7 +717,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.content.contains("[person]"));
-        assert!(!result.content.contains("[commitment]"));
+        assert!(result.content.contains("[person id="));
+        assert!(!result.content.contains("[commitment id="));
     }
 }

@@ -877,6 +877,23 @@ When the outbound routing endpoint is unreachable, messages are not lost.
 At the start of each `/message` handler, the server flushes up to 5 pending failed
 sends in a background task (does not block message processing).
 
+**Staleness policy (mika#1751):** The flush is not verbatim. For each row:
+
+- **Drop** if `now - created_at > 5 minutes` — the parked reply is stale and the
+  fresh turn supersedes it. `warn!` logged with `age_secs` for audit.
+- **Deliver with `⏳ from earlier — ` prefix** if within threshold — reader
+  gets an in-order marker so the late delivery does not read as a memory glitch.
+- **Deliver with `⚠️ UNPARSEABLE TIMESTAMP — ` prefix** on parse failure —
+  fail-open (per mika-arch first-pass review): silent drop-on-parse-fail is
+  data loss unless the accompanying `error!` is actively paged, which it
+  isn't at this frequency.
+
+Motivating incident: a family-customer-1 user's "Hello" received two
+introductions one minute apart on 2026-07-09 because a 3.5-hour-old parked
+reply was flushed alongside the fresh-turn response. The 5-minute threshold
+resolves that class of duplicate. Same-turn coordination inside the window is
+tracked at mika#1752.
+
 
 ## 16. Multi-Agent Support
 

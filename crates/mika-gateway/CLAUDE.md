@@ -53,7 +53,7 @@ The DLQ respects the shared 30-permit webhook semaphore — if all permits are h
 
 ## Agent Identification & Reply Routing
 
-- Outbound messages carry `agent_name` in the `/send` payload; gateway prepends `[agent_name]` to Telegram text and stores `(telegram_message_id, chat_id, agent_name)` in `outbound_messages` Postgres table
+- Outbound messages carry `agent_name` in the `/send` payload; gateway prepends `[agent_name]` to Telegram text (**except when `agent_name == mika_common::agent::DEFAULT_AGENT` (`"mika"`)** — single-agent customers, including every family-tier customer, see raw text with no `[mika]` parasite; suppression added after family-tier launch 2026-07-16 when the prefix leaked into a family member's first-hour greeting) and stores `(telegram_message_id, chat_id, agent_name)` in `outbound_messages` Postgres table
 - Parses `reply_to_message` from Telegram updates; looks up the originating agent via `outbound_messages` and forwards the inbound message with `"agent": "<name>"` to the correct agent in the container
 - Periodic cleanup: purges `outbound_messages` older than 7 days (batched, every ~100 webhooks)
 

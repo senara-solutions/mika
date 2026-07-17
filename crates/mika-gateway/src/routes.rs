@@ -1475,6 +1475,33 @@ async fn require_bearer_token(
 
 // -- Send handler --
 
+/// Format outbound Telegram text: prepend `[<agent_name>] ` for identification in
+/// multi-agent setups, EXCEPT when the sender is the container's default agent
+/// (`mika-common::agent::DEFAULT_AGENT`, `"mika"`). Single-agent customers —
+/// including every family-tier customer — see the raw text with no `[mika]`
+/// prefix on Telegram. Multi-agent customers who name additional agents
+/// (`work-mika`, `personal-mika`, etc.) still get the identification prefix on
+/// those non-default agents.
+///
+/// This is a rendering-layer decision only. The agent's outbound content is
+/// unchanged in its own DB, and `outbound_messages` still records `agent_name`
+/// for reply-to-message routing (`parse_agent_prefix` on inbound continues to
+/// tolerate both prefixed and unprefixed shapes for backwards compat with
+/// pre-fix history + non-default agents).
+///
+/// Founding incident: mika-cloud family-tier launch 2026-07-16 — the `[mika]`
+/// prefix leaked into a family member's first-hour Telegram greeting, breaking
+/// the persona's "warm, French, no jargon" contract before she even said
+/// hello. Pure function so the branch is unit-testable without HTTP scaffolding.
+fn format_outbound_text(agent_name: Option<&str>, text: &str) -> String {
+    match agent_name {
+        Some(name) if name != mika_common::agent::DEFAULT_AGENT => {
+            format!("[{name}] {text}")
+        }
+        _ => text.to_string(),
+    }
+}
+
 /// POST /send — containers deliver outbound messages to Telegram.
 ///
 /// Authenticated via `require_bearer_token` middleware.
@@ -1540,15 +1567,9 @@ pub(crate) async fn handle_send(
             .into_response();
     }
 
-    // Prepend agent name for identification in multi-agent setups
-    let owned_text;
-    let text_to_send = match &payload.agent_name {
-        Some(name) => {
-            owned_text = format!("[{name}] {}", payload.text);
-            &owned_text
-        }
-        None => &payload.text,
-    };
+    // Render outbound text via the pure helper so the branch is unit-testable.
+    let owned_text = format_outbound_text(payload.agent_name.as_deref(), &payload.text);
+    let text_to_send = &owned_text;
 
     // Resolve the Telegram client: per-customer bot token if customer_id is provided,
     // otherwise fall back to the global single-bot client.
@@ -1941,6 +1962,61 @@ mod tests {
         assert_eq!(payload.chat_id, 42);
         assert_eq!(payload.text, "hello");
         assert!(payload.agent_name.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // format_outbound_text — mika-cloud family-tier launch 2026-07-16
+    // ------------------------------------------------------------------
+
+    /// AC1: the container's default agent (`mika`) MUST NOT prefix outbound
+    /// Telegram text — every family-tier customer only has this one agent, and
+    /// the `[mika]` parasite broke first-hour-Perfect during the family launch.
+    #[test]
+    fn format_outbound_text_suppresses_default_agent_prefix() {
+        let out = format_outbound_text(Some("mika"), "Bonjour Sonia 🌸");
+        assert_eq!(out, "Bonjour Sonia 🌸");
+        assert!(!out.starts_with('['));
+    }
+
+    /// AC2: non-default agent names (multi-agent customers) keep the
+    /// identification prefix — the "multi-agent setups" use case the wire was
+    /// originally added for still works.
+    #[test]
+    fn format_outbound_text_keeps_prefix_for_named_agents() {
+        assert_eq!(
+            format_outbound_text(Some("work-mika"), "meeting at 3"),
+            "[work-mika] meeting at 3"
+        );
+        assert_eq!(
+            format_outbound_text(Some("personal-mika"), "yoga tonight"),
+            "[personal-mika] yoga tonight"
+        );
+        assert_eq!(
+            format_outbound_text(Some("mika-dev"), "PR ready"),
+            "[mika-dev] PR ready"
+        );
+    }
+
+    /// AC3: `None` agent_name path (operator-only /send, no identification
+    /// requested) also produces raw text — same as pre-fix behavior.
+    #[test]
+    fn format_outbound_text_no_prefix_when_agent_name_absent() {
+        assert_eq!(format_outbound_text(None, "raw text"), "raw text");
+    }
+
+    /// AC4: the default-agent branch matches the exact case of
+    /// `mika_common::agent::DEFAULT_AGENT` (`"mika"`), not case-insensitively.
+    /// An agent literally named `"Mika"` (capital M) is a hypothetical
+    /// multi-agent case and gets prefixed — the existing agent-name validation
+    /// rejects uppercase anyway (see `test_agent_name_validation_rules`), so
+    /// this is a defence-in-depth assertion rather than a live path.
+    #[test]
+    fn format_outbound_text_default_agent_match_is_case_sensitive() {
+        // Live: DEFAULT_AGENT is `"mika"`, lowercase — matched.
+        assert_eq!(format_outbound_text(Some("mika"), "x"), "x");
+        // Uppercase would already fail send-handler validation; helper still
+        // behaves consistently (prefixed) if it somehow got through.
+        assert!(format_outbound_text(Some("Mika"), "x").starts_with('['));
     }
 
     #[test]
