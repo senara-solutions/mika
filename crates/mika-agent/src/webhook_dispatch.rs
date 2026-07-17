@@ -27,6 +27,19 @@ pub(crate) use mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER;
 ///
 /// Mutually exclusive with `is_ready_label_dispatch_marker` on the
 /// `[GitHub]` domain (mika#910).
+//
+// DOCTRINE: pre-classifier structural gate (mika#1733 AC2)
+// Applies per crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md §AC2:
+// "This agent structurally cannot do X" applies to pre-classifier engine gates
+// only, NEVER to LLM classifier decisions. This predicate is such a gate — it
+// rejects unauthorized webhook-triggered `run_claude_pilot` calls based on the
+// message SOURCE (webhook prefix + kind), which is a structural fact the LLM
+// classifier cannot itself verify without begging the question.
+//
+// NOTE: The tier1/tier2/tier3 permission classifier code lives in
+// claude-pilot-py; the companion doctrine anchor for those sites is tracked
+// as a cross-repo follow-up filed alongside this PR (see PR body §Follow-ups).
+// This annotation covers the in-mika-agent structural gate only.
 pub(crate) fn is_unauthorized_webhook_dispatch(msg: &str) -> bool {
     if !msg.starts_with("[GitHub]") {
         return false;

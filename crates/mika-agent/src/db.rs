@@ -27,7 +27,19 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 43;
+pub const CURRENT_SCHEMA_VERSION: i64 = 44;
+
+/// mika#1742 Problem B: refuse-to-zombie grace window for
+/// [`Database::create_recurring_task_if_absent`]. Recent same-label recurring
+/// rows in `'failed' | 'cancelled' | 'expired'` states within this window
+/// block fresh registration and log a WARN. Grace elapses → next startup
+/// re-registers automatically. Tunable at compile-time; expose via env var
+/// only if operator experience surfaces a real need.
+pub const RECURRING_ZOMBIE_GRACE_HOURS: u32 = 24;
+
+/// SQLite `strftime` modifier form of [`RECURRING_ZOMBIE_GRACE_HOURS`]. Kept
+/// as a `&str` const so the query stays a bindable parameter.
+pub const RECURRING_ZOMBIE_GRACE_SQL: &str = "-24 hours";
 
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
@@ -1030,6 +1042,11 @@ impl Database {
             info!(version = 43, "database migrated to v43");
         }
 
+        if (3..=43).contains(&version) {
+            self.migrate_v43_to_v44()?;
+            info!(version = 44, "database migrated to v44");
+        }
+
         Ok(())
     }
 
@@ -1084,7 +1101,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (43);
+            INSERT INTO schema_version (version) VALUES (44);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -1710,6 +1727,29 @@ impl Database {
                 last_failure_at TEXT,
                 PRIMARY KEY (repo_full_name, issue_number)
             );
+
+            -- Permission-decision provenance ledger (mika#1733 AC4)
+            CREATE TABLE permission_decisions (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                args_summary TEXT,
+                classifier_verdict TEXT NOT NULL
+                    CHECK (classifier_verdict IN ('approved', 'denied', 'held')),
+                operator_decision TEXT
+                    CHECK (operator_decision IN ('approve', 'deny')),
+                override_used INTEGER NOT NULL DEFAULT 0
+                    CHECK (override_used IN (0, 1)),
+                decision_authority TEXT NOT NULL
+                    CHECK (decision_authority IN ('strict', 'override')),
+                tenant_id TEXT,
+                agent_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX idx_permission_decisions_request_id
+                ON permission_decisions(request_id);
+            CREATE INDEX idx_permission_decisions_created_at
+                ON permission_decisions(created_at DESC);
 
             -- Pre-register the default 'mika' agent
             INSERT INTO agents (id, name, home_dir) VALUES ('mika', 'Mika', '');
@@ -4310,6 +4350,96 @@ impl Database {
         Ok(())
     }
 
+    /// v43→v44: additive `permission_decisions` provenance ledger (mika#1733 AC4).
+    ///
+    /// Records every operator permission decision routed through
+    /// `PermissionsChannel::resolve_decision`, including the classifier
+    /// verdict, operator ratification, derived `override_used` flag, and the
+    /// scope (tenant/agent) at decision time. Additive-only — no rebuild of
+    /// existing tables. Two indexes support the two expected query shapes:
+    /// per-request lookup and time-window scans.
+    fn migrate_v43_to_v44(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 44 {
+            return Ok(());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS permission_decisions (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                args_summary TEXT,
+                classifier_verdict TEXT NOT NULL
+                    CHECK (classifier_verdict IN ('approved', 'denied', 'held')),
+                operator_decision TEXT
+                    CHECK (operator_decision IN ('approve', 'deny')),
+                override_used INTEGER NOT NULL DEFAULT 0
+                    CHECK (override_used IN (0, 1)),
+                decision_authority TEXT NOT NULL
+                    CHECK (decision_authority IN ('strict', 'override')),
+                tenant_id TEXT,
+                agent_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_permission_decisions_request_id
+                ON permission_decisions(request_id);
+            CREATE INDEX IF NOT EXISTS idx_permission_decisions_created_at
+                ON permission_decisions(created_at DESC);",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (44)", [])?;
+        tx.commit()?;
+
+        info!("v43→v44: added permission_decisions provenance table (mika#1733 AC4)");
+
+        Ok(())
+    }
+
+    /// Insert a permission-decision provenance record (mika#1733 AC4). All
+    /// fields correspond 1:1 to the v44 schema columns. `override_used` is
+    /// derived by the caller and asserted at the CHECK constraint here as
+    /// defense-in-depth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_permission_decision(
+        &self,
+        id: &str,
+        request_id: &str,
+        tool_name: &str,
+        args_summary: Option<&str>,
+        classifier_verdict: &str,
+        operator_decision: Option<&str>,
+        override_used: bool,
+        decision_authority: &str,
+        tenant_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO permission_decisions (
+                id, request_id, tool_name, args_summary,
+                classifier_verdict, operator_decision, override_used,
+                decision_authority, tenant_id, agent_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                request_id,
+                tool_name,
+                args_summary,
+                classifier_verdict,
+                operator_decision,
+                if override_used { 1i64 } else { 0i64 },
+                decision_authority,
+                tenant_id,
+                agent_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Check if a column exists on a table within a transaction scope.
     fn column_exists_tx(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> Result<bool> {
         let mut stmt = tx.prepare(&format!("PRAGMA table_info('{table}')"))?;
@@ -4798,8 +4928,70 @@ impl Database {
     }
 
     /// Insert a recurring task only if no task with the same (agent_id, label) and
-    /// trigger_type='recurring' exists. Returns the task ID if created, None if already existed.
+    /// trigger_type='recurring' exists. Returns the task ID if created, None if
+    /// already existed or if a recent dead sibling refuses re-registration.
+    ///
+    /// **mika#1742 Problem B — refuse-to-zombie guard.** The partial unique index
+    /// `idx_tasks_unique_recurring` explicitly excludes `'cancelled' | 'failed' |
+    /// 'expired' | 'delivered'` statuses. So a bare `INSERT OR IGNORE` silently
+    /// creates a fresh row whenever every prior instance died — and every
+    /// mika-spirit restart re-triggers the fresh registration. That's the
+    /// curator_review zombie root cause (8 dead Mika rows across 8 days per
+    /// root-claude's forensic).
+    ///
+    /// This guard adds a pre-insert query: if any recurring row for the same
+    /// `(agent_id, label)` was `failed`/`cancelled` within the last
+    /// [`RECURRING_ZOMBIE_GRACE_HOURS`] window, refuse to re-register and log a
+    /// `warn!` so the operator sees the surface. The operator can:
+    ///
+    /// - Wait for the grace window to elapse (fresh registration then proceeds).
+    /// - Investigate the previous instance's failure via `mika tasks get <id>`.
+    /// - Manually clear the dead row and let the next startup re-register.
+    ///
+    /// Non-goal here: fixing the *underlying* dispatch failure for Mika's
+    /// specific `curator_review` (Problem A in the ticket). Root-claude's
+    /// diagnosis notes PR#1726 (RouteFuture/dashmap wedge) likely already
+    /// resolves it. Verification is a Phase-2 follow-up under the Problem-A
+    /// investigation.
     pub fn create_recurring_task_if_absent(&self, task: NewTask) -> Result<Option<String>> {
+        // Zombie guard — refuse to re-register a recurring label whose most
+        // recent instance died in the grace window.
+        let dead_sibling: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, status, updated_at FROM tasks
+                 WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+                   AND trigger_type = 'recurring'
+                   AND status IN ('failed', 'cancelled', 'expired')
+                   AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3)
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![task.agent_id, task.label, RECURRING_ZOMBIE_GRACE_SQL],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if let Some((prev_id, prev_status, prev_updated)) = dead_sibling {
+            tracing::warn!(
+                agent_id = %task.agent_id,
+                label = %task.label,
+                previous_task_id = %prev_id,
+                previous_status = %prev_status,
+                previous_updated_at = %prev_updated,
+                grace_hours = RECURRING_ZOMBIE_GRACE_HOURS,
+                "mika#1742: refusing to re-register recurring task — recent same-label \
+                 instance ended in a terminal-failure state. Investigate root cause \
+                 (`mika tasks get {prev_id}`) before re-enabling; re-registration \
+                 automatically re-attempts after the grace window elapses."
+            );
+            return Ok(None);
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
         let task_type = task
             .r#type
@@ -4828,7 +5020,7 @@ impl Database {
         if n > 0 {
             Ok(Some(id))
         } else {
-            Ok(None) // already existed
+            Ok(None) // already existed (unique-index conflict on an active row)
         }
     }
 
@@ -12017,6 +12209,200 @@ mod tests {
         assert_eq!(ids[0], c_id);
     }
 
+    // ── mika#1742 Problem B — refuse-to-zombie guard on
+    //    create_recurring_task_if_absent ────────────────────────────────
+
+    fn zombie_recurring_task(agent_id: &str, label: &str) -> NewTask {
+        NewTask {
+            agent_id: agent_id.to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "recurring".to_string(),
+            cron_expr: Some("0 0 * * * *".to_string()),
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some("2286-11-20T17:46:39Z".to_string()),
+            timeout_at: None,
+            action_type: "inject_context".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        }
+    }
+
+    /// Fresh install (no prior rows) → registration succeeds.
+    #[test]
+    fn zombie_guard_fresh_install_registers() {
+        let db = db();
+        let id = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap();
+        assert!(id.is_some());
+    }
+
+    /// Existing `recurring_active` row → returns `None` (unchanged
+    /// idempotency, driven by the partial unique index).
+    #[test]
+    fn zombie_guard_active_row_still_idempotent() {
+        let db = db();
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap();
+        let second = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap();
+        assert!(
+            second.is_none(),
+            "second call must NOT create a duplicate active row"
+        );
+    }
+
+    /// Recent `failed` row within the grace window → refuse to re-register.
+    /// This IS the mika#1742 root-cause fix.
+    #[test]
+    fn zombie_guard_recent_failed_refuses_registration() {
+        let db = db();
+        let first = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap()
+            .unwrap();
+        // Mark it failed 1 hour ago.
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE id = ?1",
+                params![first],
+            )
+            .unwrap();
+
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap();
+        assert!(
+            retry.is_none(),
+            "recent-failed sibling must block fresh registration (mika#1742)"
+        );
+    }
+
+    /// Recent `cancelled` row within the grace window → refuse.
+    #[test]
+    fn zombie_guard_recent_cancelled_refuses_registration() {
+        let db = db();
+        let first = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'cancelled',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2 hours')
+                 WHERE id = ?1",
+                params![first],
+            )
+            .unwrap();
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap();
+        assert!(retry.is_none());
+    }
+
+    /// Old dead row (outside the grace window) → allow fresh registration.
+    /// The grace has elapsed; operator has had time to notice / act.
+    #[test]
+    fn zombie_guard_expired_grace_allows_registration() {
+        let db = db();
+        let first = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap()
+            .unwrap();
+        // Push the failure well outside the 24h window.
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-72 hours')
+                 WHERE id = ?1",
+                params![first],
+            )
+            .unwrap();
+        let retry = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap();
+        assert!(
+            retry.is_some(),
+            "outside grace window must allow re-registration"
+        );
+    }
+
+    /// Dead row for a DIFFERENT label must not block registration.
+    #[test]
+    fn zombie_guard_scoped_to_label() {
+        let db = db();
+        let first = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "other_label"))
+            .unwrap()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE id = ?1",
+                params![first],
+            )
+            .unwrap();
+        let curator = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap();
+        assert!(curator.is_some(), "guard must scope to (agent_id, label)");
+    }
+
+    /// Dead row for a DIFFERENT agent must not block registration.
+    #[test]
+    fn zombie_guard_scoped_to_agent() {
+        let db = db();
+        // Test fixture's migrate_v1 pre-registers 'mika' only; register the
+        // second agent explicitly so the tasks FK holds.
+        db.register_agent("mika-arch", "Mika Arch", "/tmp/mika-arch")
+            .unwrap();
+        let mika_first = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE id = ?1",
+                params![mika_first],
+            )
+            .unwrap();
+        // Different agent — must succeed.
+        let arch = db
+            .create_recurring_task_if_absent(zombie_recurring_task("mika-arch", "curator_review"))
+            .unwrap();
+        assert!(arch.is_some(), "guard must scope to agent_id");
+    }
+
+    /// Consts stay in sync: the SQL modifier's magnitude must match
+    /// [`RECURRING_ZOMBIE_GRACE_HOURS`] so operators reading logs and the
+    /// SQL query agree on the same window.
+    #[test]
+    fn zombie_guard_grace_consts_stay_in_sync() {
+        let expected = format!("-{RECURRING_ZOMBIE_GRACE_HOURS} hours");
+        assert_eq!(
+            RECURRING_ZOMBIE_GRACE_SQL, expected,
+            "RECURRING_ZOMBIE_GRACE_SQL must match RECURRING_ZOMBIE_GRACE_HOURS"
+        );
+    }
+
     #[test]
     fn test_cancelled_recurring_task_allows_re_creation() {
         let db = db();
@@ -16124,6 +16510,7 @@ mod tests {
         db2.migrate_v40_to_v41().unwrap();
         db2.migrate_v41_to_v42().unwrap();
         db2.migrate_v42_to_v43().unwrap();
+        db2.migrate_v43_to_v44().unwrap();
 
         let final_version: i64 = db2
             .conn

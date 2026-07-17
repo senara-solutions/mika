@@ -2601,6 +2601,41 @@ impl AsyncDatabase {
         })
         .await
     }
+
+    /// Async wrapper for [`Database::insert_permission_decision`] (mika#1733
+    /// AC4). Fire-and-forget from the classifier's perspective — the caller
+    /// spawns this on a `tokio::spawn` so a slow DB never blocks the
+    /// oneshot-first decision path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_permission_decision(
+        &self,
+        id: String,
+        request_id: String,
+        tool_name: String,
+        args_summary: Option<String>,
+        classifier_verdict: String,
+        operator_decision: Option<String>,
+        override_used: bool,
+        decision_authority: String,
+        tenant_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Result<()> {
+        self.with_db(move |db| {
+            db.insert_permission_decision(
+                &id,
+                &request_id,
+                &tool_name,
+                args_summary.as_deref(),
+                &classifier_verdict,
+                operator_decision.as_deref(),
+                override_used,
+                &decision_authority,
+                tenant_id.as_deref(),
+                agent_id.as_deref(),
+            )
+        })
+        .await
+    }
 }
 
 #[cfg(test)]

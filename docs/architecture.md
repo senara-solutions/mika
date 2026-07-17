@@ -838,12 +838,13 @@ discriminator key + correlation scope. They coexist by design — do NOT unify.
 | `PermissionStreamFrame` | `#[serde(tag = "event")]` | Per-process (single `AppState.permissions_channel`) | `GET /api/v1/dashboard/permissions/stream` (+ POST-back `/decide`) | `mika-agent` server | mika#1741 (sub-C AC1) |
 | `TaskEventFrame` (mika#1732) | `#[serde(tag = "event")]` | Per-process (single `AppState.task_events_channel`) | `GET /api/v1/dashboard/tasks/stream` | `mika-agent` server | this ticket |
 
-**Four axes of deliberate divergence:**
+**Five axes of deliberate divergence:**
 
 1. **Discriminator key** — A2A uses `kind`, Dashboard uses `event`.
 2. **Correlation scope** — A2A is per-task (each `message/stream` gets its own bounded broadcast); Dashboard streams are per-process global broadcasts frames tag their originating agent/session.
 3. **Route pattern** — A2A rides on JSON-RPC POST body; Dashboard uses dedicated GET endpoints.
 4. **Crate location** — A2A frames live in `mika-a2a` (protocol-owned); Dashboard frames live in `mika-agent` server module (deploy-owned).
+5. **Decision persistence** — Dashboard SSE surfaces may write a companion DB row when the frame carries a ratified decision. `PermissionStreamFrame::PermissionRequest` pairs with a `permission_decisions` row (mika#1733 AC4) once the operator POSTs back; task-event frames have no persistence yet (emission-from-transition sites land in a follow-up ticket). A2A `StreamEvent` writes go through the `a2a_task_map` + task-store path — orthogonal to the dashboard-SSE persistence axis.
 
 **Shared discipline (all three surfaces):**
 
@@ -875,6 +876,23 @@ When the outbound routing endpoint is unreachable, messages are not lost.
 
 At the start of each `/message` handler, the server flushes up to 5 pending failed
 sends in a background task (does not block message processing).
+
+**Staleness policy (mika#1751):** The flush is not verbatim. For each row:
+
+- **Drop** if `now - created_at > 5 minutes` — the parked reply is stale and the
+  fresh turn supersedes it. `warn!` logged with `age_secs` for audit.
+- **Deliver with `⏳ from earlier — ` prefix** if within threshold — reader
+  gets an in-order marker so the late delivery does not read as a memory glitch.
+- **Deliver with `⚠️ UNPARSEABLE TIMESTAMP — ` prefix** on parse failure —
+  fail-open (per mika-arch first-pass review): silent drop-on-parse-fail is
+  data loss unless the accompanying `error!` is actively paged, which it
+  isn't at this frequency.
+
+Motivating incident: a family-customer-1 user's "Hello" received two
+introductions one minute apart on 2026-07-09 because a 3.5-hour-old parked
+reply was flushed alongside the fresh-turn response. The 5-minute threshold
+resolves that class of duplicate. Same-turn coordination inside the window is
+tracked at mika#1752.
 
 
 ## 16. Multi-Agent Support

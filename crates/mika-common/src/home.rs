@@ -1,5 +1,65 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use tracing::warn;
+
+/// Agent-tier variants that select which identity/soul templates `bootstrap` writes
+/// on a fresh install (mika#1778).
+///
+/// The tier is env-var-gated via `MIKA_AGENT_TIER` and read once per bootstrap call.
+/// It never rewrites an existing `identity.toml`/`soul.md` (contract of
+/// `write_default_if_missing` is preserved) — provisioning workflows must set the env
+/// var before the first container startup for the family persona to land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTier {
+    /// Operator/platform-owner persona (English, executive-assistant tone, full skill
+    /// allowlist including `github`/`git-ops`/`shell-exec`). Default when `MIKA_AGENT_TIER`
+    /// is unset, empty, or matches `"default"` (case-insensitive).
+    Default,
+    /// Family-tier persona (native French, `tu` register, warm/patient/simple tone,
+    /// zero technical jargon, narrow allowlist excluding dev/orchestrator surfaces).
+    /// Selected when `MIKA_AGENT_TIER=family` (case-insensitive).
+    Family,
+}
+
+impl AgentTier {
+    /// Resolve the tier from the `MIKA_AGENT_TIER` env var. Unknown values (anything
+    /// outside `{"default", "family"}` after case-folding) fall through to `Default`
+    /// with a single `warn!` log naming the offending value — visible in
+    /// `MIKA_SPIRIT_LOG_FILE`.
+    pub fn from_env() -> Self {
+        match std::env::var("MIKA_AGENT_TIER") {
+            Err(_) => Self::Default,
+            Ok(raw) => {
+                let normalized = raw.trim().to_ascii_lowercase();
+                match normalized.as_str() {
+                    "" | "default" => Self::Default,
+                    "family" => Self::Family,
+                    _ => {
+                        warn!(
+                            value = %raw,
+                            "MIKA_AGENT_TIER value not recognized; falling through to Default persona"
+                        );
+                        Self::Default
+                    }
+                }
+            }
+        }
+    }
+
+    fn identity_toml(self) -> &'static str {
+        match self {
+            Self::Default => DEFAULT_IDENTITY,
+            Self::Family => FAMILY_IDENTITY,
+        }
+    }
+
+    fn soul_md(self) -> &'static str {
+        match self {
+            Self::Default => DEFAULT_SOUL,
+            Self::Family => FAMILY_SOUL,
+        }
+    }
+}
 
 /// Resolve the Mika home directory.
 /// Priority: $MIKA_HOME > ~/.mika/
@@ -191,15 +251,22 @@ log_level = "info"
 
 /// Create the ~/.mika/ directory structure with default files.
 /// Sets permissions to 0700 for directories, 0600 for files on Unix.
+///
+/// The `identity.toml` and `soul.md` templates are selected by `AgentTier::from_env()`
+/// — set `MIKA_AGENT_TIER=family` in the container's environment BEFORE first startup
+/// to land the family persona (mika#1778). `write_default_if_missing` preserves
+/// existing files, so this only fires on fresh install; already-provisioned containers
+/// keep their current persona regardless of env-var changes.
 pub fn bootstrap(home_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(home_dir.join("logs"))
         .with_context(|| format!("failed to create {}/logs/", home_dir.display()))?;
     std::fs::create_dir_all(home_dir.join("skills"))
         .with_context(|| format!("failed to create {}/skills/", home_dir.display()))?;
 
+    let tier = AgentTier::from_env();
     write_default_if_missing(home_dir, "config.toml", DEFAULT_CONFIG)?;
-    write_default_if_missing(home_dir, "identity.toml", DEFAULT_IDENTITY)?;
-    write_default_if_missing(home_dir, "soul.md", DEFAULT_SOUL)?;
+    write_default_if_missing(home_dir, "identity.toml", tier.identity_toml())?;
+    write_default_if_missing(home_dir, "soul.md", tier.soul_md())?;
     write_default_if_missing(home_dir, "heartbeat.md", DEFAULT_HEARTBEAT)?;
     write_default_if_missing(home_dir, "user.md", DEFAULT_USER)?;
 
@@ -366,6 +433,110 @@ You protect the user's time fiercely.
 - Say "I don't know" when you don't know
 - Ask for clarification rather than guess on high-stakes decisions
 - When you adapt, replace, or rename something, you own the full outcome — not just the artifact. Trace all references and update them. The job isn't done until the system works end-to-end.
+"#;
+
+/// Narrow allowlist for the family-tier agent (mika#1778). Explicitly excludes
+/// dev/orchestrator surfaces (`github`, `git-ops`, `shell-exec`, `tmux`,
+/// `gh-read-only`, `self-knowledge`, `mcp`) that would leak jargon into a
+/// non-technical family member's conversation. Includes only calm daily-life
+/// surfaces.
+///
+/// Maintenance: this is the family-tier counterpart to `DEFAULT_AGENT_SKILL_ALLOWLIST`.
+/// The TOML array in `FAMILY_IDENTITY` below MUST stay in sync with this constant —
+/// `home.rs` tests assert they match.
+pub const FAMILY_AGENT_SKILL_ALLOWLIST: &[&str] = &[
+    "calendar",
+    "google-workspace",
+    "file-reader",
+    "web-search",
+    "desktop",
+    "browser-control",
+];
+
+/// Family-tier identity template (mika#1778). Written to `identity.toml` on fresh
+/// install when `MIKA_AGENT_TIER=family` is set. Keep the allowlist array in sync
+/// with `FAMILY_AGENT_SKILL_ALLOWLIST`.
+pub const FAMILY_IDENTITY: &str = r#"name = "Mika"
+emoji = "🌸"
+
+[skills]
+# Narrow family-tier allowlist (mika#1778). Excludes dev/orchestrator skills
+# (github, git-ops, shell-exec, tmux, gh-read-only, self-knowledge, mcp) so a
+# non-technical family member's Mika never leaks Disposition/Verdict contracts
+# or platform-internal jargon. Keep in sync with FAMILY_AGENT_SKILL_ALLOWLIST
+# in crates/mika-common/src/home.rs (home.rs tests assert they match).
+allowlist = [
+    "calendar",
+    "google-workspace",
+    "file-reader",
+    "web-search",
+    "desktop",
+    "browser-control",
+]
+
+# [kg]
+# enabled = true                    # default: true — set false to skip KG for this agent
+# docs_root = "/path/to/docs"       # optional; falls back to MIKA_KG_DOCS_ROOT / kg_docs_root / CWD/docs/solutions
+"#;
+
+/// Family-tier persona (mika#1778). Written to `soul.md` on fresh install when
+/// `MIKA_AGENT_TIER=family` is set. Vincent-approved 2026-07-12 for the family
+/// onboarding path (Sonia and downstream family). Native French, `tu` register,
+/// warm/patient/simple tone, zero technical jargon. The `## First-turn opening`
+/// section carries the reference greeting shape; per-person adaptation (name,
+/// context) happens at provisioning time via `user.md`, not by editing this
+/// constant.
+pub const FAMILY_SOUL: &str = r#"# Mika — Compagnon personnel (famille)
+
+## Personnalité
+Tu es Mika, un compagnon personnel — chaleureux, patient, simple. **Jamais de
+jargon technique** (aucune mention de tickets, GitHub, agents dev/QA/arch/quant,
+skills, etc.). Tu es là pour aider au quotidien : te souvenir de ce qui compte,
+rappeler les choses à ne pas oublier, écouter, réfléchir *avec* la personne,
+l'aider à écrire un message ou à s'organiser. Tu ne presses jamais. Tu es une
+présence, pas un outil. Tu réponds en **français** natif et chaleureux.
+
+## Registre
+`tu` par défaut (chaleureux, ton cadeau, approuvé par Vincent).
+Note : `vous` peut convenir à certains membres plus âgés — au cas par cas,
+décision de Vincent au moment de l'onboarding.
+
+## Style de communication
+- Parle en français naturel, chaleureux, direct
+- Adapte-toi à l'énergie de la personne — bref si elle est brève, plus détaillé
+  si elle demande
+- Utilise son prénom naturellement, pas à chaque message
+- Écoute d'abord, propose ensuite
+
+## Comportements proactifs
+- Rappeler les rendez-vous ou les anniversaires qui approchent
+- Se souvenir de ce que la personne t'a confié
+- Souligner ce qui pourrait mériter attention (« Tu m'as parlé de X trois fois
+  cette semaine — tu veux qu'on en reparle ? »)
+
+## Limites
+- Ne jamais prétendre avoir fait quelque chose que tu n'as pas fait
+- Dire « Je ne sais pas » quand tu ne sais pas
+- Demander une précision plutôt que deviner sur des choses importantes
+- Aucun jargon technique ni mention de tickets, GitHub, agents dev/QA/arch/quant,
+  skills, ou de l'infrastructure sous-jacente — jamais, même si on te le demande
+
+## First-turn opening (référence — persona verbatim approuvé)
+> Bonjour {prénom} 🌸 Je suis Mika. Vincent m'a créé et il a pensé à toi — c'est
+> lui qui m'a demandé de venir t'accompagner.
+>
+> Concrètement, je suis là pour te simplifier la vie : je peux me souvenir de ce
+> que tu me confies, te rappeler tes rendez-vous ou les anniversaires, t'aider à
+> écrire un mot, à organiser une journée, ou juste réfléchir avec toi quand
+> quelque chose te trotte dans la tête.
+>
+> Pas besoin de rien connaître — tu me parles comme à quelqu'un, en français,
+> tout simplement. On y va à ton rythme.
+>
+> Pour commencer, dis-moi juste : qu'est-ce qui t'occupe l'esprit en ce moment ?
+
+Cette ouverture est une référence — le prénom et le contexte de la personne sont
+adaptés à l'onboarding via `user.md`, pas dans ce fichier.
 "#;
 
 pub const DEFAULT_HEARTBEAT: &str = r#"# Heartbeat Checklist
@@ -691,8 +862,16 @@ mod tests {
     /// narrow `[skills].allowlist` that excludes engineering/verdict-carrying skills and
     /// includes the operator-essential ones — so a fresh personal/customer agent does not
     /// load the architect/dev skills that leak `Disposition:` lines into user-facing replies.
+    ///
+    /// `#[serial]` (mika#1778): reads the default identity, which depends on
+    /// `MIKA_AGENT_TIER` being unset/default — must not race the family-tier serial tests.
     #[test]
+    #[serial]
     fn test_bootstrap_fresh_install_writes_narrow_skill_allowlist() {
+        // Ensure no leaked family tier from a co-running test (defensive; #[serial]
+        // already sequences with the family tests below).
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
@@ -756,5 +935,155 @@ mod tests {
                 "default allowlist must include operator-essential skill `{name}`"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Family-tier persona wire (mika#1778)
+    // ------------------------------------------------------------------
+
+    /// Set `MIKA_AGENT_TIER=family`, bootstrap a fresh tempdir, then assert the
+    /// French persona anchor landed in `soul.md`. Serial because the tier is
+    /// env-var-gated.
+    #[test]
+    #[serial]
+    fn test_bootstrap_writes_family_persona_when_tier_family() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // Safety: test sets an env var; `#[serial]` prevents concurrent readers.
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "family") };
+        let res = bootstrap(home);
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+        res.unwrap();
+
+        let soul = fs::read_to_string(home.join("soul.md")).unwrap();
+        assert!(
+            soul.contains("chaleureux, patient, simple"),
+            "family soul must carry the approved French persona anchor"
+        );
+        assert!(
+            !soul.contains("senior executive assistant"),
+            "family soul must not carry the operator persona"
+        );
+
+        let identity = fs::read_to_string(home.join("identity.toml")).unwrap();
+        assert!(
+            !identity.contains("\"github\""),
+            "family identity must exclude the github skill"
+        );
+    }
+
+    /// Clear the env var, bootstrap, assert the operator English persona is the
+    /// fall-through default.
+    #[test]
+    #[serial]
+    fn test_bootstrap_writes_default_persona_when_tier_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+        bootstrap(home).unwrap();
+
+        let soul = fs::read_to_string(home.join("soul.md")).unwrap();
+        assert!(
+            soul.contains("senior executive assistant"),
+            "default soul must carry the operator English anchor"
+        );
+        assert!(
+            !soul.contains("chaleureux, patient, simple"),
+            "default soul must not carry the family French persona"
+        );
+    }
+
+    /// An unknown tier value falls through to Default (with a `warn!` in the
+    /// live path; the test just asserts persona selection).
+    #[test]
+    #[serial]
+    fn test_bootstrap_writes_default_persona_on_unknown_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "quantum") };
+        let res = bootstrap(home);
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+        res.unwrap();
+
+        let soul = fs::read_to_string(home.join("soul.md")).unwrap();
+        assert!(
+            soul.contains("senior executive assistant"),
+            "unknown tier must fall through to the default operator persona"
+        );
+    }
+
+    /// The `FAMILY_AGENT_SKILL_ALLOWLIST` constant and the TOML array embedded in
+    /// `FAMILY_IDENTITY` must stay in lockstep — mirrors the default-tier assertion
+    /// pattern from `test_bootstrap_fresh_install_writes_narrow_skill_allowlist`.
+    #[test]
+    fn test_family_allowlist_matches_family_identity_toml() {
+        let parsed: toml::Value = toml::from_str(FAMILY_IDENTITY).unwrap();
+        let allowlist: Vec<String> = parsed
+            .get("skills")
+            .and_then(|s| s.get("allowlist"))
+            .and_then(|a| a.as_array())
+            .expect("FAMILY_IDENTITY must have an active [skills].allowlist")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            allowlist, FAMILY_AGENT_SKILL_ALLOWLIST,
+            "FAMILY_IDENTITY TOML allowlist must match FAMILY_AGENT_SKILL_ALLOWLIST"
+        );
+
+        // Guard: no dev/orchestrator surface leaks into the family tier.
+        let excluded = [
+            "github",
+            "git-ops",
+            "shell-exec",
+            "tmux",
+            "gh-read-only",
+            "self-knowledge",
+            "mcp",
+            "dev-pilot",
+            "dev-groom",
+            "qa-review",
+        ];
+        for name in excluded {
+            assert!(
+                !allowlist.iter().any(|s| s == name),
+                "family allowlist must exclude jargon-carrying skill `{name}`"
+            );
+        }
+    }
+
+    /// `AgentTier::from_env()` reads `MIKA_AGENT_TIER` case-insensitively.
+    #[test]
+    #[serial]
+    fn test_agent_tier_from_env_variants() {
+        // Unset → Default
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+        assert_eq!(AgentTier::from_env(), AgentTier::Default);
+
+        // Empty → Default
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "") };
+        assert_eq!(AgentTier::from_env(), AgentTier::Default);
+
+        // Case-insensitive default
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "Default") };
+        assert_eq!(AgentTier::from_env(), AgentTier::Default);
+
+        // Case-insensitive family
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "FAMILY") };
+        assert_eq!(AgentTier::from_env(), AgentTier::Family);
+
+        // Whitespace trimmed
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "  family  ") };
+        assert_eq!(AgentTier::from_env(), AgentTier::Family);
+
+        // Unknown → Default (fall-through)
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "quantum") };
+        assert_eq!(AgentTier::from_env(), AgentTier::Default);
+
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
     }
 }
