@@ -46,7 +46,11 @@ pub struct Issue {
 pub fn is_groomed(body: &str) -> bool {
     static GROOMING_HISTORY_RE: OnceLock<Regex> = OnceLock::new();
     let re = GROOMING_HISTORY_RE.get_or_init(|| {
-        Regex::new(r"(?m)^> - \*\*Grooming history:\*\*.+second-pass \(GROOMED\)")
+        // Mirrors GROOMED_VERDICT_RE in skills/executor.rs (#1725): accept the
+        // canonical strict form AND parameterized/annotated variants like
+        // `second-pass (GROOMED, session abc)` or `— session-id: uuid`.
+        // The character class after `GROOMED` is the structural discriminator.
+        Regex::new(r"(?m)^> - \*\*Grooming history:\*\*.+second-pass \(GROOMED[\s\)\.,;:—-]")
             .expect("grooming history regex must compile")
     });
     re.is_match(body)
@@ -482,6 +486,80 @@ This ticket has been GROOMED and is ready.
     #[test]
     fn test_is_groomed_empty_body() {
         assert!(!is_groomed(""));
+    }
+
+    // ── #1725 parameterized GROOMED verdict widening ──
+
+    #[test]
+    fn test_is_groomed_comma_parameter() {
+        // `second-pass (GROOMED, session-id fd4c1a14)` — a form orchestrator-CC
+        // produced at mika#1723 dispatch that the strict regex rejected.
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED, session fd4c1a14)
+"#;
+        assert!(is_groomed(body), "comma-parameterized GROOMED must match");
+    }
+
+    #[test]
+    fn test_is_groomed_em_dash_annotation() {
+        // `second-pass (GROOMED — session-id: uuid)` — the shape orchestrator-CC
+        // routinely emits with em-dash-separated session-id annotation.
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED — session-id: 550e8400)
+"#;
+        assert!(
+            is_groomed(body),
+            "em-dash-annotated GROOMED must match; body=\n{body}"
+        );
+    }
+
+    #[test]
+    fn test_is_groomed_period_terminator() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED. Full ratification.)
+"#;
+        assert!(is_groomed(body), "period-terminated GROOMED must match");
+    }
+
+    #[test]
+    fn test_is_groomed_reject_prose_groomedly() {
+        // Ensure `GROOMED` followed by a word-continuation char (letter) is
+        // rejected — the character class after GROOMED is the discriminator.
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMEDLY) — not a real form
+"#;
+        assert!(
+            !is_groomed(body),
+            "letter-continuation after GROOMED must not match"
+        );
+    }
+
+    #[test]
+    fn test_is_groomed_first_pass_groomed_rejected() {
+        // Ensure the `second-pass (` prefix requirement blocks `first-pass (GROOMED)`
+        // which is not a valid ratification signal (first-pass is READY/ITERATE/ESCALATE).
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (GROOMED) — no second-pass line
+"#;
+        assert!(
+            !is_groomed(body),
+            "first-pass (GROOMED) without second-pass must not match"
+        );
     }
 
     // ── priority_rank tests ──

@@ -4,11 +4,13 @@
 // files, creating shared-mutable-state bugs. All skill output goes to stdout/stderr.
 
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use base64::Engine;
+use regex::Regex;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
@@ -796,10 +798,35 @@ fn extract_skill_from_input(input: &serde_json::Value) -> Option<&str> {
 /// contiguous substring. `docs/plans/` is the essential anchoring directory
 /// prefix.
 ///
-/// The groomed-verdict check accepts both the canonical `second-pass (GROOMED)`
-/// and the spec-tolerated paraphrase `second-pass (READY, paraphrased GROOMED`
-/// shapes (#1108). The grooming spec's Phase 5 may emit either form; the gate
-/// must accept everything the spec authorizes.
+/// The groomed-verdict check accepts the canonical `second-pass (GROOMED)`,
+/// the spec-tolerated paraphrase `second-pass (READY, paraphrased GROOMED`,
+/// and parameterized/annotated variants like `second-pass (GROOMED, session ...)`
+/// or `second-pass (GROOMED — session-id: ...)` (#1725). The grooming spec's
+/// Phase 5 and orchestrator-manual verdict-landing both routinely emit
+/// parameterized forms; the gate must accept everything the spec authorizes.
+///
+/// # Regex shape
+///
+/// `second-pass \(GROOMED[\s\)\.,;:—-]` — the character class after `GROOMED` is
+/// the structural discriminator. It matches:
+/// - `)` (canonical strict form: `second-pass (GROOMED)`)
+/// - `,` (parameter: `second-pass (GROOMED, session abc)`)
+/// - `.` (terminator: `second-pass (GROOMED. Full ratification.)`)
+/// - `;` `:` (annotators)
+/// - `—` `-` (dash-separated annotation: `second-pass (GROOMED — session-id: uuid)`)
+/// - whitespace (any word-boundary follow-on)
+///
+/// Anchoring to the `second-pass (` prefix + a delimiter after `GROOMED`
+/// structurally distinguishes the verdict-line callout from prose like
+/// "the ticket was GROOMED yesterday" or "GROOMED status pending".
+static GROOMED_VERDICT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"second-pass \(GROOMED[\s\)\.,;:—-]").expect("groomed verdict regex must compile")
+});
+static PARAPHRASED_GROOMED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"second-pass \(READY, paraphrased GROOMED")
+        .expect("paraphrased groomed regex must compile")
+});
+
 pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     let mut missing = Vec::new();
     if !issue_body.contains("> - **Branch:**") {
@@ -808,8 +835,8 @@ pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
     if !issue_body.contains("docs/plans/") {
         missing.push("plan_callout");
     }
-    let has_groomed_marker = issue_body.contains("second-pass (GROOMED)")
-        || issue_body.contains("second-pass (READY, paraphrased GROOMED");
+    let has_groomed_marker =
+        GROOMED_VERDICT_RE.is_match(issue_body) || PARAPHRASED_GROOMED_RE.is_match(issue_body);
     if !has_groomed_marker {
         missing.push("groomed_verdict");
     }
@@ -5648,6 +5675,108 @@ Verdict: GROOMED
         assert_eq!(
             missing,
             vec!["branch_callout", "plan_callout", "groomed_verdict"]
+        );
+    }
+
+    // --- check_grooming_markers #1725 parameterized verdict widening ---
+
+    /// mika#1723 dispatch failure shape: orchestrator-CC produced
+    /// `second-pass (GROOMED, session fd4c1a14)` — the comma broke the strict
+    /// substring match, gate rejected with `dispatch_no_grooming_marker`.
+    #[test]
+    fn test_grooming_markers_accepts_comma_parameter() {
+        let body = r#"
+> - **Branch:** `fix/1725/loop-substrate`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED, session fd4c1a14)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "comma-parameterized GROOMED must pass, got: {missing:?}"
+        );
+    }
+
+    /// Em-dash-annotated form (canonical orchestrator-CC session-id shape).
+    #[test]
+    fn test_grooming_markers_accepts_em_dash_annotation() {
+        let body = r#"
+> - **Branch:** `fix/1725/loop-substrate`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED — session-id: fd4c1a14)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "em-dash-annotated GROOMED must pass, got: {missing:?}"
+        );
+    }
+
+    /// Period-terminated form: `second-pass (GROOMED. Full ratification.)`.
+    #[test]
+    fn test_grooming_markers_accepts_period_terminator() {
+        let body = r#"
+> - **Branch:** `fix/1725/loop-substrate`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED. Full ratification.)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "period-terminated GROOMED must pass, got: {missing:?}"
+        );
+    }
+
+    /// False-positive guard: prose `"the ticket was GROOMED yesterday"` must
+    /// NOT satisfy the check. The `second-pass (` prefix anchor blocks it.
+    #[test]
+    fn test_grooming_markers_rejects_prose_groomed_without_prefix() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+
+Discussion: the ticket was GROOMED yesterday but never actually reviewed.
+GROOMED status pending in another ticket.
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["groomed_verdict"],
+            "prose GROOMED without `second-pass (` prefix must not match"
+        );
+    }
+
+    /// False-positive guard: `second-pass (GROOMEDLY)` — letter-continuation
+    /// after GROOMED must be rejected by the character class discriminator.
+    #[test]
+    fn test_grooming_markers_rejects_letter_continuation() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMEDLY reviewed) — bogus
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["groomed_verdict"],
+            "letter-continuation after GROOMED must not match"
+        );
+    }
+
+    /// False-positive guard: `first-pass (GROOMED)` — the `second-pass (`
+    /// prefix requirement blocks this; first-pass verdict is READY/ITERATE/ESCALATE.
+    #[test]
+    fn test_grooming_markers_rejects_first_pass_groomed() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (GROOMED) — no second-pass, invalid
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["groomed_verdict"],
+            "first-pass (GROOMED) without second-pass must not match"
         );
     }
 
