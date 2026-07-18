@@ -134,10 +134,16 @@ impl McpConfig {
     /// Load MCP configuration from the operator-shell path resolved by
     /// [`mika_common::mcp_config_path::resolve_operator_mcp_config_path`]
     /// (mika#1737 AC3, AC4). Returns an empty config if the file does
-    /// not exist, is unreadable, or contains malformed JSON — MCP is a
-    /// bolt-on capability and a corrupt operator-shell file must not
-    /// wedge server startup (mika#1764). The resolved source tier is
-    /// logged so operators can verify which resolution rung fired.
+    /// not exist. Returns an error only when the file exists but is
+    /// malformed. The resolved source tier is logged so operators can
+    /// verify which resolution rung fired.
+    ///
+    /// **Callers are responsible for the fail-open policy on their
+    /// path.** `init_agent()` warns and continues with an empty config
+    /// on parse error (mika#1764 — MCP is a bolt-on capability and must
+    /// not wedge server startup); `validate::validate_agent()` surfaces
+    /// the parse error as a `Fail` diagnostic (operators need to know
+    /// their config is broken).
     pub fn load_operator_shell() -> anyhow::Result<Self> {
         let (path, source) = mika_common::mcp_config_path::resolve_operator_mcp_config_path();
         if matches!(
@@ -158,26 +164,31 @@ impl McpConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
+        let content = std::fs::read_to_string(&path)?;
+        let config: McpConfig = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// Fail-open wrapper around [`load_operator_shell`] for server-startup
+    /// callers. On any load error (unreadable file, malformed JSON) warns
+    /// with the path + error and returns an empty config. MCP is a
+    /// bolt-on capability; a corrupt operator-shell file MUST NOT wedge
+    /// `init_agent()` (mika#1764 — the actual failure surfaced on the
+    /// gentux CI runner where `~/.config/mika/mcp-servers.json` contained
+    /// `{ invalid json`). The strict `load_operator_shell` stays available
+    /// for the validate path that needs to surface the error as a Fail
+    /// diagnostic.
+    pub fn load_operator_shell_or_empty() -> Self {
+        match Self::load_operator_shell() {
+            Ok(config) => config,
             Err(err) => {
+                let (path, _) = mika_common::mcp_config_path::resolve_operator_mcp_config_path();
                 tracing::warn!(
                     path = %path.display(),
                     error = %err,
-                    "operator-shell MCP config unreadable; continuing with no MCP servers"
+                    "operator-shell MCP config failed to load; continuing with no MCP servers (mika#1764)"
                 );
-                return Ok(Self::default());
-            }
-        };
-        match serde_json::from_str::<McpConfig>(&content) {
-            Ok(config) => Ok(config),
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "operator-shell MCP config is malformed JSON; continuing with no MCP servers"
-                );
-                Ok(Self::default())
+                Self::default()
             }
         }
     }
@@ -629,14 +640,14 @@ mod tests {
         assert_eq!(headers["Authorization"], "Bearer tok");
     }
 
-    /// mika#1764: a corrupt operator-shell MCP config on disk must NOT
-    /// wedge server startup. `init_agent()` calls `load_operator_shell()?`
-    /// and a propagated parse error prevents mika-spirit from binding —
-    /// the actual failure that surfaced on the gentux CI runner where
-    /// `~/.config/mika/mcp-servers.json` contained `{ invalid json`.
+    /// mika#1764: `load_operator_shell()` is the strict primitive that
+    /// surfaces parse errors — the validate path relies on this to
+    /// produce Fail diagnostics. The startup-side fail-open policy
+    /// lives in `init_agent()`; see `load_operator_shell_or_empty` for
+    /// its coverage.
     #[test]
     #[serial_test::serial]
-    fn load_operator_shell_returns_empty_on_malformed_json() {
+    fn load_operator_shell_propagates_malformed_json() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("mcp-servers.json");
         std::fs::write(&path, "{ invalid json").unwrap();
@@ -660,16 +671,14 @@ mod tests {
             }
         }
 
-        let config = result.expect("malformed JSON must not propagate as error");
         assert!(
-            config.mcp_servers.is_empty(),
-            "malformed JSON must fall through to an empty config, not partial state"
+            result.is_err(),
+            "malformed JSON must propagate as anyhow error (validate path needs this)"
         );
     }
 
-    /// Existing well-formed JSON must still parse — regression guard for
-    /// the mika#1764 fail-safe path (make sure we didn't accidentally
-    /// swallow the happy case).
+    /// Existing well-formed JSON must still parse — regression guard
+    /// covering the happy path.
     #[test]
     #[serial_test::serial]
     fn load_operator_shell_parses_valid_json() {
@@ -703,5 +712,41 @@ mod tests {
         let config = result.expect("valid JSON must parse");
         assert_eq!(config.mcp_servers.len(), 1);
         assert!(config.mcp_servers.contains_key("fs"));
+    }
+
+    /// mika#1764: a corrupt operator-shell MCP config on disk must NOT
+    /// wedge server startup. This wraps the strict `load_operator_shell`
+    /// primitive with a warn-and-continue policy — the exact fail-open
+    /// behavior `init_agent()` needs.
+    #[test]
+    #[serial_test::serial]
+    fn load_operator_shell_or_empty_falls_back_on_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp-servers.json");
+        std::fs::write(&path, "{ invalid json").unwrap();
+
+        let prior = std::env::var(mika_common::mcp_config_path::MCP_CONFIG_ENV).ok();
+        // SAFETY: single-threaded test body via serial_test.
+        unsafe {
+            std::env::set_var(
+                mika_common::mcp_config_path::MCP_CONFIG_ENV,
+                path.to_str().unwrap(),
+            );
+        }
+
+        let config = McpConfig::load_operator_shell_or_empty();
+
+        // SAFETY: single-threaded test body via serial_test.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(mika_common::mcp_config_path::MCP_CONFIG_ENV, v),
+                None => std::env::remove_var(mika_common::mcp_config_path::MCP_CONFIG_ENV),
+            }
+        }
+
+        assert!(
+            config.mcp_servers.is_empty(),
+            "startup path must fall through to empty config on malformed JSON"
+        );
     }
 }

@@ -516,7 +516,11 @@ async fn init_agent(
     if let Err(e) = crate::mcp::config::McpConfig::migrate_from_agent_home_if_needed(agent_home) {
         tracing::warn!(error = %e, "mika#1737 AC5 MCP migration failed at server init");
     }
-    let mcp_config = crate::mcp::config::McpConfig::load_operator_shell()?;
+    // mika#1764: fail-open on load errors — MCP is a bolt-on capability
+    // and a corrupt operator-shell file must not wedge server startup.
+    // The strict `load_operator_shell` remains available for the validate
+    // path where the operator needs to see the parse error.
+    let mcp_config = crate::mcp::config::McpConfig::load_operator_shell_or_empty();
     let mcp_manager = if mcp_config.mcp_servers.is_empty() {
         None
     } else {
