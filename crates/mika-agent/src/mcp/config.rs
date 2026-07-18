@@ -134,9 +134,10 @@ impl McpConfig {
     /// Load MCP configuration from the operator-shell path resolved by
     /// [`mika_common::mcp_config_path::resolve_operator_mcp_config_path`]
     /// (mika#1737 AC3, AC4). Returns an empty config if the file does
-    /// not exist. Returns an error only when the file exists but is
-    /// malformed. The resolved source tier is logged so operators can
-    /// verify which resolution rung fired.
+    /// not exist, is unreadable, or contains malformed JSON — MCP is a
+    /// bolt-on capability and a corrupt operator-shell file must not
+    /// wedge server startup (mika#1764). The resolved source tier is
+    /// logged so operators can verify which resolution rung fired.
     pub fn load_operator_shell() -> anyhow::Result<Self> {
         let (path, source) = mika_common::mcp_config_path::resolve_operator_mcp_config_path();
         if matches!(
@@ -157,9 +158,28 @@ impl McpConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path)?;
-        let config: McpConfig = serde_json::from_str(&content)?;
-        Ok(config)
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "operator-shell MCP config unreadable; continuing with no MCP servers"
+                );
+                return Ok(Self::default());
+            }
+        };
+        match serde_json::from_str::<McpConfig>(&content) {
+            Ok(config) => Ok(config),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "operator-shell MCP config is malformed JSON; continuing with no MCP servers"
+                );
+                Ok(Self::default())
+            }
+        }
     }
 
     /// Save MCP configuration to the operator-shell path (mika#1737
@@ -607,5 +627,81 @@ mod tests {
         let loaded = McpConfig::load(tmp.path()).unwrap();
         let headers = loaded.mcp_servers["api"].headers.as_ref().unwrap();
         assert_eq!(headers["Authorization"], "Bearer tok");
+    }
+
+    /// mika#1764: a corrupt operator-shell MCP config on disk must NOT
+    /// wedge server startup. `init_agent()` calls `load_operator_shell()?`
+    /// and a propagated parse error prevents mika-spirit from binding —
+    /// the actual failure that surfaced on the gentux CI runner where
+    /// `~/.config/mika/mcp-servers.json` contained `{ invalid json`.
+    #[test]
+    #[serial_test::serial]
+    fn load_operator_shell_returns_empty_on_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp-servers.json");
+        std::fs::write(&path, "{ invalid json").unwrap();
+
+        let prior = std::env::var(mika_common::mcp_config_path::MCP_CONFIG_ENV).ok();
+        // SAFETY: single-threaded test body via serial_test.
+        unsafe {
+            std::env::set_var(
+                mika_common::mcp_config_path::MCP_CONFIG_ENV,
+                path.to_str().unwrap(),
+            );
+        }
+
+        let result = McpConfig::load_operator_shell();
+
+        // SAFETY: single-threaded test body via serial_test.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(mika_common::mcp_config_path::MCP_CONFIG_ENV, v),
+                None => std::env::remove_var(mika_common::mcp_config_path::MCP_CONFIG_ENV),
+            }
+        }
+
+        let config = result.expect("malformed JSON must not propagate as error");
+        assert!(
+            config.mcp_servers.is_empty(),
+            "malformed JSON must fall through to an empty config, not partial state"
+        );
+    }
+
+    /// Existing well-formed JSON must still parse — regression guard for
+    /// the mika#1764 fail-safe path (make sure we didn't accidentally
+    /// swallow the happy case).
+    #[test]
+    #[serial_test::serial]
+    fn load_operator_shell_parses_valid_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp-servers.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"fs":{"transport":"stdio","command":"echo"}}}"#,
+        )
+        .unwrap();
+
+        let prior = std::env::var(mika_common::mcp_config_path::MCP_CONFIG_ENV).ok();
+        // SAFETY: single-threaded test body via serial_test.
+        unsafe {
+            std::env::set_var(
+                mika_common::mcp_config_path::MCP_CONFIG_ENV,
+                path.to_str().unwrap(),
+            );
+        }
+
+        let result = McpConfig::load_operator_shell();
+
+        // SAFETY: single-threaded test body via serial_test.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(mika_common::mcp_config_path::MCP_CONFIG_ENV, v),
+                None => std::env::remove_var(mika_common::mcp_config_path::MCP_CONFIG_ENV),
+            }
+        }
+
+        let config = result.expect("valid JSON must parse");
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert!(config.mcp_servers.contains_key("fs"));
     }
 }
