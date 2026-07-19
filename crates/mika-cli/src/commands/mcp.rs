@@ -8,13 +8,20 @@ use crate::cli::{McpArgs, McpCommand, OutputFormat};
 use crate::commands::format_helper::print_structured;
 
 pub async fn run(args: McpArgs, agent_name: &str) -> Result<()> {
+    // AC5 one-shot migration: if operator-shell path is unpopulated and a
+    // legacy per-agent `{agent_home}/mcp.json` exists, copy it. Idempotent
+    // no-op on subsequent invocations. `agent_name` is still resolved so
+    // the migration knows where to source from.
     let global_home = home::resolve_home_dir()?;
     home::migrate_to_multi_agent(&global_home)?;
     let agent_home = home::resolve_agent_home(&global_home, agent_name);
+    if let Err(e) = McpConfig::migrate_from_agent_home_if_needed(&agent_home) {
+        tracing::warn!(error = %e, "mika#1737 AC5 MCP migration failed; hand-copy may be needed");
+    }
 
     match args.command {
-        None => list_servers(&agent_home, &OutputFormat::Text),
-        Some(McpCommand::List { format }) => list_servers(&agent_home, &format),
+        None => list_servers(&OutputFormat::Text),
+        Some(McpCommand::List { format }) => list_servers(&format),
         Some(McpCommand::Add {
             name,
             transport,
@@ -22,28 +29,21 @@ pub async fn run(args: McpArgs, agent_name: &str) -> Result<()> {
             args: cmd_args,
             url,
             headers,
-        }) => add_server(
-            &agent_home,
-            &name,
-            &transport,
-            command,
-            cmd_args,
-            url,
-            headers,
-        ),
-        Some(McpCommand::Remove { name }) => remove_server(&agent_home, &name),
-        Some(McpCommand::Enable { name }) => toggle_server(&agent_home, &name, true),
-        Some(McpCommand::Disable { name }) => toggle_server(&agent_home, &name, false),
+        }) => add_server(&name, &transport, command, cmd_args, url, headers),
+        Some(McpCommand::Remove { name }) => remove_server(&name),
+        Some(McpCommand::Enable { name }) => toggle_server(&name, true),
+        Some(McpCommand::Disable { name }) => toggle_server(&name, false),
     }
 }
 
-fn list_servers(agent_home: &std::path::Path, format: &OutputFormat) -> Result<()> {
-    let config = McpConfig::load(agent_home)?;
+fn list_servers(format: &OutputFormat) -> Result<()> {
+    let config = McpConfig::load_operator_shell()?;
+    let (path, _source) = mika_common::mcp_config_path::resolve_operator_mcp_config_path();
 
     if config.mcp_servers.is_empty() {
         println!("\n  No MCP servers configured.\n");
         println!("  Add one with: mika mcp add <name> --transport stdio --command <cmd>");
-        println!("  Config file:  {}/mcp.json", agent_home.display());
+        println!("  Config file:  {}", path.display());
         return Ok(());
     }
 
@@ -104,7 +104,6 @@ fn list_servers(agent_home: &std::path::Path, format: &OutputFormat) -> Result<(
 }
 
 fn add_server(
-    agent_home: &std::path::Path,
     name: &str,
     transport: &str,
     command: Option<String>,
@@ -112,7 +111,7 @@ fn add_server(
     url: Option<String>,
     raw_headers: Option<Vec<String>>,
 ) -> Result<()> {
-    let mut config = McpConfig::load(agent_home)?;
+    let mut config = McpConfig::load_operator_shell()?;
 
     if config.mcp_servers.contains_key(name) {
         anyhow::bail!(
@@ -153,14 +152,14 @@ fn add_server(
 
     server_config.validate(name)?;
     config.mcp_servers.insert(name.to_string(), server_config);
-    config.save(agent_home)?;
+    config.save_operator_shell()?;
 
     println!("Added MCP server '{name}'. Restart Mika to connect.");
     Ok(())
 }
 
-fn toggle_server(agent_home: &std::path::Path, name: &str, enabled: bool) -> Result<()> {
-    let mut config = McpConfig::load(agent_home)?;
+fn toggle_server(name: &str, enabled: bool) -> Result<()> {
+    let mut config = McpConfig::load_operator_shell()?;
 
     let server = config
         .mcp_servers
@@ -174,7 +173,7 @@ fn toggle_server(agent_home: &std::path::Path, name: &str, enabled: bool) -> Res
     }
 
     server.enabled = enabled;
-    config.save(agent_home)?;
+    config.save_operator_shell()?;
 
     let action = if enabled { "Enabled" } else { "Disabled" };
     println!("{action} MCP server '{name}'. Restart Mika to apply.");
@@ -200,14 +199,14 @@ fn parse_headers(raw: Option<Vec<String>>) -> Result<Option<HashMap<String, Stri
     Ok(Some(map))
 }
 
-fn remove_server(agent_home: &std::path::Path, name: &str) -> Result<()> {
-    let mut config = McpConfig::load(agent_home)?;
+fn remove_server(name: &str) -> Result<()> {
+    let mut config = McpConfig::load_operator_shell()?;
 
     if config.mcp_servers.remove(name).is_none() {
         anyhow::bail!("MCP server '{name}' not found.");
     }
 
-    config.save(agent_home)?;
+    config.save_operator_shell()?;
     println!("Removed MCP server '{name}'.");
     Ok(())
 }

@@ -214,11 +214,22 @@ fn open_db(settings: &Settings) -> Result<Database> {
 
 /// Load MCP config and connect to all enabled servers.
 /// Returns `None` if no servers are configured or all connections fail.
+///
+/// Reads from the operator-shell scoped MCP config path (mika#1737 AC3).
+/// Runs the AC5 one-shot migration from `{agent_home}/mcp.json` if the
+/// operator-shell path does not yet exist. `agent_home` is retained only
+/// as the migration source; runtime MCP connections themselves are
+/// operator-shell scoped.
 pub async fn connect_mcp(agent_home: &Path) -> Option<mika_agent::mcp::McpManager> {
-    let config = match mika_agent::mcp::config::McpConfig::load(agent_home) {
+    if let Err(e) =
+        mika_agent::mcp::config::McpConfig::migrate_from_agent_home_if_needed(agent_home)
+    {
+        tracing::warn!(error = %e, "mika#1737 AC5 MCP migration failed on connect_mcp");
+    }
+    let config = match mika_agent::mcp::config::McpConfig::load_operator_shell() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "failed to load MCP config, skipping");
+            tracing::warn!(error = %e, "failed to load operator-shell MCP config, skipping");
             return None;
         }
     };
