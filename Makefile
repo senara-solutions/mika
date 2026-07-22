@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install test test-async-db-saturation test-dispatch-symmetry verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-symmetry verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -43,6 +43,22 @@ install: ## Copy release binaries to INSTALL_DIR (safe while services run)
 	done
 
 deploy: deploy-info build-dashboard build install restart check-ngrok ## Full deploy: build, install, restart
+
+install-permission-policy-plugin: ## Install mika-permission-policy plugin into claude-pilot's uv tool env (mika#1817)
+	@# The plugin lives in tools/mika_permission_policy/ and provides the
+	@# per-binary safety functions loaded by claude-pilot's per-spawn evaluator
+	@# when MIKA_PERMISSION_POLICY_MODE=per_spawn +
+	@# MIKA_PERMISSION_POLICY_MODULE=mika_permission_policy:get_policy are set.
+	@#
+	@# `--with-editable` injects the plugin into the same uv tool env as
+	@# claude-pilot so the running interpreter can `import mika_permission_policy`.
+	@# `--reinstall --force` matches the discipline in the meta-repo
+	@# CLAUDE.md deploy target for claude-pilot itself.
+	uv tool install --reinstall --force --editable ../claude-pilot \
+		--with-editable ./tools/mika_permission_policy
+
+test-permission-policy-plugin: ## Run the permission-policy plugin test suite (mika#1817)
+	cd tools/mika_permission_policy && uv sync --all-extras --quiet && uv run pytest -q
 
 check-ngrok: ## Warn if ngrok is not running (Telegram webhooks need it)
 	@if ! curl -sf http://localhost:4040/api/tunnels > /dev/null 2>&1; then \
