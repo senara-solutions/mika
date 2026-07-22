@@ -1725,11 +1725,19 @@ _parse_verdict() {
     # Phase B — second-pass verdict parser. Reads architect response text from
     # stdin, emits GROOMED|ESCALATE on stdout (or nothing on no match).
     #
-    # Two-tier matching (mika#1272):
-    #   Tier 1: strict literal `Verdict: <X>` (zero-cost fast path)
-    #   Tier 2: fuzzy paraphrase matching (conservative, ESCALATE wins ties)
+    # Three-tier matching (mika#1272 + session-carry-over tolerance):
+    #   Tier 1:  strict literal `Verdict: <X>` (zero-cost fast path)
+    #   Tier 1b: session-carry-over tolerance — accept `Disposition: <X>`
+    #            (first-pass shape) when the architect legitimately declines
+    #            a third-pass on unchanged plan (spec §4.5 / R11). Mirror of
+    #            mika#1421 v3 in _parse_disposition. Founding incident: 16+
+    #            spurious ESCALATE events across 8+ tickets on 2 repos
+    #            spanning 2026-07-01 → 2026-07-22 — all plans passed content
+    #            grooming but failed on shape mismatch in this parser.
+    #   Tier 2:  fuzzy paraphrase matching (conservative, ESCALATE wins ties)
     # Writes "1" to $_DISPOSITION_FUZZY_FILE when tier 2 fires, "0" when tier 1
-    # fires. Callers read _disposition_was_fuzzy() after the $(...) returns.
+    # or tier 1b fires. Callers read _disposition_was_fuzzy() after the $(...)
+    # returns.
     printf '0' > "$_DISPOSITION_FUZZY_FILE"
     local text
     text=$(cat)
@@ -1741,6 +1749,34 @@ _parse_verdict() {
         echo "$result"
         return
     fi
+    # Tier 1b — session-carry-over tolerance (symmetric to _parse_disposition
+    # mika#1421 v3 which accepts Verdict: → READY). On session-recall of an
+    # unchanged already-ratified plan, mika-arch legitimately emits first-pass
+    # shape "Disposition: READY|ESCALATE" and declines a third pass per
+    # spec §4.5 / R11 — that ratification-on-recall MUST map to a GROOMED
+    # verdict, not the default ESCALATE. See mika-arch-second-review/
+    # system_prompt.md for the two-pass discipline; see the founding streak
+    # investigation for the failure evidence.
+    local disposition_keyword
+    disposition_keyword=$(printf '%s' "$text" \
+        | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \
+        | grep -oE '(READY|ITERATE|ESCALATE)' \
+        | head -1)
+    case "$disposition_keyword" in
+        READY)
+            echo "_parse_verdict: tier 1b accepted Disposition: READY → GROOMED (session-carry-over tolerance, mirror of mika#1421 v3)" >&2
+            echo "GROOMED"
+            return
+            ;;
+        ESCALATE)
+            echo "_parse_verdict: tier 1b accepted Disposition: ESCALATE → ESCALATE (session-carry-over tolerance)" >&2
+            echo "ESCALATE"
+            return
+            ;;
+        # Deliberately no ITERATE case — the spec forbids a third-pass, so
+        # ITERATE at second-pass falls through to Tier 2 fuzzy (typically
+        # ESCALATE-biased) rather than being aliased.
+    esac
     # Tier 2 fallback
     result=$(printf '%s' "$text" | _parse_verdict_fuzzy)
     if [ -n "$result" ]; then
