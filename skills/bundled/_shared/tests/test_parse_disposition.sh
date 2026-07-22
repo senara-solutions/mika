@@ -220,6 +220,47 @@ result=$(printf 'After careful review.\n\nVerdict: GROOMED\n\nEnd.' | _parse_ver
 assert_eq "literal GROOMED with surrounding text" "GROOMED" "$result"
 
 # ============================================================================
+# _parse_verdict — tier 1b (Disposition carry-over from architect session memory)
+# Symmetric mirror of _parse_disposition tier 1b (mika#1421 v3). Founding
+# incident: 16+ spurious ESCALATE events across 8+ tickets on 2 repos spanning
+# 2026-07-01 → 2026-07-22. All plans passed content grooming; the architect
+# legitimately declined a third pass on unchanged plans per spec §4.5 R11 and
+# emitted first-pass shape "Disposition: READY" as ratification-on-recall.
+# Without this tolerance, _parse_verdict fell to default ESCALATE and dammed
+# ~23 ready issues. Verified across mika#1667, mika#1664, mika#1727, mika#1716
+# via gh api on the .iterate/escalate-second-pass-after-ready.md files.
+# ============================================================================
+echo ""
+echo "Test: _parse_verdict — Disposition carry-over (tier 1b)"
+echo "----------------------------------------------------------"
+
+# Founding-incident response — actual mika-arch second-pass output on
+# 2026-07-22 (mika#1716 branch feat/1716/calibration-widen-scenario-artifact-json,
+# session-recall ratification of unchanged plan). Same shape appeared on
+# mika#1667, mika#1664, mika#1727 across 21 days.
+result=$(printf 'This plan was already reviewed and ratified READY in the prior session. The rev 2 content is unchanged, all prior findings (F1–F4) remain resolved, and both gates pass. Per the two-pass limit (spec §4.5 / R11), I do not perform third-pass reviews.\n\nDisposition: READY' | _parse_verdict 2>/dev/null)
+assert_eq "founding-incident: Disposition: READY → GROOMED (session carry-over)" "GROOMED" "$result"
+assert_eq "tier 1b does not set the fuzzy flag" "0" "$(check_fuzzy)"
+
+# Disposition: ESCALATE on second-pass carry-over → ESCALATE (conservative)
+result=$(printf 'Architectural concerns remain unresolved from the prior session.\n\nDisposition: ESCALATE' | _parse_verdict 2>/dev/null)
+assert_eq "Disposition: ESCALATE on second-pass carry-over → ESCALATE" "ESCALATE" "$result"
+
+# Disposition: ITERATE is NOT mapped — spec §4.5 R11 forbids a third-pass, so
+# ITERATE at second-pass falls through to Tier 2 fuzzy. On the fixture below
+# the fuzzy tier catches "human review" and returns ESCALATE.
+result=$(printf 'Findings require another iteration but need human review.\n\nDisposition: ITERATE' | _parse_verdict 2>/dev/null)
+assert_eq "Disposition: ITERATE does not map to GROOMED — falls through" "ESCALATE" "$result"
+
+# Tier 1a (Verdict: GROOMED) still wins when both keywords are present
+result=$(printf 'Disposition: READY\n\nVerdict: ESCALATE' | _parse_verdict 2>/dev/null)
+assert_eq "tier 1a wins over tier 1b when both Verdict: and Disposition: present" "ESCALATE" "$result"
+
+# Bare "READY" alone (no Disposition: prefix) does NOT trigger tier 1b
+result=$(printf 'The plan appears READY overall.' | _parse_verdict 2>/dev/null)
+assert_eq "bare READY (no Disposition: prefix) does not trigger tier 1b" "GROOMED" "$result"
+
+# ============================================================================
 # _parse_verdict — tier 2 (fuzzy)
 # ============================================================================
 echo ""
