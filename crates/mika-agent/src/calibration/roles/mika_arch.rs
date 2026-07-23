@@ -166,7 +166,8 @@ async fn run_groom_ticket_basic(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -175,6 +176,7 @@ async fn run_groom_ticket_basic(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result("groom_ticket_basic", e, start.elapsed().as_millis() as u64),
     }
@@ -231,7 +233,8 @@ async fn run_groom_milestone(provider: Arc<dyn LlmProvider>, start: Instant) -> 
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -240,6 +243,7 @@ async fn run_groom_milestone(provider: Arc<dyn LlmProvider>, start: Instant) -> 
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result("groom_milestone", e, start.elapsed().as_millis() as u64),
     }
@@ -304,7 +308,8 @@ async fn run_citation_discipline(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -313,6 +318,7 @@ async fn run_citation_discipline(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result("citation_discipline", e, start.elapsed().as_millis() as u64),
     }

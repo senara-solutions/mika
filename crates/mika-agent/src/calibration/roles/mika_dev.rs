@@ -136,7 +136,8 @@ async fn run_refusal_regression(
                         Some(response.usage.input_tokens),
                         Some(response.usage.output_tokens),
                         latency,
-                    );
+                    )
+                    .with_response_text(text);
                 }
             }
 
@@ -150,6 +151,7 @@ async fn run_refusal_regression(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result("refusal_regression", e, start.elapsed().as_millis() as u64),
     }
@@ -196,7 +198,8 @@ async fn run_contract_dev_groom(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -205,6 +208,7 @@ async fn run_contract_dev_groom(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result("contract_dev_groom", e, start.elapsed().as_millis() as u64),
     }
@@ -258,7 +262,8 @@ async fn run_golden_path_dispatch(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -267,6 +272,7 @@ async fn run_golden_path_dispatch(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "golden_path_dispatch",

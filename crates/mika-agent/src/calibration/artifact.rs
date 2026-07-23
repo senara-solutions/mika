@@ -10,6 +10,37 @@ use serde::{Deserialize, Serialize};
 
 use super::scenario::ScenarioOutcome;
 
+/// Character cap for the per-scenario `response_text` field in the artifact JSON
+/// (mika#1716, AC3). Bounds artifact size on verbose models — an 8000-char cap
+/// keeps a full role suite well under a megabyte even when every scenario is
+/// captured.
+pub const RESPONSE_TEXT_CAP: usize = 8000;
+
+/// Char-safe truncation to `cap` characters (mika#1716, DR-2).
+///
+/// Returns the (possibly truncated) string and whether truncation occurred.
+/// Cuts on a UTF-8 char boundary via `char_indices` — never a raw byte slice —
+/// so multi-byte characters at the boundary do not panic (mika#764, enforced by
+/// `scripts/check-byte-slices.sh`).
+pub(crate) fn truncate_to_chars(text: &str, cap: usize) -> (String, bool) {
+    match text.char_indices().nth(cap) {
+        Some((byte_idx, _)) => (text[..byte_idx].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
+/// Cap a captured response text for the artifact JSON, appending a marker when
+/// truncated (mika#1716, AC3 + DR-2). `None` passes through unchanged.
+fn cap_response_text(text: Option<&str>) -> Option<String> {
+    text.map(|t| {
+        let (mut capped, truncated) = truncate_to_chars(t, RESPONSE_TEXT_CAP);
+        if truncated {
+            capped.push_str(&format!("… [truncated to {RESPONSE_TEXT_CAP} chars]"));
+        }
+        capped
+    })
+}
+
 /// Top-level calibration artifact, written as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationArtifact {
@@ -50,6 +81,17 @@ pub struct ScenarioCalibration {
     /// genuine committed baseline usable as a real gate.
     #[serde(default)]
     pub latency_ms: Option<u64>,
+    /// Full LLM response text, capped at [`RESPONSE_TEXT_CAP`] chars (mika#1716,
+    /// AC2/AC3). Present for both PASS (scenario-tuning) and FAIL (verify-not-guess
+    /// diagnostic) scenarios. `#[serde(default)]` keeps v1 baselines loadable (AC6).
+    #[serde(default)]
+    pub response_text: Option<String>,
+    /// Raw human-readable failure reason (mika#1716, AC1) — e.g. "Did not name
+    /// `make deploy` as the deploy path". Distinct from the classified `error_class`:
+    /// this is the exact reason string, `error_class` is its bucket. `#[serde(default)]`
+    /// keeps v1 baselines loadable (AC6).
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 /// A single change detected between two calibration artifacts.
@@ -102,12 +144,14 @@ impl CalibrationArtifact {
                     input_tokens: outcome.input_tokens,
                     output_tokens: outcome.output_tokens,
                     latency_ms: Some(outcome.latency_ms),
+                    response_text: cap_response_text(outcome.response_text.as_deref()),
+                    failure_reason: outcome.error.clone(),
                 },
             );
         }
 
         Self {
-            version: 1,
+            version: 2,
             timestamp: chrono::Utc::now().to_rfc3339(),
             providers,
         }
@@ -346,7 +390,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&artifact).unwrap();
         let parsed: CalibrationArtifact = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.version, 2);
         assert_eq!(parsed.providers.len(), 2);
         assert!(parsed.providers.contains_key("anthropic"));
         assert!(parsed.providers.contains_key("openai"));
@@ -355,6 +399,81 @@ mod tests {
         assert_eq!(anthropic.scenarios.len(), 2);
         assert_eq!(anthropic.scenarios["basic"].outcome, "pass");
         assert_eq!(anthropic.scenarios["multi_turn"].outcome, "fail");
+    }
+
+    #[test]
+    fn test_from_outcomes_populates_response_text_and_failure_reason() {
+        // PASS: response_text present (scenario-tuning), failure_reason None.
+        // FAIL: both present (verify-not-guess diagnostic). mika#1716 AC1/AC2.
+        let artifact = CalibrationArtifact::from_outcomes(&[
+            sample_outcome("pass_scn", "role", true),
+            sample_outcome("fail_scn", "role", false),
+        ]);
+        let scenarios = &artifact.providers["role"].scenarios;
+
+        let pass = &scenarios["pass_scn"];
+        assert_eq!(pass.outcome, "pass");
+        assert_eq!(pass.response_text.as_deref(), Some("test"));
+        assert_eq!(pass.failure_reason, None);
+
+        let fail = &scenarios["fail_scn"];
+        assert_eq!(fail.outcome, "fail");
+        assert_eq!(fail.response_text.as_deref(), Some("test"));
+        // Raw reason preserved (distinct from the classified `error_class`).
+        assert_eq!(fail.failure_reason.as_deref(), Some("test error"));
+        assert_eq!(fail.error_class.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn test_cap_response_text_truncates_on_char_boundary() {
+        // Short strings pass through unchanged.
+        assert_eq!(cap_response_text(Some("short")).as_deref(), Some("short"));
+        assert_eq!(cap_response_text(None), None);
+
+        // A >8000-char string is capped to 8000 chars + marker, cut on a char
+        // boundary. Place a multi-byte char (é, 2 bytes) exactly at the boundary
+        // to prove no panic on a byte-slice.
+        let mut s = "é".repeat(RESPONSE_TEXT_CAP);
+        s.push_str("TAIL");
+        let capped = cap_response_text(Some(&s)).unwrap();
+        assert!(capped.starts_with(&"é".repeat(RESPONSE_TEXT_CAP)));
+        assert!(!capped.contains("TAIL"));
+        assert!(capped.contains(&format!("[truncated to {RESPONSE_TEXT_CAP} chars]")));
+
+        // Exactly-at-cap: not truncated (no marker).
+        let at_cap = "a".repeat(RESPONSE_TEXT_CAP);
+        let capped_at = cap_response_text(Some(&at_cap)).unwrap();
+        assert_eq!(capped_at, at_cap);
+        assert!(!capped_at.contains("truncated"));
+    }
+
+    #[test]
+    fn test_v1_baseline_without_new_fields_still_loads() {
+        // Backwards-compat (mika#1716 AC6): a v1-shaped blob lacking `response_text`
+        // and `failure_reason` must still deserialize, both defaulting to None.
+        let json = r#"{
+            "version": 1,
+            "timestamp": "2026-06-29T00:00:00+00:00",
+            "providers": {
+                "mika-qa": {
+                    "model": "openrouter/z-ai/glm-5.2",
+                    "scenarios": {
+                        "s1": {
+                            "outcome": "pass",
+                            "error_class": null,
+                            "input_tokens": 100,
+                            "output_tokens": 50,
+                            "latency_ms": 200
+                        }
+                    }
+                }
+            }
+        }"#;
+        let artifact: CalibrationArtifact = serde_json::from_str(json).unwrap();
+        let scn = &artifact.providers["mika-qa"].scenarios["s1"];
+        assert_eq!(scn.response_text, None);
+        assert_eq!(scn.failure_reason, None);
+        assert_eq!(artifact.unweighted_pass_rate(), 1.0);
     }
 
     #[test]
