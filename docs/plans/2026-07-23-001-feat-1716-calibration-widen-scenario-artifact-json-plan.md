@@ -3,7 +3,7 @@
 **Ticket:** mika#1716 — `feat(calibration): widen scenario artifact JSON to include LLM response text (verify-not-guess)`
 **Type:** feat (enhancement)
 **Author:** dev-groom (content-only pilot)
-**Date:** 2026-07-01
+**Date:** 2026-07-23 (re-groom; content re-validated against current `role.rs`/`artifact.rs`/`eval-diff.rs`)
 
 ## Problem
 
