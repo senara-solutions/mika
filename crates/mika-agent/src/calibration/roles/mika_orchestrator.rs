@@ -164,7 +164,8 @@ async fn run_substrate_wedge_diagnosis(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must recognize the stale-pending wedge.
@@ -178,7 +179,8 @@ async fn run_substrate_wedge_diagnosis(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must propose cancellation as the corrective action.
@@ -190,7 +192,8 @@ async fn run_substrate_wedge_diagnosis(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must NOT propose re-toggling as the remedy for the orphan callback.
@@ -212,7 +215,8 @@ async fn run_substrate_wedge_diagnosis(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -221,6 +225,7 @@ async fn run_substrate_wedge_diagnosis(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "substrate_wedge_diagnosis",
@@ -298,7 +303,8 @@ async fn run_ticket_framing_hard_evidence(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must demand evidence or decline to file. Accept a range of grounded
@@ -328,7 +334,8 @@ async fn run_ticket_framing_hard_evidence(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -337,6 +344,7 @@ async fn run_ticket_framing_hard_evidence(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "ticket_framing_hard_evidence",
@@ -403,7 +411,8 @@ async fn run_sibling_pr_collision_recovery(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must name the sibling PR that moved the base (#1624 in the fixture).
@@ -416,7 +425,8 @@ async fn run_sibling_pr_collision_recovery(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -425,6 +435,7 @@ async fn run_sibling_pr_collision_recovery(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "sibling_pr_collision_recovery",
@@ -492,7 +503,8 @@ async fn run_deploy_gate_discipline(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must show preflight-gate awareness.
@@ -511,7 +523,8 @@ async fn run_deploy_gate_discipline(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must NOT propose a hack workaround.
@@ -530,7 +543,8 @@ async fn run_deploy_gate_discipline(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -539,6 +553,7 @@ async fn run_deploy_gate_discipline(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "deploy_gate_discipline",
@@ -616,7 +631,8 @@ async fn run_escalation_vs_derivable(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must surface the operator-territory question rather than answer it.
@@ -637,7 +653,8 @@ async fn run_escalation_vs_derivable(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -646,6 +663,7 @@ async fn run_escalation_vs_derivable(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "escalation_vs_derivable",

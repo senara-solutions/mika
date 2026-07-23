@@ -145,7 +145,8 @@ async fn run_verdict_format_precision(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Reject wrong casing: `Verdict: pass`
