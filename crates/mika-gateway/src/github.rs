@@ -318,7 +318,10 @@ pub fn route_event(
         ("issues", Some("assigned")) => Some("mika-dev"),
         ("issues", Some("labeled")) => Some("mika-dev"),
         ("issue_comment", Some("created")) => Some("mika-dev"),
-        ("pull_request", Some("opened" | "synchronize" | "review_requested")) => Some("mika-qa"),
+        (
+            "pull_request",
+            Some("opened" | "synchronize" | "review_requested" | "ready_for_review"),
+        ) => Some("mika-qa"),
         ("pull_request", Some("closed")) => Some("mika-dev"),
         ("pull_request_review", Some("submitted")) => Some("mika-dev"),
         ("check_suite", Some("completed")) => match check_conclusion {
@@ -1707,6 +1710,39 @@ mod tests {
             route_event("pull_request", Some("review_requested"), None),
             Some("mika-qa")
         );
+    }
+
+    // --- mika#1822: draft→ready toggle routes to mika-qa ---
+
+    #[test]
+    fn ready_for_review_routes_to_mika_qa() {
+        // AC1: un-drafting a PR fires pull_request.ready_for_review, which must
+        // route to mika-qa so the draft→ready transition triggers a review.
+        assert_eq!(
+            route_event("pull_request", Some("ready_for_review"), None),
+            Some("mika-qa")
+        );
+    }
+
+    #[test]
+    fn ready_for_review_no_fan_out() {
+        // AC2: ready_for_review is primary-only — its primary target IS mika-qa,
+        // so a secondary entry would double-dispatch. secondary_targets stays empty.
+        assert_eq!(
+            secondary_targets("pull_request", Some("ready_for_review"), None),
+            &[] as &[&str]
+        );
+    }
+
+    #[test]
+    fn ready_for_review_is_never_suppressed() {
+        // Defensive: the reviewer-filter guard (mika#1655) is scoped to the
+        // review_requested action only. A draft→ready toggle carries no
+        // requested_reviewer and must reach mika-qa unconditionally.
+        assert!(!is_suppressed_review_request(
+            Some("ready_for_review"),
+            None
+        ));
     }
 
     // --- mika#1655: review-requested reviewer filter ---
