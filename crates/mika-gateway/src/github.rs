@@ -318,7 +318,10 @@ pub fn route_event(
         ("issues", Some("assigned")) => Some("mika-dev"),
         ("issues", Some("labeled")) => Some("mika-dev"),
         ("issue_comment", Some("created")) => Some("mika-dev"),
-        ("pull_request", Some("opened" | "synchronize" | "review_requested")) => Some("mika-qa"),
+        (
+            "pull_request",
+            Some("opened" | "synchronize" | "review_requested" | "ready_for_review"),
+        ) => Some("mika-qa"),
         ("pull_request", Some("closed")) => Some("mika-dev"),
         ("pull_request_review", Some("submitted")) => Some("mika-dev"),
         ("check_suite", Some("completed")) => match check_conclusion {
@@ -1690,6 +1693,19 @@ mod tests {
     }
 
     #[test]
+    fn test_route_event_pr_ready_for_review() {
+        // mika#1822: draft→ready transitions were silently dropped as
+        // "not routable" because the routing table only covered opened /
+        // synchronize / review_requested. Every PR opened as draft (dispatch-lib's
+        // wip-rescue path, systematic) then promoted to ready never triggered
+        // mika-qa. This test pins the routing table entry that closes the gap.
+        assert_eq!(
+            route_event("pull_request", Some("ready_for_review"), None),
+            Some("mika-qa")
+        );
+    }
+
+    #[test]
     fn test_route_event_pr_closed() {
         assert_eq!(
             route_event("pull_request", Some("closed"), None),
@@ -1812,7 +1828,13 @@ mod tests {
 
     #[test]
     fn test_secondary_targets_pull_request_events_no_fanout() {
-        for action in ["opened", "synchronize", "review_requested", "closed"] {
+        for action in [
+            "opened",
+            "synchronize",
+            "review_requested",
+            "ready_for_review",
+            "closed",
+        ] {
             assert!(
                 secondary_targets("pull_request", Some(action), None).is_empty(),
                 "pull_request.{action} must not fan out"
