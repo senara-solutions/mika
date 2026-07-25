@@ -2067,19 +2067,73 @@ _iterate_groom_loop() {
 
     echo "iterate_groom_loop: invoking mika-arch first-pass on $(basename "$plan_path")" >&2
 
-    # Phase 1 — first-pass
-    local resp1; resp1=$(_arch_ask "mika-arch-groom-ticket" "$plan_path" 2>/dev/null) || {
-        echo "WARN: iterate_groom_loop: first-pass _arch_ask failed" >&2; return 1; }
-    local content1; content1=$(printf '%s' "$resp1" | jq -r '.content // empty' 2>/dev/null)
-    local session_id; session_id=$(printf '%s' "$resp1" | jq -r '.metadata.session_id // empty' 2>/dev/null)
-    [ -n "$content1" ] && [ -n "$session_id" ] || {
-        echo "WARN: iterate_groom_loop: first-pass response missing .content or .metadata.session_id" >&2
-        return 1
-    }
-    local disposition; disposition=$(printf '%s' "$content1" | _parse_disposition)
-    local _trail_suffix=""
-    _disposition_was_fuzzy && _trail_suffix=" (fuzzy)"
-    _trail_append "groom-ticket" "$session_id" "${disposition:-UNPARSED}${_trail_suffix}"
+    # Phase 1 — first-pass with UNPARSED retry (mika#1823).
+    #
+    # Kimi k2.5 occasionally omits the required "Disposition:" line even after
+    # the engine's required_suffix_line guard has done its single re-prompt.
+    # Without a retry here, the first UNPARSED forces PIPELINE FAILURE and the
+    # ticket is stranded until manual re-kick. The pre-existing solution doc
+    # `docs/solutions/2026-05-21-groom-post-flight-recovery-without-architect-verdict.md`
+    # (see § 80) already identified this remedy as a followup — never landed
+    # until this PR.
+    #
+    # Retry envelope: 1 initial + 1 retry. The retry reuses $session_id so the
+    # architect sees its own prior turn and can complete it (idempotent). If
+    # the second attempt is also UNPARSED we return 1 as before (bounded, no
+    # infinite loop).
+    local resp1 content1 session_id disposition attempt
+    for attempt in 1 2; do
+        if [ "$attempt" -eq 1 ]; then
+            resp1=$(_arch_ask "mika-arch-groom-ticket" "$plan_path" 2>/dev/null) || {
+                echo "WARN: iterate_groom_loop: first-pass _arch_ask failed" >&2
+                return 1
+            }
+        else
+            # Retry: corrective payload as an @-file so _arch_ask injects it
+            # verbatim. Session preserved so the architect sees its own prior
+            # response and can complete it in-place.
+            local retry_prompt; retry_prompt=$(mktemp -t mika-arch-retry-XXXXXX.md 2>/dev/null) || {
+                echo "WARN: iterate_groom_loop: mktemp failed for retry prompt" >&2
+                return 1
+            }
+            {
+                printf 'Your previous plan-review response is missing the required `Disposition:` line.\n\n'
+                printf 'Please re-emit your findings and end with exactly ONE of these three lines as the last non-empty line of your response:\n\n'
+                printf '    Disposition: READY\n'
+                printf '    Disposition: ITERATE\n'
+                printf '    Disposition: ESCALATE\n\n'
+                printf 'The routing engine parses this line as the verdict — its absence blocks the pipeline (see mika#1823).\n'
+            } > "$retry_prompt"
+            resp1=$(_arch_ask "mika-arch-groom-ticket" "$retry_prompt" "$session_id" 2>/dev/null)
+            local _retry_status=$?
+            rm -f "$retry_prompt"
+            [ "$_retry_status" -eq 0 ] || {
+                echo "WARN: iterate_groom_loop: retry _arch_ask failed" >&2
+                return 1
+            }
+        fi
+        content1=$(printf '%s' "$resp1" | jq -r '.content // empty' 2>/dev/null)
+        session_id=$(printf '%s' "$resp1" | jq -r '.metadata.session_id // empty' 2>/dev/null)
+        [ -n "$content1" ] && [ -n "$session_id" ] || {
+            echo "WARN: iterate_groom_loop: first-pass response missing .content or .metadata.session_id" >&2
+            return 1
+        }
+        disposition=$(printf '%s' "$content1" | _parse_disposition)
+        local _trail_suffix=""
+        _disposition_was_fuzzy && _trail_suffix=" (fuzzy)"
+        local _attempt_marker=""
+        [ "$attempt" -gt 1 ] && _attempt_marker="-after-retry"
+        _trail_append "groom-ticket" "$session_id" "${disposition:-UNPARSED}${_trail_suffix}${_attempt_marker}"
+        case "$disposition" in
+            READY|ITERATE|ESCALATE)
+                [ "$attempt" -gt 1 ] && echo "INFO: iterate_groom_loop: disposition recovered on retry ($disposition) — mika#1823" >&2
+                break
+                ;;
+        esac
+        if [ "$attempt" -eq 1 ]; then
+            echo "WARN: iterate_groom_loop: first-pass disposition UNPARSED; retrying _arch_ask once with corrective prompt (mika#1823)" >&2
+        fi
+    done
 
     case "$disposition" in
         READY)
@@ -2165,7 +2219,10 @@ _iterate_groom_loop() {
             return 1
             ;;
         *)
-            echo "WARN: iterate_groom_loop: first-pass disposition unparsed (literal Disposition: line absent or paraphrased — see mika#1272)" >&2
+            # Unreachable after the retry loop above (mika#1823), which returns
+            # 1 explicitly on double-UNPARSED. Kept for safety — invariant
+            # violation if reached.
+            echo "WARN: iterate_groom_loop: first-pass disposition unparsed after retry loop (invariant violation — see mika#1272 / #1823)" >&2
             return 1
             ;;
     esac
