@@ -6,7 +6,7 @@
 
 use anyhow::{Result, anyhow};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
@@ -17,6 +17,44 @@ const DEFAULT_REPO: &str = "senara-solutions/mika";
 
 /// Maximum failure count before a ticket is skipped by the circuit-breaker.
 const CIRCUIT_BREAKER_THRESHOLD: i64 = 3;
+
+/// Default age (seconds) a `ready` label must exceed before Phase 2 treats the
+/// ticket as stuck and eligible for a remove→add rescue (mika#1824 R3).
+const STUCK_READY_THRESHOLD_DEFAULT_SECS: i64 = 900;
+
+/// Env override for the stuck-ready age threshold (mika#1824 R3).
+const STUCK_READY_THRESHOLD_ENV: &str = "MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS";
+
+/// Defensive cap on the number of stuck-ready rescues per tick (mika#1824 D3).
+/// Overflow is logged and left for the next tick.
+const MAX_STUCK_RESCUE_PER_TICK: usize = 5;
+
+/// Pure parse of the stuck-ready threshold from an optional env value. Returns
+/// [`STUCK_READY_THRESHOLD_DEFAULT_SECS`] when the value is absent, empty, or
+/// unparseable/negative (WARN on invalid). Split out from the env read so it is
+/// unit-testable without mutating process environment (mika#1824 step 1).
+fn parse_stuck_ready_threshold(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => {
+                warn!(
+                    value = %v,
+                    default = STUCK_READY_THRESHOLD_DEFAULT_SECS,
+                    "auto_pull: invalid {STUCK_READY_THRESHOLD_ENV}, using default"
+                );
+                STUCK_READY_THRESHOLD_DEFAULT_SECS
+            }
+        },
+        _ => STUCK_READY_THRESHOLD_DEFAULT_SECS,
+    }
+}
+
+/// Read the stuck-ready age threshold in seconds from the environment,
+/// falling back to [`STUCK_READY_THRESHOLD_DEFAULT_SECS`] (mika#1824 R3).
+fn stuck_ready_threshold_secs() -> i64 {
+    parse_stuck_ready_threshold(std::env::var(STUCK_READY_THRESHOLD_ENV).ok().as_deref())
+}
 
 // ───────────────────── Issue types ─────────────────────
 
@@ -104,6 +142,43 @@ pub fn select_best_candidate(
         let pb = priority_rank(&b.labels);
         pa.cmp(&pb).then_with(|| b.updated_at.cmp(&a.updated_at))
     })
+}
+
+/// Pure selection predicate for the Phase 2 stuck-ready reconciler (mika#1824
+/// D2, step 7). Given the already-fetched issue list plus the sets/maps the
+/// async wrapper resolves from GitHub + DB, return the issue numbers eligible
+/// for a remove→add rescue, in ascending order.
+///
+/// A ticket is selected iff it (a) has the `ready` label, (b) has no open PR
+/// closing it, (c) has no in-flight self_dev task, and (d) its `ready` label
+/// age (from `ages_by_issue`, in seconds) is `>= threshold_secs`. A missing age
+/// entry means the age is unknown/absent → not selected (fail-open on unknown
+/// age, per D1).
+///
+/// The per-issue circuit breaker (D4, step 4 of the D2 ordering) is applied by
+/// the async caller *before* ages are fetched, so it does not appear here — a
+/// circuit-broken ticket simply never gets an `ages_by_issue` entry.
+fn select_stuck_ready_candidates(
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
+    in_flight_issue_numbers: &HashSet<u64>,
+    ages_by_issue: &HashMap<u64, i64>,
+    threshold_secs: i64,
+) -> Vec<u64> {
+    let mut selected: Vec<u64> = issues
+        .iter()
+        .filter(|i| i.labels.iter().any(|l| l.name == "ready"))
+        .filter(|i| !open_pr_issue_numbers.contains(&i.number))
+        .filter(|i| !in_flight_issue_numbers.contains(&i.number))
+        .filter(|i| {
+            ages_by_issue
+                .get(&i.number)
+                .is_some_and(|&age| age >= threshold_secs)
+        })
+        .map(|i| i.number)
+        .collect();
+    selected.sort_unstable();
+    selected
 }
 
 // ───────────────────── GitHub CLI helpers ─────────────────────
@@ -249,15 +324,177 @@ async fn gh_apply_label(github_token: &str, issue_number: u64, label: &str) -> R
     Ok(())
 }
 
+/// Remove a label from a GitHub issue (mika#1824). Mirrors [`gh_apply_label`]
+/// with `--remove-label`. `gh issue edit` computes the new label set
+/// client-side, so removing an absent label is a no-op that exits 0 — the
+/// operation is idempotent. On the off chance a "not found" surfaces, it is
+/// tolerated as success.
+async fn gh_remove_label(github_token: &str, issue_number: u64, label: &str) -> Result<()> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args([
+        "issue",
+        "edit",
+        &issue_number.to_string(),
+        "--repo",
+        DEFAULT_REPO,
+        "--remove-label",
+        label,
+    ]);
+    cmd.env("GH_TOKEN", github_token);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Tolerate the idempotent "label not present" case as success.
+        if stderr.contains("not found") || stderr.contains("Label does not exist") {
+            debug!(
+                issue = issue_number,
+                label, "auto_pull: remove-label no-op (label not present)"
+            );
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "gh issue edit --remove-label failed for #{}: {}",
+            issue_number,
+            stderr
+        ));
+    }
+    Ok(())
+}
+
+/// Parse an issue-timeline JSON array and return the `created_at` of the LAST
+/// `labeled` event whose label name is `ready` (mika#1824 D1). A remove→add
+/// cycle appends a fresh `labeled` event, so `last` is the authoritative
+/// apply-time. Returns `None` when no such event exists.
+fn parse_last_ready_labeled_at(timeline_json: &str) -> Option<String> {
+    let events: Vec<serde_json::Value> = serde_json::from_str(timeline_json).ok()?;
+    events
+        .iter()
+        .filter(|e| {
+            e["event"].as_str() == Some("labeled") && e["label"]["name"].as_str() == Some("ready")
+        })
+        .filter_map(|e| e["created_at"].as_str())
+        .next_back()
+        .map(|s| s.to_string())
+}
+
+/// Age in seconds since the `ready` label was last applied to `issue_number`,
+/// read from the issue timeline (mika#1824 D1). Returns `Ok(None)` when no
+/// `labeled(ready)` event exists (treat as not-stuck / skip). Fail-open: on an
+/// API error the caller skips the ticket (does not rescue on unknown age).
+///
+/// Single page (`per_page=100`) — timeline events beyond the 100th are not
+/// inspected; a `ready` re-label is near the tail for any recently-touched
+/// ticket, so this bound is safe in practice.
+async fn gh_ready_label_age_secs(github_token: &str, issue_number: u64) -> Result<Option<i64>> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args([
+        "api",
+        &format!(
+            "repos/{}/issues/{}/timeline?per_page=100",
+            DEFAULT_REPO, issue_number
+        ),
+    ]);
+    cmd.env("GH_TOKEN", github_token);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "gh api timeline failed for #{}: {}",
+            issue_number,
+            stderr
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(applied_at) = parse_last_ready_labeled_at(&stdout) else {
+        return Ok(None);
+    };
+    let applied = crate::timestamp::parse(&applied_at)?;
+    let age = (chrono::Utc::now() - applied).num_seconds();
+    Ok(Some(age))
+}
+
 // ───────────────────── Orchestration ─────────────────────
 
-/// Run the auto-pull groomed ticket logic.
+/// Run the auto-pull logic for one tick (mika#1363 Phase 1 + mika#1824 Phase 2).
 ///
-/// Returns `Some(issue_number)` if a ticket was selected and labelled `ready`,
-/// `None` if no action was taken (queue not empty, no candidates, or circuit-breaker skip).
+/// Fetches the open-issue list and open-PR closing-issue set **once** and shares
+/// both across the two phases (D5). Phase 1 promotes a groomed-not-ready ticket
+/// to `ready` (queue-gated, unchanged semantics). Phase 2 reconciles tickets
+/// that already *have* `ready` but were never dispatched — it runs regardless of
+/// queue depth.
+///
+/// Returns `Some(issue_number)` if Phase 1 promoted a ticket, `None` otherwise.
+/// The Phase 2 rescue count is logged but not returned (the dispatcher log at
+/// `dispatcher.rs` keys off the Phase 1 promotion).
 pub async fn auto_pull_groomed_ticket(
     db: &AsyncDatabase,
     github_token: &str,
+    trace_id: &str,
+    session_id: &str,
+) -> Option<u64> {
+    // Fetch open issues once (F4: client-side filter for the `ready` label).
+    let issues = match gh_list_open_issues(github_token).await {
+        Ok(issues) => issues,
+        Err(e) => {
+            warn!(error = %e, "auto_pull: failed to list open issues");
+            return None;
+        }
+    };
+
+    // Fetch open-PR closing-issue refs once (mika#1517). Both phases consume it.
+    // Fail-open: an empty set preserves pre-fix behavior on infra glitches.
+    let open_pr_issue_numbers = match gh_list_open_pr_closing_issues(github_token).await {
+        Ok(set) => set,
+        Err(e) => {
+            warn!(error = %e, "auto_pull: failed to list open PR closing-issue refs; proceeding without filter");
+            HashSet::new()
+        }
+    };
+
+    // Phase 1 — promote a groomed-not-ready ticket (queue-empty gate lives inside).
+    let promoted = phase1_promote_groomed(
+        db,
+        github_token,
+        &issues,
+        &open_pr_issue_numbers,
+        trace_id,
+        session_id,
+    )
+    .await;
+
+    // Phase 2 — reconcile stuck-ready tickets, independent of queue depth (mika#1824).
+    let rescued =
+        phase2_reconcile_stuck_ready(db, github_token, &issues, &open_pr_issue_numbers).await;
+    debug!(
+        rescued,
+        "auto_pull: phase 2 stuck-ready reconciler complete"
+    );
+
+    promoted
+}
+
+/// Phase 1 (mika#1363): promote the best groomed-not-ready ticket to `ready`.
+///
+/// Verbatim of the original `auto_pull_groomed_ticket` body, including its own
+/// queue-empty early-return — Phase 1 only fires when mika-dev's dispatch queue
+/// is idle. Now receives the shared issue list and open-PR set (D5) instead of
+/// fetching them itself.
+async fn phase1_promote_groomed(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
     trace_id: &str,
     session_id: &str,
 ) -> Option<u64> {
@@ -277,27 +514,8 @@ pub async fn auto_pull_groomed_ticket(
         return None;
     }
 
-    // 2. Fetch open issues from GitHub (F4: client-side filter for no `ready` label).
-    let issues = match gh_list_open_issues(github_token).await {
-        Ok(issues) => issues,
-        Err(e) => {
-            warn!(error = %e, "auto_pull: failed to list open issues");
-            return None;
-        }
-    };
-
-    // 2b. Fetch open-PR closing-issue refs to skip tickets already in flight (mika#1517).
-    // Fail-open: an empty set preserves pre-fix behavior on infra glitches.
-    let open_pr_issue_numbers = match gh_list_open_pr_closing_issues(github_token).await {
-        Ok(set) => set,
-        Err(e) => {
-            warn!(error = %e, "auto_pull: failed to list open PR closing-issue refs; proceeding without filter");
-            HashSet::new()
-        }
-    };
-
     // 3. Select the best groomed-not-ready candidate (skip those with open PRs).
-    let candidate = match select_best_candidate(issues, &open_pr_issue_numbers) {
+    let candidate = match select_best_candidate(issues.to_vec(), open_pr_issue_numbers) {
         Some(c) => c,
         None => {
             debug!("auto_pull: no groomed-not-ready candidates found");
@@ -404,6 +622,187 @@ pub async fn auto_pull_groomed_ticket(
     }
 
     Some(candidate.number)
+}
+
+/// Phase 2 (mika#1824): reconcile stuck-ready tickets — those that *have* the
+/// `ready` label but were never dispatched (webhook dropped, mika-dev busy at
+/// fire time, dispatch-gate silent-accept). Runs regardless of queue depth.
+///
+/// Filter chain follows the D2 cost-bounded ordering (cheapest → most
+/// expensive): in-memory ready/open-PR, DB in-flight, DB circuit-breaker, then
+/// one GitHub timeline API call per survivor for the label age. Each drop emits
+/// a `stuck_ready_reconcile_skipped` DEBUG with its reason. Survivors past the
+/// age threshold are remove→add rescued (capped at [`MAX_STUCK_RESCUE_PER_TICK`]),
+/// emitting `stuck_ready_reconciled` INFO on success. Returns the rescue count.
+async fn phase2_reconcile_stuck_ready(
+    db: &AsyncDatabase,
+    github_token: &str,
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
+) -> usize {
+    let threshold = stuck_ready_threshold_secs();
+
+    // Filter 1 (in-mem): keep only tickets WITH the `ready` label (inverse of
+    // Phase 1's filter). Everything without `ready` is Phase 1 territory.
+    let ready: Vec<&Issue> = issues
+        .iter()
+        .filter(|i| i.labels.iter().any(|l| l.name == "ready"))
+        .collect();
+    if ready.is_empty() {
+        return 0;
+    }
+
+    // Filters 2–4 (in-mem open-PR, DB in-flight, DB circuit-breaker). Build the
+    // in-flight set (for the pure predicate) and the survivor list (for the
+    // age-fetch step). Ordering is cheapest-first so the API call in step 5
+    // fires for as few tickets as possible.
+    let mut in_flight_issue_numbers: HashSet<u64> = HashSet::new();
+    let mut survivors: Vec<u64> = Vec::new();
+    for issue in &ready {
+        let n = issue.number;
+
+        // Filter 2: open PR closing this issue (in-memory, already fetched).
+        if open_pr_issue_numbers.contains(&n) {
+            debug!(
+                issue = n,
+                reason = "open_pr_closing",
+                "stuck_ready_reconcile_skipped"
+            );
+            continue;
+        }
+
+        // Filter 3: in-flight self_dev task for this issue (DB, cheap).
+        let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
+        match db.has_active_self_dev_task_for_issue(&issue_url).await {
+            Ok(true) => {
+                in_flight_issue_numbers.insert(n);
+                debug!(
+                    issue = n,
+                    reason = "in_flight_self_dev",
+                    "stuck_ready_reconcile_skipped"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_pull: phase 2 in-flight check failed; skipping ticket");
+                continue;
+            }
+        }
+
+        // Filter 4: circuit-breaker (DB, cheap). Fail-open on error.
+        match db.get_auto_pull_failure_count(DEFAULT_REPO, n).await {
+            Ok(count) if count >= CIRCUIT_BREAKER_THRESHOLD => {
+                debug!(
+                    issue = n,
+                    reason = "circuit_breaker",
+                    failure_count = count,
+                    "stuck_ready_reconcile_skipped"
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_pull: phase 2 circuit-breaker check failed; proceeding");
+            }
+        }
+
+        survivors.push(n);
+    }
+
+    if survivors.is_empty() {
+        return 0;
+    }
+
+    // Filter 5 (GitHub API, one call each): read the `ready` label age. This is
+    // the expensive step, reached only by the rare survivor set.
+    let mut ages_by_issue: HashMap<u64, i64> = HashMap::new();
+    for &n in &survivors {
+        match gh_ready_label_age_secs(github_token, n).await {
+            Ok(Some(age)) => {
+                ages_by_issue.insert(n, age);
+            }
+            Ok(None) => {
+                // No `labeled(ready)` event → treat as not-stuck / skip.
+                debug!(
+                    issue = n,
+                    reason = "below_threshold",
+                    detail = "no labeled(ready) timeline event",
+                    "stuck_ready_reconcile_skipped"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_pull: phase 2 ready-label age read failed; skipping ticket");
+            }
+        }
+    }
+
+    // Pure selection: apply the age threshold + deterministic ordering (D2 step 5).
+    let selected = select_stuck_ready_candidates(
+        issues,
+        open_pr_issue_numbers,
+        &in_flight_issue_numbers,
+        &ages_by_issue,
+        threshold,
+    );
+
+    // Emit below_threshold skips for survivors with a known-but-too-young age.
+    for &n in &survivors {
+        if let Some(&age) = ages_by_issue.get(&n)
+            && age < threshold
+        {
+            debug!(
+                issue = n,
+                reason = "below_threshold",
+                age_secs = age,
+                threshold,
+                "stuck_ready_reconcile_skipped"
+            );
+        }
+    }
+
+    // Rescue loop: remove→add the `ready` label (Option A — reuse the webhook
+    // pipeline). Capped at MAX_STUCK_RESCUE_PER_TICK; overflow waits for the
+    // next tick. The remove→add cycle resets the label-age timestamp, so a
+    // rescued-but-still-undispatched ticket self-throttles for a full threshold
+    // window (D3).
+    let mut rescued = 0usize;
+    for &n in &selected {
+        if rescued >= MAX_STUCK_RESCUE_PER_TICK {
+            warn!(
+                cap = MAX_STUCK_RESCUE_PER_TICK,
+                deferred = selected.len() - rescued,
+                "auto_pull: phase 2 rescue cap reached; deferring rest to next tick"
+            );
+            break;
+        }
+
+        if let Err(e) = gh_remove_label(github_token, n, "ready").await {
+            warn!(error = %e, issue = n, "auto_pull: phase 2 remove ready label failed");
+            if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
+                warn!(error = %e2, "auto_pull: failed to increment failure counter");
+            }
+            continue;
+        }
+        if let Err(e) = gh_apply_label(github_token, n, "ready").await {
+            warn!(error = %e, issue = n, "auto_pull: phase 2 re-add ready label failed");
+            if let Err(e2) = db.increment_auto_pull_failure(DEFAULT_REPO, n).await {
+                warn!(error = %e2, "auto_pull: failed to increment failure counter");
+            }
+            continue;
+        }
+
+        if let Err(e) = db.record_auto_pull(DEFAULT_REPO, n).await {
+            warn!(error = %e, "auto_pull: failed to record auto-pull event");
+        }
+        if let Err(e) = db.reset_auto_pull_failure(DEFAULT_REPO, n).await {
+            warn!(error = %e, "auto_pull: failed to reset failure counter");
+        }
+        info!(issue = n, "stuck_ready_reconciled");
+        rescued += 1;
+    }
+
+    rescued
 }
 
 // ───────────────────── Tests ─────────────────────
@@ -756,5 +1155,152 @@ This ticket has been GROOMED and is ready.
 
         let selected = select_best_candidate(issues, &open_pr_set);
         assert!(selected.is_none(), "all candidates have open PRs → None");
+    }
+
+    // ── mika#1824 Phase 2: threshold reader tests ──
+
+    #[test]
+    fn test_threshold_default_when_absent() {
+        assert_eq!(
+            parse_stuck_ready_threshold(None),
+            STUCK_READY_THRESHOLD_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_threshold_default_when_empty() {
+        assert_eq!(
+            parse_stuck_ready_threshold(Some("   ")),
+            STUCK_READY_THRESHOLD_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_threshold_valid_override() {
+        assert_eq!(parse_stuck_ready_threshold(Some("1800")), 1800);
+        // Surrounding whitespace tolerated.
+        assert_eq!(parse_stuck_ready_threshold(Some(" 42 ")), 42);
+    }
+
+    #[test]
+    fn test_threshold_invalid_falls_back() {
+        assert_eq!(
+            parse_stuck_ready_threshold(Some("not-a-number")),
+            STUCK_READY_THRESHOLD_DEFAULT_SECS
+        );
+        // Negative rejected → default.
+        assert_eq!(
+            parse_stuck_ready_threshold(Some("-5")),
+            STUCK_READY_THRESHOLD_DEFAULT_SECS
+        );
+    }
+
+    // ── mika#1824 Phase 2: timeline-parse tests ──
+
+    #[test]
+    fn test_parse_last_ready_labeled_at_picks_last() {
+        // Two labeled(ready) events + noise; `last` (remove→add reset) wins.
+        let json = r#"[
+            {"event":"labeled","label":{"name":"ready"},"created_at":"2026-07-20T10:00:00Z"},
+            {"event":"labeled","label":{"name":"p1"},"created_at":"2026-07-21T10:00:00Z"},
+            {"event":"unlabeled","label":{"name":"ready"},"created_at":"2026-07-22T10:00:00Z"},
+            {"event":"labeled","label":{"name":"ready"},"created_at":"2026-07-23T10:00:00Z"},
+            {"event":"commented","created_at":"2026-07-24T10:00:00Z"}
+        ]"#;
+        assert_eq!(
+            parse_last_ready_labeled_at(json).as_deref(),
+            Some("2026-07-23T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn test_parse_last_ready_labeled_at_none_when_absent() {
+        let json = r#"[
+            {"event":"labeled","label":{"name":"p1"},"created_at":"2026-07-21T10:00:00Z"},
+            {"event":"commented","created_at":"2026-07-24T10:00:00Z"}
+        ]"#;
+        assert_eq!(parse_last_ready_labeled_at(json), None);
+    }
+
+    #[test]
+    fn test_parse_last_ready_labeled_at_empty_and_malformed() {
+        assert_eq!(parse_last_ready_labeled_at("[]"), None);
+        assert_eq!(parse_last_ready_labeled_at("not json"), None);
+    }
+
+    // ── mika#1824 Phase 2: AC5 mixed-fixture selection test ──
+
+    fn ready_body_issue(number: u64, extra_labels: &[&str]) -> Issue {
+        let mut labels = vec!["ready"];
+        labels.extend_from_slice(extra_labels);
+        make_issue(number, GROOMED_BODY, &labels, "2026-07-23T00:00:00Z")
+    }
+
+    #[test]
+    fn test_select_stuck_ready_only_selects_stuck() {
+        // Mixed fixture (plan step 8 / AC5):
+        //  #10 ready + in-flight self_dev task     → excluded (in_flight)
+        //  #20 ready + stuck (age > threshold)      → SELECTED
+        //  #30 ready + open PR closing it           → excluded (open_pr)
+        //  #40 ready + fresh (age < threshold)      → excluded (below_threshold)
+        //  #50 not-ready + groomed                  → excluded (no ready label)
+        let issues = vec![
+            ready_body_issue(10, &["p1"]),
+            ready_body_issue(20, &["p1"]),
+            ready_body_issue(30, &["p1"]),
+            ready_body_issue(40, &["p1"]),
+            make_issue(50, GROOMED_BODY, &["p1"], "2026-07-23T00:00:00Z"),
+        ];
+
+        let mut open_pr = HashSet::new();
+        open_pr.insert(30u64);
+
+        let mut in_flight = HashSet::new();
+        in_flight.insert(10u64);
+
+        let threshold = 900;
+        let mut ages = HashMap::new();
+        ages.insert(20u64, 1200); // stuck: above threshold
+        ages.insert(40u64, 300); // fresh: below threshold
+        // #10/#30 never reach the age fetch; #50 has no ready label.
+
+        let selected =
+            select_stuck_ready_candidates(&issues, &open_pr, &in_flight, &ages, threshold);
+        assert_eq!(
+            selected,
+            vec![20],
+            "only ready+stuck+no-in-flight+no-PR wins"
+        );
+    }
+
+    #[test]
+    fn test_select_stuck_ready_boundary_and_missing_age() {
+        // Age exactly at threshold is stuck (>=). Missing age → not selected.
+        let issues = vec![ready_body_issue(1, &[]), ready_body_issue(2, &[])];
+        let open_pr = HashSet::new();
+        let in_flight = HashSet::new();
+        let mut ages = HashMap::new();
+        ages.insert(1u64, 900); // exactly threshold → selected
+        // #2 has no age entry → excluded
+
+        let selected = select_stuck_ready_candidates(&issues, &open_pr, &in_flight, &ages, 900);
+        assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn test_select_stuck_ready_ascending_order() {
+        let issues = vec![
+            ready_body_issue(30, &[]),
+            ready_body_issue(10, &[]),
+            ready_body_issue(20, &[]),
+        ];
+        let open_pr = HashSet::new();
+        let in_flight = HashSet::new();
+        let mut ages = HashMap::new();
+        for n in [30u64, 10, 20] {
+            ages.insert(n, 1000);
+        }
+        let selected = select_stuck_ready_candidates(&issues, &open_pr, &in_flight, &ages, 900);
+        assert_eq!(selected, vec![10, 20, 30], "selected numbers ascending");
     }
 }

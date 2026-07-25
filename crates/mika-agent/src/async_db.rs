@@ -511,6 +511,14 @@ impl AsyncDatabase {
             .await
     }
 
+    /// True if an active self_dev task references this issue (mika#1824 D6).
+    pub async fn has_active_self_dev_task_for_issue(&self, issue_url: &str) -> Result<bool> {
+        let id = self.agent_id.clone();
+        let url = issue_url.to_owned();
+        self.with_db(move |db| db.has_active_self_dev_task_for_issue(&id, &url))
+            .await
+    }
+
     /// Get auto-pull failure count for circuit-breaker (mika#1363).
     pub async fn get_auto_pull_failure_count(
         &self,
