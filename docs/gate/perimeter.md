@@ -73,3 +73,5 @@ MECHANICAL allowlist additions require a Vincent-gated PR (this doc + the rules 
 
 - PR mika#1827 auto-merged by `mika-platform-dev` bot 2026-07-25 06:42:59Z, 2min54s after mika-qa APPROVED. Prose "Do not merge autonomously" in PR body was ignored — non-machine-readable. See samidarko-CC spool report `2026-07-25-064943-...URGENT-1827-breach-confirmed-1829-filed-draft-guard-active.md`.
 - mika#1829 filed as the structural fix. This module + doc are the shipped answer.
+
+<!-- forge-gate live-test 2026-07-25: this line touches the perimeter to verify code-owner gating. To be reverted/closed unmerged. -->
