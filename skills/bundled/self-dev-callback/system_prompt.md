@@ -100,7 +100,10 @@ If the callback text contains the line `RECOVERY_PENDING: true` (emitted by disp
 1. Extract metadata (Session, Cost, Turns, Duration) from lines after the prefix.
 2. Check `pipeline_retry_count` in metadata (default 0) via `check_task(task_id)`.
 3. If `pipeline_retry_count >= 2`: escalate — notify Vincent "Pipeline failure: {repo}#{issue_number} produced no commits after {n} retries." Step 6 with `blocked`.
-4. Retries remain: notify "Pipeline produced no commits for {repo}#{issue_number} — retrying ({n}/2)." `update_task_status` with same `in_progress` and `metadata: {"pipeline_retry_count": <current + 1>}`. Verify via `check_task`. Call `run_claude_pilot` with the same `repo#number` and `task_id`. If returns `{"status": "deferred", "deferred": true}`, retry is auto-enqueued — do NOT retry again. Step 6 with `in_progress`, note "pipeline retry deferred — engine will auto-dispatch when slot is free."
+4. Retries remain: notify "Pipeline produced no commits for {repo}#{issue_number} — retrying ({n}/2)." `update_task_status` with same `in_progress` and `metadata: {"pipeline_retry_count": <current + 1>}`. Verify via `check_task`. Then dispatch the retry using the **tool that matches the failed callback's class** (mika#1823 — dispatching the wrong tool triggers the grooming-marker guard and re-fails immediately):
+    - If the callback's label matches `long_running:run_claude_pilot_groom` (dev-groom failure) → call `run_claude_pilot_groom` with the same `repo#number` and `task_id`.
+    - Otherwise (dev-pilot failure) → call `run_claude_pilot` with the same `repo#number` and `task_id`.
+    - If the call returns `{"status": "deferred", "deferred": true}`, retry is auto-enqueued — do NOT retry again. Step 6 with `in_progress`, note "pipeline retry deferred — engine will auto-dispatch when slot is free."
 
 **On success (no "PIPELINE FAILURE:" prefix):**
 1. Extract metadata and persist immediately.
