@@ -212,6 +212,9 @@ Optional (callback watchdog):
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
+Optional (auto-pull stuck-ready reconciler):
+- `MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS` — Minimum age (seconds) the `ready` label must exceed before the auto-pull Phase 2 reconciler treats a ticket as stuck and remove→add re-drives it (mika#1824, default `900`). Phase 2 runs after Phase 1 on each 10-min `auto_pull_groomed_ticket` tick, independent of queue depth, and rescues tickets that carry `ready` but were never dispatched (webhook dropped, mika-dev busy at fire time, dispatch-gate silent-accept). Invalid or negative values fall back to the default (WARN-logged). Emits `stuck_ready_reconciled` INFO per rescue and `stuck_ready_reconcile_skipped` DEBUG per skip reason (`in_flight_self_dev`/`open_pr_closing`/`circuit_breaker`/`below_threshold`). Steady-state expectation: ≤5 rescues/day; >20/day indicates the dispatch-layer primary fix is still needed (#1291-adjacent).
+
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)

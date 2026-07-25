@@ -6050,6 +6050,31 @@ impl Database {
         Ok(n)
     }
 
+    /// True if an active (pending/in_progress) self_dev task references this issue
+    /// (mika#1824 D6). Used by the Phase 2 stuck-ready reconciler to skip tickets
+    /// that already have in-flight work of their own.
+    ///
+    /// `issue_url` is the canonical issue URL (e.g.
+    /// `https://github.com/senara-solutions/mika/issues/123`). The match is a
+    /// prefix `LIKE` so the `?phase=groom` suffix variant is covered.
+    pub fn has_active_self_dev_task_for_issue(
+        &self,
+        agent_id: &str,
+        issue_url: &str,
+    ) -> Result<bool> {
+        let prefix = format!("{}%", issue_url);
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND source = 'self_dev'
+               AND status IN ('pending', 'in_progress')
+               AND reference_url LIKE ?2",
+            params![agent_id, prefix],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Get all pending user-visible tasks (reminders and callbacks, excludes heartbeat/reflection).
     /// Returns user-visible reminder tasks (both `send_message` and `resume_agent`).
     ///
