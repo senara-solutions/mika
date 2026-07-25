@@ -20,6 +20,7 @@ pub mod memory;
 pub mod messaging;
 pub mod operational;
 pub mod panic_hook;
+pub mod perimeter;
 pub mod planning;
 pub mod post_condition;
 pub mod pricing;

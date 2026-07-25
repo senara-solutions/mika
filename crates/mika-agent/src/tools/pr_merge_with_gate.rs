@@ -175,6 +175,52 @@ impl Tool for PrMergeWithGateTool {
             }
         }
 
+        // -- Step 1c: Forge-gate perimeter check (mika#1829) --
+        //
+        // Fetch touched files from GitHub, classify via perimeter rules.
+        // If the PR touches any DECISION-CORE zone, block with
+        // `HumanGateRequired`. Fail-closed on gh-CLI fetch error
+        // (better to hold a mechanical PR than to auto-merge a
+        // decision-core PR).
+        //
+        // Non-negotiable (b): diff is authority. This step is
+        // structurally independent of PR labels / body prose.
+        let perimeter_verdict = match crate::perimeter::fetch::fetch_pr_files(
+            pr_number, repo, token,
+        )
+        .await
+        {
+            Ok(files) => crate::perimeter::classify_pr_files(&files),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    pr_number,
+                    repo,
+                    "pr_merge_with_gate: perimeter file fetch failed — fail-closed to DECISION-CORE (mika#1829)"
+                );
+                crate::perimeter::PrClassification {
+                    verdict: crate::perimeter::Classification::DecisionCore,
+                    mechanical_files: Vec::new(),
+                    decision_core_files: vec![format!("<fetch-error: {e}>")],
+                }
+            }
+        };
+        if perimeter_verdict.verdict == crate::perimeter::Classification::DecisionCore {
+            let detail = format!(
+                "Forge-gate: PR touches DECISION-CORE zone(s) — operator must merge manually. {}",
+                perimeter_verdict.summary()
+            );
+            let result = MergeGateResult::Blocked {
+                reason: BlockReason::HumanGateRequired {
+                    decision_core_files: perimeter_verdict.decision_core_files.clone(),
+                    summary: perimeter_verdict.summary(),
+                },
+                failing_checks: vec![],
+                detail,
+            };
+            return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+        }
+
         // -- Step 2: Fetch required check statuses --
         let checks_result = run_gh_checks(pr_number, repo, token).await;
         let checks = match checks_result {
@@ -365,6 +411,14 @@ pub(crate) enum BlockReason {
     BehindMain {
         pr_base_sha: String,
         current_main_sha: String,
+    },
+    /// PR touches DECISION-CORE zone(s) (forge-gate perimeter, mika#1829).
+    /// Operator must merge manually. The `decision_core_files` field lists the
+    /// concrete paths that tripped the gate.
+    #[serde(rename = "human_gate_required")]
+    HumanGateRequired {
+        decision_core_files: Vec<String>,
+        summary: String,
     },
 }
 
