@@ -221,6 +221,8 @@ mod tests {
             request_id: "test-req-1".to_string(),
             agent: "mika-dev".to_string(),
             images: None,
+            session_id: None,
+            internal: None,
         }
     }
 

@@ -354,6 +354,100 @@ pub fn secondary_targets(
     }
 }
 
+// -- Observer fan-out (mika#1403) --
+
+/// The fixed session id observer events target (mika#1401 single-session).
+///
+/// All observer notifications for an agent land in this one session so the
+/// observer (mika-prime) sees a continuous, event-driven conversation instead
+/// of a fresh UUID per event. The agent handler creates it on first use via
+/// `create_session_if_not_exists`.
+pub const OBSERVER_SESSION_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// An observer agent that should receive a filtered copy of an event (mika#1403).
+///
+/// Observers do NOT steal the event from the primary route ([`route_event`]);
+/// they receive a supplementary `internal=1` copy targeting [`OBSERVER_SESSION_ID`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserverNotification {
+    /// Observer agent name (v1 hardcodes `mika-prime` as the sole observer).
+    pub agent: &'static str,
+    /// Bearing-signal class the observer uses to pattern-match the event
+    /// (`backlog_changed`, `dispatch_gate`, `loop_health`). Also emitted in the
+    /// `observer_event_dispatched` structured log for post-ship filter tuning.
+    pub event_class: &'static str,
+}
+
+/// Returns the observer agents that should receive a filtered copy of this event.
+///
+/// This is the no-noise filter (mika#1403 Delta 2): only bearing-moving
+/// transitions produce an observer notification; routing/label/comment/push
+/// churn returns an empty `Vec`. Kept separate from [`route_event`] because
+/// observer semantics differ — they supplement rather than replace the primary
+/// route, and take an extra `merged` parameter the primary router doesn't need.
+///
+/// The `Vec` return type is already multi-observer; v1 hardcodes `mika-prime`
+/// as the sole observer (no registry until a second consumer exists — YAGNI).
+pub fn observe_event(
+    event_type: &str,
+    action: Option<&str>,
+    check_conclusion: Option<&str>,
+    merged: Option<bool>,
+) -> Vec<ObserverNotification> {
+    let mut observers = Vec::new();
+
+    match (event_type, action) {
+        // Backlog changed: a PR merged — backlog count dropped ("what's next?").
+        ("pull_request", Some("closed")) if merged == Some(true) => {
+            observers.push(ObserverNotification {
+                agent: "mika-prime",
+                event_class: "backlog_changed",
+            });
+        }
+        // Backlog changed: an issue closed. Observer-only (AC8) — `route_event`
+        // drops `issues.closed` to None, so this is captured before that
+        // early-return in the handler.
+        ("issues", Some("closed")) => {
+            observers.push(ObserverNotification {
+                agent: "mika-prime",
+                event_class: "backlog_changed",
+            });
+        }
+        // Dispatch gate: CI passed on a PR — sequencing gate reached.
+        ("check_suite", Some("completed")) if check_conclusion == Some("success") => {
+            observers.push(ObserverNotification {
+                agent: "mika-prime",
+                event_class: "dispatch_gate",
+            });
+        }
+        // Loop health: CI failed — loop-health signal.
+        ("check_suite", Some("completed"))
+            if matches!(check_conclusion, Some("failure" | "timed_out")) =>
+        {
+            observers.push(ObserverNotification {
+                agent: "mika-prime",
+                event_class: "loop_health",
+            });
+        }
+        // Dispatch gate: a new PR opened — sequencing awareness.
+        ("pull_request", Some("opened")) => {
+            observers.push(ObserverNotification {
+                agent: "mika-prime",
+                event_class: "dispatch_gate",
+            });
+        }
+        _ => {}
+    }
+
+    observers
+}
+
+/// Prefix an event summary with its observer event-class tag so the observer
+/// agent can pattern-match the bearing signal (mika#1403 Delta 3).
+fn format_observer_text(obs: &ObserverNotification, base_text: &str) -> String {
+    format!("[Observer: {}] {base_text}", obs.event_class)
+}
+
 // -- Message text formatting --
 
 /// Truncate text to `max_chars`, appending a truncation indicator if truncated.
@@ -762,11 +856,76 @@ pub(crate) async fn handle_github_webhook(
     // event types per agent), not by identity filtering. If loop risks emerge (e.g.,
     // mika-qa's own check_suite events), filter by sender.login != agent's bot login.
 
-    // 9. Route to agent
     let check_conclusion = event
         .check_suite
         .as_ref()
         .and_then(|cs| cs.conclusion.as_deref());
+
+    // 8b. Observer fan-out (mika#1403) — filtered, best-effort copies to
+    // observer agents (v1: mika-prime). Placed BEFORE primary routing so
+    // observer-only events (e.g. `issues.closed`, which `route_event` drops to
+    // None) still reach observers. Observers never steal the primary route;
+    // each receives an `internal=1` copy targeting the fixed observer session.
+    // Fully non-blocking: try-acquire (shed on pressure), no awaits here, no
+    // DLQ — so neither the primary dispatch nor the 200 response is delayed.
+    let observers = observe_event(
+        event_type,
+        event.action.as_deref(),
+        check_conclusion,
+        event.pull_request.as_ref().and_then(|pr| pr.merged),
+    );
+    if !observers.is_empty() {
+        let obs_base_text = format_event_text(event_type, &event);
+        let obs_delivery_base = if delivery_id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            delivery_id.clone()
+        };
+        for obs in observers {
+            // Best-effort backpressure: shed observer load rather than block
+            // the primary route (AC3/AC4). Observers share the primary
+            // semaphore and are shed first — the primary already got the event.
+            let obs_permit = match state.webhook_semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(
+                        observer_agent = obs.agent,
+                        event_class = obs.event_class,
+                        delivery_id = %delivery_id,
+                        "observer fan-out shed — webhook semaphore full (best-effort)"
+                    );
+                    continue;
+                }
+            };
+            info!(
+                event = "observer_event_dispatched",
+                event_type,
+                action = ?event.action,
+                event_class = obs.event_class,
+                observer_agent = obs.agent,
+                delivery_id = %delivery_id,
+                "observer event dispatched"
+            );
+            let obs_state = state.clone();
+            let obs_agent = obs.agent.to_string();
+            let obs_text = format_observer_text(&obs, &obs_base_text);
+            let obs_request_id = format!("{obs_delivery_base}-obs-{}", obs.agent);
+            let obs_repo_name = event.repository.as_ref().and_then(|r| r.full_name.clone());
+            tokio::spawn(async move {
+                deliver_observer_event(
+                    &obs_state,
+                    &obs_agent,
+                    &obs_text,
+                    &obs_request_id,
+                    obs_repo_name.as_deref(),
+                    obs_permit,
+                )
+                .await;
+            });
+        }
+    }
+
+    // 9. Route to agent
     let target_agent = match route_event(event_type, event.action.as_deref(), check_conclusion) {
         Some(agent) => agent,
         None => {
@@ -1221,6 +1380,85 @@ pub(crate) async fn forward_to_resolved_route(
                     reason: format!("network error: {e}"),
                 }
             }
+        }
+    }
+}
+
+/// Deliver a filtered observer copy of an event to an observer agent (mika#1403).
+///
+/// Intentionally lighter than [`deliver_with_retry`]: a single route-resolve +
+/// POST, WARN-and-drop on any failure, and **never a DLQ entry**. Observer
+/// events are informational, not operational — the primary agent already
+/// received the event through the normal path, so a lost observer copy is
+/// re-driven by the next relevant event (AC4). The message targets the fixed
+/// observer session (AC5) and is marked `internal=1` (AC6) so it stays out of
+/// the observer's user inbox.
+///
+/// The caller's semaphore permit is held for the whole forward and released on
+/// return; observers share the primary `webhook_semaphore` so they respect the
+/// same backpressure (and are shed first — see the handler fan-out block).
+async fn deliver_observer_event(
+    state: &AppState,
+    observer_agent: &str,
+    text: &str,
+    request_id: &str,
+    repo_full_name: Option<&str>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _permit = permit; // held for the single forward, released on return
+    let route = match resolve_github_container_url(state, repo_full_name).await {
+        Some(r) => r,
+        None => {
+            warn!(
+                observer_agent,
+                request_id, "observer event dropped — no route resolved (best-effort, no DLQ)"
+            );
+            return;
+        }
+    };
+    let target_agent = apply_agent_mapping(&route.agent_mapping, observer_agent);
+    let url = &route.container_url;
+    let payload = serde_json::json!({
+        "text": text,
+        "channel": "github",
+        "request_id": request_id,
+        "agent": target_agent,
+        "session_id": OBSERVER_SESSION_ID,
+        "internal": true,
+    });
+
+    let result = state
+        .http_client
+        .post(format!("{url}/message"))
+        .bearer_auth(state.internal_token.expose_secret())
+        .json(&payload)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            debug!(
+                observer_agent = %target_agent,
+                request_id,
+                "observer event delivered"
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                observer_agent = %target_agent,
+                request_id,
+                status = resp.status().as_u16(),
+                "observer event delivery failed (best-effort, dropping — no DLQ)"
+            );
+        }
+        Err(e) => {
+            warn!(
+                observer_agent = %target_agent,
+                request_id,
+                error = %e,
+                "observer event delivery error (best-effort, dropping — no DLQ)"
+            );
         }
     }
 }
@@ -1891,6 +2129,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- observe_event tests (mika#1403) ---
+
+    /// Assert the observer set is exactly one mika-prime notification of the
+    /// given event class.
+    fn assert_single_prime_observer(observers: &[ObserverNotification], event_class: &str) {
+        assert_eq!(observers.len(), 1, "expected exactly one observer");
+        assert_eq!(observers[0].agent, "mika-prime");
+        assert_eq!(observers[0].event_class, event_class);
+    }
+
+    #[test]
+    fn test_observe_event_pr_merged_is_backlog_changed() {
+        // AC1: a merged PR (closed + merged=true) → backlog_changed.
+        assert_single_prime_observer(
+            &observe_event("pull_request", Some("closed"), None, Some(true)),
+            "backlog_changed",
+        );
+    }
+
+    #[test]
+    fn test_observe_event_pr_closed_unmerged_is_ignored() {
+        // A PR closed WITHOUT merging is not bearing-moving — no backlog drop.
+        assert!(observe_event("pull_request", Some("closed"), None, Some(false)).is_empty());
+        // Missing `merged` field is treated as not-merged (fail-safe).
+        assert!(observe_event("pull_request", Some("closed"), None, None).is_empty());
+    }
+
+    #[test]
+    fn test_observe_event_issues_closed_is_backlog_changed_observer_only() {
+        // AC8: issues.closed is observer-only — route_event drops it to None,
+        // observe_event still emits a backlog_changed notification.
+        assert_eq!(route_event("issues", Some("closed"), None), None);
+        assert_single_prime_observer(
+            &observe_event("issues", Some("closed"), None, None),
+            "backlog_changed",
+        );
+    }
+
+    #[test]
+    fn test_observe_event_check_suite_success_is_dispatch_gate() {
+        // AC1: CI green → dispatch_gate (sequencing gate reached).
+        assert_single_prime_observer(
+            &observe_event("check_suite", Some("completed"), Some("success"), None),
+            "dispatch_gate",
+        );
+    }
+
+    #[test]
+    fn test_observe_event_check_suite_failure_is_loop_health() {
+        // AC1: CI failure/timeout → loop_health.
+        assert_single_prime_observer(
+            &observe_event("check_suite", Some("completed"), Some("failure"), None),
+            "loop_health",
+        );
+        assert_single_prime_observer(
+            &observe_event("check_suite", Some("completed"), Some("timed_out"), None),
+            "loop_health",
+        );
+    }
+
+    #[test]
+    fn test_observe_event_check_suite_other_conclusion_is_ignored() {
+        // Neutral/cancelled/other conclusions are not bearing signals.
+        assert!(observe_event("check_suite", Some("completed"), Some("neutral"), None).is_empty());
+        assert!(
+            observe_event("check_suite", Some("completed"), Some("cancelled"), None).is_empty()
+        );
+        assert!(observe_event("check_suite", Some("completed"), None, None).is_empty());
+    }
+
+    #[test]
+    fn test_observe_event_pr_opened_is_dispatch_gate() {
+        // AC1: a new PR opened → dispatch_gate (sequencing awareness).
+        assert_single_prime_observer(
+            &observe_event("pull_request", Some("opened"), None, None),
+            "dispatch_gate",
+        );
+    }
+
+    #[test]
+    fn test_observe_event_ignores_noise() {
+        // The IGNORE set (Delta 2): routing/label/comment/push/review churn
+        // must produce zero observers. None of these carry a check conclusion
+        // or merged flag, so both extra params are None.
+        let noise: &[(&str, Option<&str>)] = &[
+            ("issues", Some("assigned")),
+            ("issues", Some("labeled")),
+            ("issue_comment", Some("created")),
+            ("pull_request", Some("synchronize")),
+            ("pull_request", Some("review_requested")),
+            ("pull_request", Some("ready_for_review")),
+            ("pull_request_review", Some("submitted")),
+            ("ping", None),
+            ("unknown_event", Some("action")),
+        ];
+        for (event_type, action) in noise {
+            assert!(
+                observe_event(event_type, *action, None, None).is_empty(),
+                "{event_type}.{action:?} must not produce an observer notification"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_observer_text_prefixes_event_class() {
+        let obs = ObserverNotification {
+            agent: "mika-prime",
+            event_class: "backlog_changed",
+        };
+        assert_eq!(
+            format_observer_text(&obs, "[GitHub] PR closed: org/repo#42 — Fix (branch: x)"),
+            "[Observer: backlog_changed] [GitHub] PR closed: org/repo#42 — Fix (branch: x)"
+        );
     }
 
     #[test]
@@ -2977,6 +3330,73 @@ mod tests {
         });
 
         (format!("http://127.0.0.1:{}", addr.port()), call_count)
+    }
+
+    /// Mock agent server that captures the JSON body of each `/message` POST.
+    /// Returns `(base_url, captured)` where `captured` holds the latest payload.
+    /// Used by the observer-dispatch integration test to assert session/internal
+    /// targeting on the wire (mika#1403 AC5/AC6/AC9).
+    async fn mock_agent_server_capture()
+    -> (String, Arc<std::sync::Mutex<Option<serde_json::Value>>>) {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let cap = captured.clone();
+        let app = axum::Router::new().route(
+            "/message",
+            post(move |body: axum::body::Bytes| {
+                let cap = cap.clone();
+                async move {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        *cap.lock().unwrap() = Some(v);
+                    }
+                    StatusCode::OK
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://127.0.0.1:{}", addr.port()), captured)
+    }
+
+    #[tokio::test]
+    async fn test_deliver_observer_event_targets_session_and_marks_internal() {
+        // AC5 + AC6 + AC9: an observer delivery must POST /message with the
+        // fixed observer session_id and internal=true, addressed to the
+        // observer agent, on the github channel.
+        let (base_url, captured) = mock_agent_server_capture().await;
+        let state = test_state_with_base_url(&base_url);
+        let permit = state.webhook_semaphore.clone().try_acquire_owned().unwrap();
+
+        deliver_observer_event(
+            &state,
+            "mika-prime",
+            "[Observer: backlog_changed] [GitHub] PR closed: org/repo#42",
+            "delivery-obs-1-obs-mika-prime",
+            Some("org/repo"),
+            permit,
+        )
+        .await;
+
+        let payload = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("observer POST body should have been captured");
+        assert_eq!(payload["agent"], "mika-prime");
+        assert_eq!(payload["channel"], "github");
+        assert_eq!(payload["session_id"], OBSERVER_SESSION_ID); // AC5
+        assert_eq!(payload["internal"], true); // AC6
+        assert_eq!(payload["request_id"], "delivery-obs-1-obs-mika-prime");
+        assert!(
+            payload["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("[Observer: backlog_changed]")
+        );
     }
 
     /// Build an AppState pointing to a mock agent server.

@@ -836,9 +836,19 @@ async fn run_agent_for_message(
         a.skills.lock().unwrap().clone()
     };
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // Session targeting (mika#1403): observer events set an explicit session_id
+    // so every notification lands in one continuous session. Absent/empty →
+    // mint a fresh UUID (default behavior). `create_session_if_not_exists`
+    // (INSERT OR IGNORE) keeps a reused observer session from erroring on every
+    // event after the first; fresh UUIDs never collide, so behavior for the
+    // default path is unchanged.
+    let session_id = req
+        .session_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if let Err(e) =
-        a.db.create_session(&session_id, a.db.agent_id(), &req.channel)
+        a.db.create_session_if_not_exists(&session_id, a.db.agent_id(), &req.channel, None)
             .await
     {
         warn!(error = %e, "failed to create session");
@@ -861,7 +871,15 @@ async fn run_agent_for_message(
     // the LLM turn and act on VERDICT: pass deterministically (#524).
     // NOTE: This depends on the gateway's format_event_text() output
     // format for pull_request_review events.
-    if req.channel == "github" {
+    // Observer copies (mika#1403) are internal=1 event notifications for
+    // observer agents like mika-prime. They must NOT trigger the primary
+    // agent's structural automation (verdict/CI/ready-label/milestone
+    // handlers) — those act on the *primary* agent's tasks (merge, dispatch)
+    // and would fire against the observer's identity. An observer event is a
+    // plain LLM turn: the agent reads the notification and decides whether to
+    // act via its own skills or stay silent (Delta 3 intent).
+    let is_observer_event = req.internal.unwrap_or(false);
+    if req.channel == "github" && !is_observer_event {
         // Resolve per-agent GitHub token (PAT > App > None),
         // matching run_agent() pattern at agent.rs:1243 (#561).
         let verdict_github_token = a
@@ -1065,7 +1083,7 @@ async fn run_agent_for_message(
         settings: Some(&a.settings),
         trace_id: Some(req.request_id.clone()),
         correlated_task_id: None,
-        internal: false,
+        internal: is_observer_event,
         pr_reviews_posted: Some(&state.pr_reviews_posted),
         stream_tx: None,
     };
