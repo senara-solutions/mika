@@ -163,9 +163,13 @@ Same addition as Unit 3, in the plan-generation phase. The operator-direct and a
 
 **File:** `crates/mika-agent/tests/eval/skills/mika_arch_fire_disposition_gate.rs`
 
+**Registration (required):** Add `pub mod mika_arch_fire_disposition_gate;` to `crates/mika-agent/tests/eval/skills/mod.rs` — the eval-skills module is not auto-discovered; a new scenario file that is not registered as a `pub mod` line silently never compiles or runs (the mod.rs currently registers only `mika_arch_groom_milestone`).
+
 MockLlmProvider scenario: architect receives a plan with a detector deliverable (e.g., "add a `verify_bundled_skills` structural check") and a `## Fire-Disposition` section naming option (a). Assert the response contains `Disposition: READY` (gate passes, not triggered by this gate — other gates may still trigger but this one doesn't).
 
 Use the existing `EvalHarness` builder pattern with `MockLlmProvider` for deterministic execution. The mock response should contain the architect's READY disposition.
+
+**Enforcement-honesty note (what these Unit 5–7 tests actually cover).** Per the `skills/mod.rs` doc comment, per-skill eval scenarios "validate engine *handling* of a skill's declared output shape, not the production prompt's wording." A `MockLlmProvider` returns canned responses — it cannot prove the architect's *LLM judgment* applies the Fire-Disposition Gate (the mock emits whatever disposition the scenario programs). Unit 5–7 therefore assert the engine correctly threads the architect's declared disposition/F-list shape through the loop for each of the three gate branches (they are regression coverage for the output contract, the same class as `mika_arch_groom_milestone`). The **prompt-adherence** guarantee — that the live architect model actually returns ITERATE on a detector plan missing fire-disposition — is owned by the mika-arch calibration suite (mika#1190), which runs real providers against structural assertions. Because Unit 1/2 modify `mika-arch-*` system prompts, `make calibrate-mika-arch MODEL=<current-baseline-model>` MUST be run and shown to hold the baseline pass-rate before merge (a mika-arch prompt change is a calibration-relevant change even though it is not a model swap). Consider adding a `fire_disposition_gate` scenario to `src/calibration/roles/mika_arch.rs` as the durable prompt-adherence backstop; if deferred, file a follow-up and name it here.
 
 ### Unit 6: Eval test — detector + fire-disposition missing (FAIL)
 
@@ -189,6 +193,8 @@ module: dev-groom
 tags: [doctrine, scope-bind, detector, fire-disposition, architect-gate]
 problem_type: scope-underspecification
 category: best-practices
+date: 2026-06-28
+ticket: mika#1574
 ---
 
 # Fire-Disposition Doctrine
