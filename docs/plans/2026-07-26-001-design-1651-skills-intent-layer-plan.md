@@ -29,9 +29,10 @@ message" does not imply "the user wants to fetch an issue." The gate conflates
 
 Two-layer decomposition today:
 
-1. **Match layer** — `crates/mika-agent/src/skills/matcher.rs:44`
-   (`match_skills`): `message_lower.contains(kw)` → `MatchedSkill { reason:
-   Keyword }`. Pure substring, no word boundaries, no semantics.
+1. **Match layer** — `crates/mika-agent/src/skills/matcher.rs:38`
+   (`match_skills`; the substring test is at `matcher.rs:47`):
+   `message_lower.contains(kw)` → `MatchedSkill { reason: Keyword }`. Pure
+   substring, no word boundaries, no semantics.
 2. **Enforcement layer** — `crates/mika-agent/src/agent_loop/mod.rs:4709`
    (`collect_required_tools`): unions `required_tools` across `MatchReason::Keyword`
    skills; the EndTurn required-tools gate (post-condition #3) rejects the turn
@@ -231,10 +232,11 @@ architect's design pass)"), which frames them for the architect's deliberation:
 - Sibling: mika#1650 — keyword-tighten (**CLOSED / shipped** — the cheap 80% fix)
 - Existing discipline doc: `docs/architecture/skill-keyword-design-rules.md`
 - Same architectural class: mika#1575 (unsound-proxy ruling)
-- Match function: `crates/mika-agent/src/skills/matcher.rs:44` (`match_skills`)
+- Match function: `crates/mika-agent/src/skills/matcher.rs:38` (`match_skills`;
+  substring test at `matcher.rs:47`)
 - Required-tools collection: `crates/mika-agent/src/agent_loop/mod.rs:4709`
   (`collect_required_tools`)
-- `MatchReason` conditioning (#463): `crates/mika-agent/src/skills/matcher.rs:9`
+- `MatchReason` enum (#463 conditioning): `crates/mika-agent/src/skills/matcher.rs:10`
 - Required-tools gate (post-condition #3): `crates/mika-agent/CLAUDE.md`
   §"Post-Conditions (EndTurn Chain)"
 - Orthogonality / DRY grounding for the recommendation:
