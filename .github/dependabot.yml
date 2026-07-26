@@ -1,0 +1,41 @@
+# Dependabot configuration for the mika repo (mika#1729, AC1 / R1).
+#
+# Load-bearing precondition for the autonomous Dependabot review chain:
+#   Dependabot → mika-qa approve → mika-dev merge
+# on the three already-autonomous repos (mika, mika-cloud, mika-platform).
+#
+# Prime AMEND (2026-07-06) ratified Path 1 (topology config + reviewer
+# capability), NOT Path 2 (dependabot.yml auto-merge). Do NOT add auto-merge
+# config here (NF1) — merge must route through mika-qa's review, whose
+# Dependabot-PR path performs a distinct-from-CI changelog/advisory
+# breaking-change check (AC5). See docs/plans/2026-07-26-001-feat-dependabot-qa-review-plan.md.
+#
+# Weekly schedule + grouped minor/patch updates bound PR volume so the
+# autonomous review chain is not flooded.
+version: 2
+updates:
+  # Rust dependencies (workspace Cargo.toml + member crates).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions used by the CI/release workflows (all pinned to SHAs).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      github-actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
