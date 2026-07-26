@@ -106,6 +106,25 @@ pub struct CompletableParentTask {
     pub pr_url: String,
 }
 
+/// A parent self_dev issue task left `in_progress` with **zero** callback
+/// children, aged past the childless-parent reaper grace window (mika#1687).
+///
+/// This is the zero-child complement of [`OrphanedParentTask`]: the orphan
+/// reaper and parent-completer both INNER-JOIN a delivered callback child, so a
+/// parent that reached `in_progress` without ever spawning a callback child
+/// (silent pilot death — dispatch reached `in_progress` but no callback row was
+/// recorded) falls through both. `find_childless_stuck_parent_tasks` selects
+/// exactly that shape via `NOT EXISTS (SELECT 1 FROM tasks child …)`.
+///
+/// No `callback_task_id` field: by construction there is no child to reference.
+#[derive(Debug, Clone)]
+pub struct ChildlessStuckParent {
+    pub id: String,
+    pub agent_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Snapshot of a child task for the orphaned-parent reaper's structured log
 /// event (`task_engine_reaper.evaluated`). Captures all children of a candidate
 /// parent at kill time for post-incident diagnosis (mika#1126).

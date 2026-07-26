@@ -30,6 +30,19 @@ const DB_SCAN_INTERVAL_TICKS: u64 = 60;
 /// queue clears within one tick-cycle after grace expires. See #871.
 const REAPER_GRACE_SECONDS: i64 = 600;
 
+/// Default grace window (seconds) before the childless-parent reaper transitions
+/// a self_dev issue parent left `in_progress` with **zero** callback children to
+/// `failed` (mika#1687). Deliberately far larger than [`REAPER_GRACE_SECONDS`]
+/// (600): a legitimately-dispatching parent is childless only for the sub-second
+/// window between its `pending → in_progress` transition and the callback child
+/// row commit inside `spawn_long_running_exec()`. 30 min removes any plausible
+/// in-flight false positive (the ticket's real cases were 100–180 min old).
+/// Overridable via `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS`.
+const CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS: i64 = 1800;
+
+/// Env var overriding [`CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS`].
+const CHILDLESS_PARENT_REAPER_GRACE_ENV: &str = "MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS";
+
 /// The two currently-defined dispatch classes (per `derive_dispatch_class` at
 /// `skills/executor.rs`). Iteration order is `implement` first because pre-v34
 /// NULL-class wrappers fall into this bucket via `COALESCE` — promote those
@@ -273,6 +286,16 @@ impl TaskEngine {
             // sibling to the reaper: catches crash-recovery cases and pre-deploy
             // wedges that the inline path in `dispatch_resume_agent` can't reach.
             self.complete_parent_tasks_on_callback_success().await;
+
+            // Reap parent self_dev issue tasks left in_progress with ZERO
+            // callback children, aged past the childless grace window (mika#1687).
+            // The silent-pilot-death backstop: a parent that reached in_progress
+            // without ever recording a callback child falls through both reapers
+            // above (they INNER-JOIN a delivered child) and the watchdog (it keys
+            // off a callback child's PID). Runs AFTER the completer so any
+            // delivered-child success/failure case resolves first and only
+            // genuinely childless parents reach here.
+            self.reap_childless_stuck_parent_tasks().await;
 
             // Reap orphaned team runs left in `status='running'` when no
             // terminal-state writer ran (mika#1652). Failure-path sibling of
@@ -968,6 +991,145 @@ impl TaskEngine {
         }
     }
 
+    /// Reap parent self_dev **issue** tasks left `in_progress` with **zero**
+    /// callback children, aged past the childless grace window (mika#1687).
+    ///
+    /// The deterministic backstop for silent pilot death: a parent that reaches
+    /// `in_progress` but never records a callback child falls through all three
+    /// existing deterministic mechanisms — the orphan reaper (#871) and
+    /// parent-completer (mika#1162) both INNER-JOIN a delivered callback child,
+    /// and the callback watchdog (#959) keys off the callback child's PID. This
+    /// reaper's `NOT EXISTS` predicate is the exact complement of that JOIN, so
+    /// it sees exactly the parents the others cannot.
+    ///
+    /// Its job is **fail-with-telemetry**, not re-drive: it transitions the
+    /// parent to `failed` so the death is visible and terminal (freeing the
+    /// dispatch slot + emitting a greppable signal). Re-driving the still-open
+    /// ticket is mika#1824's job at the auto-pull/label layer (D3).
+    ///
+    /// SOLE WRITER: this method is the only site that writes the
+    /// `stuck_in_progress_no_callback_child` reason to `tasks.result` and the
+    /// only writer of `task_engine_childless_reaper` audit events. Reusing
+    /// either string elsewhere breaks the operator/monitor discriminator (R4,
+    /// D4) — keep this method the single writer.
+    async fn reap_childless_stuck_parent_tasks(&self) {
+        let grace_seconds = childless_parent_reaper_grace_secs();
+        let candidates = match self
+            .db
+            .find_childless_stuck_parent_tasks(grace_seconds)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "task_engine_childless_reaper: failed to query childless stuck parents"
+                );
+                return;
+            }
+        };
+
+        for parent in candidates {
+            let trace_id = mika_common::trace::generate_trace_id();
+            let system_session = format!("system-{}", parent.agent_id);
+
+            // Diagnostic parity with the #1126 reaper snapshot: confirm at
+            // decision time that the parent truly has zero children (the
+            // absence this reaper acts on). Snapshot failure is non-fatal — the
+            // SQL query already decided via `NOT EXISTS`.
+            let children = match self.db.get_reaper_child_snapshot(&parent.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_childless_reaper: failed to snapshot children"
+                    );
+                    Vec::new()
+                }
+            };
+            info!(
+                parent_id = %parent.id,
+                agent_id = %parent.agent_id,
+                parent_status = "in_progress",
+                parent_source = "self_dev",
+                children_count = children.len(),
+                children = ?children,
+                "task_engine_childless_reaper.evaluated"
+            );
+
+            // SOLE WRITER: stuck_in_progress_no_callback_child. Guarded UPDATE
+            // (terminal-state check) — returns false when the parent already
+            // left in_progress (operator/agent race), true on transition.
+            match self
+                .db
+                .update_task_failed(&parent.id, "stuck_in_progress_no_callback_child")
+                .await
+            {
+                Ok(true) => {
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_childless_reaper",
+                            &parent.id,
+                            Some("in_progress"),
+                            Some("failed"),
+                            Some("stuck_in_progress_no_callback_child"),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        warn!(
+                            parent_id = %parent.id,
+                            error = %e,
+                            "task_engine_childless_reaper: failed to write audit event"
+                        );
+                    }
+
+                    let age_minutes = compute_reaper_age_minutes(&parent.created_at);
+                    info!(
+                        parent_id = %parent.id,
+                        agent_id = %parent.agent_id,
+                        created_at = %parent.created_at,
+                        age_minutes,
+                        trace_id = %trace_id,
+                        "task_engine_childless_reaper.reaped"
+                    );
+                }
+                Ok(false) => {
+                    // Parent already transitioned away from in_progress
+                    // (operator/agent race or duplicate query row) — skip (R7).
+                    debug!(
+                        parent_id = %parent.id,
+                        "task_engine_childless_reaper: parent already in terminal state, skipping"
+                    );
+                }
+                Err(e) => {
+                    // Audit-event-on-error so operators catch silent failures
+                    // (mirror the orphan reaper's F5 pattern, R7).
+                    let _ = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_childless_reaper",
+                            &parent.id,
+                            Some("in_progress"),
+                            None,
+                            Some(&format!("reaper_db_error: {e}")),
+                            Some(&trace_id),
+                        )
+                        .await;
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_childless_reaper: db error during transition"
+                    );
+                }
+            }
+        }
+    }
+
     /// Compute the fire timestamp and push a task onto the heap (used in both
     /// startup recovery and periodic scan).
     #[allow(clippy::too_many_arguments)]
@@ -1207,6 +1369,42 @@ fn compute_reaper_age_hours(created_at: &str) -> i64 {
             (now - dt).num_hours()
         })
         .unwrap_or(0)
+}
+
+/// Compute how many minutes old a task is based on its `created_at` timestamp.
+/// Returns 0 on parse failure (conservative — won't inflate the reaped-log age).
+fn compute_reaper_age_minutes(created_at: &str) -> i64 {
+    crate::timestamp::parse(created_at)
+        .map(|dt| {
+            let now = chrono::Utc::now();
+            (now - dt).num_minutes()
+        })
+        .unwrap_or(0)
+}
+
+/// Resolve the childless-parent reaper grace window (mika#1687, D5).
+///
+/// Reads `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS`, parses to `i64`, and falls
+/// back to [`CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS`] (1800) on
+/// missing/invalid/≤0 (WARN on invalid). Same safe-fallback shape as the
+/// watchdog's `effective_callback_watchdog_grace_period_secs()`. Env read once
+/// per tick is negligible at the 60s DB-scan cadence.
+fn childless_parent_reaper_grace_secs() -> i64 {
+    match std::env::var(CHILDLESS_PARENT_REAPER_GRACE_ENV) {
+        Ok(raw) => match raw.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => {
+                warn!(
+                    env = CHILDLESS_PARENT_REAPER_GRACE_ENV,
+                    value = %raw,
+                    default = CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS,
+                    "invalid childless-parent reaper grace value; falling back to default"
+                );
+                CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+            }
+        },
+        Err(_) => CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS,
+    }
 }
 
 #[cfg(test)]
