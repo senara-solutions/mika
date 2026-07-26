@@ -2,8 +2,45 @@
 type: fix
 issue: 1616
 title: pr_merge_with_gate PAT gap on mika-cloud PRs — extend credential scope + fallback
-status: draft
+status: implemented
 ---
+
+## Diagnosis addendum (implementation-time, supersedes hypothesis)
+
+The Phase 1 diagnosis (AC1) materially revised the plan. Findings from reading
+`crates/mika-agent/src/tools/pr_merge_with_gate.rs` + credential wiring:
+
+1. **No "PAT gap" string exists in the codebase.** The message quoted in the
+   issue was mika-dev's LLM *paraphrasing an opaque `gate_errored` result* — the
+   session output shows it took "no action" and never called the tool. The
+   "PAT gap" phrasing was a fabricated guess, not a code-emitted error.
+2. **The tool uses a single credential** — `ctx.github_token` (the GitHub App
+   installation token via `Settings::agent_github_token()`, PAT as fallback),
+   passed to `gh` as `GH_TOKEN`. There is **no per-repo allowlist in code** and
+   **no "primary path vs installation-token fallback"**: they are the same
+   token. The plan's Path (2) — "GraphQL `enablePullRequestAutoMerge` via the
+   installation token" — is a **no-op**, because `gh pr merge --auto` already
+   invokes exactly that mutation with exactly that token. This is the F2
+   escape-hatch condition (do not implement a blind fallback that masks
+   unrelated failures).
+3. **Real root cause is infra, not code:** the GitHub App is almost certainly
+   not installed on `senara-solutions/mika-cloud` (a private repo), so a genuine
+   `gh pr merge` returns HTTP 403 "Resource not accessible by integration."
+   That is the operator step already captured in AC2/AC5 and Risk 1 — it cannot
+   be fixed from Rust.
+
+**Revised code deliverable (ships in this PR):** the honest, valuable code fix
+is *diagnostic classification*. When `gh` fails with a credential-scope 403,
+`pr_merge_with_gate` now returns a structured `GateErrorKind::CredentialScope
+{ repo }` variant with an actionable detail message (name the repo + the App /
+PAT remediation) instead of an opaque `gh_cli_failure`. This directly kills the
+observed failure mode — an opaque error the LLM turns into a fabricated cause —
+and gives operators a concrete signal. Detection mirrors the established
+`classify_gh_error()` heuristic (403 / forbidden / "resource not accessible").
+Wired into all four `gh` failure sites (preflight, checks, auto-merge,
+immediate-merge). The literal GraphQL fallback from AC3 is **withdrawn as a
+no-op** per the F2 criteria.
+
 
 # Plan — mika#1616 pr_merge_with_gate PAT gap on mika-cloud
 
@@ -47,6 +84,15 @@ Root cause hypothesis (per body): mika-dev's GitHub credential is one of {App in
 - **AC4** — Integration test: mocked GH API scenario asserts merge succeeds via fallback. `cargo test -p mika-agent` clean.
   - **F4 test-scaffolding boundary (architect required):** If existing GH mocking is unavailable in `crates/mika-agent/tests/eval/`, scope limited to unit-testable credential-provider logic; integration test uses recorded fixture (per `docs/adr/recorded-fixture-pattern.md` if it exists) or is deferred to manual verification, documented in the PR body. Building a full GH mocking harness is out of scope for this ticket.
 - **AC5** — Verification against mika-cloud: after ship + deploy, next mika-cloud PR that lands (or a synthetic test PR) merges via autonomous path without operator intervention. Verified by dispatch log inspection.
+
+## Definition of Done
+
+- [ ] `GateErrorKind::CredentialScope { repo }` variant added and serialized as `kind: "credential_scope"`.
+- [ ] All four `gh` failure sites in `pr_merge_with_gate` route through `classify_credential_scope_error()`.
+- [ ] Unit tests cover: serialization, positive classification (403 / forbidden / resource-not-accessible / admin-rights), and negative classification (no false positives on unrelated errors).
+- [ ] `cargo test -p mika-agent`, `cargo clippy -p mika-agent`, and `cargo fmt` all clean.
+- [ ] Diagnosis (AC1) documented in this plan; the no-op GraphQL fallback withdrawn with rationale.
+- [ ] Operator follow-up (AC2/AC5 — install the GitHub App on `senara-solutions/mika-cloud`) surfaced in the PR body as the residual infra step.
 
 ## Deliverables (mapped to ACs)
 
