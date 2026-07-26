@@ -15111,6 +15111,128 @@ mod tests {
     }
 
     #[test]
+    fn test_get_or_create_canonical_session_is_idempotent() {
+        // mika#1401: repeated calls reuse the same row (INSERT OR IGNORE), so every
+        // `mika ask` to a singleton agent lands on one canonical session.
+        let db = db();
+        let id = "canonical-mika-prime";
+        let r1 = db
+            .get_or_create_canonical_session(id, "mika-prime", "cli")
+            .unwrap();
+        assert_eq!(r1, id);
+        // Write a message to the canonical session.
+        db.save_message("mika-prime", id, "user", "first ask", None)
+            .unwrap();
+        // Second invocation must not fail on duplicate PK and must not clobber.
+        let r2 = db
+            .get_or_create_canonical_session(id, "mika-prime", "cli")
+            .unwrap();
+        assert_eq!(r2, id);
+        db.save_message("mika-prime", id, "user", "second ask", None)
+            .unwrap();
+
+        // Exactly one session row exists, accumulating both messages.
+        let session_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_count, 1);
+        let msg_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 2);
+    }
+
+    #[test]
+    fn test_end_session_unless_canonical_noops_on_canonical() {
+        // mika#1401: the canonical session must never be ended (pruning-safe).
+        let db = db();
+        let id = "canonical-mika-prime";
+        db.get_or_create_canonical_session(id, "mika-prime", "cli")
+            .unwrap();
+        // Attempt to end it while passing itself as the canonical id → no-op.
+        db.end_session_unless_canonical(id, Some(id)).unwrap();
+        let ended: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_none(), "canonical session must stay open");
+    }
+
+    #[test]
+    fn test_end_session_unless_canonical_ends_non_canonical() {
+        // A non-canonical session (or None canonical_id) ends normally.
+        let db = db();
+        db.create_session("per-ask", "mika", "cli").unwrap();
+        db.end_session_unless_canonical("per-ask", Some("canonical-mika"))
+            .unwrap();
+        let ended: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = 'per-ask'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_some(), "non-canonical session should be ended");
+
+        // None canonical_id (non-singleton agent) also ends normally.
+        db.create_session("per-ask-2", "mika", "cli").unwrap();
+        db.end_session_unless_canonical("per-ask-2", None).unwrap();
+        let ended: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = 'per-ask-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_some());
+    }
+
+    #[test]
+    fn test_canonical_session_exempt_from_pruning() {
+        // mika#1401 + D5: the `canonical-` prefix is not in prune_old_sessions's
+        // LIKE list, so even an (erroneously) ended canonical session survives.
+        let db = db();
+        let id = "canonical-mika-prime";
+        db.get_or_create_canonical_session(id, "mika-prime", "cli")
+            .unwrap();
+        // Force-end and backdate to simulate a worst-case stale row.
+        db.end_session(id).unwrap();
+        db.conn
+            .execute(
+                "UPDATE sessions SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 days') WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let pruned = db.prune_old_sessions(7 * 24 * 60 * 60).unwrap();
+        assert_eq!(pruned, 0, "canonical prefix must be exempt from pruning");
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn test_prune_old_sessions() {
         let db = db();
         // Create two ended sessions and one active (not ended)

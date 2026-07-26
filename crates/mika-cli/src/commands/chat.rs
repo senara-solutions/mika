@@ -790,11 +790,15 @@ pub async fn run(
                             new_model,
                             new_identity,
                             new_skills,
+                            new_is_singleton_session,
                         )) => {
                             // Update app fields
                             app.agent_tx = new_tx;
                             app.agent_rx = new_rx;
                             app.session_id = new_session;
+                            // The target agent may have a different session profile
+                            // (mika#1401): switch the singleton gate to match it.
+                            app.is_singleton_session = new_is_singleton_session;
                             app.model = new_model.clone();
                             app.identity_name = new_identity;
                             app.db = new_worker._ctx.async_db.clone();
@@ -891,6 +895,8 @@ pub async fn run(
                             new_model,
                             _new_identity,
                             new_skills,
+                            // Same agent restarted — the singleton gate is invariant.
+                            _new_is_singleton_session,
                         )) => {
                             app.agent_tx = new_tx;
                             app.agent_rx = new_rx;

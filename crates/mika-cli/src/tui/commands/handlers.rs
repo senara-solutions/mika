@@ -110,6 +110,31 @@ fn handle_help() -> String {
 }
 
 async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
+    // Singleton agents (mika#1401) are single-session-by-nature: the canonical
+    // session must never be ended or replaced. `/clear` therefore resets only the
+    // visual display — the session ID and the agent worker's loaded context are
+    // preserved, and the DB history (the canonical thread) is left intact. This is
+    // the TUI counterpart of `end_session_unless_canonical` on the CLI exit paths.
+    if app.is_singleton_session {
+        app.messages.clear();
+        app.scroll_offset = 0;
+        // Suppress the just-cleared history from re-rendering on the next poll.
+        app.last_seen_msg_id = app.db.max_message_id().await.unwrap_or(0);
+        app.context_tokens = None;
+        app.messages_layout = MessagesLayout::default();
+        app.pending_response = None;
+        app.reveal_index = 0;
+        app.status = AgentStatus::Idle;
+        app.pending_images.clear();
+        app.pending_command = None;
+        app.has_new_message = false;
+        app.selection_state = SelectionState::None;
+        app.pending_task_count = 0;
+        app.hidden_internal_count = 0;
+        app.needs_redraw = true;
+        return "Display cleared. This agent is single-session-by-nature (mika#1401) — the canonical session is preserved.".to_string();
+    }
+
     // End the current session
     let old_session = app.session_id.clone();
     if let Err(e) = app.db.end_session(&old_session).await {
@@ -1361,7 +1386,8 @@ mod tests {
             "mika".to_string(),
             global_home,
             ProviderKind::Anthropic,
-            false,
+            false, // start_in_audit_mode
+            false, // is_singleton_session (mika#1401)
         );
 
         (app, agent_rx, temp_dir)
@@ -1496,6 +1522,60 @@ mod tests {
         assert!(
             old.map(|s| s.ended_at.is_some()).unwrap_or(false),
             "old session should have ended_at set"
+        );
+    }
+
+    // --- /clear singleton tests (mika#1401) ---
+
+    #[tokio::test]
+    async fn test_clear_singleton_preserves_session() {
+        let (mut app, mut rx, _tmp) = test_app().await;
+        app.is_singleton_session = true;
+        let session_before = app.session_id.clone();
+
+        app.messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: "hello".to_string(),
+            rendered: None,
+            channel: None,
+        });
+
+        let output = handle_clear(&mut app, "").await;
+
+        // Session ID is preserved (single-session-by-nature).
+        assert_eq!(
+            app.session_id, session_before,
+            "singleton session_id must not change on /clear"
+        );
+        assert!(output.contains("single-session-by-nature"));
+        // Display is still cleared.
+        assert!(
+            app.messages.is_empty(),
+            "display messages should be cleared"
+        );
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.needs_redraw);
+        // No NewSession request is sent — the worker keeps its context.
+        let requests = drain_requests(&mut rx);
+        assert!(
+            requests.is_empty(),
+            "singleton /clear must not send a NewSession request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_singleton_does_not_end_session() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.is_singleton_session = true;
+        let session_id = app.session_id.clone();
+
+        handle_clear(&mut app, "").await;
+
+        // The canonical session's ended_at must stay NULL.
+        let session = app.db.get_session(&session_id).await.unwrap();
+        assert!(
+            session.map(|s| s.ended_at.is_none()).unwrap_or(false),
+            "singleton session must not be ended on /clear"
         );
     }
 
