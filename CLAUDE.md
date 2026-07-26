@@ -215,6 +215,9 @@ Optional (dispatch grooming gate):
 Optional (auto-pull stuck-ready reconciler):
 - `MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS` — Minimum age (seconds) the `ready` label must exceed before the auto-pull Phase 2 reconciler treats a ticket as stuck and remove→add re-drives it (mika#1824, default `900`). Phase 2 runs after Phase 1 on each 10-min `auto_pull_groomed_ticket` tick, independent of queue depth, and rescues tickets that carry `ready` but were never dispatched (webhook dropped, mika-dev busy at fire time, dispatch-gate silent-accept). Invalid or negative values fall back to the default (WARN-logged). Emits `stuck_ready_reconciled` INFO per rescue and `stuck_ready_reconcile_skipped` DEBUG per skip reason (`in_flight_self_dev`/`open_pr_closing`/`circuit_breaker`/`below_threshold`). Steady-state expectation: ≤5 rescues/day; >20/day indicates the dispatch-layer primary fix is still needed (#1291-adjacent).
 
+Optional (worktree hygiene — mika#1694):
+- `MIKA_WORKTREE_REAP_REPO_DIR` — mika checkout the PR-close worktree reaper enumerates worktrees from (default `/data/workspace/mika-platform/mika`; empty value disables the reaper). On each `pull_request.closed` webhook, `server::worktree_reaper` reaps that branch's dispatch worktree under `.claude/worktrees/` — clean-only, dirty worktrees are flagged via a `worktree.reap_skipped_dirty` audit event and left for operator salvage. Silent no-op when the repo dir is absent or not a git checkout (containerized production). See `docs/operator/worktree-hygiene.md` for the full runbook (audit/clean commands + stranded-worktree recovery).
+
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)

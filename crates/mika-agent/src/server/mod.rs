@@ -21,6 +21,7 @@ pub mod variants;
 pub(crate) mod verdict;
 pub mod verdict_handler;
 pub mod webhook_queue;
+pub mod worktree_reaper;
 
 use crate::kg::config::KgAgentConfig;
 use anyhow::{Context as _, Result, anyhow};

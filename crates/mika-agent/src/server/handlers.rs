@@ -1009,6 +1009,27 @@ async fn run_agent_for_message(
                 unreachable!("milestone_context handler never dispatches");
             }
         }
+
+        // Worktree reaper (mika#1694 AC3): on `[GitHub] PR closed:` webhooks,
+        // reap the branch's dispatch worktree under `.claude/worktrees/`
+        // deterministically, host-side, before the LLM turn. Side-effect only —
+        // always Passthrough, so the milestone-advance / ack flow is unchanged.
+        let reap_action = super::worktree_reaper::try_reap_closed_pr_worktree(
+            &req.text,
+            &a.db,
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match reap_action {
+            VerdictAction::Passthrough { .. } => {}
+            VerdictAction::Handled { .. } => {
+                unreachable!("worktree_reaper never handles");
+            }
+            VerdictAction::Dispatched { .. } => {
+                unreachable!("worktree_reaper never dispatches");
+            }
+        }
     }
 
     let params = agent::AgentParams {
