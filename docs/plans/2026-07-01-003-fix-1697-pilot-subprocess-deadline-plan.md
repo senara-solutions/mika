@@ -44,14 +44,14 @@ Resource cost per slow pilot: ~$1.75 in LLM billing (vs typical $0.10 fast pilot
 
 Transposed from the issue body's "What's actually missing" section + F1 architect requirement (mika#1559 gate — this section must be present + non-empty):
 
-- **AC1** — Soft-warn signal fires when subprocess elapsed > `MIKA_PILOT_SOFT_WARN_MULTIPLIER × MAX_LOOP_ELAPSED_SECS` (default: 2 × 300s = 10min). Emission is idempotent per crossed threshold (2×, 5×, 10×) — no duplicate warns per threshold per task.
-- **AC2** — Hard-kill signal fires when subprocess elapsed > `MIKA_PILOT_HARD_TIMEOUT_SECS` (default 3600s = 60min). SIGTERM sent, 30s grace, then SIGKILL. Task marked `failed` with `error_reason = "subprocess_exceeded_hard_timeout"` + `retryable = false`.
-- **AC3** — `TaskHealth` struct extended with `pilot_slow: bool` (subprocess > 2× deadline) and `pilot_timeout_imminent: bool` (subprocess > 80% of hard threshold). New fields use `#[serde(default)]` for backwards-compat with existing consumers (F4).
-- **AC4** — Dispatch slot released immediately on hard-kill. Integration test verifies: queue a task, hard-kill it via elapsed-time SQL injection, assert next queued task can dispatch within one watchdog-tick. See F2 verification prerequisite.
-- **AC5** — `audit_events` rows emitted per emission: `kind = "pilot_slow"` on soft-warn (target_key = task_id, detail = elapsed + PID + threshold), `kind = "pilot_hard_killed"` on hard-kill (target_key = task_id, detail = elapsed + PID + signal-sequence).
-- **AC6** — Subprocess PID + start_time queryable via `tasks.metadata` JSON path (F3): `metadata.subprocess.pid` (i32) and `metadata.subprocess.started_at` (unix seconds). Uses existing `set_task_metadata_field` / `get_task_metadata_field` helpers per callback-watchdog (mika#959) precedent.
-- **AC7** — Configuration documented: `.env.example` + `docs/configuration.md` describe both new env vars side-by-side with `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` to clarify semantic differences (life-of-subprocess vs post-death detection).
-- **AC8** — Regression suite passes: `cargo test -p mika-agent` clean, `make calibrate-mika-dev` shows no calibration regression, existing fast-pilot dispatches complete normally with no false-positive soft-warn.
+- [ ] **AC1** — Soft-warn signal fires when subprocess elapsed > `MIKA_PILOT_SOFT_WARN_MULTIPLIER × MAX_LOOP_ELAPSED_SECS` (default: 2 × 300s = 10min). Emission is idempotent per crossed threshold (2×, 5×, 10×) — no duplicate warns per threshold per task.
+- [ ] **AC2** — Hard-kill signal fires when subprocess elapsed > `MIKA_PILOT_HARD_TIMEOUT_SECS` (default 3600s = 60min). SIGTERM sent, 30s grace, then SIGKILL. Task marked `failed` with `error_reason = "subprocess_exceeded_hard_timeout"` + `retryable = false`.
+- [ ] **AC3** — `TaskHealth` struct extended with `pilot_slow: bool` (subprocess > 2× deadline) and `pilot_timeout_imminent: bool` (subprocess > 80% of hard threshold). New fields use `#[serde(default)]` for backwards-compat with existing consumers (F4).
+- [ ] **AC4** — Dispatch slot released immediately on hard-kill. Integration test verifies: queue a task, hard-kill it via elapsed-time SQL injection, assert next queued task can dispatch within one watchdog-tick. See F2 verification prerequisite.
+- [ ] **AC5** — `audit_events` rows emitted per emission: `kind = "pilot_slow"` on soft-warn (target_key = task_id, detail = elapsed + PID + threshold), `kind = "pilot_hard_killed"` on hard-kill (target_key = task_id, detail = elapsed + PID + signal-sequence).
+- [ ] **AC6** — Subprocess PID + start_time queryable via `tasks.metadata` JSON path (F3): `metadata.subprocess.pid` (i32) and `metadata.subprocess.started_at` (unix seconds). Uses existing `set_task_metadata_field` / `get_task_metadata_field` helpers per callback-watchdog (mika#959) precedent.
+- [ ] **AC7** — Configuration documented: `.env.example` + `docs/configuration.md` describe both new env vars side-by-side with `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` to clarify semantic differences (life-of-subprocess vs post-death detection).
+- [ ] **AC8** — Regression suite passes: `cargo test -p mika-agent` clean, `make calibrate-mika-dev` shows no calibration regression, existing fast-pilot dispatches complete normally with no false-positive soft-warn.
 
 ## Deliverables (mapped to ACs)
 
