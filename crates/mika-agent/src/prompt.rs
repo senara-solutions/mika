@@ -1138,12 +1138,87 @@ mod tests {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            session: SessionIdentityConfig::default(),
             curator: None,
         }
     }
 
     fn test_time() -> DateTime<Utc> {
         "2026-02-24T12:00:00Z".parse().unwrap()
+    }
+
+    // --- Canonical session resolution (mika#1401) ---
+
+    #[test]
+    fn test_resolve_canonical_session_non_singleton_returns_none() {
+        // Default identity is non-singleton — callers mint a fresh UUID per ask.
+        let identity = test_identity();
+        assert!(!identity.session.singleton);
+        assert_eq!(resolve_canonical_session_id(&identity, "mika-prime"), None);
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_singleton_derives_id() {
+        // singleton = true without an explicit canonical_id derives
+        // `canonical-{agent_id}` (prefix-typed sibling of system-{agent_id}).
+        let mut identity = test_identity();
+        identity.session.singleton = true;
+        assert_eq!(
+            resolve_canonical_session_id(&identity, "mika-prime"),
+            Some("canonical-mika-prime".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_singleton_honors_explicit_id() {
+        // An explicit canonical_id (e.g. mika-prime's zero-UUID) wins over derivation.
+        let mut identity = test_identity();
+        identity.session.singleton = true;
+        identity.session.canonical_id = Some("00000000-0000-0000-0000-000000000000".to_string());
+        assert_eq!(
+            resolve_canonical_session_id(&identity, "mika-prime"),
+            Some("00000000-0000-0000-0000-000000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_canonical_session_canonical_id_ignored_when_not_singleton() {
+        // canonical_id present but singleton = false → still None (opt-in gate).
+        let mut identity = test_identity();
+        identity.session.singleton = false;
+        identity.session.canonical_id = Some("00000000-0000-0000-0000-000000000000".to_string());
+        assert_eq!(resolve_canonical_session_id(&identity, "mika-prime"), None);
+    }
+
+    #[test]
+    fn test_session_identity_config_parses_from_toml() {
+        // The [session] block deserializes with both fields set.
+        let toml = r#"
+name = "Mika Prime"
+emoji = "✦"
+
+[session]
+singleton = true
+canonical_id = "00000000-0000-0000-0000-000000000000"
+"#;
+        let identity: Identity = toml::from_str(toml).unwrap();
+        assert!(identity.session.singleton);
+        assert_eq!(
+            identity.session.canonical_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
+    }
+
+    #[test]
+    fn test_session_identity_config_defaults_when_absent() {
+        // Absent [session] block → singleton = false, canonical_id = None.
+        let toml = r#"
+name = "Mika"
+emoji = "✦"
+"#;
+        let identity: Identity = toml::from_str(toml).unwrap();
+        assert!(!identity.session.singleton);
+        assert!(identity.session.canonical_id.is_none());
     }
 
     fn test_core_memory() -> Vec<CoreMemoryEntry> {
@@ -1221,6 +1296,7 @@ mod tests {
             skills: SkillsIdentityConfig::default(),
             tools: ToolsIdentityConfig::default(),
             context: ContextIdentityConfig::default(),
+            session: SessionIdentityConfig::default(),
             curator: None,
         };
         let ctx = PromptContext {

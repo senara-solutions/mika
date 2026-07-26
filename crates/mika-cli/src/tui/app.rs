@@ -2164,7 +2164,8 @@ mod tests {
             "mika".to_string(),
             global_home,
             mika_common::llm::ProviderKind::Anthropic,
-            false,
+            false, // start_in_audit_mode
+            false, // is_singleton_session (mika#1401)
         );
 
         (app, response_tx, temp_dir)
