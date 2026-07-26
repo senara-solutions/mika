@@ -6334,6 +6334,61 @@ impl Database {
         Ok(rows)
     }
 
+    /// Find parent self_dev **issue** tasks left `in_progress` with **zero**
+    /// callback children, aged past `grace_seconds` (mika#1687).
+    ///
+    /// This is the zero-child complement of `find_orphaned_parent_tasks` and
+    /// `find_completable_parent_tasks_on_pr_url`: both of those INNER-JOIN a
+    /// delivered callback child, so a parent that reached `in_progress` without
+    /// ever recording a callback child (silent pilot death — hypothesis 3 of
+    /// mika#1687) produces zero rows in either and is never reaped. The
+    /// `NOT EXISTS (SELECT 1 FROM tasks child …)` predicate here is the exact
+    /// complement of their JOIN, so the three selection sets are disjoint by
+    /// construction (they require a child; this requires none).
+    ///
+    /// Staleness keys on `parent.updated_at` (there is no delivered-child
+    /// `updated_at` to key on). Scoped to `type='issue'` in v1 — milestone and
+    /// project parents legitimately sit childless between child dispatches and
+    /// carry their own advancement backstops (mika#991, #1218); their
+    /// childless-stuck detection is a deferred follow-up.
+    ///
+    /// SOLE WRITER context: candidates selected here are transitioned to
+    /// `failed` with the distinct `stuck_in_progress_no_callback_child` reason
+    /// by `TaskEngine::reap_childless_stuck_parent_tasks`.
+    pub fn find_childless_stuck_parent_tasks(
+        &self,
+        agent_id: &str,
+        grace_seconds: i64,
+    ) -> Result<Vec<ChildlessStuckParent>> {
+        let grace_modifier = format!("-{grace_seconds} seconds");
+        let mut stmt = self.conn.prepare(
+            "SELECT parent.id, parent.agent_id, parent.created_at, parent.updated_at
+             FROM tasks parent
+             WHERE parent.agent_id = ?1
+               AND parent.status = 'in_progress'
+               AND parent.source = 'self_dev'
+               AND parent.trigger_type = 'manual'
+               AND parent.type = 'issue'
+               AND parent.updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks child
+                 WHERE child.parent_task_id = parent.id
+               )
+             ORDER BY parent.id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, grace_modifier], |row| {
+                Ok(ChildlessStuckParent {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Return ALL children of a parent task for the reaper's structured log event
     /// (`task_engine_reaper.evaluated`). Captures a point-in-time snapshot at kill
     /// time so post-incident diagnosis can see what the reaper saw (mika#1126).
