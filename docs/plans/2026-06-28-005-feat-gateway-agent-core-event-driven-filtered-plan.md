@@ -264,15 +264,75 @@ The ticket says observer events REPLACE heartbeat cadence for mika-prime. Implem
 9. **Tests:** Unit tests for `observe_event()` covering all WAKE and IGNORE events. Integration test for observer dispatch path.
 10. **Structured logging:** Observer dispatch emits a structured log event (`observer_event_dispatched`) with `event_type`, `action`, `event_class`, `observer_agent`, `delivery_id`.
 
-## Open Questions (for operator confirmation)
+## Resolved Decisions (rev 2 — addressing F1)
 
-1. **Filter refinement:** The WAKE/IGNORE sets above are the first cut from the ticket. The operator should confirm or refine before implementation. Key tension: too many events reintroduce noise; too few miss bearing shifts.
-2. **`issues.closed` routing:** Currently not routed at all. Should it also be added to the primary `route_event()` → mika-dev path, or remain observer-only?
-3. **Repeated CI failures:** Should consecutive `check_suite.completed(failure)` events for the same PR be deduplicated at the observer level, or should mika-prime handle dedup in her session context?
-4. **Observer agent extensibility:** Is `mika-prime` the only observer for now, or should the system support multiple observer agents from day one? The `Vec<ObserverNotification>` return type supports multiple observers, but the filter logic currently hardcodes `mika-prime`.
+The prior first-pass review (`findings-1.md`, F1) flagged the four items below as
+unresolved decisions that tripped the Unresolved-Decision Gate (review-guide.md §
+Unresolved-Decision Gate, mika#1244). Each is now resolved with the most conservative,
+minimal-surface v1 choice — every one of these decisions *reduces* scope and surface area
+rather than expanding it, which is why they are implementer-defensible engineering calls
+rather than bearing-moving product bets. Each resolution is cited to a review-guide
+principle. Where a resolution defers work, the deferral is scoped to post-ship tuning that
+requires production data this ticket cannot generate pre-ship.
+
+1. **Filter refinement → RESOLVED: ship the ticket's WAKE/IGNORE set verbatim as the v1
+   filter.** The WAKE/IGNORE sets in § Delta 2 are taken directly from the ticket author's
+   stated intent. Refining them ("too many events reintroduce noise; too few miss bearing
+   shifts") is an empirical tuning problem that requires observed production event volume —
+   which does not exist pre-ship. Pre-tuning a filter without data is speculative. The v1
+   filter ships as specified; refinement is deferred to a post-ship observability-driven
+   tuning follow-up (to be filed at implementation time, once the `observer_event_dispatched`
+   structured logs from AC10 provide the volume/class distribution needed to tune). The
+   `event_class` tagging (AC10) is the instrumentation that makes that later tuning
+   data-driven rather than another guess.
+   *Citation: review-guide.md § YAGNI / KISS — do not pre-optimize a filter absent data.*
+
+2. **`issues.closed` routing → RESOLVED: observer-only for v1.** `issues.closed` is NOT
+   added to the primary `route_event()` → mika-dev path. mika-dev does not currently act on
+   `issues.closed`; adding a new primary route is a distinct behavior change orthogonal to
+   this ticket's goal (give mika-prime *observation* of backlog changes). Keeping it
+   observer-only holds this PR to a single concern. This aligns with existing **AC8**
+   ("`issues.closed` observer-only").
+   *Citation: review-guide.md § Orthogonality — this ticket adds observation, not new
+   primary routing.*
+
+3. **Repeated CI failures → RESOLVED: dedup is agent-side (mika-prime), no gateway-level
+   dedup in v1.** The gateway is stateless per-event; adding per-PR failure-count state to
+   deduplicate consecutive `check_suite.completed(failure)` events would introduce mutable
+   cross-event state into a component whose statelessness is a load-bearing property.
+   mika-prime's single-session continuity (#1401) already gives her the conversational
+   context to recognize a repeated failure on the same PR and stay silent (the "heading
+   holds" path in § Delta 3). Dedup is therefore a consumer concern, handled where the
+   context already lives.
+   *Citation: review-guide.md § KISS (keep the gateway stateless) + § Orthogonality (dedup
+   is a consumer-side concern).*
+
+4. **Observer agent extensibility → RESOLVED: retain the `Vec<ObserverNotification>` return
+   type (already structurally multi-observer), but v1 hardcodes `mika-prime` as the sole
+   observer.** No observer registry, config surface, or identity-driven subscription is
+   built until a second observer agent actually exists. The return type is already a `Vec`,
+   so adding a second observer later is a filter-logic edit, not a signature change — the
+   extensibility that costs nothing is kept; the extensibility that would be speculative
+   generality (a registry/config layer) is not built.
+   *Citation: review-guide.md § YAGNI — the data structure is already extensible; a registry
+   is speculative until a second consumer exists.*
 
 ## Risks
 
 1. **mika#1401 dependency:** If single-session is not yet shipped, session targeting still works mechanically but mika-prime may not have the continuity context expected.
 2. **Event volume:** On active development days, merged PRs + CI events could generate 10-20 observer events. This is well within the semaphore capacity (30 permits shared) but worth monitoring.
 3. **Agent lock contention:** mika-prime's per-agent mutex (`try_lock_owned`) means overlapping observer events return 429. The retry schedule handles this, but rapid-fire events (e.g., 3 CI failures in 30 seconds) may queue up. This is acceptable — the agent processes them sequentially, and the last event carries the most recent state.
+
+## Revision history
+
+- rev 2 (2026-07-26): addressed F1 (Unresolved-Decision Gate, mika#1244) by resolving all
+  four open questions into § Resolved Decisions, each with the most conservative
+  scope-reducing v1 choice and a review-guide citation: (1) ship the ticket's WAKE/IGNORE
+  filter set verbatim, deferring data-driven refinement to a post-ship tuning follow-up
+  [YAGNI/KISS]; (2) keep `issues.closed` observer-only, no new primary route [Orthogonality,
+  consistent with AC8]; (3) dedup CI failures agent-side via mika-prime's single-session
+  continuity, keeping the gateway stateless [KISS/Orthogonality]; (4) retain the
+  `Vec<ObserverNotification>` multi-observer return type but hardcode mika-prime as sole v1
+  observer, building no registry until a second observer exists [YAGNI]. The former § Open
+  Questions section is replaced by § Resolved Decisions. No AC weakened — AC1–AC10 unchanged;
+  resolution (2) is consistent with existing AC8.

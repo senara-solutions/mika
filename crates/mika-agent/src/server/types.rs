@@ -25,6 +25,18 @@ pub struct MessageRequest {
     /// Optional images forwarded from the gateway (base64-encoded).
     #[serde(default)]
     pub images: Option<Vec<ImagePayload>>,
+    /// Target session id. When absent (or empty), the handler mints a fresh
+    /// UUID per message (default behavior). Observer events (mika#1403) set
+    /// this to the fixed observer session so every notification lands in one
+    /// continuous session instead of a new UUID per event.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// When `true`, the message is stored as `internal=1` — an agent-to-agent
+    /// message hidden from the user inbox. Observer events (mika#1403) set this
+    /// so mika-prime's filtered event copies never surface as user-facing chat.
+    /// Absent/`false` = normal user-visible message.
+    #[serde(default)]
+    pub internal: Option<bool>,
 }
 
 /// Accepted response for async processing.
@@ -133,5 +145,38 @@ mod tests {
         let req: MessageRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.chat_id, Some(0));
         // Deserialized as Some(0) — the handler must guard against storing it.
+    }
+
+    #[test]
+    fn test_message_request_without_session_id_or_internal() {
+        // mika#1403: primary events omit both fields — they must default to
+        // None so the handler mints a fresh UUID and stores internal=false.
+        let json = r#"{
+            "text": "PR opened",
+            "channel": "github",
+            "request_id": "req-5"
+        }"#;
+        let req: MessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.session_id, None);
+        assert_eq!(req.internal, None);
+    }
+
+    #[test]
+    fn test_message_request_with_session_id_and_internal() {
+        // mika#1403: observer events carry a fixed session_id and internal=true.
+        let json = r#"{
+            "text": "[Observer: backlog_changed] PR merged",
+            "channel": "github",
+            "request_id": "req-6-obs-mika-prime",
+            "agent": "mika-prime",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "internal": true
+        }"#;
+        let req: MessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.session_id.as_deref(),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
+        assert_eq!(req.internal, Some(true));
     }
 }
