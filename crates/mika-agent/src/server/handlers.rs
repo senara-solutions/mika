@@ -1009,6 +1009,35 @@ async fn run_agent_for_message(
                 unreachable!("milestone_context handler never dispatches");
             }
         }
+
+        // Draft-PR ready-label cleanup handler (mika#1849): for
+        // `pull_request.opened` webhooks where the PR is a draft closing one or
+        // more issues, remove the leftover `ready` label from each closing
+        // issue. Side-effect-only injector — never returns Handled/Dispatched
+        // (same shape as milestone_context above). Self-selects on the
+        // `[GitHub] PR opened:` prefix; order-independent with the handlers above.
+        let draft_pr_action = super::draft_pr_opened_handler::try_handle_draft_pr_opened(
+            &req.text,
+            &a.db,
+            verdict_github_token.as_deref(),
+            &session_id,
+            &req.request_id,
+        )
+        .await;
+        match draft_pr_action {
+            VerdictAction::Passthrough {
+                enrichment: Some(e),
+            } => {
+                req.text = format!("{e}{}", req.text);
+            }
+            VerdictAction::Passthrough { enrichment: None } => {}
+            VerdictAction::Handled { .. } => {
+                unreachable!("draft_pr_opened handler never handles");
+            }
+            VerdictAction::Dispatched { .. } => {
+                unreachable!("draft_pr_opened handler never dispatches");
+            }
+        }
     }
 
     let params = agent::AgentParams {

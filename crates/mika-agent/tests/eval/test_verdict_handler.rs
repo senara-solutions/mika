@@ -988,7 +988,13 @@ async fn non_pr_review_event_passes_through() -> Result<()> {
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn verdict_pass_no_task_passes_through() -> Result<()> {
+async fn verdict_pass_no_task_perimeter_fail_closed_holds_for_operator() -> Result<()> {
+    // Post-mika#1853: perimeter check is hoisted BEFORE the task lookup, so a
+    // VERDICT: pass on a PR without an active task row still consults the
+    // forge-gate. In this test env `gh` cannot resolve → `fetch_pr_files`
+    // errors → fail-closed to DECISION-CORE → Handled (hold for operator).
+    // This is the correct new behavior: no task + fetch-error must NOT slip
+    // through to the LLM (that was the mika#1851 bypass being closed).
     let db = test_db().await;
     let text = pr_review_text(
         "approved",
@@ -1013,14 +1019,16 @@ async fn verdict_pass_no_task_passes_through() -> Result<()> {
         VerdictAction::Dispatched { .. } => {
             unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
-        VerdictAction::Passthrough { enrichment } => {
-            assert!(
-                enrichment.is_none(),
-                "pass with no task should pass through cleanly"
+        VerdictAction::Passthrough { .. } => {
+            panic!(
+                "pass with no task + fetch-error should be Handled (forge-gate fail-closed), not Passthrough"
             );
         }
-        VerdictAction::Handled { .. } => {
-            panic!("pass with no task should not be handled");
+        VerdictAction::Handled { pre_digest } => {
+            assert!(
+                pre_digest.contains("forge-gate") || pre_digest.contains("DECISION-CORE"),
+                "hold pre-digest must name the gate: {pre_digest}"
+            );
         }
     }
     Ok(())
@@ -1031,7 +1039,12 @@ async fn verdict_pass_no_task_passes_through() -> Result<()> {
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn verdict_pass_completed_task_passes_through() -> Result<()> {
+async fn verdict_pass_completed_task_perimeter_fail_closed_holds_for_operator() -> Result<()> {
+    // Post-mika#1853: perimeter check runs BEFORE task-status check. A completed
+    // task is no longer a passthrough exit — the gate consults the diff first.
+    // fetch_pr_files errors in test env → fail-closed to DECISION-CORE →
+    // Handled. Task-side metadata write is skipped (task is not in_progress),
+    // but the notification + audit event + hold pre-digest still fire.
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/42";
     let task_id = create_task_with_pr_url(&db, pr_url).await;
@@ -1064,14 +1077,16 @@ async fn verdict_pass_completed_task_passes_through() -> Result<()> {
         VerdictAction::Dispatched { .. } => {
             unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
-        VerdictAction::Passthrough { enrichment } => {
-            assert!(
-                enrichment.is_none(),
-                "pass with completed task should pass through cleanly"
+        VerdictAction::Passthrough { .. } => {
+            panic!(
+                "pass with completed task + fetch-error should be Handled (forge-gate fail-closed), not Passthrough"
             );
         }
-        VerdictAction::Handled { .. } => {
-            panic!("pass with completed task should not be handled");
+        VerdictAction::Handled { pre_digest } => {
+            assert!(
+                pre_digest.contains("forge-gate") || pre_digest.contains("DECISION-CORE"),
+                "hold pre-digest must name the gate: {pre_digest}"
+            );
         }
     }
     Ok(())
@@ -1082,7 +1097,7 @@ async fn verdict_pass_completed_task_passes_through() -> Result<()> {
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-async fn verdict_pass_pending_task_passes_through() -> Result<()> {
+async fn verdict_pass_pending_task_perimeter_fail_closed_holds_for_operator() -> Result<()> {
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/50";
 
@@ -1146,14 +1161,19 @@ async fn verdict_pass_pending_task_passes_through() -> Result<()> {
         VerdictAction::Dispatched { .. } => {
             unreachable!("Dispatched requires resolvable tool in SkillRegistry")
         }
-        VerdictAction::Passthrough { enrichment } => {
-            assert!(
-                enrichment.is_none(),
-                "pass with pending task should pass through cleanly"
+        VerdictAction::Passthrough { .. } => {
+            panic!(
+                "pass with pending task + fetch-error should be Handled (forge-gate fail-closed), not Passthrough"
             );
         }
-        VerdictAction::Handled { .. } => {
-            panic!("pass with pending task should not be handled");
+        VerdictAction::Handled { pre_digest } => {
+            // Post-mika#1853: perimeter runs before task-status check; a pending
+            // task no longer bails to passthrough. fetch fails-closed to
+            // DECISION-CORE → Handled with hold pre-digest.
+            assert!(
+                pre_digest.contains("forge-gate") || pre_digest.contains("DECISION-CORE"),
+                "hold pre-digest must name the gate: {pre_digest}"
+            );
         }
     }
     Ok(())
