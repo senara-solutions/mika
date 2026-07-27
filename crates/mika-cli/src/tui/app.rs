@@ -194,7 +194,16 @@ pub fn session_message_to_chat_message(
             }
             ChatRole::User
         }
-        "assistant" => ChatRole::Assistant,
+        "assistant" => {
+            // mika#1667: tool-only EndTurn turns persist an empty-content assistant
+            // row (carrying tool_calls metadata) alongside the separate send_message
+            // body row. Rendering it produces a bare "<agent>:" header with no body.
+            // Skip it here; the row stays in the DB for introspection/replay.
+            if msg.content.trim().is_empty() {
+                return None;
+            }
+            ChatRole::Assistant
+        }
         "tool_result" => ChatRole::System,
         _ => return None,
     };
@@ -1683,6 +1692,52 @@ impl<'a> App<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // === session_message_to_chat_message tests (mika#1667) ===
+
+    fn session_message(role: &str, content: &str) -> mika_agent::db::SessionMessage {
+        mika_agent::db::SessionMessage {
+            id: 1,
+            session_id: "test-session".to_string(),
+            agent_id: "mika-dev".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            channel_type: "cli".to_string(),
+            metadata: None,
+            trace_id: None,
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            internal: false,
+        }
+    }
+
+    #[test]
+    fn test_empty_assistant_row_skipped() {
+        let msg = session_message("assistant", "");
+        assert!(session_message_to_chat_message(&msg).is_none());
+    }
+
+    #[test]
+    fn test_whitespace_assistant_row_skipped() {
+        let msg = session_message("assistant", "   \n");
+        assert!(session_message_to_chat_message(&msg).is_none());
+    }
+
+    #[test]
+    fn test_nonempty_assistant_row_rendered() {
+        let msg = session_message("assistant", "real reply");
+        let chat = session_message_to_chat_message(&msg).expect("should render");
+        assert_eq!(chat.role, ChatRole::Assistant);
+        assert_eq!(chat.content, "real reply");
+    }
+
+    #[test]
+    fn test_empty_user_row_still_rendered() {
+        // The skip is assistant-scoped; empty user rows are unaffected
+        // (regression guard against over-broad filtering).
+        let msg = session_message("user", "");
+        let chat = session_message_to_chat_message(&msg).expect("should render");
+        assert_eq!(chat.role, ChatRole::User);
+    }
 
     // === InputHistory tests ===
 
