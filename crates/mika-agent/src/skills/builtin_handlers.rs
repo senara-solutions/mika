@@ -7175,7 +7175,8 @@ mod tests {
     #[test]
     fn test_validate_pr_ready_undraft_blocks_wip_rescue_label() {
         // Shape detection: `gh pr ready 1681` is a ready-promote call.
-        let pr = detect_ready_promote_pr(&str_args(&["pr", "ready", "1681"]));
+        let args = str_args(&["pr", "ready", "1681"]);
+        let pr = detect_ready_promote_pr(&args);
         assert_eq!(pr, Some("1681"));
         // Decision on a wip-rescue-labelled PR rejects.
         let view = wip_rescue_label_view();
@@ -7215,13 +7216,14 @@ mod tests {
     #[test]
     fn test_validate_pr_edit_title_blocks_rename_on_wip_rescue() {
         // The captured attack shape: `gh pr edit 1681 --title "fix(...)"`.
-        let pr = detect_ready_promote_pr(&str_args(&[
+        let args = str_args(&[
             "pr",
             "edit",
             "1681",
             "--title",
             "fix(mika#1663): skill-review variant path",
-        ]));
+        ]);
+        let pr = detect_ready_promote_pr(&args);
         assert_eq!(pr, Some("1681"));
         let view = wip_rescue_label_view();
         let result = decide_pr_ready_undraft("1681", Some(&view));
@@ -7231,7 +7233,8 @@ mod tests {
     #[test]
     fn test_validate_passes_pr_ready_undo() {
         // `gh pr ready 1681 --undo` converts TO draft — not a promote, allowed.
-        let pr = detect_ready_promote_pr(&str_args(&["pr", "ready", "1681", "--undo"]));
+        let args = str_args(&["pr", "ready", "1681", "--undo"]);
+        let pr = detect_ready_promote_pr(&args);
         assert_eq!(pr, None);
     }
 
@@ -7260,17 +7263,19 @@ mod tests {
     #[test]
     fn test_extract_pr_number_skips_numeric_title_value() {
         // A numeric `--title 123` value must not be mistaken for the PR number.
-        let pr = detect_ready_promote_pr(&str_args(&["pr", "edit", "1681", "--title", "123"]));
+        let args = str_args(&["pr", "edit", "1681", "--title", "123"]);
+        let pr = detect_ready_promote_pr(&args);
         assert_eq!(pr, Some("1681"));
     }
 
     #[test]
     fn test_detect_ready_promote_normalizes_pr_url() {
-        let pr = detect_ready_promote_pr(&str_args(&[
+        let args = str_args(&[
             "pr",
             "ready",
             "https://github.com/senara-solutions/mika/pull/1681",
-        ]));
+        ]);
+        let pr = detect_ready_promote_pr(&args);
         assert_eq!(pr, Some("1681"));
     }
 
