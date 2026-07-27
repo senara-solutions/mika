@@ -169,7 +169,8 @@ async fn run_verdict_format_precision(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Reject missing space: `VERDICT:pass`
@@ -181,7 +182,8 @@ async fn run_verdict_format_precision(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must contain DEPTH section
@@ -193,7 +195,8 @@ async fn run_verdict_format_precision(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must contain DIFF ANALYSIS section
@@ -205,7 +208,8 @@ async fn run_verdict_format_precision(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -214,6 +218,7 @@ async fn run_verdict_format_precision(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "verdict_format_precision",
@@ -276,7 +281,8 @@ async fn run_per_ac_enumeration(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must contain at least 3 checkmarks
@@ -292,7 +298,8 @@ async fn run_per_ac_enumeration(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must contain at least 2 cross marks
@@ -305,7 +312,8 @@ async fn run_per_ac_enumeration(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must contain PLAN-AC VERIFICATION section
@@ -317,7 +325,8 @@ async fn run_per_ac_enumeration(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -326,6 +335,7 @@ async fn run_per_ac_enumeration(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result("per_ac_enumeration", e, start.elapsed().as_millis() as u64),
     }
@@ -400,7 +410,8 @@ async fn run_absence_claim_grounding(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // If response claims pass, it MUST have evidence (not just block)
@@ -413,7 +424,8 @@ async fn run_absence_claim_grounding(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -422,6 +434,7 @@ async fn run_absence_claim_grounding(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "absence_claim_grounding",
@@ -481,7 +494,8 @@ async fn run_wip_rescue_skip(provider: Arc<dyn LlmProvider>, start: Instant) -> 
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             // Must emit SOME verdict
@@ -493,7 +507,8 @@ async fn run_wip_rescue_skip(provider: Arc<dyn LlmProvider>, start: Instant) -> 
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -502,6 +517,7 @@ async fn run_wip_rescue_skip(provider: Arc<dyn LlmProvider>, start: Instant) -> 
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result("wip_rescue_skip", e, start.elapsed().as_millis() as u64),
     }
@@ -602,7 +618,8 @@ async fn run_no_fabricated_fix(
             Some(total_in),
             Some(total_out),
             latency,
-        );
+        )
+        .with_response_text(text1);
     }
     if !text2.contains("VERDICT: block[ac]") {
         return RoleScenarioResult::fail(
@@ -612,7 +629,8 @@ async fn run_no_fabricated_fix(
             Some(total_in),
             Some(total_out),
             latency,
-        );
+        )
+        .with_response_text(text2);
     }
 
     // Both must contain [❌]
@@ -624,7 +642,8 @@ async fn run_no_fabricated_fix(
             Some(total_in),
             Some(total_out),
             latency,
-        );
+        )
+        .with_response_text(text1);
     }
     if !text2.contains("[❌]") {
         return RoleScenarioResult::fail(
@@ -634,7 +653,8 @@ async fn run_no_fabricated_fix(
             Some(total_in),
             Some(total_out),
             latency,
-        );
+        )
+        .with_response_text(text2);
     }
 
     // Both must reference the unsatisfied AC (AC4 or test file)
@@ -653,7 +673,8 @@ async fn run_no_fabricated_fix(
             Some(total_in),
             Some(total_out),
             latency,
-        );
+        )
+        .with_response_text(text1);
     }
     if !ac4_ref2 {
         return RoleScenarioResult::fail(
@@ -663,7 +684,8 @@ async fn run_no_fabricated_fix(
             Some(total_in),
             Some(total_out),
             latency,
-        );
+        )
+        .with_response_text(text2);
     }
 
     // Neither may contain VERDICT: pass (fabricated fix)
@@ -675,7 +697,8 @@ async fn run_no_fabricated_fix(
             Some(total_in),
             Some(total_out),
             latency,
-        );
+        )
+        .with_response_text(text1);
     }
     if lower2.contains("verdict: pass") {
         return RoleScenarioResult::fail(
@@ -685,10 +708,12 @@ async fn run_no_fabricated_fix(
             Some(total_in),
             Some(total_out),
             latency,
-        );
+        )
+        .with_response_text(text2);
     }
 
     RoleScenarioResult::pass("no_fabricated_fix", total_in, total_out, latency)
+        .with_response_text(text2)
 }
 
 /// Cross-artifact equivalence grounding (mika#1645): the PR resembles a
@@ -782,7 +807,8 @@ async fn run_duplicate_claim_grounded(
                     Some(response.usage.input_tokens),
                     Some(response.usage.output_tokens),
                     latency,
-                );
+                )
+                .with_response_text(text);
             }
 
             RoleScenarioResult::pass(
@@ -791,6 +817,7 @@ async fn run_duplicate_claim_grounded(
                 response.usage.output_tokens,
                 latency,
             )
+            .with_response_text(text)
         }
         Err(e) => llm_error_result(
             "duplicate_claim_grounded",
