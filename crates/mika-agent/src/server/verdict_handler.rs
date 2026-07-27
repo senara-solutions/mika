@@ -291,7 +291,139 @@ async fn handle_pass_verdict(
         }
     };
 
-    // Look up the task by PR URL
+    // Forge-gate perimeter check (mika#1829, hoisted before task lookup by mika#1853).
+    //
+    // The perimeter check MUST run before the task lookup gate — otherwise a PR filed
+    // hors-loop (no `tasks` row) bypasses the classifier entirely and falls through to
+    // the LLM (empirically observed on mika#1851, 2026-07-27T08:06:28Z).
+    //
+    // Non-negotiable (b): the diff is authority. Labels and PR body prose are
+    // never consulted here — only what the PR ACTUALLY touches.
+    // Fail-closed: on gh-CLI fetch error, we assume DECISION-CORE (better
+    // to hold a mechanical PR than to auto-merge a decision-core PR).
+    let perimeter_verdict = match perimeter::fetch::fetch_pr_files(
+        event.pr_number,
+        &event.repo,
+        token,
+    )
+    .await
+    {
+        Ok(files) => perimeter::classify_pr_files(&files),
+        Err(e) => {
+            warn!(
+                error = %e,
+                pr_number = event.pr_number,
+                repo = %event.repo,
+                "Perimeter classifier: failed to fetch PR files — fail-closed to DECISION-CORE (mika#1829/#1853)"
+            );
+            // Synthesize a DECISION-CORE result so downstream logic gates.
+            perimeter::PrClassification {
+                verdict: Classification::DecisionCore,
+                mechanical_files: Vec::new(),
+                decision_core_files: vec![format!("<fetch-error: {e}>")],
+            }
+        }
+    };
+
+    if perimeter_verdict.verdict == Classification::DecisionCore {
+        // Best-effort task lookup for metadata write. NOT required — a hors-loop PR
+        // without a `tasks` row still triggers the notification + audit event + hold
+        // pre-digest. Task-side metadata write happens only when a task exists in a
+        // writable state (in_progress).
+        let task_for_metadata = match db.find_active_task_by_pr_url(&pr_url).await {
+            Ok(Some(t)) if t.status == "in_progress" => Some(t),
+            _ => None,
+        };
+        let task_id_label = task_for_metadata
+            .as_ref()
+            .map(|t| t.id.as_str())
+            .unwrap_or("<no-active-task>");
+
+        info!(
+            event = "verdict_handler_human_gate_required",
+            pr_number = event.pr_number,
+            repo = %event.repo,
+            task_id = %task_id_label,
+            summary = %perimeter_verdict.summary(),
+            decision_core_files = ?perimeter_verdict.decision_core_files,
+            "Forge-gate: PR touches DECISION-CORE zone(s) — skipping auto-merge, operator must merge manually (mika#1829/#1853)"
+        );
+
+        // Update task metadata only when a writable in_progress task exists.
+        if let Some(ref task) = task_for_metadata
+            && let Err(e) = update_hold_metadata(
+                db,
+                &task.id,
+                &task.metadata,
+                &event.review_url,
+                &format!(
+                    "[forge-gate mika#1829] Auto-merge blocked: {}. Operator must merge manually.\n\n{}",
+                    perimeter_verdict.summary(),
+                    truncate_body(&event.body)
+                ),
+            )
+            .await
+        {
+            warn!(error = %e, task_id = %task.id, "Failed to update hold metadata after forge-gate block");
+        }
+
+        // Audit event — distinct tool_name so operators can grep for
+        // gate firings independent of hold[review] noise.
+        let target_key = task_for_metadata
+            .as_ref()
+            .map(|t| format!("task:{}", t.id))
+            .unwrap_or_else(|| format!("pr:{}#{}", event.repo, event.pr_number));
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "verdict_handler_human_gate_required",
+                &target_key,
+                task_for_metadata.as_ref().map(|_| "in_progress"),
+                None,
+                Some(&format!(
+                    "verdict=pass gate=forge-gate pr_url={pr_url} decision_core_files={}",
+                    perimeter_verdict.decision_core_files.join(",")
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, "Failed to log verdict_handler_human_gate_required audit event");
+        }
+
+        // Notify operator with the concrete file list.
+        if let Some(sender) = message_sender {
+            send_notification(
+                sender,
+                &format!(
+                    "PR #{} on {} — VERDICT: pass from @{}, but touches DECISION-CORE zone(s). \
+                     Auto-merge blocked by forge-gate (mika#1829/#1853). {}. \
+                     Operator must merge manually. Task: {}",
+                    event.pr_number,
+                    event.repo,
+                    event.reviewer,
+                    perimeter_verdict.summary(),
+                    task_id_label
+                ),
+            )
+            .await;
+        }
+
+        return VerdictAction::Handled {
+            pre_digest: format!(
+                "[verdict_handler] Structural: VERDICT: pass on PR #{n} — auto-merge BLOCKED by \
+                 forge-gate (mika#1829/#1853). {summary}. Operator must merge manually. Do NOT call \
+                 pr_merge_with_gate for this PR — it will also block on the same gate. Task: {task_id_label}.\n\n",
+                n = event.pr_number,
+                summary = perimeter_verdict.summary(),
+            ),
+        };
+    }
+
+    // Perimeter cleared — MECHANICAL PR, proceed to task lookup + merge flow.
+    // Task lookup is required past this point: MECHANICAL auto-merge writes task
+    // metadata and updates task state, so a missing task row means we cannot
+    // book-keep the merge — pass through to the LLM.
     let task = match db.find_active_task_by_pr_url(&pr_url).await {
         Ok(Some(t)) => t,
         Ok(None) => {
@@ -299,7 +431,7 @@ async fn handle_pass_verdict(
                 pr_number = event.pr_number,
                 repo = %event.repo,
                 pr_url = %pr_url,
-                "VERDICT: pass but no active task found for PR — passing through to LLM"
+                "VERDICT: pass (MECHANICAL) but no active task found for PR — passing through to LLM"
             );
             return VerdictAction::Passthrough { enrichment: None };
         }
@@ -319,7 +451,7 @@ async fn handle_pass_verdict(
             task_id = %task.id,
             status = %task.status,
             pr_url = %pr_url,
-            "VERDICT: pass but task not in_progress (status: {}) — skipping structural merge",
+            "VERDICT: pass (MECHANICAL) but task not in_progress (status: {}) — skipping structural merge",
             task.status
         );
         return VerdictAction::Passthrough { enrichment: None };
@@ -327,121 +459,6 @@ async fn handle_pass_verdict(
 
     let task_id = task.id.clone();
 
-    // Forge-gate perimeter check (mika#1829).
-    //
-    // Fetch the actual touched-file set from GitHub and classify. If the PR
-    // touches ANY DECISION-CORE zone (permission-policy, verdict-form, gate
-    // logic, dispatch authority, perimeter itself), skip the auto-merge path
-    // and hand over to the operator with hold[review] semantics.
-    //
-    // Non-negotiable (b): the diff is authority. Labels and PR body prose are
-    // never consulted here — only what the PR ACTUALLY touches.
-    // Fail-closed: on gh-CLI fetch error, we assume DECISION-CORE (better
-    // to hold a mechanical PR than to auto-merge a decision-core PR).
-    let perimeter_verdict = match perimeter::fetch::fetch_pr_files(
-        event.pr_number,
-        &event.repo,
-        token,
-    )
-    .await
-    {
-        Ok(files) => perimeter::classify_pr_files(&files),
-        Err(e) => {
-            warn!(
-                error = %e,
-                pr_number = event.pr_number,
-                repo = %event.repo,
-                task_id = %task_id,
-                "Perimeter classifier: failed to fetch PR files — fail-closed to DECISION-CORE (mika#1829)"
-            );
-            // Synthesize a DECISION-CORE result so downstream logic gates.
-            perimeter::PrClassification {
-                verdict: Classification::DecisionCore,
-                mechanical_files: Vec::new(),
-                decision_core_files: vec![format!("<fetch-error: {e}>")],
-            }
-        }
-    };
-
-    if perimeter_verdict.verdict == Classification::DecisionCore {
-        info!(
-            event = "verdict_handler_human_gate_required",
-            pr_number = event.pr_number,
-            repo = %event.repo,
-            task_id = %task_id,
-            summary = %perimeter_verdict.summary(),
-            decision_core_files = ?perimeter_verdict.decision_core_files,
-            "Forge-gate: PR touches DECISION-CORE zone(s) — skipping auto-merge, operator must merge manually (mika#1829)"
-        );
-
-        // Update task metadata with hold-review shape so the operator
-        // dashboard surfaces the block.
-        if let Err(e) = update_hold_metadata(
-            db,
-            &task_id,
-            &task.metadata,
-            &event.review_url,
-            &format!(
-                "[forge-gate mika#1829] Auto-merge blocked: {}. Operator must merge manually.\n\n{}",
-                perimeter_verdict.summary(),
-                truncate_body(&event.body)
-            ),
-        )
-        .await
-        {
-            warn!(error = %e, task_id = %task_id, "Failed to update hold metadata after forge-gate block");
-        }
-
-        // Audit event — distinct tool_name so operators can grep for
-        // gate firings independent of hold[review] noise.
-        if let Err(e) = db
-            .log_audit_event(
-                session_id,
-                "verdict_handler_human_gate_required",
-                &format!("task:{task_id}"),
-                Some("in_progress"),
-                None,
-                Some(&format!(
-                    "verdict=pass gate=forge-gate pr_url={pr_url} decision_core_files={}",
-                    perimeter_verdict.decision_core_files.join(",")
-                )),
-                Some(trace_id),
-            )
-            .await
-        {
-            warn!(error = %e, "Failed to log verdict_handler_human_gate_required audit event");
-        }
-
-        // Notify operator with the concrete file list.
-        if let Some(sender) = message_sender {
-            send_notification(
-                sender,
-                &format!(
-                    "PR #{} on {} — VERDICT: pass from @{}, but touches DECISION-CORE zone(s). \
-                     Auto-merge blocked by forge-gate (mika#1829). {}. \
-                     Operator must merge manually. Task: {}",
-                    event.pr_number,
-                    event.repo,
-                    event.reviewer,
-                    perimeter_verdict.summary(),
-                    task_id
-                ),
-            )
-            .await;
-        }
-
-        return VerdictAction::Handled {
-            pre_digest: format!(
-                "[verdict_handler] Structural: VERDICT: pass on PR #{n} — auto-merge BLOCKED by \
-                 forge-gate (mika#1829). {summary}. Operator must merge manually. Do NOT call \
-                 pr_merge_with_gate for this PR — it will also block on the same gate. Task: {task_id}.\n\n",
-                n = event.pr_number,
-                summary = perimeter_verdict.summary(),
-            ),
-        };
-    }
-
-    // Perimeter cleared — proceed with existing merge flow.
     info!(
         event = "verdict_handler_perimeter_cleared",
         pr_number = event.pr_number,

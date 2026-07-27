@@ -22,6 +22,17 @@
 //! - The handler constructs a pre-digest for the LLM — it does NOT directly invoke
 //!   `run_claude_pilot`. The dispatch-readiness guard in `executor.rs` is the
 //!   authoritative gate for long-running dispatch.
+//!
+//! ## Forge-gate perimeter (mika#1853)
+//!
+//! Audited 2026-07-27: this handler has NO `run_gh_merge` callsite — it only builds
+//! a pre-digest that suggests a claude-pilot dispatch. No perimeter check is wired in
+//! because there is no merge path to gate here. If a future refactor introduces a
+//! direct merge callsite in this handler (or its close family), the perimeter fetch +
+//! classify pattern from `verdict_handler::handle_pass_verdict` and
+//! `ci_success_handler::try_handle_ci_success` (both mika#1853) MUST be applied here
+//! too. Grep-anchor before landing: `grep -n 'run_gh_merge' server/*.rs` — every hit
+//! must consult `perimeter::classify_pr_files`.
 
 use std::sync::Arc;
 

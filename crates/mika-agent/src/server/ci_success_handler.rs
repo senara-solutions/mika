@@ -36,6 +36,7 @@ use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::messaging::MessageSender;
+use crate::perimeter::{self, Classification};
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
     CheckClassification, classify_checks, is_behind_main, run_gh_checks, run_gh_merge,
@@ -279,6 +280,103 @@ pub async fn try_handle_ci_success(
                 "CI success handler: failed to fetch PR preflight for behind-main check — proceeding (fail-open)"
             );
         }
+    }
+
+    // 5c. Forge-gate perimeter check (mika#1853 — coupled pair with verdict_handler mika#1829).
+    //
+    // The CI-success race path was previously the load-bearing bypass: `verdict_handler`
+    // has consulted the classifier since mika#1829, but this handler called
+    // `run_gh_merge` directly — mika#1851 auto-merged 4 DECISION-CORE files
+    // (crates/mika-agent/src/task_engine/**, server/mod.rs) through this callsite on
+    // 2026-07-27T08:09:14Z because the perimeter classifier was never consulted.
+    //
+    // Fail-closed: on gh-CLI fetch error, we treat the PR as DECISION-CORE (better to
+    // hold a MECHANICAL PR than to auto-merge a DECISION-CORE PR through the CI-success
+    // race path). Behavioral, not declarative — the diff is authority; labels and PR
+    // body prose are never consulted.
+    let perimeter_verdict = match perimeter::fetch::fetch_pr_files(pr.number, &event.repo, token)
+        .await
+    {
+        Ok(files) => perimeter::classify_pr_files(&files),
+        Err(e) => {
+            warn!(
+                error = %e,
+                pr_number = pr.number,
+                repo = %event.repo,
+                "Perimeter classifier: failed to fetch PR files — fail-closed to DECISION-CORE (mika#1853)"
+            );
+            perimeter::PrClassification {
+                verdict: Classification::DecisionCore,
+                mechanical_files: Vec::new(),
+                decision_core_files: vec![format!("<fetch-error: {e}>")],
+            }
+        }
+    };
+
+    if perimeter_verdict.verdict == Classification::DecisionCore {
+        info!(
+            event = "ci_success_handler_human_gate_required",
+            pr_number = pr.number,
+            repo = %event.repo,
+            summary = %perimeter_verdict.summary(),
+            decision_core_files = ?perimeter_verdict.decision_core_files,
+            "Forge-gate: PR touches DECISION-CORE zone(s) — skipping CI-success auto-merge, operator must merge manually (mika#1853)"
+        );
+
+        // Audit event so operators can grep for gate firings independent of the merge path.
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ci_success_handler_human_gate_required",
+                &format!("pr:{}#{}", event.repo, pr.number),
+                None,
+                None,
+                Some(&format!(
+                    "trigger=check_suite_success gate=forge-gate reviewer={} decision_core_files={}",
+                    verdict_review.reviewer,
+                    perimeter_verdict.decision_core_files.join(","),
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, "Failed to log ci_success_handler_human_gate_required audit event");
+        }
+
+        // Notify operator with the concrete file list.
+        if let Some(sender) = message_sender {
+            let notification = format!(
+                "PR #{} on {} — CI checks all green + VERDICT: pass from @{}, but touches DECISION-CORE zone(s). \
+                 Auto-merge blocked by forge-gate (mika#1853). {}. Operator must merge manually.",
+                pr.number,
+                event.repo,
+                verdict_review.reviewer,
+                perimeter_verdict.summary(),
+            );
+            match sender.send(&notification).await {
+                Ok(crate::messaging::SendOutcome::Delivered) => {}
+                Ok(crate::messaging::SendOutcome::Failed { reason }) => {
+                    warn!(reason = %reason, "CI success DECISION-CORE hold notification delivery failed");
+                }
+                Ok(crate::messaging::SendOutcome::NoChannel) => {
+                    warn!(
+                        "CI success DECISION-CORE hold notification skipped — no reply channel (chat_id=0)"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to send CI success DECISION-CORE hold notification");
+                }
+            }
+        }
+
+        return VerdictAction::Handled {
+            pre_digest: format_decision_core_hold_pre_digest(
+                &event,
+                pr.number,
+                &verdict_review.reviewer,
+                &perimeter_verdict.summary(),
+            ),
+        };
     }
 
     // 6. All conditions met — initiate merge
@@ -628,6 +726,28 @@ fn format_error_pre_digest(event: &CheckSuiteEvent, pr_number: u64, error: &str)
     )
 }
 
+/// Format the pre-digest for a DECISION-CORE hold (mika#1853 — forge-gate perimeter).
+///
+/// IMPORTANT: Avoids completion-claim guard trigger words (merged, deployed,
+/// completed, complete, shipped). Uses "blocked" / "held" / "must merge manually" phrasing.
+fn format_decision_core_hold_pre_digest(
+    event: &CheckSuiteEvent,
+    pr_number: u64,
+    reviewer: &str,
+    perimeter_summary: &str,
+) -> String {
+    format!(
+        "<ci_success_handler>\n\
+         [GitHub] Check suite success on {}#{pr_number} (branch: {})\n\
+         CI checks all green + VERDICT: pass from @{reviewer}, but this PR touches DECISION-CORE zone(s).\n\n\
+         Auto-merge BLOCKED by forge-gate (mika#1853). {perimeter_summary}. Operator must merge manually.\n\n\
+         Do NOT call pr_merge_with_gate for this PR — it will also block on the same gate. \
+         Notify the operator that a manual review-and-merge is required.\n\
+         </ci_success_handler>",
+        event.repo, event.branch
+    )
+}
+
 /// Format the enrichment message for a behind-main block.
 fn format_behind_main_enrichment(pr_base_sha: &str, current_main_sha: &str) -> String {
     format!(
@@ -728,6 +848,62 @@ mod tests {
             !COMPLETION_CLAIM_RE.is_match(&text),
             "Pre-digest contains completion-claim trigger word: {text}"
         );
+    }
+
+    // ---- DECISION-CORE hold pre-digest tests (mika#1853) ----
+
+    #[test]
+    fn decision_core_hold_pre_digest_avoids_completion_claim_words() {
+        let event = sample_event();
+        let text = format_decision_core_hold_pre_digest(
+            &event,
+            1851,
+            "mika-qa",
+            "DECISION-CORE (4 files: crates/mika-agent/src/task_engine/engine.rs, crates/mika-agent/src/task_engine/liveness.rs, crates/mika-agent/src/task_engine/mod.rs, crates/mika-agent/src/server/mod.rs)",
+        );
+        assert!(
+            !COMPLETION_CLAIM_RE.is_match(&text),
+            "Pre-digest contains completion-claim trigger word: {text}"
+        );
+    }
+
+    #[test]
+    fn decision_core_hold_pre_digest_contains_do_not_call_instruction() {
+        let event = sample_event();
+        let text = format_decision_core_hold_pre_digest(
+            &event,
+            1851,
+            "mika-qa",
+            "DECISION-CORE (1 file: foo.rs)",
+        );
+        assert!(text.contains("Do NOT call pr_merge_with_gate"));
+    }
+
+    #[test]
+    fn decision_core_hold_pre_digest_contains_operator_manual_signal() {
+        let event = sample_event();
+        let text = format_decision_core_hold_pre_digest(
+            &event,
+            1851,
+            "mika-qa",
+            "DECISION-CORE (1 file: foo.rs)",
+        );
+        assert!(text.contains("Operator must merge manually"));
+        assert!(text.contains("BLOCKED by forge-gate"));
+        assert!(text.contains("mika#1853"));
+    }
+
+    #[test]
+    fn decision_core_hold_pre_digest_contains_pr_number_and_reviewer() {
+        let event = sample_event();
+        let text = format_decision_core_hold_pre_digest(
+            &event,
+            1851,
+            "mika-qa",
+            "DECISION-CORE (1 file: foo.rs)",
+        );
+        assert!(text.contains("1851"));
+        assert!(text.contains("mika-qa"));
     }
 
     #[test]
