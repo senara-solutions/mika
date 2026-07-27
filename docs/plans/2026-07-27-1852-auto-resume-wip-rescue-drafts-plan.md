@@ -29,7 +29,7 @@ mika#1852 — feat(dispatch): auto-resume wip-rescue drafts — rebase/fix-clipp
 
 ## Implementation Plan
 
-### Phase 1: New Module — `wip_resume.rs` (~400-600 lines)
+### Phase 1: New Module — `wip_rescue.rs` (~400-600 lines)
 
 **File:** `crates/mika-agent/src/wip_rescue.rs`
 
@@ -56,13 +56,32 @@ mika#1852 — feat(dispatch): auto-resume wip-rescue drafts — rebase/fix-clipp
    - Returns count of successfully resumed drafts
 
 3. **`resume_chain()` — per-draft cost-bounded chain**:
-   - Step 1: **RESCUE_DEPTH guard** — fetch parent task metadata, read `wip_rescue.depth`. If ≥ max → bail-to-human (label `human-review-required`, comment, return)
-   - Step 2: **Dry-run rebase** — `git merge-tree --write-tree main HEAD` on branch. If conflict → bail-to-human (comment "rebase-conflict-on-main")
+   - Step 1: **RESCUE_DEPTH guard** — resolve the parent task, fetch its metadata, read `wip_rescue.depth`. If ≥ max → bail-to-human (label `human-review-required`, comment, return).
+     - **Parent-task resolution chain (F2):** map PR → closing issue → task row.
+       1. `gh pr view <n> --json closingIssuesReferences` yields the closing issue number(s). wip-rescue drafts always carry a single `Closes #<issue>` (created by dispatch-lib), so take the first.
+       2. Query the task table by that issue's `reference_url` — the existing `get_task_by_reference_url()` / equivalent async_db lookup keyed on the issue URL (same key dispatch-lib and auto_pull already use to correlate a ticket to its `tasks` row). This is the reuse path called out in the F2 citation (DRY): no new join table, no PR-description metadata parsing.
+       3. If no task row is found (e.g., the draft predates task creation or the issue link is missing), treat depth as `0` for this attempt and emit `wip_rescue_skipped` with reason `"no_parent_task"` so the absence is observable — but still proceed (the draft is real work; a missing ledger row must not strand it). The depth counter then lives on whatever task row the re-run pilot dispatch creates/updates.
+     - The `wip_rescue.depth` counter is persisted in that parent task's metadata under `$.wip_rescue.depth` via the existing `update_task_metadata()` shallow-merge (`async_db.rs:2171`).
+   - Step 2: **Dry-run rebase** — `git merge-tree --write-tree main HEAD` on branch. If conflict → bail-to-human (comment "rebase-conflict-on-main").
+     - **Git version guard (F3, fail-closed):** `git merge-tree --write-tree` requires git ≥ 2.38. At the *start* of `resume_chain()` (before any mutation), run a one-shot `git version_supports_writetree()` check that parses `git --version` and compares against 2.38.0. If the version is unknown/older, do NOT silently fall back to a mutating rebase (a fallback that skips the dry-run would violate the "never mutate before a clean dry-run" safety invariant this feature exists to enforce). Instead **fail closed**: call `bail_to_human()` with reason `"git-too-old-for-dry-run:<version>"` and emit `wip_rescue_error`. This is a deploy-environment defect, not a per-PR condition, so bailing to human is the correct escalation (Citation: review-guide.md § Fail-Closed). The check result can be memoized per process (version does not change mid-run).
    - Step 3: **Live rebase** — fast-forward or 3-way (no interactive). Fail → bail
-   - Step 4: **Clippy 2-pass** — `cargo clippy --tests` on worktree. Errors → dispatch mika-dev rescue prompt. Re-clippy after fix. Still errors → bail
+   - Step 4: **Clippy 2-pass** — `cargo clippy --tests` on worktree. Errors → dispatch mika-dev rescue prompt. Re-clippy after fix. Still errors → bail.
+     - **Dispatch priority (F4):** the mika-dev clippy-fix dispatch is issued at **low priority (`priority: rescue`, fond-de-file)** — never normal priority. It must not preempt mission-avant sprint work in the dispatch queue (Citation: RT#004 "lower priority than mission-avant work"). Concretely: the dispatch inherits the same low-priority scheduling as the parent `wip_rescue` cron action (Phase 3, AC7), and the global concurrency cap of 1 (AC6) already bounds how many rescue dispatches can be in-flight. If mika-dev's `implement` slot is occupied by active sprint work, the rescue clippy-fix waits for the slot rather than jumping it. Priority annotation is carried on the dispatched task metadata (`$.priority = "rescue"`) so the executor's slot arbitration deprioritizes it and it is greppable in telemetry.
    - Step 5: **Re-run pilot** — dispatch dev-pilot on branch (reuse plan from issue body / existing worktree). Backoff-exp max 3 on transient errors
    - Step 6: **Substrate-diff check** — `perimeter::fetch::fetch_pr_files()` + `perimeter::classify_pr_files()`. DECISION-CORE → un-draft + comment "ready-for-Vincent-review" (do NOT auto-merge). MECHANICAL → proceed to un-draft
-   - Step 7: **Un-draft** — `gh pr ready <n>` → triggers `pull_request.ready_for_review` webhook → mika-qa reviews → verdict → forge-gate → merge OR gate
+   - Step 7: **Un-draft** — explicit subprocess call (F1). There is no `gh pr ready` Rust builtin; the un-draft is a direct `gh` CLI subprocess through the existing `spawn_and_collect()` wrapper (same pattern as `gh pr list` in the orchestrator). Concrete invocation:
+     ```rust
+     // reuse the token-injecting subprocess wrapper used elsewhere in the module;
+     // args: ["pr", "ready", &pr_number.to_string(), "--repo", &repo]
+     let out = run_gh_subprocess(
+         &["pr", "ready", &pr_number.to_string(), "--repo", repo],
+         github_token,
+         Duration::from_secs(30), // per-call timeout, same as other gh calls
+     ).await;
+     ```
+     - **Timeout:** 30s (matches the other `gh` calls in the chain).
+     - **Fail-open / bail-to-human on failure:** if the subprocess exits non-zero or times out, do NOT retry the un-draft and do NOT leave the PR in a half-resumed state — call `bail_to_human()` with reason `"un-draft-failed:<stderr-snippet>"`. The draft stays a draft (safe default: work is preserved, human decides). Emit `wip_rescue_error` with the `gh` stderr.
+     - On success, `gh pr ready` triggers the `pull_request.ready_for_review` webhook → mika-qa reviews → verdict → forge-gate → merge OR gate. No further action from this chain.
    - Increment `wip_rescue.depth` on each attempt
 
 4. **Bail-to-human**:
@@ -125,6 +144,27 @@ mika#1852 — feat(dispatch): auto-resume wip-rescue drafts — rebase/fix-clipp
 - Rebase-conflict auto-resolution beyond fast-forward + 3-way
 - claude-pilot-py policy fix (F3 — separate PR, gated)
 
+## Definition of Done
+- `wip_rescue.rs` module implements the full 7-step cost-bounded chain with RESCUE_DEPTH gate.
+- Server registers the periodic scan cron; dispatcher routes the `wip_rescue` trigger to a low-priority action.
+- Global concurrency cap of 1 auto-resume in-flight is enforced before entering any chain.
+- Perimeter classification (mika#1831) is reused verbatim — no reimplementation of the DECISION-CORE/MECHANICAL classifier.
+- All five structured events (`wip_rescue_resume_attempt`, `wip_rescue_bail_to_human`, `wip_rescue_success`, `wip_rescue_skipped`, `wip_rescue_error`) are emitted with the documented fields, plus `log_audit_event()` per action.
+- Unit + integration tests cover env-var parsing, age filter, RESCUE_DEPTH guard, bail-to-human, and perimeter routing.
+- `cargo build`, `cargo clippy`, `cargo test`, and `cargo fmt --check` all pass.
+- Post-deploy AC9 verification performed (test wip-rescue draft resumed or bailed with `human-review-required`).
+
+## Acceptance criteria
+- **AC1** — Periodic scan identifies wip-rescue drafts age > threshold (env `MIKA_WIP_RESCUE_MIN_AGE_SECS`, default 900).
+- **AC2** — Per draft: rebase dry-run → live rebase → clippy 2-pass → pilot re-run → substrate-diff check → un-draft chain, with RESCUE_DEPTH gate bailing to human at max 2.
+- **AC3** — Bail-to-human: adds label `human-review-required`, posts PR comment naming the bail reason, ends chain. NO further auto-attempts.
+- **AC4** — Substrate-diff check reuses `perimeter::fetch::fetch_pr_files` + `perimeter::classify_pr_files` (from mika#1831). DECISION-CORE → un-draft + comment "Vincent-hand-merge" (do not run verdict merge). MECHANICAL → un-draft normally (verdict handler will invoke merge).
+- **AC5 STRICT** — NO trivial-diff auto-merge carve-out. Even 1-line diffs go through forge-gate.
+- **AC6** — Concurrency cap: max 1 auto-resume attempt in-flight globally. Excess wait for next scan tick.
+- **AC7** — Priority: uses low-priority scheduling (fond-de-file), does not preempt normal dispatch.
+- **AC8** — Observability: emits `wip_rescue_resume_attempt`, `wip_rescue_bail_to_human` (with reason), `wip_rescue_success` structured events for grep/dashboard.
+- **AC9** — Post-deploy verification: create test wip-rescue draft (mechanically stale), wait for scan; expect either successful un-draft + qa-review → merge, OR bail with human-review-required label + comment.
+
 ## Files Modified/Created
 
 | File | Action | Lines |
@@ -141,7 +181,10 @@ mika#1852 — feat(dispatch): auto-resume wip-rescue drafts — rebase/fix-clipp
 - mika#1850 (liveness heartbeat) — MERGED ✓ (alert-only, no auto-restart)
 
 ## Risk Notes
-- `gh pr ready` has no existing Rust implementation — needs new subprocess call pattern
-- Git merge-tree dry-run rebase requires git 2.38+ (verify on deploy target)
-- Clippy 2-pass dispatches mika-dev which may conflict with active sprint — concurrency cap mitigates
-- RESCUE_DEPTH stored in parent task metadata — need to identify parent task from PR metadata
+- `gh pr ready` has no existing Rust implementation — resolved (F1): explicit `run_gh_subprocess(["pr", "ready", ...])` call with 30s timeout + bail-to-human on failure, specified in Step 7.
+- Git merge-tree dry-run rebase requires git 2.38+ — resolved (F3): fail-closed version guard at chain start (`git-too-old-for-dry-run` bail), no silent mutating fallback.
+- Clippy 2-pass dispatches mika-dev which may conflict with active sprint — resolved (F4): rescue dispatch pinned to low priority (`$.priority = "rescue"`, fond-de-file) + AC6 concurrency cap; never preempts sprint work.
+- RESCUE_DEPTH stored in parent task metadata — resolved (F2): parent task resolved via PR → `closingIssuesReferences` → task lookup by issue `reference_url` (reuse of existing correlation key); depth defaults to 0 with `wip_rescue_skipped:no_parent_task` when no row exists.
+
+## Revision history
+- rev 2 (2026-07-27): addressed F1 by specifying the explicit `gh pr ready` subprocess call in Step 7 (invocation, 30s timeout, fail-open→bail-to-human); addressed F2 by defining the parent-task resolution chain (PR → closing issue → task lookup by `reference_url`, reusing the existing correlation key, with a `no_parent_task` observable-skip fallback); addressed F3 by adding a fail-closed git ≥ 2.38 version guard at chain start (bail `git-too-old-for-dry-run`, no silent mutating fallback per § Fail-Closed); addressed F4 by pinning the mika-dev clippy-fix dispatch to low priority (`$.priority = "rescue"`, fond-de-file) so it never preempts mission-avant sprint work (RT#004). Risk Notes updated to mark all four resolved.
