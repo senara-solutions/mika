@@ -38,6 +38,60 @@ pub const RETRY_BUFFER_SECS: u64 = 30;
 /// safety margin against variance.
 pub const TRANSPORT_RETRY_MIN_REMAINING_SECS: u64 = 60;
 
+/// Default HTTP-client timeout (seconds) for non-Anthropic LLM providers.
+/// Overridable per-process via `MIKA_LLM_HTTP_TIMEOUT_SECS` (see [`http_timeout_secs`]).
+pub const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
+
+/// Environment variable that overrides the LLM HTTP-client timeout.
+pub const HTTP_TIMEOUT_ENV_VAR: &str = "MIKA_LLM_HTTP_TIMEOUT_SECS";
+
+/// Minimum accepted HTTP-client timeout (seconds). Values below this are
+/// almost always a config mistake and would abort even trivial LLM calls.
+pub const MIN_HTTP_TIMEOUT_SECS: u64 = 10;
+
+/// Resolve the HTTP-client timeout (seconds) for LLM providers.
+///
+/// Reads `MIKA_LLM_HTTP_TIMEOUT_SECS`; returns [`DEFAULT_HTTP_TIMEOUT_SECS`]
+/// (120) when the var is unset or empty. Both the OpenAI-compatible and
+/// Ollama provider constructors call this so they stay in lockstep (mika#1660).
+///
+/// # Panics
+///
+/// Panics when the env var is set but unparseable as `u64`, or resolves to a
+/// value below [`MIN_HTTP_TIMEOUT_SECS`]. Provider construction is cold-path
+/// startup work: a misconfigured timeout should fail fast and loud rather than
+/// silently fall back to the default and mask the error until the next
+/// long-context call times out.
+pub fn http_timeout_secs() -> u64 {
+    parse_http_timeout(std::env::var(HTTP_TIMEOUT_ENV_VAR).ok().as_deref())
+}
+
+/// Pure resolver behind [`http_timeout_secs`], split out so the parse/validate
+/// logic is testable without mutating the process-global env var (which would
+/// race parallel tests).
+fn parse_http_timeout(raw: Option<&str>) -> u64 {
+    let raw = match raw {
+        Some(v) => v,
+        None => return DEFAULT_HTTP_TIMEOUT_SECS,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_HTTP_TIMEOUT_SECS;
+    }
+    let secs: u64 = trimmed.parse().unwrap_or_else(|_| {
+        panic!(
+            "{HTTP_TIMEOUT_ENV_VAR}={raw:?} is not a valid non-negative integer number of seconds"
+        )
+    });
+    if secs < MIN_HTTP_TIMEOUT_SECS {
+        panic!(
+            "{HTTP_TIMEOUT_ENV_VAR}={secs} is below the minimum of {MIN_HTTP_TIMEOUT_SECS}s; \
+             a timeout this small aborts even trivial LLM calls"
+        );
+    }
+    secs
+}
+
 /// Internal tag names that should be stripped from LLM response text.
 /// These tags are injected into conversation history for LLM context (tool history,
 /// callback results, task health, etc.) but the LLM may echo them in its response.
@@ -502,6 +556,48 @@ pub fn dummy_provider() -> Arc<dyn LlmProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- http_timeout_secs / parse_http_timeout (mika#1660) --
+
+    #[test]
+    fn test_http_timeout_default_when_unset() {
+        assert_eq!(parse_http_timeout(None), DEFAULT_HTTP_TIMEOUT_SECS);
+        assert_eq!(DEFAULT_HTTP_TIMEOUT_SECS, 120);
+    }
+
+    #[test]
+    fn test_http_timeout_default_when_empty_or_whitespace() {
+        assert_eq!(parse_http_timeout(Some("")), DEFAULT_HTTP_TIMEOUT_SECS);
+        assert_eq!(parse_http_timeout(Some("   ")), DEFAULT_HTTP_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_http_timeout_valid_override() {
+        assert_eq!(parse_http_timeout(Some("600")), 600);
+        // Surrounding whitespace is tolerated.
+        assert_eq!(parse_http_timeout(Some(" 600 ")), 600);
+        // The minimum boundary is accepted.
+        assert_eq!(parse_http_timeout(Some("10")), MIN_HTTP_TIMEOUT_SECS);
+    }
+
+    #[test]
+    #[should_panic(expected = "MIKA_LLM_HTTP_TIMEOUT_SECS")]
+    fn test_http_timeout_rejects_too_small() {
+        let _ = parse_http_timeout(Some("5"));
+    }
+
+    #[test]
+    #[should_panic(expected = "MIKA_LLM_HTTP_TIMEOUT_SECS")]
+    fn test_http_timeout_rejects_unparseable() {
+        let _ = parse_http_timeout(Some("abc"));
+    }
+
+    #[test]
+    #[should_panic(expected = "MIKA_LLM_HTTP_TIMEOUT_SECS")]
+    fn test_http_timeout_rejects_negative() {
+        // Negative values fail the u64 parse and are rejected.
+        let _ = parse_http_timeout(Some("-1"));
+    }
 
     #[test]
     fn test_provider_kind_display() {

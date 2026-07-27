@@ -2130,21 +2130,28 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         );
     }
 
-    // Per-turn PR review idempotency guard (#695): if the command is `pr review ...`
-    // and we already posted a review in this turn, reject with a structured error.
-    // Retained as fallback when pr_reviews_posted is None (CLI/test contexts).
-    if pr_dedup_key.is_some()
-        && ctx
-            .pr_review_posted
-            .load(std::sync::atomic::Ordering::Acquire)
-    {
-        return ToolOutput::error(
-            "{\"error\": \"duplicate_pr_review\", \"message\": \"A PR review was already \
-             posted in this turn. Duplicate reviews create duplicate webhooks. End your \
-             turn — the review is already submitted.\"}"
-                .to_string(),
-        );
-    }
+    // Per-turn PR review idempotency guard REMOVED (Rolex-P0 2026-07-26).
+    //
+    // The old guard read `ctx.pr_review_posted: &AtomicBool` — a single
+    // boolean for "any pr review posted this turn". It rejected ALL
+    // subsequent pr review calls in the same turn, even when the LLM was
+    // legitimately reviewing DIFFERENT PRs (e.g. mika-qa batch-reviewing
+    // wip-rescue drafts). Observed live: 3/4 parallel `pr review` calls
+    // for 4 distinct PR numbers were silently rejected with a fake
+    // "duplicate_pr_review" error, blocking mika-qa from ever posting
+    // reviews on the real dispatch PRs (#1834/#1836) — first-merge Rolex
+    // blocker.
+    //
+    // The correct per-PR dedup is done by the session-scope check above
+    // (lines ~2118-2131), keyed by `pr_dedup_key`. It correctly prevents
+    // same-PR-twice within a session (across turns) — the real intent of
+    // #695. The AtomicBool per-turn guard was redundant in server mode
+    // and too coarse everywhere.
+    //
+    // `ctx.pr_review_posted` field is left in place (still set to true
+    // on successful post below) to avoid a large-scale ToolContext type
+    // change. Cleanup in follow-up: remove the field + threading across
+    // ~15 call sites.
 
     // Tool-argument suffix validation (mika#899): check --body argument against
     // skill-declared required_tool_arg_suffixes BEFORE subprocess spawn.

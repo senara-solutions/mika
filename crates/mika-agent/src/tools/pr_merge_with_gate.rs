@@ -130,12 +130,16 @@ impl Tool for PrMergeWithGateTool {
         let preflight = match run_gh_pr_view(pr_number, repo, token).await {
             Ok(pf) => pf,
             Err(e) => {
-                let result = MergeGateResult::GateError {
-                    kind: GateErrorKind::GhCliFailure {
-                        exit_code: e.exit_code.unwrap_or(-1),
+                // A credential-scope 403 surfaces here first when the App/PAT
+                // cannot even read the private repo (mika#1616).
+                let result = classify_credential_scope_error(&e.message, repo).unwrap_or(
+                    MergeGateResult::GateError {
+                        kind: GateErrorKind::GhCliFailure {
+                            exit_code: e.exit_code.unwrap_or(-1),
+                        },
+                        detail: e.message,
                     },
-                    detail: e.message,
-                };
+                );
                 return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
             }
         };
@@ -226,12 +230,14 @@ impl Tool for PrMergeWithGateTool {
         let checks = match checks_result {
             Ok(c) => c,
             Err(e) => {
-                let result = MergeGateResult::GateError {
-                    kind: GateErrorKind::GhCliFailure {
-                        exit_code: parse_exit_code_from_error(&e),
+                let result = classify_credential_scope_error(&e, repo).unwrap_or(
+                    MergeGateResult::GateError {
+                        kind: GateErrorKind::GhCliFailure {
+                            exit_code: parse_exit_code_from_error(&e),
+                        },
+                        detail: format!("Failed to fetch check statuses: {e}"),
                     },
-                    detail: format!("Failed to fetch check statuses: {e}"),
-                };
+                );
                 return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
             }
         };
@@ -298,12 +304,14 @@ impl Tool for PrMergeWithGateTool {
                         Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                     }
                     Err(e) => {
-                        let result = MergeGateResult::GateError {
-                            kind: GateErrorKind::GhCliFailure {
-                                exit_code: parse_exit_code_from_error(&e),
+                        let result = classify_credential_scope_error(&e, repo).unwrap_or(
+                            MergeGateResult::GateError {
+                                kind: GateErrorKind::GhCliFailure {
+                                    exit_code: parse_exit_code_from_error(&e),
+                                },
+                                detail: format!("Auto-merge failed: {e}"),
                             },
-                            detail: format!("Auto-merge failed: {e}"),
-                        };
+                        );
                         Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                     }
                 }
@@ -325,6 +333,10 @@ impl Tool for PrMergeWithGateTool {
                     Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                 } else if !is_err {
                     let result = MergeGateResult::Merged;
+                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                } else if let Some(result) = classify_credential_scope_error(&output, repo) {
+                    // Credential-scope 403 takes priority over the generic
+                    // draft/conflict/review classification below (mika#1616).
                     Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
                 } else if output_lower.contains("draft") {
                     let result = MergeGateResult::Blocked {
@@ -430,6 +442,14 @@ pub(crate) enum GateErrorKind {
     /// gh CLI returned non-zero exit code.
     #[serde(rename = "gh_cli_failure")]
     GhCliFailure { exit_code: i32 },
+    /// The merge credential (GitHub App installation token or PAT) lacks write
+    /// access to `repo` — surfaces from `gh` as a 403 / "Resource not
+    /// accessible by integration" / forbidden response (mika#1616). Distinct
+    /// from `GhCliFailure` so the agent reports a concrete, actionable cause
+    /// (install the App / widen the PAT scope) instead of paraphrasing an
+    /// opaque exit code into a fabricated guess.
+    #[serde(rename = "credential_scope")]
+    CredentialScope { repo: String },
     /// Network-level failure.
     #[serde(rename = "network_error")]
     NetworkError,
@@ -917,6 +937,47 @@ async fn persist_supervisor_metadata(
             "pr_merge_with_gate: failed to persist pr_url to supervisor metadata"
         ),
     }
+}
+
+/// Detect credential-scope failures from a `gh` error string (mika#1616).
+///
+/// When mika-dev's merge credential (GitHub App installation token, or PAT
+/// fallback) is not authorized to write to the target repo — e.g. the App is
+/// installed on `senara-solutions/mika` but not `senara-solutions/mika-cloud`
+/// — `gh pr merge` fails with a 403 / "Resource not accessible by integration"
+/// / forbidden response. The bare exit code carries no cause, so the LLM
+/// paraphrases it into fabricated guesses ("PAT gap blocks pr_merge_with_gate").
+///
+/// This classifier returns an actionable `GateError` naming the repo and the
+/// concrete remediation so the agent surfaces a real cause. Detection mirrors
+/// the established `classify_gh_error()` heuristic in `builtin_handlers.rs`
+/// (403 / forbidden / "resource not accessible"). Returns `None` for any other
+/// failure so unrelated errors keep their existing classification.
+pub(crate) fn classify_credential_scope_error(err: &str, repo: &str) -> Option<MergeGateResult> {
+    let lower = err.to_lowercase();
+    let is_credential_scope = lower.contains("resource not accessible")
+        || lower.contains("must have admin rights")
+        || lower.contains("403")
+        || lower.contains("forbidden");
+
+    if !is_credential_scope {
+        return None;
+    }
+
+    Some(MergeGateResult::GateError {
+        kind: GateErrorKind::CredentialScope {
+            repo: repo.to_string(),
+        },
+        detail: format!(
+            "Merge credential lacks write access to {repo}. The GitHub App \
+             installation (or PAT) used for autonomous merges is not authorized \
+             to merge pull requests on this repository. This is a credential/config \
+             gap, not a PR-state problem. Fix: install the mika GitHub App on \
+             {repo} with Contents + Pull requests write permission, or grant the \
+             configured PAT the `repo` scope for private repositories. \
+             Underlying gh error: {err}"
+        ),
+    })
 }
 
 /// Try to extract an exit code integer from an error string like "gh exit code 1: ..."
@@ -1456,6 +1517,75 @@ mod tests {
         assert_eq!(json["action"], "blocked");
         assert!(json["failing_checks"].is_array());
         assert_eq!(json["failing_checks"][0]["name"], "CI / test");
+    }
+
+    // -- Credential-scope classification tests (mika#1616) --
+
+    #[test]
+    fn serialize_gate_error_credential_scope() {
+        let result = MergeGateResult::GateError {
+            kind: GateErrorKind::CredentialScope {
+                repo: "senara-solutions/mika-cloud".to_string(),
+            },
+            detail: "Merge credential lacks write access".to_string(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["action"], "gate_errored");
+        assert_eq!(json["kind"]["kind"], "credential_scope");
+        assert_eq!(json["kind"]["repo"], "senara-solutions/mika-cloud");
+    }
+
+    #[test]
+    fn classify_credential_scope_resource_not_accessible() {
+        // The exact string GitHub App installation tokens return when the App
+        // lacks write access to the target repo — the mika#1616 root cause.
+        let err = "gh exit code 1: HTTP 403: Resource not accessible by integration";
+        let result = classify_credential_scope_error(err, "senara-solutions/mika-cloud");
+        match result {
+            Some(MergeGateResult::GateError {
+                kind: GateErrorKind::CredentialScope { repo },
+                detail,
+            }) => {
+                assert_eq!(repo, "senara-solutions/mika-cloud");
+                // Actionable diagnostic: names the repo + remediation.
+                assert!(detail.contains("senara-solutions/mika-cloud"));
+                assert!(detail.contains("GitHub App"));
+                // Preserves the underlying gh error for debugging.
+                assert!(detail.contains("Resource not accessible by integration"));
+            }
+            other => panic!("Expected CredentialScope GateError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_credential_scope_forbidden_and_403() {
+        for err in [
+            "gh exit code 1: HTTP 403: Forbidden",
+            "gh: 403 Forbidden accessing the merge endpoint",
+            "You must have admin rights to this repository",
+        ] {
+            assert!(
+                classify_credential_scope_error(err, "owner/repo").is_some(),
+                "expected credential-scope classification for: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_credential_scope_ignores_unrelated_errors() {
+        // Non-credential failures must fall through to their existing
+        // classification — no false positives that would mask real problems.
+        for err in [
+            "gh exit code 1: no checks reported on the 'main' branch",
+            "GraphQL: Pull request is in draft state",
+            "merge conflict between base and head",
+            "Connection refused",
+        ] {
+            assert!(
+                classify_credential_scope_error(err, "owner/repo").is_none(),
+                "expected no credential-scope classification for: {err}"
+            );
+        }
     }
 
     // -- parse_exit_code_from_error tests --
