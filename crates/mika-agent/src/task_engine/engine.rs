@@ -13,6 +13,7 @@ use super::cron::{
     extract_timezone_from_metadata, next_fire_from_cron, next_fire_from_cron_tz, parse_timezone,
 };
 use super::dispatcher::TaskDispatcher;
+use super::liveness::EngineHeartbeat;
 use super::queue::QueuedTask;
 use super::types::{action_type, task_status, trigger_type};
 
@@ -61,6 +62,10 @@ pub struct TaskEngine {
     reenqueue_rx: mpsc::Receiver<QueuedTask>,
     /// Tick counter used to trigger periodic DB scans.
     tick_count: u64,
+    /// Wedge-watchdog heartbeat (mika#1850). Updated at the top of every
+    /// tick; read by [`super::liveness::spawn_engine_wedge_watchdog`]
+    /// on its own cadence to detect wedged tick loops.
+    heartbeat: EngineHeartbeat,
 }
 
 impl TaskEngine {
@@ -74,7 +79,16 @@ impl TaskEngine {
             reenqueue_tx: tx,
             reenqueue_rx: rx,
             tick_count: 0,
+            heartbeat: EngineHeartbeat::new(),
         }
+    }
+
+    /// Clone the wedge-watchdog heartbeat handle (mika#1850). Cheap — the
+    /// underlying state is an `Arc<AtomicI64>`. Called by the server startup
+    /// after engine construction to hand a shared handle to
+    /// [`super::liveness::spawn_engine_wedge_watchdog`].
+    pub fn heartbeat(&self) -> EngineHeartbeat {
+        self.heartbeat.clone()
     }
 
     /// Called at startup.
@@ -218,6 +232,13 @@ impl TaskEngine {
     /// One tick: drain the re-enqueue channel, run periodic DB scan, then fire
     /// all due tasks (up to MAX_PER_TICK).
     async fn tick(&mut self) {
+        // Update wedge-watchdog heartbeat (mika#1850) — MUST be first line of
+        // tick body so a wedge in downstream awaits still tells the watchdog
+        // "the previous tick reached this point at time T". If we placed it
+        // after the DB scans, a hung scan would look like the loop never
+        // ticked at all.
+        self.heartbeat.tick();
+
         // Drain re-enqueue messages from completed recurring tasks
         while let Ok(task) = self.reenqueue_rx.try_recv() {
             self.push_to_heap(task);
