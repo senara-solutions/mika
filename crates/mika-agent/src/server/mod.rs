@@ -1475,9 +1475,30 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         // Prune completed tasks older than 30 days to prevent unbounded DB growth
         task_engine::prune_old_tasks(&db).await;
 
+        // Grab wedge-watchdog heartbeat handle BEFORE spawning tick loop
+        // (mika#1850). Cheap Arc clone; must be captured pre-spawn so both
+        // the tick loop and the watchdog reference the same underlying atom.
+        let heartbeat = {
+            let eng = engine.lock().await;
+            eng.heartbeat()
+        };
+
         // Spawn tick loop and retain the handle so we can abort it on shutdown
         let handle = TaskEngine::spawn_tick_loop(engine);
         tick_handles.push(handle);
+
+        // Spawn engine wedge watchdog (mika#1850). Runs on its own tokio task
+        // so a wedge in the tick loop cannot silence the alerter. Alert-only
+        // per Vincent RT#003 (no auto-restart). Shares kg_shutdown_token for
+        // graceful shutdown coherence — same lifecycle as the KG ticks.
+        let watchdog_threshold = task_engine::liveness::wedge_threshold_secs();
+        let watchdog_handle = task_engine::liveness::spawn_engine_wedge_watchdog(
+            heartbeat,
+            watchdog_threshold,
+            Some(agent_state.db.clone()),
+            kg_shutdown_token.child_token(),
+        );
+        tick_handles.push(watchdog_handle);
 
         // Background cleanup runs concurrently — fire and forget
         tokio::spawn(startup_cleanup(db, agent_state.embedding_client.clone()));
