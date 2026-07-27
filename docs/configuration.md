@@ -558,6 +558,7 @@ For running `mika` (the TUI chat client), only the API key is required:
 | `MIKA_{PROVIDER}_MODEL` | No | Override model for a provider |
 | `MIKA_{PROVIDER}_BASE_URL` | No | Override base URL for a provider |
 | `MIKA_LLM_MAX_TOKENS` | No | Override max tokens (default: `4096`) |
+| `MIKA_LLM_HTTP_TIMEOUT_SECS` | No | Per-request HTTP timeout for non-Anthropic LLM providers (openai-compatible + ollama). Default `120`. Raise for long-context synthesis (e.g. skill-review on large skills). Values `<10` rejected at provider construction (mika#1660). |
 | `MIKA_DB_PATH` | No | Override database path |
 | `MIKA_LOG_LEVEL` | No | Override log level (default: `info`) |
 | `MIKA_HOME` | No | Override home directory (default: `~/.mika/`) |
