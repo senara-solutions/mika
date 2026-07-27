@@ -1059,6 +1059,7 @@ async fn run_agent_for_message(
         github_token: a.settings.agent_github_token(),
         github_app: a.github_app.as_deref(),
         skills_dirty: &a.skills_dirty,
+        skill_nudge: Some(&a.skill_nudge),
         mcp_manager: a.mcp_manager.as_ref(),
         global_home_dir: Some(&state.global_home_dir),
         is_callback_turn: false,

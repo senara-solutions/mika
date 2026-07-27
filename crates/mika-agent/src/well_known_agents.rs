@@ -132,6 +132,7 @@ enabled = false\n\
 \n\
 [skills]\n\
 allow_authoring = false\n\
+nudge_enabled = false\n\
 allowlist = [\n\
   \"self-dev\",\n\
   \"self-dev-callback\",\n\
@@ -217,6 +218,7 @@ enabled = false\n\
 \n\
 [skills]\n\
 allow_authoring = false\n\
+nudge_enabled = false\n\
 allowlist = [\n\
   \"qa-review\",\n\
   \"qa-review-build-callback\",\n\
@@ -387,6 +389,7 @@ inject = false
 
 [skills]
 allow_authoring = false
+nudge_enabled = false
 allowlist = [{allowlist_block}]
 
 [tools]
@@ -464,6 +467,7 @@ pub fn well_known_skill_allowlists() -> Vec<(&'static str, Vec<String>)> {
 pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] = &[
     "skills.allowlist",
     "skills.allow_authoring",
+    "skills.nudge_enabled",
     "tools.disabled",
     "context.summary",
 ];
@@ -1331,6 +1335,7 @@ enabled = false\n\
 \n\
 [skills]\n\
 allow_authoring = false\n\
+nudge_enabled = false\n\
 allowlist = [\"__mika_test_no_skills__\"]\n";
 
 const MIKA_ARCH_SOUL: &str = r#"# Mika Architect — Plan Review Agent

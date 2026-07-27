@@ -371,6 +371,7 @@ pub async fn run(
         github_token: ctx.settings.agent_github_token(),
         github_app: ctx.github_app.as_deref(),
         skills_dirty: &skills_dirty,
+        skill_nudge: None, // mika#1583: nudges apply in server mode only
         mcp_manager: mcp_manager.as_ref(),
         global_home_dir: Some(&ctx.global_home),
         is_callback_turn: false,

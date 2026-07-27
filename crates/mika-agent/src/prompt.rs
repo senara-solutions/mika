@@ -142,6 +142,48 @@ pub struct SkillsIdentityConfig {
     /// `Some(true)` = authoring enabled.
     #[serde(default)]
     pub allow_authoring: Option<bool>,
+    /// Whether turn-end skill-authoring nudges are injected for this agent (mika#1583).
+    /// `None` or `Some(false)` = disabled (default). `Some(true)` = enabled.
+    #[serde(default)]
+    pub nudge_enabled: Option<bool>,
+    /// Nudge cadence in tool-invoking turns (mika#1583). `None` = default 10.
+    /// `Some(0)` is rejected at identity load (see `validate_skills_config`).
+    /// `Some(N > 0)` = nudge every N tool-invoking turns.
+    #[serde(default)]
+    pub nudge_interval: Option<u32>,
+}
+
+impl SkillsIdentityConfig {
+    /// Whether skill authoring (`skill_manage`) is permitted for this agent (mika#1582).
+    pub fn authoring_enabled(&self) -> bool {
+        self.allow_authoring.unwrap_or(false)
+    }
+
+    /// Whether turn-end skill-authoring nudges are enabled (mika#1583, default off).
+    pub fn nudge_is_enabled(&self) -> bool {
+        self.nudge_enabled.unwrap_or(false)
+    }
+
+    /// Resolved nudge cadence in tool-invoking turns (mika#1583, default 10).
+    /// Always `> 0` when reached at runtime — `Some(0)` is rejected at load.
+    pub fn resolved_nudge_interval(&self) -> u32 {
+        self.nudge_interval.unwrap_or(10)
+    }
+}
+
+/// Post-parse validation of the `[skills]` block (mika#1583, architect F1).
+///
+/// `toml::from_str` accepts `0` as a valid `u32`, so a `nudge_interval = 0` slips
+/// past deserialization. Reject it here so `nudge_enabled` is the sole on/off
+/// gate and `resolved_nudge_interval()` is always `> 0` at runtime (no zero-guard
+/// needed in the turn-end check).
+fn validate_skills_config(skills: &SkillsIdentityConfig) -> Result<(), String> {
+    if skills.nudge_interval == Some(0) {
+        return Err(
+            "skills.nudge_interval must be > 0 (use nudge_enabled = false to disable)".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Tool visibility config from the `[tools]` block in identity.toml.
@@ -336,7 +378,17 @@ pub async fn load_identity_async(home_dir: &Path) -> Identity {
 }
 
 fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) -> Identity {
-    match toml::from_str::<Identity>(content) {
+    // Parse, then run post-parse field validation (mika#1583 F1). A validation
+    // failure routes into the same malformed-identity path as a parse failure —
+    // no new error surface.
+    let parsed = toml::from_str::<Identity>(content)
+        .map_err(|e| e.to_string())
+        .and_then(|identity| {
+            validate_skills_config(&identity.skills)
+                .map(|()| identity)
+                .map_err(|e| format!("invalid [skills] config: {e}"))
+        });
+    match parsed {
         Ok(identity) => identity,
         Err(parse_err) => {
             let agent_name = home_dir
@@ -385,6 +437,8 @@ fn fail_closed_identity() -> Identity {
         skills: SkillsIdentityConfig {
             allowlist: Some(vec!["__fail_closed_no_skills__".to_string()]),
             allow_authoring: None,
+            nudge_enabled: None,
+            nudge_interval: None,
         },
         tools: ToolsIdentityConfig {
             disabled: crate::well_known_agents::MIKA_ARCH_DISABLED_TOOLS
@@ -1126,6 +1180,57 @@ mod tests {
 
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.starts_with("You are a sharp, proactive executive assistant."));
+    }
+
+    // mika#1583 F1 — nudge_interval = 0 is rejected at the pure-validator layer.
+    #[test]
+    fn test_validate_skills_config_rejects_zero_interval() {
+        let mut skills = SkillsIdentityConfig::default();
+        skills.nudge_interval = Some(0);
+        assert!(validate_skills_config(&skills).is_err());
+        skills.nudge_interval = Some(5);
+        assert!(validate_skills_config(&skills).is_ok());
+        skills.nudge_interval = None;
+        assert!(validate_skills_config(&skills).is_ok());
+    }
+
+    // mika#1583 F1 — a user-defined identity with nudge_interval = 0 routes into
+    // the existing malformed-identity fallback (Identity::default), not a crash.
+    #[test]
+    fn test_identity_load_rejects_zero_nudge_interval() {
+        // Non-well-known agent name → validation failure falls back to default.
+        let home = Path::new("/tmp/some-user-agent-1583");
+        let path = home.join("identity.toml");
+        let bad =
+            "name = \"X\"\nemoji = \"x\"\n\n[skills]\nnudge_enabled = true\nnudge_interval = 0\n";
+        let id = parse_identity_or_fail_closed(bad, home, &path);
+        assert_eq!(id.skills.nudge_interval, None);
+        assert!(!id.skills.nudge_is_enabled());
+
+        // A valid interval parses through and is preserved.
+        let good =
+            "name = \"X\"\nemoji = \"x\"\n\n[skills]\nnudge_enabled = true\nnudge_interval = 5\n";
+        let id2 = parse_identity_or_fail_closed(good, home, &path);
+        assert_eq!(id2.skills.nudge_interval, Some(5));
+        assert!(id2.skills.nudge_is_enabled());
+        assert_eq!(id2.skills.resolved_nudge_interval(), 5);
+    }
+
+    // mika#1583 — off-by-default: absent nudge fields default to disabled with
+    // interval 10. Well-known identities are intentionally NOT in this fixture.
+    #[test]
+    fn test_nudge_off_by_default() {
+        let skills = SkillsIdentityConfig::default();
+        assert!(!skills.nudge_is_enabled());
+        assert_eq!(skills.resolved_nudge_interval(), 10);
+        assert!(!skills.authoring_enabled());
+
+        let home = Path::new("/tmp/some-user-agent-1583");
+        let path = home.join("identity.toml");
+        let toml = "name = \"X\"\nemoji = \"x\"\n\n[skills]\nallowlist = [\"foo\"]\n";
+        let id = parse_identity_or_fail_closed(toml, home, &path);
+        assert!(!id.skills.nudge_is_enabled());
+        assert_eq!(id.skills.resolved_nudge_interval(), 10);
     }
 
     #[test]

@@ -43,6 +43,11 @@ use mika_common::config::Settings;
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::ProviderKind;
 
+/// Nudge-driven skill creation (mika#1583) — turn-end counter + advisory
+/// prompt-injection helpers. Co-located with the loop that reads them.
+pub mod skill_nudge;
+use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pending_nudge};
+
 /// Skills whose LLM output legitimately contains `Verdict:` lines.
 /// Used by the dev-groom fabrication guard (#1133, #1254) to exempt
 /// verdict-producer agents. When a skill in this list is loaded, the
@@ -674,6 +679,7 @@ async fn run_loop(
     internal: bool,
     deadline: Instant,
     scope_task_id: Option<&str>,
+    skill_nudge: Option<&SkillNudgeContext<'_>>,
 ) -> Result<LoopResult> {
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
@@ -694,6 +700,15 @@ async fn run_loop(
                 .flat_map(|m| m.tool_definitions().iter().map(|d| d.name.clone())),
         )
         .collect();
+
+    // mika#1583 — turn-end skill-authoring nudge. Applied once per turn at every
+    // clean EndTurn-accept exit (after all post-condition guards passed). No-op
+    // when `skill_nudge` is `None` (CLI / silent / team modes).
+    let apply_nudge_turn_end = |tool_use_occurred: bool| {
+        if let Some(nudge) = skill_nudge {
+            apply_turn_end(nudge, tool_use_occurred, enabled_tool_names);
+        }
+    };
 
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
@@ -2199,6 +2214,7 @@ async fn run_loop(
                         }
                     }
 
+                    apply_nudge_turn_end(tool_use_occurred);
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
                         text: Some(text),
@@ -2305,6 +2321,7 @@ async fn run_loop(
                         continue;
                     }
 
+                    apply_nudge_turn_end(tool_use_occurred);
                     info!(step, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
                         text: None,
@@ -2346,6 +2363,7 @@ async fn run_loop(
                         "agent returned empty text after follow-up"
                     );
                 }
+                apply_nudge_turn_end(tool_use_occurred);
                 info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
                 return Ok(LoopResult::Done {
                     text: None,
@@ -2434,6 +2452,7 @@ async fn run_loop(
                             )
                             .await;
                     }
+                    apply_nudge_turn_end(tool_use_occurred);
                     return Ok(LoopResult::Done {
                         text: None,
                         thinking: thinking_text,
@@ -2546,6 +2565,11 @@ pub struct AgentParams<'a> {
     pub github_app: Option<&'a mika_common::github_app::GitHubApp>,
     /// Shared dirty flag for skill hot-reload.
     pub skills_dirty: &'a AtomicBool,
+    /// Cross-turn skill-authoring nudge state (mika#1583). `Some` in server mode
+    /// (from `AgentState`), `None` in CLI/test — nudges only apply in
+    /// conversation mode with a server-provided state. Mirrors
+    /// `pr_reviews_posted`'s optional-borrowed shape.
+    pub skill_nudge: Option<&'a SkillNudgeState>,
     /// Optional MCP manager for external tool servers.
     pub mcp_manager: Option<&'a McpManager>,
     /// Global Mika home directory (e.g. `~/.mika/`), used for team/agent discovery in the prompt.
@@ -2773,6 +2797,21 @@ async fn run_agent_inner(
         system.push_str("<context type=\"summary\" trust=\"data\">\n");
         system.push_str(&content);
         system.push_str("\n</context>\n");
+    }
+
+    // mika#1583 — consume a pending skill-authoring nudge from a prior turn.
+    // Injected alongside the summary block, NOT inside `build_system_prompt`
+    // (a pure, widely-tested builder that must not gain per-agent mutable state).
+    // `nudge_is_enabled()` re-check is belt-and-suspenders — pending is only set
+    // while enabled, but an operator could flip the flag off between turns.
+    if let Some(nudge) = params.skill_nudge
+        && ctx.identity.skills.nudge_is_enabled()
+    {
+        inject_pending_nudge(
+            &mut system,
+            nudge,
+            ctx.identity.skills.resolved_nudge_interval(),
+        );
     }
 
     // Resolve GitHub token once: prefer GitHub App installation token, fall back to PAT.
@@ -3111,6 +3150,15 @@ async fn run_agent_inner(
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
     let is_verdict_producer = has_verdict_producer_skill(params.skills.skills());
 
+    // mika#1583 — per-turn nudge context (conversation mode only; `None` when no
+    // server-provided `SkillNudgeState` is threaded through `AgentParams`).
+    let skill_nudge_ctx = params.skill_nudge.map(|state| SkillNudgeContext {
+        state,
+        enabled: ctx.identity.skills.nudge_is_enabled(),
+        interval: ctx.identity.skills.resolved_nudge_interval(),
+        authoring_enabled: ctx.identity.skills.authoring_enabled(),
+    });
+
     let result = run_loop(
         effective_llm,
         tools,
@@ -3134,6 +3182,7 @@ async fn run_agent_inner(
         params.internal,
         deadline,
         scope_task_id,
+        skill_nudge_ctx.as_ref(),
     )
     .await?;
 
@@ -3977,6 +4026,7 @@ async fn run_silent_inner(params: &SilentAgentParams<'_>, deadline: Instant) -> 
         false, // silent mode messages are never internal
         deadline,
         scope_task_id.as_deref(),
+        None, // mika#1583: silent-mode turns do not nudge
     )
     .await?;
 
@@ -4408,6 +4458,7 @@ async fn run_team_agent_inner_impl(
         false, // team mode messages are never internal
         deadline,
         None, // team mode: no task context for parallel narrative
+        None, // mika#1583: team-mode turns do not nudge
     )
     .await?;
 
