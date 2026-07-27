@@ -216,7 +216,7 @@ impl OllamaProvider {
         provider_kind: super::ProviderKind,
     ) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(super::http_timeout_secs()))
             .build()
             .expect("failed to build HTTP client");
 
