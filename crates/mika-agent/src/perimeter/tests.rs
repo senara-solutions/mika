@@ -470,3 +470,60 @@ fn cpp_all_mechanical_pr_classifies_mechanical() {
     assert!(result.decision_core_files.is_empty());
     assert_eq!(result.mechanical_files.len(), 4);
 }
+
+// ---------------------------------------------------------------------------
+// Root scaffolding config (mika#1864) — exact-match, root-only.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn root_gitignore_is_mechanical() {
+    // Repo-root scaffolding config carries zero decision-core semantics.
+    for path in [".gitignore", ".gitattributes", ".editorconfig"] {
+        assert_eq!(
+            classify_path(path),
+            Classification::Mechanical,
+            "root scaffolding {path} should be MECHANICAL (mika#1864)"
+        );
+    }
+    // A PR touching only the root `.gitignore` auto-merges.
+    let result = classify_pr_files(&[".gitignore".to_string()]);
+    assert_eq!(result.verdict, Classification::Mechanical);
+    assert!(result.decision_core_files.is_empty());
+    assert_eq!(result.mechanical_files.len(), 1);
+}
+
+#[test]
+fn nested_gitignore_still_decision_core() {
+    // Exact-match is root-only: a nested `.gitignore` arrives as a repo-relative
+    // path (never the bare `.gitignore`), so it fails closed to DECISION-CORE.
+    // No prefix/suffix rule may accidentally allow it (that would open an
+    // auto-merge bypass for decision-core PRs).
+    for path in [
+        "crates/foo/.gitignore",
+        "crates/mika-agent/src/perimeter/.gitignore",
+    ] {
+        assert_eq!(
+            classify_path(path),
+            Classification::DecisionCore,
+            "nested {path} must stay DECISION-CORE (mika#1864)"
+        );
+    }
+}
+
+#[test]
+fn gitignore_plus_decision_core_taints() {
+    // Mixed PR: root `.gitignore` (MECHANICAL) + a decision-core `.rs` still
+    // taints the whole batch to DECISION-CORE — the taint invariant is
+    // untouched by adding `.gitignore` to the allowlist.
+    let files = vec![
+        ".gitignore".to_string(),
+        "crates/mika-agent/src/foo.rs".to_string(),
+    ];
+    let result = classify_pr_files(&files);
+    assert_eq!(result.verdict, Classification::DecisionCore);
+    assert_eq!(result.mechanical_files.len(), 1);
+    assert_eq!(
+        result.decision_core_files,
+        vec!["crates/mika-agent/src/foo.rs"]
+    );
+}

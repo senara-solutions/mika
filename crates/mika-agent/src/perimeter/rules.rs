@@ -18,6 +18,8 @@
 //! - narrative docs (logs, plans, solution write-ups); NOT authority docs
 //!   (`docs/architecture/**`, `docs/adr/**`, `docs/design/**`,
 //!   `docs/gate/**` — those are gated)
+//! - repo-root scaffolding config (`.gitignore`/`.gitattributes`/`.editorconfig`)
+//!   via exact-match (root-only); nested copies stay DECISION-CORE (mika#1864)
 //!
 //! ## What is explicitly DECISION-CORE (grep-anchored)
 //!
@@ -134,6 +136,15 @@ const MECHANICAL_EXACT: &[&str] = &[
     "pyproject.toml", // cpp deps (Dependabot-managed; visible in diff)
     "uv.lock",        // cpp dep lock (regenerated from pyproject.toml)
     "LICENSE",        // license file (both repos have one; universally safe)
+    // --- Repo-root scaffolding config (mika#1864) ---
+    // Pure config/scaffolding with zero decision-core semantics. EXACT-match
+    // (root-only) BY DESIGN: `is_mechanical` checks `MECHANICAL_EXACT.contains(&path)`,
+    // so only the bare repo-root path matches. A nested copy arrives as
+    // `crates/foo/.gitignore` and deliberately stays DECISION-CORE — a prefix
+    // or suffix rule here would open an auto-merge bypass for decision-core PRs.
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
 ];
 
 /// Path substrings that grant MECHANICAL when found anywhere in the path.
