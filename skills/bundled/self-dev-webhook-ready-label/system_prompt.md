@@ -59,3 +59,9 @@ When the message starts with `[GitHub] Issue labeled ready on <repo>#<n>`, the o
 
 **Other label-add events** (`bug`, `enhancement`, `p1-important`, etc.) — any `[GitHub] Issue labeled <name> on ...` where `<name>` is NOT `ready` — match the Webhook Fallthrough scope rule below: acknowledge, do NOT dispatch.
 
+
+---
+
+## Wip-rescue contract (mika#1613 / mika#1682)
+
+Do NOT call `gh pr ready` or `gh pr edit --title` on any PR matching the wip-rescue signature: `wip-rescue` label OR head commit starts with `wip(`. The operator must un-draft these PRs manually after reviewing the rescued work. Engine-side guard mika#1682 will reject the tool call if attempted — this instruction is a prompt-level reinforcement to avoid hitting the guard.

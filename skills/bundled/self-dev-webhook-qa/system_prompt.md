@@ -268,3 +268,9 @@ For milestone and project workflows (see self-dev skill), child tasks are linked
 3. If still no match, check if any task has this PR's issue as its `parent_task_id` (milestone/project child lookup)
 
 Child tasks use the same PR review webhook path — their QA verdict handling is identical to standalone issues.
+
+---
+
+## Wip-rescue contract (mika#1613 / mika#1682)
+
+Do NOT call `gh pr ready` or `gh pr edit --title` on any PR matching the wip-rescue signature: `wip-rescue` label OR head commit starts with `wip(`. The operator must un-draft these PRs manually after reviewing the rescued work. Engine-side guard mika#1682 will reject the tool call if attempted — this instruction is a prompt-level reinforcement to avoid hitting the guard.

@@ -2077,6 +2077,241 @@ fn extract_api_path(args: &[String]) -> &str {
     ""
 }
 
+/// Parsed subset of `gh pr view --json isDraft,labels,commits` output used to
+/// detect the wip-rescue signature (mika#1682).
+#[derive(Debug, Clone)]
+struct PrWipRescueView {
+    is_draft: bool,
+    labels: Vec<String>,
+    /// Head commit headline = `commits[-1].messageHeadline` (last commit on the PR).
+    head_commit_headline: Option<String>,
+}
+
+/// Structured rejection message for un-drafting / renaming a wip-rescue PR.
+/// References mika#1613's operator-review contract so the LLM (and operator
+/// reading audit logs) understands why the tool call was blocked.
+fn wip_rescue_rejection_message(pr_num: &str) -> String {
+    format!(
+        "Cannot un-draft / rename wip-rescue PR #{pr_num}. This PR was opened by \
+         dispatch-lib's post-flight recovery (mika#1282 or mika#1383). The wip-rescue \
+         draft state is the operator-review gate per mika#1613 — the operator must \
+         un-draft this PR manually after reviewing the rescued work.\n\n\
+         To proceed: leave the PR draft. The operator will review and promote it. \
+         Source: builtin_handlers.rs::validate_pr_ready_undraft_scope (mika#1682)."
+    )
+}
+
+/// Detect a ready-promoting `gh` call and extract its target PR number (mika#1682).
+///
+/// Returns `Some(pr_num)` when the argv is one of the two un-draft / rename shapes:
+/// - `gh pr ready <N>` (without `--undo`) — explicit un-draft. (`--undo` converts
+///   TO draft and is allowed.)
+/// - `gh pr edit <N> --title <T>` — title rename (the captured `wip(...)` → `fix(...)`
+///   promotion shape).
+///
+/// Returns `None` for any other call, or when no PR number can be parsed from a
+/// positional argument (fail-open: e.g. current-branch `gh pr ready`).
+fn detect_ready_promote_pr(args: &[String]) -> Option<&str> {
+    let subcommand = args.first().map(String::as_str)?;
+    if subcommand != "pr" {
+        return None;
+    }
+    let verb = args.get(1).map(String::as_str)?;
+
+    let is_ready_promote = verb == "ready" && !args.iter().any(|a| a == "--undo");
+    let is_edit_title = verb == "edit" && args.iter().any(|a| a == "--title");
+    if !is_ready_promote && !is_edit_title {
+        return None;
+    }
+
+    extract_pr_number_positional(args)
+}
+
+/// Extract the first positional PR number from a `gh pr <verb> ...` argv.
+///
+/// Scans args after the subcommand+verb (index 2+), skipping value-consuming flags
+/// and their values so a numeric `--title 123` is not mistaken for the PR number.
+/// Normalizes GitHub PR URLs to bare numbers via `normalize_pr_identifier`.
+fn extract_pr_number_positional(args: &[String]) -> Option<&str> {
+    /// Flags on `gh pr ready`/`gh pr edit` that consume the next argument as a value.
+    const VALUE_FLAGS: &[&str] = &[
+        "--title",
+        "-t",
+        "--body",
+        "-b",
+        "--body-file",
+        "-F",
+        "--add-label",
+        "--remove-label",
+        "--add-assignee",
+        "--remove-assignee",
+        "--add-reviewer",
+        "--remove-reviewer",
+        "--add-project",
+        "--remove-project",
+        "--milestone",
+        "-m",
+        "--base",
+        "-B",
+        "--repo",
+        "-R",
+    ];
+
+    let mut iter = args.iter().skip(2);
+    while let Some(arg) = iter.next() {
+        if arg.starts_with('-') {
+            if VALUE_FLAGS.contains(&arg.as_str()) {
+                let _ = iter.next(); // consume the flag's value
+            }
+            continue;
+        }
+        let normalized = normalize_pr_identifier(arg);
+        if normalized.parse::<u32>().is_ok() {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+/// Pure wip-rescue signature check (mika#1682 / mika#1613).
+///
+/// A PR matches when EITHER:
+/// - it carries the `wip-rescue` label (case-insensitive), OR
+/// - it is a draft AND its head commit headline starts with `wip(` (the marker
+///   prefix written by dispatch-lib's post-flight recovery, mika#1282/#1383).
+fn pr_matches_wip_rescue(view: &PrWipRescueView) -> bool {
+    if view
+        .labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case("wip-rescue"))
+    {
+        return true;
+    }
+    view.is_draft
+        && view
+            .head_commit_headline
+            .as_deref()
+            .map(|h| h.starts_with("wip("))
+            .unwrap_or(false)
+}
+
+/// Pure decision for a detected ready-promote call (mika#1682).
+///
+/// `view` is `None` when the `gh pr view` fetch failed — fail-open (allow), per the
+/// existing scope-validator pattern, so a transient GitHub error never blocks
+/// legitimate PR flows. Rejects only when the fetched view matches the wip-rescue
+/// signature.
+fn decide_pr_ready_undraft(pr_num: &str, view: Option<&PrWipRescueView>) -> Result<(), ToolOutput> {
+    match view {
+        Some(v) if pr_matches_wip_rescue(v) => {
+            Err(ToolOutput::error(wip_rescue_rejection_message(pr_num)))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Parse `gh pr view --json isDraft,labels,commits` JSON output into a
+/// `PrWipRescueView`. Returns `None` on any parse failure (fail-open).
+fn parse_pr_wip_rescue_view(json: &str) -> Option<PrWipRescueView> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let is_draft = value
+        .get("isDraft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let labels = value
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Head commit = last entry in the commits array.
+    let head_commit_headline = value
+        .get("commits")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|c| c.get("messageHeadline"))
+        .and_then(|h| h.as_str())
+        .map(String::from);
+    Some(PrWipRescueView {
+        is_draft,
+        labels,
+        head_commit_headline,
+    })
+}
+
+/// Fetch the wip-rescue-relevant view of a PR via `gh pr view`. Fail-open: any
+/// spawn / non-zero-exit / parse error returns `None` so the caller allows the call.
+async fn fetch_pr_wip_rescue_view(
+    pr_num: &str,
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Option<PrWipRescueView> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(["pr", "view", pr_num, "--json", "isDraft,labels,commits"]);
+    if let Some(repo) = repo {
+        cmd.arg("--repo").arg(repo);
+    }
+    cmd.env("GH_PROMPT_DISABLED", "1");
+    super::executor::scrub_mika_env_vars(&mut cmd);
+    if let Some(token) = ctx.github_token {
+        cmd.env("GH_TOKEN", token);
+    }
+
+    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+    if output.is_error
+        || output.content.starts_with("Exit code:")
+        || output.content.starts_with("Killed by signal:")
+    {
+        // Fail-open: don't block legitimate flows on a transient GitHub error.
+        return None;
+    }
+    parse_pr_wip_rescue_view(&output.content)
+}
+
+/// Validate `gh pr ready` / `gh pr edit --title` against the wip-rescue
+/// operator-review contract (mika#1682, layer-2 companion of mika#1679).
+///
+/// mika#1613 requires that dispatch-lib post-flight rescue draft PRs stay draft
+/// until the operator manually un-drafts them after review. This engine-side
+/// tool-boundary guard — mirroring `validate_dispatch_readiness()` (mika#525) and
+/// the `validate_gh_api_scope` (mika#1167) / `validate_qa_review_gh_scope`
+/// (mika#1196) chain — rejects un-draft / rename calls targeting a wip-rescue PR
+/// before the subprocess spawns. Prompt-only contracts don't bind across model
+/// classes (per `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`),
+/// so this structural guard is the load-bearing fix.
+///
+/// Fail-open on `gh pr view` errors and on non-promote calls (pass-through).
+async fn validate_pr_ready_undraft_scope(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    let Some(pr_num) = detect_ready_promote_pr(args) else {
+        return Ok(());
+    };
+
+    let view = fetch_pr_wip_rescue_view(pr_num, repo, ctx).await;
+    let decision = decide_pr_ready_undraft(pr_num, view.as_ref());
+
+    if decision.is_err() {
+        // Audit event mirroring `gh_api_invocation` shape (mika#1682 AC3).
+        tracing::info!(
+            event = "pr_ready_undraft_blocked",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            pr_number = %pr_num,
+            reason = "wip_rescue_contract",
+            repo = %repo.unwrap_or("unknown"),
+            "blocked un-draft / rename of wip-rescue PR per mika#1613 contract"
+        );
+    }
+
+    decision
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -2092,6 +2327,15 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // Skill-scoped scope check (mika#1196): when qa-review is in the active
     // skill set, restrict to the narrow allowlist before any side effects.
     if let Err(err) = validate_qa_review_gh_scope(&gh_args.args, ctx) {
+        return err;
+    }
+
+    // Wip-rescue ready-promote gate (mika#1682): reject `gh pr ready` / `gh pr
+    // edit --title` on PRs matching the wip-rescue signature, restoring mika#1613's
+    // operator-review contract that mika-dev was silently bypassing (layer-2).
+    if let Err(err) =
+        validate_pr_ready_undraft_scope(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
         return err;
     }
 
@@ -6895,5 +7139,168 @@ mod tests {
         let ctx = harness.ctx(); // active_skill_paths: &[]
         let result = validate_qa_review_gh_scope(&str_args(&["pr", "merge", "123"]), &ctx);
         assert!(result.is_ok());
+    }
+
+    // -- validate_pr_ready_undraft_scope tests (mika#1682) --
+    //
+    // The network-fetch boundary (`fetch_pr_wip_rescue_view`) is separated from
+    // the pure detection (`detect_ready_promote_pr`) and decision
+    // (`decide_pr_ready_undraft`) logic, so these tests exercise the full guard
+    // semantics without hitting GitHub.
+
+    fn wip_rescue_label_view() -> PrWipRescueView {
+        PrWipRescueView {
+            is_draft: true,
+            labels: vec!["wip-rescue".to_string()],
+            head_commit_headline: Some("fix(mika#1663): skill-review variant path".to_string()),
+        }
+    }
+
+    fn wip_commit_view() -> PrWipRescueView {
+        PrWipRescueView {
+            is_draft: true,
+            labels: vec![],
+            head_commit_headline: Some("wip(mika#1663): impl staged by recovery".to_string()),
+        }
+    }
+
+    fn normal_pr_view() -> PrWipRescueView {
+        PrWipRescueView {
+            is_draft: false,
+            labels: vec!["bug".to_string()],
+            head_commit_headline: Some("fix(mika#1700): correct edge case".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_validate_pr_ready_undraft_blocks_wip_rescue_label() {
+        // Shape detection: `gh pr ready 1681` is a ready-promote call.
+        let args = str_args(&["pr", "ready", "1681"]);
+        let pr = detect_ready_promote_pr(&args);
+        assert_eq!(pr, Some("1681"));
+        // Decision on a wip-rescue-labelled PR rejects.
+        let view = wip_rescue_label_view();
+        let result = decide_pr_ready_undraft("1681", Some(&view));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("wip-rescue PR #1681"));
+        assert!(err.content.contains("mika#1613"));
+        assert!(err.content.contains("mika#1682"));
+    }
+
+    #[test]
+    fn test_validate_pr_ready_undraft_blocks_wip_commit() {
+        // Draft PR whose head commit starts with `wip(` matches even without a label.
+        let view = wip_commit_view();
+        assert!(pr_matches_wip_rescue(&view));
+        let result = decide_pr_ready_undraft("1681", Some(&view));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_pr_ready_undraft_allows_normal_pr() {
+        // Non-draft, no wip-rescue label, conventional commit → allowed.
+        let view = normal_pr_view();
+        assert!(!pr_matches_wip_rescue(&view));
+        let result = decide_pr_ready_undraft("1700", Some(&view));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_pr_ready_undraft_fail_open_on_api_error() {
+        // `gh pr view` failed → view is None → fail-open (allow).
+        let result = decide_pr_ready_undraft("1681", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_pr_edit_title_blocks_rename_on_wip_rescue() {
+        // The captured attack shape: `gh pr edit 1681 --title "fix(...)"`.
+        let args = str_args(&[
+            "pr",
+            "edit",
+            "1681",
+            "--title",
+            "fix(mika#1663): skill-review variant path",
+        ]);
+        let pr = detect_ready_promote_pr(&args);
+        assert_eq!(pr, Some("1681"));
+        let view = wip_rescue_label_view();
+        let result = decide_pr_ready_undraft("1681", Some(&view));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_passes_pr_ready_undo() {
+        // `gh pr ready 1681 --undo` converts TO draft — not a promote, allowed.
+        let args = str_args(&["pr", "ready", "1681", "--undo"]);
+        let pr = detect_ready_promote_pr(&args);
+        assert_eq!(pr, None);
+    }
+
+    #[test]
+    fn test_detect_ready_promote_ignores_non_pr_and_other_verbs() {
+        // Non-`pr` subcommands and non-promote verbs are pass-through.
+        assert_eq!(
+            detect_ready_promote_pr(&str_args(&["issue", "view", "1"])),
+            None
+        );
+        assert_eq!(
+            detect_ready_promote_pr(&str_args(&["pr", "view", "1681"])),
+            None
+        );
+        assert_eq!(
+            detect_ready_promote_pr(&str_args(&["pr", "diff", "1681"])),
+            None
+        );
+        // `pr edit` WITHOUT `--title` (e.g. label change) is not a rename-promote.
+        assert_eq!(
+            detect_ready_promote_pr(&str_args(&["pr", "edit", "1681", "--add-label", "x"])),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_pr_number_skips_numeric_title_value() {
+        // A numeric `--title 123` value must not be mistaken for the PR number.
+        let args = str_args(&["pr", "edit", "1681", "--title", "123"]);
+        let pr = detect_ready_promote_pr(&args);
+        assert_eq!(pr, Some("1681"));
+    }
+
+    #[test]
+    fn test_detect_ready_promote_normalizes_pr_url() {
+        let args = str_args(&[
+            "pr",
+            "ready",
+            "https://github.com/senara-solutions/mika/pull/1681",
+        ]);
+        let pr = detect_ready_promote_pr(&args);
+        assert_eq!(pr, Some("1681"));
+    }
+
+    #[test]
+    fn test_parse_pr_wip_rescue_view_reads_last_commit() {
+        let json = r#"{
+            "isDraft": true,
+            "labels": [{"name": "wip-rescue"}, {"name": "bug"}],
+            "commits": [
+                {"messageHeadline": "first commit"},
+                {"messageHeadline": "wip(mika#1663): impl staged by recovery"}
+            ]
+        }"#;
+        let view = parse_pr_wip_rescue_view(json).expect("parses");
+        assert!(view.is_draft);
+        assert_eq!(view.labels, vec!["wip-rescue", "bug"]);
+        assert_eq!(
+            view.head_commit_headline.as_deref(),
+            Some("wip(mika#1663): impl staged by recovery")
+        );
+        assert!(pr_matches_wip_rescue(&view));
+    }
+
+    #[test]
+    fn test_parse_pr_wip_rescue_view_malformed_returns_none() {
+        assert!(parse_pr_wip_rescue_view("Exit code: 1\nnot found").is_none());
     }
 }

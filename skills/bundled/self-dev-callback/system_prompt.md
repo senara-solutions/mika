@@ -155,3 +155,9 @@ If the callback text contains the line `RECOVERY_PENDING: true` (emitted by disp
 **Step 5 — (removed: QA is webhook-driven)**
 
 QA review triggers automatically on PR open/update/review_requested. Verdicts arrive via `pull_request_review.submitted` webhook, handled by the `self-dev-webhook-qa` skill. After claude-pilot creates a PR, proceed directly to Step 6 with `in_progress`.
+
+---
+
+## Wip-rescue contract (mika#1613 / mika#1682)
+
+Do NOT call `gh pr ready` or `gh pr edit --title` on any PR matching the wip-rescue signature: `wip-rescue` label OR head commit starts with `wip(`. The operator must un-draft these PRs manually after reviewing the rescued work. Engine-side guard mika#1682 will reject the tool call if attempted — this instruction is a prompt-level reinforcement to avoid hitting the guard.

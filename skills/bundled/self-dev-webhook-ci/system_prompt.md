@@ -43,3 +43,9 @@ Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR
 `run_gh` takes TWO SEPARATE INPUTS: `"command"` (array of gh subcommand arguments) and `"repo"` (string, `owner/repo` target). `--repo` is a **sibling parameter to `command`**, NOT a flag inside the array. Any shorthand example like `run_gh("pr list --repo senara-solutions/mika ...")` is **not literal** — split it: put every token EXCEPT `--repo VALUE` into `command`, pull `VALUE` into `repo`. Including `--repo` inside `command` causes the wrapper to reject the call. If that happens, **move `--repo` out of the array** — do NOT drop it (you will silently query the wrong repo). Permitted: `pr, issue, run, workflow, release, repo, search, label, api`. Use `gh api` for milestone/project mutations and arbitrary REST/GraphQL operations (e.g., `gh api --method PATCH /repos/owner/repo/milestones/N -f state=closed`).
 
 **Incident:** session `4cbc6de7-...` on 2026-04-17 — milestone #12 dispatch failed because `--repo` was passed inside `command`, wrapper rejected it, agent dropped `--repo` on retry and falsely concluded milestone didn't exist.
+
+---
+
+## Wip-rescue contract (mika#1613 / mika#1682)
+
+Do NOT call `gh pr ready` or `gh pr edit --title` on any PR matching the wip-rescue signature: `wip-rescue` label OR head commit starts with `wip(`. The operator must un-draft these PRs manually after reviewing the rescued work. Engine-side guard mika#1682 will reject the tool call if attempted — this instruction is a prompt-level reinforcement to avoid hitting the guard.
