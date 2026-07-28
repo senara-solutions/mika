@@ -91,6 +91,30 @@ inject = true
 max_tokens = 0
 ```
 
+## Session Configuration
+
+`[session]` section in `identity.toml` makes an agent **single-session-by-nature** (mika#1401). `SessionIdentityConfig` in `prompt.rs` deserializes it.
+
+### `[session].singleton` (bool, default: `false`)
+
+When `true`, every conversational invocation (`mika ask`, `mika chat`, HTTP `/send`) reuses one canonical session instead of minting a fresh `Uuid::new_v4()` per ask. The single-session invariant is enforced by the engine, not by remembering to pass `--session-id`. Opt-in — absent or `false` preserves the default (random UUID per ask). An explicit `--session-id` always overrides the canonical session.
+
+### `[session].canonical_id` (string, optional, default: derived)
+
+The literal session ID to use. When absent and `singleton = true`, the engine derives `canonical-{agent_id}` — a prefix-typed sibling of `system-{agent_id}`, structurally exempt from `prune_old_sessions` (the `canonical-` prefix is not in its LIKE clause). `canonical_id` exists for mika-prime's operator-chosen zero-UUID (`00000000-0000-0000-0000-000000000000`), which is likewise pruning-exempt (no matching prefix).
+
+```toml
+[session]
+singleton = true
+canonical_id = "00000000-0000-0000-0000-000000000000"  # optional
+```
+
+**Mechanism:** `resolve_canonical_session_id(&Identity, agent_id) -> Option<String>` returns `None` for non-singleton agents (callers mint per-ask UUIDs), else the resolved ID. The `/send` handler caches it on `AgentState.canonical_session_id` at `init_agent` time; CLI paths resolve it per-invocation. Session creation goes through the idempotent `get_or_create_canonical_session` (`INSERT OR IGNORE`, mirroring `get_or_create_system_session`). Session teardown goes through `end_session_unless_canonical(id, canonical_id)`, which no-ops when `id == canonical_id` so the canonical session's `ended_at` stays NULL forever. In the TUI, `/clear` for a singleton agent clears only the display (gated by `App.is_singleton_session`) — the session ID and worker context are preserved.
+
+**Compaction interaction:** compaction already keys on `agent_id`, not `session_id`, so a singleton agent is unaffected — the single canonical session simply accumulates all history. The silent/callback/heartbeat paths use their own derived namespaces (`callback-*`, `heartbeat-*`) and are untouched.
+
+**Concurrency:** the singleton merges all channels into one thread. For a single-surface, zero-skill oracle (mika-prime's profile) this is the designed intent, not a defect. High-concurrency multi-surface agents should not opt in.
+
 ## Tools
 
 Each tool validates inputs. Control fields capped at `MAX_INPUT_LEN = 10_000` chars; payload fields capped at `MAX_PAYLOAD_BYTES = 200 * 1024` bytes (200 KB).

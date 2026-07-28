@@ -43,7 +43,7 @@ Home directory: `$MIKA_HOME` (default `~/.mika/`).
 ├── agents/
 │   └── mika/                         # Default agent (same structure per agent)
 │       ├── config.toml               # Per-agent config overrides (0600)
-│       ├── identity.toml             # Agent name + emoji (0600)
+│       ├── identity.toml             # Agent name + emoji + [kg]/[skills]/[tools]/[context]/[session] blocks (0600)
 │       ├── soul.md                   # Personality definition (0600)
 │       ├── heartbeat.md              # Heartbeat checklist (0600)
 │       ├── user.md                   # User info seed (0600)
@@ -114,7 +114,7 @@ Durable changes to bundled skills must go through the source tree at `skills/bun
 
 **agents** — `id TEXT PK`, `name TEXT NOCASE`, `home_dir TEXT`, `active BOOLEAN DEFAULT 1`, `last_seen TEXT`, `created_at TEXT`
 
-**sessions** — `id TEXT PK`, `agent_id TEXT FK→agents`, `channel_type TEXT DEFAULT 'cli'`, `parent_session_id TEXT`, `task_id TEXT` (reverse link to triggering task, partial index), `started_at TEXT`, `ended_at TEXT`, `metadata TEXT`
+**sessions** — `id TEXT PK`, `agent_id TEXT FK→agents`, `channel_type TEXT DEFAULT 'cli'`, `parent_session_id TEXT`, `task_id TEXT` (reverse link to triggering task, partial index), `started_at TEXT`, `ended_at TEXT`, `metadata TEXT`. Session IDs are prefix-typed: random UUID (per-ask default), `system-{agent_id}` (compaction summaries), `canonical-{agent_id}` (single-session-by-nature agents, mika#1401), plus derived namespaces `heartbeat-*`, `callback-*`, `skill-*`, `reflection-*`, `team-*`, `delegate-*`, `reminder-*`. `prune_old_sessions` only deletes the derived-namespace prefixes; `canonical-*`, `system-*`, and bare UUIDs are exempt. Agents opt into a single canonical session via `[session] singleton = true` in `identity.toml` (see `crates/mika-agent/CLAUDE.md` § Session Configuration).
 
 **messages** — `id INTEGER PK AUTO`, `session_id TEXT FK→sessions`, `agent_id TEXT FK→agents`, `role TEXT CHECK(user|assistant|system|summary|tool_result)`, `content TEXT`, `metadata TEXT`, `trace_id TEXT`, `compacted_through_id INTEGER`, `created_at TEXT`, `internal INTEGER NOT NULL DEFAULT 0` (agent-to-agent messages hidden from TUI inbox mode)
 
